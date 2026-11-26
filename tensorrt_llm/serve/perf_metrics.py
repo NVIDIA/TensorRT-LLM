@@ -863,6 +863,15 @@ class PerfMetricsMiddleware:
             name.lower() == _RETURN_METRICS_HEADER_BYTES and value.strip() == b"1"
             for name, value in scope.get("headers", [])
         )
+        records_submitted = False
+
+        def submit_records_once() -> None:
+            nonlocal records_submitted
+            if self._writer is None or records_submitted:
+                return
+            records_submitted = True
+            for record in records:
+                self._writer.submit(record)
 
         async def send_metrics(message: Dict[str, Any]) -> None:
             nonlocal is_stream, metrics_headers
@@ -892,9 +901,7 @@ class PerfMetricsMiddleware:
                 if records:
                     if metrics_headers is None:
                         metrics_headers = build_metrics_headers(records)
-                    if self._writer is not None:
-                        for record in records:
-                            self._writer.submit(record)
+                    submit_records_once()
                     if return_metrics and is_stream:
                         message["body"] = message.get("body", b"") + build_metrics_sse_event(
                             metrics_headers
@@ -911,4 +918,11 @@ class PerfMetricsMiddleware:
             self._input_processing_observer if scope.get("path") != "/health_generate" else None
         )
         with _input_processing_context(scope["state"], input_observer):
-            await self._app(scope, receive, send_metrics)
+            try:
+                await self._app(scope, receive, send_metrics)
+            finally:
+                # A client that disconnects at [DONE] makes Starlette cancel the
+                # StreamingResponse when the server reports ASGI spec < 2.4 (uvicorn does).
+                # The final body then never reaches send_metrics. Records are appended only
+                # once generation has finished, so submitting them here is safe.
+                submit_records_once()

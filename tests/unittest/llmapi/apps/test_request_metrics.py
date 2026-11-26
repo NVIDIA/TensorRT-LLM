@@ -485,6 +485,52 @@ async def test_disconnect_after_done_is_ignored():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "propagate_cancellation",
+    [False, True],
+    ids=["starlette_absorbed", "propagated"],
+)
+async def test_record_is_submitted_when_stream_is_cancelled_before_final_body(
+    propagate_cancellation,
+):
+    # Starlette absorbs the cancellation, so the middleware can see the app return
+    # without a final body. It must also preserve a propagated CancelledError.
+    writer = MagicMock(spec=PerfMetricsJsonlWriter)
+    record = _record()
+
+    async def app(scope, receive, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        scope["state"]["perf_metrics_records"].append(record)
+        await send(
+            {
+                "type": "http.response.body",
+                "body": b"data: [DONE]\n\n",
+                "more_body": True,
+            }
+        )
+        if propagate_cancellation:
+            raise asyncio.CancelledError()
+
+    async def discard(message):
+        pass
+
+    middleware = PerfMetricsMiddleware(app, expose_headers=False, writer=writer)
+    if propagate_cancellation:
+        with pytest.raises(asyncio.CancelledError):
+            await middleware({"type": "http", "headers": [], "state": {}}, None, discard)
+    else:
+        await middleware({"type": "http", "headers": [], "state": {}}, None, discard)
+
+    writer.submit.assert_called_once_with(record)
+
+
+@pytest.mark.asyncio
 async def test_file_middleware_intercepts_detail_headers(tmp_path):
     writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
     await writer.start()
