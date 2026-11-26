@@ -4,12 +4,15 @@ import argparse
 import sys
 from pathlib import Path
 
+import yaml
+
 from agent_flow.agent_runtime import resolve_agent_config
 from agent_flow.prompts import dump_prompt_bundle
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
 from agent_flow.workflows.perf_analyze.task_schema import casebook_enabled
 
 from .disagg import has_disagg
+from .disagg.sol_track import track_name
 from .prompts import PROMPTS_DIRNAME, build_perf_optimize_prompts
 from .state import STATE_FILENAME
 from .task_schema import (
@@ -110,13 +113,106 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "`optimize.item_execution` mode). "
         "Ignored on resume — the checkpointed budget wins.",
     )
+    _add_dry_run(parser)
     return parser.parse_args(argv)
+
+
+def _run_disagg_sol(args) -> None:
+    """The staged two-track path: fix the operating point, then optimize at it.
+
+    Dispatched on the shape of `task.yaml` rather than on a flag, so one file
+    describes the whole campaign and there is one place to look for what it
+    will do. The single-track path below is untouched: a spec without a
+    `disagg_sol` block reaches it exactly as before.
+    """
+    import json
+
+    import yaml
+
+    from .disagg import spawn
+    from .disagg.sol import DisaggSolError, supervise
+
+    raw = yaml.safe_load(Path(args.task).read_text(encoding="utf-8")) or {}
+    block = raw.get("disagg_sol") or {}
+    root = Path(args.workspace)
+    try:
+        record = supervise(
+            raw,
+            sweeps={k: Path(v) for k, v in (block.get("sweeps") or {}).items()},
+            repos={k: Path(v) for k, v in (block.get("repos") or {}).items()},
+            workspace_root=root,
+            label=block.get("label") or root.name,
+            incumbent=block.get("incumbent"),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            # Only when the spec says where the skill lives. Without it the
+            # design stays an input and an unestablished one is refused --
+            # which is the safer default for a step that costs an order of
+            # magnitude more than the campaigns it enables.
+            designer=(
+                (
+                    lambda instruction: spawn.design(
+                        instruction,
+                        cwd=Path(block["config_repo"]),
+                        log=root / "design.log",
+                    )
+                )
+                if block.get("config_repo")
+                else None
+            ),
+        )
+    except DisaggSolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(record, indent=2, default=str))
+    # Exit with the halves' outcome, not 0 regardless. A half that died left no
+    # checkpoint, so anything watching this process could only infer success
+    # from the exit code -- and 0 said a crashed campaign had finished.
+    failed = {t: c for t, c in (record.get("exit_status") or {}).items() if c}
+    if failed:
+        print(f"error: campaign(s) exited non-zero: {failed}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _add_dry_run(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "staged disagg only: select the operating point and write every "
+            "campaign's task.yaml, then stop without starting them"
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     resume = not args.clean and (args.workspace / STATE_FILENAME).is_file()
     task_path = args.workspace / "task.yaml" if resume else args.task
+    # Before schema validation: a staged spec is a different shape, and the
+    # single-track schema would reject it for the fields it deliberately lacks.
+    try:
+        _raw = yaml.safe_load(Path(args.task).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        print(f"error: could not read {args.task}: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if isinstance(_raw, dict) and "disagg_sol" in _raw:
+        _run_disagg_sol(args)
+        return
+    # Refused rather than ignored. The flag is on the shared parser because
+    # argparse cannot know which path the spec takes until the file is read,
+    # and only the staged path implements it -- so on a single-track spec it
+    # used to be accepted and then silently dropped, which turns "show me
+    # what this would do" into a full multi-hour campaign on real hardware.
+    # The one failure mode a dry run must not have.
+    if getattr(args, "dry_run", False):
+        print(
+            "error: --dry-run is implemented for the staged disagg path only "
+            f"(a spec with a 'disagg_sol' block); {args.task} is a single-track "
+            "campaign, and running it without the flag would start it for real. "
+            "Re-run without --dry-run when you mean to.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     try:
         task_data = load_and_validate_task_yaml(
             task_path,
@@ -149,6 +245,7 @@ def main(argv: list[str] | None = None) -> None:
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
         include_casebook=casebook_enabled(task_data),
+        sol_track=track_name(task_data),
     )
     with PerfOptimizeWorkflow(
         workspace=args.workspace,

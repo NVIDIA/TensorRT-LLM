@@ -287,12 +287,34 @@ def test_stage_prompts_state_the_mode_so_the_system_prompt_section_wins(tmp_path
     wf = PerfOptimizeWorkflow.__new__(PerfOptimizeWorkflow)
     wf._task_data = lambda: task_schema.load_and_validate_task_yaml(task)
 
-    directive = wf._disagg_directive()
+    directive = wf._campaign_directive()
     assert "DISAGGREGATED" in directive
     assert "replaces all of it" in directive
     assert str(harness) in directive
     # It must name the guidance it overrides, or a reader cannot tell what to skip.
     assert "trtllm-serve" in directive
+
+
+def test_an_ordinary_campaign_is_handed_no_directive_at_all(tmp_path):
+    """The regression guard for every campaign that is neither mode.
+
+    ``_campaign_directive`` replaced ``_disagg_directive`` and grew a second
+    branch for the SOL tracks. Both branches are gated, and a campaign with
+    neither block must come out exactly as it did before: the stage prompt
+    opens with ``Workspace:`` and nothing is prepended.
+
+    The empty string is the whole contract. Anything else silently rewrites
+    the opening line of every aggregate run's prompt -- which is the one
+    change this refactor must not make, and the one a test of the two
+    populated branches cannot catch.
+    """
+    from agent_flow.workflows.perf_optimize.workflow import PerfOptimizeWorkflow
+
+    task = _write_task(tmp_path, {})
+    wf = PerfOptimizeWorkflow.__new__(PerfOptimizeWorkflow)
+    wf._task_data = lambda: task_schema.load_and_validate_task_yaml(task)
+
+    assert wf._campaign_directive() == ""
 
 
 # ------------------------------------------------- profiling wording
