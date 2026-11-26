@@ -484,19 +484,20 @@ class MoeTailWeights:
 
 
 class PreparedTail:
-    """The layer's MoE tail; placement = (model MoeTailBox, MoE ordinal, MoE layer
+    """The layer's MoE tail using this rank's up-projection shard.
+
+    Placement = (model MoeTailBox, MoE ordinal, MoE layer
     count). At WaveMoeTail batches the experts publish into latent slot ``publish[b]``
     (multicast, parity, rank; at ``twoshots`` the two-shot push box) and the side
     stream pushes the shared-expert output (``push``)."""
 
-    def __init__(self, op, norm, up, batches, placement):
+    def __init__(self, op, norm, up_shard, batches, placement):
         tp, rank = op.contract.tp_size, op.rank
-        local_up = up.narrow(0, rank * (7168 // tp), 7168 // tp)
         self.tail_box, ordinal, count = placement
         eps = op.contract.rms_eps
         m8 = [b for b in batches if published(tp, b, norm.device)]
         self.twoshots = twoshot_batches(tp, norm.device) & set(m8)
-        args = (tp, local_up, norm, eps, ordinal, count, batches, self.twoshots)
+        args = (tp, up_shard, norm, eps, ordinal, count, batches, self.twoshots)
         self.tail_weights = MoeTailWeights(*args)
         self.peers, _, mc, _ = self.tail_box.tail
         self.ring = (self.tail_weights.parity, Int32(rank))

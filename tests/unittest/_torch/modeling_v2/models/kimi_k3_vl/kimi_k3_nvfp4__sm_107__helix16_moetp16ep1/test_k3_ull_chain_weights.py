@@ -110,18 +110,22 @@ def test_read_kda(rank):
 def test_read_moe_dense(fp8, few_experts):
     rank = 7
     ckpt = synth.synthetic_checkpoint([3], experts=2, fp8_moe_dense=fp8)
-    w = cw.read_moe(ckpt, 3, rank, prefix=P)
     m = f"{P}model.layers.3.block_sparse_moe."
+    up_key = m + "routed_expert_up_proj.weight"
+    if not fp8:
+        # A dense checkpoint tensor can back a sliced view with its full storage.
+        ckpt[up_key] = ckpt[up_key].full()
+    w = cw.read_moe(ckpt, 3, rank, prefix=P)
     router = dequant_full(ckpt, m + "gate.weight")
     down = dequant_full(ckpt, m + "routed_expert_down_proj.weight")
-    up = dequant_full(ckpt, m + "routed_expert_up_proj.weight")
+    up = dequant_full(ckpt, up_key)
     # The front GEMM's rows: router rows of the rank, 8 zero rows, its latent-down shard.
     front = torch.cat((router[56 * rank : 56 * rank + 56], router.new_zeros(8, 7168),
                        down[224 * rank : 224 * rank + 224]))  # fmt: skip
     assert same(w.front, front)
-    assert same(w.latent_up, up)
-    assert same(w.up_shard, up[448 * rank : 448 * rank + 448])
-    assert w.up_shard.untyped_storage().data_ptr() == w.latent_up.untyped_storage().data_ptr()
+    assert same(w.latent_up, up[448 * rank : 448 * rank + 448])
+    assert w.latent_up.is_contiguous()
+    assert w.latent_up.untyped_storage().nbytes() == w.latent_up.nbytes
     assert same(w.score_bias, ckpt[m + "gate.e_score_correction_bias"].full())
     assert same(w.latent_norm, ckpt[m + "routed_expert_norm.weight"].full().to(torch.bfloat16))
     ss = slice(384 * rank, 384 * rank + 384)

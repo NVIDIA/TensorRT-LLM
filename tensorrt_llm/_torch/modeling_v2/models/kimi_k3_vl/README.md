@@ -37,8 +37,9 @@ recipe below. Routing admits exactly these layouts; anything else raises `NoTarg
 it saw (`modeling_v2="require"` turns that into an error).
 
 Set `modeling_v2: require` explicitly on the Helix16 ULL generation worker. This layout requires
-a KV cache transceiver, MNNVL all-reduce (`AUTO` or `MNNVL`), and a standalone MLA DSpark drafter
-with Markov head weights and a fixed draft length of seven tokens. Set
+an explicit MoE TP16 split (`moe_tensor_parallel_size: 16`), a KV cache transceiver, MNNVL
+all-reduce (`AUTO` or `MNNVL`), and a standalone MLA DSpark drafter with Markov head weights
+and a fixed draft length of seven tokens. Set
 `kv_cache_config.enable_kv_pool_rebalance` to `false` so KDA checkpoint slot bindings stay fixed.
 The target declines an explicit non-generation role, guided decoding, or GEN slot preemption.
 

@@ -324,15 +324,15 @@ def test_pdl_off_gets_no_target(monkeypatch):
     )
 
 
-def _helix16_moetp16(**cp_config) -> Mapping:
+def _helix16_moetp16(*, moe_tp_size: int = 16, moe_ep_size: int = 1, **cp_config) -> Mapping:
     return Mapping(
         world_size=16,
         rank=0,
         tp_size=1,
         cp_size=16,
         cp_config={"cp_type": "HELIX", "use_nccl_for_alltoall": False, **cp_config},
-        moe_tp_size=16,
-        moe_ep_size=1,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
     )
 
 
@@ -357,6 +357,13 @@ def test_ull_generation_server_routes_to_the_ull_target(max_batch_size):
     )
 
 
+def test_ull_declines_the_implicit_moe_split() -> None:
+    mapping = _helix16_moetp16(moe_tp_size=-1, moe_ep_size=-1)
+    assert (mapping.moe_tp_size, mapping.moe_ep_size) == (16, 1)
+    with pytest.raises(NoTarget, match="explicit MoE TP16"):
+        _route_name(_model_config(mapping), _ull_args())
+
+
 @pytest.mark.parametrize(
     "llm_args, match",
     [
@@ -364,6 +371,12 @@ def test_ull_generation_server_routes_to_the_ull_target(max_batch_size):
         (_ull_args(max_batch_size=8), "max_batch_size 8"),
         (_ull_args(max_batch_size=None), "max_batch_size None"),
         (_ull_args(kv_cache_config=SimpleNamespace(dtype="fp8")), "NVFP4 KV cache"),
+        (
+            _ull_args(
+                kv_cache_config=SimpleNamespace(dtype="nvfp4", enable_kv_pool_rebalance=True)
+            ),
+            "enable_kv_pool_rebalance=False",
+        ),
         (_ull_args(env_overrides={"TRTLLM_ENABLE_PDL": "0"}), "TRTLLM_ENABLE_PDL='0'"),
         (_ull_args(cache_transceiver_config=None), "disaggregated generation server"),
         (

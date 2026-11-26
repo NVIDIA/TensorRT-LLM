@@ -359,7 +359,7 @@ def _worker_env(llm_args: TorchLlmArgs, name: str) -> Optional[str]:
     return os.environ.get(name)
 
 
-def _check_sm107_ull(llm_args: TorchLlmArgs) -> None:
+def _check_sm107_ull(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
     """Raise ``NoTarget`` unless the Helix CP16 / MoE TP16 deployment is the ULL generation server.
 
     The ULL target runs every KDA + MoE layer and every MoE of an MLA layer on fixed decode
@@ -374,6 +374,11 @@ def _check_sm107_ull(llm_args: TorchLlmArgs) -> None:
         )
     if llm_args.guided_decoding_backend is not None:
         raise NoTarget("the sm107 Kimi K3 ULL target does not support guided_decoding_backend")
+    if not mapping.moe_tp_ep_user_specified:
+        raise NoTarget(
+            "the sm107 Kimi K3 ULL target requires explicit MoE TP16 "
+            "(set moe_tensor_parallel_size=16)"
+        )
     if llm_args.moe_config.backend != "CUTEDSL_FC12":
         raise NoTarget("the sm107 Kimi K3 ULL target requires moe_config.backend CUTEDSL_FC12")
     if getattr(llm_args, "allreduce_strategy", None) not in (None, "AUTO", "MNNVL"):
@@ -381,6 +386,10 @@ def _check_sm107_ull(llm_args: TorchLlmArgs) -> None:
     preemption = getattr(getattr(llm_args, "scheduler_config", None), "gen_preemption", None)
     if getattr(preemption, "enabled", False):
         raise NoTarget("the sm107 Kimi K3 ULL target does not support GEN slot preemption")
+    if getattr(llm_args.kv_cache_config, "enable_kv_pool_rebalance", False):
+        raise NoTarget(
+            "the sm107 Kimi K3 ULL target requires kv_cache_config.enable_kv_pool_rebalance=False"
+        )
 
     spec = llm_args.speculative_config
     if getattr(spec, "draft_is_embedded_in_target", False):
@@ -475,7 +484,7 @@ def _check_sm107(model_config: ModelConfig, llm_args: TorchLlmArgs) -> str:
             f"{seen}: no sm107 Kimi K3 target serves this layout. The targets: {layouts}"
         )
     if target == "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1":
-        _check_sm107_ull(llm_args)
+        _check_sm107_ull(llm_args, mapping)
     logger.info(
         f"modeling_v2 kimi_k3_vl: {target} rank={mapping.rank} {seen} kv={kv_algo} "
         f"spec={spec_config.spec_dec_mode.name}"

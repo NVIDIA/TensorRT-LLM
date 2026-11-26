@@ -672,9 +672,10 @@
    "source": "NVIDIA implementation developed for the vLLM Kimi K3 Rubin decode backend",
    "source_sha256": "fcc62c8e1dc5dc1ac382162904812a7c538c306c4fd4ca9fb192c26409059c4e",
    "import_edits": 0,
-   "sha256": "68ccf81ea58845cab0996cbd7e43f52a7f581a60cae7e42ae468580d4768057c",
+   "sha256": "b1191288d785f02569c5b21d2b584a5ea4677a6e42302641ac1ff85bd842ce57",
    "local_edits": [
-    "Updated import paths for the Kimi K3 family layout."
+    "Updated import paths for the Kimi K3 family layout.",
+    "Use the rank-local latent up projection loaded by the chain."
    ]
   },
   "kernels/k3r_oproj/ull/__init__.py": {

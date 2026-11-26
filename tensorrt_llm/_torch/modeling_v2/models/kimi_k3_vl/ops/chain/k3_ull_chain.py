@@ -240,7 +240,7 @@ class MoeWeights:
     rank: int
     front: torch.Tensor
     score_bias: torch.Tensor
-    latent_up: torch.Tensor
+    latent_up: torch.Tensor  # This rank's output rows of the latent up projection.
     latent_norm: torch.Tensor
     shared_gate_up: torch.Tensor
     shared_down: torch.Tensor
@@ -253,7 +253,12 @@ class MoeWeights:
         where = f"L{self.layer} MoE"
         _check(f"{where} front", self.front, (rows, CHAIN_HIDDEN), torch.bfloat16)
         _check(f"{where} score_bias", self.score_bias, (EXPERTS,), torch.float32)
-        _check(f"{where} latent_up", self.latent_up, (CHAIN_HIDDEN, LATENT), torch.bfloat16)
+        _check(
+            f"{where} latent_up",
+            self.latent_up,
+            (CHAIN_HIDDEN // self.tp, LATENT),
+            torch.bfloat16,
+        )
         _check(f"{where} latent_norm", self.latent_norm, (LATENT,), torch.bfloat16)
         _check(
             f"{where} shared_gate_up",
@@ -263,12 +268,6 @@ class MoeWeights:
         )
         _check(f"{where} shared_down", self.shared_down, (CHAIN_HIDDEN, inter), torch.bfloat16)
         check_routed(self.routed, where)
-
-    @property
-    def up_shard(self) -> torch.Tensor:
-        """The rank's rows of the latent up projection [448, 3584] (a view)."""
-        rows = CHAIN_HIDDEN // self.tp
-        return self.latent_up[self.rank * rows : (self.rank + 1) * rows]
 
     def tensors(self) -> Dict[str, torch.Tensor]:
         names = ("front", "score_bias", "latent_up", "latent_norm", "shared_gate_up", "shared_down")
@@ -556,8 +555,7 @@ def read_moe(
     prefix: str = "",
     device=None,
 ) -> MoeWeights:
-    """MoE ``layer``'s weights on TP rank ``rank`` (module docstring): only the rank's router and
-    latent-down rows are read (into ``front``), the latent up projection whole."""
+    """Read the MoE weights for one TP rank, including its latent up projection rows."""
     if SHARED_INTER % tp or EXPERTS % tp or LATENT % tp or CHAIN_HIDDEN % tp:
         raise ValueError(f"Kimi K3 chain: TP {tp} does not divide the K3 shapes")
     moe = f"{prefix}model.layers.{layer}.block_sparse_moe."
@@ -575,7 +573,12 @@ def read_moe(
     front = torch.cat((router, router.new_zeros((pad, CHAIN_HIDDEN)), down)).contiguous()
     del router, down
     score_bias = get_plain(moe + "gate.e_score_correction_bias").float().contiguous()
-    latent_up = get(moe + "routed_expert_up_proj.weight").contiguous()
+    up_rows = CHAIN_HIDDEN // tp
+    up_slice = slice(rank * up_rows, (rank + 1) * up_rows)
+    # The shard owns its storage even when the checkpoint value is a dense tensor.
+    latent_up = get(moe + "routed_expert_up_proj.weight", up_slice).clone(
+        memory_format=torch.contiguous_format
+    )
     latent_norm = get_plain(moe + "routed_expert_norm.weight").to(torch.bfloat16).contiguous()
     inter = SHARED_INTER // tp
     ss = slice(rank * inter, (rank + 1) * inter)
@@ -1276,7 +1279,6 @@ def _moe_view(w: MoeWeights, config: ChainConfig):
         prefix=f"model.layers.{w.layer}.mlp",
         gate=NS(e_score_correction_bias=w.score_bias),
         routed_expert_norm=NS(weight=w.latent_norm, variance_epsilon=eps, eps=eps),
-        routed_expert_up_proj=NS(weight=w.latent_up),
         shared_experts=NS(
             gate_up_proj=NS(weight=w.shared_gate_up), down_proj=NS(weight=w.shared_down)
         ),
