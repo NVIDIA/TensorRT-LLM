@@ -206,10 +206,11 @@ def calculate_metrics(
         else:
             actual_output_lens.append(0)
 
-    total_error_count = sum(error_counts.values())
+    # A request can fail without an exception, e.g. on an SSE error event.
+    failed_count = sum(1 for output in outputs if not output.success)
     for exception_type, count in error_counts.items():
         print(f"Error type: {exception_type}, Count: {count} requests")
-    print(f"Total failed requests: {total_error_count}")
+    print(f"Total failed requests: {failed_count}")
 
     if goodput_config_dict:
         valid_metrics = []

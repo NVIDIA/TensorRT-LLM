@@ -24,6 +24,8 @@ from tensorrt_llm.serve.scripts.backend_request_func import (
     async_request_openai_chat_completions,
     async_request_openai_completions,
 )
+from tensorrt_llm.serve.scripts.benchmark_dataset import SampleRequest
+from tensorrt_llm.serve.scripts.benchmark_serving import calculate_metrics
 
 pytestmark = pytest.mark.cpu_only
 
@@ -121,3 +123,23 @@ async def test_stream_without_error_event_succeeds(endpoint):
     assert output.error == ""
     assert output.generated_text == "Hello"
     assert output.output_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_metrics_count_a_failed_stream_as_a_failed_request(capsys):
+    failed = await _run("completions", [ERROR_EVENT])
+    succeeded = await _run("completions", [USAGE_EVENT])
+    assert failed.exception_type is None
+
+    metrics, _ = calculate_metrics(
+        input_requests=[SampleRequest(prompt="Hi", prompt_len=1, expected_output_len=8)] * 2,
+        outputs=[failed, succeeded],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentile_metrics=["ttft"],
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+    )
+
+    assert metrics.completed == 1
+    assert "Total failed requests: 1" in capsys.readouterr().out
