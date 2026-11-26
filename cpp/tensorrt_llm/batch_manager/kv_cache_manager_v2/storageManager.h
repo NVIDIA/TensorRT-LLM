@@ -218,9 +218,11 @@ public:
         DropRecorder const& dropRecorder = {}, std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     // Dynamic cache level resizing. A localized GPU level is resized one domain at a time.
+    // `maxNumSlots` caps each pool group's slots per domain; see slotCountsForLevel().
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
         TypedVec<PoolGroupIndex, float> const& ratioList,
-        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages);
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+        std::optional<TypedVec<PoolGroupIndex, SlotCount>> const& maxNumSlots = std::nullopt);
     void shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots,
         std::vector<SharedPtr<Page>> const& persistentPages, LocalityDomainId localityDomainId = LocalityDomainId{0});
     void expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots,
@@ -520,9 +522,11 @@ private:
     [[nodiscard]] size_t minQuotaForLevel(CacheLevel level) const;
 
     //! Slot counts `quota` buys at `ratio`, for a level that exists. Fixed hot-tier groups keep
-    //! their fixed slot count.
-    [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> slotCountsForLevel(
-        CacheLevel level, size_t quota, TypedVec<PoolGroupIndex, float> const& ratio) const;
+    //! their fixed slot count. A group the split takes past its `maxNumSlots` is held at that
+    //! count like a fixed group, and the others split what is left.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> slotCountsForLevel(CacheLevel level, size_t quota,
+        TypedVec<PoolGroupIndex, float> const& ratio,
+        std::optional<TypedVec<PoolGroupIndex, SlotCount>> const& maxNumSlots = std::nullopt) const;
 
     //! Slot floors for a level: the hot level's feasibility constraints, and elsewhere the
     //! structural one slot per pool group.

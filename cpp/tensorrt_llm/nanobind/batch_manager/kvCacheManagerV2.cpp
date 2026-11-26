@@ -3757,10 +3757,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "which is what sparse loading pulls into the per-request GPU cache.")
         .def(
             "resize",
-            [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)
-            { return self.resize(kv::CacheLevel{cacheLevel}, quota, bestEfforts); },
+            [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts,
+                std::optional<std::vector<kv::SlotCount>> const& maxNumSlots)
+            {
+                return self.resize(kv::CacheLevel{cacheLevel}, quota, bestEfforts,
+                    maxNumSlots.has_value() ? std::optional{typedSlotCounts(*maxNumSlots)} : std::nullopt);
+            },
             nb::arg("cache_level"), nb::arg("quota"), nb::arg("best_efforts") = false,
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("max_num_slots").none() = std::nullopt, nb::call_guard<nb::gil_scoped_release>(),
+            "Resize a cache level to `quota` bytes, split by the target ratio. `max_num_slots`, when "
+            "given, caps the slots of each pool group in each locality domain: a group the split "
+            "would take past its cap is held at it and the other groups split the rest.")
         .def(
             "get_quota",
             [](kv::KvCacheManager const& self, int cacheLevel) { return self.getQuota(kv::CacheLevel{cacheLevel}); },

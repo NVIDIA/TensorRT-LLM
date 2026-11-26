@@ -5208,7 +5208,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 cooldown_secs=rebalance_cfg.cooldown_secs,
                 # The backend splits every quota change by the auto-tuner's target split. Without
                 # the auto-tuner that target never moves (the largest int32 interval), so
-                # resize_gpu_quota keeps the split the pools were sized by and their views cover.
+                # resize_gpu_quota splits every quota by the split the pools were sized by.
                 target_ratio_update_interval=(
                     rebalance_cfg.target_ratio_update_interval
                     if kv_cache_config.enable_kv_pool_rebalance
@@ -9362,15 +9362,15 @@ class KVCacheManagerV2(BaseResourceManager):
         Every KV cache must be suspended, the CUDA graph padding dummies included, and no queued
         work may use the pool. The views of the pool (attention's, a drafter's) are bound while the
         pool is at its size at construction and cover that many slots, so the pool never grows past
-        that size.
+        that size, and no pool group past its slot count at that size: a quota just below it can
+        split into more slots for one group, which is then held at its count.
 
         Returns:
             The quota the pool took.
 
         Raises:
             OutOfPagesError: The pages in use do not fit in ``quota`` bytes.
-            RuntimeError: A KV cache is not suspended, or the resize would grow a pool group past
-                its slot count at construction.
+            RuntimeError: A KV cache is not suspended.
             ValueError: ``quota`` exceeds the pool's size at construction.
         """
         unit = _gpu_alloc_granularity(self.impl.init_config.cache_tiers[GPU_LEVEL].quota)
@@ -9383,14 +9383,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"construction of {self._max_gpu_quota} bytes"
             )
         num_slots = [pool_group.num_slots for pool_group in self.impl.pool_group_descs]
-        if not self.impl.resize(GPU_LEVEL, quota):
+        if not self.impl.resize(GPU_LEVEL, quota, max_num_slots=self._max_gpu_num_slots):
             raise OutOfPagesError(f"The GPU KV cache pool cannot be resized to {quota} bytes")
-        resized = [pool_group.num_slots for pool_group in self.impl.pool_group_descs]
-        if any(count > max_count for count, max_count in zip(resized, self._max_gpu_num_slots)):
-            raise RuntimeError(
-                f"Resizing the GPU KV cache pool to {quota} bytes gave its pool groups {resized} "
-                f"slots, past the {self._max_gpu_num_slots} at construction that its views cover"
-            )
         grown = [
             (pool_group, range(old_num_slots, pool_group.num_slots))
             for pool_group, old_num_slots in zip(self.impl.pool_group_descs, num_slots)

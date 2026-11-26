@@ -28,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig, KvPoolRebalanceConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -278,6 +279,79 @@ def test_resize_keeps_pool_groups_within_construction():
         assert manager.resume_request(held)
         manager.free_resources(held)
     finally:
+        manager.shutdown()
+
+
+def _uneven_pool_manager() -> KVCacheManagerV2:
+    """Return a manager of two pool groups, each with two pools of different slot sizes.
+
+    Each attention window is a life cycle with a pool group of its own, and its layers of different
+    KV head counts keep separate pools. Those pools round to the 2 MiB allocation unit of the 64 MiB
+    pool unevenly, so splitting a quota a few units below the pool's size at construction can give
+    a group more slots than it had at construction. The pool ratio is set, so the split does not
+    depend on the default sizing.
+    """
+    return KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=64 * MIB,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            max_attention_window=[64, 64, 1024, 1024],
+            pool_ratio=[0.1, 0.9],
+        ),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=4,
+        num_kv_heads=[7, 1, 3, 1],
+        head_dim=128,
+        tokens_per_block=CHUNK,
+        max_seq_len=1024,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+    )
+
+
+def _pool_group_num_slots(manager: KVCacheManagerV2) -> list[int]:
+    return [pool_group.num_slots for pool_group in manager.impl.pool_group_descs]
+
+
+def test_resize_below_construction_keeps_pool_groups_within_it():
+    """Keep every pool group within its size at construction when a smaller quota splits past it."""
+    uncapped = _uneven_pool_manager()
+    manager = _uneven_pool_manager()
+    try:
+        construction = _pool_group_num_slots(manager)
+        assert len(construction) == 2
+        assert _pool_group_num_slots(uncapped) == construction
+        quota = manager.gpu_quota
+        unit = 2 * MIB
+
+        # Without a cap, the split of some quota below the pool's size at construction gives a
+        # pool group more slots than at construction.
+        for target in range(quota - unit, quota // 2, -unit):
+            assert uncapped.impl.resize(GPU_LEVEL, target)
+            if any(c > m for c, m in zip(_pool_group_num_slots(uncapped), construction)):
+                break
+        else:
+            pytest.fail(
+                "No quota below the pool's size at construction splits past its slot counts"
+            )
+
+        uncapped_counts = _pool_group_num_slots(uncapped)
+        manager.resize_gpu_quota(target)
+        # The group the split took past its slots at construction stays at them, and the other
+        # group takes the bytes it leaves.
+        for count, uncapped_count, max_count in zip(
+            _pool_group_num_slots(manager), uncapped_counts, construction
+        ):
+            if uncapped_count > max_count:
+                assert count == max_count
+            else:
+                assert uncapped_count <= count <= max_count
+        assert manager.resize_gpu_quota(quota) == quota
+        assert _pool_group_num_slots(manager) == construction
+    finally:
+        uncapped.shutdown()
         manager.shutdown()
 
 
