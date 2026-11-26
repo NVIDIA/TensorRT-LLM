@@ -13,10 +13,13 @@ linear e4m3 block scales at the layer's global scale. The runner then enters pre
 
 Up to `LEAN_MAX_ROWS` rows the lean form runs (one cheaper count exchange; it releases its
 dependent, the runner's FC1, at its start, whose own wait still holds it until this grid
-completes); past them clusters of 16 and the default release.
+completes); past them clusters of 16 and the default release, or with `early=True` the release
+right after the launch's wait, which is then its first statement (the same bits; only FC1's
+launch moves).
 
-`fast2=True` (past 512 rows, where a warp routes two tokens) routes each of a warp's two tokens
-on the kernel's one-token fast path instead of both on the full per-lane sort: the same bits.
+`fast2=True` / `1` (past 512 rows, where a warp routes two tokens) routes each of a warp's two
+tokens on the kernel's one-token fast path instead of both on the full per-lane sort: the same
+bits. `fast2=2` also loads the second token's logits before the first token is routed.
 
 `route_front_only(..., ids_in=True)` (past `LEAN_MAX_ROWS`) takes rows their owners already
 routed (`IDS_ROW_SLOTS` int16 a row: the experts, then their weight bits, which the attention-DP
@@ -92,13 +95,21 @@ FAST2_MIN_ROWS = 513
 IDS_ROW_SLOTS = 24
 
 
-def _key(rows, hidden, row_stride, num_local, tile, fast2, route_only=False, ids_in=False) -> tuple:
-    fast2 = bool(fast2) and rows >= FAST2_MIN_ROWS
+def _key(
+    rows, hidden, row_stride, num_local, tile, fast2, route_only=False, ids_in=False, early=False
+) -> tuple:
+    form = int(fast2) if rows >= FAST2_MIN_ROWS else 0
+    if form not in (0, 1, 2):
+        raise ValueError(f"fast2={fast2!r}: expected 0 / False, 1 / True or 2")
     pdl = bool(get_env_enable_pdl())
+    # `early` moves only the release past the lean rows, and only with PDL.
+    early = bool(early) and pdl and rows > LEAN_MAX_ROWS
     return (
-        (rows, hidden, row_stride, num_local, tile, pdl, fast2)
+        # form 1 keys as `True`, as before form 2 existed
+        (rows, hidden, row_stride, num_local, tile, pdl, form if form != 1 else True)
         + (("route",) if route_only else ())
         + (("ids",) if ids_in else ())
+        + (("early",) if early else ())
     )
 
 
@@ -108,16 +119,18 @@ def compile_front(
     row_stride: int,
     num_local: int,
     tile: int,
-    fast2: bool = False,
+    fast2: bool | int = False,
     route_only: bool = False,
     ids_in: bool = False,
+    early: bool = False,
 ):
     """Compile (once) the launch of `rows` gathered rows of `hidden` (row stride `row_stride`)
     for a window of `num_local` experts at tile `tile` (`fast2`: two tokens a warp on the
-    one-token fast path; `route_only`: the routing cluster alone, `route_front_only`; `ids_in`:
-    with it, over routed rows past `LEAN_MAX_ROWS`); False where the kernel does not take the
-    shape. Outside CUDA-graph capture only; `__call__` then finds it."""
-    key = _key(rows, hidden, row_stride, num_local, tile, fast2, route_only, ids_in)
+    one-token fast path, `2` with the second token's logits loaded first; `route_only`: the
+    routing cluster alone, `route_front_only`; `ids_in`: with it, over routed rows past
+    `LEAN_MAX_ROWS`; `early`: past them, the release right after the wait); False where the
+    kernel does not take the shape. Outside CUDA-graph capture only; `__call__` then finds it."""
+    key = _key(rows, hidden, row_stride, num_local, tile, fast2, route_only, ids_in, early)
     if key in _COMPILED:
         return _COMPILED[key] is not None
     assert not torch.cuda.is_current_stream_capturing(), "compile outside graph capture"
@@ -154,7 +167,12 @@ def compile_front(
         _COMPILED[key] = None
         return False
     kernel = MoeRouteFrontKernel(
-        use_pdl=key[5], fast2=key[6], route_only=route_only, ids_in=ids_in, **config
+        use_pdl=key[5],
+        fast2=int(key[6]),
+        route_only=route_only,
+        ids_in=ids_in,
+        early="early" in key,
+        **config,
     )
     z = cutlass.Int64(0)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -163,11 +181,19 @@ def compile_front(
 
 
 def _cell(
-    rows: int, offset: int, tile: int, why: str, num_local: int = 128, fast2: bool = False
+    rows: int,
+    offset: int,
+    tile: int,
+    why: str,
+    num_local: int = 128,
+    fast2: bool | int = False,
+    early: bool = False,
 ) -> Cell:
     spec = dict(rows=rows, hidden=2560, local_offset=offset, num_local=num_local, tile=tile)
     if fast2:
-        spec["fast2"] = True
+        spec["fast2"] = True if fast2 is True else int(fast2)
+    if early:
+        spec["early"] = True
     return Cell(why=why, spec=spec)
 
 
@@ -195,6 +221,27 @@ class MoeRouteFront(OpWrapper):
         _cell(544, 128, 32, "dep8 fast2: 17 a rank (544 rows), window 2, tile 32", 64, True),
         _cell(768, 448, 32, "dep8 fast2: 24 a rank (768 rows), window 7, tile 32", 64, True),
         _cell(1024, 0, 64, "fast2: 1024 rows, 64 tokens a CTA (two mask words)", 64, True),
+        _cell(640, 256, 32, "dep4 fast2=2: 40 a rank (640 rows), window 2, early", 128, 2, True),
+        _cell(
+            832,
+            384,
+            64,
+            "dep4 fast2=2: 52 a rank (832 rows, F1's cap), window 3, early",
+            128,
+            2,
+            True,
+        ),
+        _cell(1024, 0, 64, "fast2=2: 1024 rows, 64 tokens a CTA, window 0, early", 128, 2, True),
+        _cell(768, 448, 32, "dep8 fast2: 24 a rank (768 rows), window 7, early", 64, True, True),
+        _cell(
+            448,
+            64,
+            32,
+            "dep8: 14 a rank (448 rows, one token a warp), window 1, early",
+            64,
+            False,
+            True,
+        ),
     )
 
     note = """
@@ -214,13 +261,14 @@ class MoeRouteFront(OpWrapper):
         tile: int,
         local_offset: int,
         num_local: int,
-        fast2: bool = False,
+        fast2: bool | int = False,
+        early: bool = False,
     ):
         import cuda.bindings.driver as cuda
         import cutlass
 
         rows, hidden = x.shape
-        key = _key(rows, hidden, x.stride(0), num_local, tile, fast2)
+        key = _key(rows, hidden, x.stride(0), num_local, tile, fast2, early=early)
         fn = _COMPILED.get(key)
         assert fn is not None, f"no route front compiled for {key}: `compile_front` first"
         dev = x.device
@@ -252,18 +300,29 @@ class MoeRouteFront(OpWrapper):
         tile: int,
         local_offset: int,
         num_local: int,
-        fast2: bool = False,
+        fast2: bool | int = False,
+        early: bool = False,
     ):
         """The composed path it replaces, without the tables (they are checked by their meaning,
-        `check_tables`): `fp4_quantize` with linear scales, `renorm_moe_routing_op`. `fast2`
-        moves no value."""
+        `check_tables`): `fp4_quantize` with linear scales, `renorm_moe_routing_op`. `fast2` and
+        `early` move no value."""
         xq, xsf = fp4_quantize(x, global_scale, _SF_VEC, False, False)
         ids, wts = renorm_moe_routing_op(logits, TOP_K, torch.bfloat16)
         return xq, xsf.reshape(x.shape[0], -1), ids, wts
 
     def is_valid(
-        self, logits, x, global_scale, tables, tile, local_offset, num_local, fast2=False
+        self,
+        logits,
+        x,
+        global_scale,
+        tables,
+        tile,
+        local_offset,
+        num_local,
+        fast2=False,
+        early=False,
     ) -> None:
+        assert int(fast2) in (0, 1, 2), "fast2: 0 / False, 1 / True or 2"
         rows, hidden = x.shape
         assert x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.data_ptr() % 16 == 0
         assert logits.dtype == torch.bfloat16 and logits.is_contiguous()
@@ -280,7 +339,7 @@ def route_front_only(
     local_offset: int,
     num_local: int,
     hidden: int,
-    fast2: bool = False,
+    fast2: bool | int = False,
     ids_in: bool = False,
 ):
     """`moe_route_front`'s routing alone, for rows whose NVFP4 form the caller has already (the

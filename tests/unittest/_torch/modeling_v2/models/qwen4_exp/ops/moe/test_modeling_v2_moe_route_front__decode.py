@@ -9,6 +9,10 @@ activation of a decode MoE block's gathered rows in one launch.
   repeated values exercise the top-k's ties.
 * **GPU**: `route_front_only` alone, and with `ids_in` over rows routed by `routed_rows`, writes
   the full launch's experts, weights and tables.
+* **GPU**: `fast2=2` (the second token's logits loaded first) and `early` (the release right
+  after the wait) write the same bits as the plain launch; `early` under PDL has exactly one
+  `griddepcontrol.wait`, first, with no global access, branch or label above it in the SASS / PTX
+  and no `ld.global.nc` anywhere (compiled for the running SM103, no launch).
 * **CPU** (`check_tables` itself): a table built the way the runner reads it passes, and each
   way of breaking it is named; the `ids_in` row layout.
 
@@ -16,12 +20,19 @@ The window output through the runner entered pre-routed is held bitwise to the r
 routing by the target's build check (`modeling._route_front_check`) on every layer.
 """
 
+import glob
+import os
+import subprocess
+import sys
 import zlib
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import moe_route_front__decode as op
+
+# `_sass_pdl` is imported inside the SASS test (a test helper of the modeling_v2 test dir).
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
 
 _GPU = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
@@ -61,11 +72,17 @@ def test_certified_cells(cell):
     spec, device = cell.spec, torch.device("cuda")
     seed = zlib.crc32(cell.why.encode()) % 2**31
     logits, x, global_scale, tables = _operands(spec, seed, device)
-    fast2 = spec.get("fast2", False)
+    fast2, early = spec.get("fast2", False), spec.get("early", False)
     assert op.compile_front(
-        spec["rows"], spec["hidden"], x.stride(0), spec["num_local"], spec["tile"], fast2
+        spec["rows"],
+        spec["hidden"],
+        x.stride(0),
+        spec["num_local"],
+        spec["tile"],
+        fast2,
+        early=early,
     )
-    args = (spec["tile"], spec["local_offset"], spec["num_local"], fast2)
+    args = (spec["tile"], spec["local_offset"], spec["num_local"], fast2, early)
     got = op.moe_route_front(logits, x, global_scale, tables, *args)
     _assert_matches(spec, logits, x, global_scale, tables, got)
 
@@ -103,6 +120,77 @@ def test_fast2_is_bitwise_the_two_token_sort(rows, local):
     for a, b in zip(base, fast):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
     _assert_matches(spec, logits, x, global_scale, fast_tables, fast)
+
+
+@_GPU
+@pytest.mark.parametrize("rows, local, tile", [(528, 128, 32), (640, 128, 32), (832, 128, 64)])
+@pytest.mark.parametrize("ties", [False, True])
+def test_preload_and_early_are_bitwise_the_plain_launch(rows, local, tile, ties):
+    """dep4's F1 shapes (33..52 requests a rank of 16 gathered rows): `fast2=2` and `early`, alone
+    and together, write the codes, scales, experts, weights and tables of the two-token sort with
+    the release at the end, bit for bit; with `ties` every row's top-10 sits in one lane's 16
+    experts (the fast path's fallback to the full sort)."""
+    device = torch.device("cuda")
+    spec = dict(rows=rows, hidden=2560, local_offset=local, num_local=local, tile=tile)
+    logits, x, global_scale, tables = _operands(spec, 9100 + rows, device)
+    if ties:
+        logits[:, 16:32] = (logits.abs().amax(dim=1, keepdim=True) + 1).to(torch.bfloat16)
+    forms = [(0, False), (1, False), (2, False), (0, True), (2, True)]
+    outs = []
+    for fast2, early in forms:
+        assert op.compile_front(rows, 2560, x.stride(0), local, tile, fast2, early=early)
+        t = tables.clone()
+        got = op.moe_route_front(logits, x, global_scale, t, tile, local, local, fast2, early)
+        outs.append((got, t))
+    torch.cuda.synchronize()
+    (base, base_tables) = outs[0]
+    for (got, t), form in zip(outs[1:], forms[1:]):
+        for a, b in zip(base, got):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), form
+        assert torch.equal(t, base_tables), form
+    _assert_matches(spec, logits, x, global_scale, base_tables, base)
+
+
+_COMPILE_EARLY = """
+import sys
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import moe_route_front__decode as op
+rows, local, tile, fast2 = (int(v) for v in sys.argv[1:5])
+assert op.compile_front(rows, 2560, 2560, local, tile, fast2, early=True)
+"""
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+    reason="compiles for the running SM103 GPU",
+)
+@pytest.mark.parametrize(
+    "rows, local, tile, fast2",
+    [(288, 128, 32, 0), (448, 64, 32, 0), (640, 128, 32, 2), (832, 128, 64, 2), (768, 64, 32, 1)],
+)
+def test_early_reads_nothing_before_its_wait(tmp_path, rows, local, tile, fast2):
+    """`early` releases FC1 right after the wait, so the wait must come before every global access:
+    in the SASS exactly one `ACQBULK` (`griddepcontrol.wait`) with no global access, branch or label
+    before it, in the PTX no global load above it, and no `ld.global.nc` anywhere (ptxas may move one
+    above the wait). The release itself is not a memory access."""
+    from _sass_pdl import nc_loads, pre_wait_violations
+
+    env = dict(
+        os.environ,
+        CUTE_DSL_KEEP="ptx,cubin,sass",
+        CUTE_DSL_DUMP_DIR=str(tmp_path),
+        CUTE_DSL_CACHE_DIR=str(tmp_path / "cache"),
+        CUTE_DSL_DISABLE_FILE_CACHING="1",
+        TRTLLM_ENABLE_PDL="1",
+    )
+    args = [str(rows), str(local), str(tile), str(fast2)]
+    subprocess.run([sys.executable, "-c", _COMPILE_EARLY, *args], env=env, check=True, timeout=1800)
+    sass = glob.glob(str(tmp_path / "*.sass"))
+    ptx = glob.glob(str(tmp_path / "*.ptx"))
+    assert len(sass) == 1 and len(ptx) == 1, (sass, ptx)
+    sass_text, ptx_text = open(sass[0]).read(), open(ptx[0]).read()
+    assert not pre_wait_violations(sass_text, ptx_text)
+    assert nc_loads(sass_text) == 0
+    assert ptx_text.count("griddepcontrol.launch_dependents") >= 1
 
 
 @_GPU
