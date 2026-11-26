@@ -128,8 +128,8 @@ provides a standard-library Python renderer and publisher for Kubernetes serving
 It discovers engine workers and has E2E, Prefill, Decode and All views. Configure
 your workload pod/job patterns, datasource UIDs, endpoint/container labels and
 Grafana's supported schema-v2 API version in a copy of `example.config.json`.
-The default configuration generates metrics only; Loki, scrape-resource creation
-and trace-PVC panels are optional.
+The default configuration generates metrics only; the logs dashboard,
+scrape-resource creation and trace-PVC panels are optional.
 
 ```sh
 cp examples/serve/grafana/example.config.json /tmp/trtllm-dashboard.json
