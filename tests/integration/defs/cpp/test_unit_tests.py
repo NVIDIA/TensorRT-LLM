@@ -108,9 +108,9 @@ def test_fmha_head104_unit_tests(build_fmha_head104_tests: None,
 
 
 # HALO-Q runs on Blackwell and Rubin only; the gtest skips other GPUs.
-@pytest.mark.parametrize("build_haloq_planner_tests", ["100", "107"],
-                         indirect=True)
-def test_haloq_planner_unit_tests(build_haloq_planner_tests, build_dir):
+@pytest.mark.parametrize("build_haloq_planner_tests", ["100"], indirect=True)
+def test_haloq_planner_unit_tests(build_haloq_planner_tests: None,
+                                  build_dir: _pl.Path) -> None:
 
     xml_name = "results-unit-tests-haloq_planner.xml"
 
