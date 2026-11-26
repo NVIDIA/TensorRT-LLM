@@ -3138,8 +3138,9 @@ class PyExecutor:
     def _has_pending_context_retirement(self) -> bool:
         """Keep qualified source retirement live after the logical result leaves.
 
-        Scans the in-flight transfers only when the coordinator supports
-        logical context cancellation. Under attention DP it never does:
+        Asks the coordinator nothing while no transfer is in flight, and scans
+        the in-flight transfers only when it supports logical context
+        cancellation. Under attention DP it never does:
         validate_context_first_peer refuses a context-first transfer when either
         peer enables attention DP.
 
@@ -3147,12 +3148,15 @@ class PyExecutor:
             Whether a source claim still awaits TP-agreed retirement. All
             qualified cleanup paths retain these claims until group settlement.
         """
+        transceiver = getattr(self, "kv_cache_transceiver", None)
         transfers = getattr(self, "async_transfer_manager", None)
-        return (getattr(self, "kv_cache_transceiver", None) is not None
-                and transfers is not None
+        if transceiver is None or transfers is None:
+            return False
+        in_transfer = transfers.requests_in_transfer()
+        return (bool(in_transfer)
                 and self.disagg.supports_logical_context_cancellation() and any(
                     self.disagg.supports_logical_context_cancellation(req)
-                    for req in transfers.requests_in_transfer().values()))
+                    for req in in_transfer.values()))
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
