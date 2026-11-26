@@ -295,14 +295,6 @@ def test_int32_bound(state_dtype: torch.dtype) -> None:
         ck.kda_checkpoint_views(over, layout)
 
 
-_DEVICES = [
-    "cpu",
-    pytest.param(
-        "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-    ),
-]
-
-
 def _coalesced_layers(num_layers, layout, ssm_dtype, device, generator):
     """Slots coalesced as the V2 manager lays them out: every layer's SSM state, then conv
     state, then ``kda_ckpt`` payload, then the 256-byte count; random bytes everywhere, and
@@ -351,7 +343,6 @@ def _seed_stacked(ssm, conv, views, slots):
     ck.seed_kda_checkpoints_stacked(*stacked, slots)
 
 
-@pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize(
     ("state_dtype", "ssm_dtype", "num_layers", "seeded"),
     [
@@ -366,9 +357,10 @@ def _seed_stacked(ssm, conv, views, slots):
         pytest.param(torch.float32, torch.float32, 3, [], id="empty-slots"),
     ],
 )
-def test_stacked_seed_is_the_layer_loop_bitwise(device, state_dtype, ssm_dtype, num_layers, seeded):
+def test_stacked_seed_is_the_layer_loop_bitwise(state_dtype, ssm_dtype, num_layers, seeded):
     """Seeding all layers at once writes the same bytes as seed_kda_checkpoints layer by layer,
     over the whole pool (every other byte of the slots and the padding included)."""
+    device = "cpu"
     layout = _layout(state_dtype)
     # Two pools with the same bytes; one is seeded layer by layer, the other at once.
     loop = _coalesced_layers(

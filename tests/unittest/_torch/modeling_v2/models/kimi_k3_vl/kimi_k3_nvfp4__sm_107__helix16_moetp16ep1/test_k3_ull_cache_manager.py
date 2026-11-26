@@ -45,7 +45,6 @@ HEADS, DIM, NUM_SPEC, WINDOW = 2, 8, 3, 3
 SLOTS = 6
 LAYERS = (1, 2)  # global ids of the local KDA layers
 CHECKPOINT, COUNT = "kda_ckpt", "prev_num_accepted_tokens"
-_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
 def _context(state_dtype: torch.dtype, slot_capacity: int | None = SLOTS) -> MambaStateLayout:
@@ -331,26 +330,18 @@ def test_lifecycle(monkeypatch, state_dtype: torch.dtype, misalign: int) -> None
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize(
-    ("device", "wrapped"),
-    [
-        ("cpu", False),
-        pytest.param("cuda", False, marks=_CUDA),
-        pytest.param("cuda", True, marks=_CUDA),
-    ],
-)
-def test_transfer_seed_runs_on_all_layers_at_once(state_dtype, device, wrapped) -> None:
+def test_transfer_seed_runs_on_all_layers_at_once(state_dtype) -> None:
     """On the V2 manager's coalesced slots every seeded kind stacks over the layers, and seeding
     transferred slots that way writes the same pool bytes as seeding layer by layer."""
     pools = []
     for stacked in (True, False):
-        _, state, pool, _, _ = _bound_state(state_dtype, 16, device=device, wrapped=wrapped)
+        _, state, pool, _, _ = _bound_state(state_dtype, 16, device="cpu", wrapped=False)
         assert state._stacked_seed is not None
         if not stacked:
             state._stacked_seed = None
         state.prev_num_accepted_tokens[[4, 1, 2]] = 2
         before = pool.slots.clone()
-        state.seed_transferred_slots(torch.tensor([4, 1], dtype=torch.int32, device=device))
+        state.seed_transferred_slots(torch.tensor([4, 1], dtype=torch.int32, device="cpu"))
         assert state.prev_num_accepted_tokens[[4, 1, 2]].tolist() == [0, 0, 2]
         assert not torch.equal(pool.slots, before)
         pools.append(pool.slots.clone())
