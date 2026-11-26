@@ -47,8 +47,14 @@ per-server launch environment, before the YAML merge. An explicit numeric YAML
 value is used directly. Explicit YAML null requests the later default: a fresh
 probe mirrors initial CLI discovery, applies rendered `env_overrides` inside
 the running interpreter, then recounts. Keys and values are converted to strings;
-overrides are passed on stdin and the count uses an encoding-independent byte
-channel, so worker text-encoding settings do not alter probe startup or output.
+overrides are passed on stdin and the count uses a marked ASCII byte record.
+The parent reads raw bytes and parses only that record, so unrelated startup
+output and worker text-encoding settings do not change the capacity result.
+Every complete count record is checked, including adjacent records. Repeated
+matching counts are accepted; conflicting counts are rejected before measurement
+rather than choosing the first or last record. Missing or conflicting count
+records retain the probe's server-specific error context, as do child failures
+and the existing 30-second timeout.
 With `RAY_LOCAL_WORLD_SIZE` in the launch or rendered environment, the worker
 uses TP as node capacity instead. The hardware inventory and uploaded topology
 fields do not replace these capacity-source rules.

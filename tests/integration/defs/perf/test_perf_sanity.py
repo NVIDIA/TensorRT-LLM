@@ -2652,7 +2652,7 @@ class ServerConfig:
             node_capacity = parallelism["tensor_parallel_size"]
         elif node_capacity is None:
             try:
-                node_capacity = subprocess.check_output(
+                probe_output = subprocess.check_output(
                     [
                         sys.executable,
                         "-c",
@@ -2663,16 +2663,27 @@ class ServerConfig:
                         "if overrides is not None:\n"
                         "    os.environ.update(overrides)\n"
                         "    capacity = torch.cuda.device_count()\n"
-                        "sys.stdout.buffer.write(str(capacity).encode('ascii'))",
+                        "sys.stdout.buffer.write(b'\\nTRTLLM_CUDA_DEVICE_COUNT=' + "
+                        "str(capacity).encode('ascii') + b'\\n')",
                     ],
                     input=json.dumps(
                         worker_env_overrides if "gpus_per_node" in worker_config else None
-                    ),
+                    ).encode("utf-8"),
                     env=server_env,
-                    encoding="utf-8",
                     timeout=WORKER_DEVICE_COUNT_TIMEOUT,
                 )
-            except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+                node_capacities = {
+                    int(record)
+                    for record in re.findall(
+                        rb"^TRTLLM_CUDA_DEVICE_COUNT=([0-9]+)$", probe_output, re.MULTILINE
+                    )
+                }
+                if not node_capacities:
+                    raise ValueError("probe did not return a marked CUDA device count")
+                if len(node_capacities) > 1:
+                    raise ValueError("probe returned conflicting CUDA device counts")
+                node_capacity = node_capacities.pop()
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError) as error:
                 raise RuntimeError(
                     f"CUDA capacity probe for server {self.name!r} failed: {error}"
                 ) from error

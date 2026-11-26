@@ -161,18 +161,26 @@ def perf_sanity_caller(
             launches: list[tuple[Path, dict]] | None = None,
             worker_device_count: Callable[[dict[str, str]], int] | None = None,
             probe_timeouts: list[float | None] | None = None,
+            probe_outputs: list[bytes | str] | None = None,
+            worker_probe_stdout: bytes | None = None,
             warmup_only: bool = False,
             expect_upload: bool = True,
             real_worker_probe: bool = False,
         ) -> tuple[list[dict], RuntimeError | None]:
-            def check_output(command, *args, **kwargs) -> str:
+            def check_output(command, *args, **kwargs) -> bytes | str:
                 if isinstance(command, str):
                     return "Product Name : B200\n"
                 assert command[:2] == [sys.executable, "-c"]
                 if probe_timeouts is not None:
                     probe_timeouts.append(kwargs.get("timeout"))
+                if worker_probe_stdout is not None:
+                    encoding = kwargs.get("encoding")
+                    return worker_probe_stdout.decode(encoding) if encoding else worker_probe_stdout
                 if real_worker_probe:
-                    return real_check_output(command, *args, **kwargs)
+                    result = real_check_output(command, *args, **kwargs)
+                    if probe_outputs is not None:
+                        probe_outputs.append(result)
+                    return result
                 cuda_module = ModuleType("torch.cuda")
                 cuda_module.device_count = lambda: (
                     worker_device_count(dict(os.environ)) if worker_device_count is not None else 4
@@ -181,6 +189,9 @@ def perf_sanity_caller(
                 torch_module.__path__ = []
                 torch_module.cuda = cuda_module
                 output_buffer = BytesIO()
+                query_input = kwargs.get("input", b"")
+                if isinstance(query_input, str):
+                    query_input = query_input.encode("utf-8")
                 with (
                     TextIOWrapper(output_buffer, encoding="utf-8") as output,
                     patch.dict(os.environ, kwargs["env"], clear=True),
@@ -192,14 +203,13 @@ def perf_sanity_caller(
                     query_context.setattr(
                         sys,
                         "stdin",
-                        TextIOWrapper(
-                            BytesIO(kwargs.get("input", "").encode("utf-8")), encoding="utf-8"
-                        ),
+                        TextIOWrapper(BytesIO(query_input), encoding="utf-8"),
                     )
                     exec(command[2], {})
                     output.flush()
-                    result = output_buffer.getvalue().decode("utf-8")
-                return result
+                    result = output_buffer.getvalue()
+                encoding = kwargs.get("encoding")
+                return result.decode(encoding) if encoding else result
 
             monkeypatch.setattr(harness.subprocess, "check_output", check_output)
             configuration_data = config or {
@@ -921,15 +931,22 @@ def test_ttft_caller_checks_read_only_history(
         )
 
 
+@pytest.mark.parametrize("startup_banner", [False, True], ids=["quiet", "startup-banner"])
 def test_ttft_caller_keeps_rendered_encoding_after_probe_startup(
-    perf_sanity_caller: Callable, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    perf_sanity_caller: Callable,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    startup_banner: bool,
 ) -> None:
-    """A late worker encoding override does not break a real read-only capacity probe."""
+    """Startup encoding and banners do not break a real read-only capacity probe."""
     monkeypatch.delenv("RAY_LOCAL_WORLD_SIZE", raising=False)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
-    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
-    torch_path = tmp_path / "probe_modules"
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-16")
+    torch_path = tmp_path / "probe modules"
     torch_path.mkdir()
+    monkeypatch.setenv("PYTHONPATH", str(torch_path))
+    if startup_banner:
+        (torch_path / "sitecustomize.py").write_text("print('probe startup banner', flush=True)\n")
     (torch_path / "torch.py").write_text(
         "import os\n"
         "class cuda:\n"
@@ -944,13 +961,14 @@ def test_ttft_caller_keeps_rendered_encoding_after_probe_startup(
                 "gpus_per_node": None,
                 "env_overrides": {
                     "CUDA_VISIBLE_DEVICES": "0,1",
-                    "PYTHONIOENCODING": "utf-16",
+                    "PYTHONIOENCODING": "utf-8",
                 },
             }
         )
     )
     launches = []
     probe_timeouts = []
+    probe_outputs = []
     uploaded, error = perf_sanity_caller(
         [_ttft_history()],
         config={
@@ -960,7 +978,6 @@ def test_ttft_caller_keeps_rendered_encoding_after_probe_startup(
                     "name": "plain",
                     "tensor_parallel_size": 2,
                     "extra_llm_api_config_path": str(worker_path),
-                    "server_env_var": f"PYTHONPATH={torch_path}",
                     "client_configs": [{"name": "con1", "concurrency": 1}],
                 }
             ],
@@ -970,15 +987,112 @@ def test_ttft_caller_keeps_rendered_encoding_after_probe_startup(
         real_worker_probe=True,
         launches=launches,
         probe_timeouts=probe_timeouts,
+        probe_outputs=probe_outputs,
     )
     assert probe_timeouts
+    if startup_banner:
+        assert probe_outputs and all(
+            isinstance(output, bytes) and "probe startup banner".encode("utf-16")[2:] in output
+            for output in probe_outputs
+        )
     assert len(launches) == 1 and not uploaded
     assert error is not None
     assert _metric_comparison({"s_regression_info": str(error)}, "d_mean_ttft") == pytest.approx(
         (125.0, 100.0)
     )
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
-    assert os.environ["PYTHONIOENCODING"] == "utf-8"
+    assert os.environ["PYTHONIOENCODING"] == "utf-16"
+
+
+@pytest.mark.parametrize(
+    ("launch_visibility", "worker_visibility"),
+    [
+        ("0,1", "0,1,2,3"),
+        ("0,1,2,3", "0,1"),
+        ("0,1,2,3", "0,1,2,3"),
+    ],
+    ids=["expand", "shrink", "matching-counts"],
+)
+def test_ttft_caller_rejects_conflicting_capacity_records(
+    perf_sanity_caller: Callable,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_visibility: str,
+    worker_visibility: str,
+) -> None:
+    """Conflicting adjacent count records must not choose TTFT eligibility."""
+    monkeypatch.delenv("RAY_LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", launch_visibility)
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    torch_path = tmp_path / "probe modules"
+    torch_path.mkdir()
+    monkeypatch.setenv("PYTHONPATH", str(torch_path))
+    (torch_path / "torch.py").write_text(
+        "import os\n"
+        "class cuda:\n"
+        "    @staticmethod\n"
+        "    def device_count():\n"
+        "        return len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))\n"
+    )
+    (torch_path / "sitecustomize.py").write_text(
+        "import os\n"
+        "capacity = len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))\n"
+        "os.write(1, b'launch topology\\nTRTLLM_CUDA_DEVICE_COUNT=' + "
+        "str(capacity).encode('ascii'))\n"
+    )
+    worker_path = tmp_path / "worker.yaml"
+    worker_path.write_text(
+        yaml.safe_dump(
+            {
+                "gpus_per_node": None,
+                "env_overrides": {"CUDA_VISIBLE_DEVICES": worker_visibility},
+            }
+        )
+    )
+    launches = []
+    probe_timeouts = []
+    probe_outputs = []
+    uploaded, error = perf_sanity_caller(
+        [_ttft_history()],
+        config={
+            "metadata": {"model_name": "latency-control"},
+            "server_configs": [
+                {
+                    "name": "plain",
+                    "tensor_parallel_size": 4,
+                    "extra_llm_api_config_path": str(worker_path),
+                    "client_configs": [{"name": "con1", "concurrency": 1}],
+                }
+            ],
+        },
+        test_case="aggr-latency_control",
+        expect_upload=False,
+        real_worker_probe=True,
+        launches=launches,
+        probe_timeouts=probe_timeouts,
+        probe_outputs=probe_outputs,
+    )
+    launch_count = len(launch_visibility.split(","))
+    worker_count = len(worker_visibility.split(","))
+    adjacent_records = (
+        f"TRTLLM_CUDA_DEVICE_COUNT={launch_count}\nTRTLLM_CUDA_DEVICE_COUNT={worker_count}\n"
+    ).encode("ascii")
+    assert probe_outputs and all(
+        isinstance(output, bytes) and adjacent_records in output for output in probe_outputs
+    )
+    assert probe_timeouts and all(timeout == 30 for timeout in probe_timeouts)
+    assert not uploaded and error is not None
+    if launch_count != worker_count:
+        assert not launches
+        assert "CUDA capacity probe for server 'plain' failed" in str(error)
+        assert "conflicting" in str(error)
+        assert isinstance(error.__cause__, ValueError)
+    else:
+        assert len(launches) == 1
+        assert _metric_comparison(
+            {"s_regression_info": str(error)}, "d_mean_ttft"
+        ) == pytest.approx((125.0, 100.0))
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == launch_visibility
 
 
 @pytest.mark.parametrize("mode", ["aggr", "aggr_upload"])
@@ -1048,7 +1162,7 @@ def test_ttft_caller_skips_warmup_capacity_probes(perf_sanity_caller: Callable) 
     assert uploaded[0]["d_warmup_time"] == 1.0
 
 
-@pytest.mark.parametrize("failure", ["timeout", "process-error"])
+@pytest.mark.parametrize("failure", ["timeout", "process-error", "missing-result"])
 def test_ttft_caller_reports_capacity_probe_failure(
     perf_sanity_caller: Callable, failure: str
 ) -> None:
@@ -1064,6 +1178,7 @@ def test_ttft_caller_reports_capacity_probe_failure(
         [],
         worker_device_count=failing_query,
         probe_timeouts=timeouts,
+        worker_probe_stdout=b"probe startup banner\n" if failure == "missing-result" else None,
         expect_upload=False,
     )
     assert not uploaded and error is not None
@@ -1071,7 +1186,11 @@ def test_ttft_caller_reports_capacity_probe_failure(
     assert timeouts and all(
         timeout is not None and 0 < timeout < float("inf") for timeout in timeouts
     )
-    expected = subprocess.TimeoutExpired if failure == "timeout" else subprocess.CalledProcessError
+    expected = {
+        "timeout": subprocess.TimeoutExpired,
+        "process-error": subprocess.CalledProcessError,
+        "missing-result": ValueError,
+    }[failure]
     assert isinstance(error.__cause__, expected)
 
 
@@ -1170,10 +1289,15 @@ def test_ttft_caller_respects_ray_node_capacity(
     def unexpected_probe(environment: dict[str, str]) -> int:
         pytest.fail("Explicit or Ray worker capacity must not query CUDA")
 
-    for source in ("server", "worker"):
+    for source, pipeline_parallel_size in (
+        ("server", 2),
+        ("worker", 2),
+        ("server", 1),
+        ("worker", 1),
+    ):
         worker_config = {
             "tensor_parallel_size": 2,
-            "pipeline_parallel_size": 2,
+            "pipeline_parallel_size": pipeline_parallel_size,
             "gpus_per_node": 4,
         }
         server = {
@@ -1191,14 +1315,17 @@ def test_ttft_caller_respects_ray_node_capacity(
             "hardware": {"gpus_per_node": 4},
             "server_configs": [server],
         }
+        probe_timeouts = []
         uploaded, error = perf_sanity_caller(
             [_ttft_history(s_runtime="multi_node_aggr_server")],
             config=config,
             worker_device_count=unexpected_probe,
+            probe_timeouts=probe_timeouts,
         )
+        assert not probe_timeouts
         assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
-        assert uploaded[0]["b_is_regression"] is False
-        assert error is None
+        assert uploaded[0]["b_is_regression"] is (pipeline_parallel_size == 1)
+        assert (error is not None) is (pipeline_parallel_size == 1)
     assert "RAY_LOCAL_WORLD_SIZE" not in os.environ
 
 
