@@ -15,10 +15,7 @@
 
 The reference YAML (``references/trtllm_serve_api.yaml``) is the *single
 source of truth* for the stability status of every field on the Pydantic
-request and response models in ``tensorrt_llm/serve/openai_protocol.py``.
-The models themselves carry no inline stability annotations — that module
-is internal and not surfaced in any public document, so the metadata stays
-in the YAML.
+request and response models listed in the YAML.
 
 What the gate enforces, per gated model:
 
@@ -41,7 +38,7 @@ What the gate enforces, per gated model:
    flipping between them is a breaking change.
 5. **Allowed tags and kinds.** Every ``status:`` must be one of
    ``stable | beta | prototype | deprecated``; every ``kind:`` must be one
-   of ``openai | extension``.
+   of ``openai | typesafe | extension``.
 
 What the gate intentionally does NOT enforce:
 
@@ -89,7 +86,7 @@ STATUS_RANK: dict[str, int] = {
     "deprecated": 3,
 }
 ALLOWED_TAGS: tuple[str, ...] = tuple(STATUS_RANK.keys())
-ALLOWED_KINDS: tuple[str, ...] = ("openai", "extension")
+ALLOWED_KINDS: tuple[str, ...] = ("openai", "typesafe", "extension")
 
 
 def _load_reference() -> dict[str, Any]:
@@ -98,12 +95,13 @@ def _load_reference() -> dict[str, Any]:
 
 
 def _load_model(name: str):
-    """Resolve a Pydantic model class by name from the protocol module."""
-    module = importlib.import_module(_PROTOCOL_MODULE)
-    cls = getattr(module, name, None)
+    """Load a qualified model path or a bare class name from openai_protocol."""
+    module_name, _, class_name = name.rpartition(".")
+    module = importlib.import_module(module_name or _PROTOCOL_MODULE)
+    cls = getattr(module, class_name, None)
     assert cls is not None, (
         f"Model {name!r} is in the stability reference YAML but not in "
-        f"{_PROTOCOL_MODULE}. Was the class renamed or moved?"
+        f"{module.__name__}. Was the class renamed or moved?"
     )
     return cls
 
@@ -194,7 +192,7 @@ class TestServeAPIStability:
 
         This is the forcing function: a PR that adds a new field on a gated
         request / response model cannot land until the contributor picks a
-        ``kind:`` (``openai`` or ``extension``) and a ``status:``
+        ``kind:`` (``openai``, ``typesafe``, or ``extension``) and a ``status:``
         (``prototype | beta | stable | deprecated``) and commits the matching
         YAML row. The YAML diff is the reviewer-visible signal that the API
         surface changed.
@@ -213,7 +211,7 @@ class TestServeAPIStability:
                     errors.append(
                         f"[{model_name}] live field `{fname}` is missing "
                         "from the stability reference YAML. Add a row with "
-                        "`kind:` (openai | extension) and `status:` "
+                        "`kind:` (openai | typesafe | extension) and `status:` "
                         "(prototype | beta | stable | deprecated). New "
                         "TRT-LLM extensions should start at `status: "
                         "prototype`."

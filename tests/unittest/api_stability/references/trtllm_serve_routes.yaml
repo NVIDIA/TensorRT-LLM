@@ -40,6 +40,8 @@ configs:
     - POST /start_profile _MsgspecRoute
     - POST /stop_profile _MsgspecRoute
     - GET /server_info _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_context:
     kind: openai_server
     routes:
@@ -134,6 +136,8 @@ configs:
     - POST /start_profile _MsgspecRoute
     - POST /stop_profile _MsgspecRoute
     - GET /server_info _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_gpt_oss_harmony_disabled:
     kind: openai_server
     routes:
@@ -168,6 +172,8 @@ configs:
     - POST /start_profile _MsgspecRoute
     - POST /stop_profile _MsgspecRoute
     - GET /server_info _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_governor:
     kind: openai_server
     routes:
@@ -205,6 +211,8 @@ configs:
     - POST /start_profile _MsgspecRoute
     - POST /stop_profile _MsgspecRoute
     - GET /server_info _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_rl_control:
     kind: openai_server
     routes:
@@ -242,6 +250,8 @@ configs:
     - POST /resume_memory _MsgspecRoute
     - POST /update_weights _MsgspecRoute
     - GET /server_info _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_runtime_control:
     kind: openai_server
     routes:
@@ -279,6 +289,8 @@ configs:
     - POST /resume_memory _MsgspecRoute
     - GET /memory_status _MsgspecRoute
     - GET /server_info _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_memory_report:
     kind: openai_server
     routes:
@@ -314,6 +326,8 @@ configs:
     - POST /stop_profile _MsgspecRoute
     - GET /memory_report _MsgspecRoute
     - GET /server_info _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_rl_and_runtime_control:
     kind: openai_server
     error: 'ValueError: Legacy RL control and runtime control endpoints cannot both be enabled.'
@@ -352,6 +366,8 @@ configs:
     - POST /stop_profile _MsgspecRoute
     - GET /server_info _MsgspecRoute
     - MOUNT /prometheus/metrics Mount
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_perf_metrics_enable_metrics_env:
     kind: openai_server
     routes:
@@ -388,6 +404,8 @@ configs:
     - GET /server_info _MsgspecRoute
     - 'GET /metrics _MsgspecRoute #metrics'
     - MOUNT /prometheus/metrics Mount
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_perf_metrics_output_dir_only:
     kind: openai_server
     routes:
@@ -423,6 +441,8 @@ configs:
     - POST /stop_profile _MsgspecRoute
     - GET /server_info _MsgspecRoute
     - MOUNT /prometheus/metrics Mount
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_render_endpoints:
     kind: openai_server
     routes:
@@ -459,6 +479,8 @@ configs:
     - GET /server_info _MsgspecRoute
     - POST /v1/chat/completions/render _MsgspecRoute
     - POST /v1/completions/render _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   llm_multi_frontend_attached:
     kind: openai_server
     routes:
@@ -503,6 +525,8 @@ configs:
     - 'POST /start_profile _MsgspecRoute #start_profile'
     - 'POST /stop_profile _MsgspecRoute #stop_profile'
     - GET /server_info _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   mm_encoder:
     kind: openai_server
     routes:
@@ -529,6 +553,8 @@ configs:
     - GET /version _MsgspecRoute
     - GET /v1/models _MsgspecRoute
     - POST /v1/embeddings _MsgspecRoute
+    - POST /v1/systemone _MsgspecRoute
+    - POST /v1/decisions _MsgspecRoute
   embedding_runtime_control:
     kind: openai_server
     error: 'ValueError: Runtime control endpoints are not supported for embedding servers'
