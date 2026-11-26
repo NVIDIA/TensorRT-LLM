@@ -582,8 +582,8 @@ class TestOpenAIHttpClient:
             streaming_completion_request, hooks=hooks
         )
         if close_after_done:
-            events.append(await anext(response_generator))
-            events.append(await anext(response_generator))
+            events.append(await response_generator.__anext__())
+            events.append(await response_generator.__anext__())
             await response_generator.aclose()
         else:
             async for chunk in response_generator:
