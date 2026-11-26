@@ -27,7 +27,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
@@ -4962,6 +4962,91 @@ def test_sm107_genphase_defaults_run_the_decode_scheduler() -> None:
         assert megamoe_op._default_megamoe_tactic_for_key(
             key, num_tokens=bucket
         ) == megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[bucket])
+
+
+@pytest.mark.cpu_only
+def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    default = megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[128])
+    twin = (*default[:3], ("phase_interleave", None), *default[4:])
+    nonbulk = megamoe_op._unpack_tactic(megamoe_op._MEGAMOE_NONBULK_STANDALONE_TACTIC)
+    assert megamoe_op._megamoe_default_tactic_candidates(default) == (default, twin, nonbulk)
+
+    warnings = []
+    monkeypatch.setattr(
+        megamoe_op.logger, "warning_once", lambda msg, *, key: warnings.append((msg, key))
+    )
+
+    def decode_refused(tactic: Tuple) -> Tuple:
+        if tactic[3][0] == "decode":
+            raise ValueError("decode refused here")
+        return tactic
+
+    assert megamoe_op._resolve_megamoe_kernel_tactic(
+        default, allow_fallback=True, build=decode_refused
+    ) == (twin, twin)
+    ((msg, key),) = warnings
+    assert key == msg
+    assert repr(default) in msg and "decode refused here" in msg and repr(twin) in msg
+
+    def all_refused(tactic: Tuple) -> Tuple:
+        raise ValueError(f"{tactic[3][0]} refused here")
+
+    # With every candidate refused, the default's own reason is the one reported.
+    with pytest.raises(ValueError, match="decode refused here"):
+        megamoe_op._resolve_megamoe_kernel_tactic(default, allow_fallback=True, build=all_refused)
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    from tensorrt_llm._torch.moe.kernels import megamoe_kernels
+
+    built = []
+
+    class Generic:
+        def __init__(self, problem_desc: Any, impl_desc: Any) -> None:
+            built.append(("generic", tuple(impl_desc["schedule_policy"])))
+
+        @classmethod
+        def problem_desc_require(cls) -> dict:
+            return {}
+
+        def get_workspace_sizes(self) -> Tuple[int, int]:
+            return 0, 4096
+
+    class Genphase(Generic):
+        def __init__(self, problem_desc: Any, impl_desc: Any) -> None:
+            built.append(("genphase", tuple(impl_desc["schedule_policy"])))
+            raise ValueError("cluster refused here")
+
+    monkeypatch.setattr(megamoe_kernels, "RubinInferenceMegaMoE", Generic)
+    monkeypatch.setattr(megamoe_kernels, "RubinInferenceGenphaseMegaMoE", Genphase)
+    monkeypatch.setattr(megamoe_op, "RubinInferenceGenphaseMegaMoE", Genphase)
+    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
+    query = dict(
+        world_size=4,
+        num_topk=6,
+        num_experts_per_rank=96,
+        hidden_size=7168,
+        intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
+        max_tokens_per_rank=128,
+        gate_up_clamp=10.0,
+    )
+    # A decode default the generation-phase kernel refuses runs its own tile on the generic
+    # kernel, not the non-bulk fallback.
+    warnings.clear()
+    assert megamoe_op.query_megamoe_kernel_properties(**query) == (4096, False)
+    assert built == [("genphase", tuple(default[3])), ("generic", ("phase_interleave", None))]
+    assert len(warnings) == 1 and "cluster refused here" in warnings[0][0]
+    # A quantized combine defaults to a grouped tactic, which never tries the decode-only kernel.
+    built.clear()
+    warnings.clear()
+    megamoe_op.query_megamoe_kernel_properties(**query, combine_format="16e2m1xbf16")
+    assert built == [("generic", tuple(nonbulk[3]))] and not warnings
 
 
 @pytest.mark.gpu

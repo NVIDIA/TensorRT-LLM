@@ -1039,7 +1039,11 @@ def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
     tactic = _unpack_tactic(tactic)
     candidates = [tactic]
     schedule_policy = tactic[3]
-    if schedule_policy[0] == "phase_interleave" and schedule_policy[1] is not None:
+    # Only the SM107 generation-phase kernel runs the decode scheduler, so a decode tactic it
+    # refuses retries the same tile on the generic kernel with phase_interleave.
+    if schedule_policy[0] == "decode" or (
+        schedule_policy[0] == "phase_interleave" and schedule_policy[1] is not None
+    ):
         auto_hint_tactic = list(tactic)
         auto_hint_tactic[3] = ("phase_interleave", None)
         candidates.append(tuple(auto_hint_tactic))
@@ -1054,16 +1058,26 @@ def _resolve_megamoe_kernel_tactic(
 ) -> Tuple[Any, Tuple]:
     """Build ``tactic``, retrying safe defaults only for heuristic selection."""
     candidates = _megamoe_default_tactic_candidates(tactic) if allow_fallback else (tactic,)
-    last_error = None
+    first_error = None
     for candidate in candidates:
         try:
-            return build(candidate), candidate
+            kernel = build(candidate)
         except ValueError as exc:
-            last_error = exc
+            if first_error is None:
+                first_error = exc
             logger.debug(f"[MegaMoE] rejected tactic {candidate!r}: {type(exc).__name__}: {exc}")
-    if last_error is None:
+            continue
+        if first_error is not None:
+            # A refused default runs slower; the query and every layer resolve it again.
+            msg = (
+                f"[MegaMoE] default tactic {candidates[0]!r} was refused "
+                f"({type(first_error).__name__}: {first_error}); running {candidate!r} instead."
+            )
+            logger.warning_once(msg, key=msg)
+        return kernel, candidate
+    if first_error is None:
         raise RuntimeError("MegaMoE default tactic resolution had no candidates")
-    raise last_error
+    raise first_error
 
 
 # group_hint saturates ~512; omission (-> ~74) is worst.
@@ -1201,8 +1215,8 @@ def _megamoe_ugpu_tactic() -> tuple:
 
 def _construct_megamoe_kernel(
     *, sm_version: int, common: dict, combine_format: str, ugpu_weight_layout: str = "none"
-) -> Tuple[Any, Optional[Exception]]:
-    """Construct the active architecture kernel and report a narrow gen rejection."""
+) -> Any:
+    """Construct the kernel that runs ``common["schedule_policy"]`` on the active architecture."""
     from cutlass.cute.nvgpu import OperandMajorMode
 
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
@@ -1335,16 +1349,21 @@ def _construct_megamoe_kernel(
     if ugpu_kernel_cls is not None:
         # Never retry with a consumer that may interpret the same bank differently.
         if ugpu_kernel_cls is RubinInferenceGenphaseMegaMoE:
-            return construct_genphase(), None
-        return construct(ugpu_kernel_cls), None
-    rejection = None
-    if genphase:
+            return construct_genphase()
+        return construct(ugpu_kernel_cls)
+    schedule_policy = tuple(common["schedule_policy"])
+    if genphase and schedule_policy[0] == "decode":
+        # The generic kernel has no decode scheduler, so a refusal here is the tactic's: the
+        # resolver catches ValueError only and moves to its next candidate.
         try:
-            return construct_genphase(), None
+            return construct_genphase()
         except (ValueError, TypeError, NotImplementedError) as exc:
-            rejection = exc
+            raise ValueError(
+                f"The generation-phase kernel refused {schedule_policy!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
     kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
-    return construct(kernel_cls), rejection
+    return construct(kernel_cls)
 
 
 def _megamoe_tmp_buffer_span(kernel) -> Tuple[int, int]:
@@ -2634,13 +2653,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 ),
                 **_LOCKED_KERNEL_KWARGS,
             )
-            probe, _ = _construct_megamoe_kernel(
+            return _construct_megamoe_kernel(
                 sm_version=sm_version,
                 common=common,
                 combine_format=combine_format,
                 ugpu_weight_layout=ugpu_weight_layout,
             )
-            return probe
 
         probe, resolved = _resolve_megamoe_kernel_tactic(
             tactic,
@@ -3123,21 +3141,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 helper_expert_count=self.helper_expert_count,
                 **_LOCKED_KERNEL_KWARGS,
             )
-            kernel, rejection = _construct_megamoe_kernel(
+            return _construct_megamoe_kernel(
                 sm_version=self.sm_version,
                 common=common,
                 combine_format=self.combine_format,
                 ugpu_weight_layout=self.ugpu_weight_layout,
             )
-            if rejection is not None:
-                # A rejected default runs on the generic kernel: correct but slower, so say so.
-                # Autotune candidates may be rejected by design.
-                log = logger.debug if self.tactic_autotune else logger.warning
-                log(
-                    f"[MegaMoE] gen specialization rejected tactic {tactic!r}: "
-                    f"{type(rejection).__name__}: {rejection}"
-                )
-            return kernel
 
         def _tactic_cache_key(self, tactic: Tuple) -> Tuple:
             """Hashable cache key over ``unique_id()`` + the full tactic.
