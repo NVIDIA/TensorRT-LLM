@@ -39,6 +39,8 @@ Coding agents have changed how model code is written in TensorRT LLM. An enginee
 
 Modeling V2 ([`tensorrt_llm/_torch/modeling_v2/`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modeling_v2/README.md)) is our exploration of how model code should be organized when agents write most of it. This post explains why we started it, how it is designed, what it has delivered on three models, and where it goes next.
 
+**Modeling V2 is now the default workflow for supporting new models in TensorRT LLM.** A new model is brought up as a Modeling V2 family. Modeling V1 keeps serving the models it already supports, and nothing changes for their users.
+
 ## Motivation
 
 ### How models are built in TensorRT LLM today
@@ -212,14 +214,14 @@ This helps agents in three ways:
 
 Modeling V2 now serves 8 model families through 36 ModelCores, across Blackwell, Blackwell Ultra and Rubin GPUs.
 
-The way models split into ModelCores shows what Modeling V2 enables. In disaggregated serving, the same model runs in very different roles, and each role is limited by something different:
+The way models split into ModelCores shows what Modeling V2 enables. In [disaggregated serving](blog05_Disaggregated_Serving_in_TensorRT-LLM.md), the same model runs in very different roles, and each role is limited by something different:
 
-- **Context servers** process long prompts in large batches. Their cost is GEMM throughput and attention over long sequences, so their ModelCores favor few ranks per instance and compute-efficient kernels. Kimi K3's context ModelCore on Rubin runs on a single GPU and uses DWDP to fetch the expert weights it does not hold. MiniMax M3.1 has two context ModelCores: TP2, and attention data parallelism.
+- **Context servers** process long prompts in large batches. Their cost is GEMM throughput and attention over long sequences, so their ModelCores favor few ranks per instance and compute-efficient kernels. Kimi K3's context ModelCore on Rubin runs on a single GPU and uses [DWDP](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md) to fetch the expert weights it does not hold. MiniMax M3.1 has two context ModelCores: TP2, and attention data parallelism.
 - **Low-latency generation servers** decode a handful of requests per step. Their time goes to reading weights, waiting on small all-reduces and launching kernels. Their ModelCores use tensor or context parallelism to spread the weight reads, and fuse aggressively across operator and layer boundaries.
-  - GLM-5.2's low-latency ModelCore on Rubin uses pure tensor parallelism with an FP8 KV cache and MTP.
-  - Kimi K3's low-latency ModelCores use Helix context parallelism over eight GPUs.
+  - GLM-5.2's low-latency ModelCore on Rubin uses pure tensor parallelism with an FP8 KV cache and [MTP](blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.md).
+  - Kimi K3's low-latency ModelCores use [Helix context parallelism](blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.md) over eight GPUs.
   - MiniMax M3.1 has separate TP2, TP4 and TP8 ModelCores, and each carries its own decode megakernels.
-- **High-throughput generation servers** run hundreds of requests per step. There, MoE throughput and KV cache capacity dominate. Their ModelCores use attention data parallelism with expert parallelism, and MegaMoE, which exchanges tokens in a single cross-rank round trip on the critical path. GLM-5.2's high-throughput ModelCore also moves the KV cache to NVFP4 to fit more requests.
+- **High-throughput generation servers** run hundreds of requests per step. There, MoE throughput and KV cache capacity dominate. Their ModelCores use attention data parallelism with [expert parallelism](blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), and MegaMoE, which exchanges tokens in a single cross-rank round trip on the critical path. GLM-5.2's high-throughput ModelCore also moves the KV cache to [NVFP4](blog33_NVFP4_MLA_Unified_4bit_KV_Cache_Storage_and_Attention_Compute_in_TensorRT-LLM.md) to fit more requests.
 
 In a shared module, each of these needs would be a branch inside the same attention or MoE code, and every optimization for one role would be checked against all the others. In Modeling V2, each role is its own ModelCore. Routing picks one from the deployment's parallel layout and server role, and an optimization for one role cannot slow down another.
 
@@ -247,7 +249,7 @@ Kimi K3 was optimized in Modeling V1 for months. Its Modeling V1 implementation 
 - DWDP for context servers;
 - an NVFP4 KV cache.
 
-Kimi K3.1 has the same backbone as K3. It adds a DeepSeek sparse-attention indexer on every MLA layer and ships its own DFlash2 drafter. On day 0, we served K3.1 with the Modeling V1 K3 implementation and the K3 drafter.
+Kimi K3.1 has the same backbone as K3. It adds a [DeepSeek sparse-attention](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md) indexer on every MLA layer and ships its own DFlash2 drafter. On day 0, we served K3.1 with the Modeling V1 K3 implementation and the K3 drafter.
 
 An agent then moved the model to Modeling V2 in three days. In Modeling V2, an optimization is code inside a ModelCore directory, not a change spread across shared modules. Moving the model therefore meant carrying those optimizations into the new family, with no review of shared modules and no change to the Modeling V1 code that other models depend on. On top of this, the agent added the DSA indexer and DFlash2.
 
@@ -305,8 +307,6 @@ Figure 4 compares the Modeling V2 ModelCores with the Modeling V1 implementation
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: GLM-5.3-Flash NVFP4 on four GB300 GPUs with TP4 and MTP (three draft tokens). The Modeling V1 line is the built-in implementation before the standalone engine work began; the Modeling V2 line runs the NVFP4 TP4 ModelCore. Each line is the Pareto frontier of the layouts measured for it, labeled by layout and concurrency.</em></sub></p>
-
-The gain combines all of the optimizations that the standalone engine found, and we have not yet profiled how it splits among them. Besides the fused step, the Modeling V2 ModelCore runs the MTP experts in FP8, where Modeling V1 falls back to an unquantized MoE path, and the two implementations use different KV cache layouts.
 
 ## Future Work
 
