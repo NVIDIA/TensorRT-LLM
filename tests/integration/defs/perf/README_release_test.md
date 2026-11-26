@@ -122,7 +122,8 @@ YAML. Fields omitted from both use the runner and TensorRT-LLM defaults.
 - Use a named preset for workloads whose historical settings would make the ID too long.
   For example, `-cfg:lightning_mtp` supplies the shared KV, MTP and streaming settings
   for both Nemotron Lightning variants. Each case selects its own `moe:` backend.
-  These presets are declared together in [pytorch_model_config.py](pytorch_model_config.py).
+  Look up the name in `_PERF_PRESETS` to see all fields for that preset, including
+  GPU-specific overrides. See [pytorch_model_config.py](pytorch_model_config.py).
 - Set a case-specific field directly with `-cfg:enable_attention_dp=true`.
   Append comma-separated overrides to a selection, or combine selections from left
   to right with `+`, as in `-cfg:glm53_flash_fp8+mtp3`.

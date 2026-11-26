@@ -42,59 +42,15 @@ def _read_yaml(path: str) -> dict:
     return data
 
 
-def _eagle3(draft_dir: str) -> dict:
-    return {
-        'enable_autotuner': False,
-        'speculative_config': {
-            'decoding_type': 'Eagle',
-            'max_draft_len': 3,
-            'speculative_model_dir': '${LLM_MODELS_ROOT}/' + draft_dir,
-        },
-    }
-
-
-_MTP3 = {
-    'speculative_config.decoding_type': 'MTP',
-    'speculative_config.max_draft_len': 3,
-}
-
-_MINIMAX_M3 = {
-    'kv_cache_config.enable_block_reuse': False,
-    'sparse_attention_config.algorithm': 'minimax_m3',
-}
-
-_GLM53_FLASH = {
-    'disable_mm_encoder': True,
-    'enable_chunked_prefill': True,
-    'cuda_graph_config.max_batch_size': 64,
-    'kv_cache_config.enable_block_reuse': False,
-}
-
-_KIMI_K3 = {
-    'enable_chunked_prefill': True,
-    'kv_cache_config.enable_block_reuse': False,
-    'kv_cache_config.tokens_per_block': 64,
-}
-
-_MAMBA_FP16 = {
-    'kv_cache_config.mamba_ssm_cache_dtype': 'float16',
-    'kv_cache_config.mamba_ssm_stochastic_rounding': True,
-    'kv_cache_config.mamba_ssm_philox_rounds': 5,
-}
-
-_V4_PRO_DSPARK = {
-    'custom_tokenizer': 'deepseek_v4',
-    'disable_overlap_scheduler': True,
-    'enable_attention_dp': True,
-    'enable_chunked_prefill': False,
-    'kv_cache_config.enable_block_reuse': False,
-    'max_seq_len': 10240,
-    'speculative_config.decoding_type': 'DSpark',
-}
-
 # Named settings selected by the cfg: suffix in the test lists.
 _PERF_PRESETS = {
     'gemma4_nvfp4': {
+        # Gemma 4 uses 512-wide heads and defaults to TRTLLM on SM107.
+        '_sm_overrides': {
+            107: {
+                'attn_backend': 'FLASHINFER'
+            }
+        },
         'enable_chunked_prefill': True,
         'kv_cache_config.dtype': 'fp8',
         'kv_cache_config.enable_partial_reuse': False,
@@ -108,7 +64,8 @@ _PERF_PRESETS = {
         'moe_config.backend': 'CUTEDSL',
     },
     'glm53_flash_bf16_kv': {
-        **_MTP3,
+        'speculative_config.decoding_type': 'MTP',
+        'speculative_config.max_draft_len': 3,
         'cuda_graph_config.max_batch_size': 32,
         'disable_mm_encoder': True,
         'enable_chunked_prefill': True,
@@ -122,13 +79,19 @@ _PERF_PRESETS = {
         'modeling_v2': 'require',
     },
     'glm53_flash_fp8': {
-        **_GLM53_FLASH,
+        'disable_mm_encoder': True,
+        'enable_chunked_prefill': True,
+        'cuda_graph_config.max_batch_size': 64,
+        'kv_cache_config.enable_block_reuse': False,
         'kv_cache_config.free_gpu_memory_fraction': 0.5,
         'max_seq_len': 16384,
         'moe_config.backend': 'TRTLLM',
     },
     'glm53_flash_nvfp4': {
-        **_GLM53_FLASH,
+        'disable_mm_encoder': True,
+        'enable_chunked_prefill': True,
+        'cuda_graph_config.max_batch_size': 64,
+        'kv_cache_config.enable_block_reuse': False,
         'kv_cache_config.dtype': 'fp8',
         'max_seq_len': 8192,
         'modeling_v2': 'require',
@@ -141,11 +104,28 @@ _PERF_PRESETS = {
         'stream_interval': 10,
         'moe_config.backend': 'DEEPGEMM',
     },
-    'gpt_oss_eagle3': _eagle3('gpt_oss/gpt-oss-120b-Eagle3'),
-    'gpt_oss_eagle3_throughput':
-    _eagle3('gpt_oss/gpt-oss-120b-Eagle3-throughput'),
+    'gpt_oss_eagle3': {
+        'enable_autotuner': False,
+        'speculative_config': {
+            'speculative_model_dir':
+            '${LLM_MODELS_ROOT}/gpt_oss/gpt-oss-120b-Eagle3',
+            'decoding_type': 'Eagle',
+            'max_draft_len': 3,
+        },
+    },
+    'gpt_oss_eagle3_throughput': {
+        'enable_autotuner': False,
+        'speculative_config': {
+            'speculative_model_dir':
+            '${LLM_MODELS_ROOT}/gpt_oss/gpt-oss-120b-Eagle3-throughput',
+            'decoding_type': 'Eagle',
+            'max_draft_len': 3,
+        },
+    },
     'kimi_k3_dep8': {
-        **_KIMI_K3,
+        'enable_chunked_prefill': True,
+        'kv_cache_config.enable_block_reuse': False,
+        'kv_cache_config.tokens_per_block': 64,
         'cuda_graph_config.max_batch_size': 8,
         'enable_attention_dp': True,
         'kv_cache_config.dtype': 'nvfp4',
@@ -155,15 +135,20 @@ _PERF_PRESETS = {
         'moe_config.use_low_precision_moe_combine': True,
     },
     'kimi_k3_streaming': {
-        **_KIMI_K3,
+        'enable_chunked_prefill': True,
+        'kv_cache_config.enable_block_reuse': False,
+        'kv_cache_config.tokens_per_block': 64,
         'cuda_graph_config.enable_padding': False,
         'cuda_graph_config.max_batch_size': 16,
         'max_seq_len': 9344,
         'stream_interval': 10,
     },
     'lightning_mtp': {
-        **_MTP3,
-        **_MAMBA_FP16,
+        'speculative_config.decoding_type': 'MTP',
+        'speculative_config.max_draft_len': 3,
+        'kv_cache_config.mamba_ssm_cache_dtype': 'float16',
+        'kv_cache_config.mamba_ssm_stochastic_rounding': True,
+        'kv_cache_config.mamba_ssm_philox_rounds': 5,
         'enable_chunked_prefill': True,
         'num_postprocess_workers': 4,
         'stream_interval': 10,
@@ -177,9 +162,13 @@ _PERF_PRESETS = {
             'speculative_model': '${LLM_MODELS_ROOT}/MiniMax-M3.1-Flash/dspark'
         },
     },
-    'minimax_m3': _MINIMAX_M3,
+    'minimax_m3': {
+        'kv_cache_config.enable_block_reuse': False,
+        'sparse_attention_config.algorithm': 'minimax_m3',
+    },
     'minimax_m31_flash': {
-        **_MINIMAX_M3,
+        'kv_cache_config.enable_block_reuse': False,
+        'sparse_attention_config.algorithm': 'minimax_m3',
         'sparse_attention_config.implementation': 'msa',
         'sparse_attention_config.indexer_kv_dtype': 'fp8',
         'sparse_attention_config.fuse_qkv_index_projection': True,
@@ -189,7 +178,8 @@ _PERF_PRESETS = {
         'max_seq_len': 16384,
     },
     'minimax_m3_fp4': {
-        **_MINIMAX_M3,
+        'kv_cache_config.enable_block_reuse': False,
+        'sparse_attention_config.algorithm': 'minimax_m3',
         'enable_attention_dp': True,
         'kv_cache_config.dtype': 'fp8',
         'kv_cache_config.free_gpu_memory_fraction': 0.6,
@@ -198,7 +188,8 @@ _PERF_PRESETS = {
         'sparse_attention_config.implementation': 'msa',
     },
     'minimax_m3_fp4_bench': {
-        **_MINIMAX_M3,
+        'kv_cache_config.enable_block_reuse': False,
+        'sparse_attention_config.algorithm': 'minimax_m3',
         'max_seq_len': 2560,
         'enable_attention_dp': True,
         'cuda_graph_config.enable_padding': True,
@@ -208,7 +199,10 @@ _PERF_PRESETS = {
         'moe_config.backend': 'CUTLASS',
         'sparse_attention_config.implementation': 'msa',
     },
-    'mtp3': _MTP3,
+    'mtp3': {
+        'speculative_config.decoding_type': 'MTP',
+        'speculative_config.max_draft_len': 3,
+    },
     'nano_omni': {
         'cuda_graph_config.max_batch_size': 1,
         'enable_chunked_prefill': True,
@@ -217,7 +211,9 @@ _PERF_PRESETS = {
         'moe_config.backend': 'CUTLASS',
     },
     'nemotron_super_throughput': {
-        **_MAMBA_FP16,
+        'kv_cache_config.mamba_ssm_cache_dtype': 'float16',
+        'kv_cache_config.mamba_ssm_stochastic_rounding': True,
+        'kv_cache_config.mamba_ssm_philox_rounds': 5,
         'enable_attention_dp': True,
         'cuda_graph_config.max_batch_size': 256,
         'kv_cache_config.enable_block_reuse': False,
@@ -241,7 +237,8 @@ _PERF_PRESETS = {
         10,
     },
     'qwen38_flash_next_tep4': {
-        **_MTP3,
+        'speculative_config.decoding_type': 'MTP',
+        'speculative_config.max_draft_len': 3,
         'enable_chunked_prefill': True,
         'cuda_graph_config.max_batch_size': 128,
         'moe_config.backend': 'TRTLLM',
@@ -255,24 +252,37 @@ _PERF_PRESETS = {
         'prefill_cuda_graph_backend': 'breakable',
     },
     'qwen38_max_mtp': {
-        **_MTP3,
+        'speculative_config.decoding_type': 'MTP',
+        'speculative_config.max_draft_len': 3,
         'kv_cache_config.mamba_ssm_cache_dtype': 'bfloat16',
         'moe_config.backend': 'TRTLLM',
         'cuda_graph_config.max_batch_size': 32,
         'max_seq_len': 8192,
     },
-    'qwen3_235b_eagle3': _eagle3('Qwen3/qwen3-235B-eagle3'),
+    'qwen3_235b_eagle3': {
+        'enable_autotuner': False,
+        'speculative_config': {
+            'speculative_model_dir':
+            '${LLM_MODELS_ROOT}/Qwen3/qwen3-235B-eagle3',
+            'decoding_type': 'Eagle',
+            'max_draft_len': 3,
+        },
+    },
     'reuse': {
         'kv_cache_config.enable_block_reuse': True,
         'kv_cache_config.mamba_state_config.periodic_snapshot_interval': 8192,
     },
     'super_mamba': {
-        **_MAMBA_FP16,
+        'kv_cache_config.mamba_ssm_cache_dtype': 'float16',
+        'kv_cache_config.mamba_ssm_stochastic_rounding': True,
+        'kv_cache_config.mamba_ssm_philox_rounds': 5,
         'enable_chunked_prefill': True,
         'moe_config.backend': 'CUTLASS',
     },
     'super_streaming': {
-        **_MAMBA_FP16,
+        'kv_cache_config.mamba_ssm_cache_dtype': 'float16',
+        'kv_cache_config.mamba_ssm_stochastic_rounding': True,
+        'kv_cache_config.mamba_ssm_philox_rounds': 5,
         'enable_chunked_prefill': True,
         'cuda_graph_config.max_batch_size': 8,
         'max_seq_len': 1048576,
@@ -295,22 +305,34 @@ _PERF_PRESETS = {
         'kv_cache_config.max_tokens': 262144,
     },
     'v4_pro_dspark': {
-        **_V4_PRO_DSPARK,
+        'custom_tokenizer': 'deepseek_v4',
+        'disable_overlap_scheduler': True,
+        'enable_attention_dp': True,
+        'enable_chunked_prefill': False,
+        'kv_cache_config.enable_block_reuse': False,
+        'max_seq_len': 10240,
         'speculative_config': {
-            'speculative_model': '${LLM_MODELS_ROOT}/DeepSeek-V4-Pro-DSpark'
+            'decoding_type': 'DSpark',
+            'max_draft_len': 5,
+            'speculative_model': '${LLM_MODELS_ROOT}/DeepSeek-V4-Pro-DSpark',
         },
-        'speculative_config.max_draft_len': 5,
     },
     'v4_pro_dspark3': {
-        **_V4_PRO_DSPARK,
+        'custom_tokenizer': 'deepseek_v4',
+        'disable_overlap_scheduler': True,
+        'enable_attention_dp': True,
+        'enable_chunked_prefill': False,
+        'kv_cache_config.enable_block_reuse': False,
+        'max_seq_len': 10240,
         'enable_lm_head_tp_in_adp': True,
         'kv_cache_config.dtype': 'fp8',
         'moe_config.use_low_precision_moe_combine': True,
-        'speculative_config.max_draft_len': 3,
-        'speculative_config.block_size': 3,
         'speculative_config': {
+            'decoding_type': 'DSpark',
+            'max_draft_len': 3,
+            'block_size': 3,
             'speculative_model':
-            '${LLM_MODELS_ROOT}/DeepSeek-V4-Pro-nvfp4-DSpark'
+            '${LLM_MODELS_ROOT}/DeepSeek-V4-Pro-nvfp4-DSpark',
         },
     },
 }
@@ -328,9 +350,6 @@ _FIELD_ALIASES = {
     'periodic_snapshot_interval':
     'kv_cache_config.mamba_state_config.periodic_snapshot_interval',
 }
-
-# Gemma 4 uses 512-wide heads and defaults to TRTLLM on SM107.
-_SM_OVERRIDES = {'gemma4_nvfp4': {107: {'attn_backend': 'FLASHINFER'}}}
 
 
 def _update_field(config: dict, field: str, value) -> None:
@@ -354,9 +373,9 @@ def get_perf_config_preset(selection: str) -> dict:
             except FileNotFoundError as exc:
                 raise ValueError(f"Unknown curated config {name!r}") from exc
         elif name in _PERF_PRESETS:
-            fields = _PERF_PRESETS[name]
-            if sm_overrides := _SM_OVERRIDES.get(name):
-                fields = fields | sm_overrides.get(get_sm_version(), {})
+            fields = _PERF_PRESETS[name].copy()
+            if sm_overrides := fields.pop('_sm_overrides', None):
+                fields.update(sm_overrides.get(get_sm_version(), {}))
             for field, value in fields.items():
                 _update_field(config, field, copy.deepcopy(value))
         else:
