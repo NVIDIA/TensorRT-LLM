@@ -39,6 +39,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _trtllm_backend_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    # PrimTS serves the TRTLLM backend. FlashInfer has its own suites; comparing
+    # it here only adds cold FlashInfer JIT builds.
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+
+
 _QWEN2_7B = {
     "num_heads": 28,
     "num_kv_heads": 4,
@@ -107,8 +114,6 @@ def test_prims_ts_qwen2_gqa(
     dtype: str,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
-    if kv_dtype == "fp8":
-        monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     case = BackendCase(
         **{**_QWEN2_7B, "dtype": dtype},
         seq_lens=seq_lens,
@@ -322,7 +327,6 @@ def test_prims_ts_context_receives_zeroed_v_tail(
             **kwargs,
         )
 
-    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     monkeypatch.setattr(PrimsTSFmha, "run_context", run_context_with_selected_preprocessing)
     monkeypatch.setattr(backend_case, "generate_inputs", generate_inputs)
     monkeypatch.setattr(backend_case, "fill_kv_cache_logical", fill_cache_and_poison_tail)
@@ -376,7 +380,6 @@ def test_prims_ts_decode_with_computed_rope(
 
     monkeypatch.setattr(PrimsTSFmha, "run_generation", run_generation_without_rope_table)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
-    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     run_case(
         BackendCase(
             **{**_QWEN2_7B, "dtype": dtype},
@@ -395,8 +398,6 @@ def test_prims_ts_fp16_dense_context_with_alternate_shape(
     kv_dtype: str | None,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
-    if kv_dtype == "fp8":
-        monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     case = BackendCase(
         num_heads=8,
         num_kv_heads=2,

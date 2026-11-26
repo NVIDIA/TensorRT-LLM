@@ -710,15 +710,15 @@ def test_sinks_pass_through_or_are_prepared_once_per_layer() -> None:
     assert mod._SINKS_CACHE_LIMIT >= 61
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+# supports_dsv4_epilogue_fusion admits only 128 heads over an FP8 cache, which
+# plans an FP8 query.
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn], ids=["fp8"])
 @pytest.mark.parametrize(
     "rows,heads,groups,topk,extra_topk",
     [
         (1, 128, 16, 128, 0),
         (5, 128, 16, 128, 512),
         (64, 128, 16, 128, 512),
-        (16, 64, 8, 128, 256),
-        (3, 64, 8, 128, 0),
     ],
 )
 def test_fused_output_matches_trtllm_inverse_rope_quant(
@@ -991,7 +991,8 @@ def _assert_fused_close(got, got_sc, ref, ref_sc, channels, device):
 
 
 @pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+# The module fuses this epilogue only over an FP8 cache.
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8"])
 @pytest.mark.parametrize("batch_name", ["small_decode", "medium_decode", "single_decode"])
 def test_forward_sparse_mla_unified_fused_epilogue(monkeypatch, batch_name, kv_cache_dtype):
     """Module-level coverage of the fused DSv4 epilogue (production ADP path).

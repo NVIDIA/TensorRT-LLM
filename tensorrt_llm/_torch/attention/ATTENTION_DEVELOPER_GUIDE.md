@@ -1139,6 +1139,26 @@ Working rules:
   separately.
 - Any dispatch change touching `forward_context()` needs chunked-context tests.
 
+JIT kernels (PrimTS and other CuTe DSL kernels, FlashInfer, Triton) compile cold
+in every CI run, so a kernel test's cost is the number of distinct kernels it
+builds, not its problem size. One PrimTS specialization takes from a few seconds
+to over a minute to compile; running it takes milliseconds.
+
+- Count compiles, not cases. A new head count, head dim, page size, dtype, query
+  layout, or a plan that selects a different tile or split policy is a new
+  compile. Changing only tensor values, scales, or lengths under the same plan
+  is nearly free.
+- Parametrize over configurations that dispatch can reach, such as the gate in
+  `supports_dsv4_epilogue_fusion`, and reuse geometries across tests in a file
+  so they share compiled kernels.
+- Compare against the Vanilla golden or a PyTorch reference. Adding another JIT
+  backend as a second comparison also builds that backend's kernels.
+- Test planning, caching, and dispatch logic with fakes rather than real
+  compiles.
+- Measure the cold cost before adding a test:
+  `FLASHINFER_WORKSPACE_BASE=$(mktemp -d) pytest --durations=0 <file>`. A rerun
+  with the same directory gives the warm cost.
+
 Keep reusable sparse computation in the root `test_sparse_mla_forward.py`,
 `test_sparse_mqa_gqa.py`, and `test_sparse_mha.py` modules. Shared framework
 tests live in `test_sparse_attention.py`; selector and cache tests belong in
