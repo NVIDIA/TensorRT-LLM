@@ -413,6 +413,58 @@ def test_send_poll_counts_one_rank_observed_deadline_on_every_rank(
     assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]
 
 
+@pytest.mark.parametrize("peer_failed", [True, False], ids=["peer-backend-error", "cancel-only"])
+def test_cancelled_partial_send_counts_a_peer_backend_error_on_every_rank(
+    monkeypatch: pytest.MonkeyPatch, peer_failed: bool
+) -> None:
+    """A send that one rank failed and the client then cancelled counts one error each.
+
+    The send has no transfer-manager entry yet, as for an intermediate pipelined chunk,
+    so only the request keeps the agreed cause.
+    """
+    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = []
+    requests = []
+    for rank in range(2):
+        request = _context_request()
+        request.py_kv_transfer_committed_cause = None
+        request.is_disagg_generation_transmission_in_progress = False
+        session = SimpleNamespace(
+            _enforce_physical_ownership=False,
+            disagg_request_id=401,
+            is_completed=Mock(return_value=False),
+            has_failed=Mock(return_value=True),
+            wait_complete=Mock(return_value=WaitResult.FAILED),
+            status=SessionStatus.CANCELLED,
+            has_transferring_tasks=Mock(return_value=False),
+            timed_out=False,
+            # Only rank 1's send committed a backend error before the abort.
+            committed_failure=peer_failed and rank == 1,
+            close=Mock(return_value=True),
+        )
+        harness = _harness(
+            _worker(), request, session, dist=group.rank(rank), enable_transfer_metrics=True
+        )
+        harness.active.append(request)
+        ranks.append(harness)
+        requests.append(request)
+
+    for _ in range(2):
+        group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+    for harness, request in zip(ranks, requests):
+        assert not harness.transceiver._send_sessions
+        assert not harness.transfers.requests_in_transfer()
+        assert request.py_kv_transfer_committed_cause == ("error" if peer_failed else None)
+        # The client abort then finishes the request at the cancellation boundary.
+        harness.coordinator.record_cancelled_transfer_outcome(request)
+        harness.coordinator.record_cancelled_transfer_outcome(request)
+        assert harness.coordinator.transfer_outcomes == ((0, 1, 0) if peer_failed else (0, 0, 0))
+        harness.effects.fail_requests.assert_not_called()
+
+    assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]
+
+
 @pytest.mark.parametrize("result_already_sent", [False, True])
 @pytest.mark.parametrize("pending_write", [False, True])
 def test_context_timeout_skew_retains_claims_until_tp_retirement(

@@ -2156,6 +2156,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
         failed = [rid for rid in failed if rid in quiesced]
+        # Cancellation wins the outcome, but a backend error any rank committed
+        # still counts once on every rank, even before the transfer manager
+        # holds the request. An agreed timeout stays.
+        for rid in backend_failed.intersection(cancelled):
+            req = self._send_reqs.get(rid)
+            if req is not None and getattr(req, "py_kv_transfer_committed_cause", None) is None:
+                req.py_kv_transfer_committed_cause = "error"
 
         owned_cancelled = [
             rid
