@@ -28,7 +28,7 @@ Keep changes for one deployment local to its pipeline so developers can merge wo
 | **Pipeline** | The inference entry point for a checkpoint or deployment. It runs the stages needed to serve a request. |
 | **Component** | A major building block of the pipeline, such as the text encoder, denoiser or video decoder. |
 | **Op** | A fine-grained unit of work with explicit inputs and observable results. |
-| **Kernel** | Code that runs on hardware to perform computation, move data or communicate between devices. |
+| **Kernel** | Code that runs on hardware to perform computation, move data or communicate between devices. [Native build guide](../../../../cpp/tensorrt_llm/visual_gen/README.md) |
 
 **The boundary between a component and an op is flexible. In general, a component implements part of the model’s behavior, and an op defines a smaller unit of work.** Extract an op when you can describe its behavior from its inputs and have a reason to test it independently or replace its implementation.
 
@@ -44,13 +44,9 @@ Keep parallel rules with their caller. Create a component when several operation
 
 ### Allowed dependencies
 
-**Prefer a self-contained V2 implementation from op to kernel.** Check the LLM and VisualGen V2 catalogs first. Use existing checkpoint loaders, process groups, device utilities and autotuning services directly. Extend a shared service when the change belongs to its callers across models. Keep model-specific input conversion and execution policy in the family or target. Public third-party APIs such as PyTorch and FlashInfer are also available. If no op fits, start with the target or family that needs it. Promote an op to the VisualGen catalog when its calculation and tests are independent of the model. A single family can be the first caller.
-
-**Keep V1 model and backend implementations unchanged during migration.** Put any adapters V2 needs in the V2 family or catalog that uses them.
-
-**Treat imports from a V1 backend as an exception.** When reimplementing a mature, model-agnostic kernel or runner would duplicate substantial work, V2 may call it through its existing interface. Attention and GEMM are common examples. Keep checkpoint interpretation, input preparation and per-layer policy in V2. Write or port a kernel when the available implementations miss a required result, layout, hardware capability or measured performance goal. Build new native code under its owning catalog, family or target. Reuse a shared kernel’s registration and give new V2 registrations distinct names. [Native build guide](../../../../cpp/tensorrt_llm/visual_gen/README.md)
-
-**List every V1 backend dependency in the migration PR for review**, including indirect calls through catalog ops, shared services and registered Torch ops or classes. For each entry, name the V2 caller, the V1 file and symbol, and why V2 needs it. Reviewers check that the entry point and its fallbacks provide the required calculation and leave model decisions in V2. If there are no exceptions, say so in the PR.
+- **Start in V2.** Check the LLM and VisualGen V2 catalogs first. Implement missing ops and kernels in the V2 model or catalog that owns them. You can use VisualGen runtime services and public third-party APIs directly.
+- **Keep V1 unchanged.** V2 may call a mature, model-agnostic kernel or runner through its existing interface when reimplementing it would duplicate substantial work. Attention and GEMM are common examples. Keep adapters and model decisions in V2.
+- **Review every V1 backend dependency.** In the migration PR, list the V2 caller, the V1 file and symbol, and the reason for reuse. Include indirect calls and fallbacks. If there are no exceptions, say so.
 
 ## Feature development during migration
 
