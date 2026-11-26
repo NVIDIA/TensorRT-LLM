@@ -495,7 +495,7 @@ def test_packed_inputs_share_the_largest_physical_allocation() -> None:
     )
     buffers = []
 
-    def allocate(key, lengths, device):
+    def allocate(key, lengths, device, capture_stream):
         buffers.append(runner._io_adapter.allocate_inputs(key, device)["x"])
 
     with mock.patch.object(runner, "_capture_key", side_effect=allocate):
@@ -629,7 +629,7 @@ def test_capture_failure_abandons_partial_graphs(monkeypatch, completed):
     pool = (90001, 91)
     graphs = []
 
-    def capture(graph, graph_pool):
+    def capture(graph, graph_pool, **kwargs):
         graphs.append(graph)
         return nccl_window_graph.nccl_window_graph_owner(graph_pool)
 
@@ -966,12 +966,14 @@ def test_flashinfer_replay_across_shared_buckets(cuda_device):
     assert len(workspaces) == 1
     assert len({c.inputs["x"].data_ptr() for c in runner._captured.values()}) == 1
     input_buffer = weakref.ref(adapter._static_inputs["x"])
-    workspace = weakref.ref(adapter._buffers.buffers["workspace_buffer"][0].buffer)
+    pool = next(iter(runner._captured.values())).metadata.cuda_graph_buffers
+    workspace = weakref.ref(pool.buffers["workspace_buffer"][0].buffer)
     runner.clear()
     assert input_buffer() is None and workspace() is None
     runner.capture_all(cuda_device)
 
     generator = torch.Generator(device=cuda_device).manual_seed(2)
+    replays = []
     for lengths, capacity in [([49, 40], 128), ([19], 64), ([30, 32, 33], 128)]:
         padded = [*lengths, *([1] * (3 - len(lengths))), capacity - sum(lengths) + len(lengths)]
         x = torch.randn(
@@ -979,9 +981,20 @@ def test_flashinfer_replay_across_shared_buckets(cuda_device):
         )
         prepare_encoder_attn_metadata(padded, eager, max_seq_len=128)
         expected = attention({"x": x}, eager)["y"][: sum(lengths)]
-        actual = runner.maybe_run(seq_lengths=lengths, inputs={"x": x[: sum(lengths)]})
-        assert actual is not None
-        torch.testing.assert_close(actual["y"], expected, rtol=0, atol=0)
+        replays.append((lengths, x[: sum(lengths)], expected, torch.empty_like(expected)))
+
+    # Keep uploads in flight as the larger bucket is submitted a second time.
+    replay_stream = torch.cuda.Stream(device=cuda_device)
+    replay_stream.wait_stream(torch.cuda.current_stream(cuda_device))
+    with torch.cuda.stream(replay_stream):
+        torch.cuda._sleep(20_000_000)
+        for lengths, x, _, actual in replays:
+            outputs = runner.maybe_run(seq_lengths=lengths, inputs={"x": x})
+            assert outputs is not None
+            actual.copy_(outputs["y"])
+    torch.cuda.current_stream(cuda_device).wait_stream(replay_stream)
+    for _, _, expected, actual in replays:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _probing_encoder_fn(probe: Callable[[], bool], sink: List[bool]):

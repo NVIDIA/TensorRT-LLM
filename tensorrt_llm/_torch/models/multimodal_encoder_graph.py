@@ -27,6 +27,7 @@ from typing import (
 
 import torch
 
+from ..._utils import current_cuda_stream, prefer_pinned, wait_event
 from ...logger import logger
 from ..memory_buffer_utils import Buffers
 from ..nccl_window_graph import (
@@ -194,6 +195,7 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
         output_specs: Token axis of each graph output; outputs preserve the real input token count.
     """
 
+    graph_critical_attrs = ("seq_lens_cuda", "cu_q_seqlens", "cu_kv_seqlens")
     _enable_padding: bool = True
 
     def __init__(
@@ -207,14 +209,7 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
         self._output_specs = output_specs
         self._static_inputs: dict[str, torch.Tensor] = {}
         self._eager_metadata = attn_metadata
-        self._buffers = Buffers()
-        self.graph_critical_attrs = ("_seq_lens_cuda", "cu_q_seqlens", "cu_kv_seqlens")
-        if hasattr(attn_metadata, "workspace_buffer"):
-            self.graph_critical_attrs += (
-                "workspace_buffer",
-                "_ragged_qo_indptr_buf",
-                "_ragged_kv_indptr_buf",
-            )
+        self._buffers: tuple[Buffers, dict[int, Callable[[Sequence[int]], None]]] = Buffers(), {}
 
     def capture_buckets(self, max_batch_size: int, max_num_tokens: int) -> list[EncoderGraphKey]:
         if not self._enable_padding:
@@ -253,29 +248,49 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
     def build(self, key: EncoderGraphKey) -> AttentionMetadata:
         eager = self._eager_metadata
         assert eager is not None
+        workspace, refreshers = self._buffers
         metadata = type(eager)(
             max_num_requests=key.num_contexts,
             max_num_tokens=key.total_tokens,
             kv_cache_manager=None,
             kv_layout=eager.kv_layout,
             is_cuda_graph=True,
-            cuda_graph_buffers=self._buffers,
+            cuda_graph_buffers=workspace,
         )
         metadata.max_seq_len = max(eager.max_seq_len or 0, key.total_tokens - key.num_contexts + 1)
-        metadata.seq_lens = torch.ones(key.num_contexts, dtype=torch.int32)
-        bind = getattr(metadata, "bind_encoder_cuda_graph_seq_lens", None)
-        if bind is not None:
-            bind(metadata.seq_lens, key.num_contexts)
+        n = key.num_contexts
+        host = torch.empty(2 * n + 1, dtype=torch.int32, pin_memory=prefer_pinned())
+        device = torch.empty_like(host, device="cuda")
+        values = memoryview(host.numpy())
+        values[n] = 0  # First exclusive offset.
+        metadata.request_ids = list(range(1, n + 1))
+        metadata.cu_q_seqlens = metadata.cu_kv_seqlens = device[n:]
+        metadata.bind_encoder_cuda_graph_seq_lens(host[:n], n, seq_lens_cuda=device[:n])
+        host_offsets = host[n:]
+        uploaded = torch.cuda.Event()
+        device_index = device.device.index
+
+        def refresh(lengths: Sequence[int]) -> None:
+            wait_event(uploaded)
+            offset = 0
+            for i, length in enumerate(lengths):
+                values[i] = length
+                offset += length
+                values[n + i + 1] = offset
+            device.copy_(host, non_blocking=True)
+            try:
+                metadata.prepare_encoder_only(host_offsets=host_offsets)
+            finally:
+                # Also protect the host planner's reusable schedule until its upload completes.
+                uploaded.record(current_cuda_stream(device_index))
+
+        refreshers[id(metadata)] = refresh
         return metadata
 
     def refresh_in_place(
         self, metadata: AttentionMetadata, padded_seq_lengths: Sequence[int]
     ) -> None:
-        from .modeling_multimodal_encoder import prepare_encoder_attn_metadata
-
-        prepare_encoder_attn_metadata(
-            list(padded_seq_lengths), metadata, max_seq_len=metadata.max_seq_len
-        )
+        self._buffers[1][id(metadata)](padded_seq_lengths)
 
     def allocate_inputs(
         self, key: EncoderGraphKey, device: torch.device
@@ -566,14 +581,15 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         # metadata variants; warming up a later, larger workload can resize that workspace and
         # invalidate pointers captured by an earlier graph. This matches the ordering used by the
         # LLM CUDA-graph runners and also lets smaller graphs reuse the larger graph's memory pool.
-        with ExitStack() as cleanup:
+        with torch.cuda.device(device if device.type == "cuda" else -1), ExitStack() as cleanup:
+            capture_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
             cleanup.callback(self.clear, release_nccl_window_owners=False)
             for bucket in sorted(self._buckets, key=self._padded_key_for_bucket, reverse=True):
                 key = self._padded_key_for_bucket(bucket)
                 if key in self._captured:
                     continue
                 padded_seq_lengths = self._dummy_padded_seq_lengths(bucket, key)
-                self._capture_key(key, padded_seq_lengths, device)
+                self._capture_key(key, padded_seq_lengths, device, capture_stream)
             cleanup.pop_all()
 
     def maybe_run(
@@ -643,7 +659,9 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         if isinstance(self._io_adapter, PackedEncoderGraphIOAdapter):
             self._io_adapter._static_inputs.clear()
         if isinstance(self._metadata_provider, PackedEncoderGraphIOAdapter):
-            self._metadata_provider._buffers.buffers.clear()
+            workspace, refreshers = self._metadata_provider._buffers
+            workspace.buffers.clear()
+            refreshers.clear()
         if self._memory_pool is not None:
             if release_nccl_window_owners:
                 release_nccl_window_graph_owner(self._memory_pool)
@@ -717,6 +735,7 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         key: EncoderGraphKey,
         padded_seq_lengths: Sequence[int],
         device: torch.device,
+        capture_stream: torch.cuda.Stream | None = None,
     ) -> None:
         padded_seq_lengths = list(padded_seq_lengths)
         logger.info(f"Capturing multimodal encoder CUDA graph for key={key} on device={device}.")
@@ -744,7 +763,7 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
                         self._encoder_fn(static_inputs, metadata)
                 torch.cuda.synchronize()
 
-                with nccl_window_graph_capture(graph, self._memory_pool):
+                with nccl_window_graph_capture(graph, self._memory_pool, stream=capture_stream):
                     with discard_nccl_window_tensor_outputs(static_inputs):
                         outputs = self._encoder_fn(static_inputs, metadata)
 

@@ -1583,7 +1583,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self,
         plan_params: PlanParams,
         ragged_prefill_wrapper: Any,
-        flashinfer_backend: str,
+        flashinfer_backend: Optional[str] = None,
+        host_offsets: Optional[torch.Tensor] = None,
     ) -> None:
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
         if plan_params.attention_mask_data is not None:
@@ -1604,22 +1605,26 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         num_contexts = self.num_contexts
         q_and_kv_seqlens = self.seq_lens[:num_contexts]
         q_and_kv_seqlens_cuda = self.seq_lens_cuda[:self.num_contexts]
-        query_output_indptr = torch.zeros(
-            num_contexts + 1,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
-        key_value_indptr = query_output_indptr
         num_query_output_heads = plan_params.num_heads
         num_key_value_heads = plan_params.num_kv_heads
         attention_head_dim = plan_params.head_dim
 
-        max_query_tokens_per_sequence = 0
-        if num_contexts > 0:
-            query_output_indptr[1:].copy_(torch.cumsum(q_and_kv_seqlens, dim=0))
-            # key_value_indptr is query_output_indptr
-            max_query_tokens_per_sequence = cast(int,
-                                                 q_and_kv_seqlens.max().item())
+        if host_offsets is None:
+            query_output_indptr = torch.zeros(num_contexts + 1,
+                                              dtype=torch.int32,
+                                              pin_memory=prefer_pinned())
+            max_query_tokens_per_sequence = 0
+            if num_contexts > 0:
+                query_output_indptr[1:].copy_(
+                    torch.cumsum(q_and_kv_seqlens, dim=0))
+                max_query_tokens_per_sequence = cast(
+                    int,
+                    q_and_kv_seqlens.max().item())
+        else:
+            # The capture layout gives one token to every other segment.
+            max_query_tokens_per_sequence = self.max_num_tokens - num_contexts + 1
+            query_output_indptr = self.cu_q_seqlens
+        key_value_indptr = query_output_indptr
 
         if (multi_item_params := plan_params.multi_item_params) is not None:
             if flashinfer_backend not in ["fa2", "fa3"]:
@@ -1656,6 +1661,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 max_sequence_kv=
                 max_key_value_tokens_per_sequence,  # breaks BatchPrefillWithPagedKVCacheWrapper
             )
+            if host_offsets is not None:
+                plan_kwargs.update(qo_indptr_cpu=host_offsets,
+                                   kv_indptr_cpu=host_offsets)
         ragged_prefill_wrapper.plan(
             qo_indptr=query_output_indptr,
             num_qo_heads=num_query_output_heads,
@@ -1887,6 +1895,27 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 # float workspace is run scratch.
                 wrappers.is_planned = False
                 self._plan_with_params(plan_params)
+
+    def prepare_encoder_only(self,
+                             *,
+                             host_offsets: Optional[torch.Tensor] = None
+                             ) -> None:
+        if host_offsets is None:
+            super().prepare_encoder_only()
+            return
+
+        if not self._plan_params_to_wrappers:
+            # The constructor takes stable device offsets for all four operands
+            # of ragged self-attention. Warmup creates the wrappers after prepare.
+            self._qo_indptr = self._kv_indptr = self.cu_q_seqlens
+            self._ragged_qo_indptr_buf = self._ragged_kv_indptr_buf = self.cu_q_seqlens
+            super().prepare_encoder_only()
+            return
+
+        for params, wrappers in self._plan_params_to_wrappers.items():
+            self._plan_ragged_no_kv(params,
+                                    wrappers.ragged_prefill_wrapper,
+                                    host_offsets=host_offsets)
 
     def prepare(self) -> None:
 
