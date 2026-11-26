@@ -84,6 +84,17 @@ def delay_background_disk_writes_for_testing(seconds: float) -> None:
     _cpp().delay_background_disk_writes_for_testing(seconds)
 
 
+def disk_write_behind_pages_for_testing() -> int:
+    """Pages in disk write-behind staging: pending a flush, or kept after a failed one."""
+    return int(_cpp().disk_write_behind_pages_for_testing())
+
+
+def delay_disk_write_behind_flushes_for_testing(seconds: float) -> None:
+    """A disk write-behind flush starts only once it has been queued for ``seconds`` (0: no delay), so reads of the
+    staged pages are served from staging meanwhile."""
+    _cpp().delay_disk_write_behind_flushes_for_testing(seconds)
+
+
 def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]) -> Any:
     """Create the private native padding codec used by cold-tier end-to-end tests."""
     return _cpp().create_test_padding_cold_page_codec(cold_page_bytes_by_layer)
