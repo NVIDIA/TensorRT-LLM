@@ -1397,7 +1397,7 @@ def _logic_compile_fullgraph_ce(rank, world_size, device):
 
 def _logic_cuda_graph_ce(rank, world_size, device):
     """CUDA-graph capture + replay of the FP8 boundary chain with the copy-engine gather on:
-    begin() reserves the pool eagerly, two eager boundaries precede the capture (the consumed
+    begin() reserves the pool eagerly, two eager boundaries precede the capture (the transport
     waits are in the graph), the replay is bitwise the eager chain on new inputs, and a larger
     shape after the captures is refused rather than growing the pool under the graphs."""
     d = 256
@@ -1702,7 +1702,7 @@ def _logic_ce_reduce_scatter_op(rank, world_size, device):
         for i in range(24):
             if rank == i % world_size:
                 dst = transport.dest_order[i % len(transport.dest_order)]
-                with torch.cuda.stream(transport.streams.stream(dst)):
+                with torch.cuda.stream(transport.ce._streams[dst]):
                     torch.cuda._sleep(2_000_000)
             _, _, raw, _, c5 = boundary(row, k_local, plan, 5 + k_local + 31 * rank, True)
             if first is None:
@@ -2143,7 +2143,7 @@ def _logic_compile_fullgraph_ce_rs(rank, world_size, device):
 def _logic_cuda_graph_ce_rs(rank, world_size, device):
     """CUDA-graph capture + replay of a gather + reduce-scatter chain with both copy-engine
     modes on: begin() reserves both pools eagerly, two eager boundaries precede the capture (the
-    consumed waits are in the graph), the replays are bitwise the eager chain on new inputs --
+    transport completion fences are in the graph), the replays are bitwise the eager chain on new inputs --
     which is itself bitwise the fixed-order chain over the row Linear's partials (the smaller
     shapes run at the pool's region stride of the first, larger one), or, on the rows the stock
     Linear runs main's low-M GEMM (``fp8_low_m_gemm.serves`` on the row adapter's padded

@@ -875,7 +875,7 @@ def test_copy_engine_probe_falls_back_on_gloo(monkeypatch):
         assert ts.effective_gather_mode == "nccl"
         reason = ts._ce_state.reason
         assert reason and len(warnings) == 1 and reason in warnings[0]
-        assert "keeping the NCCL path" in warnings[0]  # the protocol base's one fallback warning
+        assert "ProcessGroupNCCL" in warnings[0]  # The shared factory names the unsupported group.
         ts.begin(2, 8)
         other = simulated_helper(plan, gather_mode="copy_engine")
         other.group, other.group_name = group, group.group_name
@@ -898,9 +898,8 @@ class _FakeRsState:
 
     probe_ok = True
 
-    def __init__(self, group, group_name, *, timeout_ms=600_000, per_peer_streams=True):
+    def __init__(self, group, group_name, *, timeout_ms=600_000):
         self.group, self.group_name, self.timeout_ms = group, group_name, timeout_ms
-        self.per_peer_streams = per_peer_streams
         self.effective, self.reason = False, "not probed"
         self.ks: set[int] = set()
         self.ns: set[int] = set()
@@ -1357,7 +1356,7 @@ def test_ce_reduce_scatter_probe_falls_back_on_gloo(monkeypatch):
         assert ts.effective_reduce_scatter_mode == "nccl"
         reason = ts._rs_state.reason
         assert reason and len(warnings) == 1 and reason in warnings[0]
-        assert "reduce-scatter" in warnings[0]
+        assert "ProcessGroupNCCL" in warnings[0]
         ts.begin(2, 8)
         other = simulated_helper(plan, reduce_scatter_mode="copy_engine")
         other.group, other.group_name = group, group.group_name

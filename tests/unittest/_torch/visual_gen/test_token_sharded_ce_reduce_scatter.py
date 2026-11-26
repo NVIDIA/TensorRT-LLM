@@ -27,12 +27,10 @@ import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
-import contextlib
 import itertools
 import math
 import sys
 import traceback
-from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -41,21 +39,24 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from token_sharded_tp_test_utils import simulated_helper
 
-from tensorrt_llm._torch.distributed import ce_protocol
-from tensorrt_llm._torch.distributed.symm_mem_pool import PoolLayout
 from tensorrt_llm._torch.modules.linear import (
     Fp8BlockScaleLowMGemmRange,
     Linear,
     TensorParallelMode,
 )
+from tensorrt_llm._torch.visual_gen.parallel import (
+    ce_transport,
+    token_sharded_modules,
+    token_sharded_tp,
+)
 from tensorrt_llm._torch.visual_gen.parallel import token_sharded_ce_reduce_scatter as tsr
-from tensorrt_llm._torch.visual_gen.parallel import token_sharded_modules, token_sharded_tp
+from tensorrt_llm._torch.visual_gen.parallel import token_sharded_ce_workspace as ce_workspace
+from tensorrt_llm._torch.visual_gen.parallel.symm_mem_pool import PoolLayout
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_ce_gather import packed_weight_scale_cols
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_ce_reduce_scatter import (
     DEFAULT_ALIGN,
     SLOTS,
     Bf16RowsRegionLayout,
-    CeReduceScatter,
     CeReduceScatterState,
     fixed_order_reduce_bf16,
     get_rs_state,
@@ -653,464 +654,6 @@ def test_rs_prepare_caps_workspace_at_large_token_counts(monkeypatch):
 
 
 # =============================================================================
-# Recovery bookkeeping: every rank's signal protocol on a fake pool, in one process
-# =============================================================================
-
-
-class _FakeStream:
-    """One CUDA stream of one rank: a FIFO of ops the fabric executes in order."""
-
-    def __init__(self, fabric: "_Fabric", rank: int, name: str):
-        self.fabric, self.rank, self.name = fabric, rank, name
-        self.ops: list[tuple] = []
-        self.done = 0
-
-    def wait_event(self, event: "_FakeEvent") -> None:
-        self.ops.append(("event", event))
-
-    def wait_stream(self, other: "_FakeStream") -> None:
-        event = _FakeEvent(self.fabric)
-        event.record(other)
-        self.wait_event(event)
-
-    def __repr__(self) -> str:
-        return self.name
-
-
-class _FakeEvent:
-    """A CUDA event: 'everything enqueued on ``stream`` before the record has completed'."""
-
-    def __init__(self, fabric: "_Fabric"):
-        self.fabric = fabric
-        self.stream: _FakeStream | None = None
-        self.index = 0
-
-    def record(self, stream: _FakeStream | None = None) -> None:
-        self.stream = stream if stream is not None else self.fabric.current_stream()
-        self.index = len(self.stream.ops)
-
-    def ready(self) -> bool:
-        return self.stream is not None and self.stream.done >= self.index
-
-    def __repr__(self) -> str:
-        return f"event({self.stream}@{self.index})"
-
-
-class _Fabric:
-    """Single-process model of what the devices do with the work the transports of ALL ranks
-    enqueue: the signal pads (one bit per ``(channel, src -> dst)``, kept the way
-    ``put_signal`` / ``wait_signal`` keep them) and the CUDA streams of every rank (one op
-    queue per stream; events order queues). :meth:`run` executes the queues as the devices
-    would -- a put is runnable only while its flag is clear, a wait only once it is set -- and
-    fails where the real pool traps the device after its deadline: when no queue can make
-    progress. Puts and waits are counted per ``(channel, src -> dst)`` for the balance check.
-    """
-
-    def __init__(self, tp: int):
-        self.tp = tp
-        self.rank = 0  # the rank whose transport code is running
-        self.active: _FakeStream | None = None  # set by the torch.cuda.stream context
-        self.streams: list[_FakeStream] = []
-        self.main = [self._new_stream(r, f"rank{r}/current") for r in range(tp)]
-        self.flags: dict[tuple[int, int, int], int] = {}  # (channel, src, dst) -> 0 / 1
-        self.puts: Counter = Counter()
-        self.waits: Counter = Counter()
-        self.pushes: Counter = Counter()  # (slot, src, dst) -> pushes the driver issued
-        self.bufs: dict[int, torch.Tensor] = {}  # rank -> its symmetric buffer
-
-    def _new_stream(self, rank: int, name: str) -> _FakeStream:
-        stream = _FakeStream(self, rank, name)
-        self.streams.append(stream)
-        return stream
-
-    # -- the torch.cuda surface the transport uses --
-
-    def Stream(self, device=None, priority=0) -> _FakeStream:  # noqa: N802 (torch.cuda.Stream)
-        n = sum(1 for s in self.streams if s.rank == self.rank) - 1
-        return self._new_stream(self.rank, f"rank{self.rank}/side{n}")
-
-    def Event(self) -> _FakeEvent:  # noqa: N802 (torch.cuda.Event)
-        return _FakeEvent(self)
-
-    def current_stream(self) -> _FakeStream:
-        return self.active if self.active is not None else self.main[self.rank]
-
-    @contextlib.contextmanager
-    def stream(self, stream: _FakeStream):
-        prev, self.active = self.active, stream
-        try:
-            yield
-        finally:
-            self.active = prev
-
-    @staticmethod
-    def is_current_stream_capturing() -> bool:
-        return False
-
-    def install(self, monkeypatch) -> None:
-        for name in ("Stream", "Event", "current_stream", "stream", "is_current_stream_capturing"):
-            monkeypatch.setattr(torch.cuda, name, getattr(self, name))
-        # The base's resync after a reset: every rank reset in a rank-symmetric case, so the
-        # counts agree (the base's own test covers the disagreement).
-        monkeypatch.setattr(
-            ce_protocol, "_gather_boundary_counts", lambda group, count: [count] * self.tp
-        )
-
-    # -- the pads --
-
-    def put(self, channel: int, src: int, dst: int) -> None:
-        self.current_stream().ops.append(("put", channel, src, dst))
-
-    def wait(self, channel: int, src: int, dst: int) -> None:
-        self.current_stream().ops.append(("wait", channel, src, dst))
-
-    def _step(self, op: tuple) -> bool:
-        if op[0] == "event":
-            return op[1].ready()
-        kind, channel, src, dst = op
-        key = (channel, src, dst)
-        if kind == "put":
-            if self.flags.get(key, 0):
-                return False  # put_signal spins while the previous flag is unconsumed
-            self.flags[key] = 1
-            self.puts[key] += 1
-        else:
-            if not self.flags.get(key, 0):
-                return False  # wait_signal spins until the flag is set
-            self.flags[key] = 0
-            self.waits[key] += 1
-        return True
-
-    def run(self) -> None:
-        """Execute every queue to its end, or fail where the devices would trap."""
-        while True:
-            progressed = pending = False
-            for stream in self.streams:
-                while stream.done < len(stream.ops):
-                    if not self._step(stream.ops[stream.done]):
-                        pending = True
-                        break
-                    stream.done += 1
-                    progressed = True
-            if not pending:
-                return
-            if not progressed:
-                heads = "; ".join(
-                    f"{s}: {s.ops[s.done]}" for s in self.streams if s.done < len(s.ops)
-                )
-                raise AssertionError(
-                    f"the devices would trap at the signal deadline; blocked: {heads}"
-                )
-
-
-class _FakePool:
-    """``SymmMemPool`` stand-in over a :class:`_Fabric`: real CPU buffers (one per rank, the
-    peers' mapped through ``peer_region``), the pool's own region arithmetic, and signals that
-    enqueue into the fabric instead of launching kernels."""
-
-    def __init__(self, fabric: _Fabric, rank: int):
-        self.fabric = fabric
-        self.rank = rank
-        self.world_size = fabric.tp
-        self.align = DEFAULT_ALIGN
-        self.channels = 4  # ready and consumed for the two slots the tests use
-        self.group = None  # the resync gather is the fabric's
-        self.group_name = f"fake{fabric.tp}"
-        self._layout: PoolLayout | None = None
-
-    @property
-    def reserved(self) -> bool:
-        return self._layout is not None
-
-    @property
-    def nbytes(self) -> int:
-        return self._layout.nbytes if self._layout else 0
-
-    @property
-    def slot_nbytes(self) -> int:
-        return self._layout.slot_nbytes if self._layout else 0
-
-    @property
-    def slots(self) -> int:
-        return self._layout.slots if self._layout else 0
-
-    @property
-    def region_nbytes(self) -> int:
-        return self._layout.region_nbytes if self._layout else 0
-
-    def reserve(self, slot_nbytes: int, slots: int, min_channels: int) -> bool:
-        want = PoolLayout.for_request(slot_nbytes, slots, self.world_size)
-        if self._layout is not None:
-            if self._layout.covers(want):
-                return False
-            want = self._layout.merged(want)
-        self._layout = want
-        self.fabric.bufs[self.rank] = torch.zeros(want.nbytes, dtype=torch.uint8)
-        for key in self.fabric.flags:  # the real pool zeroes this rank's pad on every allocation
-            if key[2] == self.rank:
-                self.fabric.flags[key] = 0
-        return True
-
-    def region(self, slot: int, rank: int, offset: int, nbytes: int) -> torch.Tensor:
-        start, stop = self._layout.region_span(slot, rank, offset, nbytes)
-        return self.fabric.bufs[self.rank][start:stop]
-
-    def peer_region(self, peer: int, slot: int, offset: int, nbytes: int) -> torch.Tensor:
-        start, stop = self._layout.region_span(slot, self.rank, offset, nbytes)
-        return self.fabric.bufs[peer][start:stop]
-
-    def signal(self, peer: int, channel: int) -> None:
-        self.fabric.put(channel, self.rank, peer)
-
-    def wait(self, src: int, channel: int) -> None:
-        self.fabric.wait(channel, src, self.rank)
-
-    def release(self) -> None:
-        self._layout = None
-
-
-def _block(src: int, dst: int, m: int, n: int, boundary: int) -> torch.Tensor:
-    """Source ``src``'s partial of destination ``dst``'s rows at boundary ``boundary``."""
-    seed = 1 + src + 16 * dst + 256 * boundary
-    return torch.randn((m, n), generator=torch.Generator().manual_seed(seed)).to(torch.bfloat16)
-
-
-def _transports(fabric: _Fabric, slots: int, layout: Bf16RowsRegionLayout) -> list[CeReduceScatter]:
-    transports = []
-    for r in range(fabric.tp):
-        fabric.rank = r
-        transports.append(
-            CeReduceScatter(_FakePool(fabric, r), fabric.tp, r, torch.device("cpu"), slots=slots)
-        )
-    for r, transport in enumerate(transports):
-        fabric.rank = r
-        assert transport.reserve(layout)
-    return transports
-
-
-def _boundary(fabric, transports, slot, layout, index, fail=None) -> dict[int, torch.Tensor]:
-    """One boundary on every rank, enqueued in rank order as the op body does, then run on the
-    fabric. ``fail`` injects the op's rank-symmetric raise and its except path (``reset``):
-    ``"before_begin"``; an int ``k`` = the GEMM of push ``k`` failed after ``k`` pushes
-    (``k = tp - 1`` is the own GEMM: every push issued); ``"before_wait_all"``;
-    ``"in_reduce"`` (after ``wait_all``). Returns each rank's ``[tp, m, N]`` partials view
-    (a normal boundary only), valid once the fabric ran."""
-    tp = len(transports)
-    m, n = layout.rows, layout.cols
-    views: dict[int, torch.Tensor] = {}
-    for r, transport in enumerate(transports):
-        fabric.rank = r
-        try:
-            if fail == "before_begin":
-                raise RuntimeError("injected before begin")
-            transport.begin(slot, layout)
-            for i, dst in enumerate(transport.dest_order):
-                if fail == i:
-                    raise RuntimeError(f"injected at GEMM {i}")
-                transport.push(dst, slot, _block(r, dst, m, n, index))
-                fabric.pushes[(slot, r, dst)] += 1
-            if fail == tp - 1:
-                raise RuntimeError("injected at the own GEMM")
-            transport.own_view(slot).copy_(_block(r, r, m, n, index))
-            if fail == "before_wait_all":
-                raise RuntimeError("injected before wait_all")
-            transport.wait_all(slot)
-            if fail == "in_reduce":
-                raise RuntimeError("injected inside the reduce")
-            views[r] = transport.partials(slot)
-            transport.done(slot)
-        except RuntimeError:
-            assert fail is not None, "the transport raised in a normal boundary"
-            transport.reset()  # the op body's except path
-    fabric.run()
-    return views
-
-
-def _check_partials(views: dict[int, torch.Tensor], tp: int, m: int, n: int, index: int) -> None:
-    """Every destination holds all ``tp`` partials of THIS boundary in source order and its
-    fixed-order reduce is the reference chain."""
-    assert sorted(views) == list(range(tp))
-    for d, view in views.items():
-        parts = [_block(src, d, m, n, index) for src in range(tp)]
-        for src in range(tp):
-            assert torch.equal(view[src], parts[src]), (d, src)
-        out = torch.empty((m, n), dtype=torch.bfloat16)
-        fixed_order_reduce_bf16(view, None, out)
-        assert torch.equal(out, reference_fixed_order_reduce(parts)), d
-
-
-def _assert_balanced(fabric: _Fabric, transports: list[CeReduceScatter]) -> None:
-    """The invariant the transport documents (module docstring, 'Slot state machine'): after
-    every completed boundary (``done`` or ``reset``) and for every slot ``s`` and ordered pair
-    ``p -> d``: the ``ready(s)`` flag is clear and ``puts = waits`` = the pushes ``p`` issued
-    to ``d`` on ``s`` (``uses[s]`` unless a boundary was cut short before that push); the
-    ``consumed(s)`` flag is set iff ``uses[s] > 0``, with ``puts = uses[s]`` and
-    ``waits = uses[s] - 1`` -- one unconsumed flag per wait of the next boundary, on both
-    sides."""
-    tp, slots = fabric.tp, transports[0].slots
-    for s in range(slots):
-        uses = {t._uses[s] for t in transports}
-        assert len(uses) == 1, f"slot {s}: uses differ across ranks: {uses}"
-        (uses,) = uses
-        for p in range(tp):
-            for d in range(tp):
-                if p == d:
-                    continue
-                ready, consumed = (s, p, d), (slots + s, p, d)
-                assert fabric.flags.get(ready, 0) == 0, ("ready set", s, p, d)
-                issued = fabric.pushes[(s, p, d)]
-                assert issued <= uses, ("pushes", s, p, d)
-                assert fabric.puts[ready] == fabric.waits[ready] == issued, ("ready", s, p, d)
-                assert fabric.flags.get(consumed, 0) == (1 if uses else 0), ("consumed", s, p, d)
-                assert fabric.puts[consumed] == uses, ("consumed puts", s, p, d)
-                assert fabric.waits[consumed] == max(uses - 1, 0), ("consumed waits", s, p, d)
-
-
-_RECOVERY_TPS = (2, 3, 4, 8)
-
-
-def _recovery_paths(tp: int) -> list:
-    """Every point of the op body a rank-symmetric raise can hit at ``tp`` ranks: before
-    ``begin``; at GEMM ``k`` for every ``k`` (after ``k`` pushes; ``k = tp - 1`` is the own
-    GEMM, every push issued); before ``wait_all``; inside the reduce."""
-    return ["before_begin", *range(tp), "before_wait_all", "in_reduce"]
-
-
-def _recovery_cases() -> list:
-    return [
-        pytest.param(tp, fail, id=f"tp{tp}-{fail if isinstance(fail, str) else f'gemm{fail}'}")
-        for tp in _RECOVERY_TPS
-        for fail in _recovery_paths(tp)
-    ]
-
-
-@pytest.mark.parametrize("slots", [1, 2])
-@pytest.mark.parametrize("tp", [2, 3, 4])
-def test_boundaries_keep_the_signals_balanced(tp, slots, monkeypatch):
-    """Normal boundaries: the first use of each slot skips the consumed wait, every later one
-    waits it; after each boundary the flags are balanced and every destination reduced the
-    boundary's own partials."""
-    fabric = _Fabric(tp)
-    fabric.install(monkeypatch)
-    layout = Bf16RowsRegionLayout(5, 24)
-    transports = _transports(fabric, slots, layout)
-    for index in range(3 * slots):
-        views = _boundary(fabric, transports, index % slots, layout, index)
-        _check_partials(views, tp, 5, 24, index)
-        _assert_balanced(fabric, transports)
-    assert all(t._uses == [3] * slots for t in transports)
-    # The op body's drain between forwards and a reserve that does not grow touch no flag.
-    for r, t in enumerate(transports):
-        fabric.rank = r
-        t.drain()
-        assert not t.reserve(layout)
-    fabric.run()
-    _assert_balanced(fabric, transports)
-
-
-@pytest.mark.parametrize("first_use", [False, True])
-@pytest.mark.parametrize("slots", [1, 2])
-@pytest.mark.parametrize("tp,fail", _recovery_cases())
-def test_reset_after_a_rank_symmetric_raise_keeps_the_signals_balanced(
-    tp, fail, slots, first_use, monkeypatch
-):
-    """A rank-symmetric raise at every point of the op body -- before ``begin``, at GEMM
-    ``k`` for every ``k`` (after ``k`` pushes; ``k = tp - 1`` is the own GEMM, every push
-    issued), before ``wait_all``, inside the reduce -- on a warm slot and on a slot's first
-    use, at both slot counts and ``tp`` 2, 3, 4, 8: ``reset`` completes the boundary's
-    protocol like ``done`` (the balance invariant holds right after it), the recovered slot
-    never re-enters first use, no device would trap (the job-4800143 symptom: ``reset``
-    putting ``consumed`` to a destination that never pushed in the failed boundary, a second
-    put onto a set flag), and the following boundaries are plain boundaries whose reduce is
-    the reference chain -- first with a smaller layout the reservation covers (a warm slot's
-    views are dropped and re-carved by ``_bind_layout``), then with the original."""
-    fabric = _Fabric(tp)
-    fabric.install(monkeypatch)
-    m, n = 5, 24
-    layout = Bf16RowsRegionLayout(m, n)
-    transports = _transports(fabric, slots, layout)
-    index = 0
-    for _ in range(0 if first_use else 2 * slots):
-        views = _boundary(fabric, transports, index % slots, layout, index)
-        _check_partials(views, tp, m, n, index)
-        _assert_balanced(fabric, transports)
-        index += 1
-    failed_slot = index % slots
-    uses_before = transports[0]._uses[failed_slot]
-    assert _boundary(fabric, transports, failed_slot, layout, index, fail=fail) == {}
-    _assert_balanced(fabric, transports)
-    completed = fail != "before_begin"  # nothing was in flight: reset() had nothing to release
-    assert all(t._uses[failed_slot] == uses_before + int(completed) for t in transports)
-    assert not any(any(t._in_flight) for t in transports)
-    index += 1
-    small = Bf16RowsRegionLayout(3, n)  # same aligned region, a different layout
-    assert all(t.covers(small) for t in transports)
-    for i in range(2 * slots):
-        after = small if i < slots else layout
-        views = _boundary(fabric, transports, index % slots, after, index)
-        _check_partials(views, tp, after.rows, after.cols, index)
-        _assert_balanced(fabric, transports)
-        index += 1
-    for r, t in enumerate(transports):
-        fabric.rank = r
-        t.drain()
-
-
-@pytest.mark.parametrize("first_use", [False, True])
-@pytest.mark.parametrize(
-    "pair",
-    [(0, "before_wait_all"), ("in_reduce", 0)],
-    ids=["gemm0+before_wait_all", "in_reduce+gemm0"],
-)
-@pytest.mark.parametrize("slots", [1, 2])
-@pytest.mark.parametrize("tp", _RECOVERY_TPS)
-def test_back_to_back_recoveries_keep_the_signals_balanced(tp, slots, pair, first_use, monkeypatch):
-    """Two rank-symmetric raises on every slot with no good boundary between them (from a
-    warm slot and from a slot's first use): the IDLE state ``reset`` leaves -- every
-    ``consumed`` flag set, no ``ready`` flag, ``uses`` counted -- is the one ``done`` leaves,
-    so the second recovery starts from it as a plain boundary would, and the boundaries
-    after both are plain ones whose reduce is the reference chain."""
-    fabric = _Fabric(tp)
-    fabric.install(monkeypatch)
-    m, n = 5, 24
-    layout = Bf16RowsRegionLayout(m, n)
-    transports = _transports(fabric, slots, layout)
-    index = 0
-    for _ in range(0 if first_use else slots):
-        views = _boundary(fabric, transports, index % slots, layout, index)
-        _check_partials(views, tp, m, n, index)
-        index += 1
-    for i in range(2 * slots):  # slot s fails with pair[0], then on its next use with pair[1]
-        failed = _boundary(fabric, transports, index % slots, layout, index, fail=pair[i // slots])
-        assert failed == {}
-        _assert_balanced(fabric, transports)
-        index += 1
-    assert all(t._uses == [2 + (0 if first_use else 1)] * slots for t in transports)
-    assert not any(any(t._in_flight) for t in transports)
-    for _ in range(2 * slots):
-        views = _boundary(fabric, transports, index % slots, layout, index)
-        _check_partials(views, tp, m, n, index)
-        _assert_balanced(fabric, transports)
-        index += 1
-    for r, t in enumerate(transports):
-        fabric.rank = r
-        t.drain()
-
-
-def test_fabric_detects_the_trap():
-    """The fabric fails where the pool traps: a second put onto a set flag, a wait with no put."""
-    fabric = _Fabric(2)
-    fabric.put(0, 0, 1)
-    fabric.put(0, 0, 1)
-    with pytest.raises(AssertionError, match=r"would trap .* \('put', 0, 0, 1\)"):
-        fabric.run()
-    fabric = _Fabric(2)
-    fabric.wait(1, 1, 0)
-    with pytest.raises(AssertionError, match=r"would trap .* \('wait', 1, 1, 0\)"):
-        fabric.run()
-
-
-# =============================================================================
 # CeReduceScatterState on a gloo group: the probe falls back, the registry lifecycle
 # =============================================================================
 
@@ -1136,14 +679,13 @@ def _state_logic(rank, world_size, device):
     group = dist.group.WORLD
     name = group.group_name
     recorder = _Recorder()
-    tsr.logger = ce_protocol.logger = recorder  # the probe's one warning is the base's
+    tsr.logger = ce_workspace.logger = ce_transport.logger = recorder
     with pytest.raises(ValueError, match="process group; got None"):
         CeReduceScatterState(None, name)
     with pytest.raises(ValueError, match="timeout_ms >= 0"):
         CeReduceScatterState(group, name, timeout_ms=-1)
     state = CeReduceScatterState(group, name)
-    assert state.tp_size == world_size and state.rank == rank and state.per_peer_streams
-    assert not CeReduceScatterState(group, name, per_peer_streams=False).per_peer_streams
+    assert state.tp_size == world_size and state.rank == rank
     assert not state.effective and state.reason == "not probed yet"
     assert register_rs_state(state) is state
     assert register_rs_state(CeReduceScatterState(group, name)) is state  # two TPs share one
@@ -1158,10 +700,10 @@ def _state_logic(rank, world_size, device):
     assert state.consumer_ks == {640, 1280, 3456} and state.consumer_ns == {5120}
     plan = TokenShardPlan.build(1, 8, world_size, rank)
     state.prepare(plan)  # probes: a gloo group is not a CUDA NCCL group
-    assert not state.effective and "NCCL" in state.reason
+    assert not state.effective and "transport unavailable" in state.reason
     assert state.transport is None and state.pool is None
     assert len(recorder.warnings) == 1 and state.reason in recorder.warnings[0]
-    assert "reduce-scatter" in recorder.warnings[0]
+    assert "CE transport unavailable" in recorder.warnings[0]
     state.prepare(plan)  # probed once: no second warning, still a no-op
     assert len(recorder.warnings) == 1 and not recorder.infos
     assert SLOTS == 1 and [state.next_slot() for _ in range(3)] == [0, 0, 0]
@@ -1172,16 +714,13 @@ def _state_logic(rank, world_size, device):
     with pytest.raises(RuntimeError, match="not effective"):
         _OP(x, sf, w, ws, bias, name, rank, world_size, 1, 8, plan.padded_seq_len)
 
-    # A resync disagreement raised by the transport (CeResyncError: the ranks' boundary counts
-    # differ after a failed boundary) takes the group off the protocol, CeState.disable:
-    # effective False, the reason, the error propagated (the state's one warning was already
-    # given by the probe); the adapters' next call reads effective and reduce-scatters with
-    # NCCL. Nothing was opened, so reset() must not run.
+    # Refused collective recovery disables CE and preserves the NCCL fallback.
+    # No boundary was opened, so reset must not run.
     def _raise_resync(*args):
-        raise ce_protocol.CeResyncError("boundary counts differ across the ranks: [1, 2]")
+        raise ce_workspace.CeUnavailableError("shared transport recovery failed")
 
     def _no_reset():
-        raise AssertionError("reset() must not run for a resync disagreement")
+        raise AssertionError("reset() must not run for a recovery refusal")
 
     state.effective = True
     state.transport = SimpleNamespace(
@@ -1191,9 +730,9 @@ def _state_logic(rank, world_size, device):
         begin=_raise_resync,
         reset=_no_reset,
     )
-    with pytest.raises(ce_protocol.CeResyncError, match="boundary counts differ"):
+    with pytest.raises(ce_workspace.CeUnavailableError, match="recovery failed"):
         _OP(x, sf, w, ws, bias, name, rank, world_size, 1, 8, plan.padded_seq_len)
-    assert not state.effective and "boundary counts differ" in state.reason
+    assert not state.effective and "recovery failed" in state.reason
     assert len(recorder.warnings) == 1  # one warning per state: the probe's
     state.transport = None
     release_rs_state(name)
