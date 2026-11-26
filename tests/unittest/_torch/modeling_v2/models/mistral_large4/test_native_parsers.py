@@ -5,7 +5,7 @@
 Every case runs through the serving glue streamed in every two-way split, token-sized
 pieces and seeded random pieces, and must give the one-shot result.
 
-The round-trip tests need MISTRAL_LARGE4_CHECKPOINT_DIR (its tekken.json): mistral-common
+The round-trip test uses the v15 Tekken file under LLM_MODELS_ROOT: mistral-common
 encodes an assistant message, the native tokenizer decodes the ids whole and token by token
 with special tokens kept, and the parsers must return the message.
 """
@@ -13,11 +13,11 @@ with special tokens kept, and the parsers must return the message.
 from __future__ import annotations
 
 import json
-import os
 import random
 import re
 
 import pytest
+from test_common.mistral_tekken import load_tekken
 
 from tensorrt_llm.llmapi.reasoning_parser import (
     MistralLarge4ReasoningParser,
@@ -239,11 +239,7 @@ def test_tool_call_ids_take_the_mistral_form():
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    if not os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR"):
-        pytest.skip("needs checkpoint tokenizer")
-    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
-
-    return MistralTokenizer.from_pretrained(os.environ["MISTRAL_LARGE4_CHECKPOINT_DIR"])
+    return load_tekken("v15")
 
 
 def _assistant_ids(tokenizer, assistant, after):

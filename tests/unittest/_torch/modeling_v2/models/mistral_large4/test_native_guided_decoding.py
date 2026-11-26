@@ -1,135 +1,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Guided decoding for mistral_large_4: xgrammar and llguidance over the Tekken vocabulary.
+"""Mistral-native llguidance tool-call and reasoning-before-JSON guided decoding.
 
-xgrammar matches a grammar against each token's bytes. A Tekken token is raw bytes that
-need not be valid UTF-8, so the vocabulary keeps them as bytes. Control tokens are empty
-strings, which xgrammar treats as special: a grammar never selects them, so `[INST]` or
-`[IMG]` cannot appear inside a JSON string, and end-of-sequence is the only stop token.
-
-llguidance takes the Tekken tokenizer as mistral-common wraps it: ordinary tokens are
-their bytes and control tokens are special, which a Lark grammar selects only by id
-(`<[9]>` for `[TOOL_CALLS]`). That is the form of the tool-call and reasoning grammars
-mistral-common's grammar factory renders, which a serving frontend may send as a
-request's grammar.
-
-These tests run on CPU with the Tekken file bundled with mistral-common, and with the
-checkpoint's when MISTRAL_LARGE4_CHECKPOINT_DIR names it.
+Generic Tekken vocabulary, xgrammar, and plain JSON llguidance paths are covered in
+``tests/unittest/_torch/misc/test_tekken_guided_decoding.py`` and
+``tests/unittest/_torch/models/checkpoints/mistral/test_tokenizer.py``. This module pins
+mistral-common's v15 tool-call grammars (required / named tool choices), optional
+``[THINK]...[/THINK]`` reasoning sections before tool calls or JSON responses, draft-token
+rollback across section boundaries, and strict JSON when no reasoning parser is set.
 """
 
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_common.mistral_tekken import load_tekken
 
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
-from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
 pytestmark = pytest.mark.cpu_only
 
 _SCHEMA = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
 
 
-@pytest.fixture(scope="module", params=["bundled", "checkpoint"])
-def tokenizer(request):
-    mistral_common = pytest.importorskip("mistral_common")
-    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
-
-    if request.param == "bundled":
-        files = sorted((Path(mistral_common.__file__).parent / "data").glob("tekken*.json"))
-        if not files:
-            pytest.skip("this mistral_common ships no tekken tokenizer file")
-        return MistralTokenizer.from_pretrained(str(files[-1]))
-    checkpoint = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR")
-    if not checkpoint:
-        pytest.skip("needs checkpoint tokenizer")
-    return MistralTokenizer.from_pretrained(checkpoint)
-
-
-def test_vocab_is_raw_bytes_with_control_tokens_empty(tokenizer):
-    tekken = tokenizer.tokenizer
-    info = tokenizer.xgrammar_tokenizer_info()
-    vocab = info["encoded_vocab"]
-    assert info["stop_token_ids"] == [tokenizer.eos_token_id]
-    assert len(vocab) == tekken.n_words
-    assert vocab[: tekken.num_special_tokens] == [""] * tekken.num_special_tokens
-    pieces = [tekken.id_to_byte_piece(i) for i in range(tekken.num_special_tokens, tekken.n_words)]
-    expected = ["" if piece.startswith(b"\x00") else piece for piece in pieces]
-    assert vocab[tekken.num_special_tokens :] == expected
-    # Some tokens are partial UTF-8 sequences: only bytes represent them.
-    undecodable = 0
-    for piece in pieces:
-        try:
-            piece.decode("utf-8")
-        except UnicodeDecodeError:
-            undecodable += 1
-    assert undecodable > 0
-
-
-def test_mistral_large_4_config_takes_the_byte_vocab(tokenizer):
-    config = get_guided_decoding_config("xgrammar", tokenizer)
-    assert config.backend == GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR
-    assert config.encoded_vocab == tokenizer.xgrammar_tokenizer_info()["encoded_vocab"]
-    assert config.stop_token_ids == [tokenizer.eos_token_id]
-    assert get_guided_decoding_config(None, tokenizer) is None
-
-
-def test_mistral_large_4_llguidance_config_defers_to_the_tokenizer(tokenizer):
-    from tensorrt_llm._torch.pyexecutor.py_executor_creator import _llguidance_tokenizer
-
-    config = get_guided_decoding_config("llguidance", tokenizer)
-    assert config.backend == GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
-    # The guided decoder gets the llguidance tokenizer itself, so the config carries none.
-    assert config.tokenizer_str is None and config.encoded_vocab is None
-    assert config.stop_token_ids is None
-    n_words = tokenizer.tokenizer.n_words
-    assert _llguidance_tokenizer(config, tokenizer, n_words) is not None
-    xgrammar = get_guided_decoding_config("xgrammar", tokenizer)
-    assert _llguidance_tokenizer(xgrammar, tokenizer, n_words) is None
-    with pytest.raises(ValueError, match="Unsupported guided decoding backend"):
-        get_guided_decoding_config("outlines", tokenizer)
-
-
-def _matcher(tokenizer, schema):
-    from tensorrt_llm._torch.pyexecutor.grammar_matcher import XGrammarMatcherFactory
-    from tensorrt_llm.bindings.executor import GuidedDecodingParams
-
-    config = get_guided_decoding_config("xgrammar", tokenizer)
-    factory = XGrammarMatcherFactory(config, vocab_size_padded=tokenizer.tokenizer.n_words)
-    return factory.create(
-        GuidedDecodingParams(GuidedDecodingParams.GuideType.JSON_SCHEMA, json.dumps(schema))
-    )
-
-
-@pytest.mark.parametrize("text", ['{"city": "Paris"}', '{"city": "巴黎 São Paulo 🙂"}'])
-def test_xgrammar_accepts_the_tokens_of_a_valid_answer(tokenizer, text):
-    matcher = _matcher(tokenizer, _SCHEMA)
-    for token_id in tokenizer.tokenizer.encode(text, bos=False, eos=False):
-        assert matcher.accept_token(token_id), token_id
-    assert matcher.accept_token(tokenizer.eos_token_id)
-    assert matcher.is_terminated()
-
-
-def test_xgrammar_never_allows_control_tokens_inside_a_string(tokenizer):
-    import xgrammar
-
-    tekken = tokenizer.tokenizer
-    matcher = _matcher(tokenizer, _SCHEMA)
-    for token_id in tekken.encode('{"city": "', bos=False, eos=False):
-        assert matcher.accept_token(token_id), token_id
-    bitmask = xgrammar.allocate_token_bitmask(1, tekken.n_words)
-    matcher.fill_next_token_bitmask(bitmask, 0)
-    allowed = [
-        token_id
-        for token_id in range(tekken.n_words)
-        if (int(bitmask[0, token_id // 32]) >> (token_id % 32)) & 1
-    ]
-    assert allowed, "a JSON string accepts ordinary text"
-    assert min(allowed) >= tekken.num_special_tokens
+@pytest.fixture(scope="module")
+def tokenizer():
+    return load_tekken("v15")
 
 
 _WEATHER_TOOL = {
@@ -152,26 +50,6 @@ _WEATHER_TOOL = {
 def llg(tokenizer):
     pytest.importorskip("llguidance")
     return tokenizer.llguidance_tokenizer(tokenizer.tokenizer.n_words)
-
-
-def test_llguidance_tokenizer_is_tekken(tokenizer, llg):
-    tekken = tokenizer.tokenizer
-    assert llg.vocab_size == tekken.n_words
-    assert llg.eos_token == tokenizer.eos_token_id
-    assert all(llg.is_special_token(i) for i in range(tekken.num_special_tokens))
-    # llguidance marks special tokens with a leading 0xFF byte, which no UTF-8 text has; the
-    # raw 0xFF byte token reads as special too.
-    ordinary = [
-        i
-        for i in range(tekken.num_special_tokens, 2000)
-        if not tekken.id_to_byte_piece(i).startswith(b"\xff")
-    ]
-    assert len(ordinary) > 900
-    assert not any(llg.is_special_token(i) for i in ordinary)
-    for text in ("Hello, world!", '{"city": "巴黎 São Paulo 🙂"}'):
-        ids = tekken.encode(text, bos=False, eos=False)
-        assert llg.tokenize_str(text) == ids
-        assert llg.decode_bytes(ids) == text.encode()
 
 
 def _llg_matcher(tokenizer, llg, guide_type, guide):
@@ -221,16 +99,6 @@ def _allowed(matcher, n_words):
     bitmask = torch.zeros(1, (n_words + 31) // 32, dtype=torch.int32)
     matcher.fill_next_token_bitmask(bitmask, 0)
     return {i for i in range(n_words) if (int(bitmask[0, i // 32]) >> (i % 32)) & 1}
-
-
-def test_llguidance_json_schema_over_tekken(tokenizer, llg):
-    matcher = _llg_matcher(tokenizer, llg, "JSON_SCHEMA", json.dumps(_SCHEMA))
-    assert _consume(matcher, tokenizer.tokenizer.encode('{"city": "Paris"}', bos=False, eos=False))
-    assert matcher.accept_token(tokenizer.eos_token_id)
-    matcher = _llg_matcher(tokenizer, llg, "JSON_SCHEMA", json.dumps(_SCHEMA))
-    assert _consume(matcher, tokenizer.tokenizer.encode('{"city": "', bos=False, eos=False))
-    allowed = _allowed(matcher, tokenizer.tokenizer.n_words)
-    assert allowed and min(allowed) >= tokenizer.tokenizer.num_special_tokens
 
 
 def test_llguidance_tool_call_grammar_from_mistral_common(tokenizer, llg):
@@ -475,20 +343,22 @@ def test_llguidance_json_response_without_reasoning_parser_starts_at_the_json(
 def test_llguidance_json_schema_lark_needs_llguidance_and_a_grammar_tokenizer(tokenizer):
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _llguidance_json_schema_lark
 
+    for candidate in (tokenizer, load_tekken("bundled")):
+        llguidance = get_guided_decoding_config("llguidance", candidate)
+        xgrammar = get_guided_decoding_config("xgrammar", candidate)
+        # A tokenizer mistral-common renders no grammars for (the bundled Tekken file is older
+        # than v11) constrains JSON from its first token.
+        rendered = _llguidance_json_schema_lark(
+            llguidance, candidate, reasoning_parser="mistral_large_4"
+        )
+        assert (rendered is not None) is candidate.renders_grammars
+        assert _llguidance_json_schema_lark(llguidance, candidate, reasoning_parser=None) is None
+        assert _llguidance_json_schema_lark(llguidance, candidate) is None
+        assert (
+            _llguidance_json_schema_lark(xgrammar, candidate, reasoning_parser="mistral_large_4")
+            is None
+        )
     llguidance = get_guided_decoding_config("llguidance", tokenizer)
-    xgrammar = get_guided_decoding_config("xgrammar", tokenizer)
-    # A tokenizer mistral-common renders no grammars for (the bundled Tekken file is older
-    # than v11) constrains JSON from its first token.
-    rendered = _llguidance_json_schema_lark(
-        llguidance, tokenizer, reasoning_parser="mistral_large_4"
-    )
-    assert (rendered is not None) is tokenizer.renders_grammars
-    assert _llguidance_json_schema_lark(llguidance, tokenizer, reasoning_parser=None) is None
-    assert _llguidance_json_schema_lark(llguidance, tokenizer) is None
-    assert (
-        _llguidance_json_schema_lark(xgrammar, tokenizer, reasoning_parser="mistral_large_4")
-        is None
-    )
     no_grammars = SimpleNamespace(renders_grammars=False)
     assert (
         _llguidance_json_schema_lark(llguidance, no_grammars, reasoning_parser="mistral_large_4")

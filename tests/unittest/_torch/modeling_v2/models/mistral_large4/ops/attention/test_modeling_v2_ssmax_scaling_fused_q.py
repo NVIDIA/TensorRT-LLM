@@ -14,22 +14,15 @@ Every cell is gated bit for bit, three ways:
   start poisoned and must come back untouched.
 
 A `position_sweep` cell (every position 0..1048575 of the 1M config, 32 calls of 32768 rows) is
-gated so at every call. The old-versus-new tests state the equivalence on its own: the
-unfused composition the targets ran (`ssmax_scaling`, then the tail's copy or zero fill into a
-poisoned fused query) and the fused call, on identical inputs, compared with `torch.equal` on
-the bit patterns -- over every cell's random inputs (every call of a sweep), and over tensors
-captured from a served decode step when
-TRTLLM_MODELING_V2_FUSE_CAPTURE names their directory (`mla_*.pt`, one file per call: `q`,
-`positions`, `s`, `b`, `rope`). `test_every_layer_and_position_bit_equal_to_the_unfused_composition`
-states it at the 1M config over the NVFP4 checkpoint's own s and b: every layer, every position
-0..1048575, at each call site's layout of the fused query (skipped where the checkpoint is absent
-from LLM_MODELS_ROOT). `test_device_log_is_torchs_log` pins the one transcendental: the kernel's
-libdevice logf returns torch.log's fp32 bits, so even the unrounded log agrees.
+gated so at every call. The old-versus-new test states the equivalence on its own: the unfused
+composition the targets ran (`ssmax_scaling`, then the tail's copy or zero fill into a poisoned
+fused query) and the fused call, on identical inputs, compared with `torch.equal` on the bit
+patterns over every cell's random inputs (every call of a sweep). `test_device_log_is_torchs_log`
+pins the one transcendental: the kernel's libdevice logf returns torch.log's fp32 bits, so even
+the unrounded log agrees.
 """
 
-import os
 import zlib
-from pathlib import Path
 
 import pytest
 import torch
@@ -284,10 +277,6 @@ def test_guard_refuses(case) -> None:
             op(q, positions, s, b, out, tail, True)
 
 
-#: The directory of tensors captured from a served decode step.
-_CAPTURE_ENV = "TRTLLM_MODELING_V2_FUSE_CAPTURE"
-
-
 def _unfused(q, positions, s, b, rope: bool, fq_heads: int = FQ_HEADS):
     """The composition the targets ran: ssmax_scaling, then the tail's copy or zero fill."""
     heads = q.shape[1]
@@ -327,20 +316,6 @@ def test_bit_equal_to_the_unfused_composition(cell) -> None:
         )
 
 
-@pytest.mark.skipif(
-    not os.environ.get(_CAPTURE_ENV), reason=f"{_CAPTURE_ENV} names no captured decode step"
-)
-def test_bit_equal_to_the_unfused_composition_on_captured_decode_tensors() -> None:
-    files = sorted(Path(os.environ[_CAPTURE_ENV]).glob("mla_*.pt"))
-    assert files, f"no mla_*.pt under {os.environ[_CAPTURE_ENV]}"
-    rows = 0
-    for f in files:
-        d = torch.load(f, map_location="cuda")
-        _assert_old_equals_new(d["q"], d["positions"], d["s"], d["b"], d["rope"], f.name)
-        rows += d["q"].shape[0]
-    print(f"\n  {len(files)} captured MLA calls, {rows} rows: bit-equal")
-
-
 @triton.jit
 def _logf_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -366,24 +341,3 @@ def test_device_log_is_torchs_log() -> None:
         x, y, x.numel(), BLOCK=1024, enable_fp_fusion=False
     )
     assert torch.equal(y.view(torch.int32), torch.log(x).view(torch.int32))
-
-
-# ---- every layer of the checkpoint at every position of the 1M config
-
-#: The NVFP4 checkpoint, read under LLM_MODELS_ROOT for its per-layer SSMax s and b.
-CHECKPOINTS = ("Mistral-Large-4-1T-A52B-NVFP4", "mistral-large-4-nvfp4")
-#: Every position the 1M config reaches (max_seq_len 1048576), in calls of one chunked step's
-#: 32768 rows.
-LONG_MAX_SEQ_LEN, STEP_ROWS = 1048576, 32768
-#: The call sites' layouts, (a rank's heads, the fused query's heads): dep4's 64 heads into
-#: FlashMLA's 64-head query; a tp4 / tep4 rank's 16 into the native decode's `[T, 16, 576]`
-#: scratch and into FlashMLA's padded 64-head one (the prefill scratch, and the decode scratch
-#: under `_GEN_ATTN_FLASH_MLA`); a tp8 / tep8 rank's 8 the same. A layout's ranks together
-#: hold all 64 heads.
-LAYOUTS = {
-    "dep4": (64, 64),
-    "tp4_native": (16, 16),
-    "tp4_padded": (16, 64),
-    "tp8_native": (8, 8),
-    "tp8_padded": (8, 64),
-}

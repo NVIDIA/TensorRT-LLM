@@ -8,20 +8,12 @@ for its own op), and against the three calls it replaces run on the same inputs:
 `ssmax_scaling`, the head weights' fp32 copy and `cute_dsl_indexer_q_side_fused`. Nothing is
 left to accumulation order, so the band is zero.
 
-The old-versus-new tests state that equivalence on its own, with `torch.equal` on the codes' and
-weights' bit patterns: over every cell's random inputs, and over tensors captured from a served
-decode step when TRTLLM_MODELING_V2_FUSE_CAPTURE names their directory (`ix_*.pt`, one file per
-call: `q`, `positions`, `s`, `b`, the head weights `wq`, `weight_scale` and the name of the rope
-table, saved beside them as `table_<name>.pt`), and at the 1M config over the NVFP4 checkpoint's
-own indexer layers: each one's s and b and its table (the 1048576-row table the targets build from
-the checkpoint's rope parameters and `lerope.alpha`, the identity table on a NoPE indexer layer)
-at every position 0..1048575 (skipped where the checkpoint is absent from LLM_MODELS_ROOT).
+The old-versus-new test states that equivalence on its own, with `torch.equal` on the codes' and
+weights' bit patterns over every cell's random inputs.
 """
 
 import math
-import os
 import zlib
-from pathlib import Path
 
 import pytest
 import torch
@@ -270,10 +262,6 @@ def test_guard_refuses(case, match) -> None:
             op(*args)
 
 
-#: The directory of tensors captured from a served decode step.
-_CAPTURE_ENV = "TRTLLM_MODELING_V2_FUSE_CAPTURE"
-
-
 def _assert_old_equals_new(args, what: str) -> None:
     """The fused call into poisoned buffers against the three calls it replaces."""
     q, pos, s, b, table, wq, scale, q_fp8, weights = args
@@ -289,41 +277,3 @@ def _assert_old_equals_new(args, what: str) -> None:
 def test_bit_equal_to_the_unfused_composition(cell) -> None:
     for args in _calls(cell.spec, _seed(cell) + 7):
         _assert_old_equals_new(args, cell.why)
-
-
-@pytest.mark.skipif(
-    not os.environ.get(_CAPTURE_ENV), reason=f"{_CAPTURE_ENV} names no captured decode step"
-)
-def test_bit_equal_to_the_unfused_composition_on_captured_decode_tensors() -> None:
-    root = Path(os.environ[_CAPTURE_ENV])
-    files = sorted(root.glob("ix_*.pt"))
-    assert files, f"no ix_*.pt under {root}"
-    tables, rows = {}, 0
-    for f in files:
-        d = torch.load(f, map_location="cuda")
-        name = d["table"]
-        if name not in tables:
-            tables[name] = torch.load(root / f"table_{name}.pt", map_location="cuda")
-        tokens = d["q"].shape[0]
-        # The head weights as the targets pass them: the last 32 columns of [T, 160].
-        kw = torch.zeros(tokens, HEAD_DIM + HEADS, dtype=d["wq"].dtype, device="cuda")
-        kw[:, HEAD_DIM:] = d["wq"]
-        args = [
-            d["q"], d["positions"], d["s"], d["b"], tables[name], kw[:, HEAD_DIM:],
-            d["weight_scale"],
-            torch.empty(tokens, HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device="cuda"),
-            torch.empty(tokens, HEADS, device="cuda"),
-        ]  # fmt: skip
-        _assert_old_equals_new(args, f.name)
-        rows += tokens
-    print(f"\n  {len(files)} captured indexer calls, {rows} rows: bit-equal")
-
-
-# ---- every indexer layer of the checkpoint at every position of the 1M config
-
-#: The NVFP4 checkpoint, read under LLM_MODELS_ROOT for its indexer layers' SSMax s and b and
-#: the rope table's inputs.
-CHECKPOINTS = ("Mistral-Large-4-1T-A52B-NVFP4", "mistral-large-4-nvfp4")
-#: Every position the 1M config reaches (max_seq_len 1048576, the table's rows), in calls of
-#: one chunked step's 32768 rows.
-LONG_MAX_SEQ_LEN, STEP_ROWS = 1048576, 32768

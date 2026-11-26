@@ -1,52 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Mistral Large 4 NVFP4 tp4 weight table against the checkpoint it reads, at tp4 (four ranks on
-one node) and at tp8 (eight ranks over two nodes of four).
+"""The Mistral Large 4 NVFP4 tp4/tp8 weight table, manifest, and synthetic CPU load tests.
 
 No GPU. Against the tep4 table only the routed experts move: every rank holds all 128 experts of
 a layer, each cut along its intermediate width to rank r's I -- `w1`/`w3` codes and block scales
 by output rows `[Ir, Ir + I)`, `w2`'s codes by input bytes `[Ir/2, (I/2)(r + 1))` and its block
 scales by columns `[Ir/16, (I/16)(r + 1))` -- and the MoE runner's layout is applied to that
-slice. I is 1536 at tp4 (768 code bytes, 96 scale columns) and 768 at tp8 (384 and 48). Four
-kinds of evidence, at each world size:
+slice. I is 1536 at tp4 (768 code bytes, 96 scale columns) and 768 at tp8 (384 and 48). Two kinds
+of evidence, at each world size (tp4 and tp8):
 
-* the table at the checkpoint's own language-model configuration (written out below, and
-  compared with the configuration adapted from the checkpoint's `params.json` when it is
-  present) on each rank of the engine's mapping (tp and moe_tp at the world size, moe_ep 1, four
-  ranks per node): which layers carry which weight at what per-rank shape, that every rank's
-  manifest reads every expert through its width slice, and that the ranks' slices tile each
-  expert exactly once;
-* the checkpoint itself, through its index and safetensors headers, as meta tensors, plus the
-  values of its small scale tensors: every rank reads all 1,721 language-model keys, all
-  109,056 expert keys and all 276 vision-tower keys, each at the per-rank shape and dtype
-  `_PER_RANK` states, 157,212,207,424 bytes (146.42 GiB) at tp4 and 82,442,488,768 bytes
-  (76.78 GiB) at tp8 -- the language model's 153,803,770,176 and 79,034,051,520 and the vision
-  tower's 3,408,437,248, whole -- which is also what the production `load` itself reads; the
-  index `load` takes of every key on every rank -- the ranks' head, row, column and vocabulary
-  ranges and expert width slices tile each sliced tensor exactly once, everything else is read
-  whole; the production `load` -- every slice, transform, shape and dtype assert, the
-  expert-scalar asserts on the checkpoint's own scalars and the two-way coverage assert, the
-  DSpark draft its only known-not-loaded set -- passes on each rank; every FP8 block scale and
-  every expert scalar satisfies the invariants `load` asserts;
-  and the packed UE8M0 scale operand at each K a rank's slice gives (at tp8 `wo` at 1024, the
-  dense `w2` at 3072, the shared expert's `w2` at 768: 6 blocks, a half-padding second word)
-  equals an independent byte-level packing and the engine's `transform_sf_into_required_layout`;
-* the checkpoint's bytes for sampled experts of layers 1, 35 and 71: the production `load` puts
-  each rank's slice of them, in the runner layout, exactly where the stock TRTLLM-Gen NVFP4 MoE
-  preparation at moe_tp_size 4 or 8 puts it (its own slicing, permutations and scale
-  interleave, run on CPU), and where the whole stored expert, cut here and laid out by this
-  file's own construction, puts it; the ranks' slices, read through the production shards,
-  reassemble the stored tensors; and the whole expert laid out before slicing differs wherever
-  the layout depends on the slice (the negative control). Skipped where the checkpoint is
-  absent (looked up as `mistral-large-4-nvfp4` or `Mistral-Large-4-1T-A52B-NVFP4` under
-  `LLM_MODELS_ROOT`);
+* the table at the checkpoint's language-model configuration on each rank of the engine's mapping
+  (tp and moe_tp at the world size, moe_ep 1, four ranks per node): which layers carry which weight
+  at what per-rank shape, that every rank's manifest reads every expert through its width slice,
+  that the ranks' slices tile each expert exactly once, that per-rank slices satisfy the MoE
+  runner's unpadded layout alignment, and that manifest and declaration agree;
 * a scaled-down configuration with real CPU tensors, loaded on every rank and compared element
   for element with an independent construction of what each parameter must hold: the slices,
   the `wkv_b` regroup, both half orders, the packed scale operand padding included (at tp8 the
   dense `w2` at a 6-block K here too), every expert's width slice in the MoE runner's layout and
-  its scalars, and the DSpark draft tensors left alone; plus what the streaming path reads off
-  the shard files -- each expert code and block scale as this rank's slice of the entry, never
-  the whole, and each file's cached pages dropped once read -- and each assert's refusal.
+  its scalars, DSpark draft manifests, dummy int32 FP8 scale initialization, shard streaming, and
+  each assert's refusal.
 """
 
 from __future__ import annotations
@@ -76,11 +49,8 @@ pytestmark = pytest.mark.cpu_only
 WORLDS = (4, 8)
 #: GB300 nodes carry four devices.
 GPUS_PER_NODE = 4
-CHECKPOINTS = ("mistral-large-4-nvfp4", "Mistral-Large-4-1T-A52B-NVFP4")
 
 _LAYERS = 72
-#: The DSpark draft's keys, all in the checkpoint's last shard, which no rank reads.
-_DRAFT_KEYS = 38
 
 #: The language-model configuration surface the table reads, at the checkpoint's values. The
 #: checkpoint's configuration adds its vision encoder, whose rows are checked against the
@@ -276,20 +246,8 @@ _PER_RANK = {
     world: {**_PER_RANK_WHOLE, **_PER_RANK_SHARDED[world], **_PER_RANK_VISION} for world in WORLDS
 }
 
-#: What each rank moves of the language model, from the headers (also plain arithmetic on them,
-#: apart from the table: a quarter or an eighth of every expert code and block scale, every
-#: expert scalar, the rest as at tep4 or tep8). tep8's rank moves 79,033,860,672 bytes of it,
-#: its 16 whole experts 72,364,354,176 of them: the same bytes up to the per-tensor scalars of
-#: the 112 experts a tep8 rank does not hold, 71 x 112 x 6 x 4 = 190,848 bytes.
-_RANK_LM_BYTES = {4: 153_803_770_176, 8: 79_034_051_520}
-_RANK_EXPERT_BYTES = {4: 144_728_871_936, 8: 72_364_545_024}
-#: The same in GiB, to the second decimal: (rank, routed experts).
+#: The language model and routed experts in GiB, to the second decimal: (rank, routed experts).
 _RANK_GIB = {4: (143.24, 134.79), 8: (73.61, 67.39)}
-#: The vision tower's keys and bytes (3.17 GiB), and all a rank moves: the language model and
-#: the vision tower, 146.42 GiB at tp4 and 76.78 GiB at tp8.
-_VISION_KEYS, _VISION_BYTES = 276, 3_408_437_248
-_RANK_BYTES = {world: n + _VISION_BYTES for world, n in _RANK_LM_BYTES.items()}
-_RANK_READ_GIB = {4: 146.42, 8: 76.78}
 
 
 @pytest.fixture(autouse=True)

@@ -1,37 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Mistral Large 4 NVFP4 dep4 weight table against the checkpoint it reads, at both of the worlds
-it serves: four ranks on one node, and eight on two nodes of four (dep8; rank r is local rank
-r % 4 on node r // 4); attention data parallel, the routed experts expert-parallel over every
-rank.
+"""The Mistral Large 4 NVFP4 dep4/dep8 weight table, manifest, and synthetic CPU load tests.
 
-No GPU. Three kinds of evidence:
+No GPU. Attention data parallel, with routed experts expert-parallel over every rank, at both
+worlds the table serves (dep4 on one node of four; dep8 on two nodes of four). Two kinds of
+evidence:
 
-* the table at the checkpoint's own language-model configuration (written out below, and
-  compared with the configuration adapted from the checkpoint's `params.json` when it is
-  present): which layers carry which weight at what per-rank shape -- every head and the full
-  MLP widths on every rank -- and that each rank's manifest reads only its own routed experts
-  (32 at four ranks, 16 at eight) and the same replicated rest, the windows tiling the 128
-  experts exactly once, at eight ranks the first four on node 0 and the last four on node 1;
-* the checkpoint itself, through its index and safetensors headers, as meta tensors, plus the
-  values of its small scale tensors: what each key stores; the union of the ranks' sources is
-  exactly the index's keys but the DSpark draft's, which every rank declares unconsumed; each
-  rank consumes all 1,721 language-model keys and all 276 vision-tower keys whole and its
-  window's expert keys, 27,264 and 159.86 GiB in all at four ranks, 13,632 and 92.46 GiB at
-  eight, 3.17 GiB of it the vision tower; the production `load` -- every transform, shape and
-  dtype assert, the expert-scalar asserts on the checkpoint's own scalars and the two-way
-  coverage assert -- passes on each rank, reading each key once and whole, beyond the manifest
-  only the other ranks' expert scalars, for the asserts (163,584 B at four ranks, 190,848 B at
-  eight); at eight ranks each node's four ranks read 294.65 GiB of distinct bytes; and every
-  FP8 block scale and every expert scalar satisfies the invariants `load` asserts. Skipped
-  where the checkpoint is absent (looked up as `mistral-large-4-nvfp4` or
-  `Mistral-Large-4-1T-A52B-NVFP4` under `LLM_MODELS_ROOT`);
-* a scaled-down configuration with real CPU tensors, loaded on every rank and compared
-  element for element with an independent construction of what each parameter must hold:
-  the replicated weights whole and identical on every rank, the `wkv_b` regroup, both half
-  orders, the packed scale operand, the expert window in the MoE runner's layout and its
-  scalars, the whole `lm_head`, and the DSpark draft tensors left alone; plus what the
-  streaming path reads off the shard files, and each assert's refusal.
+* the table at the checkpoint's language-model configuration: which layers carry which weight at
+  what per-rank shape -- every head and the full MLP widths on every rank -- that each rank's
+  manifest reads only its own routed experts (32 at four ranks, 16 at eight) and the same
+  replicated rest, the windows tiling the 128 experts exactly once, and that manifest and
+  declaration agree;
+* a scaled-down configuration with real CPU tensors, loaded on every rank and compared element for
+  element with an independent construction of what each parameter must hold: the replicated weights
+  whole and identical on every rank, the `wkv_b` regroup, both half orders, the packed scale
+  operand, the expert window in the MoE runner's layout and its scalars, the whole `lm_head`, DSpark
+  draft manifests, shard streaming, and each assert's refusal.
 """
 
 from __future__ import annotations
@@ -60,7 +44,6 @@ pytestmark = pytest.mark.cpu_only
 WORLDS = (4, 8)
 #: Devices per GB300 node on this cluster: one node holds four ranks, two hold eight.
 GPUS_PER_NODE = 4
-CHECKPOINTS = ("mistral-large-4-nvfp4", "Mistral-Large-4-1T-A52B-NVFP4")
 
 _LAYERS = 72
 _EXPERTS = 128
@@ -76,20 +59,6 @@ _each_rank = pytest.mark.parametrize(
 #: Per world, a rank's declared routed experts and all its language-model parameters with the
 #: whole lm_head (GiB), as the table declares them at `_CONFIG`.
 _DECLARED_GIB = {4: (134.79, 156.80), 8: (67.39, 89.41)}
-#: The BF16 vision tower -- encoder, pre-projector norm, patch merger and language adapter --
-#: which every rank reads whole: its keys and bytes in the checkpoint (3.17 GiB).
-_VISION_KEYS, _VISION_BYTES = 276, 3_408_437_248
-#: The DSpark draft's keys, all in the checkpoint's last shard, which no rank reads.
-_DRAFT_KEYS = 38
-#: Per world, what one rank reads off the checkpoint: its window of routed experts (GiB), the
-#: window with the replicated rest, the vision tower among it (bytes and GiB), and what the
-#: production `load` reads in all -- that and the other ranks' expert scalars, for its asserts
-#: -- in keys and bytes.
-_READS = {
-    4: dict(window_gib=134.79, total=171_644_394_304, total_gib=159.86, keys=70157),
-    8: dict(window_gib=67.39, total=99_280_040_128, total_gib=92.46, keys=63341),
-}
-_LOAD_READ = {4: 171_644_557_888, 8: 99_280_230_976}
 
 #: The language-model configuration surface the table reads, at the checkpoint's values. The
 #: checkpoint's configuration adds its vision encoder, whose rows are checked against the

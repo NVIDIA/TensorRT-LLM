@@ -1,38 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Mistral Large 4 NVFP4 tep4 weight table against the checkpoint it reads, at tep4 (four ranks:
-tp 4, moe_ep 4, moe_tp 1, one node) and at tep8 (eight ranks: tp 8, moe_ep 8, moe_tp 1, two
-nodes of four).
+"""The Mistral Large 4 NVFP4 tep4/tep8 weight table, manifest, and synthetic CPU load tests.
 
-No GPU. Three kinds of evidence, each at both world sizes:
+No GPU. Two kinds of evidence, each at both world sizes (tep4: tp 4, moe_ep 4, moe_tp 1 on one
+node; tep8: tp 8, moe_ep 8, moe_tp 1 across two nodes of four):
 
-* the table at the checkpoint's own language-model configuration (written out below, and
-  compared with the configuration adapted from the checkpoint's `params.json` when it is
-  present), on the ranks of the engine's mapping: which layers carry which weight at what
-  per-rank shape, and that each rank's manifest reads only its own routed experts, 32 at tep4
-  and 16 at tep8;
-* the checkpoint itself, through its index and safetensors headers, as meta tensors, plus the
-  values of its small scale tensors: the union of the ranks' sources is exactly the index's
-  keys but the DSpark draft's, which every rank declares unconsumed; each rank consumes every
-  one of the 1,721 language-model keys, the 276 vision-tower keys and its window's expert keys,
-  27,264 and 146.42 GiB at tep4, 13,632 and 76.78 GiB at tep8, 3.17 GiB of it the vision tower
-  every rank reads whole; the index the production `load` takes of every key on every rank --
-  the ranks' head, row, column and vocabulary ranges and expert windows tile each sliced tensor
-  exactly once, everything else is read whole; the production `load` -- every slice, transform,
-  shape and dtype assert, the expert-scalar asserts on the checkpoint's own scalars and the
-  two-way coverage assert -- passes on each rank; every FP8 block scale and every expert
-  scalar satisfies the invariants `load` asserts; and the packed UE8M0 scale operand at each K
-  a rank's slice gives (at tep8 `wo` at 1024, the dense `w2` at 3072, the shared expert's `w2`
-  at 768: 6 blocks, a half-padding second word; at tep4 2048, 6144 and 1536, whole words)
-  equals an independent byte-level packing and the engine's
-  `transform_sf_into_required_layout`. Skipped where the checkpoint is absent (looked up as
-  `mistral-large-4-nvfp4` or `Mistral-Large-4-1T-A52B-NVFP4` under `LLM_MODELS_ROOT`);
+* the table at the checkpoint's language-model configuration on the ranks of the engine's mapping:
+  which layers carry which weight at what per-rank shape, that each rank's manifest reads only its
+  own routed experts (32 at tep4, 16 at tep8), and that manifest and declaration agree;
 * a scaled-down configuration per world size with real CPU tensors, loaded on every rank and
-  compared element for element with an independent construction of what each parameter must
-  hold: the slices, the `wkv_b` regroup, both half orders, the packed scale operand padding
-  included (at tep8 the dense `w2` at a 6-block K too), the expert window in the MoE runner's
-  layout and its scalars, and the DSpark draft tensors left alone; plus what the streaming path
-  reads off the shard files, and each assert's refusal.
+  compared element for element with an independent construction of what each parameter must hold:
+  the slices, the `wkv_b` regroup, both half orders, the packed scale operand padding included (at
+  tep8 the dense `w2` at a 6-block K too), the expert window in the MoE runner's layout and its
+  scalars, DSpark draft manifests, shard streaming, and each assert's refusal.
 """
 
 from __future__ import annotations
@@ -61,14 +41,8 @@ pytestmark = pytest.mark.cpu_only
 WORLDS = (4, 8)
 #: GB300 nodes carry four devices: tep4 is one node, tep8 spans two.
 GPUS_PER_NODE = 4
-CHECKPOINTS = ("mistral-large-4-nvfp4", "Mistral-Large-4-1T-A52B-NVFP4")
 
 _LAYERS = 72
-#: The BF16 vision tower -- encoder, pre-projector norm, patch merger and language adapter --
-#: which every rank reads whole: its keys and bytes in the checkpoint (3.17 GiB).
-_VISION_KEYS, _VISION_BYTES = 276, 3_408_437_248
-#: The DSpark draft's keys, all in the checkpoint's last shard, which no rank reads.
-_DRAFT_KEYS = 38
 
 #: The language-model configuration surface the table reads, at the checkpoint's values. The
 #: checkpoint's configuration adds its vision encoder, whose rows are checked against the

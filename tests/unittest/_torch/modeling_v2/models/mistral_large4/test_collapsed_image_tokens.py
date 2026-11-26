@@ -17,8 +17,9 @@ reasoning effort, an image larger than the encoder's maximum size, and JPEG / RG
 palette PNG inputs. The images reach the processor as decoded PIL images in RGB,
 transparency composited over white, while trtllm-serve loads the same bytes itself.
 
-CPU only. Needs MISTRAL_LARGE4_CHECKPOINT_DIR (the checkpoint's tekken.json and
-params.json) and OpenCV, which mistral-common's image resize uses.
+CPU only. Uses the v15 Tekken file under LLM_MODELS_ROOT (which carries the same Pixtral
+image encoder geometry as Mistral Large 4) and OpenCV, which mistral-common's image resize
+uses.
 """
 
 from __future__ import annotations
@@ -26,31 +27,35 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import os
 from io import BytesIO
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
+from test_common.llm_data import llm_models_root
+from test_common.mistral_tekken import TEKKEN_CHECKPOINT_FILES
 
 pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(scope="module")
 def native_processor():
-    if not os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR"):
-        pytest.skip("needs the checkpoint's tokenizer and configuration")
     pytest.importorskip("cv2")
-    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.routing import serves_images
-    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
+    pytest.importorskip("mistral_common")
+    from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
     from tensorrt_llm._torch.models.modeling_mistral import MistralNativeInputProcessor
 
-    path = os.environ["MISTRAL_LARGE4_CHECKPOINT_DIR"]
-    config = MistralConfigLoader().load_pretrained_config(path)
-    if not serves_images(config):
-        pytest.skip(f"{path}: this checkpoint's target serves text only")
-    return MistralNativeInputProcessor(path, config, None)
+    root = llm_models_root()
+    tekken = None if root is None else root / TEKKEN_CHECKPOINT_FILES["v15"]
+    if tekken is None or not tekken.is_file():
+        pytest.skip("no v15 Tekken file")
+    config = MistralLarge4Config(
+        dtype="bfloat16",
+        vocab_size=131072,
+        vision_config={"image_size": 1540, "patch_size": 14, "spatial_merge_size": 2},
+    )
+    return MistralNativeInputProcessor(str(tekken.parent), config, None)
 
 
 def _noise(seed: int, height: int, width: int, mode: str = "RGB") -> Image.Image:
@@ -242,7 +247,7 @@ def _cases():
                 }
             ],
             None,
-            "low",
+            "none",
         ),
     }
 

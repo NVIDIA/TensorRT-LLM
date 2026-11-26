@@ -2203,27 +2203,19 @@ def test_native_text_chat_keeps_control_ids_through_harness(
 
 def _real_tekken(source):
     """A real tekken MistralTokenizer and the chat kwargs its instruct version accepts."""
-    mistral_common = pytest.importorskip("mistral_common")
-    from pathlib import Path
+    from test_common.mistral_tekken import load_tekken
 
-    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
-
+    tokenizer = load_tekken(source)
     if source == "bundled":
         # Instruct v3 has no model settings, so it rejects reasoning_effort.
-        files = sorted((Path(mistral_common.__file__).parent / "data").glob("tekken*.json"))
-        if not files:
-            pytest.skip("this mistral_common ships no tekken tokenizer file")
-        return MistralTokenizer.from_pretrained(str(files[-1])), [{}]
-    checkpoint = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR")
-    if not checkpoint:
-        pytest.skip("MISTRAL_LARGE4_CHECKPOINT_DIR names no Mistral Large 4 checkpoint")
-    return MistralTokenizer.from_pretrained(checkpoint), [
-        {"reasoning_effort": "low"},
+        return tokenizer, [{}]
+    return tokenizer, [
+        {"reasoning_effort": "none"},
         {"reasoning_effort": "high"},
     ]
 
 
-@pytest.mark.parametrize("source", ["bundled", "checkpoint"])
+@pytest.mark.parametrize("source", ["bundled", "v15"])
 def test_native_text_chat_real_tekken_keeps_control_ids(source):
     """The envelope carries exactly mistral-common's chat tokens.
 

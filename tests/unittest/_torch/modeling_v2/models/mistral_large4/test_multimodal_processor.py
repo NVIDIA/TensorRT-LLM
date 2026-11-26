@@ -16,18 +16,16 @@ Mistral Large 4 composite config is "mistral_large_4"; with the metadata registe
 under "mistral_common" every image chat request was refused with
 `TypeError: Unknown modality: image`.
 
-The conversion and placeholder tests run on CPU. The end-to-end test runs the
-processor on the boot image when MISTRAL_LARGE4_CHECKPOINT_DIR names the checkpoint
-(its tekken.json) and OpenCV is installed (mistral-common's image encoder needs
-it): every format gives the same token ids and pixels, and the geometry the
-Mistral Large 4 tower and its splice expect.
+The conversion and placeholder tests run on CPU. The end-to-end tests run the processor
+with the v15 Tekken file under LLM_MODELS_ROOT (which carries the same Pixtral image
+encoder geometry as Mistral Large 4) and OpenCV: every format gives the same token ids
+and pixels, and the geometry the Mistral Large 4 tower and its splice expect.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import os
 from io import BytesIO
 from pathlib import Path
 
@@ -35,6 +33,8 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from test_common.llm_data import llm_models_root
+from test_common.mistral_tekken import TEKKEN_CHECKPOINT_FILES, load_tekken
 from torchvision.transforms import ToTensor
 
 from tensorrt_llm._torch.models.modeling_mistral import MistralCommonImageProcessor
@@ -140,17 +140,16 @@ def test_the_server_places_an_image_for_the_mistral_large4_config():
     assert len(mm_data["image"]) == 1
 
 
-@pytest.mark.skipif(
-    not os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR"),
-    reason="MISTRAL_LARGE4_CHECKPOINT_DIR names no Mistral Large 4 checkpoint",
-)
-def test_every_loader_format_encodes_the_boot_image_alike():
+@pytest.fixture(scope="module")
+def v15_tokenizer():
     pytest.importorskip("cv2")
-    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
+    return load_tekken("v15")
+
+
+def test_every_loader_format_encodes_the_boot_image_alike(v15_tokenizer):
     from tensorrt_llm.inputs.utils import load_image
 
-    tokenizer = MistralTokenizer.from_pretrained(os.environ["MISTRAL_LARGE4_CHECKPOINT_DIR"])
-    processor = MistralCommonImageProcessor(tokenizer=tokenizer, dtype=torch.bfloat16)
+    processor = MistralCommonImageProcessor(tokenizer=v15_tokenizer, dtype=torch.bfloat16)
     prompt = "Describe this image in one sentence."
     pil = load_image(str(_BOOT_IMAGE), format="pil")
     images = {
@@ -175,15 +174,8 @@ def test_every_loader_format_encodes_the_boot_image_alike():
     assert int(flat[0]) == 1, "BOS"
 
 
-@pytest.mark.skipif(
-    not os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR"), reason="needs checkpoint tokenizer"
-)
-def test_two_different_image_sizes_preserve_each_grid():
-    pytest.importorskip("cv2")
-    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
-
-    tokenizer = MistralTokenizer.from_pretrained(os.environ["MISTRAL_LARGE4_CHECKPOINT_DIR"])
-    processor = MistralCommonImageProcessor(tokenizer, torch.bfloat16)
+def test_two_different_image_sizes_preserve_each_grid(v15_tokenizer):
+    processor = MistralCommonImageProcessor(v15_tokenizer, torch.bfloat16)
     images = [_rgb(12, (224, 336)), _rgb(13, (448, 280))]
     singles = [processor("Describe.", images=[image]) for image in images]
     together = processor("Describe.", images=images)
@@ -195,19 +187,12 @@ def test_two_different_image_sizes_preserve_each_grid():
     assert int((together["input_ids"] == processor.image_token_id).sum()) == expected
 
 
-@pytest.mark.skipif(
-    not os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR"), reason="needs checkpoint tokenizer"
-)
 @pytest.mark.parametrize("name", ["merlion.png", "excel_table_test.jpg"])
-def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(name):
+def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(v15_tokenizer, name):
     """Nothing lossy lies between the loaded image and mistral-common's resize and normalize."""
-    pytest.importorskip("cv2")
     from mistral_common.protocol.instruct.chunk import ImageChunk
 
-    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
-
-    tokenizer = MistralTokenizer.from_pretrained(os.environ["MISTRAL_LARGE4_CHECKPOINT_DIR"])
-    processor = MistralCommonImageProcessor(tokenizer, torch.float32)
+    processor = MistralCommonImageProcessor(v15_tokenizer, torch.float32)
     image = Image.open(_BOOT_IMAGE.parent / name).convert("RGB")
     expected = torch.as_tensor(processor.image_processor(ImageChunk(image=image)).image)
     pixels = processor("", images=[image])["pixel_values"][0]
@@ -216,19 +201,21 @@ def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(name):
 
 @pytest.fixture(scope="module")
 def native_processor():
-    if not os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR"):
-        pytest.skip("needs checkpoint tokenizer")
-    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.routing import serves_images
-    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
+    pytest.importorskip("cv2")
+    pytest.importorskip("mistral_common")
+    from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
     from tensorrt_llm._torch.models.modeling_mistral import MistralNativeInputProcessor
 
-    path = os.environ["MISTRAL_LARGE4_CHECKPOINT_DIR"]
-    # The checkpoint's own configuration: its vision encoder and its NVFP4 export are what make
-    # the processor take images.
-    config = MistralConfigLoader().load_pretrained_config(path)
-    if not serves_images(config):
-        pytest.skip(f"{path}: this checkpoint's target serves text only")
-    return MistralNativeInputProcessor(path, config, None)
+    root = llm_models_root()
+    tekken = None if root is None else root / TEKKEN_CHECKPOINT_FILES["v15"]
+    if tekken is None or not tekken.is_file():
+        pytest.skip("no v15 Tekken file")
+    config = MistralLarge4Config(
+        dtype="bfloat16",
+        vocab_size=131072,
+        vision_config={"image_size": 1540, "patch_size": 14, "spatial_merge_size": 2},
+    )
+    return MistralNativeInputProcessor(str(tekken.parent), config, None)
 
 
 def _image_url(image):

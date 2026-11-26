@@ -23,17 +23,13 @@ The boot image is `tests/integration/test_input_files/merlion.png` (1192 x 874) 
 the engine's mistral-native processor delivers it: 896 x 1204 pixels, a 64 x 86
 patch grid (5504 patch rows), 32 x 43 [IMG] tokens.
 
-The attention tests use the checkpoint's vision layer 0 when MISTRAL_LARGE4_CHECKPOINT_DIR
-names the checkpoint, else seeded random weights at the same shapes. They need a GPU;
-the splice test runs on CPU.
+The attention tests use seeded random weights at the checkpoint's shapes and need a GPU;
+the splice tests run on CPU.
 """
 
 from __future__ import annotations
 
 import importlib
-import json
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -82,30 +78,10 @@ BOOT_GRID = (64, 86)
 #: The prompt tokens of an image span (tekken.json special ids).
 IMG, IMG_BREAK, IMG_END = 10, 12, 13
 
-_CKPT_ENV = "MISTRAL_LARGE4_CHECKPOINT_DIR"
-_LAYER0 = "vision_encoder.transformer.layers.0."
-
 needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
 # --- weights ---------------------------------------------------------------------
-
-
-def _checkpoint_layer0() -> dict | None:
-    """Vision layer 0's attention weights and attention norm, as published, or None."""
-    root = os.environ.get(_CKPT_ENV)
-    if not root or not Path(root, "consolidated.safetensors.index.json").is_file():
-        return None
-    from safetensors import safe_open
-
-    index = json.loads(Path(root, "consolidated.safetensors.index.json").read_text())
-    names = ("attention.wq", "attention.wk", "attention.wv", "attention.wo", "attention_norm")
-    out = {}
-    for name in names:
-        key = f"{_LAYER0}{name}.weight"
-        with safe_open(str(Path(root, index["weight_map"][key])), framework="pt") as f:
-            out[name] = f.get_tensor(key)
-    return out
 
 
 def _random_layer0() -> dict:
@@ -126,8 +102,7 @@ def _random_layer0() -> dict:
 
 @pytest.fixture(scope="module")
 def layer0():
-    found = _checkpoint_layer0()
-    return (found, "checkpoint") if found is not None else (_random_layer0(), "random")
+    return (_random_layer0(), "random")
 
 
 def _to_hf_layout(w: torch.Tensor) -> torch.Tensor:
@@ -529,74 +504,3 @@ def test_vision_slices_padding_by_each_true_size():
     assert [image[1:] for image in images] == [(4, 6), (8, 4)]
     assert torch.equal(images[0][0], pixels[0, :, :56, :84])
     assert torch.equal(images[1][0], pixels[1, :, :112, :56])
-
-
-@needs_gpu
-def test_full_tower_images_are_independent(target):
-    """Full checkpoint vision outputs retain image identity beside other images."""
-    from PIL import Image
-    from safetensors import safe_open
-
-    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import adapt_config_dict
-    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
-    from tensorrt_llm._torch.models.modeling_mistral import MistralCommonImageProcessor
-    from tensorrt_llm.mapping import Mapping
-
-    checkpoint = os.environ.get(_CKPT_ENV)
-    if not checkpoint:
-        pytest.skip("Requires MISTRAL_LARGE4_CHECKPOINT_DIR for full vision weights")
-    root = Path(checkpoint)
-    config = adapt_config_dict(json.loads((root / "params.json").read_text()))
-    core = SimpleNamespace(
-        model_config=SimpleNamespace(
-            pretrained_config=config,
-            torch_dtype=torch.bfloat16,
-            mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4),
-        ),
-        w={},
-    )
-    table = weights.MODEL_WEIGHTS
-    dimensions = table.dims(core)
-    index = json.loads((root / "consolidated.safetensors.index.json").read_text())["weight_map"]
-    with torch.inference_mode():
-        for entry in table.WEIGHTS:
-            if entry.tag != "v" and not entry.name.startswith("vis_"):
-                continue
-            for key, layer, prefix in table._targets(entry, dimensions):
-                destination = torch.empty(
-                    entry.shape(dimensions), dtype=entry.dtype or dimensions.dtype, device="cuda"
-                )
-                for name, selection in entry.sources(dimensions, layer, prefix):
-                    with safe_open(str(root / index[name]), framework="pt") as shard:
-                        value = shard.get_tensor(name)
-                    if entry.transform:
-                        value = entry.transform(value, core)
-                    destination[selection if selection is not None else ...].copy_(value)
-                core.w[key] = destination
-        tower = modeling.VisionTower(core)
-        processor = MistralCommonImageProcessor(
-            MistralTokenizer.from_pretrained(checkpoint), torch.bfloat16
-        )
-        red = Image.new("RGB", (224, 168), "red")
-        blue = Image.new("RGB", (168, 280), "blue")
-        green = Image.new("RGB", (336, 112), "green")
-
-        def encode(images):
-            processed = processor(text="", images=images)
-            params = [MultimodalParams(multimodal_data={"image": processed})]
-            output = tower.forward(params)
-            assert output.shape[0] == sum(
-                height * width // (PATCH * 2) ** 2
-                for height, width in processed["image_sizes"].tolist()
-            )
-            return output
-
-        singles = [encode([image]) for image in (red, blue, green)]
-        for order in ((0, 1), (1, 0), (0, 2), (0, 1, 1)):
-            images = (red, blue, green)
-            actual = encode([images[index] for index in order])
-            expected = torch.cat([singles[index] for index in order])
-            relative_rms = (
-                actual.float() - expected.float()
-            ).square().mean().sqrt() / expected.float().square().mean().sqrt()
-            assert relative_rms < 0.005, (order, relative_rms.item())

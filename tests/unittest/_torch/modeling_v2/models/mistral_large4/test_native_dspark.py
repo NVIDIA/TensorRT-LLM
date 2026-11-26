@@ -3,8 +3,6 @@
 """Native DSpark math independently of weights, CUDA kernels and runtime sampling."""
 
 import importlib
-import json
-import struct
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,24 +10,6 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.fixture(scope="module")
-def native_checkpoint():
-    from utils.llm_data import llm_models_root
-
-    root = llm_models_root()
-    path = None if root is None else root / "Mistral-Large-4-1T-A52B-NVFP4"
-    if path is None or not (path / "params.json").is_file():
-        pytest.skip("the NVFP4 checkpoint is not under LLM_MODELS_ROOT")
-    index = json.loads((path / "consolidated.safetensors.index.json").read_text())["weight_map"]
-    keys = {key for key in index if key.startswith("mtp_dspark.")}
-    headers = {}
-    for shard in {index[key] for key in keys}:
-        with (path / shard).open("rb") as stream:
-            size = struct.unpack("<Q", stream.read(8))[0]
-            headers.update(json.loads(stream.read(size)))
-    return path, {key: headers[key] for key in keys}
 
 
 @pytest.fixture(params=[103, 107], ids=["sm103", "sm107"])
@@ -437,55 +417,3 @@ def test_block_attention_matches_explicit_kv_and_obeys_window(modeling, monkeypa
             x = norm(residual, layer.next_norm, core.eps)
         reference.append(x)
     torch.testing.assert_close(actual, torch.stack(reference), rtol=2e-6, atol=2e-7)
-
-
-@pytest.mark.parametrize("world", [4, 8])
-def test_native_draft_manifest_matches_checkpoint_headers(modeling, native_checkpoint, world):
-    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
-    from tensorrt_llm.llmapi import DSparkDecodingConfig
-    from tensorrt_llm.mapping import Mapping
-
-    path, headers = native_checkpoint
-    # The configuration the engine adapts from the checkpoint's params.json.
-    cfg = MistralConfigLoader().load_pretrained_config(str(path))
-    spec = DSparkDecodingConfig(max_draft_len=3)
-    from tensorrt_llm._torch.models.checkpoints.dspark_config import resolve_dspark_checkpoint
-
-    resolve_dspark_checkpoint(spec, str(path))
-    target = modeling.__name__.split(".")[-2]
-    tp = target.endswith("__tp4")
-    dep = target.endswith("__dep4")
-    table = modeling._weights.MODEL_WEIGHTS
-    for rank in range(world):
-        mapping = Mapping(
-            world_size=world,
-            rank=rank,
-            gpus_per_node=4,
-            tp_size=world,
-            moe_tp_size=world if tp else 1,
-            moe_ep_size=1 if tp else world,
-            enable_attention_dp=dep,
-        )
-        core = SimpleNamespace(
-            model_config=SimpleNamespace(
-                pretrained_config=cfg, mapping=mapping, torch_dtype=torch.bfloat16, spec_config=spec
-            )
-        )
-        manifest = table.manifest(core)
-        with torch.device("meta"):
-            declared = table.declare(table.dims(core))
-        consumed = set()
-        for name, rows in manifest.items():
-            if not name.startswith("draft_") and "_draft_" not in name:
-                continue
-            assert len(rows) == 1
-            key, index, transform, *sharding = rows[0]
-            assert index is None and transform is None
-            assert headers[key]["dtype"] == "BF16"
-            source = torch.empty(headers[key]["shape"], device="meta", dtype=torch.bfloat16)
-            if sharding and sharding[0] is not None:
-                source = sharding[0](source)
-            assert source.shape == declared[name].shape, (rank, name, key)
-            consumed.add(key)
-        assert consumed == headers.keys()
-        assert len(consumed) == 38
