@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._profiler import custom_region_active, custom_region_enabled, record_moe_routing
 from tensorrt_llm._torch.custom_ops.router_logit_partials import RouterLogitPartials
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
@@ -179,6 +180,7 @@ class MoEScheduler(ABC):
 
     def __init__(self, moe: "ConfigurableMoE") -> None:
         self.moe = moe
+        self._profile_moe_routing = custom_region_enabled("moe")
 
     def _try_fused_route_quant(
         self,
@@ -687,6 +689,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
             assert token_selected_experts.shape == token_final_scales.shape
             assert token_selected_experts.dtype == torch.int32
 
+            if prerouted is None and self._profile_moe_routing and custom_region_active("moe"):
+                record_moe_routing(moe.layer_idx, moe.num_experts, token_selected_experts)
+
             # Backends disagree on routing-scale precision, so the requirement
             # names the dtype instead of the backend class.
             scales_dtype = moe.backend.input_requirement.routing_scales_dtype
@@ -739,6 +744,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 )
             token_selected_experts = None
             token_final_scales = None
+
+        if prerouted is not None and self._profile_moe_routing and custom_region_active("moe"):
+            record_moe_routing(moe.layer_idx, moe.num_experts, prerouted.topk_ids)
 
         # ========== Step 3: EPLB - Update statistics and route ==========
         if moe.layer_load_balancer and token_selected_experts is not None:
@@ -1854,6 +1862,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 dtype=torch.float32,
                 device=device,
             )
+
+        if self._profile_moe_routing and custom_region_active("moe"):
+            record_moe_routing(moe.layer_idx, moe.num_experts, token_selected_experts)
 
         # ----- EPLB: update stats + remap expert ids -> slot ids -----
         # Per-layer dynamic EPLB plans from the routes that the layer-wise

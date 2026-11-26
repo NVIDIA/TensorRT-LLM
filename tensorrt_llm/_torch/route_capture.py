@@ -57,10 +57,12 @@ routing only; fused backends fail closed (``assert_capturable``).
 """
 
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+from functools import partial
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
@@ -120,22 +122,31 @@ class RouteCopier:
         # Event allocation on the hot path).
         self._fwd_done: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(ring)]
         self._d2h: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(ring)]
-        # (slot, layout, n): staged copies whose rows are not yet committed.
-        self._pending: List[Tuple[int, list, int]] = []
+        # (slot, layout, n, on_ready): staged copies with their own observer.
+        self._pending: List[Tuple[int, list, int, Optional[Callable[[torch.Tensor], None]]]] = []
         self._slot = 0
         self._last_d2h: Optional[torch.cuda.Event] = None
 
     def _slot_pending(self, slot: int) -> bool:
         return any(p[0] == slot for p in self._pending)
 
-    def stage(self, buf: torch.Tensor, n: int, layout: list, commit_cb) -> None:
+    def stage(
+        self,
+        buf: torch.Tensor,
+        n: int,
+        layout: list,
+        commit_cb,
+        *,
+        on_ready: Optional[Callable[[torch.Tensor], None]] = None,
+    ) -> None:
         """Copy this step's ``n`` valid rows of ``buf`` into the next host slot.
 
         A slot is never overwritten while a staged copy of it is still pending:
         landed copies are committed first (event-gated, no host sync), and the
         rare still-in-flight case is synchronized and committed before reuse.
         Otherwise a later ``drain`` would commit the new rows under the old
-        layout.
+        layout. Optional ``on_ready`` observes completed CPU rows after commit;
+        it is retained per copy so delayed observations keep their source metadata.
         """
         if n <= 0:
             return
@@ -152,7 +163,7 @@ class RouteCopier:
             self._ring[slot][:n].copy_(buf[:n], non_blocking=True)
             d2h.record(self._stream)
         self._last_d2h = d2h
-        self._pending.append((slot, list(layout), n))
+        self._pending.append((slot, list(layout), n, on_ready))
         self._slot = (slot + 1) % len(self._ring)
 
     def wait_before_overwrite(self) -> None:
@@ -163,14 +174,17 @@ class RouteCopier:
 
     def drain(self, commit_cb, force: bool = False) -> None:
         still = []
-        for slot, layout, n in self._pending:
+        for slot, layout, n, on_ready in self._pending:
             ev = self._d2h[slot]
             if force or ev.query():
                 if force and not ev.query():
                     ev.synchronize()
-                commit_cb(self._ring[slot][:n], layout)
+                rows = self._ring[slot][:n]
+                commit_cb(rows, layout)
+                if on_ready is not None:
+                    on_ready(rows)
             else:
-                still.append((slot, layout, n))
+                still.append((slot, layout, n, on_ready))
         self._pending = still
 
 
@@ -522,7 +536,17 @@ class RouteCapture:
         # whatever prior D2Hs have already landed. Never syncs the forward path.
         if self._copier is not None and self._buf is not None and self._layout is not None:
             try:
-                self._copier.stage(self._buf, len(self._layout), self._layout, self.commit)
+                on_ready = None
+                if profiler.custom_region_active("moe"):
+                    on_ready = partial(
+                        profiler.record_moe_routing_ids,
+                        step=self._iter_id,
+                        rank=self.rank,
+                        layer_pos=tuple(self._layer_pos.items()),
+                    )
+                self._copier.stage(
+                    self._buf, len(self._layout), self._layout, self.commit, on_ready=on_ready
+                )
                 # On a prefill step, force-drain so THIS step's prompt routes land
                 # in the store now (prefill is not the graphed decode hot loop, so
                 # the sync is cheap) -- then incremental populate can push them to
