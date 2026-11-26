@@ -92,19 +92,25 @@ def _release_unsubmitted_exports(
     otherwise the raw `handoff`; it then holds the only reference to each handle.
     """
     from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-    try:
-        if multimodal_params is not None:
+    if multimodal_params is not None:
+        try:
             multimodal_params.release_handles()
-        elif handoff is not None:
-            for handle in [
-                    *(handoff.multimodal_embedding_handles or ()),
-                    handoff.mrope_position_ids_handle,
-                    handoff.mrope_position_deltas_handle,
-            ]:
-                if handle is not None:
-                    SharedTensorContainer.release_dict(handle)
-    except Exception as error:
-        logger.error(f"Failed to release unsubmitted request exports: {error}")
+        except Exception as error:
+            logger.error(
+                f"Failed to release unsubmitted request exports: {error}")
+        return
+    if handoff is None:
+        return
+    for handle in (*(handoff.multimodal_embedding_handles or ()),
+                   handoff.mrope_position_ids_handle,
+                   handoff.mrope_position_deltas_handle):
+        if handle is None:
+            continue
+        try:
+            SharedTensorContainer.release_dict(handle)
+        except Exception as error:
+            logger.error(
+                f"Failed to release an unsubmitted request export: {error}")
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):

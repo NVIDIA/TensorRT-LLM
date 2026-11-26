@@ -724,6 +724,7 @@ def test_prefill_drops_consumed_layout_before_executor(video_handoff, preprocess
         ("generate_async", "invalid_hidden"),
         ("preprocess", "invalid_hidden"),
         ("preprocessed_inputs", "too_long"),
+        ("preprocessed_inputs", "shutdown"),
         ("generate_async", None),
     ],
 )
@@ -737,7 +738,7 @@ def test_prefill_releases_each_handoff_export_it_does_not_submit(
     llm.args = SimpleNamespace(mm_encoder_only=False, return_perf_metrics=False)
     llm.input_processor = processor
     llm._executor = Mock()
-    llm._executor.is_shutdown.return_value = False
+    llm._executor.is_shutdown.return_value = rejection == "shutdown"
     llm._executor.generate_async.side_effect = RuntimeError("submitted")
     llm._is_encoder_decoder_model = Mock(return_value=False)
     llm._prepare_sampling_params = Mock(return_value=SamplingParams(max_tokens=1))
@@ -774,7 +775,9 @@ def test_prefill_releases_each_handoff_export_it_does_not_submit(
         inputs = llm.preprocess(inputs, disaggregated_params=handoff)
     run = llm.preprocess if entry == "preprocess" else llm.generate_async
 
-    with pytest.raises((ValueError, RuntimeError), match="too long|hidden size|submitted"):
+    with pytest.raises(
+        (ValueError, RuntimeError), match="too long|hidden size|shutting down|submitted"
+    ):
         run(inputs, disaggregated_params=handoff)
 
     if rejection is None:
