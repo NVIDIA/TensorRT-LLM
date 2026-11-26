@@ -181,6 +181,7 @@ class DisaggTransferCoordinator:
         return (
             getattr(request, "py_kv_transfer_timed_out", False) is True
             or getattr(request, "kv_cache_transfer_timed_out", False) is True
+            or getattr(request, "py_kv_transfer_committed_cause", None) == "timeout"
         )
 
     def _record_transfer_outcome(
@@ -632,17 +633,16 @@ class DisaggTransferCoordinator:
             for request in active
             if not request.is_finished
         ]
-        # Each rank's committed transfer cause for its ready receives. A peer
-        # shard can time out or fail while this one completes.
-        causes = {}
-        for request in ready:
-            if not request.is_generation_only_request:
+        # Each rank's session-committed transfer cause for its ready receives.
+        # A peer shard can time out or fail while this one completes.
+        causes: dict[int, tuple[bool, bool]] = {}
+        for request in ready if self._transfer_outcomes is not None else ():
+            cause = getattr(request, "py_kv_transfer_committed_cause", None)
+            if not request.is_generation_only_request or cause is None:
                 continue
-            timed_out = self._has_observed_transfer_timeout(request)
-            failed = getattr(request, "py_kv_transfer_backend_failed", False) is True
-            if timed_out or failed:
-                client = request.parent_request_id if request.is_child else request.py_request_id
-                causes[client] = (timed_out, failed)
+            client = request.parent_request_id if request.is_child else request.py_request_id
+            timed_out, failed = causes.get(client, (False, False))
+            causes[client] = (timed_out or cause == "timeout", failed or cause == "error")
         payload = (list(cancel_ids), gen_active, list(gen_ready), active_clients, causes)
         gather = self._dist.tp_cp_allgather if self._dist.cp_size > 1 else self._dist.tp_allgather
         peers = gather(payload, small_payload=True)
@@ -1398,7 +1398,7 @@ class DisaggTransferCoordinator:
         """
         if self._has_observed_transfer_timeout(request):
             self._record_transfer_outcome(request, "timeout")
-        elif getattr(request, "py_kv_transfer_backend_failed", False) is True:
+        elif getattr(request, "py_kv_transfer_committed_cause", None) == "error":
             self._record_transfer_outcome(request, "error", backend_failure=True)
 
     def request_cancellation(self, request: LlmRequest) -> bool:
@@ -1647,7 +1647,12 @@ class DisaggTransferCoordinator:
     def _fail_transfer_requests(self, message: str, requests: List[LlmRequest]) -> None:
         if self._transfer_outcomes is not None:
             for request in requests:
-                self._record_transfer_outcome(request, "error")
+                self._record_transfer_outcome(
+                    request,
+                    "error",
+                    backend_failure=getattr(request, "py_kv_transfer_committed_cause", None)
+                    == "error",
+                )
         self._effects.fail_requests(message, requests, charge_budget=False)
 
     def _check_transfer_errors(self, kind: str) -> None:
@@ -1800,6 +1805,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def supports_logical_context_cancellation(self, request: Optional[LlmRequest] = None) -> bool:
         """Return False because this coordinator has no transfer ownership."""
         return False
+
+    def record_cancelled_transfer_outcome(self, request: LlmRequest) -> None:
+        return None
 
     def request_logical_context_cancellation(self, request: LlmRequest) -> bool:
         """Reject logical context cancellation without a transceiver."""

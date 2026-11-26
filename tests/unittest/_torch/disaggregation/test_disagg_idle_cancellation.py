@@ -1497,7 +1497,8 @@ def test_committed_receive_timeout_survives_either_cancellation_order(
     if abort_first:
         _abort(executor, request)
         executor._cancel_waiting_disagg_requests([])
-        assert request.py_kv_transfer_timed_out
+        assert request.py_kv_transfer_committed_cause == "timeout"
+        assert not request.py_kv_transfer_timed_out
         assert transceiver._recv_sessions == transceiver._recv_reqs == {}
         assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     executor.disagg.reap_gen_receives(0)
@@ -2311,9 +2312,9 @@ def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
     def retire(req: LlmRequest, rank: int) -> bool:
         """Retire the drained session, copying its committed cause as cancel_request does."""
         if rank == 1 and peer_cause == "timeout":
-            req.py_kv_transfer_timed_out = True
+            req.py_kv_transfer_committed_cause = "timeout"
         elif rank == 1 and peer_cause == "failure":
-            req.py_kv_transfer_backend_failed = True
+            req.py_kv_transfer_committed_cause = "error"
         return True
 
     for rank in range(2):

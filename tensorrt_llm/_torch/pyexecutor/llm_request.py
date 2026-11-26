@@ -4,7 +4,7 @@
 
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional,
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Optional,
                     Sequence, Union, cast)
 
 import numpy as np
@@ -1088,9 +1088,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
-        # A committed non-timeout transfer failure, kept when cancellation
-        # retires the session that recorded it.
-        self.py_kv_transfer_backend_failed = False
+        # The committed transfer outcome ("timeout" or "error") of a receive
+        # session that cancellation retired before a poll could report it.
+        self.py_kv_transfer_committed_cause: Optional[Literal["timeout",
+                                                              "error"]] = None
         # Set once a received generation request's first token is found not
         # to end it, so the executor does not recheck it while it waits.
         self.py_first_token_checked = False

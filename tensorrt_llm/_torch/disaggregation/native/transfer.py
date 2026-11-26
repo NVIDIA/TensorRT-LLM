@@ -450,6 +450,21 @@ class _LogicalOutcomes:
         with self._lock:
             return self._terminal is not None and self._terminal.status is SessionStatus.ERROR
 
+    @property
+    def committed_failure(self) -> bool:
+        """Whether the first terminal decision was a non-timeout failure.
+
+        Reads the stored decision only: no deadline check, and a later cancel
+        does not change it.
+        """
+        with self._lock:
+            terminal = self._terminal
+            return (
+                terminal is not None
+                and terminal.status is SessionStatus.ERROR
+                and not terminal.timed_out
+            )
+
     def _end(self, outcome: _LogicalOutcome) -> None:
         with self._lock:
             if self._retirement is not None:
@@ -2755,6 +2770,15 @@ class TxSession(TxSessionBase):
         terminal = self._logical_outcomes.terminal
         return terminal is not None and terminal.timed_out
 
+    @property
+    def committed_failure(self) -> bool:
+        """Whether a non-timeout failure committed before any cancellation.
+
+        Unlike ``status``, a later cancellation does not hide it, and reading it
+        polls neither the session nor its deadline.
+        """
+        return self._logical_outcomes.committed_failure
+
     def has_failed(self) -> bool:
         """Non-blocking check: has the transfer failed or been cancelled?"""
         if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
@@ -4484,6 +4508,15 @@ class RxSession(RxSessionBase):
         """Whether a deadline or blocking wait committed a timeout outcome."""
         terminal = self._logical_outcomes.terminal
         return terminal is not None and terminal.timed_out
+
+    @property
+    def committed_failure(self) -> bool:
+        """Whether a non-timeout failure committed before any cancellation.
+
+        Unlike ``status``, a later cancellation does not hide it, and reading it
+        polls neither the session nor its deadline.
+        """
+        return self._logical_outcomes.committed_failure
 
     def has_failed(self) -> bool:
         """Non-blocking check: has the transfer failed or been cancelled?"""

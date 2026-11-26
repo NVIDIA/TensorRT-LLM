@@ -13389,8 +13389,9 @@ class PyExecutor:
                 # block the coordinator's rank-synchronized error cleanup.
                 failed_ids.add(request.py_request_id)
                 continue
-            if (getattr(request, "py_kv_transfer_timed_out", False) or getattr(
-                    request, "py_kv_transfer_backend_failed", False)):
+            if (getattr(request, "py_kv_transfer_timed_out", False)
+                    or getattr(request, "py_kv_transfer_committed_cause",
+                               None) is not None):
                 # Count a committed transfer outcome; the client still sees a
                 # cancellation.
                 self.disagg.record_cancelled_transfer_outcome(request)
@@ -13480,8 +13481,9 @@ class PyExecutor:
                 # Its prior result is immutable; only transfer obligations
                 # remain. The reaper, not this notification, retires them.
                 continue
-            if (getattr(request, "py_kv_transfer_timed_out", False) or getattr(
-                    request, "py_kv_transfer_backend_failed", False)):
+            if (getattr(request, "py_kv_transfer_timed_out", False)
+                    or getattr(request, "py_kv_transfer_committed_cause",
+                               None) is not None):
                 # Count a committed transfer outcome; the client still sees a
                 # cancellation.
                 self.disagg.record_cancelled_transfer_outcome(request)
@@ -13633,8 +13635,9 @@ class PyExecutor:
                 continue
             # Mark requests as finished, then, we reuse all existing code
             # to clean up the KV cache resources.
-            if (getattr(request, "py_kv_transfer_timed_out", False) or getattr(
-                    request, "py_kv_transfer_backend_failed", False)):
+            if (getattr(request, "py_kv_transfer_timed_out", False)
+                    or getattr(request, "py_kv_transfer_committed_cause",
+                               None) is not None):
                 # Count a committed transfer outcome; the client still sees a
                 # cancellation.
                 self.disagg.record_cancelled_transfer_outcome(request)

@@ -1854,6 +1854,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 ):
                     continue
                 cancelled.append(rid)
+                if getattr(session, "committed_failure", False) is True:
+                    # Cancellation still wins the outcome; the failure that
+                    # committed first only reaches outcome accounting.
+                    failed.append(rid)
             elif result == WaitResult.COMPLETED:
                 completed.append(rid)
             elif result is None:
@@ -1991,6 +1995,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # server timeout).  Return the req objects so the caller can
                 # distinguish the two cases and set the appropriate state.
                 cancelled.append(rid)
+                if getattr(session, "committed_failure", False) is True:
+                    # Cancellation still wins the outcome; the failure that
+                    # committed first only reaches outcome accounting.
+                    failed.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
                 if session.transfer_end_time is not None:
@@ -2329,12 +2337,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif session.close() is False:
                 has_transferring = True
             else:
-                # Keep a committed timeout or failure cause; the session that
-                # records it is removed below.
+                # Keep a committed timeout or failure for outcome accounting;
+                # the session that records it is removed below. The cancel
+                # above may already report CANCELLED, so read the committed
+                # outcome, not status.
                 if getattr(session, "timed_out", False) is True:
-                    req.py_kv_transfer_timed_out = True
-                elif session.status == SessionStatus.ERROR:
-                    req.py_kv_transfer_backend_failed = True
+                    req.py_kv_transfer_committed_cause = "timeout"
+                elif getattr(session, "committed_failure", False) is True:
+                    req.py_kv_transfer_committed_cause = "error"
                 # The bridge has a stable, rank-local receive outcome. Keep
                 # an earlier failure when cancellation retires the session.
                 if (

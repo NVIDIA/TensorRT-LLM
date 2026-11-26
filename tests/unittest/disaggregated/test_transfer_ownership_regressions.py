@@ -953,6 +953,132 @@ def test_cancel_request_retains_session_when_close_refuses(direction: str) -> No
     assert requests == {}
 
 
+class _LegacyReceiverProbe:
+    """Receiver without physical ownership that publishes one destination to its writers."""
+
+    _enforce_physical_ownership = False
+
+    def __init__(self, expected_writers: int = 1) -> None:
+        self.expected_writers = expected_writers
+        self.cancel_count = 0
+        self.clear_count = 0
+
+    def setup_session(self, _session: RxSession) -> None:
+        pass
+
+    def dispatch_task(self, task: KVRecvTask) -> None:
+        task.expected_transfers = self.expected_writers
+
+    def send_cancel_to_senders(self, _unique_rid: int, _sender_endpoints: set[str]) -> None:
+        self.cancel_count += 1
+
+    def clear_session(self, _unique_rid: int) -> None:
+        self.clear_count += 1
+
+
+def _legacy_cancel_transceiver(rid: int, session: RxSession) -> tuple[KvCacheTransceiverV2, object]:
+    """A transceiver holding one legacy receive session and its request."""
+    request = SimpleNamespace(
+        request_id=rid,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
+        py_kv_transfer_timed_out=False,
+        py_kv_transfer_committed_cause=None,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+    return transceiver, request
+
+
+def _report_writer(session: RxSession, peer_rank: int, status: AgentResult) -> None:
+    session.process_kv_agent_result(
+        peer_rank=peer_rank,
+        receiver_slice_id=0,
+        is_last_slice=True,
+        status=status,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("committed", "expected_cause"),
+    [("failure", "error"), ("timeout-then-failure", "timeout"), (None, None)],
+    ids=["writer-failed", "timeout-wins", "cancel-only"],
+)
+def test_cancel_request_keeps_a_committed_legacy_receive_outcome(
+    committed: str | None, expected_cause: str | None
+) -> None:
+    """The committed outcome survives the cancel that makes the legacy session report CANCELLED."""
+    rid = 84
+    receiver = _LegacyReceiverProbe()
+    session = _make_rx_session(receiver, rid=rid)
+    session.receive(_sole_piece())
+    _publish_report_tokens(session)
+    if committed == "timeout-then-failure":
+        session._logical_outcomes.timeout()
+    if committed is not None:
+        _report_writer(session, 0, AgentResult.FAILED)
+        assert session.status is SessionStatus.ERROR
+    transceiver, request = _legacy_cancel_transceiver(rid, session)
+
+    assert transceiver.cancel_request(request) is True
+
+    # The cancel replaces the public status; the committed outcome is kept.
+    assert session.status is SessionStatus.CANCELLED
+    assert session.committed_failure is (committed == "failure")
+    assert request.py_kv_transfer_committed_cause == expected_cause
+    # Only the poll path sets the executor's timeout flag.
+    assert request.py_kv_transfer_timed_out is False
+    assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+    assert receiver.cancel_count == 1
+    assert receiver.clear_count == 1
+
+
+@pytest.mark.cpu_only
+def test_poll_reports_a_failure_committed_before_a_deferred_legacy_cancel() -> None:
+    """A cancel that cannot retire yet must not hide the failure from the next poll."""
+    rid = 85
+    receiver = _LegacyReceiverProbe(expected_writers=2)
+    session = _make_rx_session(receiver, rid=rid)
+    session.receive(_sole_piece())
+    _publish_report_tokens(session)
+    _report_writer(session, 0, AgentResult.FAILED)
+    transceiver, request = _legacy_cancel_transceiver(rid, session)
+
+    # Writer 1 has not reported, so the failed receive stays open for it.
+    assert transceiver.cancel_request(request) is False
+    assert rid in transceiver._recv_sessions
+    assert request.py_kv_transfer_committed_cause is None
+    _report_writer(session, 1, AgentResult.SUCCESS)
+    assert session.status is SessionStatus.CANCELLED
+
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._gen_idle_agreed = False
+    transceiver._gen_idle_probe = False
+    transceiver._rank_info_start_failures = None
+    transceiver._collect_done = Mock(return_value=([], []))
+    transceiver._poll_rank_info_admissions = Mock(return_value=([rid], []))
+    transceiver._build_to_process = Mock(return_value=[rid])
+    transceiver._retirement_blocked = Mock(return_value=False)
+    transceiver._gen_consensus_outcome = Mock(wraps=transceiver._gen_consensus_outcome)
+    transceiver._dist = SimpleNamespace(rank=0)
+
+    status = transceiver.check_gen_transfer_status(0)
+
+    # Cancellation wins the outcome; the earlier failure reaches accounting.
+    _, cancelled, failed, completed, _ = transceiver._gen_consensus_outcome.call_args.args
+    assert (cancelled, failed, completed) == ([rid], [rid], [])
+    assert status.cancelled_requests == [request]
+    assert status.error_request_ids == []
+    assert status.backend_failed_request_ids == (rid,)
+    assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+
+
 @pytest.mark.cpu_only
 def test_failed_session_is_not_reported_retired_when_close_refuses() -> None:
     rid = 89
@@ -1051,6 +1177,52 @@ def test_send_terminal_session_is_retained_when_close_refuses(
         assert request.state is initial_state
     assert transceiver._send_sessions == {}
     assert transceiver._send_reqs == {}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("committed_failure", [True, False], ids=["send-failed", "cancel-only"])
+def test_send_poll_reports_a_failure_committed_before_cancellation(committed_failure: bool) -> None:
+    """A cancelled legacy send still reports the failure that committed first to accounting."""
+    rid = 97
+    request = SimpleNamespace(state=object())
+    session = SimpleNamespace(
+        _enforce_physical_ownership=False,
+        status=SessionStatus.CANCELLED,
+        committed_failure=committed_failure,
+        is_completed=Mock(return_value=False),
+        has_failed=Mock(return_value=True),
+        has_transferring_tasks=Mock(return_value=False),
+        wait_complete=Mock(return_value=WaitResult.FAILED),
+        close=Mock(return_value=True),
+        disagg_request_id=rid,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
+    transceiver._send_sessions = {rid: session}
+    transceiver._send_reqs = {rid: request}
+    transceiver._ctx_consensus = Mock(side_effect=lambda rids: rids)
+    transceiver._ctx_consensus_outcome = Mock(
+        side_effect=lambda _rids, cancelled, failed, completed, locally_quiesced: (
+            cancelled,
+            [rid for rid in failed if rid not in set(cancelled)],
+            [rid for rid in completed if rid not in set(cancelled) | set(failed)],
+            locally_quiesced,
+            set(failed) & set(locally_quiesced),
+        )
+    )
+    transceiver._transfer_worker = SimpleNamespace(sweep_stale_req_infos=Mock())
+
+    status = transceiver.check_context_transfer_status(None)
+
+    _, cancelled, failed, completed, _ = transceiver._ctx_consensus_outcome.call_args.args
+    assert (cancelled, failed, completed) == ([rid], [rid] if committed_failure else [], [])
+    # Cancellation still wins the request's outcome.
+    assert status.completed_request_ids == status.error_request_ids == []
+    assert status.cancelled_request_ids == (rid,)
+    assert status.backend_failed_request_ids == ((rid,) if committed_failure else ())
+    assert transceiver._send_sessions == transceiver._send_reqs == {}
 
 
 @pytest.mark.cpu_only
