@@ -965,7 +965,12 @@ def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
     }[model]
     config = SimpleNamespace(
         torch_dtype=torch.float32,
-        text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=100, dtype=torch.float32),
+        text_config=SimpleNamespace(
+            hidden_size=hidden_size,
+            vocab_size=100,
+            max_position_embeddings=128000,
+            dtype=torch.float32,
+        ),
         vision_config=vision_config,
         image_token_id=12,
         video_token_id=14,
@@ -974,6 +979,7 @@ def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
     )
     tokenizer = MagicMock()
     tokenizer.return_value.input_ids = [torch.tensor(prompt_ids)]
+    tokenizer.convert_tokens_to_ids = {"<|image_pad|>": 12, "<|video_pad|>": 14}.get
     with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor") as auto_processor:
         auto_processor.from_pretrained.return_value = MagicMock(mm_special_token_ids=None)
         processor = processor_cls("unused", config, tokenizer, trust_remote_code=True)
