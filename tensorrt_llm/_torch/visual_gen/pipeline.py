@@ -314,7 +314,7 @@ class BasePipeline(nn.Module):
             self._init_transformer()
             self.pipeline_config = original
             models = {name: getattr(self, name) for name in self.transformer_components}
-            schedules = {name: schedules[name] for name in models}
+            schedules = {name: schedules[name] for name in models if name in schedules}
             self._transformer_quant_schedules = schedules
             if not any(schedule.linear for schedule in schedules.values()):
                 return
