@@ -61,7 +61,9 @@ def _run_forward(worker, attn_metadata, spec_metadata):
     )
 
 
-def _make_hybrid_manager(manager_cls):
+def _make_hybrid_manager(
+    manager_cls: type[MixedMambaHybridCacheManager] | type[CppMambaHybridCacheManager],
+) -> MixedMambaHybridCacheManager | CppMambaHybridCacheManager:
     """A hybrid manager of the given class that records the promotion instead of running it."""
     manager = object.__new__(manager_cls)
     manager.update_mamba_states = mock.MagicMock()
@@ -69,7 +71,9 @@ def _make_hybrid_manager(manager_cls):
 
 
 @pytest.mark.parametrize("manager_cls", [MixedMambaHybridCacheManager, CppMambaHybridCacheManager])
-def test_hybrid_manager_promotes_accepted_states(manager_cls):
+def test_hybrid_manager_promotes_accepted_states(
+    manager_cls: type[MixedMambaHybridCacheManager] | type[CppMambaHybridCacheManager],
+) -> None:
     worker = _make_worker()
     manager = _make_hybrid_manager(manager_cls)
     attn_metadata, spec_metadata = _make_metadata(manager, num_seqs=2, num_contexts=0)

@@ -642,7 +642,7 @@ def test_ple_speculative_commit_selects_accepted_prefix_state() -> None:
     ids=["context_only_step", "empty_step"],
 )
 def test_ple_forward_drops_the_candidates_of_an_uncommitted_verification(
-    next_lengths, next_accepted, next_contexts
+    next_lengths: list[int], next_accepted: list[int], next_contexts: int
 ) -> None:
     """A step that fails after its verification leaves the candidates uncommitted. The next
     forward drops them, so its acceptance writes nothing to the slots of the failed step."""
@@ -658,7 +658,7 @@ def test_ple_forward_drops_the_candidates_of_an_uncommitted_verification(
     )
     record = PLESpeculativeRecord()
 
-    def forward(lengths, slots, **layout):
+    def forward(lengths: list[int], slots: list[int], **layout: object) -> None:
         tokens = torch.randint(0, VOCAB_SIZE, (sum(lengths),), generator=gen, device=device)
         hidden = torch.randn(sum(lengths), CONV_CHANNELS, generator=gen, device=device).to(dtype)
         metadata = PLEMetadata.build(
@@ -675,8 +675,8 @@ def test_ple_forward_drops_the_candidates_of_an_uncommitted_verification(
     forward([3, 3], [2, 3], use_spec_decoding=True, host_seq_lens=[3, 3])
     assert record.conv_states is not None and record.ngram_contexts is not None
 
-    forward(next_lengths, [0] * len(next_lengths), num_contexts=next_contexts)
     failed_step_conv, failed_step_context = conv_state[2:].clone(), ngram_context[2:].clone()
+    forward(next_lengths, [0] * len(next_lengths), num_contexts=next_contexts)
     record.commit(torch.tensor(next_accepted, device=device), next_contexts)
     assert torch.equal(conv_state[2:], failed_step_conv)
     assert torch.equal(ngram_context[2:], failed_step_context)
