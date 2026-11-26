@@ -639,9 +639,9 @@ operations also need approval from the owners of that code, as usual.
 ### Does Modeling V2 replace Modeling V1 or change the user API?
 
 Not now. Modeling V1 and V2 exist side by side, and adding a V2 ModelCore does
-not require migrating any V1 model. We recommend Modeling V2 for new models
-whose implementation differs significantly from existing Modeling V1 models,
-and for optimizations specific to one model. Modeling V1 will eventually be
+not require migrating any V1 model. Modeling V2 is the default workflow for
+supporting new models: a new model is brought up as a Modeling V2 family. It is
+also the place for optimizations specific to one model. Modeling V1 will eventually be
 deprecated, as the models it supports are deprecated, but not now.
 
 Users keep using the LLM API and `trtllm-serve`. The `modeling_v2` option
