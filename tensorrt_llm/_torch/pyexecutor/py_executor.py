@@ -13389,6 +13389,9 @@ class PyExecutor:
         if self.kv_cache_transceiver is None:
             return True
 
+        if request.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER:
+            return self.disagg.request_cancellation(request)
+
         if (request.is_generation_only_request
                 and id(request) in self._held_transfer_failures()
                 and self.kv_cache_transceiver.

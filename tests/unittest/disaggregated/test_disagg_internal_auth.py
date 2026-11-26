@@ -217,6 +217,23 @@ def test_worker_rejects_protected_fields_without_cache_transceiver_config():
         server._validate_internal_disagg_request(request, raw_request=None)
 
 
+def test_network_worker_admits_signed_internal_requests():
+    from types import SimpleNamespace
+
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    server = object.__new__(OpenAIServer)
+    server.host = "worker.example"
+    server._has_cache_transceiver_config = lambda: True
+    request = _make_request(ctx_info_endpoint="tcp://context.example:5000")
+    server._internal_disagg_auth_key = None
+    with pytest.raises(ValueError, match="internal_request_auth_key"):
+        server._validate_internal_disagg_request(request, raw_request=None)
+    server._internal_disagg_auth_key = "fleet-unit-test-key"
+    headers = build_internal_disagg_auth_headers(server._internal_disagg_auth_key, request)
+    server._validate_internal_disagg_request(request, SimpleNamespace(headers=headers))
+
+
 def _make_affinity_request(
     role: ServerRole, completion: bool = False
 ) -> ChatCompletionRequest | CompletionRequest:

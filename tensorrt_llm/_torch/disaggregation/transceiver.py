@@ -2251,14 +2251,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if self._pending_rank_info_admissions is not None:
             self._pending_rank_info_admissions.pop(rid, None)
 
+        self._wait_reqs.pop(rid, None)
         if self.supports_logical_context_cancellation(req):
             # Local quiescence cannot remove a TP participant's retirement vote.
             # Keep the session until the normal send reaper agrees across ranks.
             accepted = self.request_logical_context_cancellation(req)
             return accepted and rid not in self._send_sessions
-
-        # Not yet started (generation-first wait queue).
-        self._wait_reqs.pop(rid, None)
 
         has_transferring = False
 

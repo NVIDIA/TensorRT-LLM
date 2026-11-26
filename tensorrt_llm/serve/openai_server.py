@@ -97,7 +97,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
-from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
+from tensorrt_llm.serve.cluster_storage import (create_cluster_storage_client,
+                                                is_loopback_host)
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
@@ -1133,13 +1134,23 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _validate_internal_disagg_request(
             self, request, raw_request: Optional[Request]) -> None:
-        if (request_requires_internal_disagg_auth(request)
-                and not self._has_cache_transceiver_config()):
+        protected = request_requires_internal_disagg_auth(request)
+        if protected and not self._has_cache_transceiver_config():
             raise ValueError("Protected disaggregated request fields require "
                              "cache_transceiver_config to be configured")
+        key = getattr(self, "_internal_disagg_auth_key", None)
+        if protected and not key:
+            host = getattr(self, "host", None)
+            if host is None and raw_request is not None:
+                # ASGI's bound address also covers apps served outside our own launcher.
+                bound = raw_request.scope.get("server")
+                host = bound[0] if bound else ""
+            if host is not None and not is_loopback_host(host):
+                raise ValueError(
+                    "Protected disaggregated request fields on a network "
+                    "listener require internal_request_auth_key")
         headers = None if raw_request is None else raw_request.headers
-        validate_internal_disagg_request(
-            getattr(self, "_internal_disagg_auth_key", None), request, headers)
+        validate_internal_disagg_request(key, request, headers)
 
     def _get_scheduling_params(
             self, request: Union[ChatCompletionRequest, CompletionRequest],

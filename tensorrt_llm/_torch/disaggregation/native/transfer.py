@@ -3533,7 +3533,7 @@ class Receiver(ReceiverBase):
         if isinstance(ep, list):
             ep = ep[0] if ep else None
         if ep is None:
-            raise ValueError("ctx_info_endpoint is required")
+            raise PeerIncompatibleError("ctx_info_endpoint is required")
         return ep  # str (backward compat)
 
     def _should_register_peer(self, params: DisaggregatedParams) -> bool:
@@ -3620,6 +3620,8 @@ class Receiver(ReceiverBase):
             # fail, and cached so later requests fail fast.
             try:
                 # from_bytes rejects a peer on another protocol version.
+                if len(message) != 1 or not isinstance(message[0], bytes):
+                    raise ValueError("Invalid RankInfo reply")
                 sender_info = RankInfo.from_bytes(message[0])
                 validate_protocol_version(sender_info)
                 self._registrar.validate_bounded_replay_compatible(sender_info)
