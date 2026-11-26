@@ -38,7 +38,9 @@ the geometry of their base state is: shapes, dtypes and the split across ranks.
 Shared code does not read the declaration. The model-family predicates in
 `pyexecutor/config_utils.py` (`is_hybrid_linear` and the per-family ones), `MambaKVCacheParams` and
 `isinstance` checks on the recurrent manager classes answer these questions. New shared code uses
-the declaration instead of adding to them.
+the declaration instead of adding to them. A decision that depends on a built cache or on the
+loaded model is asked of that object instead; see
+[What shared runtime code asks](#what-shared-runtime-code-asks).
 
 ## The declaration
 
@@ -162,6 +164,30 @@ The manager itself answers the rest:
 | `get_disagg_ignored_roles()` | Disaggregated transfer | The buffers the receiving worker rebuilds, replay buffers among them |
 | `get_disagg_global_layer_ids()`, `get_disagg_pool_view_partition()` | Disaggregated transfer | The transfer IDs of a layer group's layers, and which layers of one pool form separate transfer views |
 | `on_state_transfer_complete(request_ids)` | `PyExecutor`, after a disaggregated transfer completes with speculative decoding enabled | A family manager rebuilds what was not transferred; Kimi K3 and GLM5Next seed their replay slots |
+
+### What shared runtime code asks
+
+The executor, the decoder runner and the KV connector setup ask the owner of a fact. For the
+facts below they do not check for a recurrent manager class:
+
+| Hook | When | Use |
+|---|---|---|
+| `has_state_layers(manager)` in `pyexecutor/connectors/kv_cache_layout.py` | `PyExecutor`, when a KV connector is configured on a V2 cache | Whether the layout has an `SsmLayerConfig` layer. A connector has nothing to transfer for such a layer, so the setup is rejected |
+| `prepare_expect_snapshot_points(requests)` | `PyExecutor`, before it schedules the active requests | Fill `LlmRequest.expect_snapshot_points`. The hybrid managers set the snapshot points; `MambaHybridCacheManagerV2` also aligns them to the attention layout and, with block reuse, adds branch-snapshot and waiter points |
+| `is_context_only_cache` | Decoder warmup, dummy requests and the executor | `True` when the cache omits generation-only state, so its worker runs context requests only: the KDA draft-verification buffers, or the FP4 MLA V scales and packed V. The KDA and FP4 MLA managers report their own flags. A CSA2 cache pruned for a context worker reports `context_swa_layer_limit` instead |
+| `resets_recurrent_state_in_context` on the causal LM | The CUDA-graph runner, before it promotes a one-token context request into a decode graph | A class flag, `True` when only the context forward resets the state of a fresh slot. The runner also reads `has_ple` from the decoder, which is how Qwen4-exp reports active PLE |
+
+`prepare_expect_snapshot_points` and `on_state_transfer_complete` are steps of
+`BaseResourceManager`, which does nothing in either, and `is_context_only_cache` is `False` there.
+Such a default goes there and not on a KV cache manager base: `MambaHybridCacheManagerV2` derives
+from `KVCacheManagerV2` before the `MambaHybridCacheManager` mixin, so a default on the KV base
+would shadow the mixin's implementation. The executor calls both steps on the primary KV cache
+manager only.
+
+Decoder warmup and per-step metadata still check the manager class. So does `PyExecutor` in two
+places, both on V1 caches: the connector setup, which has no layout to ask, and `_schedule`, which
+filters context requests by capacity for `MixedMambaHybridCacheManager` when a transceiver is
+present.
 
 ## Adding a recurrent family
 

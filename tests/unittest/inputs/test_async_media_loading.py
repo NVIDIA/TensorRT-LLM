@@ -62,9 +62,7 @@ class TestAsyncLoadImage:
     @pytest.mark.asyncio
     async def test_load_image_from_raw_bytes_pil(self):
         encoded = _make_image_data_url().partition(",")[2]
-        image = await media_io_module.ImageMediaIO(format="pil").async_load_bytes(
-            base64.b64decode(encoded)
-        )
+        image = await media_io_module.ImageMediaIO().async_load_bytes(base64.b64decode(encoded))
         assert isinstance(image, Image.Image)
         assert image.mode == "RGB"
 
@@ -130,6 +128,22 @@ class TestLoadImageLocalFile:
     def _reference(path):
         return np.asarray(Image.open(path).convert("RGB"))
 
+    def test_offline_image_default_and_explicit_tensor(self, tmp_path):
+        path = self._write_image(tmp_path, "offline.png")
+        kwargs = dict(
+            tokenizer=None,
+            model_dir="",
+            model_type="llava_llama",
+            modality="image",
+            prompts=["Describe the image."],
+            media=[str(path)],
+        )
+        default = utils_module.default_multimodal_input_loader(**kwargs)
+        explicit = utils_module.default_multimodal_input_loader(**kwargs, image_data_format="pt")
+        image = default[0]["multi_modal_data"]["image"][0]
+        assert isinstance(image, Image.Image) and image.mode == "RGB"
+        assert isinstance(explicit[0]["multi_modal_data"]["image"][0], torch.Tensor)
+
     @pytest.mark.parametrize(
         "name",
         [
@@ -148,9 +162,11 @@ class TestLoadImageLocalFile:
         source = path.as_uri() if as_uri else str(path)
 
         expected = self._reference(path)
-        sync_image = utils_module.load_image(source, format="pil")
-        async_image = await async_load_image(source, format="pil")
+        sync_image = utils_module.load_image(source)
+        async_image = await async_load_image(source)
 
+        assert isinstance(sync_image, Image.Image) and sync_image.mode == "RGB"
+        assert isinstance(async_image, Image.Image) and async_image.mode == "RGB"
         assert np.array_equal(np.asarray(sync_image), expected)
         assert np.array_equal(np.asarray(async_image), expected)
 

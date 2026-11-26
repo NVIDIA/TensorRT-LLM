@@ -261,7 +261,7 @@ class BaseMultimodalInputProcessor(ABC):
             "This processor does not support prepared decode inputs")
 
     def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
-        """Return per-modality decode defaults, below server and request overrides."""
+        """Return sampling defaults, below server and per-request overrides."""
         return {}
 
     def get_disagg_prefill_inputs(
@@ -966,12 +966,7 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         return None
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        """Per-modality media-IO decode defaults for this model.
-
-        Applied under the server's ``--media_io_kwargs`` and any per-request
-        override, so a model can opt into a decode format it was tuned for
-        (e.g. ``{"video": {"format": "np"}}``) without operator config.
-        """
+        """Return sampling defaults, below server and per-request overrides."""
         return {}
 
     def get_dummy_mm_data(
@@ -1582,6 +1577,35 @@ class _InputProcessorCallable(Protocol):
         ...
 
 
+def _validate_media_representations(modality: str, items: list | tuple) -> None:
+    from .multimodal_data import VideoData
+
+    float_kind = None
+    byte_kind = None
+    for item in items:
+        if modality == "video":
+            if isinstance(item, VideoData):
+                item = item.frames
+            if isinstance(item, list) and item:
+                item = item[0]
+        if isinstance(item, Image.Image):
+            byte_kind = "PIL image"
+        elif isinstance(item, torch.Tensor):
+            if item.is_floating_point():
+                float_kind = "float tensor"
+            elif item.dtype == torch.uint8:
+                byte_kind = "uint8 tensor"
+        elif isinstance(item, np.ndarray):
+            if np.issubdtype(item.dtype, np.floating):
+                float_kind = "float array"
+            elif item.dtype == np.uint8:
+                byte_kind = "uint8 array"
+        if float_kind and byte_kind:
+            raise ValueError(
+                f"{modality} inputs in one request must use one representation; "
+                f"got {float_kind} and {byte_kind}")
+
+
 def create_input_processor_with_hash(
     input_processor: BaseMultimodalInputProcessor,
     hash_lib=default_hasher,
@@ -1755,13 +1779,15 @@ def create_input_processor_with_hash(
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         try_multimodal_hashing = False  # only used for first time
         use_multimodal_hashing = False  # used for subsequent calls
+        mm_data = inputs.get("multi_modal_data", {})
+        for modality in ("image", "video"):
+            items = mm_data.get(modality)
+            if isinstance(items, (list, tuple)) and len(items) > 1:
+                _validate_media_representations(modality, items)
         # Any subset of the supported modalities is eligible for hashing.
         # ``None`` payloads are skipped so an empty bucket doesn't gate off
         # hashing for the modalities that are actually present.
-        modalities = [
-            m for m, d in inputs.get('multi_modal_data', {}).items()
-            if d is not None
-        ]
+        modalities = [m for m, d in mm_data.items() if d is not None]
         if modalities and all(m in MEDIA_MODALITIES for m in modalities):
             if input_processor.multimodal_hashing_supported is not None:
                 use_multimodal_hashing = input_processor.multimodal_hashing_supported

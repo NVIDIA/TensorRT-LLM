@@ -147,6 +147,7 @@ def test_encoder_samples_are_not_duplicated_by_adp_fanout(attention_dp, monkeypa
         _latest_kv_iter_stats=None,
         _latest_host_step_time_ms=None,
         _latest_prev_device_step_time_ms=None,
+        _fmha_step_stats_enabled=False,
     )
     executor._stats_scheduler_mode = partial(PyExecutor._stats_scheduler_mode, executor)
     executor._take_mm_encoder_stats = partial(PyExecutor._take_mm_encoder_stats, executor)

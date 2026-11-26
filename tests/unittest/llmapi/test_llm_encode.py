@@ -22,7 +22,7 @@ from tensorrt_llm.llmapi import EncodeCudaGraphConfig, EncodeExtraInputSpec
 from tensorrt_llm.llmapi.llm import EncoderOutput
 
 # isort: off
-from .test_llm import get_model_path
+from .model_paths import get_model_path
 
 # isort: on
 

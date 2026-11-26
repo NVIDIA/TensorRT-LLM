@@ -62,7 +62,7 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fmha.registry import is_fmha_lib_enabled
+from .fmha.registry import is_fmha_lib_enabled, step_planning_fmha_lib_classes
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, fp4_mla_cache_layout,
                       has_fp4_mla_cache_layout, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
@@ -257,6 +257,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     beam_shared_prefix_enabled: bool = field(default=False,
                                              init=False,
                                              repr=False)
+    # Per-step device tensors that FMHA libraries derive once and share across
+    # the layers of a forward (e.g. page tables); emptied by every prepare().
+    fmha_step_caches: Dict[str, dict] = field(default_factory=dict,
+                                              init=False,
+                                              repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
     context_plan: Optional[_ContextPlan] = field(init=False,
                                                  default=None,
@@ -539,6 +544,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fmha_plan_caches = {}
         self.beam_shared_prefix_enabled = is_fmha_lib_enabled(
             "beam_shared_prefix")
+        self.fmha_step_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1388,6 +1394,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
+        self.fmha_step_caches = {}
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
         self._steady_block_table_keys = (None, None)
@@ -1755,6 +1762,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                 pool_block_offsets[:, 1],
                                 out=pool_block_offsets[:, 1])
 
+        # Per-step host planning of the enabled FMHA libraries that plan steps
+        # (Fmha.plan_step). It must run here, ahead of every forward of the
+        # step, so that under CUDA graphs it precedes both capture and replay.
+        for fmha_cls in step_planning_fmha_lib_classes():
+            fmha_cls.plan_step(self)
+
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
         batch = len(view.page_counts)
@@ -1880,7 +1893,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def supports_steady_decode_step(self) -> bool:
         """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
         prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
-        mixed-precision KV or full generation page table) and prepare() is this class's."""
+        mixed-precision KV, full generation page table or FMHA library step plan) and prepare() is this
+        class's."""
         return (type(self).prepare is TrtllmAttentionMetadata.prepare
                 and self.kv_cache_manager is not None
                 and not self.enable_flash_mla and not self.enable_helix
@@ -1888,7 +1902,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()
                 and self.mixed_precision_high_block_table is None
-                and not self.kv_cache_params.use_full_generation_page_table)
+                and not self.kv_cache_params.use_full_generation_page_table
+                # No enabled FMHA library plans steps in prepare().
+                and not step_planning_fmha_lib_classes())
 
     def key_prepared_block_offsets(self) -> None:
         """Key the block offsets the last prepare() copied, so that the next prepare_steady_decode_step skips

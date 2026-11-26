@@ -338,6 +338,53 @@ def test_kimi_k25_forward_with_attached_embeddings():
                 cache_manager.shutdown()
 
 
+@pytest.mark.cpu_only
+def test_kimi_video_chunk_token_budgets():
+    from PIL import Image
+
+    class KimiK25VisionProcessor:
+        __module__ = "kimi_k25_vision_processing"
+
+        def media_tokens_calculator(self, media):
+            assert all(isinstance(frame, Image.Image) for frame in media["video_chunk"])
+            return 11
+
+    class CustomProcessor(KimiK25VisionProcessor):
+        pass
+
+    cfg = dict(
+        config_type="media_proc.processors.moonvit.MoonViTMediaProcessorConfig",
+        temporal_merge_kernel_size=4,
+        patch_size=2,
+        merge_kernel_size=2,
+        patch_limit_on_one_side=256,
+        in_patch_limit=64,
+        in_patch_limit_each_frame=8,
+        in_patch_limit_video=None,
+        fixed_output_tokens=None,
+    )
+    frames = [np.zeros((16, 32, 3), dtype=np.uint8)] * 4 + [np.zeros((24, 16, 3), dtype=np.uint8)]
+    processor = KimiK25InputProcessor.__new__(KimiK25InputProcessor)
+    vision = KimiK25VisionProcessor()
+    processor._processor = SimpleNamespace(image_processor=vision)
+    with mock.patch.object(Image, "fromarray", side_effect=AssertionError("copied video pixels")):
+        for overrides, expected in [
+            ({}, 4),
+            ({"in_patch_limit_each_frame": None, "in_patch_limit_video": 48}, 15),
+            ({"in_patch_limit_each_frame": None, "patch_limit_on_one_side": 4}, 6),
+            ({"fixed_output_tokens": 5}, 10),
+        ]:
+            vision.media_proc_cfg = {**cfg, **overrides}
+            assert processor.get_num_tokens_per_video(video=frames) == expected
+
+    vision.media_tokens_calculator = mock.Mock(return_value=13)
+    assert processor.get_num_tokens_per_video(video=frames) == 26
+    custom = CustomProcessor()
+    custom.media_proc_cfg = cfg
+    processor._processor.image_processor = custom
+    assert processor.get_num_tokens_per_video(video=frames) == 22
+
+
 class TestKimiK25Structure(unittest.TestCase):
     """Structural tests for Kimi K2.5 — no forward pass."""
 
@@ -435,15 +482,17 @@ class TestKimiK25Structure(unittest.TestCase):
         """Pre-sampled VideoData frames keep timestamps from the original video."""
         from PIL import Image
 
-        frames = [Image.new("RGB", (16, 16), color=(i, i, i)) for i in range(4)]
-
-        _, prompt = _frames_to_chunks(
+        frames = np.arange(4 * 8 * 16 * 3, dtype=np.uint8).reshape(4, 8, 16, 3)
+        chunks, prompt = _frames_to_chunks(
             frames,
             temporal_merge_kernel_size=2,
             fps=10.0,
             frame_indices=[0, 5, 9, 12],
         )
 
+        decoded = [frame for chunk in chunks for frame in chunk["video_chunk"]]
+        self.assertTrue(all(isinstance(frame, Image.Image) for frame in decoded))
+        np.testing.assert_array_equal(np.stack(decoded), frames)
         self.assertIn("00:00:00.000<|media_begin|>video", prompt)
         self.assertIn("00:00:00.900<|media_begin|>video", prompt)
         self.assertNotIn("00:00:00.200<|media_begin|>video", prompt)

@@ -705,14 +705,17 @@ class DecoderRunner(ScheduledModelRunner):
         )
         assert kv_cache_manager is not None, "the legacy runner requires a KV cache manager"
         semantic_requests = scheduled_requests
-        context_plan = (
+        output_plan = (
             ContextLogitsPlan.for_batch(
                 self._context_logits_heads,
                 semantic_requests,
                 is_spec_decode=self._config.is_spec_decode or enable_spec_decode,
             )
-            if gather_context_logits
+            if gather_context_logits and self._mapping.is_last_pp_rank()
             else None
+        )
+        context_plan = (
+            output_plan if output_plan is not None and output_plan.project_in_forward else None
         )
         scheduled_requests = self._graphs.attention_dp_execution_batch(
             scheduled_requests, runtime_draft_len
@@ -983,6 +986,16 @@ class DecoderRunner(ScheduledModelRunner):
 
             if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:
                 outputs = self._logits_for_greedy_tokens(semantic_requests, outputs)
+            if output_plan is not None and output_plan.replay_rows and not output_plan.handled:
+                # A custom LM head can return all physical rows. Normalize them
+                # before post-processors, HandleLogits and sampling share the result.
+                logits = outputs.get("logits") if isinstance(outputs, dict) else None
+                if isinstance(logits, torch.Tensor) and not logits.is_nested and logits.ndim == 2:
+                    outputs = {
+                        **outputs,
+                        "logits": output_plan.store_full_logits(logits),
+                        "context_logits_handled": True,
+                    }
             self._execute_logit_post_processors(semantic_requests, outputs, pending_beam_histories)
 
             if not isinstance(outputs, dict):
