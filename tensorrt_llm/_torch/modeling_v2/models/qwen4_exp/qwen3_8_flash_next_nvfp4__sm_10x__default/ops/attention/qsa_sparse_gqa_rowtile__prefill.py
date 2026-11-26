@@ -295,6 +295,9 @@ _GP_RUN = 16
 #: The CTA's shared memory: the union bitmap, the prefix counts and one row's re-indexed bits.
 _GP_MAX_SMEM = 200 << 10  # capacity: fixed: a launch above it takes the two passes
 _GP_MAX_ROWS = 32  # capacity: fixed: rows a group (10 at a dep4 rank, 20 at a tp4 / tep4 one)
+#: The plan the last `qsa_rowtile_sparse_gqa` call took, "group plan" or "two passes": read by
+#: the target's context-forms log line (diagnostic only; no launch reads it).
+last_plan = ""
 
 
 @dsl_user_op
@@ -1274,6 +1277,8 @@ def qsa_rowtile_sparse_gqa(
         selected_tokens, query_positions, request_indices, block_table, tokens_per_block,
         rows_per_tile, packed_words,
     )  # fmt: skip
+    global last_plan
+    last_plan = "group plan" if group_planned else "two passes"
     slots = torch.empty((num_groups, packed_words * 64), dtype=torch.int32, device=q.device)
     packed_bits = torch.zeros((rows, packed_words), dtype=torch.int64, device=q.device)
     group_plan = torch.empty((num_groups, 2), dtype=torch.int32, device=q.device)

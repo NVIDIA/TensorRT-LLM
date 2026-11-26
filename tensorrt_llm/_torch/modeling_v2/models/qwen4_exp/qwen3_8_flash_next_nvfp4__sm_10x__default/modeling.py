@@ -218,6 +218,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_b
     qsa_expand_block_indices,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_fp8 import (
+    _takes_ctx_tile,
     index_anchors_to_fp8,
     qsa_index_scores_fp8,
 )
@@ -315,6 +316,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_exp
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
     supports as _topk_expand_supports,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
+    takes_context as _topk_takes_context,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_select import (
     qsa_topk_select,
@@ -589,6 +593,7 @@ from .. import ple_host_table as _ple_host
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
+from .ops.attention import qsa_sparse_gqa_rowtile__prefill as _rowtile_prefill
 from .ops.attention.qsa_fp8_pages_to_bf16__prefill import qsa_fp8_pages_to_bf16
 from .ops.attention.qsa_sparse_gqa_rowtile__prefill import qsa_sparse_gqa_rowtile
 from .ops.attention.qwen4_exp_attn_decode_prologue__decode import qwen4_exp_attn_decode_prologue
@@ -950,6 +955,27 @@ _FP8_ROWTILE_MAX_SCRATCH = 1 << 30  # capacity: fixed: bounds a per-call scratch
 # 24 q / 2 kv heads, 200k-token histories: the widen and the pass take 0.55-0.64 ms a group
 # whatever its rows, the per-row kernel about 0.8 us a row (0.49 ms at 512 rows, 0.69 ms at 768).
 _FP8_GROUP_ROWTILE_MIN_ROWS = 768  # capacity: fixed: a dispatch threshold, not a buffer size
+
+
+#: The context-step forms this process took, each with the rows of the call that first took it
+#: (`_ctx_form`). Diagnostic only: nothing dispatches on it.
+_CTX_FORMS: dict = {}
+
+
+def _ctx_form(name: str, rows: int) -> None:
+    """Record that a context call took form `name` (the index scores' ctx tile, the context
+    top-k launch, the row-tile group plan, the in-place row-tile output, the fp8 groups, the
+    one-launch MoE, the in-forward split, or the path taken instead). The first time a form is
+    seen, log one line with every form seen so far, so a log shows which context forms engaged
+    and which did not (the context counterpart of `_decode_forms`)."""
+    if name in _CTX_FORMS:
+        return
+    _CTX_FORMS[name] = rows
+    logger.info(
+        "context forms: " + ", ".join(f"{k} (first at {v} rows)" for k, v in _CTX_FORMS.items())
+    )
+
+
 # A step with more context rows than this over an NVFP4 pool attends them on the row-tile pass
 # over a bf16 scratch of their requests' pages (`_sparse_gqa_nvfp4_context`): at one rank 16384
 # context rows 1.36 ms a layer there against 77-948 ms for the NVFP4 per-row kernel.
@@ -5095,6 +5121,8 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
         routed_out = torch.empty([rows, core.hidden], dtype=x.dtype, device=x.device)
         return _cute_dsl_routed(core, L, router_mm(x, L.router), xq, xsf, routed_out)
     if L.fc1_w_cd is not None and _CUTE_DSL_MOE_MIN_ROWS <= rows <= _CUTE_DSL_MOE_MAX_ROWS:
+        if router_mm is cublas_mm:
+            _ctx_form("moe cutedsl copy", rows)
         xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, False) if fp4 is None else fp4
         return fp4_moe_renorm_cute_dsl(
             router_mm(x, L.router),
@@ -5119,6 +5147,7 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
     ):
         # The router GEMM keeps its chunk-sized calls: cuBLAS picks its kernel by the row count,
         # and another kernel could move a logit's last bit and flip a near-tie of the top-k.
+        _ctx_form("moe one launch", rows)
         logits = torch.cat(
             [
                 router_mm(x[lo : lo + _MOE_MAX_ROWS], L.router)
@@ -5142,6 +5171,8 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
             core.expert_offset,
             core.local_experts,
         )
+    if core.one_rank and router_mm is cublas_mm and rows > _MOE_MAX_ROWS:
+        _ctx_form(f"moe {_MOE_MAX_ROWS}-row chunks", rows)
     sf_cols = x.shape[1] // _SF_VEC
     parts = []
     for lo in range(0, rows, _MOE_MAX_ROWS):
@@ -5494,6 +5525,10 @@ def _selection(
         )
         return
     if _topk_expand_supports(scores):
+        if context:
+            # The op's block top-k: `topk_indices` is `[rows, token_topk / compress_ratio]`.
+            took = _topk_takes_context(scores, core.token_topk // core.compress_ratio)
+            _ctx_form("ctx top-k cta" if took else "ctx top-k decode launch", scores.shape[0])
         qsa_topk_expand_decode(
             scores,
             visible_blocks,
@@ -5506,6 +5541,8 @@ def _selection(
             context=context,
         )
         return
+    if context:
+        _ctx_form("ctx top-k select + expand", scores.shape[0])
     _select(core, scores, row_starts, visible_blocks, topk_indices, live_cols)
     out.copy_(
         qsa_expand_block_indices(
@@ -5843,7 +5880,12 @@ def _sparse_gqa(
                 core, kv, q, block_table, selected, request_indices, tpb, query_positions,
                 fp8_pages, rowtile_out,
             )  # fmt: skip
-            if out is not None:
+            if out is None:
+                _ctx_form("row-tile declined, per-row kernel", q.shape[0])
+            else:
+                _ctx_form(f"row-tile {_rowtile_prefill.last_plan}", q.shape[0])
+                if rowtile_out is not None and out.data_ptr() == rowtile_out.data_ptr():
+                    _ctx_form("row-tile out in place", q.shape[0])
                 return out
         return qsa_paged_sparse_gqa(
             q=q,
@@ -5913,6 +5955,11 @@ def _index_scores(core, **kw):
     (`qsa_index_scores_fp8`), which takes no launch hints (PDL, prefetch, the visible split)."""
     if not getattr(core, "index_key_fp8", False):
         return qsa_paged_index_scores(**kw)
+    if kw["context_rows"]:
+        tile = _takes_ctx_tile(
+            kw["q"], kw["only_visible_blocks"], True, kw.get("rows_per_request", 1)
+        )
+        _ctx_form("index fp8 ctx tile" if tile else "index fp8 request-group", kw["q"].shape[0])
     return qsa_index_scores_fp8(
         kw["q"],
         kw["index_cache"],
@@ -6429,6 +6476,7 @@ class PrefillTarget:
                 )
                 parts = []
             if parts and step.fp8_groups is not None:
+                _ctx_form("fp8 context groups", num_ctx)
                 # The context rows a scratch-sized group of requests at a time.
                 assert parts[0] == (0, num_ctx, True), (parts[0], num_ctx)
                 assert step.fp8_groups[-1][1] == num_ctx, (step.fp8_groups[-1], num_ctx)
@@ -6656,6 +6704,7 @@ class PrefillTarget:
         pools = core._bound.pools
         conv_states = pools.conv[i]
         stage_ssm, stage_conv = core._bound.cm.inforward_snapshot_stage_views(i)
+        _ctx_form("in-forward snapshot split", num_tokens)
         ref = (
             self._gdn_inforward_reference(mq, a, b, L, i, qsl, si, hi, num_tokens)
             if _INFORWARD_VALIDATE
