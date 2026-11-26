@@ -904,6 +904,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex._reset_scheduler_failure_state()
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
         ex.kv_cache_manager = _make_v2_kv_cache_manager()
@@ -952,6 +953,7 @@ class TestBenchmarkFillAdmissionFlowControl:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex._reset_scheduler_failure_state()
         ex.enable_attention_dp = True
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
@@ -1315,6 +1317,7 @@ class TestFailFastDuringBenchmarkFill:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex._reset_scheduler_failure_state()
         ex.sampler = Mock(spec=["release_request"])
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
@@ -1700,6 +1703,7 @@ class TestFillPhaseEndToEnd:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex._reset_scheduler_failure_state()
         ex.benchmark_req_queues_size = self.TOTAL_REQUESTS
         ex.kv_cache_transceiver = _make_transceiver(transfer_complete=False)
         ex.kv_cache_manager = _make_v2_kv_cache_manager()

@@ -298,14 +298,17 @@ class DisaggTransferCoordinator:
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         """Let the transceiver gate generation-first context requests.
 
-        Context-first context requests are schedulable at once; for
-        generation-first ones the transceiver decides when the peer is ready.
+        Context-first requests need no peer handshake, but wait for agent
+        recovery. Generation-first requests also wait until the peer is ready.
         """
         gen_first_ctx_requests = [
             req
             for req in new_requests
             if req.is_context_only_request
-            and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            and (
+                req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+                or getattr(self._transceiver, "can_admit_ctx_requests", True) is False
+            )
         ]
         # Always call prepare_context_requests, with new requests or without,
         # so the consensus inside it can promote requests whose peer info has
@@ -315,7 +318,13 @@ class DisaggTransferCoordinator:
     @nvtx_range("poll_gen_transfers")
     def poll_gen_transfers(self) -> None:
         """Poll receive-side transfers and their timeouts; rank-synchronized."""
+        if getattr(self._transceiver, "can_admit_ctx_requests", True) is False:
+            # Continue the existing send outcome exchange after the last failed
+            # request retires, so recovery can reopen context admission while idle.
+            self.reap_context_sends(0)
         if not uses_async_gen_transfer():
+            if self._transceiver.reap_sync_receives():
+                self._check_transfer_errors("generation requests")
             return
         if self._defer_unready_gen_receives:
             self._publish_ready_gen_receives()
@@ -504,6 +513,10 @@ class DisaggTransferCoordinator:
         # the number of blocking transfers started in one executor iteration.
         if is_gen_only_no_context_benchmark():
             return fitting_gen_init, False
+
+        if getattr(self._transceiver, "can_admit_gen_requests", True) is False:
+            self.revert_deferred_gen_init(fitting_gen_init, [], reason="agent_recovery")
+            return [], True
 
         if not (self._transfer_window_is_active() and fitting_gen_init):
             return fitting_gen_init, False
@@ -958,23 +971,34 @@ class DisaggTransferCoordinator:
                             timeout_ms=self._transceiver.kv_transfer_timeout_ms,
                         )
 
-    def poll_progress_when_idle(self) -> None:
+    def poll_progress_when_idle(self, batch_is_empty: bool = False) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
 
-        A synchronous GEN receive blocks rank-locally, so a multi-rank worker
-        must not enter the context status collective here. A single-rank
-        worker cannot diverge and polls only while a send is in flight.
+        ``batch_is_empty`` says the scheduled batch has no request to forward,
+        so no post-forward reap runs this iteration.
+
+        With synchronous transfers, a single-rank worker polls only while a
+        send is in flight. A multi-rank worker polls only when its batch is
+        empty: the status collective's peers share that schedule, and the
+        sync receives started before this call are aligned across them and
+        finish before it, so every peer enters the collective in the same
+        iteration. Retained send sessions (a drained cancelled send waiting
+        for the group vote) then retire with no forward step.
         """
         uses_synchronous_gen_transfer = (
             not uses_async_gen_transfer() and not is_gen_only_no_context_benchmark()
         )
-        should_poll_synchronous_context_status = (
-            uses_synchronous_gen_transfer
-            and self._dist.world_size == 1
-            and self._transfers.has_any_inflight_requests()
-        )
-        if uses_synchronous_gen_transfer and not should_poll_synchronous_context_status:
-            return
+        if uses_synchronous_gen_transfer:
+            if self._dist.world_size == 1:
+                should_poll = (
+                    self._transfers.has_any_inflight_requests()
+                    # A cancelled partial send is retired only by this reap.
+                    or getattr(self._transceiver, "has_open_send_sessions", lambda: False)()
+                )
+            else:
+                should_poll = batch_is_empty
+            if not should_poll:
+                return
 
         self.reap_context_sends(0)
 
@@ -1697,10 +1721,14 @@ class DisaggTransferCoordinator:
         ]
 
     def _is_error_cleanup_blocked(self, request: LlmRequest) -> bool:
-        """Whether a failed request must wait: the cancel path owns it, or a
-        transfer owner still holds its context blocks."""
+        """Whether cancellation or transfer resources still hold a failed request."""
         if self._vote_id(request) in self._registry.canceled_request_ids():
             return True
+        if (
+            getattr(request, "is_generation_only_request", False) is True
+            and not uses_async_gen_transfer()
+        ):
+            return self._transceiver.has_inflight_transfer(request)
         return (
             getattr(request, "is_context_only_request", False) is True
             and request.py_request_id in self._transfers.requests_in_transfer()
@@ -1802,7 +1830,7 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def poll_gen_transfers(self) -> None:
         return None
 
-    def poll_progress_when_idle(self) -> None:
+    def poll_progress_when_idle(self, batch_is_empty: bool = False) -> None:
         return None
 
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:

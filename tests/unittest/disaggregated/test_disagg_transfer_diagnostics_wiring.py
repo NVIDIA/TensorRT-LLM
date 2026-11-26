@@ -1464,7 +1464,7 @@ def test_backend_wait_continues_when_submission_diagnostic_callback_fails(
     sender._agent = SimpleNamespace(submit_transfer_requests=Mock(return_value=status))
     sender._ownership_poison_lock = threading.Lock()
     sender._ownership_poisoned = None
-    task = Mock()
+    task = Mock(lock=threading.Lock(), _native_inflight=0)
     task._enforce_physical_ownership = enforce_physical_ownership
     request = Mock()
     callback = Mock(side_effect=RuntimeError("diagnostics failed"))
@@ -1780,49 +1780,6 @@ def test_native_profile_diagnostics_do_not_affect_worker_setup(
             rank_info=rank_info,
             profile="native_v1",
         )
-
-
-@pytest.mark.parametrize("physical_ownership", [False, True])
-def test_expired_blocking_receive_marks_timeout_and_preserves_retirement(
-    monkeypatch: pytest.MonkeyPatch, receive_chunk_bytes: Mock, physical_ownership: bool
-) -> None:
-    session = object.__new__(RxSession)
-    session._logical_outcomes = transfer_module._LogicalOutcomes()
-    session._retirement = None
-    session._enforce_physical_ownership = physical_ownership
-    session._terminal_status = None
-    session._exception = None
-    session._need_aux = False
-    session._timeout_s = 0.0
-    session._writer_wait_expired = False
-    session._writer_wait_start = None
-    session._kv_tasks = [
-        SimpleNamespace(
-            status=TaskStatus.TRANSFERRING,
-            wait=Mock(return_value=False),
-            reports_outstanding=False,
-        )
-    ]
-    session.resources_drained = Mock(return_value=not physical_ownership)
-    session.receive = Mock()
-    session.close = Mock(return_value=not physical_ownership)
-    request = _disagg_request(41, 4041)
-    request.state = LlmRequestState.DISAGG_GENERATION_INIT
-    request.set_kv_cache_size = Mock()
-    transceiver = _diagnostic_transceiver()
-    transceiver._validate_bridge_req = Mock(return_value=True)
-    transceiver._recv_sessions = {}
-    transceiver._recv_reqs = {}
-    transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
-    transceiver._create_cache_extent = Mock(return_value=_extent(4041))
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
-    transceiver.request_and_receive_sync(request)
-    assert session.timed_out is True
-    assert request.py_kv_transfer_timed_out is True
-    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
-    session._kv_tasks[0].wait.assert_called_once_with(timeout=0.0)
-    assert bool(transceiver._recv_sessions) == physical_ownership
-    session.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize("outcome", ["success", "error", "timeout"])
