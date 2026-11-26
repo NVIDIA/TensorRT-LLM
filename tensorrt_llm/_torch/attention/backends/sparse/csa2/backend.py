@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import math
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,7 @@ from .params import (
     CSA2Layout,
     CSA2Mode,
     CSA2Params,
+    resolve_swa_cache_format,
     select_csa2_backend,
 )
 
@@ -49,7 +50,6 @@ _SWA_TILE = 128
 # out of Q's low end (see ``_prepare_native_fp8`` below), and this caps what it
 # may spend when a SWA group scale asks for more than the main pool ever can.
 _CONTEXT_STAGE_SCALE_MAX_EXPONENT = 3
-_CSA2_KV_CACHE_DTYPES = ("auto", "bfloat16", "fp8", "fp8_ds_mla")
 _CSA2_FP8_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla")
 # From here a ratio-2 staging group's decode step is faster on the ``gen_fmha`` core than on the fused
 # decode (GB300, independent or shared selections); ratio-1 groups are slower at any row count.
@@ -94,20 +94,16 @@ def _fused_decode_workspace(device: int) -> torch.Tensor:
 
 
 def _csa2_kv_cache_algo(quant_config) -> QuantAlgo | None:
-    """Return the requested KV-cache quantization, which CSA2 honors only as FP8 staging.
+    """Validate the KV algorithm used for compute staging.
 
-    The persistent CSA2 cache formats (FP8 SWA rows, NVFP4 main and index
-    records) never change with the quantization config. FP8 is accepted as a
-    request for E4M3 compute staging; any other KV-cache algorithm has no
-    CSA2 meaning and is rejected.
+    Both FP8 cache dtype spellings map to the same quantization algorithm;
+    persistent SWA encoding is selected separately from the original dtype.
     """
     algo = None if quant_config is None else quant_config.kv_cache_quant_algo
     if algo is None:
         return None
     if algo not in (QuantAlgo.FP8, QuantAlgo.FP8.value):
-        raise ValueError(
-            "CSA2 persistent cache formats are fixed; only FP8 KV-cache quantization is accepted"
-        )
+        raise ValueError("CSA2 accepts only FP8 KV-cache quantization")
     return QuantAlgo.FP8
 
 
@@ -152,13 +148,47 @@ class CSA2TrtllmAttention(TrtllmAttention):
             return 0
         layout = CSA2Layout.from_hf_config(model_config.pretrained_config)
         owners = layout.kv_source_layer_ids
-        if not owners:
-            return 0
-        max_positions = max(1, max_seq_len // min(layout.compress_ratios[i] for i in owners))
-        pages = max(1, (max_positions + 63) // 64)
+        sparse_config = model_config.sparse_attention_config
+        provider_params = CSA2Params(
+            use_fp8_staging=getattr(sparse_config, "use_fp8_staging", None)
+        )
         spec_config = model_config.spec_config
         draft_width = spec_config.tokens_per_gen_step if spec_config is not None else 1
         query_capacity = max_batch_size * draft_width
+        reserve = 0
+        if select_csa2_backend(get_sm_version(), provider_params) == "prims_ts":
+            from .prims_ts import workspace_reservation_bytes
+
+            heads = model_config.pretrained_config.num_attention_heads
+            if not mapping.enable_attention_dp:
+                heads //= mapping.tp_size
+            widths = {128}
+            if owners:
+                widths.add(128 + (layout.index_topk + 127) // 128 * 128)
+            device = torch.device("cuda", torch.cuda.current_device())
+            # Generation tiles of up to one step's queries take a selection bank, with an
+            # owner slot per row of the largest layer's MAIN pool.
+            main_pool_rows = (
+                max_batch_size
+                * max(1, max_seq_len // min(layout.compress_ratios[i] for i in owners))
+                if owners
+                else 0
+            )
+            reserve = sum(
+                workspace_reservation_bytes(
+                    device,
+                    heads,
+                    width,
+                    max_num_tokens,
+                    generation_queries=min(max_num_tokens, query_capacity),
+                    main_pool_rows=main_pool_rows,
+                )
+                for width in widths
+            )
+        if not owners:
+            return reserve
+        max_positions = max(1, max_seq_len // min(layout.compress_ratios[i] for i in owners))
+        pages = max(1, (max_positions + 63) // 64)
         num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
@@ -177,7 +207,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         # Eager arenas grow to a power-of-two page capacity. The graph arena
         # uses exact maximum geometry and is shared across captured batch sizes.
         eager_pages = 1 << (pages - 1).bit_length()
-        reserve = arena_bytes(min(max_num_tokens, query_capacity), eager_pages)
+        reserve += arena_bytes(min(max_num_tokens, query_capacity), eager_pages)
         if enable_cuda_graph:
             reserve += arena_bytes(query_capacity, pages)
         if layout.index_head_dim == 128:
@@ -220,30 +250,20 @@ class CSA2TrtllmAttention(TrtllmAttention):
         if num_kv_heads != 1:
             raise ValueError("CSA2 TRTLLM sparse MLA requires one KV head")
         requested_dtype = kwargs.get("kv_cache_dtype", "auto")
-        if requested_dtype not in _CSA2_KV_CACHE_DTYPES:
-            raise ValueError("CSA2 KV cache dtype must be auto, bfloat16, fp8 or fp8_ds_mla")
+        self.swa_cache_format = resolve_swa_cache_format(requested_dtype)
         quant_config = kwargs.get("quant_config")
         requested_algo = _csa2_kv_cache_algo(quant_config)
         sparse_params = sparse_params or CSA2Params()
-        self.compute_backend = (
-            select_csa2_backend(get_sm_version())
-            if sparse_params.compute_backend == "auto"
-            else sparse_params.compute_backend
-        )
-        if self.compute_backend not in ("trtllm", "flash_mla", "flashinfer"):
-            raise ValueError(f"Unknown CSA2 attention backend: {self.compute_backend}")
+        self.compute_backend = select_csa2_backend(get_sm_version(), sparse_params)
+        if self.compute_backend == "prims_ts" and not 0 < num_heads <= 128:
+            raise ValueError("CSA2 PrimTS sparse MLA supports up to 128 query heads")
         if self.compute_backend == "trtllm" and not is_sm_100f():
             raise ValueError("CSA2 trtllm-gen requires an SM100-family GPU")
-        # ``kv_cache_config.dtype`` selects the compute staging dtype only; an
-        # FP8 KV-cache algorithm in the quantization config does the same when
-        # the dtype is left at ``auto``. Only native trtllm-gen consumes E4M3
-        # staging, whose per-tensor KV scale is derived per forward from the
-        # packed pools' group scales, so that path additionally requires
-        # ``use_fp8_staging``. The library adapters and packed attention read
-        # BF16 staging or the persistent rows, so they keep BF16 and drop the
-        # FP8 KV algo from the inherited config. A default ``use_fp8_staging``
-        # follows that same support boundary, while an explicit request for
-        # staging the backend cannot serve stays an error.
+        # Persistent SWA format and compute staging are independent. Both FP8
+        # dtype spellings request native E4M3 staging when that provider supports
+        # it; the FP8 quantization algorithm does the same under ``auto``.
+        # Flash helpers stage BF16. PrimTS decodes directly to native E4M3
+        # operands, while the separate custom packed kernel uses BF16 operands.
         fp8_requested = requested_dtype in _CSA2_FP8_KV_CACHE_DTYPES or (
             requested_dtype == "auto" and requested_algo is QuantAlgo.FP8
         )
@@ -292,18 +312,29 @@ class CSA2TrtllmAttention(TrtllmAttention):
         )
         self.local_layer_idx = 0  # one physical compute-pool slot in this view
         # FP8 context tiles that stage the shared E4M3 bank run one fused kernel
-        # (``forward_fused_context``) instead of the trtllm-gen context FMHA.
+        # (``forward_fused_context``) instead of the trtllm-gen context FMHA. PrimTS leaves
+        # them to that kernel too on the unit-scale E4M3 SWA records of the ``fp8`` KV cache,
+        # the FP8 format it reads: its context tiles that get a shared bank stage it in E4M3
+        # (``query_tile_metadata``), wherever native FP8 staging would.
+        context_fp8 = native_fp8 or (
+            self.compute_backend == "prims_ts"
+            and fp8_requested
+            and self.swa_cache_format == "swa_fp8"
+            and sparse_params.use_fp8_staging is not False
+        )
         self.fused_context = (
-            self.native_fp8
+            context_fp8
             and num_heads == 64
             and _fused_context_supported(torch.cuda.current_device())
         )
         # Module generation tiles read the packed pools with one fused kernel
         # (``forward_fused_decode``) instead of staging. It takes 64 query heads,
-        # an even SWA window and main selections in 64-key blocks.
+        # 528-byte scaled SWA records, an even SWA window and main selections in
+        # 64-key blocks.
         layout = sparse_params.layout
         self.fused_decode = (
             staging_supported
+            and self.swa_cache_format == "swa"
             and num_heads == 64
             and layout is not None
             and layout.window_size % 2 == 0
@@ -324,9 +355,37 @@ class CSA2TrtllmAttention(TrtllmAttention):
         )
 
     @property
+    def kv_input_mode(self) -> Literal["staged", "packed"]:
+        """PrimTS consumes persistent packed records, not native KV staging."""
+        return "packed" if self.compute_backend == "prims_ts" else "staged"
+
+    @property
     def native_fp8(self) -> bool:
-        """Whether trtllm-gen consumes E4M3 staging (the only FP8 compute path)."""
+        """Whether trtllm-gen consumes E4M3 staging, independently of persistent SWA."""
         return self.staging_dtype == torch.float8_e4m3fn
+
+    def query_tile_metadata(
+        self,
+        source: CSA2TrtllmMetadata,
+        q: torch.Tensor,
+        extra_width: int,
+        *,
+        query_start: int,
+        layer_idx: int,
+    ) -> CSA2TrtllmMetadata:
+        """``source``'s compute metadata of the module tile ``q`` ([rows, heads, 512]) from row
+        ``query_start``: staged in ``staging_dtype``, or packed for PrimTS. A PrimTS context tile
+        that the fused context kernel serves stages its shared E4M3 bank instead
+        (``runs_fused_context``)."""
+        return source.get_query_tile_metadata(
+            q,
+            extra_width,
+            query_start,
+            staging_dtype=self.staging_dtype,
+            layer_idx=layer_idx,
+            kv_input_mode=self.kv_input_mode,
+            stage_shared_context=self.kv_input_mode == "packed" and self.fused_context,
+        )
 
     def update_quant_config(self, new_quant_config):
         """Rebuild the shared dispatcher, then apply CSA2's provider policy."""
@@ -351,11 +410,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
             )
 
     def forward(self, q, k, v, metadata, forward_args=None, **kwargs):
-        if not self.native_fp8:
-            return super().forward(q, k, v, metadata, forward_args=forward_args, **kwargs)
         args = merge_attention_forward_args(forward_args, kwargs)
         if self.direct_decode_applies(q, metadata, args):
             return self._forward_direct(q, metadata, args)
+        if not self.native_fp8 and not self.runs_fused_context(metadata):
+            return super().forward(q, k, v, metadata, forward_args=forward_args, **kwargs)
         state = getattr(args.sparse_backend_args, "state", None)
         if state is not None and state.query_rope is not None:
             raise ValueError("Only the CSA2 direct decode applies the query RoPE itself")
@@ -373,8 +432,14 @@ class CSA2TrtllmAttention(TrtllmAttention):
         return super().forward(q, k, v, metadata, forward_args=args)
 
     def runs_fused_context(self, metadata: CSA2TrtllmMetadata) -> bool:
-        """Whether a context tile with this metadata runs ``forward_fused_context``."""
-        return self.native_fp8 and self.fused_context and metadata.shared_plan is not None
+        """Whether a context tile with this metadata runs ``forward_fused_context``: a tile that
+        stages the shared E4M3 bank, under either provider."""
+        return (
+            self.fused_context
+            and metadata.shared_plan is not None
+            and metadata.kv_input_mode == "staged"
+            and metadata.staging_dtype == torch.float8_e4m3fn
+        )
 
     def direct_decode_applies(self, q, metadata, forward_args) -> bool:
         """Whether this tile takes the direct sparse decode (``direct_decode.py``) instead of
@@ -393,6 +458,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
             and forward_args.attention_input_type == AttentionInputType.generation_only
             and metadata.num_contexts == 0
             and metadata.shared_plan is None
+            # A module's tile of this backend: PrimTS plans packed tiles, native ones staged.
+            and metadata.kv_input_mode == self.kv_input_mode
             and self.direct_decode_serves(
                 metadata.num_tokens,
                 context_tokens,
@@ -403,11 +470,20 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
     def direct_decode_serves(self, rows, context_tokens, main_width, device) -> bool:
         """The forward-level part of ``direct_decode_applies``: the module asks it before
-        projecting, to leave the query RoPE to the launch."""
+        projecting, to leave the query RoPE to the launch. The launch decodes either SWA format;
+        native FP8 staging takes it for legacy scaled SWA records only (payload-only FP8 uses
+        the format-aware staging path), and PrimTS, which reads the packed pools too, for both.
+        """
         from .direct_decode import MAX_ROWS, direct_decode_device_supported, direct_decode_fits
 
         return (
-            self.native_fp8
+            (
+                (self.native_fp8 and self.swa_cache_format == "swa")
+                or (
+                    self.compute_backend == "prims_ts"
+                    and self.swa_cache_format in ("swa", "swa_fp8")
+                )
+            )
             and not self.sparse_params.use_packed_sparse_attention
             and context_tokens == 0
             and 0 < rows <= MAX_ROWS
@@ -636,7 +712,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
         metadata: CSA2TrtllmMetadata,
         forward_args: AttentionForwardArgs,
     ) -> CSA2BackendForwardArgs:
-        if self.native_fp8 and (
+        fused_context = self.runs_fused_context(metadata)
+        if (self.native_fp8 or fused_context) and (
             forward_args.out_scale is not None
             or forward_args.out_scale_sf is not None
             or forward_args.output_sf is not None
@@ -644,7 +721,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
             or (forward_args.output is not None and forward_args.output.dtype != torch.bfloat16)
         ):
             raise ValueError("CSA2 native FP8 attention requires unquantized BF16 output")
-        if metadata.swa_pool.dtype != self.staging_dtype:
+        # PrimTS stages only the context tiles of the fused context kernel.
+        if metadata.kv_input_mode != self.kv_input_mode and not fused_context:
+            raise ValueError("CSA2 tile KV input mode must match its attention backend")
+        staging_dtype = torch.float8_e4m3fn if fused_context else self.staging_dtype
+        if metadata.kv_input_mode == "staged" and metadata.swa_pool.dtype != staging_dtype:
             raise ValueError("CSA2 tile staging dtype must match its attention backend")
         count = metadata.num_tokens
         if (
@@ -658,7 +739,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
             q, metadata, forward_args
         )
         inputs = self._resolve_sparse_inputs(count, forward_args, release_after_wait=release)
-        if metadata.swa_pool.device != q.device:
+        if metadata._csa2_device != q.device:
             raise ValueError("CSA2 Q and metadata must be on the same CUDA device")
         return inputs
 
@@ -712,6 +793,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
         inputs = forward_args.sparse_backend_args
         if not isinstance(inputs, CSA2BackendForwardArgs):
             raise TypeError("CSA2 requires CSA2BackendForwardArgs")
+        if inputs.swa_cache_format is not None and inputs.swa_cache_format != self.swa_cache_format:
+            raise ValueError("CSA2 input SWA format must match its attention backend")
+        if inputs.swa_cache_format is None:
+            # Module tiles build fresh inputs that already carry the format.
+            inputs = replace(inputs, swa_cache_format=self.swa_cache_format)
         if forward_args.attention_input_type not in (
             AttentionInputType.context_only,
             AttentionInputType.generation_only,
@@ -721,6 +807,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
             state = inputs.state
             source = state.metadata
             manager = source.kv_cache_manager
+            if manager.swa_cache_format != self.swa_cache_format:
+                raise ValueError("CSA2 cache manager SWA format must match its attention backend")
             layout = self.sparse_params.layout
             if layout is None:
                 raise ValueError("CSA2 module inputs require the model layout")
@@ -763,9 +851,9 @@ class CSA2TrtllmAttention(TrtllmAttention):
             mapping = None
             if logical is not None:
                 visible = source.csa2_visible_lengths[self.layer_idx][start:end]
-                if self._native_slot_mapping(logical):
-                    # The staging kernels resolve logical rows through the
-                    # owner's live page table themselves (one launch fewer).
+                if self.kv_input_mode == "packed" or self._native_slot_mapping(logical):
+                    # Packed PrimTS metadata and native staging each resolve
+                    # logical rows through the owner's live page table.
                     owner = source.csa2_kv_sources[self.layer_idx]
                     slots = logical
                     mapping = (
@@ -784,6 +872,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 projected_q_unit_scale=inputs.projected_q_unit_scale,
                 projected_q_amax=inputs.projected_q_amax,
                 swa_pool=manager.get_swa_buffer(self.layer_idx),
+                swa_cache_format=self.swa_cache_format,
                 swa_indices=source.csa2_swa_indices[self.layer_idx][start:end],
                 main_pool=None if logical is None else manager.get_main_buffer(layer.kv_source),
                 topk_indices=slots,
@@ -845,6 +934,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
             _fused_decode_workspace(q.device.index),
             *(() if mxfp8 is None else mxfp8[1:]),
         )
+        if mxfp8 is not None:
+            inputs.state.output_mxfp8_written = True
 
     def _native_slot_mapping(self, logical: torch.Tensor) -> bool:
         """Logical main selections may stay logical when native staging maps them."""
@@ -858,7 +949,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
     def sparse_attn_predict(self, q, k, metadata, forward_args, *, bank=False):
         """``bank``: stage for the ``gen_fmha`` generation core (``_forward_gen_fmha``)."""
-        if self.compute_backend != "trtllm" or self.sparse_params.use_packed_sparse_attention:
+        # PrimTS stages the context tiles of the fused context kernel as native FP8 staging does.
+        fused_context = self.runs_fused_context(metadata)
+        if (
+            self.compute_backend != "trtllm" and not fused_context
+        ) or self.sparse_params.use_packed_sparse_attention:
             raise ValueError("CSA2 Flash and packed attention require their explicit module helper")
         if (
             metadata.is_cuda_graph
@@ -870,7 +965,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         ):
             raise RuntimeError("Warm up CSA2 metadata with forward before CUDA Graph capture")
         inputs = self.prepare_sparse_inputs(q, metadata, forward_args)
-        if self.native_fp8:
+        if self.native_fp8 or fused_context:
             generation = (
                 forward_args.attention_input_type == AttentionInputType.generation_only
                 and q.numel() > 0
@@ -1019,7 +1114,10 @@ class CSA2TrtllmAttention(TrtllmAttention):
                     forward_args.quant_q_buffer = quant_q
         else:
             metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices, dedup=True)
-        if not self.native_fp8 and forward_args.sparse_backend_args.query_ready is not None:
+        if (
+            not (self.native_fp8 or fused_context)
+            and forward_args.sparse_backend_args.query_ready is not None
+        ):
             forward_args.sparse_backend_args.query_ready.wait()
         sparse = forward_args.sparse_runtime_params
         sparse.sparse_attn_kv_lens = metadata.prepared_lens
@@ -1075,6 +1173,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
             inputs.topk_indices,
             forward_args.attention_sinks,
             1.0 / (self.q_scaling * math.sqrt(_HEAD_DIM)),
+            swa_cache_format=inputs.swa_cache_format,
             position_ids=inputs.output_position_ids,
             rotary_cos_sin=inputs.output_rotary_cos_sin,
         )
@@ -1106,6 +1205,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
         self._validate_helper_output(q, forward_args)
         if self.sparse_params.use_packed_sparse_attention:
             raise ValueError("Packed CSA2 must use forward_packed without BF16 staging")
+        if self.compute_backend == "prims_ts":
+            raise ValueError("CSA2 PrimTS must read persistent packed KV without staging")
         inputs = self.prepare_sparse_inputs(q, metadata, forward_args)
         metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
         query = q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)
@@ -1154,6 +1255,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
             forward_args.attention_sinks,
             1.0 / (self.q_scaling * math.sqrt(_HEAD_DIM)),
             output=output,
+            swa_cache_format=inputs.swa_cache_format,
             position_ids=inputs.output_position_ids,
             rotary_cos_sin=inputs.output_rotary_cos_sin,
         )
@@ -1162,7 +1264,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
 def get_csa2_backend(params: CSA2Params) -> type[CSA2TrtllmAttention]:
     """The single sparse backend owns metadata; the module selects compute helpers."""
-    if params.compute_backend not in ("auto", "trtllm", "flash_mla", "flashinfer"):
+    if params.compute_backend not in ("auto", "trtllm", "prims_ts", "flash_mla", "flashinfer"):
         raise ValueError(f"Unknown CSA2 attention backend: {params.compute_backend}")
     return CSA2TrtllmAttention
 

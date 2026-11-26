@@ -27,6 +27,9 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -46,11 +49,14 @@ def _managers(
     *,
     reuse: bool = False,
     remote_tail: bool = False,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> list[CSA2CacheManager]:
     assert pp == 1  # CSA2 PP remains explicitly unsupported.
     return [
         CSA2CacheManager(
-            KvCacheConfig(max_gpu_total_bytes=128 << 20, enable_block_reuse=reuse, dtype="fp8"),
+            KvCacheConfig(
+                max_gpu_total_bytes=128 << 20, enable_block_reuse=reuse, dtype=kv_cache_dtype
+            ),
             CacheType.SELFKONLY,
             num_layers=len(layout.compress_ratios),
             tokens_per_block=TOKENS_PER_BLOCK,
@@ -170,12 +176,14 @@ def _verify(
     ],
 )
 @pytest.mark.parametrize("update_before_transfer", [False, True])
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_ds_mla"])
 def test_csa2_shared_owner_kv_transfer(
     ctx_tp: int,
     gen_tp: int,
     ctx_enable_dp: bool,
     gen_enable_dp: bool,
     update_before_transfer: bool,
+    kv_cache_dtype: str,
 ) -> None:
     layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)
     run_kv_transfer_test(
@@ -186,10 +194,39 @@ def test_csa2_shared_owner_kv_transfer(
         ctx_enable_dp=ctx_enable_dp,
         gen_enable_dp=gen_enable_dp,
         update_before_transfer=update_before_transfer,
-        manager_factory=functools.partial(_managers, layout=layout),
+        manager_factory=functools.partial(_managers, layout=layout, kv_cache_dtype=kv_cache_dtype),
         init_fn=_init_csa2_pool_data,
         verify_fn=_verify,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("local_dtype,peer_dtype", [("fp8", "fp8_ds_mla"), ("fp8_ds_mla", "fp8")])
+def test_csa2_transfer_rejects_mismatched_swa_layout(local_dtype, peer_dtype):
+    layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)
+    managers = _managers(1, 1, False, layout, kv_cache_dtype=local_dtype)
+    try:
+        managers.extend(_managers(1, 1, False, layout, kv_cache_dtype=peer_dtype))
+        local = RankInfo.from_kv_cache_manager("local", managers[0], torch.cuda.current_device())
+        peer = RankInfo.from_kv_cache_manager("peer", managers[1], torch.cuda.current_device())
+        peer = RankInfo.from_bytes(peer.to_bytes())
+        assert local.page_table is not None
+        registrar = PeerRegistrar(local, KVRegionExtractorV1(local.page_table))
+        registrar.register(peer.instance_name, peer.instance_rank, peer)
+        rejected = 0
+        for local_key, peer_key in registrar.get_pool_mapping(peer).items():
+            group, pool = local_key
+            view = local.page_table.layer_groups[group].pool_views[pool]
+            if str(CSA2CacheRole.SWA.role) in view.pool_role:
+                with pytest.raises(ValueError, match="Replicated cache region size mismatch"):
+                    registrar.get_kv_map(peer, local_key, peer_key)
+                rejected += 1
+            else:
+                registrar.get_kv_map(peer, local_key, peer_key)
+        assert rejected > 0
+    finally:
+        for manager in managers:
+            manager.shutdown()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -210,8 +247,9 @@ def test_csa2_shared_owner_kv_transfer(
         )
     ],
 )
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_ds_mla"])
 def test_csa2_ced_transfer_with_generation_prefix_reuse(
-    monkeypatch, ctx_tp, gen_tp, policy, remote_tail
+    monkeypatch, ctx_tp, gen_tp, policy, remote_tail, kv_cache_dtype
 ):
     """A Global hit cannot suppress missing Encoder or private Decoder transfers."""
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
@@ -220,8 +258,15 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
     replay_window = 140
     layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)
     reuse = policy != "required-no-reuse"
-    ctx_managers = _managers(ctx_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail)
-    gen_managers = _managers(gen_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail)
+    factory = functools.partial(
+        _managers,
+        layout=layout,
+        reuse=reuse,
+        remote_tail=remote_tail,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    ctx_managers = factory(ctx_tp, 1, False)
+    gen_managers = factory(gen_tp, 1, False)
     ctx_tcs, gen_tcs = [], []
     cached_tokens = 256
     prompt_len = cached_tokens + 1 + (replay_window if remote_tail else 0)

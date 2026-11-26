@@ -523,6 +523,8 @@ _REPLAY_WINDOW = 5
 _ENCODER_REPLAY_WINDOW = 128
 # Both ADP ranks can recover a full cache block plus their uncached suffixes.
 _REPLAY_MAX_TOKENS = 512
+# The replay cache managers and attention modules share one KV dtype, so their SWA formats agree.
+_REPLAY_KV_CACHE_DTYPE = "fp8"
 
 
 def _replay_attention(layout: CSA2Layout, mapping: Mapping, layer_idx: int = 0) -> torch.nn.Module:
@@ -549,6 +551,7 @@ def _replay_attention(layout: CSA2Layout, mapping: Mapping, layer_idx: int = 0) 
         index_heads=8,
         mapping=mapping,
         compute_backend="trtllm",
+        kv_cache_dtype=_REPLAY_KV_CACHE_DTYPE,
     )
     for name, parameter in module.named_parameters():
         if name.endswith("norm.weight"):
@@ -574,7 +577,7 @@ def _replay_metadata(
             enable_block_reuse=False,
             max_gpu_total_bytes=128 << 20,
             enable_swa_scratch_reuse=scratch,
-            dtype="fp8",
+            dtype=_REPLAY_KV_CACHE_DTYPE,
         ),
         CacheType.SELFKONLY,
         num_layers=1,
@@ -840,7 +843,7 @@ def _check_dp_encoder_replay_case(
                 enable_block_reuse=True,
                 enable_swa_scratch_reuse=scratch,
                 max_gpu_total_bytes=128 << 20,
-                dtype="fp8",
+                dtype=_REPLAY_KV_CACHE_DTYPE,
             ),
             CacheType.SELFKONLY,
             num_layers=2,
@@ -1282,10 +1285,17 @@ def _run_decoder_pass_graph() -> None:
     )
     saved_env = {
         name: os.environ.get(name)
-        for name in ("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "TRTLLM_FORCE_COMM_METHOD")
+        for name in (
+            "TRTLLM_V41_DECODER_BOUNDED_REPLAY",
+            "TRTLLM_FORCE_COMM_METHOD",
+            "TRTLLM_CSA2_COMPUTE_BACKEND",
+        )
     }
     saved_graph_flag = get_per_request_prefill_cuda_graph_flag()
     os.environ["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
+    # Pass graphs split attention into row-wise projections and attention, which only the
+    # native trtllm-gen provider supports; "auto" selects PrimTS on SM100, SM103 and SM107.
+    os.environ["TRTLLM_CSA2_COMPUTE_BACKEND"] = "trtllm"
     # The platform's own MoE communication, as served (EP all-to-all where supported).
     os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
     set_per_request_prefill_cuda_graph_flag(False)
@@ -1438,10 +1448,17 @@ def _run_encoder_pass_graph() -> None:
     )
     saved_env = {
         name: os.environ.get(name)
-        for name in ("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "TRTLLM_FORCE_COMM_METHOD")
+        for name in (
+            "TRTLLM_V41_DECODER_BOUNDED_REPLAY",
+            "TRTLLM_FORCE_COMM_METHOD",
+            "TRTLLM_CSA2_COMPUTE_BACKEND",
+        )
     }
     saved_graph_flag = get_per_request_prefill_cuda_graph_flag()
     os.environ["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
+    # Pass graphs split attention into row-wise projections and attention, which only the
+    # native trtllm-gen provider supports; "auto" selects PrimTS on SM100, SM103 and SM107.
+    os.environ["TRTLLM_CSA2_COMPUTE_BACKEND"] = "trtllm"
     # The platform's own MoE communication, as served (EP all-to-all where supported).
     os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
     set_per_request_prefill_cuda_graph_flag(False)

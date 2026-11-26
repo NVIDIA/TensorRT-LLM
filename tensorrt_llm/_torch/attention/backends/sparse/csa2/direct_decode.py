@@ -3,9 +3,9 @@
 """Direct sparse decode attention over CSA2's persistent caches for small generation batches.
 
 One CuTe DSL launch computes the sparse attention of every query row straight from the packed
-caches: the selected SWA rows (E4M3 with power-of-two scales per 32 channels) and main rows
-(E2M1 with E4M3 scales per 16 channels) are decoded into BF16 in shared memory -- exactly, both
-formats are subsets of BF16 -- and attended by the BF16 query. Neither an FP8 staging pool nor
+caches: the selected SWA rows (E4M3 with power-of-two scales per 32 channels, or unit-scale E4M3)
+and main rows (E2M1 with E4M3 scales per 16 channels) are decoded into BF16 in shared memory --
+exactly, every format is a subset of BF16 -- and attended by the BF16 query. Neither an FP8 staging pool nor
 a per-forward staging scale is involved.
 
 Work split: one cluster of up to 8 CTAs per query row. CTA ``c`` owns an equal share of the
@@ -51,6 +51,7 @@ from tensorrt_llm.math_utils import ceil_div, pad_up
 MAX_ROWS = 16
 HEAD_DIM = 512
 SWA_ROW_BYTES = 528
+SWA_FP8_ROW_BYTES = 512
 MAIN_ROW_BYTES = 288
 _THREADS = 256
 _KEY_ROW = 2 * HEAD_DIM + 16  # bytes per BF16 key row in shared memory (16 B bank shift)
@@ -1094,6 +1095,7 @@ def _kernel_type():
             late_coefs: bool = False,
             rows_out: bool = False,
             rows_in: bool = False,
+            swa_scaled: bool = True,
         ):
             self.q_heads = q_heads or heads
             self.heads = heads
@@ -1110,6 +1112,8 @@ def _kernel_type():
             # Widest load (bytes) every row's payload start is aligned to.
             self.swa_vec = swa_vec
             self.main_vec = main_vec
+            # SWA rows carry UE8M0 scales per 32 channels (528 B) or are unit-scale E4M3 (512 B).
+            self.swa_scaled = swa_scaled
             self.inputs_ready = inputs_ready
             self.main_ready = main_ready and main_width > 0
             self.v2 = v2
@@ -1395,7 +1399,8 @@ def _kernel_type():
                             else:
                                 for wi in cutlass.range_constexpr(4):
                                     data[i, wi] = ld_global_b32(src + 4 * wi)
-                            scale_byte[i] = ld_global_u8(row_base + Int64(HEAD_DIM + lane // 2))
+                            if const_expr(self.swa_scaled):
+                                scale_byte[i] = ld_global_u8(row_base + Int64(HEAD_DIM + lane // 2))
                             kinds[i] = Int32(1)
                     if const_expr(want & 2):
                         if kind == 2:
@@ -1434,7 +1439,9 @@ def _kernel_type():
                 dst = k_addr + r * _KEY_ROW + 32 * lane
                 if const_expr(want & 1):
                     if kinds[i] == 1:
-                        s = swa_scale(scale_byte[i])
+                        s = Float32(1.0)
+                        if const_expr(self.swa_scaled):
+                            s = swa_scale(scale_byte[i])
                         o0, o1 = self._swa4(data[i, 0], s)
                         o2, o3 = self._swa4(data[i, 1], s)
                         o4, o5 = self._swa4(data[i, 2], s)
@@ -2604,9 +2611,10 @@ def direct_sparse_decode(
 ) -> torch.Tensor:
     """Sparse attention of ``q [T, H, 512]`` (BF16) over its selected packed cache rows.
 
-    ``swa_pool [*, 528]`` / ``main_pool [*, 288]`` are uint8 rows (unit column stride, any row
-    stride); ``swa_indices [T, Ws]`` are SWA slots and ``main_indices [T, Wm]`` main slots, or
-    logical positions mapped in-kernel when ``main_mapping = (page_table, page_size,
+    ``swa_pool [*, 528]`` (scaled) or ``[*, 512]`` (unit-scale E4M3) / ``main_pool [*, 288]`` are
+    uint8 rows (unit column stride, any row stride); ``swa_indices [T, Ws]`` are SWA slots and
+    ``main_indices [T, Wm]`` main slots, or logical positions mapped in-kernel when
+    ``main_mapping = (page_table, page_size,
     max_positions, requests, visible)`` is given (CSA2's owner page-table rules). ``sink [H]``
     FP32 logits, ``scale`` the softmax scale. Returns BF16 ``[T, H, 512]`` (``output`` if given).
     ``inputs_ready``: the query, SWA slots and page tables were final before the launch preceding
@@ -2642,8 +2650,9 @@ def direct_sparse_decode(
             f"CSA2 direct decode serves 1-{MAX_ROWS} query rows of 8, 16, 32 or 64 heads"
         )
     has_main = main_indices is not None and main_indices.shape[1] > 0
+    swa_scaled = swa_pool.ndim != 2 or swa_pool.shape[1] != SWA_FP8_ROW_BYTES
     for pool, width in (
-        (swa_pool, SWA_ROW_BYTES),
+        (swa_pool, SWA_ROW_BYTES if swa_scaled else SWA_FP8_ROW_BYTES),
         (main_pool if has_main else None, MAIN_ROW_BYTES),
     ):
         if pool is not None and (
@@ -2770,6 +2779,7 @@ def direct_sparse_decode(
         _datacenter_blackwell(q.device.index),
         rows_out is not None,
         rows_in is not None,
+        swa_scaled,
     )
     key = (q.device.index, *config)
     swa_index_type = cutlass.Int64 if swa_index64 else cutlass.Int32

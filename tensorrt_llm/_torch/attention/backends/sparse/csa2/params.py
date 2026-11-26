@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
@@ -16,6 +17,18 @@ from ..params import SparseBackendForwardArgs, SparseMetadataParams, SparseParam
 
 if TYPE_CHECKING:
     from .metadata import CSA2TrtllmMetadata
+
+SwaCacheFormat = Literal["swa", "swa_fp8"]
+# Rows PrimTS reads for MAIN: persistent 288-byte NVFP4 records, or 512-byte
+# unit-scale E4M3 rows of a context-phase bank decoded from them.
+PrimsTSMainFormat = Literal["main", "main_fp8"]
+
+
+def resolve_swa_cache_format(kv_cache_dtype: str = "auto") -> SwaCacheFormat:
+    """Resolve persistent SWA encoding independently of the compute staging dtype."""
+    if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_ds_mla"):
+        raise ValueError("CSA2 KV cache dtype must be auto, bfloat16, fp8 or fp8_ds_mla")
+    return "swa_fp8" if kv_cache_dtype == "fp8" else "swa"
 
 
 class CSA2Mode(Enum):
@@ -194,24 +207,49 @@ class CSA2Params(SparseParams):
             raise ValueError("CSA2 emission requires temporal GVR and CuTe DSL paged MQA")
 
 
-def select_csa2_backend(sm_version: int) -> str:
-    """Match the DSV4 hardware families without confusing SM120 with SM100."""
-    if sm_version == 90:
-        return "flash_mla"
-    if is_sm_100f(sm_version):
-        return "trtllm"
-    if is_sm_120f(sm_version):
-        return "flashinfer"
-    raise ValueError(f"CSA2 attention is unsupported on SM{sm_version}")
+def select_csa2_backend(sm_version: int, params: CSA2Params | None = None) -> str:
+    """Resolve an explicit provider, environment override, or hardware default."""
+    backend = "auto" if params is None else params.compute_backend
+    if backend == "auto":
+        backend = os.environ.get("TRTLLM_CSA2_COMPUTE_BACKEND", "auto")
+    if backend not in ("auto", "trtllm", "prims_ts", "flash_mla", "flashinfer"):
+        raise ValueError(f"Unknown CSA2 attention backend: {backend}")
+    if backend == "auto":
+        native_only = params is not None and (
+            params.use_packed_sparse_attention or params.use_fp8_staging is True
+        )
+        if sm_version == 90:
+            backend = "flash_mla"
+        elif sm_version in (100, 103, 107) and not native_only:
+            backend = "prims_ts"
+        elif is_sm_100f(sm_version):
+            backend = "trtllm"
+        elif is_sm_120f(sm_version):
+            backend = "flashinfer"
+        else:
+            raise ValueError(f"CSA2 attention is unsupported on SM{sm_version}")
+    if backend == "prims_ts":
+        if sm_version not in (100, 103, 107):
+            raise ValueError("CSA2 PrimTS sparse MLA requires SM100, SM103 or SM107")
+        if params is not None and params.use_packed_sparse_attention:
+            raise ValueError(
+                "CSA2 PrimTS cannot select the separate custom packed attention kernel"
+            )
+        if params is not None and params.use_fp8_staging is True:
+            raise ValueError("CSA2 FP8 staging requires trtllm-gen without packed attention")
+    return backend
 
 
 @dataclass(kw_only=True, slots=True)
 class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     """Selected packed-pool inputs for the standard sparse prediction hook.
 
-    SWA uses CSA2 FP8 rows, main uses CSA2 FP4 rows, both uint8 [pool_rows, bytes].
+    SWA uses the explicit ordinary E4M3 or legacy MXFP8 format; MAIN uses CSA2
+    FP4 rows. Both pools have uint8 [pool_rows, bytes] physical views.
     swa_indices and inherited topk_indices are [queries, selected] pool-relative
-    row indices; -1 denotes padding. topk_indices addresses main_pool.
+    row indices; -1 denotes padding, and physical row zero is valid. With
+    main_mapping, topk_indices instead addresses logical rows in its live
+    owner page table, resolved by the consuming provider's metadata/staging.
     """
 
     # Decode may prepare Q on another stream while this stream publishes KV.
@@ -219,6 +257,10 @@ class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     # With a Q amax word, staging may reduce the selected rows before ``query_ready`` and
     # wait only to finalize the scale. Layers that run the indexer meanwhile keep waiting first.
     late_query_ready: bool = False
+    # Recorded on the model stream before this layer's projections, where its selections and
+    # the MAIN rows they address were already complete: a layer that runs no indexer and writes
+    # no MAIN rows. PrimTS may prepare its selection metadata from it on a side stream.
+    selection_ready: torch.cuda.Event | None = None
     # Unit-scale FP8 Q from the projection epilogue; staging resolves its live scale.
     projected_quant_q: torch.Tensor | None = None
     # Context: ``projected_quant_q`` is final at unit scale and no BF16 Q exists. Only the
@@ -228,13 +270,15 @@ class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     # is all of Q staging reads; the scale derivation consumes and clears it.
     projected_q_amax: torch.Tensor | None = None
     swa_pool: torch.Tensor | None = None
+    # None is resolved by the backend; standalone metadata callers retain the legacy encoding.
+    swa_cache_format: SwaCacheFormat | None = None
     swa_indices: torch.Tensor | None = None
     main_pool: torch.Tensor | None = None
     # Logical MAIN group indices for shared-domain staging, before page mapping.
     main_logical_indices: torch.Tensor | None = None
     # (page_table, page_size, max_positions, requests, visible): when present,
-    # ``topk_indices`` hold logical positions that the native staging kernels
-    # map to physical rows themselves.
+    # ``topk_indices`` hold logical positions resolved by native staging or
+    # PrimTS packed metadata, using the owner's live page table.
     main_mapping: tuple | None = None
     # (kv_source, index_source, query_start): layers with equal groups share
     # one staging compaction per forward.
@@ -280,9 +324,10 @@ class CSA2ForwardState:
     output_fp8: tuple[torch.Tensor, ...] | None = None
     output_fp8_written: bool = False
     # (data, scale, positions, cos/sin) of the grouped MXFP8 o_a projection's input: the fused
-    # decode kernel or the ``gen_fmha`` generation core writes data and scale instead of the BF16
-    # output.
+    # decode kernel, the ``gen_fmha`` generation core, or PrimTS context attention whose plan
+    # can, writes data and scale instead of the BF16 output and sets output_mxfp8_written.
     output_mxfp8: tuple[torch.Tensor, ...] | None = None
+    output_mxfp8_written: bool = False
     # (positions, cos/sin) when the query still awaits its RoPE, which the direct decode applies.
     query_rope: tuple[torch.Tensor, torch.Tensor] | None = None
     # With ``query_rope``: the direct decode writes its output rotated back for the O-A.

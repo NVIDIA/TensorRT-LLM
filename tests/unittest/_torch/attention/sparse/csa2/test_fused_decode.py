@@ -337,9 +337,9 @@ def _attention_layers(layout):
                 o_lora_rank=128,
                 num_groups=8,
                 index_heads=32,
-                sparse_params=CSA2Params(layout=layout),
+                sparse_params=CSA2Params(layout=layout, compute_backend="trtllm"),
                 projection_quantization="bf16",
-                kv_cache_dtype="fp8",
+                kv_cache_dtype="fp8_ds_mla",
             )
             for name, parameter in model.named_parameters():
                 if name.endswith("norm.weight"):
@@ -449,7 +449,7 @@ def dspark_cache(request):
             enable_block_reuse=False,
             max_tokens=16384,
             enable_swa_scratch_reuse=True,
-            dtype="fp8",
+            dtype="fp8_ds_mla",
         ),
         CacheType.SELFKONLY,
         layout=layout,
@@ -622,7 +622,7 @@ def test_module_generation_mxfp8_output(monkeypatch, dspark_cache):
             layout=manager.layout,
             attention_heads=HEADS,
             num_groups=8,
-            kv_cache_dtype="fp8",
+            kv_cache_dtype="fp8_ds_mla",
             layer_idx=layer_idx,
             max_positions=DSPARK_MAX_SEQ,
         )
@@ -697,7 +697,7 @@ def large_decode_cache():
             enable_block_reuse=False,
             max_gpu_total_bytes=16 << 30,
             enable_swa_scratch_reuse=False,
-            dtype="fp8",
+            dtype="fp8_ds_mla",
         ),
         CacheType.SELFKONLY,
         layout=GEN_FMHA_LAYOUT,
