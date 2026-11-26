@@ -1366,6 +1366,15 @@ class DisaggTransferCoordinator:
             self._gen_termination_requested.remove(request_id)
             self._effects.terminate_request(request)
 
+    def record_cancelled_transfer_timeout(self, request: LlmRequest) -> None:
+        """Count a committed transfer timeout before cancellation finishes the request.
+
+        The client still receives a cancellation response. The latch keeps a
+        timeout that an earlier poll already counted from being counted again.
+        """
+        if self._has_observed_transfer_timeout(request):
+            self._record_transfer_outcome(request, "timeout")
+
     def request_cancellation(self, request: LlmRequest) -> bool:
         """Cancel transfers, retaining unpublished fences and resources until safe.
 

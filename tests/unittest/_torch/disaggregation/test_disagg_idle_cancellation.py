@@ -2281,6 +2281,78 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
     )
 
 
+@pytest.mark.parametrize("reaper_counted", [False, True], ids=["abort-first", "poll-first"])
+def test_replicated_cancel_counts_a_committed_receive_timeout_once(
+    executor: PyExecutor, reaper_counted: bool
+) -> None:
+    """Each TP rank counts one timeout when an agreed cancellation retires a timed-out receive.
+
+    Args:
+        executor: Template executor whose state each rank copies.
+        reaper_counted: Whether a receive poll already counted the timeout before the abort.
+    """
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    engines = []
+    requests = []
+
+    def retire(req: LlmRequest) -> bool:
+        """Retire the drained session, copying its committed timeout as cancel_request does."""
+        req.py_kv_transfer_timed_out = True
+        return True
+
+    for rank in range(2):
+        engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        request = _request(1)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        engine.active_requests = [request]
+        engine.canceled_req_ids = [1]
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine.previous_batch = None
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+            enable_transfer_metrics=True,
+        )
+        engine.disagg.request_cancellation = Mock(side_effect=retire)
+        engine._try_cancel_request = Mock(side_effect=retire)
+        if reaper_counted:
+            request.py_kv_transfer_timed_out = True
+            engine.disagg._record_transfer_outcome(request, "timeout")
+        engines.append(engine)
+        requests.append(request)
+
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+
+    for rank, engine in enumerate(engines):
+        request = requests[rank]
+        assert engine.disagg.transfer_outcomes == (0, 0, 1)
+        assert request.is_finished_due_to_cancellation
+        assert not request.py_kv_transfer_timed_out
+        assert engine.active_requests == []
+        assert engine.canceled_req_ids == []
+        assert engine._pending_response_terminations == [request]
+
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    for rank, engine in enumerate(engines):
+        assert engine.disagg.transfer_outcomes == (0, 0, 1)
+        assert engine._pending_response_terminations == [requests[rank]]
+
+
 @pytest.mark.parametrize("peer_owns_receive", [False, True])
 @pytest.mark.parametrize("cancel_rank", [0, 1])
 def test_legacy_tp_cancel_with_request_missing_on_peer(
