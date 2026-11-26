@@ -4,12 +4,39 @@
 """Bounded coordination for two-node stress tests with one pytest task per node."""
 
 import hashlib
+import re
 import select
 import socket
-import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+
+
+def _expand_nodelist(nodelist: str) -> list[str]:
+    """Expand Slurm's comma-separated hosts and bracketed numeric ranges."""
+    groups = re.split(r",(?![^\[]*\])", nodelist)
+    hosts = []
+    for group in groups:
+        match = re.fullmatch(r"(.+?)\[([\d,-]+)\]", group)
+        if match is None:
+            if not group or "[" in group or "]" in group:
+                raise ValueError(f"Unsupported Slurm node list: {nodelist}")
+            hosts.append(group)
+            continue
+        prefix, suffixes = match.groups()
+        for suffix in suffixes.split(","):
+            start, separator, end = suffix.partition("-")
+            if separator:
+                if not start.isdigit() or not end.isdigit() or int(end) < int(start):
+                    raise ValueError(f"Invalid Slurm node range: {suffix}")
+                hosts.extend(
+                    f"{prefix}{number:0{len(start)}d}" for number in range(int(start), int(end) + 1)
+                )
+            elif suffix.isdigit():
+                hosts.append(f"{prefix}{suffix}")
+            else:
+                raise ValueError(f"Invalid Slurm node suffix: {suffix}")
+    return hosts
 
 
 def slurm_topology(environ: Mapping[str, str]) -> tuple[int, list[str]]:
@@ -23,9 +50,7 @@ def slurm_topology(environ: Mapping[str, str]) -> tuple[int, list[str]]:
     rank = int(environ["SLURM_NODEID"])
     if rank not in (0, 1) or int(environ["SLURM_PROCID"]) != rank:
         raise ValueError("Slurm process rank must equal node rank (0 or 1)")
-    hosts = subprocess.check_output(
-        ["scontrol", "show", "hostnames", environ["SLURM_STEP_NODELIST"]], text=True, timeout=30
-    ).splitlines()
+    hosts = _expand_nodelist(environ["SLURM_STEP_NODELIST"])
     if len(hosts) != 2 or len(set(hosts)) != 2:
         raise ValueError(f"Expected two distinct Slurm step hosts, got {hosts}")
     return rank, hosts

@@ -4,7 +4,6 @@
 """CPU checks for multinode stress coordination; no model or TRT-LLM imports."""
 
 import socket
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -26,15 +25,23 @@ def step_env() -> dict[str, str]:
     }
 
 
-def test_step_topology_uses_active_step(monkeypatch: pytest.MonkeyPatch, step_env: dict) -> None:
+def test_step_topology_uses_active_step(step_env: dict) -> None:
     step_env["SLURM_NODELIST"] = "node[01-08]"
 
-    def hostnames(cmd: list[str], **kwargs: object) -> str:
-        assert cmd == ["scontrol", "show", "hostnames", "node[01-02]"]
-        return "node01\nnode02\n"
-
-    monkeypatch.setattr(subprocess, "check_output", hostnames)
     assert slurm_topology(step_env) == (1, ["node01", "node02"])
+
+
+@pytest.mark.parametrize("nodelist", ["node01,node02", "node[01,02]", "node[01],node02"])
+def test_step_topology_expands_host_lists(step_env: dict, nodelist: str) -> None:
+    step_env["SLURM_STEP_NODELIST"] = nodelist
+    assert slurm_topology(step_env) == (1, ["node01", "node02"])
+
+
+@pytest.mark.parametrize("nodelist", ["node[01-03]", "node01,node01", "node[02-01]", "node["])
+def test_step_topology_rejects_invalid_host_lists(step_env: dict, nodelist: str) -> None:
+    step_env["SLURM_STEP_NODELIST"] = nodelist
+    with pytest.raises(ValueError):
+        slurm_topology(step_env)
 
 
 @pytest.mark.parametrize("name,value", [("SLURM_LOCALID", "1"), ("SLURM_STEP_NUM_TASKS", "8")])
