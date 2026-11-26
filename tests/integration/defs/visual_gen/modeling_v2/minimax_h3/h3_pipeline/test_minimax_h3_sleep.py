@@ -18,7 +18,7 @@ import torch
 from test_common.llm_data import get_checkpoint
 
 from tensorrt_llm import VisualGenArgs
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
     MiniMaxH3Pipeline,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader

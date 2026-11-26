@@ -26,9 +26,10 @@ from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
-from tensorrt_llm._torch.visual_gen.runtime import logger, mpi_disabled
-from tensorrt_llm._torch.visual_gen.runtime.collectives import TensorParallelSubgroup
+from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.logger import logger
 
+from ..components.linear import TensorParallelSubgroup
 from ..components.transformer import MiniMaxH3Transformer3DModel, trunk_attention_for
 from ..packing import resolve_canvas_size
 from ..pipeline import H3PipelineBase

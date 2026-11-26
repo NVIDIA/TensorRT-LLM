@@ -22,7 +22,8 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
-from tensorrt_llm._torch.visual_gen.runtime import AttentionConfig, VideoSparseAttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
 
 from ..checkpoint import load_fasth3_manifest
 from ..components.attention import MiniMaxH3VSAAttention

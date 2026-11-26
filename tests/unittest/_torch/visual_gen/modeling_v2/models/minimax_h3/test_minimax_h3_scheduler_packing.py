@@ -22,7 +22,7 @@ import pytest
 import torch
 from diffusers import MiniMaxH3Scheduler
 
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
     MiniMaxH3Pipeline,
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.packing import (

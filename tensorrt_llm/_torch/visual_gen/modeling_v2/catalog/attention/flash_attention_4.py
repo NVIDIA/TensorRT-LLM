@@ -1,14 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import torch
 
+from tensorrt_llm._torch.cute_dsl_utils import (
+    install_flash_attn_tile_scheduler_compatibility,
+    load_flash_attn_cute_forward,
+)
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.visual_gen.runtime.cutlass_compat import load_flash_attention_4_forward
 
+# FA4 reads this setting when its CuTe interface is first imported.
+os.environ.setdefault("FA_DISABLE_2CTA", "1")
 _flash_attn_fwd_import_error = None
 try:
-    _flash_attn_fwd = load_flash_attention_4_forward()
+    _flash_attn_fwd = load_flash_attn_cute_forward()
+    install_flash_attn_tile_scheduler_compatibility()
 except (AttributeError, ImportError, OSError) as e:
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e

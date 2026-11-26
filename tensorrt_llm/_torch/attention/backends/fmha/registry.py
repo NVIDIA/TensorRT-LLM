@@ -111,7 +111,8 @@ DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
 )
 
 
-def _parse_fmha_libs_env() -> tuple[str, ...]:
+def get_enabled_fmha_lib_names() -> tuple[str, ...]:
+    """Return the enabled registry names in priority order."""
     return _parse_fmha_libs_value(os.environ.get("TLLM_FMHA_LIBS"))
 
 
@@ -158,12 +159,12 @@ def _parse_fmha_libs_value(value: str | None) -> tuple[str, ...]:
 
 
 def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
-    return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
+    return [FMHA_LIBS[name] for name in get_enabled_fmha_lib_names()]
 
 
 def is_fmha_lib_enabled(name: str) -> bool:
     """Whether ``TLLM_FMHA_LIBS`` enables the library registered as ``name``."""
-    return name in _parse_fmha_libs_env()
+    return name in get_enabled_fmha_lib_names()
 
 
 @functools.lru_cache(maxsize=8)
@@ -178,12 +179,12 @@ def _step_stats_classes(names: tuple[str, ...]) -> tuple[FmhaCls, ...]:
 
 def step_planning_fmha_lib_classes() -> tuple[FmhaCls, ...]:
     """Enabled libraries that plan every step (``Fmha.plan_step``); cached, prepare() calls it."""
-    return _step_planning_classes(_parse_fmha_libs_env())
+    return _step_planning_classes(get_enabled_fmha_lib_names())
 
 
 def step_stats_fmha_lib_classes() -> tuple[FmhaCls, ...]:
     """Enabled libraries that keep per-step counters (``Fmha.step_stats``)."""
-    return _step_stats_classes(_parse_fmha_libs_env())
+    return _step_stats_classes(get_enabled_fmha_lib_names())
 
 
 def fmha_step_stats(kv_cache_manager: object) -> dict[str, dict[str, int]] | None:
@@ -209,6 +210,7 @@ __all__ = [
     "FmhaCls",
     "fmha_step_stats",
     "get_enabled_fmha_lib_classes",
+    "get_enabled_fmha_lib_names",
     "init_fmha_libs",
     "is_fmha_lib_enabled",
     "reset_fmha_step_stats",

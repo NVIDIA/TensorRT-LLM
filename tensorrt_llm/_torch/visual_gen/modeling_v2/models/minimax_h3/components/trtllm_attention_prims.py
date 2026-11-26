@@ -5,14 +5,12 @@ from __future__ import annotations
 
 import math
 import os
+from types import SimpleNamespace
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.runtime import QuantAttentionConfig, logger
-from tensorrt_llm._torch.visual_gen.runtime.fmha import (
-    enabled_fmha_libraries,
-    is_context_prims_available,
-)
+from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....catalog.attention.prims_dense_attention import prims_dense_attention, vc_token_permutation
 from ....catalog.attention.prims_routed_attention import (
@@ -48,9 +46,11 @@ class H3PrimTS:
     """Own the attention plans, compression schedule and provider selection for an H3 instance."""
 
     def __init__(self, recipe: QuantAttentionConfig | None, metadata_state: dict):
+        from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_names
+
         self.recipe = recipe
         self.metadata_state = metadata_state
-        enabled = enabled_fmha_libraries()
+        enabled = get_enabled_fmha_lib_names()
         self._enabled = enabled
         self._available: dict[str, bool] = {}
         self.fallback_enabled = "fallback" in enabled
@@ -83,7 +83,10 @@ class H3PrimTS:
 
     def _has_prims(self, name: str) -> bool:
         if name not in self._available:
-            self._available[name] = name in self._enabled and is_context_prims_available(name)
+            from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
+
+            layer = SimpleNamespace(is_mla_enable=False, skip_correction_threshold=0.0)
+            self._available[name] = name in self._enabled and FMHA_LIBS[name].is_available(layer)
         return self._available[name]
 
     @torch.compiler.disable

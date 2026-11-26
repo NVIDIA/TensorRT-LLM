@@ -301,7 +301,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_minimax_h3_vsa.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
-  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/default_pipeline/test_minimax_h3_pipeline.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/test_minimax_h3_pipeline.py
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/fasth3/test_fasth3_pipeline.py
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/test_routing.py
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/test_dependencies.py

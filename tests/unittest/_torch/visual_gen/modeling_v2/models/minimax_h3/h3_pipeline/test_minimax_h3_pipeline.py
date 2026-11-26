@@ -35,23 +35,23 @@ from tensorrt_llm._torch.visual_gen.config import (
     discover_pipeline_components,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3 import pipeline as h3_pipeline
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3 import pipeline as family_pipeline
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components import vae as h3_vae
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline import (
-    pipeline as default_pipeline,
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.linear import (
+    TensorParallelSubgroup,
+    TensorParallelSum,
 )
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline import (
+    pipeline as h3_pipeline,
+)
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
     MiniMaxH3Pipeline,
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.packing import resolve_canvas_size
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
-from tensorrt_llm._torch.visual_gen.runtime.collectives import (
-    AllReduceStrategy,
-    TensorParallelSubgroup,
-    TensorParallelSum,
-)
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.visual_gen.args import ParallelConfig, TorchCompileConfig, VisualGenArgs
 
 from .._pipeline_fixtures import SyntheticH3Pipeline as _SyntheticMiniMaxH3Pipeline
@@ -396,7 +396,7 @@ def test_pipeline_keeps_torch_compile_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        h3_pipeline.BasePipeline,
+        family_pipeline.BasePipeline,
         "__init__",
         lambda self, config: torch.nn.Module.__init__(self),
     )
@@ -501,7 +501,9 @@ def test_trtllm_attention_accepts_supported_gpu(
 ) -> None:
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
     monkeypatch.setattr(
-        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+        family_pipeline.BasePipeline,
+        "__init__",
+        lambda self, config: torch.nn.Module.__init__(self),
     )
     config = SimpleNamespace(
         extra_attrs={},
@@ -520,7 +522,7 @@ def test_text_encoder_residency_skips_non_owner_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        h3_pipeline.BasePipeline,
+        family_pipeline.BasePipeline,
         "__init__",
         lambda self, config: torch.nn.Module.__init__(self),
     )
@@ -559,9 +561,9 @@ def test_text_encoder_residency_skips_non_owner_rank(
 def test_subset_tensor_parallel_text_encoder_loads_on_participant_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(default_pipeline, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: True)
     monkeypatch.setattr(
-        h3_pipeline.BasePipeline,
+        family_pipeline.BasePipeline,
         "__init__",
         lambda self, config: torch.nn.Module.__init__(self),
     )
@@ -620,7 +622,7 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
     expected_prefetch: bool,
 ) -> None:
     monkeypatch.setattr(
-        h3_pipeline.BasePipeline,
+        family_pipeline.BasePipeline,
         "__init__",
         lambda self, config: torch.nn.Module.__init__(self),
     )
@@ -649,11 +651,11 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
             return {"weight": torch.ones(1)}
 
     monkeypatch.setattr(
-        default_pipeline.MiniMaxH3TensorParallelTextEncoder,
+        h3_pipeline.MiniMaxH3TensorParallelTextEncoder,
         "from_pretrained_config",
         from_pretrained_config,
     )
-    monkeypatch.setattr(default_pipeline, "WeightLoader", FakeWeightLoader)
+    monkeypatch.setattr(h3_pipeline, "WeightLoader", FakeWeightLoader)
     config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(world_size=world_size, tp_size=1),
@@ -680,9 +682,9 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
 def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(default_pipeline, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: True)
     monkeypatch.setattr(
-        h3_pipeline.BasePipeline,
+        family_pipeline.BasePipeline,
         "__init__",
         lambda self, config: torch.nn.Module.__init__(self),
     )
@@ -722,7 +724,7 @@ def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
 def test_subset_text_encoder_tp_rejects_mpi_before_group_creation(
     monkeypatch: pytest.MonkeyPatch, rank: int
 ) -> None:
-    monkeypatch.setattr(default_pipeline, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: False)
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
 
     def unexpected_group_creation(*args, **kwargs):
@@ -1076,7 +1078,7 @@ def test_infer_supports_a_last_frame_without_a_first_frame(
         del args, kwargs
         return marker
 
-    monkeypatch.setattr(h3_pipeline, "load_rgb_image", _return_marker)
+    monkeypatch.setattr(family_pipeline, "load_image", _return_marker)
 
     def _capture_forward(**kwargs: object) -> str:
         captured.update(kwargs)
@@ -1146,7 +1148,7 @@ def test_prepare_request_derives_default_canvas_from_last_only_keyframe(
         del args, kwargs
         return last_frame
 
-    monkeypatch.setattr(h3_pipeline, "load_rgb_image", _return_last_frame)
+    monkeypatch.setattr(family_pipeline, "load_image", _return_last_frame)
     request = SimpleNamespace(
         params=SimpleNamespace(
             image_reference=[
@@ -1225,11 +1227,11 @@ def test_prepare_request_rejects_partial_canvas_override() -> None:
 def test_denoise_step_rejects_unusable_velocity(velocity: torch.Tensor, match: str) -> None:
     """A blank or non-finite velocity must fail loudly, not decode to black."""
     with pytest.raises(RuntimeError, match=match):
-        h3_pipeline._check_denoise_step(velocity, "video", 3)
+        family_pipeline._check_denoise_step(velocity, "video", 3)
 
 
 def test_denoise_step_accepts_a_normal_velocity() -> None:
-    h3_pipeline._check_denoise_step(torch.randn(1, 4, 2), "video", 3)
+    family_pipeline._check_denoise_step(torch.randn(1, 4, 2), "video", 3)
 
 
 @pytest.mark.parametrize("generated_value,condition_value", [(0.0, 1.0), (1.0, float("nan"))])
@@ -1409,7 +1411,7 @@ def test_h3_workflow_reference_slots(workflow: str) -> None:
     ["image:0", ["image"], ["image:-1"], ["image:00"], ["image:0", "image:0"], ["unknown:0"], [1]],
 )
 def test_ref2va_invalid_reference_order(order: object) -> None:
-    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.ref2va import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.ref2va import (
         validate_reference_order,
     )
 
@@ -1421,7 +1423,7 @@ def test_ref2va_invalid_reference_order(order: object) -> None:
 def test_ref2va_cross_modality_order(
     monkeypatch: pytest.MonkeyPatch, order: list[str] | None
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline import ref2va
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline import ref2va
 
     params = SimpleNamespace(
         image_reference=[
@@ -1446,7 +1448,7 @@ def test_ref2va_cross_modality_order(
 def test_ref2va_image_bytes() -> None:
     from io import BytesIO
 
-    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.ref2va import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.ref2va import (
         load_references,
     )
 
@@ -1464,7 +1466,7 @@ def test_ref2va_image_bytes() -> None:
 def test_ref2va_groups_vae_stages_preserving_reference_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline import ref2va
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline import ref2va
 
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
@@ -1573,7 +1575,7 @@ def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPat
         )
         return torch.ones(1, 1, 4), layout, torch.full((1, 8), 7.0), torch.full((1, 3), 9.0)
 
-    monkeypatch.setattr(default_pipeline, "prepare_references", prepare)
+    monkeypatch.setattr(h3_pipeline, "prepare_references", prepare)
     original = _FakeMiniMaxH3Transformer.__call__
 
     def observe(
@@ -1649,12 +1651,12 @@ def test_ref2va_loads_ref_weights(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
     def load(
-        loader: default_pipeline.WeightLoader, checkpoint: str, mapping: object
+        loader: h3_pipeline.WeightLoader, checkpoint: str, mapping: object
     ) -> dict[str, torch.Tensor]:
         captured.update(components=loader.components, checkpoint=checkpoint, mapping=mapping)
         return {"sentinel": torch.ones(1)}
 
-    monkeypatch.setattr(default_pipeline.WeightLoader, "load_weights", load)
+    monkeypatch.setattr(h3_pipeline.WeightLoader, "load_weights", load)
     result = pipeline.load_transformer_weights("checkpoint")
     assert captured == {
         "components": ["transformer_ref"],
@@ -1682,7 +1684,7 @@ def test_ref2va_rejects_invalid_reference_combinations(kinds: list[str]) -> None
         MiniMaxH3VideoReference,
     )
 
-    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.ref2va import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.ref2va import (
         normalize_references,
     )
 
@@ -1764,7 +1766,7 @@ def test_pipeline_accepts_pure_ulysses(monkeypatch: pytest.MonkeyPatch, world_si
         torch.nn.Module.__init__(self)
         initialized.append(config)
 
-    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    monkeypatch.setattr(family_pipeline.BasePipeline, "__init__", initialize)
     config = _ulysses_pipeline_config(world_size)
     MiniMaxH3Pipeline(config)
     assert initialized == [config]
@@ -1851,7 +1853,7 @@ def test_h3_accepts_vae_groups_up_to_ulysses_size(
         torch.nn.Module.__init__(self)
         initialized.append(config)
 
-    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    monkeypatch.setattr(family_pipeline.BasePipeline, "__init__", initialize)
     config = _ulysses_pipeline_config(8)
     config.parallel.parallel_vae_size = size
     config.visual_gen_mapping = VisualGenMapping(
@@ -1903,7 +1905,9 @@ def test_h3_forward_decodes_only_on_vae_ranks(
 
 def test_pipeline_accepts_fa4_ulysses(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+        family_pipeline.BasePipeline,
+        "__init__",
+        lambda self, config: torch.nn.Module.__init__(self),
     )
     config = _ulysses_pipeline_config(2)
     config.attention.backend = "FA4"
@@ -1920,7 +1924,7 @@ def test_pipeline_accepts_tp(
         torch.nn.Module.__init__(self)
         initialized.append(config)
 
-    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    monkeypatch.setattr(family_pipeline.BasePipeline, "__init__", initialize)
     config = _ulysses_pipeline_config(tp_size * ulysses_size)
     config.mapping.tp_size = tp_size
     config.visual_gen_mapping.ulysses_size = ulysses_size
@@ -1933,7 +1937,9 @@ def test_pipeline_accepts_masked_ulysses_backends(
     monkeypatch: pytest.MonkeyPatch, backend: str
 ) -> None:
     monkeypatch.setattr(
-        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+        family_pipeline.BasePipeline,
+        "__init__",
+        lambda self, config: torch.nn.Module.__init__(self),
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
     config = _ulysses_pipeline_config(2)

@@ -86,11 +86,11 @@ def _check_rollout(_rank, root):
 
     os.environ[H3_V2] = "1"
     base, fast = resolve("base"), resolve("fast")
-    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
-        MiniMaxH3Pipeline,
-    )
     from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.fasth3.pipeline import (
         FastH3Pipeline,
+    )
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
+        MiniMaxH3Pipeline,
     )
 
     assert base is MiniMaxH3Pipeline
@@ -131,7 +131,7 @@ def test_family_without_opt_in_keeps_local_factory_path(tmp_path, monkeypatch):
 
 
 def _check_rank_agreement(rank, root):
-    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
         MiniMaxH3Pipeline,
     )
 

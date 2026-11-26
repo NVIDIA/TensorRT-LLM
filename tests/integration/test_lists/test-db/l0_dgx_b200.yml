@@ -63,8 +63,8 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[TRTLLM-2-1]
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[FLASHINFER-2-1]
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_ulysses_and_parallel_vae
-  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/default_pipeline/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world2]
-  - visual_gen/modeling_v2/minimax_h3/default_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] TIMEOUT (30)
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world2]
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] TIMEOUT (30)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
   - visual_gen/test_dynamic_batching.py::test_dynamic_batching_multi_gpu[flux1-ulysses2] TIMEOUT (15)
   - visual_gen/test_dynamic_batching.py::test_dynamic_batching_multi_gpu[flux2-tp2] TIMEOUT (20)
@@ -108,7 +108,7 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[TRTLLM-2-2]
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[FLASHINFER-2-2]
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_partial_vae_groups
-  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/default_pipeline/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world4]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world4]
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
   # Vocab-parallel token selection over TP2/TP4 vocab shards (default all-reduce),
@@ -332,13 +332,13 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
-  - visual_gen/modeling_v2/minimax_h3/default_pipeline/test_parallel_quality.py::test_minimax_h3_tp2_example_lpips TIMEOUT (30)
-  - visual_gen/modeling_v2/minimax_h3/default_pipeline/test_parallel_quality.py::test_minimax_h3_text_encoder_tp_lpips[2] TIMEOUT (30)
-  - visual_gen/modeling_v2/minimax_h3/default_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4] TIMEOUT (30)
-  - visual_gen/modeling_v2/minimax_h3/default_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-TRTLLM] TIMEOUT (30)
-  - visual_gen/modeling_v2/minimax_h3/default_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FLASHINFER] TIMEOUT (30)
-  - visual_gen/modeling_v2/minimax_h3/default_pipeline/test_parallel_quality.py::test_minimax_h3_text_encoder_tp_lpips[4] TIMEOUT (30)
-  - visual_gen/modeling_v2/minimax_h3/default_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_tp2_example_lpips TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_text_encoder_tp_lpips[2] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-TRTLLM] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FLASHINFER] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_text_encoder_tp_lpips[4] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
   # GLM-5.3-Flash modeling_v2 split target without speculation (SM100 only).
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k
   # GLM-5.3-Flash FP8 modeling_v2 target: GSM8K without speculation.

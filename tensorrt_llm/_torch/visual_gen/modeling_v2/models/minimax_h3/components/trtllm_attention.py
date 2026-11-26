@@ -9,12 +9,10 @@ import os
 import torch
 from torch.nn import functional as F
 
-from tensorrt_llm._torch.visual_gen.runtime import (
-    AttentionConfig,
-    AttentionTensorLayout,
-    QuantConfig,
-    SolAttentionConfig,
-)
+from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SolAttentionConfig
 
 from ....catalog.attention.prims_routed_attention import PrimsRoutes
 from ....catalog.attention.trtllm_context_attention import (

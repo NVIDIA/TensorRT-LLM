@@ -14,19 +14,15 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoConfig
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
     flashinfer_fused_add_rmsnorm,
 )
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.activation.swiglu import swiglu
-from tensorrt_llm._torch.visual_gen.runtime import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.visual_gen.runtime.collectives import (
-    AllReduceStrategy,
-    TensorParallelSubgroup,
-    TensorParallelSum,
-)
+from tensorrt_llm.functional import AllReduceStrategy
 
-from ..components.linear import Linear, shard_bounds
+from ..components.linear import Linear, TensorParallelSubgroup, TensorParallelSum, shard_bounds
 from ..packing import MINIMAX_H3_TEXT_ENCODER_LAYER
 from .ops.text_attention import text_causal_attention
 from .ops.text_qk_norm_rope import text_qk_norm_rope

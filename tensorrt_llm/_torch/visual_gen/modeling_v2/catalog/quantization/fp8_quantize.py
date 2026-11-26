@@ -5,12 +5,9 @@ from functools import lru_cache
 
 import torch
 
+from tensorrt_llm._torch.autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.visual_gen.runtime.tuning import (
-    AutoTuner,
-    DynamicTensorSpec,
-    TunableRunner,
-    TuningConfig,
+from tensorrt_llm._torch.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )

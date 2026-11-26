@@ -21,8 +21,8 @@ from typing import Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm._torch.visual_gen.runtime import AttentionTensorLayout
 
 from ..ops.rope import apply_minimax_h3_qk_norm_rope_bf16, apply_minimax_h3_rotary_emb
 from ..ops.vsa import H3VSAMetadata, h3_vsa_attention

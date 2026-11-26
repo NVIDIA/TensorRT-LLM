@@ -17,7 +17,7 @@ TLLM_VISUALGEN_MODELING2_H3=1 python examples/visual_gen/models/minimax_h3.py \
 
 | Checkpoint | V2 target | Denoising schedule |
 | --- | --- | --- |
-| Base H3 | [default_pipeline/](default_pipeline/) supports BF16, FP8, block-scaled FP8 and NVFP4. | The default 50 sigma points include zero and give 49 updates. |
+| Base H3 | [h3_pipeline/](h3_pipeline/) supports BF16, FP8, block-scaled FP8 and NVFP4. | The default 50 sigma points include zero and give 49 updates. |
 | FastH3 | [fasth3/](fasth3/) uses the checkpoint's learned compression gate and video sparse attention. | The released eight-step checkpoint supplies nine sigma points. |
 
 The [H3 router](pipeline_registry.py) checks `fastvideo_inference.json`. A `fasth3-` schema selects FastH3, and an ordinary base checkpoint selects the base pipeline. Each worker logs its target in `AutoPipeline: Creating`. The selected pipeline builds the transformer.
@@ -39,6 +39,6 @@ The family also decides which layers and denoising steps use a sparse prediction
 
 H3 [unit tests](../../../../../../tests/unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/) and [checkpoint quality tests](../../../../../../tests/integration/defs/visual_gen/modeling_v2/minimax_h3/) mirror family and target ownership. Use the [catalog tests](../../../../../../tests/unittest/_torch/visual_gen/modeling_v2/catalog/) for model-independent ops. Record shared backend imports in the [dependency test](../../../../../../tests/unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/test_dependencies.py). Map native dependencies that CI cannot infer in the [VisualGen CI rule](../../../../../../jenkins/scripts/cbts/cbts/rules/visual_gen.py).
 
-For migration coverage, check Base H3 and FastH3 against their respective V1 features. A generation run can verify that the requested parallel or attention path produced the expected media. A lifecycle feature needs its own check. The [base H3 sleep/wake test](../../../../../../tests/integration/defs/visual_gen/modeling_v2/minimax_h3/default_pipeline/test_minimax_h3_sleep.py) checks request admission, memory release and restored video and audio. For a loading fix, check the weights against the checkpoint and repeat the original request. Include shared-code fixes here when needed for a supported V1/V2 comparison or rollout. [Migration validation](../../README.md#test-a-change)
+For migration coverage, check Base H3 and FastH3 against their respective V1 features. A generation run can verify that the requested parallel or attention path produced the expected media. A lifecycle feature needs its own check. The [base H3 sleep/wake test](../../../../../../tests/integration/defs/visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_sleep.py) checks request admission, memory release and restored video and audio. For a loading fix, check the weights against the checkpoint and repeat the original request. Include shared-code fixes here when needed for a supported V1/V2 comparison or rollout. [Migration validation](../../README.md#test-a-change)
 
 Review H3 V1 retirement one week after the opt-in PR merges. Before removing V1 and its switch, check any H3 features merged during the rollout, the remaining opt-in coverage, and peak memory on representative deployments.

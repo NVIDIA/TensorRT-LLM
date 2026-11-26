@@ -28,7 +28,7 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.runtime import QuantAlgo
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..kernels.fused_adaln import h3_adaln_supported
 from ..ops.adaln import gate_res_norm_mod as h3_gate_res_norm_mod

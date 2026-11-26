@@ -7,7 +7,6 @@ import torch
 from torch.nn import functional as F
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.visual_gen.runtime.native import run_context
 
 from ._trtllm_context_params import (
     _ContextForwardArgs,
@@ -241,6 +240,8 @@ class TrtllmContextAttention(OpWrapper):
             num_requests=batch,
             local_layer_idx=layer_idx,
         )
+        from tensorrt_llm.bindings.internal.thop import run_context
+
         run_context(params)
         return out
 

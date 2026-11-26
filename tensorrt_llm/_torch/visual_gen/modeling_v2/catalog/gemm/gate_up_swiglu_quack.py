@@ -6,9 +6,10 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
-from tensorrt_llm._torch.visual_gen.runtime import get_sm_version, logger
-from tensorrt_llm._torch.visual_gen.runtime.cutlass_compat import install_cutlass_dsl_compatibility
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 
 @lru_cache(maxsize=1)

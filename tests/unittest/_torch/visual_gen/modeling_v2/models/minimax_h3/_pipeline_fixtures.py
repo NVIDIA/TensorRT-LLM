@@ -21,11 +21,11 @@ import torch
 from diffusers import MiniMaxH3Scheduler
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
-    MiniMaxH3Pipeline,
-)
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.fasth3.pipeline import (
     FastH3Pipeline,
+)
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
+    MiniMaxH3Pipeline,
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.packing import MINIMAX_H3_TEXT_TAG
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader

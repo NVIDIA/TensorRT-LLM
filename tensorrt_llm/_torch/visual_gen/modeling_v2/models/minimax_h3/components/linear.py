@@ -4,11 +4,18 @@
 import os
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
+from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
 from tensorrt_llm._torch.modules.low_m_gemm import low_m_gemm_dispatcher, low_m_gemm_takes_rows
+from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.quantization.fp8_block_weight_layout import (
     fp8_block_weight_layout,
 )
@@ -19,27 +26,67 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.quantization.fp8_quantiz
 from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.quantization.fp8_static_quantize import (
     fp8_static_quantize,
 )
-from tensorrt_llm._torch.visual_gen.runtime import (
-    IS_CUTLASS_DSL_AVAILABLE,
-    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
-    Mapping,
-    QuantAlgo,
-    QuantConfig,
-    get_model_extra_attrs,
-    get_sm_version,
-    ipc_nvls_supported,
-    is_sm_100f,
-    mpi_disabled,
-)
-from tensorrt_llm._torch.visual_gen.runtime.collectives import (
-    AllReduceStrategy,
-    BufferKind,
-    TensorParallelSum,
-)
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_disabled
+from tensorrt_llm.bindings import ipc_nvls_supported
+from tensorrt_llm.bindings.internal.thop import BufferKind
+from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.mapping import Mapping, MpiTopology
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..ops.nvfp4_gemm_allreduce import nvfp4_gemm_allreduce
 from ..ops.quantized_gemm import fp8_block_gemm, fp8_scaled_gemm, low_m_limit, tunable_fp4_quantize
 from .projection_weights import load_projection
+
+
+class TensorParallelSubgroup(MpiTopology):
+    """A tensor-parallel mapping for the first `size` ranks and their explicit process group."""
+
+    def __new__(cls, *args, **kwargs):
+        return object.__new__(cls)
+
+    def __init__(self, size: int, rank: int, group: dist.ProcessGroup | None):
+        super().__init__(world_size=size, rank=rank, tp_size=size, gpus_per_node=size)
+        self.process_group = group
+
+    @property
+    def tp_group_pg(self) -> dist.ProcessGroup:
+        if self.process_group is None:
+            raise RuntimeError("Tensor-parallel subgroup is not initialized.")
+        return self.process_group
+
+    @property
+    def tp_group_name(self) -> str:
+        return self.tp_group_pg.group_name
+
+
+class TensorParallelSum(nn.Module):
+    """Sum across a TP mapping and supply its GEMM output allocation policy."""
+
+    def __init__(self, mapping: Mapping, strategy: AllReduceStrategy, dtype: torch.dtype | None):
+        super().__init__()
+        self.mapping = mapping
+        self._process_group = None
+        self._engine = None
+        if mapping.tp_size > 1:
+            if isinstance(mapping, TensorParallelSubgroup) and mpi_disabled():
+                self._process_group = mapping.tp_group_pg
+            else:
+                self._engine = AllReduce(mapping=mapping, strategy=strategy, dtype=dtype)
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._process_group is not None:
+            result = tensor.contiguous().clone()
+            dist.all_reduce(result, group=self._process_group)
+            return result
+        if self._engine is not None:
+            return self._engine(tensor)
+        return tensor
+
+    def output_allocation(self) -> tuple[int, list[int] | None]:
+        if self._engine is not None and self._engine.uses_nccl_symmetric_memory_window():
+            return int(BufferKind.NCCL_WINDOW), self.mapping.tp_group
+        return int(BufferKind.DEFAULT), None
 
 
 def shard_bounds(size: int, tp_size: int, rank: int) -> tuple[int, int]:

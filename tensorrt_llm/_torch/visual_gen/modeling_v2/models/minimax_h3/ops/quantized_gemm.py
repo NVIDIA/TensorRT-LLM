@@ -5,7 +5,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import Fp4Quantize
-from tensorrt_llm._torch.visual_gen.runtime.collectives import BufferKind
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform,
     unpack_col_major_tma_aligned_packed_tensor,

@@ -6,13 +6,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.quantization import fp8_quantize
 from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.quantization.fp8_quantize import (
     native_fp8_per_tensor_quantize,
     native_static_fp8_per_tensor_quantize,
     quantize_e4m3_per_tensor,
 )
-from tensorrt_llm._torch.visual_gen.runtime.tuning import AutoTuner
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA FP8 quantization"

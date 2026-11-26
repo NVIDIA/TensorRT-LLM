@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.visual_gen.runtime import mpi_disabled
+from tensorrt_llm._utils import mpi_disabled
 
 
 def exchange_shards(

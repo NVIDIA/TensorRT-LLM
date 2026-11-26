@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .checkpoint import load_fasth3_manifest
-from .default_pipeline.pipeline import MiniMaxH3Pipeline
 from .fasth3.pipeline import FastH3Pipeline, configure_checkpoint
+from .h3_pipeline.pipeline import MiniMaxH3Pipeline
 
 
 def route(config, checkpoint_dir):

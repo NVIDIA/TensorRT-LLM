@@ -48,7 +48,7 @@ from ..packing import (
 if TYPE_CHECKING:
     from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 
-    from tensorrt_llm._torch.visual_gen.runtime import VisualGenParams
+    from tensorrt_llm.visual_gen.params import VisualGenParams
 
     from .pipeline import MiniMaxH3Pipeline
 

@@ -4,8 +4,8 @@
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
-from tensorrt_llm._torch.visual_gen.runtime import IS_FLASHINFER_AVAILABLE
 
 
 class PerHeadRMSNorm(nn.Module):

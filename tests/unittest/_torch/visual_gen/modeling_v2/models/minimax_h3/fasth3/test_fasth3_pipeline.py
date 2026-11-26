@@ -24,11 +24,11 @@ import torch
 from diffusers import MiniMaxH3Scheduler
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
-    MiniMaxH3Pipeline,
-)
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.fasth3.pipeline import (
     FastH3Pipeline,
+)
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
+    MiniMaxH3Pipeline,
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.pipeline_registry import route
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent

@@ -4,7 +4,7 @@
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
-from tensorrt_llm._torch.visual_gen.runtime import get_sm_version
+from tensorrt_llm._utils import get_sm_version
 
 
 class CuteBf16Gemm(OpWrapper):

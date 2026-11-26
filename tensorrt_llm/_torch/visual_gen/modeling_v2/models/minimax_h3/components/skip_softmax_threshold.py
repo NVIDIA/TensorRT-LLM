@@ -9,7 +9,8 @@ from dataclasses import dataclass
 import torch
 
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
-from tensorrt_llm._torch.visual_gen.runtime import SkipSoftmaxAttentionConfig, logger
+from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 
 def dense_prefix(timestep: object, cutoff: float | None) -> bool:

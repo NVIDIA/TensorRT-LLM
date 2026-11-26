@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.runtime import native
+from tensorrt_llm._torch.visual_gen.modeling_v2 import _native as native
 
 pytestmark = pytest.mark.cpu_only
 

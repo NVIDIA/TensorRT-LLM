@@ -25,6 +25,7 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
 )
 
+from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
@@ -44,7 +45,6 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.att
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.weights import (
     remap_feed_forward_weights,
 )
-from tensorrt_llm._torch.visual_gen.runtime import AttentionTensorLayout
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig

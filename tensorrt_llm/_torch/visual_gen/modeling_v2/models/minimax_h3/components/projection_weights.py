@@ -16,7 +16,7 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.quantization.nvfp4_weigh
     pack_nvfp4_weight_scales,
     quantize_nvfp4,
 )
-from tensorrt_llm._torch.visual_gen.runtime import QuantAlgo
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig

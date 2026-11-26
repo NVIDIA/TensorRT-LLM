@@ -4,8 +4,7 @@
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._torch.visual_gen.runtime import AttentionTensorLayout
-from tensorrt_llm._torch.visual_gen.runtime.collectives import AsyncAllToAll
+from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
 
 from ..ops.ulysses_qkv import exchange_shards, ulysses_qkv_all_to_all, ulysses_unscatter_qkv
 
@@ -21,7 +20,8 @@ class H3UlyssesAttention:
         self.size = dist.get_world_size(group)
         self.hnd = inner.preferred_layout == AttentionTensorLayout.HND
         if stream is not None:
-            self.transfer = AsyncAllToAll(group, stream)
+            self._boxed_group = group.boxed()
+            self._stream = stream
 
     def _output(self, out, batch, seq):
         if self.hnd:
@@ -44,11 +44,30 @@ class H3UlyssesAttention:
         q, k, v = ulysses_qkv_all_to_all(q, k, v, self.group, self.hnd)
         return self._run(q, k, v, batch, seq, kwargs)
 
+    @torch.compiler.disable(recursive=False)
+    def _push(self, tensor: torch.Tensor) -> torch.Tensor:
+        recv, ticket = torch.ops.trtllm.ulysses_a2a_async_prepare(tensor, self._boxed_group)
+        ready = torch.cuda.Event()
+        ready.record()
+        with torch.cuda.stream(self._stream):
+            ready.wait()
+            torch.ops.trtllm.ulysses_a2a_async_push(ticket, self._boxed_group)
+        return recv
+
+    @torch.compiler.disable(recursive=False)
+    def _wait_for_qkv(self) -> None:
+        with torch.cuda.stream(self._stream):
+            for _ in range(3):
+                torch.ops.trtllm.ulysses_a2a_async_barrier(self._boxed_group, 60000)
+            done = torch.cuda.Event()
+            done.record()
+        torch.cuda.current_stream().wait_event(done)
+
     def forward_async(self, compute_q, compute_k, compute_v, **kwargs):
-        v = self.transfer.push(compute_v())
-        q = self.transfer.push(compute_q())
-        k = self.transfer.push(compute_k())
-        self.transfer.wait(3)
+        v = self._push(compute_v())
+        q = self._push(compute_q())
+        k = self._push(compute_k())
+        self._wait_for_qkv()
         _, batch, rows, _, _ = q.shape
         # Async prepare returns each receive at the base of its symmetric-memory allocation.
         q, k, v = ulysses_unscatter_qkv(q, k, v, self.hnd, aligned_receives=True)

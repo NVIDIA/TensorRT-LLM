@@ -5,7 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.visual_gen.runtime import get_sm_version, logger
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 from ....catalog.activation.swiglu import swiglu
 from ....catalog.activation.swiglu_block_fp8 import swiglu_block_fp8

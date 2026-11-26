@@ -20,6 +20,7 @@
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from io import BytesIO
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -33,8 +34,8 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
-from tensorrt_llm._torch.visual_gen.runtime import logger
-from tensorrt_llm._torch.visual_gen.runtime.media import load_rgb_image
+from tensorrt_llm.inputs.utils import load_image
+from tensorrt_llm.logger import logger
 
 from .components.text_encoder import encode_text_tokens
 from .components.tiled_vae import TiledAutoencoderKLMiniMaxH3
@@ -413,7 +414,11 @@ class H3PipelineBase(BasePipeline):
         for role, anchor in (("first_frame", "first"), ("last_frame", "last")):
             content = by_role.get(role)
             if content is not None:
-                keyframes.append(load_rgb_image(content))
+                if isinstance(content, (bytes, bytearray, memoryview)):
+                    with Image.open(BytesIO(bytes(content))) as image:
+                        keyframes.append(image.convert("RGB"))
+                else:
+                    keyframes.append(load_image(content))
                 keyframe_anchors.append(anchor)
         return keyframes, tuple(keyframe_anchors)
 

@@ -13,7 +13,7 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components imp
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.tiled_vae import (
     TiledAutoencoderKLMiniMaxH3,
 )
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
     MiniMaxH3Pipeline,
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.pipeline import (

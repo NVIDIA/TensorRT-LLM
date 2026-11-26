@@ -12,13 +12,15 @@ import torch.multiprocessing as mp
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
 
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.text_encoder_tp import (
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.linear import (
+    TensorParallelSubgroup,
+)
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.text_encoder_tp import (
     MiniMaxH3TensorParallelTextEncoder,
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.packing import (
     MINIMAX_H3_TEXT_ENCODER_LAYER,
 )
-from tensorrt_llm._torch.visual_gen.runtime.collectives import TensorParallelSubgroup
 
 
 def _assert_projection_shards(

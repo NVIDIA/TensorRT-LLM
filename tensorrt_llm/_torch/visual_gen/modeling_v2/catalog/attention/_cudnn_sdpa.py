@@ -10,7 +10,8 @@ import cudnn
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.mxfp8_quantize import mxfp8_quantize
-from tensorrt_llm._torch.visual_gen.runtime import get_sm_version, logger
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 from ..quantization.fp8_quantize import quantize_e4m3_per_tensor
 

@@ -310,12 +310,12 @@ def test_public_api_accepts_validation_in_any_candidate_stage(name: str) -> None
     [
         (
             "tensorrt_llm/_torch/modeling_v2/catalog/_op.py",
-            {"default_pipeline", "fasth3", "ops", "second_consumer", "second_other"},
+            {"h3_pipeline", "fasth3", "ops", "second_consumer", "second_other"},
         ),
         (
             "tensorrt_llm/_torch/visual_gen/models/wan/ops/attention.py",
             {
-                "default_pipeline",
+                "h3_pipeline",
                 "fasth3",
                 "ops",
                 "legacy",
@@ -328,7 +328,7 @@ def test_public_api_accepts_validation_in_any_candidate_stage(name: str) -> None
         (
             "tensorrt_llm/_torch/visual_gen/modeling_v2/__init__.py",
             {
-                "default_pipeline",
+                "h3_pipeline",
                 "fasth3",
                 "ops",
                 "catalog",
@@ -351,7 +351,7 @@ def test_public_api_accepts_validation_in_any_candidate_stage(name: str) -> None
         ),
         (
             "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/csrc/shared.cpp",
-            {"default_pipeline", "fasth3", "ops"},
+            {"h3_pipeline", "fasth3", "ops"},
         ),
         (
             "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/fasth3/csrc/fast.cu",
@@ -364,19 +364,19 @@ def test_public_api_accepts_validation_in_any_candidate_stage(name: str) -> None
         ("tensorrt_llm/_torch/modeling_v2/catalog/attention/core.py", {"fasth3", "ops"}),
         (
             "tensorrt_llm/_torch/modeling_v2/catalog/gemm/cublas_mm.py",
-            {"default_pipeline", "fasth3"},
+            {"h3_pipeline", "fasth3"},
         ),
         (
             "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/vsa.py",
             {"fasth3", "ops", "contracts"},
         ),
         (
-            "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/default_pipeline/pipeline.py",
-            {"default_pipeline"},
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/pipeline.py",
+            {"h3_pipeline"},
         ),
         (
             "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/pipeline_registry.py",
-            {"default_pipeline", "fasth3", "ops"},
+            {"h3_pipeline", "fasth3", "ops"},
         ),
     ],
 )
@@ -386,10 +386,10 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
     quality = f"visual_gen/modeling_v2/{family}"
     files = {
         f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/pipeline_registry.py": (
-            "from .default_pipeline.pipeline import Default\nfrom .fasth3.pipeline import Fast\n"
+            "from .h3_pipeline.pipeline import Default\nfrom .fasth3.pipeline import Fast\n"
             "def route(config):\n    if config.fast:\n        return Fast\n    return Default\n"
         ),
-        f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/default_pipeline/pipeline.py": (
+        f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/h3_pipeline/pipeline.py": (
             "from ..components.linear import project\nclass Default: pass"
         ),
         f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/fasth3/pipeline.py": (
@@ -424,9 +424,9 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source)
     entries = {
-        "default_pipeline": {
-            f"{unit}/default_pipeline/test_model.py",
-            f"{quality}/default_pipeline/test_quality.py",
+        "h3_pipeline": {
+            f"{unit}/h3_pipeline/test_model.py",
+            f"{quality}/h3_pipeline/test_quality.py",
         },
         "fasth3": {f"{unit}/fasth3/test_pipeline.py", f"{quality}/fasth3/test_quality.py"},
         "ops": {f"{unit}/ops/test_vsa.py"},
@@ -467,9 +467,9 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
         (
             "minimax_h3_quality_cases.py",
             {
-                "default_pipeline/test_loading.py",
-                "default_pipeline/test_parallel_quality.py",
-                "default_pipeline/test_quality.py",
+                "h3_pipeline/test_loading.py",
+                "h3_pipeline/test_parallel_quality.py",
+                "h3_pipeline/test_quality.py",
             },
         ),
         ("fasth3/quality_case.py", {"fasth3/test_smoke.py"}),
@@ -521,7 +521,7 @@ def test_visualgen_ops_select_only_importing_families(module):
         mirror,
         contracts,
         f"{unit}/test_dependencies.py",
-        f"{unit}/default_pipeline/test_minimax_h3_pipeline.py",
+        f"{unit}/h3_pipeline/test_minimax_h3_pipeline.py",
         f"{unit}/fasth3/test_fasth3_pipeline.py",
     } <= selected
     catalog_consumers = {mirror}
@@ -549,7 +549,7 @@ def test_shared_native_build_selects_visual_gen_native_tests(changed):
     assert {
         "unittest/_torch/visual_gen/test_native_cmake.py",
         "unittest/_torch/visual_gen/modeling_v2/catalog/activation/test_swiglu_block_fp8.py",
-        f"{unit}/default_pipeline/test_minimax_h3_pipeline.py",
+        f"{unit}/h3_pipeline/test_minimax_h3_pipeline.py",
         f"{unit}/fasth3/test_fasth3_pipeline.py",
     } <= selected
 
@@ -642,7 +642,7 @@ def test_shared_llm_provider_adds_vg_tests_and_remains_in_coverage_residual(
     unit = "unittest/_torch/visual_gen/modeling_v2/"
     assert {
         unit + consumer,
-        unit + "models/minimax_h3/default_pipeline/test_minimax_h3_pipeline.py",
+        unit + "models/minimax_h3/h3_pipeline/test_minimax_h3_pipeline.py",
         unit + "models/minimax_h3/fasth3/test_fasth3_pipeline.py",
         "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
     } <= selected
@@ -661,7 +661,7 @@ def test_shared_visualgen_kernel_selects_catalog_and_legacy_consumers(provider, 
     assert {
         f"unittest/_torch/visual_gen/sparse_attention/sol/{test_name}",
         f"unittest/_torch/visual_gen/modeling_v2/catalog/attention/{test_name}",
-        "unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/default_pipeline/test_minimax_h3_pipeline.py",
+        "unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/test_minimax_h3_pipeline.py",
         "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
     } <= selected
 

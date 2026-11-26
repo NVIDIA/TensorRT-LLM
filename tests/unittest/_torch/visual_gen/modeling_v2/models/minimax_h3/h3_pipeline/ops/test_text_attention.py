@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.ops.text_attention import (
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.ops.text_attention import (
     text_causal_attention,
 )
 

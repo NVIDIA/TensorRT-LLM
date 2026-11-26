@@ -172,7 +172,7 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
-MiniMax-H3 uses Modeling V1 by default. Set `TLLM_VISUALGEN_MODELING2_H3=1` before starting VisualGen to opt into Modeling V2 for base H3 and FastH3. Base H3 defaults to 50 sigma points in both implementations, giving 49 joint denoising updates. FastH3 8-Step V2 uses its checkpoint's eight-update schedule in both implementations. [H3 Modeling V2 guide](../../../tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/README.md)
+Base H3 and FastH3 use V1 by default during rollout. Set `TLLM_VISUALGEN_MODELING2_H3=1` before starting VisualGen to use V2.
 
 MiniMax-H3 parallel VAE uses independent spatial tiles via
 `parallel_config.parallel_vae_size`, with size from 1 through the world size (`tp_size * ulysses_size`).

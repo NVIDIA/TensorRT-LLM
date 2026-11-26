@@ -5,7 +5,9 @@
 
 Keep changes for one deployment local to its pipeline so developers can merge work on different deployments independently. A **target** is a pipeline for a checkpoint or deployment. A **family** owns the code its targets share. The public VisualGen API and CLI work across implementations. [LLM Modeling V2 guide](../../modeling_v2/README.md)
 
-## Code layout
+## Architecture
+
+### Code layout
 
 | Location | What belongs here |
 | --- | --- |
@@ -13,37 +15,26 @@ Keep changes for one deployment local to its pipeline so developers can merge wo
 | `visual_gen/modeling_v2/models/<family>/` | The checkpoint router and components, ops or kernels that sibling targets import from the family. |
 | `visual_gen/modeling_v2/catalog/` | **Model-agnostic operations only.** Another family can pass its own tensors to the same op unchanged. Each entry defines its inputs and results, provides a reference and tests its implementations. |
 
-### When to split or merge a target
+#### When to split or merge a target
 
 **Split when a checkpoint or deployment needs a substantially different implementation.** Look for deployment checks spread across components or a new mechanism within a single stage. For example, a checkpoint that needs different modules and a new shard allocation order can own its loader and still reuse the family’s forward pass. If two targets later converge on the same implementation, merge them and keep tests for the deployments they support.
 
-**Name the target for what makes it distinct.** Include only the dimensions that define its implementation. A checkpoint-specific target such as `fasth3/` needs only the checkpoint name. When checkpoint, quantization, SM and parallel layout all matter, use `<checkpoint>_<quantization>__<sm>__<parallel>/`. For example, a MiniMax-H3 target specialized for NVFP4 on SM107 with four-way Ulysses could be named `minimax_h3_nvfp4__sm_107__u4/`. If Blackwell and Rubin differ only in which kernel a projection calls, keep one target and select the kernel in that projection.
+**Name the target for what makes it distinct.** All fields in `<checkpoint>_<quantization>__<sm>__<parallel>/` are optional. For example, `fasth3/` identifies a checkpoint, and `minimax_h3_nvfp4__sm_107__u4/` could identify an NVFP4 implementation for SM107 with four-way Ulysses. If two deployments differ only in which kernel a projection calls, keep one target and select the kernel in that projection.
 
 ### Implementation layers
 
 | Layer | Responsibility |
 | --- | --- |
-| **Pipeline** | Runs request stages in order, such as encoding, denoising and decoding. |
-| **Component** | Owns part of the model and coordinates its work. An attention component forms Q/K/V from its weights, applies RoPE, handles communication and projects the output. |
-| **Op** | Computes a result from explicit arguments. An attention op takes prepared Q/K/V and masking options. It can call several kernels or collectives. |
-| **Kernel** | Implements a calculation on the GPU for particular shapes, layouts or hardware. |
+| **Pipeline** | The inference entry point for a checkpoint or deployment. It runs the stages needed to serve a request. |
+| **Component** | A major building block of the pipeline, such as the text encoder, denoiser or video decoder. |
+| **Op** | A fine-grained unit of work with explicit inputs and observable results. |
+| **Kernel** | Code that runs on hardware to perform computation, move data or communicate between devices. |
 
-**A component owns a model decision. An op owns a calculation.** Changing how a block assigns heads to ranks belongs in the component. A kernel that computes the same attention result from prepared tensors can be tested against the op’s reference. Extract an op when you can specify its result from its arguments and have a reason to implement or test it separately.
+**The boundary between a component and an op is flexible. In general, a component implements part of the model’s behavior, and an op defines a smaller unit of work.** Extract an op when you can describe its behavior from its inputs and have a reason to test it independently or replace its implementation.
 
 Keep parallel rules with their caller. Create a component when several operations must coordinate computation and communication. [H3 attention and Ulysses](models/minimax_h3/README.md#attention-and-parallelism)
 
-## Where to add a feature
-
-Check the family’s V2 targets and its migration plan before choosing where to implement a feature. The [V2 models directory](models/) lists the migrated families.
-
-| Model family | Where to develop |
-| --- | --- |
-| New family | **Prefer V2** for the initial implementation. |
-| V1 only | The model owner decides whether to migrate. Development can continue in V1. |
-| V2 target available, V1 retiring soon | **Add new features only in V2.** MiniMax-H3 follows this policy. |
-| V1 and V2 will both remain in active use | When the model owner considers a new feature important for the family, **support and test it on every supported V1 and V2 target**. A deployment-specific optimization can stay in its target. |
-
-## Routing
+### Routing
 
 **The family router selects one pipeline before model construction.** Use the checkpoint and the deployment settings that distinguish its targets. Return the selected target class directly so CI can identify its tests. The pipeline constructs its components, and each component or op selects its implementation for the hardware and inputs.
 
@@ -51,13 +42,20 @@ Check the family’s V2 targets and its migration plan before choosing where to 
 - **Full migration with a short V1 rollout.** A temporary family switch can select V2 while V1 remains the default. Within V2, use the functional target for the same checkpoint when a deployment specialization does not match. [H3 rollout](models/minimax_h3/README.md#run-a-target)
 - **Partial migration with ongoing V1 support.** A family can route deployments covered by a V2 target to V2 and keep the existing V1 pipeline for the others. Make the choice at load time and test both routes.
 
-## Allowed dependencies
+### Allowed dependencies
 
-**Prefer a self-contained V2 implementation from op to kernel.** Check the LLM and VisualGen V2 catalogs first. Use the VisualGen runtime to read checkpoint tensors by name, manage process groups and autotune kernels. Public third-party APIs such as PyTorch and FlashInfer are also available. If no op fits, start with the target or family that needs it. Promote an op to the VisualGen catalog when its calculation and tests are independent of the model. A single family can be the first caller.
+**Prefer a self-contained V2 implementation from op to kernel.** Check the LLM and VisualGen V2 catalogs first. Use existing checkpoint loaders, process groups, device utilities and autotuning services directly. Extend a shared service when the change belongs to its callers across models. Keep model-specific input conversion and execution policy in the family or target. Public third-party APIs such as PyTorch and FlashInfer are also available. If no op fits, start with the target or family that needs it. Promote an op to the VisualGen catalog when its calculation and tests are independent of the model. A single family can be the first caller.
 
 **Treat imports from a V1 backend as an exception.** Reuse a complex, mature, model-agnostic kernel or runner, typically attention or GEMM, when a second implementation would duplicate substantial work. Keep checkpoint interpretation, input preparation and per-layer policy in V2. Write or port a kernel when the available implementations miss a required result, layout, hardware capability or measured performance goal. Build new native code under its owning catalog, family or target. Reuse a shared kernel’s registration and give new V2 registrations distinct names. [Native build guide](../../../../cpp/tensorrt_llm/visual_gen/README.md)
 
-List every V1 backend exception in the migration PR, or state that there are none. Trace construction, loading, execution and fallbacks through runtime adapters, catalog calls and registered Torch ops or classes. Identify the V2 caller, the provider path and symbol, and the capability that justifies reuse.
+List every V1 backend exception in the migration PR, or state that there are none. Trace construction, loading, execution and fallbacks through shared services, catalog calls and registered Torch ops or classes. Identify the V2 caller, the provider path and symbol, and the capability that justifies reuse.
+
+## Feature development during migration
+
+- **New model families use V2.** Discuss exceptions with the model owner case by case.
+- **For an existing model, develop in the implementation its family uses.** A V1-only family can keep developing in V1, and its owner decides when to migrate. Check the [V2 families](models/) and the family’s migration plan.
+
+When V1 is retiring soon, as in MiniMax-H3, **add new features only in V2**. When V1 and V2 will both remain in active use, **support important family-wide features on every supported V1 and V2 target**. A deployment-specific optimization can stay in its own target.
 
 ## Test a change
 

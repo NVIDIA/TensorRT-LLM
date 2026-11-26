@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components import (
     trtllm_attention_prims as prims,
 )
@@ -14,7 +15,8 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.fixture
 def prims_available(monkeypatch):
-    monkeypatch.setattr(prims, "is_context_prims_available", lambda name: True)
+    for name in ("prims_ts", "prims_ts_block_sparse"):
+        monkeypatch.setattr(FMHA_LIBS[name], "is_available", staticmethod(lambda layer: True))
 
 
 @pytest.mark.parametrize(
@@ -35,17 +37,17 @@ def test_sparse_only_admission_for_fp8_and_vc(monkeypatch):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts_block_sparse")
     probes = []
 
-    def available(name):
-        probes.append(name)
+    def available(layer):
+        probes.append(layer.is_mla_enable)
         return True
 
-    monkeypatch.setattr(prims, "is_context_prims_available", available)
+    monkeypatch.setattr(FMHA_LIBS["prims_ts_block_sparse"], "is_available", staticmethod(available))
     prims.H3PrimTS(None, {})
     with pytest.raises(RuntimeError, match="VC attention requires an available dense PrimTS"):
         prims.H3PrimTS(QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8", vc_attention=True), {})
     assert not probes
     prims.H3PrimTS(QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"), {})
-    assert probes == ["prims_ts_block_sparse"]
+    assert probes == [False]
 
 
 @pytest.mark.parametrize(

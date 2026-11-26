@@ -10,12 +10,6 @@ _LIBS_DIR = Path(__file__).resolve().parents[3] / "libs"
 _LOAD_LOCK = threading.Lock()
 
 
-def run_context(params) -> None:
-    from tensorrt_llm.bindings.internal import thop
-
-    thop.run_context(params)
-
-
 class NativeScopeUnavailable(RuntimeError):
     """The requested VisualGen scope was omitted from this build."""
 

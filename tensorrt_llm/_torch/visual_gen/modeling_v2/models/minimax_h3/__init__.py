@@ -17,6 +17,6 @@
 
 """MiniMax-H3 VisualGen pipeline."""
 
-from .default_pipeline.pipeline import MiniMaxH3Pipeline
+from .h3_pipeline.pipeline import MiniMaxH3Pipeline
 
 __all__ = ["MiniMaxH3Pipeline"]

@@ -39,7 +39,7 @@ def load_default_h3_visual_gen(args):
     """Start the public executor and check the pipeline instance loaded by every rank."""
     from tensorrt_llm import VisualGen
     from tensorrt_llm._torch.visual_gen import executor
-    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
         MiniMaxH3Pipeline,
     )
 

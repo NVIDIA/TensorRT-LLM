@@ -8,13 +8,10 @@ import struct
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
-from tensorrt_llm._torch.visual_gen.runtime import (
-    AttentionTensorLayout,
-    SkipSoftmaxAttentionConfig,
-    SolAttentionConfig,
-    logger,
-)
+from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 from .skip_softmax_threshold import (
     H3SkipSoftmax,

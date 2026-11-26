@@ -6,7 +6,8 @@ import torch
 
 from tensorrt_llm._torch.modules import low_m_gemm
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.linear import Linear
-from tensorrt_llm._torch.visual_gen.runtime import QuantAlgo, QuantConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),

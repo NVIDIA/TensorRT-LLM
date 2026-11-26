@@ -23,7 +23,7 @@ import torch
 import torch.distributed as dist
 from diffusers import AutoencoderKLMiniMaxH3
 
-from tensorrt_llm._torch.visual_gen.runtime import logger
+from tensorrt_llm.logger import logger
 
 # Share of the memory available at decode time that the tiles of one decoder call may occupy.
 TILE_DECODE_MEMORY_FRACTION = 0.75

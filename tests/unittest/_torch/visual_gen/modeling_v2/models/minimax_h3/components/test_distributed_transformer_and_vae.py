@@ -24,7 +24,7 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.til
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.transformer import (
     MiniMaxH3Transformer3DModel,
 )
-from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
     MiniMaxH3Pipeline,
 )
 from tensorrt_llm.mapping import Mapping
