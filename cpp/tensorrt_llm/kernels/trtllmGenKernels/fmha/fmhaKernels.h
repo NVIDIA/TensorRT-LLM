@@ -705,6 +705,13 @@ public:
         setFmhaData(params, options, fmhaData);
         fmha::checkSkipCorrThreshold(options, fmhaData.mMetaData.skipCorrThreshold);
 
+        // WAR for unit-scale kernels. Clear the device scale so the separate reduction uses 1.
+        if (options.mSkipsSoftmaxScale)
+        {
+            fmhaData.mScales.scaleSoftmaxLog2D = nullptr;
+            fmhaData.mScales.softmaxScale = 1.0F;
+        }
+
         if (usesNvrtc(params, options))
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
