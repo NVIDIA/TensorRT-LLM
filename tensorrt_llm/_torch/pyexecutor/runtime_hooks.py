@@ -150,6 +150,25 @@ class MsaRuntimePolicy:
     reuse_pool_views: bool = False
 
 
+@dataclass(frozen=True)
+class QsaRuntimePolicy:
+    """QSA sparse-attention metadata preparation a model may opt into.
+
+    Every option changes how a decode step's page and row tables reach the device, not their values.
+    """
+
+    # A steady one-model MTP decode step (steady_spec_prepare.py) advances the QSA metadata with
+    # QSAAttentionMetadata.prepare_steady_decode_step instead of its full prepare(): the KV lengths from the
+    # staging kernel, and the block offsets copied and unscaled only for a KV cache manager whose
+    # batch_block_table_key changed.
+    steady_decode: bool = False
+    # With steady_decode, on a CUDA-graph decode step under the overlap scheduler: the step does not launch
+    # the QSA row mapping, which the forward rewrites before any reader (the KV-length correction's
+    # on_update_kv_lens, or a decode prologue that writes the mapping), and a changed block table is copied
+    # and unscaled in one launch (triton_qsa_copy_block_offsets) where the manager's copy is the plain one.
+    steady_replay_gap: bool = False
+
+
 class KvBalancedAdmissionPlanner(Protocol):
     """Chooses the requests attention-DP KV-balanced admission admits, and their ranks.
 
@@ -307,6 +326,8 @@ class RuntimeHooks:
     perf_metrics_timing_side_stream: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
+    # QSA sparse-attention metadata preparation.
+    qsa: QsaRuntimePolicy = QsaRuntimePolicy()
     # Device memory, in bytes, the executor leaves outside the PyTorch cap for driver allocations made after
     # setup (streams, events, copy launches of the KV cache manager and transfer agents, CUDA IPC mappings of
     # peer buffers, kernel attribute and module loads), up to the memory free at that point. None keeps the

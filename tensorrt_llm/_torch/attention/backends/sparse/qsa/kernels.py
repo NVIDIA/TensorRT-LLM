@@ -104,6 +104,131 @@ def triton_qsa_unscale_block_table(
     )
 
 
+@triton.jit(
+    do_not_specialize=["num_seqs", "src_rows", "dst_rows", "width", "qsa_pool", "qsa_row_stride"]
+)
+def _qsa_copy_block_offsets_kernel(
+    src,  # int32 [pools, src_rows, 2, width]: the manager's host table (read through its device mapping)
+    dst,  # int32 [pools, >= dst_rows, 2, width]: the metadata's block offsets
+    copy_idx,  # int32 [num_seqs]: each sequence's row in src
+    scales,  # int32 [pools]: page-index scale
+    kv_offset,  # int32 [pools]: the value role's page distance from the key role
+    qsa_table,  # int32 [>= num_seqs, width] (HAS_QSA): the slot table of pool qsa_pool
+    num_seqs,
+    src_rows,
+    dst_rows,
+    width,
+    qsa_pool,
+    qsa_row_stride,
+    QSA_SCALE: tl.constexpr,
+    QSA_ROLE: tl.constexpr,
+    HAS_QSA: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One (pool, sequence) row and BLOCK columns a program: the stores of the native
+    # copyBatchBlockOffsetsToDevice (key = BAD ? 0 : scale * v, value = BAD ? 0 : scale * v + offset), then
+    # _qsa_unscale_block_table_kernel's of the same row when it is the QSA attention pool's.
+    row = tl.program_id(0)
+    pool = row // num_seqs
+    seq = row - pool * num_seqs
+    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    valid = columns < width
+    width64 = width.to(tl.int64)
+    index = tl.load(copy_idx + seq).to(tl.int64)
+    value = tl.load(
+        src + (pool.to(tl.int64) * src_rows + index) * 2 * width64 + columns, mask=valid, other=0
+    )
+    bad = value == -1
+    scaled = tl.load(scales + pool) * value
+    key = tl.where(bad, 0, scaled)
+    val = tl.where(bad, 0, scaled + tl.load(kv_offset + pool))
+    base = (pool.to(tl.int64) * dst_rows + seq) * 2 * width64
+    tl.store(dst + base + columns, key, mask=valid)
+    tl.store(dst + base + width64 + columns, val, mask=valid)
+    if HAS_QSA:
+        if pool == qsa_pool:
+            if QSA_ROLE == 0:
+                role = key
+            else:
+                role = val
+            slot = tl.where(role < 0, role, role // QSA_SCALE)
+            tl.store(qsa_table + seq.to(tl.int64) * qsa_row_stride + columns, slot, mask=valid)
+
+
+def triton_qsa_copy_block_offsets(
+    *,
+    host_block_offsets: torch.Tensor,
+    block_offsets: torch.Tensor,
+    copy_index: torch.Tensor,
+    index_scales: torch.Tensor,
+    kv_offset: torch.Tensor,
+    num_seqs: int,
+    qsa_table: torch.Tensor | None = None,
+    qsa_pool: int = -1,
+    qsa_page_index_scale: int = 1,
+    qsa_role: int = 0,
+) -> None:
+    """``KVCacheManagerV2.copy_batch_block_offsets`` of a plain host table in one Triton launch, plus, with
+    ``qsa_table``, ``triton_qsa_unscale_block_table`` of pool ``qsa_pool`` in the same programs: the same
+    values in the same rows (the native copy for ``num_seqs`` rows at the full table width, then the unscale
+    of that pool's ``qsa_role`` half). ``host_block_offsets``, ``copy_index``, ``index_scales`` and
+    ``kv_offset`` may be pinned host tensors (read through their device mapping), as for the native copy."""
+    if host_block_offsets.dim() != 4 or block_offsets.dim() != 4:
+        raise ValueError("block-offset tables must be [pools, rows, 2, width]")
+    pools, src_rows, kv_factor, width = host_block_offsets.shape
+    if (
+        kv_factor != 2
+        or block_offsets.shape[0] != pools
+        or block_offsets.shape[2] != 2
+        or block_offsets.shape[3] != width
+        or block_offsets.shape[1] < num_seqs
+    ):
+        raise ValueError(
+            f"block-offset tables {tuple(host_block_offsets.shape)} -> {tuple(block_offsets.shape)} "
+            f"do not match for {num_seqs} rows"
+        )
+    if (
+        host_block_offsets.dtype != torch.int32
+        or block_offsets.dtype != torch.int32
+        or not host_block_offsets.is_contiguous()
+        or not block_offsets.is_contiguous()
+        or not block_offsets.is_cuda
+    ):
+        raise ValueError("block-offset tables must be contiguous int32, the destination on CUDA")
+    if qsa_table is not None and (
+        qsa_table.dtype != torch.int32
+        or qsa_table.dim() != 2
+        or qsa_table.shape[1] != width
+        or qsa_table.stride(1) != 1
+        or qsa_table.shape[0] < num_seqs
+        or qsa_page_index_scale <= 0
+        or not 0 <= qsa_pool < pools
+        or qsa_role not in (0, 1)
+    ):
+        raise ValueError("QSA slot table does not match the block-offset table")
+    if num_seqs <= 0 or width == 0:
+        return
+    block = 1024
+    _qsa_copy_block_offsets_kernel[(pools * num_seqs, triton.cdiv(width, block))](
+        host_block_offsets,
+        block_offsets,
+        copy_index,
+        index_scales,
+        kv_offset,
+        qsa_table if qsa_table is not None else block_offsets,
+        num_seqs,
+        src_rows,
+        block_offsets.shape[1],
+        width,
+        qsa_pool,
+        qsa_table.stride(0) if qsa_table is not None else 0,
+        QSA_SCALE=int(qsa_page_index_scale),
+        QSA_ROLE=int(qsa_role),
+        HAS_QSA=qsa_table is not None,
+        BLOCK=block,
+    )
+
+
 @triton.jit(do_not_specialize=["num_rows"])
 def _qsa_decode_token_mapping_kernel(
     kv_lens,
@@ -2509,6 +2634,7 @@ def triton_qsa_mtp_reuse_topk(
 
 __all__ = [
     "can_fuse_qsa_splitk_output_gate",
+    "triton_qsa_copy_block_offsets",
     "qsa_supports_head_dims",
     "triton_qsa_decode_pre_indexer",
     "triton_qsa_mtp_reuse_topk",

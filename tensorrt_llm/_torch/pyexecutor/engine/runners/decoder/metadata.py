@@ -21,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     MsaRuntimePolicy,
+    QsaRuntimePolicy,
     RuntimeHooks,
     runtime_hooks_of,
 )
@@ -135,11 +136,27 @@ class DecoderMetadata:
         if isinstance(self.attn_metadata, TrtllmAttentionMetadata):
             self.attn_metadata.host_uploader = self._host_uploader
         self._arm_msa_policy(kv_cache_manager)
+        self._arm_qsa_policy()
         if self.keep_steady_growth_blocks and isinstance(kv_cache_manager, KVCacheManagerV2):
             # The steady decode prepare re-reads a page table whenever its pages change.
             kv_cache_manager.keep_growth_blocks()
 
         return self.attn_metadata
+
+    def _arm_qsa_policy(self) -> None:
+        """Hand the model's QSA preparation choices to the metadata (its CUDA-graph copies inherit them)."""
+        qsa = self.runtime_hooks.qsa
+        if qsa == QsaRuntimePolicy():
+            return
+        # Imported here: only a model that armed a QSA policy needs the sparse backend.
+        from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAAttentionMetadata
+
+        if not isinstance(self.attn_metadata, QSAAttentionMetadata):
+            raise ValueError(
+                "RuntimeHooks.qsa requires the QSA sparse attention backend, got "
+                f"{type(self.attn_metadata).__name__}"
+            )
+        self.attn_metadata.qsa_policy = qsa
 
     def _arm_msa_policy(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None) -> None:
         """Hand the model's MiniMax-M3 MSA preparation choices to the metadata and the KV cache."""
