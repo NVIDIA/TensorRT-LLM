@@ -126,7 +126,7 @@ async def test_stream_without_error_event_succeeds(endpoint):
 
 
 @pytest.mark.asyncio
-async def test_metrics_count_a_failed_stream_as_a_failed_request(capsys):
+async def test_metrics_count_a_failed_stream_as_a_failed_request(capfd):
     failed = await _run("completions", [ERROR_EVENT])
     succeeded = await _run("completions", [USAGE_EVENT])
     assert failed.exception_type is None
@@ -142,4 +142,4 @@ async def test_metrics_count_a_failed_stream_as_a_failed_request(capsys):
     )
 
     assert metrics.completed == 1
-    assert "Total failed requests: 1" in capsys.readouterr().out
+    assert "Total failed requests: 1" in capfd.readouterr().out
