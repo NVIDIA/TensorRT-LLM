@@ -157,6 +157,9 @@ class CompletionOutput:
     _incremental_states: Optional[dict] = field(default=None,
                                                 init=False,
                                                 repr=False)
+    # Set when a stop string was found in the decoded text of this candidate
+    # while its own request may still be generating; see _handle_sequence.
+    _stopped_by_text: bool = field(default=False, init=False, repr=False)
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
     # this sequence's own spec-decode counters; see _handle_sequence
@@ -362,6 +365,17 @@ class GenerationResultBase:
         spec_dec.acceptance_rate = accepted / drafted
         perf_metrics.speculative_decoding = spec_dec
 
+    def _is_sequence_finished(self, finish_reasons, src_idx: int) -> bool:
+        """Whether this sequence is finished, not just the entire request.
+
+        This is important for best_of > n sampling where sequences finish at
+        different times.
+        """
+        return bool(finish_reasons and finish_reasons[src_idx]
+                    != tllm.FinishReason.NOT_FINISHED
+                    and finish_reasons[src_idx]
+                    != tllm.FinishReason.CANCELLED) or self._done
+
     def _handle_sequence(self,
                          finish_reasons,
                          response_tensors,
@@ -389,6 +403,16 @@ class GenerationResultBase:
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
         output._last_logprobs_len = len(output.logprobs)
+        if output._stopped_by_text:
+            # With n > 1 the engine keeps generating a candidate whose stop
+            # string was only found in its decoded text. Keep the output as it
+            # was at the stop; still record the candidate once the engine
+            # finishes it, and trace when the whole request is done.
+            if self._is_sequence_finished(finish_reasons, src_idx):
+                self.record_stats(output, req_perf_metrics_dict, seq_idx)
+            if self._done:
+                self.do_tracing(output, req_perf_metrics_dict)
+            return
         output._spec_dec_counters = _SpecDecCounters()
         decoder_output_prefix = ()
         if (self.sampling_params.exclude_input_from_output
@@ -502,12 +526,8 @@ class GenerationResultBase:
             output.request_perf_metrics = request_perf_metrics
             self._maybe_fill_spec_dec_perf_metrics(output.request_perf_metrics)
 
-        # Check if this specific sequence is finished (not just if the entire request is done)
-        # This is important for best_of > n sampling where sequences finish at different times
-        sequence_is_finished = (finish_reasons and finish_reasons[src_idx]
-                                != tllm.FinishReason.NOT_FINISHED
-                                and finish_reasons[src_idx]
-                                != tllm.FinishReason.CANCELLED) or self._done
+        sequence_is_finished = self._is_sequence_finished(
+            finish_reasons, src_idx)
 
         if sequence_is_finished:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
@@ -1087,6 +1107,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 is not None) and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
+                if beam_output._stopped_by_text:
+                    continue
                 # A stop word matched by token id is trimmed from token_ids in
                 # _handle_sequence. If some of its ids came in earlier streamed
                 # responses, the incremental decoder has already turned them
@@ -1138,8 +1160,22 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
 
                             beam_output.finish_reason = 'stop'
                             beam_output.stop_reason = stop_reason
-                            self._done = True
+                            if self.sampling_params.use_beam_search:
+                                # All beams share one request, which ends here.
+                                self._done = True
+                            else:
+                                # With n > 1 every candidate is its own request:
+                                # this one is finished, its siblings are not.
+                                beam_output._stopped_by_text = True
                             break
+
+            # The engine does not know about the text matches, so the request
+            # ends here once every candidate is finished, by the engine or by
+            # a stop string.
+            if any(output._stopped_by_text for output in self._outputs) and all(
+                    output.finish_reason is not None
+                    for output in self._outputs):
+                self._done = True
 
             self._apply_post_processor_hook()
 
