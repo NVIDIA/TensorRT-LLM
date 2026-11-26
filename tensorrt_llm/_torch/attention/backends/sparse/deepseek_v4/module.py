@@ -393,40 +393,40 @@ def _run_dsv4_o_lora_bmms(
         projected_output.copy_(self.o_b_proj(o_lora_bmm_output.flatten(1)))
 
 
+def supports_dsv4_epilogue_fusion(self: MLA) -> bool:
+    """Whether this layer can fuse the sparse attention output epilogue."""
+    if self._disable_dsv4_epilogue_fusion:
+        return False
+    if self.mapping.has_cp_helix() or not is_sm_100f():
+        return False
+    # SM107 takes the fused epilogue only with its direct-output o_b_proj.
+    if get_sm_version() == 107 and not _uses_rubin_dsv4_o_b_proj_out(self):
+        return False
+    if not getattr(self.mapping, "enable_attention_dp", False):
+        return False
+    if self.num_heads != 128 or self.num_heads_tp != 128:
+        return False
+    if getattr(self.mqa, "sparse_params", None) is None:
+        return False
+    if not getattr(self.mqa, "has_fp8_kv_cache", False):
+        return False
+    if self.o_a_proj.dtype != torch.float8_e4m3fn:
+        return False
+    if self.kv_lora_rank != 448 or self.qk_rope_head_dim != 64:
+        return False
+    if self.qk_head_dim != 512 or self.v_head_dim != 512:
+        return False
+    if self.n_local_groups <= 0 or self.num_heads_tp % self.n_local_groups != 0:
+        return False
+    return not self.inverse_rotary_emb.is_neox
+
+
 def prepare_sparse_attn_outputs(
     self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
 ) -> list[torch.Tensor]:
-    def _should_use_dsv4_epilogue_fusion() -> bool:
-        num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.num_generations
-        if self._disable_dsv4_epilogue_fusion:
-            return False
-        if num_contexts == 0 and num_generations == 0:
-            return False
-        if self.mapping.has_cp_helix() or not is_sm_100f():
-            return False
-        # SM107 takes the fused epilogue only with its direct-output o_b_proj.
-        if get_sm_version() == 107 and not _uses_rubin_dsv4_o_b_proj_out(self):
-            return False
-        if not getattr(self.mapping, "enable_attention_dp", False):
-            return False
-        if self.num_heads != 128 or self.num_heads_tp != 128:
-            return False
-        if getattr(self.mqa, "sparse_params", None) is None:
-            return False
-        if not getattr(self.mqa, "has_fp8_kv_cache", False):
-            return False
-        if self.o_a_proj.dtype != torch.float8_e4m3fn:
-            return False
-        if self.kv_lora_rank != 448 or self.qk_rope_head_dim != 64:
-            return False
-        if self.qk_head_dim != 512 or self.v_head_dim != 512:
-            return False
-        if self.n_local_groups <= 0 or self.num_heads_tp % self.n_local_groups != 0:
-            return False
-        return not self.inverse_rotary_emb.is_neox
-
-    if _should_use_dsv4_epilogue_fusion():
+    if (
+        attn_metadata.num_contexts or attn_metadata.num_generations
+    ) and supports_dsv4_epilogue_fusion(self):
         # 3D marks the fused epilogue (see forward_sparse_attn); the op writes the
         # projected hidden states, so the buffer is exactly hidden_size wide.
         return [
@@ -1446,33 +1446,34 @@ def forward_sparse_attn(
         self.compressor(hidden_states, attn_metadata)
         return None
 
-    def _indexer_branch():
+    def _indexer_branch(decode_topk_start_event: Optional[torch.cuda.Event] = None):
         return self.indexer(
             qr,
             hidden_states,
             attn_metadata,
             position_ids,
             pre_aux=_indexer_pre_aux,
+            decode_topk_start_event=decode_topk_start_event,
         )
 
     topk_indices = None
     indexer_ran = False
     if _v4_extra_overlap:
         if _use_indexer_overlap:
-            # Compressor and indexer prework are already in flight. Run Q after the
-            # compressor on the same stream, then synchronize both streams below.
+            # Issue Q first: decode Top-K waits on dsv4_compressor_event, so its
+            # record must be enqueued before the indexer consumes the event.
             self.dsv4_overlap_start_event.record()
-
-            with torch.cuda.stream(self.indexer_stream):
-                self.dsv4_overlap_start_event.wait()
-                topk_indices = _indexer_branch()
-                indexer_ran = True
-                self.dsv4_indexer_event.record()
 
             with torch.cuda.stream(self.compressor_stream):
                 self.dsv4_overlap_start_event.wait()
                 q = _q_branch()
                 self.dsv4_compressor_event.record()
+
+            with torch.cuda.stream(self.indexer_stream):
+                self.dsv4_overlap_start_event.wait()
+                topk_indices = _indexer_branch(self.dsv4_compressor_event)
+                indexer_ran = True
+                self.dsv4_indexer_event.record()
 
             self.dsv4_compressor_event.wait()
             self.dsv4_indexer_event.wait()

@@ -14,11 +14,6 @@
 # the License.
 include(FetchContent)
 
-set(SRCS
-    bufferManagerNvls.cpp utils/debugUtils.cu ipcUtils.cpp
-    mcastDeviceMemory.cpp moeLoadBalancer/moeLoadBalancer.cpp
-    ncclCommunicator.cpp)
-
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
 if(NOT WIN32)
@@ -77,8 +72,8 @@ add_library(ipc_nvls_memory_src STATIC ipcNvlsMemory.cu ipcSocket.cpp
                                        mcastGroupComm.cpp)
 add_library(tllm::runtime_ipc_nvls ALIAS ipc_nvls_memory_src)
 target_link_libraries(
-  ipc_nvls_memory_src PUBLIC tllm::common_cuda tllm::runtime_distributed
-                             CUDA::cuda_driver)
+  ipc_nvls_memory_src PUBLIC tllm::common_cuda tllm::common_native_memory
+                             tllm::runtime_distributed CUDA::cuda_driver)
 target_compile_features(ipc_nvls_memory_src PUBLIC cxx_std_20)
 set_target_properties(
   ipc_nvls_memory_src
@@ -91,6 +86,18 @@ if(ENABLE_NVSHMEM)
   target_link_libraries(ipc_nvls_memory_src PRIVATE nvshmem::nvshmem_host
                                                     nvshmem::nvshmem_device)
 endif()
+
+add_library(tllm_runtime_ipc STATIC ipcUtils.cpp)
+add_library(tllm::runtime_ipc ALIAS tllm_runtime_ipc)
+target_link_libraries(
+  tllm_runtime_ipc
+  PUBLIC tllm::runtime_buffers tllm::runtime_distributed
+  PRIVATE tllm::common_environment)
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(tllm_runtime_ipc PUBLIC tllm::kernel_custom_all_reduce)
+endif()
+target_compile_features(tllm_runtime_ipc PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_ipc PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(tllm_runtime_worker_pool STATIC workerPool.cpp)
 add_library(tllm::runtime_worker_pool ALIAS tllm_runtime_worker_pool)
@@ -121,13 +128,25 @@ add_library(tllm::runtime_host_accessible_memory ALIAS
             tllm_runtime_host_accessible_memory)
 target_link_libraries(
   tllm_runtime_host_accessible_memory
-  PUBLIC tllm::runtime_gdr tllm::runtime_topology Threads::Threads
+  PUBLIC tllm::runtime_gdr tllm::runtime_topology tllm::common_native_memory
+         Threads::Threads
   PRIVATE tllm::common_environment)
 if(NOT WIN32)
   target_link_libraries(tllm_runtime_host_accessible_memory PUBLIC NUMA::NUMA)
 endif()
 target_compile_features(tllm_runtime_host_accessible_memory PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_host_accessible_memory
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_runtime_moe_load_balance STATIC
+            moeLoadBalancer/moeLoadBalancer.cpp)
+add_library(tllm::runtime_moe_load_balance ALIAS tllm_runtime_moe_load_balance)
+target_link_libraries(
+  tllm_runtime_moe_load_balance
+  PUBLIC tllm::common_cuda Threads::Threads
+  PRIVATE tllm::runtime_host_accessible_memory tllm::kernel_moe_load_balance)
+target_compile_features(tllm_runtime_moe_load_balance PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_moe_load_balance
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(tllm_runtime_locality STATIC
@@ -173,23 +192,51 @@ foreach(component
   set_target_properties(${component} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
-add_library(runtime_src OBJECT ${SRCS})
-set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-add_cuda_architectures(runtime_src 89)
+add_library(tllm_runtime_debug STATIC utils/debugUtils.cu)
+add_library(tllm::runtime_debug ALIAS tllm_runtime_debug)
+target_link_libraries(tllm_runtime_debug PUBLIC tllm::runtime_buffers)
+target_compile_features(tllm_runtime_debug PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_runtime_debug
+  PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(tllm_runtime_debug 89)
+
+add_library(tllm_runtime_nvls_buffers STATIC bufferManagerNvls.cpp)
+add_library(tllm::runtime_nvls_buffers ALIAS tllm_runtime_nvls_buffers)
 target_link_libraries(
-  runtime_src PUBLIC ipc_nvls_memory_src tllm::runtime_topology
-                     tllm::runtime_host_accessible_memory)
+  tllm_runtime_nvls_buffers
+  PUBLIC tllm::runtime_buffers
+  PRIVATE tllm::runtime_ipc_nvls)
+target_compile_features(tllm_runtime_nvls_buffers PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_runtime_nvls_buffers PROPERTIES CXX_EXTENSIONS OFF
+                                       POSITION_INDEPENDENT_CODE ON)
 
-target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
+add_library(tllm_runtime_multicast STATIC mcastDeviceMemory.cpp)
+add_library(tllm::runtime_multicast ALIAS tllm_runtime_multicast)
+target_link_libraries(tllm_runtime_multicast PUBLIC tllm::runtime_ipc_nvls
+                                                    tllm::common_mcast_registry)
+target_compile_features(tllm_runtime_multicast PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_runtime_multicast PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
+                                                       ON)
 
+add_library(tllm_runtime_nccl STATIC ncclCommunicator.cpp)
+add_library(tllm::runtime_nccl ALIAS tllm_runtime_nccl)
+target_link_libraries(
+  tllm_runtime_nccl
+  PUBLIC tllm::runtime_distributed
+  PRIVATE tllm::common_environment Threads::Threads)
 if(ENABLE_MULTI_DEVICE)
-  target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})
+  target_link_libraries(tllm_runtime_nccl PRIVATE tllm::runtime_ipc_nvls
+                                                  ${NCCL_LIB})
+  target_include_directories(tllm_runtime_nccl SYSTEM
+                             PRIVATE ${NCCL_INCLUDE_DIR})
 endif()
-
-if(NOT WIN32)
-  target_link_libraries(runtime_src PUBLIC NUMA::NUMA)
-endif()
+target_compile_features(tllm_runtime_nccl PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_nccl PROPERTIES CXX_EXTENSIONS OFF
+                                                   POSITION_INDEPENDENT_CODE ON)
 
 # Add utils subdirectory for pg_utils module
 add_subdirectory(utils)

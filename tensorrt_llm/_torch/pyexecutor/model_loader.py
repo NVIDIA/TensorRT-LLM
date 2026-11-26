@@ -41,6 +41,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from ..locality_domain.policy import LocalityDomainPolicy
+from ..memory.monitor import claims as monitor_claims
+from ..memory.monitor import names as monitor_names
 from ..mmap_utils import (page_cache_bytes, release_file_page_cache,
                           wait_for_page_migration_to_settle)
 from ..model_config import ModelConfig
@@ -395,6 +397,28 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
             "Encoder-decoder tensor parallelism currently supports "
             f"attn_backend='TRTLLM' only, but got "
             f"attn_backend='{model_config.attn_backend}'.")
+
+
+def release_localized_moe_weights(model: torch.nn.Module) -> None:
+    """Unmap every die-local MoE weight bank (MEGAMOE_UGPU_LAYOUT) under ``model``.
+
+    The banks are driver mappings outside PyTorch's allocator, so dropping the
+    model does not free them. Call only once no CUDA graph can replay them.
+    """
+    errors = []
+    for module in model.modules():
+        release = getattr(module, "release_ugpu_localized_weights", None)
+        if release is not None:
+            # Keep going: a module that fails must not strand the banks after it.
+            try:
+                release()
+            except Exception as error:  # noqa: BLE001 - re-raised below
+                errors.append(error)
+    for error in errors[1:]:
+        logger.error(
+            f"Releasing a localized MoE weight bank also failed: {error!r}")
+    if errors:
+        raise errors[0]
 
 
 def validate_lm_head_output_dtype(model: torch.nn.Module,
@@ -946,7 +970,7 @@ def _load_checkpoint_into_model(
         # MX indicate weights to be preloaded successfully by returning
         # `weights` as empty. It does not yet support draft model.
         if (weights or is_draft_model
-                or not checkpoint_loader.is_weights_preloaded()):
+                or not mx_loading.is_mx_weights_preloaded(checkpoint_loader)):
             _copy_weights_into_model(
                 model_load_weights,
                 model_hooks.select_draft_weights(weights, key_prefixes),
@@ -958,7 +982,9 @@ def _load_checkpoint_into_model(
     # Take the policy after the weight session finished, which can turn
     # read-ahead into native I/O, and before a draft read with the same loader
     # resets it.
-    return checkpoint_io_policy_metadata(checkpoint_loader)
+    return checkpoint_io_policy_metadata(
+        checkpoint_loader,
+        weights_preloaded=mx_loading.is_mx_weights_preloaded(checkpoint_loader))
 
 
 def _copy_weights_into_model(model_load_weights: Callable[..., None],
@@ -1039,7 +1065,7 @@ def load_model_from_auto_load_format(
         metrics=metrics)
     # Read before the draft load: an MX draft read without MX state resets
     # this flag.
-    weights_preloaded = checkpoint_loader.is_weights_preloaded()
+    weights_preloaded = mx_loading.is_mx_weights_preloaded(checkpoint_loader)
 
     # load separate draft weights
     if spec_config is not None and spec_config.needs_separate_draft_weights:
@@ -1441,22 +1467,42 @@ class ModelLoader:
         self._metrics = {}
         # Directories _timed_load read checkpoint files from.
         self._checkpoint_dirs_read: list[str] = []
-        with timing_metric(
-                ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
-                self._metrics):
-            model, moe_load_balancer = self._timed_load(checkpoint_dir,
-                                                        checkpoint_loader)
+        # Track the model until it is returned: localized MoE banks are driver
+        # mappings that outlive it, so any failure before then must release them.
+        self._model_in_load = None
+        try:
+            with timing_metric(
+                    ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
+                    self._metrics):
+                model, moe_load_balancer = self._timed_load(
+                    checkpoint_dir, checkpoint_loader)
 
-        release_seconds = _release_checkpoint_page_cache(
-            self._checkpoint_dirs_read)
-        if release_seconds is not None:
-            self._metrics[
-                _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
+            release_seconds = _release_checkpoint_page_cache(
+                self._checkpoint_dirs_read)
+            if release_seconds is not None:
+                self._metrics[
+                    _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
 
-        metrics = ", ".join(f"{name}={value:.4f}"
-                            for name, value in self._metrics.items())
-        logger.info(
-            f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+            metrics = ", ".join(f"{name}={value:.4f}"
+                                for name, value in self._metrics.items())
+            logger.info(
+                f"Model loading metrics for rank {self.mapping.rank}: {metrics}"
+            )
+            # Attribute the parameters the model ended up with, whichever load
+            # path produced them. Only a weak reference; read when reporting.
+            monitor_claims.claim_module_memory(model, monitor_names.WEIGHTS)
+        except BaseException:
+            if self._model_in_load is not None:
+                # The load error stays the one callers see.
+                try:
+                    release_localized_moe_weights(self._model_in_load)
+                except Exception as release_error:  # noqa: BLE001 - logged
+                    logger.error(
+                        "Releasing localized MoE weights after a failed "
+                        f"load also failed: {release_error!r}")
+            raise
+        finally:
+            self._model_in_load = None
         return model, moe_load_balancer
 
     def _timed_load(
@@ -1470,6 +1516,17 @@ class ModelLoader:
             checkpoint_dir, checkpoint_loader)
         load_format = self.llm_args.load_format
         gms_loading.check_gms_locality_domain_compat(load_format, config)
+        if os.environ.get("MEGAMOE_UGPU_LAYOUT", "none") != "none":
+            if load_format == LoadFormat.GMS:
+                raise ConfigInputError(
+                    "LoadFormat.GMS is incompatible with MEGAMOE_UGPU_LAYOUT. GMS "
+                    "moves parameters into its own mappings after loading, which "
+                    "would undo the die-local MegaMoE weight placement.")
+            if self.model_weights_memory_tag is not None:
+                raise ConfigInputError(
+                    "MEGAMOE_UGPU_LAYOUT is incompatible with sleep_config. The "
+                    "localized MegaMoE expert weights are mapped outside the model "
+                    "weights memory tag, so sleep would not release them.")
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
 
@@ -1486,6 +1543,8 @@ class ModelLoader:
             # model's config gets its own name.
             model, model_config, is_meta_init = memory_init.create_model_with_meta_tensors(
                 config)
+        # load() unmaps the model's localized MoE banks if loading fails after this.
+        self._model_in_load = model
 
         validate_lm_head_output_dtype(model, self.llm_args.lm_head_output_dtype)
 
@@ -1609,19 +1668,16 @@ class ModelLoader:
         with timing_metric(
                 ModelLoaderMetricNames.POST_LOAD_PROCESSING_SECONDS.value,
                 self._metrics):
-            # GMS RW and RO have already run the post_load_* hooks
-            # themselves. RW handles them inside `mem_pool_scope` so the
-            # committed pool reflects the post-post_load layout; RO runs
+            # GMS RW and RO have already run the post-load hooks and the MX
+            # publish themselves. RW handles them inside `mem_pool_scope` so
+            # the committed pool reflects the post-post_load layout; RO runs
             # `setup_aliases()` before `materialize_module` to wire aliases
             # prior to zero-copy mapping, then refreshes derived state after
             # real GMS tensors are bound.
             if load_format != LoadFormat.GMS:
-                checkpoint_loader.post_load_apply(
-                    model, weights_preloaded=weights_preloaded)
                 mx_loading.run_post_load_walks_and_publish(
                     checkpoint_loader,
                     model,
-                    checkpoint_dir=checkpoint_dir,
                     weights_preloaded=weights_preloaded,
                     qualification=post_transform_qualification,
                     source_identity=source_identity)
@@ -1811,6 +1867,7 @@ class ModelLoader:
             replicate_embedding=self.llm_args.replicate_embedding,
             cuda_graph_batch_sizes=captured_cuda_graph_batch_sizes(
                 self.llm_args, self.max_num_tokens, self.spec_config),
+            max_batch_size=self.llm_args.max_batch_size,
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,

@@ -63,6 +63,7 @@ from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
     DeepSeekV4SparseAttentionConfig,
     DraftTargetDecodingConfig,
+    MTPDecodingConfig,
     PARDDecodingConfig,
     PrefillCudaGraphBackend,
     SparseKvCacheOffloadConfig,
@@ -136,6 +137,11 @@ def _run_warmup_tracked(
         patch.object(model_engine, "_general_warmup", side_effect=tracker("general_warmup")),
         patch.object(model_engine, "_run_autotuner_warmup", side_effect=tracker("autotuner")),
         patch.object(
+            model_engine,
+            "_prewarm_lowm_mma_row_buckets",
+            side_effect=tracker("lowm_mma_row_buckets"),
+        ),
+        patch.object(
             model_engine._graphs,
             "_capture_generation_cuda_graphs",
             side_effect=tracker("generation_cuda_graph"),
@@ -204,6 +210,8 @@ def _other_pp_stage_indexer() -> Mock:
 class _StandInMambaCacheManager:
     """Concrete stand-in for the abstract Mamba cache-manager type check."""
 
+    is_context_only_cache = False
+
     def __init__(self, available_tokens: int = 8) -> None:
         self._available_tokens = available_tokens
 
@@ -212,17 +220,16 @@ class _StandInMambaCacheManager:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("cache_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
 @pytest.mark.parametrize("context_only", [False, True])
 def test_general_and_memory_pool_warmups_leave_out_generation_shapes_on_context_only_cache(
-    cache_flag: str, context_only: bool
+    context_only: bool,
 ) -> None:
     """A context-only cache that is not a Mamba hybrid one runs the general and memory-pool phases.
 
     Both take their shapes from these lists, so the lists must hold context shapes only.
     """
     warmup = decoder_warmup(decoder_config(), agreement=_agreement(world_size=4, dwdp_size=4))
-    resources = _context_only_cache_resources(cache_flag, context_only)
+    resources = _context_only_cache_resources("fp4_mla_context_only_cache", context_only)
 
     max_shapes = warmup._get_max_shape_warmup_requests(resources)
     general_shapes = warmup._get_full_general_warmup_requests(resources)
@@ -462,7 +469,9 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _forward_warmup=Mock(),
     )
     engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
-    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+    cache = SimpleNamespace(
+        is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+    )
     resources = SimpleNamespace(
         get_resource_manager=lambda key: (
             cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -570,7 +579,9 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
         _release_megamoe_profiling_scratch=Mock(),
         _forward_warmup=Mock(),
     )
-    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+    cache = SimpleNamespace(
+        is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+    )
     resources = SimpleNamespace(
         get_resource_manager=lambda key: (
             cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -730,7 +741,19 @@ def _context_only_warmup_requests(context_only: bool) -> Mock:
 
 
 def _context_only_cache_resources(cache_flag: str, context_only: bool) -> SimpleNamespace:
-    cache = SimpleNamespace(**{cache_flag: context_only}, get_num_available_tokens=lambda **_: 16)
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_layout import Fp4MlaCacheLayout
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+
+    if cache_flag == "kda_context_only":
+        cache = object.__new__(KimiK3HybridCacheManager)
+        cache.kda_context_only = context_only
+    else:
+        # The FP4 MLA flag belongs to the layout the manager holds.
+        cache = object.__new__(Fp4MlaKVCacheManagerV2)
+        cache.fp4_mla_layout = Fp4MlaCacheLayout(cache)
+        cache.fp4_mla_layout.fp4_mla_context_only_cache = context_only
+    cache.get_num_available_tokens = lambda **_: 16
     return SimpleNamespace(
         get_resource_manager=lambda key: (
             cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -1109,7 +1132,9 @@ def test_decode_prewarm_skips_verify_kernels_on_context_only_cache() -> None:
     model = _kimi_linear_model()
     owner = _decode_prewarm_owner([model], tp_size=1, spec_config=object())
     with patch.object(torch.cuda, "synchronize"):
-        DecoderWarmup._prewarm_model_decode_kernels(owner, SimpleNamespace(kda_context_only=True))
+        DecoderWarmup._prewarm_model_decode_kernels(
+            owner, SimpleNamespace(is_context_only_cache=True)
+        )
     model.prewarm_decode_kernels.assert_called_once_with(96, False)
 
 
@@ -1138,10 +1163,157 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
     ):
         DecoderWarmup._prewarm_model_decode_kernels(owner, None)
     warning.assert_called_once()
-    owner.dist.tp_allgather.assert_called_once_with(1)
+    owner.dist.tp_allgather.assert_called_once_with(None)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cp_size,tp_size", [(1, 4), (2, 1)])
+def test_prims_ts_prewarm_prepares_metadata_and_barriers(cp_size: int, tp_size: int) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_sparse_mla
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4TrtllmAttentionMetadata,
+    )
+
+    events = []
+    metadata = SimpleNamespace()
+
+    def build_metadata(*args: object) -> SimpleNamespace:
+        events.append("metadata")
+        metadata.cu_seq_lens = torch.zeros(1, dtype=torch.int32)
+        return metadata
+
+    owner = SimpleNamespace(
+        _config=SimpleNamespace(
+            attention_backend=SimpleNamespace(Metadata=DeepseekV4TrtllmAttentionMetadata),
+            spec_config=MTPDecodingConfig(max_draft_len=5),
+        ),
+        _metadata=SimpleNamespace(setup_attention=Mock(side_effect=build_metadata)),
+        model=object(),
+        mapping=SimpleNamespace(cp_size=cp_size, tp_size=tp_size),
+        dist=Mock(),
+    )
+    gather = owner.dist.tp_cp_allgather if cp_size > 1 else owner.dist.tp_allgather
+    gather.side_effect = lambda status: events.append("gather") or [status, None]
+    manager, draft_manager = Mock(spec=KVCacheManagerV2), Mock(spec=KVCacheManagerV2)
+    resources = ResourceManager({ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_manager})
+    with (
+        patch.object(
+            prims_ts_sparse_mla,
+            "warmup_prims_ts_sparse_mla",
+            side_effect=lambda *args, **kwargs: events.append("kernels"),
+        ) as warm,
+        patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("sync")),
+    ):
+        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        assert events == ["metadata", "kernels", "sync", "gather"]
+        gather.assert_called_once_with(None)
+        assert metadata.cu_seq_lens.is_inference()
+        warm.assert_called_once_with(owner.model, metadata)
+        owner._metadata.setup_attention.assert_called_once_with(manager, draft_manager)
+
+        if cp_size > 1:
+            local_error = FileNotFoundError("missing kernel")
+            warm.side_effect = local_error
+            with pytest.raises(FileNotFoundError) as failed:
+                DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+            assert failed.value is local_error
+            gather.assert_called_with("FileNotFoundError: missing kernel")
+        else:
+            gather.side_effect = None
+            gather.return_value = [None, "FileNotFoundError: missing kernel"]
+            with pytest.raises(RuntimeError, match="on a peer: FileNotFoundError: missing kernel"):
+                DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+
+        events.clear()
+        owner.dist.reset_mock()
+        owner._config.attention_backend.Metadata = TrtllmAttentionMetadata
+        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        assert events == [] and not owner.dist.mock_calls
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cp_size,gather,attention_dp,spec_mode,max_rows",
+    [
+        (1, "tp_allgather", False, None, 8),
+        (2, "tp_cp_allgather", True, None, 16),
+        (1, "tp_allgather", False, "DSPARK", None),
+        (1, "tp_allgather", False, "NGRAM", 8),
+        (1, "tp_allgather", False, "USER_PROVIDED", None),
+    ],
+)
+@pytest.mark.parametrize("fails", [False, True])
+def test_lowm_row_bucket_prewarm_always_meets_its_peers(
+    cp_size: int,
+    gather: str,
+    attention_dp: bool,
+    spec_mode: str | None,
+    max_rows: int | None,
+    fails: bool,
+) -> None:
+    """Without speculation, or with NGram's prefix-lookup drafts, a rank prewarms the buckets up to
+    a step's most rows (its tokens, gathered over the TP group under attention DP). With any other
+    drafter, a user-provided one included, every bucket, since it can run more rows than its target
+    verifies. The rank meets its TP (TP x CP) peers whether its prewarm compiled nothing or failed;
+    a failure is a warning, since it only defers the compiles to their first calls."""
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+    spec_config = (
+        None
+        if spec_mode is None
+        else SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode[spec_mode])
+    )
+    owner = SimpleNamespace(
+        _config=SimpleNamespace(
+            max_num_tokens=8, spec_config=spec_config, is_spec_decode=spec_config is not None
+        ),
+        mapping=SimpleNamespace(cp_size=cp_size, tp_size=2, enable_attention_dp=attention_dp),
+        dist=Mock(),
+    )
+    prewarm = Mock(side_effect=RuntimeError("no compiler")) if fails else Mock(return_value=(0, 0))
+    with (
+        patch("tensorrt_llm._torch.modules.low_m_gemm.prewarm_mma_row_buckets", prewarm),
+        patch.object(decoder_warmup_module.logger, "warning") as warning,
+    ):
+        DecoderWarmup._prewarm_lowm_mma_row_buckets(owner)
+    prewarm.assert_called_once_with(max_rows)
+    getattr(owner.dist, gather).assert_called_once_with(1)
+    assert warning.call_count == int(fails)
 
 
 class TestWarmupCleanup(unittest.TestCase):
+    def test_lowm_row_bucket_prewarm_runs_between_the_autotuner_and_capture(self) -> None:
+        """The low-M MMA row-bucket prewarm runs exactly once, after the eager warmup forwards (the
+        autotuner's are the last) and before any CUDA graph is captured."""
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
+        calls, _ = _run_warmup_tracked(model_engine, resource_manager)
+
+        self.assertEqual(calls.count("lowm_mma_row_buckets"), 1, calls)
+        prewarm = calls.index("lowm_mma_row_buckets")
+        self.assertLess(calls.index("autotuner"), prewarm, calls)
+        self.assertLess(prewarm, calls.index("generation_cuda_graph"), calls)
+        captures = ("generation_cuda_graph", "additional_cuda_graph", "prefill_cuda_graph")
+        for i, name in enumerate(calls):
+            if name in captures:
+                self.assertLess(prewarm, i, calls)
+
+    def test_warmup_frees_the_low_m_staging_buffers_of_its_thread(self) -> None:
+        """Serving stages padded low-M GEMM rows in buffers of its own thread, so the warmup frees
+        the ones its thread holds once it is done, whether or not a phase raises."""
+        from tensorrt_llm._torch.modules import low_m_gemm
+
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
+        low_m_gemm._staging_buffers()[("warmup",)] = torch.zeros(1)
+        _run_warmup_tracked(model_engine, resource_manager)
+        self.assertEqual(low_m_gemm._staging_buffers(), {})
+        low_m_gemm._staging_buffers()[("warmup",)] = torch.zeros(1)
+        with (
+            patch.object(model_engine, "_warmup_scheduled", side_effect=RuntimeError("phase")),
+            self.assertRaises(RuntimeError),
+        ):
+            model_engine.run(resource_manager)
+        self.assertEqual(low_m_gemm._staging_buffers(), {})
+
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
         _run_autotuner_warmup."""
@@ -1289,7 +1461,9 @@ class TestWarmupCleanup(unittest.TestCase):
             _forward_warmup=Mock(),
             _completed_autotuner_warmup_num_tokens=None,
         )
-        kv_cache_manager = SimpleNamespace(get_num_available_tokens=get_num_available_tokens)
+        kv_cache_manager = SimpleNamespace(
+            is_context_only_cache=False, get_num_available_tokens=get_num_available_tokens
+        )
         resource_manager = SimpleNamespace(
             get_resource_manager=lambda key: (
                 kv_cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -1482,7 +1656,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+            kv_cache_manager = SimpleNamespace(
+                is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+            )
             resource_manager = SimpleNamespace(
                 get_resource_manager=lambda key: (
                     kv_cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -1612,7 +1788,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),
             )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+            kv_cache_manager = SimpleNamespace(
+                is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+            )
             resource_manager = SimpleNamespace(
                 get_resource_manager=lambda key: (
                     kv_cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -1720,7 +1898,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),
             )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+            kv_cache_manager = SimpleNamespace(
+                is_context_only_cache=False, get_num_available_tokens=lambda **kwargs: 16
+            )
             resource_manager = SimpleNamespace(
                 get_resource_manager=lambda key: (
                     kv_cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -2148,7 +2328,7 @@ def _fmha_prewarm_owner(modules: list, pp_size: int, tp_size: int = 1) -> Simple
 def _fmha_prewarm_cache() -> SimpleNamespace:
     from tensorrt_llm.bindings import DataType
 
-    return SimpleNamespace(dtype=DataType.BF16, tokens_per_block=32)
+    return SimpleNamespace(dtype=DataType.BF16, tokens_per_block=32, is_context_only_cache=False)
 
 
 def _attention_layer(

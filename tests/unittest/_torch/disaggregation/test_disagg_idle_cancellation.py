@@ -50,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
+from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
 from tensorrt_llm._torch.pyexecutor.sampler import (
     SampleStateTensorsHostTorch,
     SampleStateTorch,
@@ -78,6 +79,7 @@ def _request(
     request_id: int,
     *,
     context: bool = False,
+    streaming: bool = False,
     num_return_sequences: int = 1,
     lora_task_id: int | None = None,
 ) -> LlmRequest:
@@ -86,6 +88,7 @@ def _request(
     Args:
         request_id: Executor and transfer identity.
         context: Whether to create the context-side request.
+        streaming: Whether to return intermediate responses.
         num_return_sequences: Number of sequences, including any native children.
         lora_task_id: Adapter identity, if the request holds PEFT resources.
 
@@ -97,7 +100,7 @@ def _request(
         max_new_tokens=8,
         input_tokens=list(range(8)),
         sampling_config=SamplingConfig(1, num_return_sequences=num_return_sequences),
-        is_streaming=False,
+        is_streaming=streaming,
         draft_tokens=None,
         lora_task_id=lora_task_id,
         llm_request_type=(
@@ -545,6 +548,50 @@ def test_existing_compute_request_keeps_post_batch_cancellation(
     executor.resource_manager.free_resources.assert_not_called()
 
 
+def test_between_batch_cancellation_preserves_current_response_counters(
+    executor: PyExecutor,
+) -> None:
+    request = _request(1, streaming=True, lora_task_id=0)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([9])
+    request.py_decoding_iter = 1
+    request.py_draft_tokens = [11, 12]
+    request.py_per_pos_drafted[0] = 4
+    request.py_per_pos_accepted[0] = 2
+    request.py_total_draft_tokens = 4
+    request.py_total_accepted_draft_tokens = 2
+    earlier = prepare_response(request, publish_metadata=True)
+    assert earlier is not None
+    assert earlier.result.spec_dec_totals == (2, 4)
+
+    request.add_new_tokens([10])
+    request.py_decoding_iter = 2
+    request.py_draft_tokens = [13]
+    request.py_per_pos_drafted[0] = 5
+    request.py_per_pos_accepted[0] = 3
+    request.py_total_draft_tokens = 5
+    request.py_total_accepted_draft_tokens = 3
+    assert request.decoding_iter == 1
+    executor.active_requests = [request]
+    _abort(executor, request)
+
+    assert executor._cancel_waiting_disagg_requests([]) == []
+
+    ((request_id, response),) = executor._pending_transfer_responses
+    assert request_id == request.py_request_id
+    assert response.result.is_final
+    assert response.result.get_result().decoding_iter == 2
+    assert request.draft_tokens == [13]
+    assert response.result.per_pos_drafted[0] == 5
+    assert response.result.per_pos_accepted[0] == 3
+    assert response.result.spec_dec_totals == (3, 5)
+    assert earlier.result.get_result().decoding_iter == 1
+    assert earlier.result.per_pos_drafted[0] == 4
+    assert earlier.result.per_pos_accepted[0] == 2
+    assert earlier.result.spec_dec_totals == (2, 4)
+    _assert_released_once(executor, request)
+
+
 @pytest.mark.parametrize("context, bridge_enabled", [(False, True), (True, True), (True, False)])
 def test_model_request_cancels_between_batches_without_another_forward(
     executor: PyExecutor, context: bool, bridge_enabled: bool
@@ -597,7 +644,7 @@ def test_scheduler_excludes_cancelled_model_work_without_releasing_its_roots(
     healthy = _request(2)
     healthy.state = LlmRequestState.GENERATION_IN_PROGRESS
     executor.active_requests = [request, healthy]
-    executor.kv_cache_manager = SimpleNamespace()
+    executor.kv_cache_manager = SimpleNamespace(prepare_expect_snapshot_points=Mock())
     executor.inflight_req_ids = set()
     executor.scheduler = Mock()
     executor.scheduler.schedule_request.side_effect = _ReachedScheduler
@@ -715,7 +762,12 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
     executor.kv_cache_manager = Mock(
-        spec=["update_resources", "is_preemption_pending", "has_pending_preemption"]
+        spec=[
+            "update_resources",
+            "is_preemption_pending",
+            "has_pending_preemption",
+            "prepare_expect_snapshot_points",
+        ]
     )
     executor.kv_cache_manager.is_preemption_pending.return_value = False
     executor.kv_cache_manager.has_pending_preemption.return_value = False
@@ -867,7 +919,7 @@ def test_model_cancellation_keeps_unqualified_scheduler_paths_unchanged(
     request = _request(1)
     request.state = LlmRequestState.GENERATION_IN_PROGRESS
     executor.active_requests = [request]
-    executor.kv_cache_manager = SimpleNamespace()
+    executor.kv_cache_manager = SimpleNamespace(prepare_expect_snapshot_points=Mock())
     executor.inflight_req_ids = set()
     executor.scheduler = Mock()
     executor.scheduler.schedule_request.side_effect = _ReachedScheduler

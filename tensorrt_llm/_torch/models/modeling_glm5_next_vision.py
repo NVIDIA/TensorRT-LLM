@@ -763,12 +763,15 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     Requires the Transformers version specified in the deployment guide.
     """
 
+    supports_tokenization_cache = True
+
     def __init__(
         self,
         model_path: str,
         config: PretrainedConfig,
         tokenizer: Optional[AutoTokenizer] = None,
         trust_remote_code: bool = True,
+        enable_tokenization_cache: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -784,6 +787,16 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self._tokenizer = (
             tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(model_path)
         )
+        # Text-only prompts are tokenized with add_special_tokens=True and the cache with False,
+        # so their ids match only if the tokenizer adds no special tokens (the GLM-5 tokenizer adds
+        # none: the chat template writes [gMASK]<sop>).
+        if enable_tokenization_cache and self._tokenizer.num_special_tokens_to_add() != 0:
+            logger.warning(
+                "enable_tokenization_cache is ignored: the tokenizer adds special tokens, so "
+                "cached ids would differ from the full tokenization's."
+            )
+            enable_tokenization_cache = False
+        self._init_tokenization_cache(enable_tokenization_cache, self._tokenizer)
         self._processor = None
         vision = config.vision_config
         self._merge_size = int(vision.spatial_merge_size)
@@ -822,11 +835,6 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def get_vocab_size(self) -> int:
         return int(unwrap_glm5_next_text_config(self._config).vocab_size)
-
-    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # PIL is the HF processor's native input; the server's default float
-        # CHW tensor would be decoded, hashed and converted back for nothing.
-        return {"image": {"format": "pil"}}
 
     def get_mm_token_ids(self) -> torch.Tensor:
         """In-vocab ``<|image|>`` / ``<|video|>`` ids: the frontend's
@@ -937,14 +945,17 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         video_datas = mm_data.get("video") or None
         if not images and not video_datas:
             # Text-only fast path: identical to the tokenizer and no
-            # multimodal payload, so the tower is never touched.
+            # multimodal payload, so the tower is never touched. A prompt that
+            # extends a recent one tokenizes only its tail when the prefix
+            # tokenization cache is on (enable_tokenization_cache).
+            ids = self._encode_with_tokenization_cache(text_prompt or "", sampling_params)
+            if ids is not None:
+                return ids, None
             # A Python list straight from the tokenizer: a tensor round trip costs
             # milliseconds on long prompts.
             return self._tokenizer(text_prompt).input_ids, None
 
-        # Media loaders may deliver pre-rescaled float tensors (the server
-        # default) instead of PIL / uint8; tell the HF processor not to
-        # rescale those a second time (Qwen2-VL precedent).
+        # Caller-supplied float tensors are already scaled to [0, 1].
         images_kwargs = dict(mm_processor_kwargs.get("images_kwargs") or {})
         videos_kwargs = dict(mm_processor_kwargs.get("videos_kwargs") or {})
         if images and "do_rescale" not in mm_processor_kwargs:

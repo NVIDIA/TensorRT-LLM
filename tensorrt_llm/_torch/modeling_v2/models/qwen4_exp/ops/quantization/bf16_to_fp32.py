@@ -14,7 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's vocabulary: the width of the logits rows.
 VOCAB = 248320
@@ -39,7 +40,7 @@ class Bf16ToFp32(OpWrapper):
     are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode logits: 128 rows of the 248320 vocabulary", spec=dict(shape=(128, VOCAB))),

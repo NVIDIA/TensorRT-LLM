@@ -29,7 +29,8 @@ from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as _fi_splitk
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 class _Plan(NamedTuple):
@@ -148,7 +149,7 @@ class LowMBf16Mm(OpWrapper):
     branch.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # Every cell is a qwen3.8-flash-next-nvfp4 decode projection, at tp1 (from M=2; one row
     # takes `bf16_gemv_pdl` there) or at a tp4/tep4 rank; `kind` pins the branch `plan`

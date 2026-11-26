@@ -1703,7 +1703,7 @@ def _run_mla_workspace_estimation(
             "_get_token_num_for_estimation",
             return_value=estimation_max_tokens,
         ),
-        patch.object(creator, "_cal_max_memory", return_value=512),
+        patch.object(creator, "_cal_max_memory", return_value=(1024, 512)),
         patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
         patch.object(
             torch.cuda,
@@ -2866,7 +2866,7 @@ def test_helix_estimation_profiles_agg_and_keeps_fraction_for_disagg(is_disagg: 
 
     with (
         patch.object(creator, "_get_token_num_for_estimation", return_value=256),
-        patch.object(creator, "_cal_max_memory", return_value=512),
+        patch.object(creator, "_cal_max_memory", return_value=(1024, 512)),
         patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
         patch.object(
             torch.cuda,
@@ -2975,7 +2975,7 @@ def _configure_context_mla_capacity(
     with (
         patch("tensorrt_llm._torch.pyexecutor._util.get_sm_version", return_value=100),
         patch.object(creator, "_get_token_num_for_estimation", return_value=256),
-        patch.object(creator, "_cal_max_memory", return_value=kv_budget),
+        patch.object(creator, "_cal_max_memory", return_value=(1024, kv_budget)),
         patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
         patch.object(
             torch.cuda,

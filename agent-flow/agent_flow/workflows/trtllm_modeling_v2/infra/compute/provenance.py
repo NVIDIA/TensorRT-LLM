@@ -45,10 +45,14 @@ def _identity(path: str) -> tuple[int, int] | str:
 def read_records(path: str | Path) -> list[dict]:
     """Every well-formed record in a resolve log; a missing log has none."""
     records = []
-    try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return records
+    lines = []
+    base = Path(path)
+    # The job's own, and one a node for the ranks of its steps (``steps.RESOLVE_PER_HOST``).
+    for log in (base, *sorted(base.parent.glob(f"{base.name}.*"))):
+        try:
+            lines += log.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
     for line in lines:
         try:
             record = json.loads(line)

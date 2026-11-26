@@ -1604,6 +1604,48 @@ def main(*,
             msa_dst / relative_dir,
         )
     install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
+    for notice in ("LICENSE", "NOTICE"):
+        install_file(build_dir / "_deps" / "msa-src" / notice, msa_dst / notice)
+
+    # Stage the MiniMax-M3.1 MSA packages of the FetchContent-patched msa_vllm
+    # tree: the Q8KV8 index scorer (the files it needs from python/fmha_sm100/cute)
+    # and the BF16X sparse prefill (python/fmha_sm100/prefill_q8kv4).
+    msa_vllm_src = build_dir / "_deps" / "msa_vllm-src" / "python" / "fmha_sm100"
+    msa_vllm_packages = (
+        ("fmha_sm100_q8kv8", msa_vllm_src / "cute", (
+            "__init__.py",
+            "q8_indexer_interface.py",
+            "src/__init__.py",
+            "src/common/__init__.py",
+            "src/common/aot_cache.py",
+            "src/common/utils.py",
+            "src/sm100/__init__.py",
+            "src/sm100/q8kv4_indexer_decode.py",
+            "src/sm100/q8kv8_indexer_decode.py",
+            "src/sm100/q8kv8_indexer_prefill.py",
+            "src/sm100/q8kv8_indexer_prefill_plan.py",
+        )),
+        ("fmha_sm100_prefill_bf16x", msa_vllm_src / "prefill_q8kv4", None),
+    )
+    for package_name, package_src, package_files in msa_vllm_packages:
+        if not (package_src / "__init__.py").is_file():
+            raise FileNotFoundError(
+                f"MSA package missing at {package_src}; CMake FetchContent for "
+                "msa_vllm did not populate the expected sources.")
+        package_dst = wheel_project_dir / "3rdparty" / package_name
+        if package_dst.is_symlink():
+            package_dst.unlink()
+        elif package_dst.exists():
+            rmtree(package_dst)
+        if package_files is None:
+            install_tree(package_src, package_dst)
+        else:
+            for relative in package_files:
+                (package_dst / relative).parent.mkdir(parents=True,
+                                                      exist_ok=True)
+                install_file(package_src / relative, package_dst / relative)
+        for notice in ("LICENSE", "NOTICE"):
+            install_file(msa_vllm_src.parents[1] / notice, package_dst / notice)
 
     if not skip_stubs:
         with working_directory(pkg_dir):

@@ -65,6 +65,7 @@ class DecoderMetadata:
     # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
     _host_uploader: HostUploader | None = None
+    keep_steady_growth_blocks: bool = False
 
     def __init__(
         self,
@@ -121,6 +122,7 @@ class DecoderMetadata:
             else None,
             kv_cache_manager=kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            max_total_draft_tokens=self._config.max_total_draft_tokens,
             enable_ragged_verification=self._ragged_verification_enabled,
         )
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
@@ -133,6 +135,9 @@ class DecoderMetadata:
         if isinstance(self.attn_metadata, TrtllmAttentionMetadata):
             self.attn_metadata.host_uploader = self._host_uploader
         self._arm_msa_policy(kv_cache_manager)
+        if self.keep_steady_growth_blocks and isinstance(kv_cache_manager, KVCacheManagerV2):
+            # The steady decode prepare re-reads a page table whenever its pages change.
+            kv_cache_manager.keep_growth_blocks()
 
         return self.attn_metadata
 
@@ -172,6 +177,7 @@ class DecoderMetadata:
         )
         self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
         self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        self.spec_metadata.skip_verify_row_gather = self.runtime_hooks.skip_verify_row_gather
         if self.runtime_hooks.pack_spec_rng_uploads:
             logger.info(
                 "Sampled-step Philox uploads: written by the steady MTP stager on its steps, "
@@ -335,14 +341,28 @@ def get_spec_managers(
 
 
 def supports_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mapping | None) -> bool:
-    """Whether the MTP-Eagle fast paths' decode CUDA graphs can capture the temperature-only variant."""
+    """Whether the decode CUDA graphs can capture the temperature-only variant: the spec worker
+    draws temperature-only target tokens on the LM head's vocabulary shard, on the MTP-Eagle fast
+    paths or through the stock workers' vocab-parallel selection."""
     # It draws the sampled rows on vocabulary-sharded logits without the watermark, so a
-    # watermark configuration keeps the ordinary sampler.
+    # watermark configuration keeps the ordinary sampler. With rejection sampling or penalties
+    # (deploy-time switches of the spec config) no batch selects it (_temperature_only), so
+    # capturing it would only add a warmup pass per shape.
+    spec_config = config.spec_config
     return (
         config.cuda_graph_config is not None
-        and config.spec_decode_fast_paths
         and config.watermark_config is None
-        and supports_sharded_target_sampling(config.spec_config, mapping)
+        and not config.guided_decoding_enabled
+        and spec_config is not None
+        and not spec_config.use_rejection_sampling
+        and not spec_config.enable_penalty
+        and (
+            config.spec_samples_sharded_temperature
+            or (
+                config.spec_decode_fast_paths
+                and supports_sharded_target_sampling(config.spec_config, mapping)
+            )
+        )
     )
 
 

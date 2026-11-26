@@ -11,7 +11,7 @@ import yaml
 from test_common.perf_metrics_utils import read_perf_metrics_jsonl, wait_for_perf_metrics_jsonl
 from utils.llm_data import llm_datasets_root
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)

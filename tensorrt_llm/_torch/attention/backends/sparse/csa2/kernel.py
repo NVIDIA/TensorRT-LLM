@@ -148,11 +148,12 @@ def _glue_kernels():
 
     @cute.jit
     def tensor1d(ptr: cute.Pointer, count: Int64):
-        return cute.make_tensor(ptr, cute.make_layout(count))
+        # Keep offsets beyond 2 GiB in 64 bits on CuTe DSL builds with 32-bit default strides.
+        return cute.make_tensor(ptr, cute.make_layout(count, stride=Int64(1)))
 
     @cute.jit
     def tensor2d(ptr: cute.Pointer, rows: Int64, cols: Int64, row_stride: Int64):
-        return cute.make_tensor(ptr, cute.make_layout((rows, cols), stride=(row_stride, 1)))
+        return cute.make_tensor(ptr, cute.make_layout((rows, cols), stride=(row_stride, Int64(1))))
 
     @cute.jit
     def _int32_ptr(address: Int64):
@@ -319,15 +320,23 @@ def _glue_kernels():
         sequence) map to its scratch slots, as ``PageIndexConverter`` does. With
         ``with_low`` the first ``low_tables`` tables go to ``low_out`` (its own
         width and strides) instead of ``out``. With ``with_dst_rows`` sequence ``s``
-        writes output row ``dst_rows[s]`` instead of row ``s``.
+        writes output row ``dst_rows[s]`` instead of row ``s``. With ``with_row_columns``
+        sequence ``s`` converts only its first ``row_columns[s]`` columns.
         """
 
         threads = 128
 
-        def __init__(self, with_scratch: bool, with_low: bool, with_dst_rows: bool = False):
+        def __init__(
+            self,
+            with_scratch: bool,
+            with_low: bool,
+            with_dst_rows: bool = False,
+            with_row_columns: bool = False,
+        ):
             self.with_scratch = with_scratch
             self.with_low = with_low
             self.with_dst_rows = with_dst_rows
+            self.with_row_columns = with_row_columns
 
         @cute.jit
         def __call__(
@@ -353,6 +362,7 @@ def _glue_kernels():
             low_table_stride: Int64,
             low_row_stride: Int64,
             dst_rows: cute.Pointer,  # int32 [seqs]: output row of each sequence
+            row_columns: cute.Pointer,  # int32 [seqs]: columns each sequence converts
             stream: cuda.CUstream,
         ):
             self.kernel(
@@ -377,6 +387,7 @@ def _glue_kernels():
                 low_table_stride,
                 low_row_stride,
                 dst_rows,
+                row_columns,
             ).launch(grid=[seqs, tables, 1], block=[self.threads, 1, 1], stream=stream)
 
         @cute.kernel
@@ -403,6 +414,7 @@ def _glue_kernels():
             low_table_stride: Int64,
             low_row_stride: Int64,
             dst_rows: cute.Pointer,
+            row_columns: cute.Pointer,
         ):
             tid, _, _ = cute.arch.thread_idx()
             seq, table, _ = cute.arch.block_idx()
@@ -438,6 +450,11 @@ def _glue_kernels():
                 begin = Int32(ranges[scratch_row * 2])
                 end = Int32(ranges[scratch_row * 2 + 1])
                 slots = tensor1d(scratch_slots, (scratch_row + 1) * Int64(slot_stride))
+            if cutlass.const_expr(self.with_row_columns):
+                # Past its bound a sequence's row is BAD_PAGE_INDEX on both sides already.
+                bound = Int32(tensor1d(row_columns, Int64(seqs))[seq])
+                if bound < columns:
+                    columns = bound
             for column in cutlass.range(tid, columns, self.threads):
                 page = Int32(src[src_base + Int64(column)])
                 value = bad
@@ -456,9 +473,13 @@ def _glue_kernels():
         """Copy many int32 ``[rows, columns]`` tables in one launch: one CTA per (row,
         table) of an int64 ``[tables, 6]`` descriptor table of (source, destination,
         rows, columns, source row stride, destination row stride), at most
-        ``max_columns`` columns of each."""
+        ``max_columns`` columns of each, and with ``with_row_columns`` at most
+        ``row_columns[row]`` columns of row ``row``."""
 
         threads = 128
+
+        def __init__(self, with_row_columns: bool = False):
+            self.with_row_columns = with_row_columns
 
         @cute.jit
         def __call__(
@@ -467,14 +488,22 @@ def _glue_kernels():
             tables: Int32,
             max_rows: Int32,
             max_columns: Int32,
+            row_columns: cute.Pointer,  # int32 [max_rows]
             stream: cuda.CUstream,
         ):
-            self.kernel(descriptors, tables, max_columns).launch(
+            self.kernel(descriptors, tables, max_rows, max_columns, row_columns).launch(
                 grid=[max_rows, tables, 1], block=[self.threads, 1, 1], stream=stream
             )
 
         @cute.kernel
-        def kernel(self, descriptors: cute.Pointer, tables: Int32, max_columns: Int32):
+        def kernel(
+            self,
+            descriptors: cute.Pointer,
+            tables: Int32,
+            max_rows: Int32,
+            max_columns: Int32,
+            row_columns: cute.Pointer,
+        ):
             tid, _, _ = cute.arch.thread_idx()
             row, table, _ = cute.arch.block_idx()
             desc = tensor2d(descriptors, Int64(tables), Int64(6), Int64(6))
@@ -482,6 +511,10 @@ def _glue_kernels():
                 columns = Int32(desc[table, 3])
                 if max_columns < columns:
                     columns = max_columns
+                if cutlass.const_expr(self.with_row_columns):
+                    bound = Int32(tensor1d(row_columns, Int64(max_rows))[row])
+                    if bound < columns:
+                        columns = bound
                 src = tensor1d(_int32_ptr(desc[table, 0]), Int64(2**62))
                 dst = tensor1d(_int32_ptr(desc[table, 1]), Int64(2**62))
                 src_base = Int64(row) * Int64(desc[table, 4])
@@ -2407,6 +2440,7 @@ def convert_page_tables(
     scratch_slots: torch.Tensor | None = None,
     low_out: torch.Tensor | None = None,
     dst_rows: torch.Tensor | None = None,
+    row_columns: torch.Tensor | None = None,
 ) -> None:
     """``out[t, s, c] = base[pool_t, rows[s], c] * scale_t + offset_t``, keeping ``bad``.
 
@@ -2421,7 +2455,8 @@ def convert_page_tables(
     (int32 ``[L, seqs, low width]``, unit column stride, ``low width <= width``) tables
     ``0..L-1`` are written there instead of ``out``, in the same launch. With
     ``dst_rows`` (int32 ``[n]``, no scratch) only the ``n`` sequences of ``rows`` are
-    converted, into rows ``dst_rows`` of ``out`` and ``low_out``.
+    converted, into rows ``dst_rows`` of ``out`` and ``low_out``. With ``row_columns``
+    (int32 ``[seqs]``) sequence ``s`` converts only its first ``row_columns[s]`` columns.
     """
     tables, out_rows, width = out.shape
     seqs = out_rows if dst_rows is None else rows.shape[0]
@@ -2468,10 +2503,27 @@ def convert_page_tables(
         )
     else:
         low_out = out
+    with_row_columns = row_columns is not None
+    if with_row_columns:
+        _check(
+            row_columns.dtype == torch.int32
+            and row_columns.shape == (seqs,)
+            and row_columns.is_contiguous(),
+            "CSA2 row columns",
+        )
+    else:
+        row_columns = rows
     ns = _glue_kernels()
     _launch(
-        ("page_table_convert", with_scratch, with_low, with_dst_rows, out.device.index),
-        lambda: ns.PageTableConvertKernel(with_scratch, with_low, with_dst_rows),
+        (
+            "page_table_convert",
+            with_scratch,
+            with_low,
+            with_dst_rows,
+            with_row_columns,
+            out.device.index,
+        ),
+        lambda: ns.PageTableConvertKernel(with_scratch, with_low, with_dst_rows, with_row_columns),
         _ptr(base),
         _ptr(rows),
         _ptr(params),
@@ -2493,6 +2545,7 @@ def convert_page_tables(
         int(low_out.stride(0)),
         int(low_out.stride(1)),
         _ptr(dst_rows),
+        _ptr(row_columns),
         _stream(out.device),
     )
 
@@ -2516,10 +2569,15 @@ def table_copy_descriptor(destination: torch.Tensor, source: torch.Tensor) -> tu
     )
 
 
-def copy_tables_(descriptors: torch.Tensor, max_rows: int, max_columns: int) -> None:
+def copy_tables_(
+    descriptors: torch.Tensor,
+    max_rows: int,
+    max_columns: int,
+    row_columns: torch.Tensor | None = None,
+) -> None:
     """Copy the leading ``max_columns`` columns (at most) of every table of the device int64
     ``[tables, 6]`` ``table_copy_descriptor`` rows, none of them taller than ``max_rows``, in
-    one launch."""
+    one launch; ``row_columns`` (int32 ``[max_rows]``) caps row ``r`` at ``row_columns[r]``."""
     tables = int(descriptors.shape[0])
     if tables == 0 or max_rows == 0 or max_columns == 0:
         return
@@ -2529,14 +2587,23 @@ def copy_tables_(descriptors: torch.Tensor, max_rows: int, max_columns: int) -> 
         and descriptors.shape[1:] == (6,),
         "CSA2 table copy descriptors",
     )
+    with_row_columns = row_columns is not None
+    if with_row_columns:
+        _check(
+            row_columns.dtype == torch.int32
+            and row_columns.shape == (max_rows,)
+            and row_columns.is_contiguous(),
+            "CSA2 table copy row columns",
+        )
     ns = _glue_kernels()
     _launch(
-        ("table_copy", descriptors.device.index),
-        ns.TableCopyKernel,
+        ("table_copy", with_row_columns, descriptors.device.index),
+        lambda: ns.TableCopyKernel(with_row_columns),
         _ptr(descriptors, align=8),
         tables,
         int(max_rows),
         int(max_columns),
+        _ptr(row_columns if with_row_columns else descriptors, dtype=torch.int32),
         _stream(descriptors.device),
     )
 
@@ -7825,13 +7892,22 @@ def _mapping_args(main_mapping, main_slots, main_logical, count: int, device):
     ``(page_table, page_size, max_positions, requests, visible)``; otherwise
     ``main_slots`` already hold physical rows.
     """
+    from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
     identity = _constant_zeros(device, (1, 1), torch.int32)
     if main_mapping is None:
         _check(main_slots is not None, "CSA2 staging requires physical main slots or a mapping")
         slots = main_slots if main_slots.dtype == torch.int64 else main_slots.long()
         logical = main_logical if main_logical is not None else slots
         table_args = (_ptr(identity), 1, 1, 1, 1, 2**62)
-        zeros = _constant_zeros(device, (count,), torch.int64)
+        # Pooled rather than a constant per shape: the row count changes from step to step.
+        zeros = get_memory_buffers().get_buffer(
+            [count],
+            torch.int64,
+            buffer_name="csa2_unmapped_rows",
+            reserve_buffer=torch.cuda.is_current_stream_capturing(),
+        )
+        zeros.zero_()
         return (
             True,
             logical,

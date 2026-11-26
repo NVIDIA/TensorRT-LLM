@@ -49,6 +49,7 @@ def _helix_metadata(kv_lens, helix_pos, tokens_per_block, cp_size, cp_rank, max_
         helix_position_offsets=helix_pos,
         helix_local_slots=buffer(torch.int32, -7),
         helix_kv_bounds=buffer(torch.int32, -7),
+        helix_global_kv_lens=None,
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
         mapping=SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank),
     )
@@ -188,6 +189,7 @@ def _step_metadata(num_ctx, num_ctx_tokens, num_gen, num_chunked, helix, gen_pos
     md.helix_position_offsets[: gen_positions.numel()] = gen_positions
     md.helix_local_slots = torch.full((max_tokens,), -7, dtype=torch.int32, device="cuda")
     md.helix_kv_bounds = torch.full((max_tokens,), -7, dtype=torch.int32, device="cuda")
+    md.helix_global_kv_lens = None
     md.recompute_helix_spec_buffers = (
         lambda num_tokens, width: TrtllmAttentionMetadata.recompute_helix_spec_buffers(
             md, num_tokens, width

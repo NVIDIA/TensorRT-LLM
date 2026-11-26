@@ -45,6 +45,21 @@ add_tllm_gtest(
   tllm::kernel_mmha
   LABELS
   "unit;kernels;cascade-attention;gpu")
+add_tllm_gtest(
+  minimaxM3Prob1AgreementTest
+  OWNER
+  kernel
+  SOURCES
+  minimaxM3Prob1AgreementTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  LABELS
+  "unit;kernels;minimax-m3;host")
+target_include_directories(
+  minimaxM3Prob1AgreementTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/../tensorrt_llm/_torch/modeling_v2/models)
+target_compile_definitions(minimaxM3Prob1AgreementTest
+                           PRIVATE TRTLLM_MV2_SCOPE=minimax_m3::shared)
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
@@ -55,16 +70,38 @@ macro(remove_compile_definition TARGET_NAME DEFINITION)
   endif()
 endmacro()
 
-add_gtest(mixtureOfExpertsTest moe/mixtureOfExpertsTest.cu)
+add_tllm_gtest(
+  mixtureOfExpertsTest
+  OWNER
+  kernel
+  SOURCES
+  moe/mixtureOfExpertsTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe
+  tllm::kernel_quantization
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe;gpu")
 
 # If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  target_link_libraries(mixtureOfExpertsTest PRIVATE moe_gemm_src)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_gtest(mixtureOfExpertsInternalTest moe/mixtureOfExpertsTest.cu
-            TEST_PREFIX "Internal.")
+  add_tllm_gtest(
+    mixtureOfExpertsInternalTest
+    TEST_PREFIX
+    "Internal."
+    OWNER
+    kernel
+    SOURCES
+    moe/mixtureOfExpertsTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_internal
+    tllm::kernel_quantization
+    tllm::runtime_buffers
+    LABELS
+    "unit;kernels;moe;gpu")
   remove_compile_definition(mixtureOfExpertsInternalTest
                             USING_OSS_CUTLASS_MOE_GEMM)
 endif()

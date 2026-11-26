@@ -14,11 +14,12 @@ Each engine that armed ``RuntimeHooks.skip_unchanged_h2d`` owns one cache and ma
 cache travels in the context rather than as an argument.
 
 Route a copy through it only for a destination that no other code writes (no device kernel, no other copy path, no other
-engine, no graph replay): the shadow describes the device contents only under that invariant. CUDA graph metadata
-buffers do not satisfy it: every graph key's metadata takes them from one pool, which hands the same block to each key
-that asks for the same name, and a captured graph's device writes into a block run again at each of its replays. Those
-destinations use ``copy_h2d_pool_shared`` / ``fill_tail_pool_shared``, which never skip. A write through a different
-view of the same buffer replaces the shadow, so overlapping views never skip on stale state.
+engine, no graph replay), or whose other writer calls ``forget``: the shadow describes the device contents only under
+that invariant. CUDA graph metadata buffers do not satisfy it: every graph key's metadata takes them from one pool,
+which hands the same block to each key that asks for the same name, and a captured graph's device writes into a block
+run again at each of its replays. Those destinations use ``copy_h2d_pool_shared`` / ``fill_tail_pool_shared``, which
+never skip. A write through a different view of the same buffer replaces the shadow, so overlapping views never skip on
+stale state.
 """
 
 from __future__ import annotations
@@ -181,6 +182,13 @@ def copy_h2d_if_changed(dst: torch.Tensor, src: torch.Tensor, pack: bool = False
         dst.copy_(src, non_blocking=True)
         return True
     return cache.copy(dst, src, pack)
+
+
+def forget(dst: torch.Tensor) -> None:
+    """Tell the active cache that a device kernel wrote ``dst``: its next copy is issued."""
+    cache = _active.get()
+    if cache is not None:
+        cache.forget(dst)
 
 
 def fill_tail_if_changed(buf: torch.Tensor, start: int, value: int) -> None:
