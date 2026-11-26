@@ -815,6 +815,8 @@ accuracy/modeling_v2/nemotron_shortcut/bf16__sm_103__default/test_accuracy.py::T
 accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_103__default/test_accuracy.py::TestShortcutNvfp4::test_gsm8k
 accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_103__default/test_accuracy.py::test_mtp_greedy_matches_ordinary_decode
 accuracy/modeling_v2/nemotron_shortcut/mxfp8__sm_103__default/test_accuracy.py::TestShortcutMxfp8::test_gsm8k
+accuracy/modeling_v2/nemotron_shortcut/test_video.py::test_decoded_video_frames[nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_video.py::test_conditioned_video[nvfp4]
 accuracy/modeling_v2/nemotron_shortcut/test_lora.py::test_multi_adapter_generation[nvfp4]
 accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[plain-bf16]
 accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[plain-nvfp4]

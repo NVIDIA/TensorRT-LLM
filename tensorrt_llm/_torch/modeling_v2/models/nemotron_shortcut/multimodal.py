@@ -30,7 +30,7 @@ class _TokenEmbeddings:
 class ShortcutMedia:
     supported_encoder_attention_backends = {"vision": frozenset()}
     supports_mm_encoder_item_scheduling = False
-    multimodal_data_device_paths = ("image.patches",)
+    multimodal_data_device_paths = ("image.patches", "video.patches")
 
     def __init__(self, model_config):
         super().__init__(model_config)

@@ -15,7 +15,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from .decoder import rms_norm
-from .manifest import row_window, load_unquantized
+from .manifest import load_unquantized, row_window
 
 _VISION_PREFIX = "model.vision_tower."
 _PROJECTOR_PREFIX = "model.multi_modal_projector."
@@ -255,19 +255,30 @@ class ShortcutVisionFrontend(nn.Module):
         hidden = F.linear(merged, self.w["merge"])
         return F.linear(self.act(F.linear(hidden, self.w["proj_1"])), self.w["proj_2"])
 
+    def _video_rows(self, patches, size):
+        height, width = (edge // self.patch for edge in size)
+        frames = patches.split(height * width)
+        return torch.cat([self.project(self.encode_tower(frame, size)) for frame in frames])
+
     def forward(self, params: Sequence[MultimodalParams]) -> torch.Tensor:
         rows = []
         for request in params:
             metadata = request.item_metadata
             if metadata is None:
-                raise ValueError("Raw images require prompt-ordered item metadata.")
+                raise ValueError("Visual inputs require prompt-ordered item metadata.")
             for modality, index in metadata.item_refs:
-                if modality != "image":
+                if modality not in ("image", "video"):
                     raise ValueError(f"Unsupported Shortcut input {modality}.")
-                image = request.multimodal_data["image"]
-                partition = metadata.input_partitions["image"]["patches"]
-                patches = partition.select(image["patches"], [index])
-                rows.append(self.project(self.encode_tower(patches, image["image_sizes"][index])))
+                data = request.multimodal_data[modality]
+                patches = metadata.input_partitions[modality]["patches"].select(
+                    data["patches"], [index]
+                )
+                if modality == "image":
+                    rows.append(
+                        self.project(self.encode_tower(patches, data["image_sizes"][index]))
+                    )
+                else:
+                    rows.append(self._video_rows(patches, data["frame_sizes"][index]))
         if not rows:
-            raise ValueError("The vision frontend requires at least one image.")
+            raise ValueError("The vision frontend requires at least one image or video.")
         return torch.cat(rows)
