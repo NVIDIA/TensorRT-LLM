@@ -419,6 +419,8 @@ _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attentio
 # the engine leaves its paged-context attention off and the target takes it for the NVFP4 pool.
 # The attention-TP cases run 6 query heads a KV head on each rank. FP8 at dep4 once more with the
 # MoE round trip on the Lamport transport (`TRTLLM_QWEN4_EXP_DP_MOE_COMM=lamport`, SM103 only),
+# once more with host-indexed slots and the router front (`lamport_step` and
+# `TRTLLM_QWEN4_EXP_DP_ROUTER_FRONT=1`, class S: the bf16 trunk router at 48-112 gathered rows),
 # and FP8 at tep4 once more with each decode MoE block's finalize and all-reduce in one Lamport
 # launch (`TRTLLM_QWEN4_EXP_TEP_FINAR=early`, SM103 only). FP8 at dep4 once more with both
 # output projections on the bf16 mid-rows GEMM (`TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16=all`, opt-in,
@@ -432,8 +434,17 @@ _QUANTIZED_KV = [
     pytest.param(
         _DEP4,
         "fp8",
-        dict(lamport=True),
+        dict(lamport="lamport"),
         id="dep4_fp8_kv_lamport",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103, reason="the Lamport MoE round trip is certified on SM103"
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(lamport="lamport_step", router_front=True),
+        id="dep4_fp8_kv_lamport_step_router_front",
         marks=pytest.mark.skipif(
             get_sm_version() != 103, reason="the Lamport MoE round trip is certified on SM103"
         ),
@@ -898,7 +909,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         if variant.get("flashinfer_ring"):
             env["TRTLLM_USE_GDN_FLASHINFER_REPLAY"] = "force"
         if variant.get("lamport"):
-            env["TRTLLM_QWEN4_EXP_DP_MOE_COMM"] = "lamport"
+            env["TRTLLM_QWEN4_EXP_DP_MOE_COMM"] = variant["lamport"]
+        if variant.get("router_front"):
+            env["TRTLLM_QWEN4_EXP_DP_ROUTER_FRONT"] = "1"
         if variant.get("finar"):
             env["TRTLLM_QWEN4_EXP_TEP_FINAR"] = variant["finar"]
         if variant.get("out_proj_bf16"):
