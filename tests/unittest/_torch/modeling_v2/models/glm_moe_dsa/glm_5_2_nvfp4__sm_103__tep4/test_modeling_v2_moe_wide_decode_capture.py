@@ -52,6 +52,9 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.moe import (  # noqa: E402, E501
     moe_fc1_kblock as _fc1_kblock,
 )
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.mixed import (  # noqa: E402, E501
+    MixedTarget,
+)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E402, E501
     cute_dsl_allreduce as _ar_op,
 )
@@ -625,18 +628,21 @@ def test_prequant_only_on_decode_widths_and_wide_decode_steps() -> None:
     """The collective writes the routed experts' NVFP4 input at 1..64 rows in every
     configuration, as before; above 64 only on an MTP3 / MTP5 decode step's exact rows up to
     256 (the window `WideDecodeTarget.on_load` computes, `_quant_rows`). MTP1, no speculation
-    and every context step keep the plain collective above 64 rows."""
+    and every context or mixed step keep the plain collective above 64 rows."""
     k = state().h.k
     for draft_len in (0, 1, 3, 5):
         wide_cells = draft_len > 1
         windows = {
             cls: _quant_rows(cls, wide_cells, k)
-            for cls in (PrefillTarget, DecodeTarget, WideDecodeTarget)
+            for cls in (PrefillTarget, MixedTarget, DecodeTarget, WideDecodeTarget)
         }
-        for decode in (False, True):
+        for step in ("context", "mixed", "decode"):
+            decode = step == "decode"
 
             def target(r: int):
                 # The Target the step routes to (`_select_target`).
+                if step == "mixed":
+                    return MixedTarget
                 if not decode:
                     return PrefillTarget
                 return WideDecodeTarget if wide_cells and r > DECODE_MAX_ROWS else DecodeTarget

@@ -36,6 +36,9 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     decode as DT,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    mixed as MX,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as M,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
@@ -320,13 +323,14 @@ def _wide(max_draft_len: int, decode: bool, rows: int) -> bool:
 
 def _step(core, decode: bool, rows: int) -> S.Phase:
     """Route a step of `rows` rows the way the engine's forward does (`_select_target`: a
-    context step to prefill, an MTP3 / MTP5 decode step above 64 rows to the wide decode
-    Target, any other decode step to the decode Target), and return the `Phase` the chosen
-    Target runs its ops at. Builds the core's projection and MLP handles first, from its
-    runner tables as the test left them."""
+    context step of context rows only to prefill, an MTP3 / MTP5 decode step above 64 rows to
+    the wide decode Target, any other decode step to the decode Target), and return the `Phase`
+    the chosen Target runs its ops at. Builds the core's projection and MLP handles first, from
+    its runner tables as the test left them."""
     core._build_gemm_handles()
-    core._prefill, core._decode, core._wide = "prefill", "decode", "wide"
-    target = core._select_target(SimpleNamespace(num_contexts=0 if decode else 2), rows)
+    core._prefill, core._mixed, core._decode, core._wide = "prefill", "mixed", "decode", "wide"
+    md = SimpleNamespace(num_contexts=0 if decode else 2, num_ctx_tokens=0 if decode else rows)
+    target = core._select_target(md, rows)
     want = "wide" if _wide(core.max_draft_len, decode, rows) else "decode" if decode else "prefill"
     assert target == want, (core.max_draft_len, decode, rows, target)
     return {"prefill": S.PREFILL, "decode": M.DecodeTarget(core).phase, "wide": W._WIDE}[target]
@@ -334,22 +338,29 @@ def _step(core, decode: bool, rows: int) -> S.Phase:
 
 @pytest.mark.parametrize("wide_env", (True, False))
 @pytest.mark.parametrize("rows", (1, 32, 64, 65, 96, 128, 192))
+@pytest.mark.parametrize("gen", (0, 1, 2, 64))
 @pytest.mark.parametrize("contexts", (0, 2))
 @pytest.mark.parametrize("max_draft_len", ENGINES)
-def test_select_target(max_draft_len, contexts, rows, wide_env) -> None:
-    """Three Targets: a step with context rows on prefill; a decode step above 64 rows on the
-    wide decode Target wherever the engine built the wide decode cells (always at MTP3 /
-    MTP5; at MTP1 and without speculation unless `TRTLLM_GLM52_WIDE_DECODE=0`, `wide_env`
-    False), else on the decode Target. The decode Target's phase takes the next cell up only
-    on an MTP3 / MTP5 engine (with `TRTLLM_GLM52_DEC_CELL_UP`); the wide one's maps rows above
-    64 onto the MTP decode cells."""
+def test_select_target(max_draft_len, contexts, gen, rows, wide_env) -> None:
+    """Four Targets: a step with context rows on prefill when all its rows are context rows,
+    on mixed when `gen` generation rows follow them (the rows past `num_ctx_tokens`); a decode
+    step above 64 rows on the wide decode Target wherever the engine built the wide decode
+    cells (always at MTP3 / MTP5; at MTP1 and without speculation unless
+    `TRTLLM_GLM52_WIDE_DECODE=0`, `wide_env` False), else on the decode Target. The decode
+    Target's phase takes the next cell up only on an MTP3 / MTP5 engine (with
+    `TRTLLM_GLM52_DEC_CELL_UP`); the wide one's maps rows above 64 onto the MTP decode cells."""
+    if contexts and rows < contexts + gen:
+        pytest.skip("fewer rows than the step's context requests and generation rows")
+    if not contexts and gen:
+        pytest.skip("a decode step's rows are all generation rows")
     core = object.__new__(M.GlmMoeDsaTep4ModelingV2)
     core.max_draft_len = max_draft_len
     core.wide_cells = core.max_draft_len > 1 or wide_env
-    core._prefill, core._decode, core._wide = "prefill", "decode", "wide"
-    got = core._select_target(SimpleNamespace(num_contexts=contexts), rows)
+    core._prefill, core._mixed, core._decode, core._wide = "prefill", "mixed", "decode", "wide"
+    md = SimpleNamespace(num_contexts=contexts, num_ctx_tokens=rows - gen if contexts else 0)
+    got = core._select_target(md, rows)
     if contexts:
-        assert got == "prefill"
+        assert got == ("mixed" if gen else "prefill")
     elif (max_draft_len > 1 or wide_env) and rows > 64:
         assert got == "wide"
     else:
@@ -823,7 +834,7 @@ def _moe_close_core(max_draft_len: int, monkeypatch):
             on("cut")()
         real_fence(launch, handle)
 
-    for mod in (DT, W, PT):
+    for mod in (DT, W, PT, MX):
         # The routed experts: their front is a stub, the experts logged.
         monkeypatch.setattr(mod, "moe_l2_prefetch", lambda *a: None)
         monkeypatch.setattr(mod, "moe_quantize_first", lambda *a: False)
@@ -858,28 +869,32 @@ def _moe_close_core(max_draft_len: int, monkeypatch):
         monkeypatch.setattr(mod, "sparse_mla_decode", lambda *a: None)
         monkeypatch.setattr(mod, "v_b", lambda *a: False)
     core._prefill = M.PrefillTarget(core)
+    core._mixed = M.MixedTarget(core)
     core._decode = M.DecodeTarget(core)
     core._wide = W.WideDecodeTarget(core)
     # Each Target's handoff table, as `post_load_weights` has them decide it.
-    for target in (core._prefill, core._decode, core._wide):
+    for target in (core._prefill, core._mixed, core._decode, core._wide):
         target.on_load()
     return core, log
 
 
-def _close(core, close: str, decode: bool, rows: int) -> None:
+def _close(core, close: str, step: str, rows: int) -> None:
     """Run a step's trunk MoE layer (`close == "trunk"`) or MTP layer (`"mtp"`) through the
-    Target `_select_target` routes the step to: on a context step its MoE-layer close
-    (`PrefillTarget._mlp_and_close` / `_mtp_close`), on a decode step the decode Target's
-    whole `forward` / `mtp_forward` (one layer)."""
+    Target `_select_target` routes the step to: on a context step (`step` "context": context
+    rows only, "mixed": two generation rows after them) its MoE-layer close
+    (`PrefillTarget` / `MixedTarget`: `_mlp_and_close` / `_mtp_close`), on a decode step the
+    decode Target's whole `forward` / `mtp_forward` (one layer)."""
     x = torch.zeros(rows, 8, dtype=BF16)
-    md = SimpleNamespace(num_contexts=0 if decode else 2)
+    decode = step == "decode"
+    tc = 0 if decode else rows - 2 if step == "mixed" else rows
+    md = SimpleNamespace(num_contexts=0 if decode else 2, num_ctx_tokens=tc)
     target = core._select_target(md, rows)
     if not decode:
-        assert target is core._prefill
+        assert target is (core._mixed if step == "mixed" else core._prefill)
         if close == "trunk":
-            core._prefill._mlp_and_close(x, x, 0, rows, None, None)
+            target._mlp_and_close(x, x, 0, rows, None, None)
         else:
-            core._prefill._mtp_close(x, x, rows)
+            target._mtp_close(x, x, rows)
         return
     want = core._wide if core.max_draft_len > 1 and rows > 64 else core._decode
     assert target is want
@@ -903,19 +918,20 @@ def _from_o_proj(log: list) -> list:
 
 
 @pytest.mark.parametrize("rows", (64, 96, 128, 192))
-@pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
+@pytest.mark.parametrize("step", ("decode", "context", "mixed"))
 @pytest.mark.parametrize("max_draft_len", ENGINES)
-def test_moe_close_shared_after_collective(max_draft_len, decode, rows, monkeypatch) -> None:
+def test_moe_close_shared_after_collective(max_draft_len, step, rows, monkeypatch) -> None:
     """On an MTP3 / MTP5 decode step's exact rows (`routed_moe.decode_exact`, `WideDecodeTarget`) a
     trunk MoE layer and the MTP layer put one plain kernel on the side stream right after its
     fork, ahead of the shared expert (`order_fence`: the shared GEMM then
     cannot launch off the pre-MoE collective's PDL release ahead of the router). Nowhere else:
-    MTP1, no speculation and context steps issue exactly the calls they did."""
+    MTP1, no speculation and context and mixed steps issue exactly the calls they did."""
+    decode = step == "decode"
     exact = decode and max_draft_len > 1 and rows > 64
     for close in ("trunk", "mtp"):
         with monkeypatch.context() as mp:
             core, log = _moe_close_core(max_draft_len, mp)
-            _close(core, close, decode, rows)
+            _close(core, close, step, rows)
         if close == "trunk":
             # The pre-MoE collective writes the routed experts' NVFP4 input at decode widths
             # and on the exact wide rows (`WideDecodeTarget._quant_rows`), else the plain
@@ -932,17 +948,18 @@ def test_moe_close_shared_after_collective(max_draft_len, decode, rows, monkeypa
 
 
 @pytest.mark.parametrize("rows", (32, 64, 128, 192))
-@pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
+@pytest.mark.parametrize("step", ("decode", "context", "mixed"))
 @pytest.mark.parametrize("max_draft_len", ENGINES)
-def test_mtp_close_output_add_and_head_norm(max_draft_len, decode, rows, monkeypatch) -> None:
+def test_mtp_close_output_add_and_head_norm(max_draft_len, step, rows, monkeypatch) -> None:
     """The MTP layer's output: routed + shared, the closing all-reduce, then the residual add.
     On an MTP3 / MTP5 decode step (its 1-token draft steps' 32 rows included) the residual
     add and the head norm are one launch (`hidden_add_rmsnorm`, bit for bit the pair: the op's
     own test); those engines' context steps keep the two launches, and MTP1 / no speculation
     return the un-normed sum as before."""
+    decode = step == "decode"
     core, log = _moe_close_core(max_draft_len, monkeypatch)
     core._mtp_out_normed = max_draft_len > 1
-    _close(core, "mtp", decode, rows)
+    _close(core, "mtp", step, rows)
     exact = decode and max_draft_len > 1 and rows > 64
     cut = [("cut", "side")] if exact else []
     head = [("o_proj", "main"), ("ar", "main")] + cut + [("shared", "side"), ("routed", "main")]

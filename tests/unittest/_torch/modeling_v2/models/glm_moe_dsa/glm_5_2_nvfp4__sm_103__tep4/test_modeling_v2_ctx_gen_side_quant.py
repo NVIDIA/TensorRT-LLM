@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for a mixed context step's generation-row quantize on the generation stream
-(TRTLLM_GLM52_CTX_GEN_SIDE_QUANT, `PrefillTarget._layer_attention`).
+(TRTLLM_GLM52_CTX_GEN_SIDE_QUANT, `MixedTarget._layer_attention`).
 
 o_proj's MXF8 operand `o8 = (q8, sf)` has two writers:
 - the fp8 context MHA's MXF8-O epilogue writes rows `[0, tc)` and their block scales;
@@ -112,7 +112,7 @@ def _serial(args, x, tc):
 
 
 def _concurrent(args, x, tc, spin_cycles, gen_stream):
-    """As `PrefillTarget._layer_attention` with the switch on: the generation stream waits for the main stream
+    """As `MixedTarget._layer_attention` with the switch on: the generation stream waits for the main stream
     (o8 is allocated there), then quantizes while the main stream runs the context MHA; the main stream joins
     it before o_proj would read o8. The generation side is enqueued first; `spin_cycles` delays it."""
     h_mha, h_rows = _handles()

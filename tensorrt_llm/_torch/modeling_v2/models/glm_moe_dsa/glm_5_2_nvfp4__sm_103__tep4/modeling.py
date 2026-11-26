@@ -53,6 +53,7 @@ from . import weights as _weights
 from .decode import DecodeTarget
 from .kernels.common import cuda_stream as _cuda_stream
 from .kernels.moe import moe_fc1_kblock as _fc1_kblock
+from .mixed import MixedTarget
 from .ops._build import try_build as _try_build
 from .ops.activation import cute_dsl_swiglu_rows as _swiglu_rows_op
 from .ops.activation.cute_dsl_dense_swiglu import compile as compile_dense_swiglu
@@ -221,7 +222,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._mixed_base = os.environ.get("TRTLLM_GLM52_MIXED_BASE", "1") == "1"
         # TRTLLM_GLM52_CTX_HOST_DIET (default 1; 0 restores the per-call paths): host time
         # only, same kernels and arguments. A context step reads its per-layer pool addressing
-        # from python tables built once per step (`PrefillTarget._diet_tables`); the launch
+        # from python tables built once per step (`context_plan.step_tables`); the launch
         # wrappers read raw stream handles (`kernels/common/cuda_stream.py`); eager calls of the
         # decode-cell GEMMs a mixed step's generation rows take (q_b, K-B, V-B) launch TVM-FFI
         # twins of their kernels; the context rope/append and the generation sparse MLA launch a
@@ -1324,7 +1325,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # A CUDA stream created inside a graph capture is not capturable.
         self._side_stream = torch.cuda.Stream(device=dev)
         # A mixed context step's generation-row attention on its own stream beside the context
-        # rows' MHA (`PrefillTarget._layer_attention`); on by default,
+        # rows' MHA (`MixedTarget._layer_attention`); on by default,
         # TRTLLM_GLM52_CTX_GEN_SIDE=0 restores the serial order.
         self._gen_stream = (
             torch.cuda.Stream(device=dev)
@@ -1377,10 +1378,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             self._warm_draft_rows()
 
         self._prefill = PrefillTarget(self)
+        self._mixed = MixedTarget(self)
         self._decode = DecodeTarget(self)
         self._wide = WideDecodeTarget(self)
         # Each Target decides its cross-op handoffs from the handles built above.
-        for target in (self._prefill, self._decode, self._wide):
+        for target in (self._prefill, self._mixed, self._decode, self._wide):
             target.on_load()
 
     def _build_moe(self, dev) -> None:
@@ -1597,12 +1599,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._build_ctx_handles()
 
     def _build_ctx_handles(self) -> None:
-        """The context attention ops' handles (`_ctx_h`, `PrefillTarget`), over the kernels
-        built at load and, once the first forward derived them, the context rope kernel, the
-        rope table and the pool stride. Compiles nothing. Besides the handles: `qa8` whether
-        the fp8 MHA route's q_a norm writes `q_b_e4m3`'s MXF8 operand (its q_b is the MXF8
-        GEMM), the row select of the MTP layer's selected rows (None: no such plan), the
-        mixed step's generation-row stream and whether their o_proj quantize runs there,
+        """The context attention ops' handles (`_ctx_h`: `PrefillTarget`, `MixedTarget`), over
+        the kernels built at load and, once the first forward derived them, the context rope
+        kernel, the rope table and the pool stride. Compiles nothing. Besides the handles:
+        `qa8` whether the fp8 MHA route's q_a norm writes `q_b_e4m3`'s MXF8 operand (its q_b is
+        the MXF8 GEMM), the row select of the MTP layer's selected rows (None: no such plan),
+        the mixed step's generation-row stream and whether their o_proj quantize runs there,
         CTX-HOST-DIET and TRTLLM_GLM52_MIXED_BASE."""
         count = self._count
         kv8, q8 = self._kvb8, self._mha_q8
@@ -1791,18 +1793,20 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
 
     def _select_target(
         self, attn_metadata, rows: int
-    ) -> "PrefillTarget | DecodeTarget | WideDecodeTarget":
+    ) -> "PrefillTarget | MixedTarget | DecodeTarget | WideDecodeTarget":
         """Which target runs this step of `rows` rows.
 
         Host-side integers only: a decode-only CUDA graph is a per-capture constant
-        environment. A mixed batch goes to prefill, so prefill is the general case and the
-        decode targets the specializations that may assume there are no context rows. With
-        more than one draft token a decode step's rows reach 32 x (max_draft_len + 1), past
-        the 64 rows the decode cells serve, as do an MTP1 or non-speculative engine's above 32 /
-        64 sequences: those steps are `WideDecodeTarget`'s wherever the wide decode cells are
-        built (`wide_cells`).
+        environment. A step with context rows goes to `MixedTarget` when it also carries
+        generation rows (rows past the `num_ctx_tokens` context rows), else to
+        `PrefillTarget`. With more than one draft token a decode step's rows reach
+        32 x (max_draft_len + 1), past the 64 rows the decode cells serve, as do an MTP1 or
+        non-speculative engine's above 32 / 64 sequences: those steps are
+        `WideDecodeTarget`'s wherever the wide decode cells are built (`wide_cells`).
         """
         if attn_metadata.num_contexts:
+            if rows > attn_metadata.num_ctx_tokens:
+                return self._mixed
             return self._prefill
         if self.wide_cells and rows > _DECODE_MAX_ROWS:
             return self._wide
@@ -2076,7 +2080,7 @@ class MTPLayer:
         self, hidden_states, lm_head, attn_metadata, return_context_logits
     ) -> torch.Tensor:
         """The module's own norm (a distinct parameter from `model.norm`; already applied by
-        `PrefillTarget._mtp_close` when `_mtp_out_normed`), then the trunk's `lm_head`."""
+        the context Targets' `_mtp_close` when `_mtp_out_normed`), then the trunk's `lm_head`."""
         core = self.core
         if core._mtp_out_normed:
             x = hidden_states
@@ -2091,7 +2095,7 @@ class MTPLayer:
     ):
         """Route the draft step by the phase this call's metadata shows: the worker rewrites the
         metadata in place between draft steps, so one engine step's draft calls can cross from
-        prefill to decode."""
+        a context Target to a decode one (draft step 0 of a mixed step runs on `MixedTarget`)."""
         return self.core._select_target(attn_metadata, int(hidden_states.shape[0])).mtp_forward(
             embed_tokens, all_rank_num_tokens, input_ids, hidden_states, attn_metadata, **kwargs
         )
