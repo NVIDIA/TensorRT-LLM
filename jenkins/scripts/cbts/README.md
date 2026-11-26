@@ -42,10 +42,11 @@ filter chain.
 
 ## Rules
 
-Nine rules, registered in `cbts/command/main.py::RULE_CLASSES`:
+Rules registered in `cbts/command/main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
+| `ImportSanityRule` | `importsanityonly` | Python import/definition edits; selects the fixed sanity inventory and leaves mixed-file runtime edits to coverage. |
 | `WaivesRule` | `importsanityonly` | Import/definition-only edits select registered import sanity; mixed edits union sanity with existing rule or coverage selections. |
 | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
@@ -112,6 +113,7 @@ jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH fo
 │   │   ├── README.md      per-rule logic
 │   │   ├── base.py        Rule ABC + PRInputs + RuleResult
 │   │   ├── _helpers.py    diff iteration + lookup-into-block_filters + stages_by_yaml_stem
+│   │   ├── import_sanity.py
 │   │   ├── waives.py
 │   │   ├── tests_def.py
 │   │   ├── test_list.py

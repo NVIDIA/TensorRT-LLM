@@ -21,6 +21,7 @@ for the overall CBTS architecture.
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
+| `import_sanity.py` | `ImportSanityRule` | `importsanityonly` | Python import/definition edits; fixed sanity inventory with runtime coverage retained for mixed files |
 | `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template, developer-assistant, and agent-skill (`skills/`) folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
 
 ## ImportSanityRule
