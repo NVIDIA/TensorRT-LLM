@@ -254,7 +254,8 @@ class CSA2Params(SparseParams):
     # native path supports it: trtllm-gen without packed attention, and only
     # when an FP8 staging dtype is requested. An explicit ``True`` still demands
     # that path and is rejected elsewhere rather than silently downgraded, and
-    # ``False`` pins BF16 staging.
+    # ``False`` pins BF16 staging. Either explicit value selects the native
+    # provider, since PrimTS attends unit-scale E4M3 without staging.
     use_fp8_staging: bool | None = None
 
     def __post_init__(self) -> None:
@@ -268,17 +269,75 @@ class CSA2Params(SparseParams):
             raise ValueError("CSA2 emission requires temporal GVR and CuTe DSL paged MQA")
 
 
-def select_csa2_backend(sm_version: int, params: CSA2Params | None = None) -> str:
-    """Resolve an explicit provider, environment override, or hardware default."""
+def csa2_prims_ts_unsupported_reason() -> str | None:
+    """Why this process cannot run the CSA2 PrimTS provider on its current CUDA device, or None.
+
+    Checks, without compiling or allocating, the CuTe DSL toolchain the PrimTS kernels need
+    (``get_prims_ts_toolchain_unsupported_reason``), the import of the vendored PrimTS
+    internals the provider builds on, and a host-side plan of its smallest packed launch. The
+    answer is cached per device, so the workspace reservation and every layer get the same one.
+    """
+    if not torch.cuda.is_available():
+        return "CUDA is unavailable"
+    return _prims_ts_unsupported_reason(torch.cuda.current_device())
+
+
+@functools.cache
+def _prims_ts_unsupported_reason(device: int) -> str | None:
+    from ...fmha.prims_ts_sparse_mla import get_prims_ts_toolchain_unsupported_reason
+
+    reason = get_prims_ts_toolchain_unsupported_reason()
+    if reason is not None:
+        return reason
+    try:
+        from ._prims_ts_packed import get_packed_sparse_mla_workspace_size
+
+        get_packed_sparse_mla_workspace_size(
+            device, 1, 64, max_topk=128, max_extra_topk=512, swa_cache_format="swa_fp8"
+        )
+    except (ImportError, AttributeError, TypeError, ValueError) as error:
+        return f"the vendored PrimTS kernels it builds on are unavailable ({error})"
+    return None
+
+
+def select_csa2_backend(
+    sm_version: int,
+    params: CSA2Params | None = None,
+    swa_cache_format: SwaCacheFormat | None = None,
+) -> str:
+    """Resolve an explicit provider, environment override, or hardware default.
+
+    ``swa_cache_format`` is the persistent SWA encoding (``resolve_swa_cache_format``).
+    The hardware default is PrimTS on SM100/103/107 only for ``swa_fp8``, the encoding of
+    ``kv_cache_config.dtype="fp8"``; with the 528-byte scaled SWA records of the other KV
+    dtypes, or an unknown encoding, it is the native provider, whose fused and direct
+    decode read those records. An explicit provider is not limited by the encoding. Where the
+    default would be PrimTS but this process cannot run it (``csa2_prims_ts_unsupported_reason``:
+    a missing or old CuTe DSL toolchain, or vendored PrimTS internals that no longer import or
+    plan), it raises instead of falling back to a native provider without its fused and
+    direct decodes on these rows.
+    """
     backend = "auto" if params is None else params.compute_backend
     if backend == "auto":
         backend = os.environ.get("TRTLLM_CSA2_COMPUTE_BACKEND", "auto")
     if backend not in ("auto", "trtllm", "prims_ts", "flash_mla", "flashinfer"):
         raise ValueError(f"Unknown CSA2 attention backend: {backend}")
     if backend == "auto":
-        native_only = params is not None and (
-            params.use_packed_sparse_attention or params.use_fp8_staging is True
-        )
+        native_only = (
+            params is not None
+            and (params.use_packed_sparse_attention or params.use_fp8_staging is not None)
+        ) or swa_cache_format != "swa_fp8"
+        if sm_version in (100, 103, 107) and not native_only:
+            reason = csa2_prims_ts_unsupported_reason()
+            if reason is not None:
+                raise RuntimeError(
+                    f"CSA2 PrimTS, the default provider for kv_cache_config.dtype=fp8 on "
+                    f"SM{sm_version}, cannot run in this process: {reason}. Install the "
+                    "requirements.txt toolchain, use kv_cache_config.dtype=fp8_ds_mla for the "
+                    "native provider with its fused and direct decodes, or set "
+                    "TRTLLM_CSA2_COMPUTE_BACKEND=trtllm to run the native provider on fp8 SWA "
+                    "rows, which stages every generation step"
+                )
         if sm_version == 90:
             backend = "flash_mla"
         elif sm_version in (100, 103, 107) and not native_only:
@@ -298,6 +357,11 @@ def select_csa2_backend(sm_version: int, params: CSA2Params | None = None) -> st
             )
         if params is not None and params.use_fp8_staging is True:
             raise ValueError("CSA2 FP8 staging requires trtllm-gen without packed attention")
+        if params is not None and params.use_fp8_staging is False:
+            raise ValueError(
+                "CSA2 PrimTS attends unit-scale E4M3; BF16 staging (use_fp8_staging=False) "
+                "requires trtllm-gen"
+            )
     return backend
 
 

@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2Layout,
     CSA2Mode,
     CSA2Params,
+    csa2_prims_ts_unsupported_reason,
     resolve_swa_cache_format,
     select_csa2_backend,
 )
@@ -2666,20 +2667,41 @@ def test_invalid_layout(ratios, kv, index, candidate):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "sm,backend",
+    "sm,fp8_backend,backend",
     [
-        (90, "flash_mla"),
-        (100, "prims_ts"),
-        (103, "prims_ts"),
-        (107, "prims_ts"),
-        (120, "flashinfer"),
-        (121, "flashinfer"),
+        (90, "flash_mla", "flash_mla"),
+        (100, "prims_ts", "trtllm"),
+        (103, "prims_ts", "trtllm"),
+        (107, "prims_ts", "trtllm"),
+        (120, "flashinfer", "flashinfer"),
+        (121, "flashinfer", "flashinfer"),
     ],
 )
-def test_hardware_policy(monkeypatch: pytest.MonkeyPatch, sm: int, backend: str) -> None:
+def test_hardware_policy(
+    monkeypatch: pytest.MonkeyPatch, sm: int, fp8_backend: str, backend: str
+) -> None:
+    """PrimTS is the SM100/103/107 default only for kv_cache_config.dtype="fp8"."""
     monkeypatch.delenv("TRTLLM_CSA2_COMPUTE_BACKEND", raising=False)
+    for kv_cache_dtype in ("auto", "bfloat16", "fp8", "fp8_ds_mla"):
+        swa_cache_format = resolve_swa_cache_format(kv_cache_dtype)
+        expected = fp8_backend if kv_cache_dtype == "fp8" else backend
+        assert select_csa2_backend(sm, swa_cache_format=swa_cache_format) == expected
+        assert select_csa2_backend(sm, CSA2Params(), swa_cache_format) == expected
+    # Without a known SWA encoding, the default is the provider of the scaled records.
     assert select_csa2_backend(sm) == backend
     assert select_csa2_backend(sm, CSA2Params()) == backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("source", ["internal", "environment"])
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_forced_prims_ts_reads_scaled_swa(
+    monkeypatch: pytest.MonkeyPatch, source: str, sm: int
+) -> None:
+    """The SWA encoding limits only the default: a forced PrimTS also reads scaled records."""
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "prims_ts")
+    params = CSA2Params(compute_backend="prims_ts" if source == "internal" else "auto")
+    assert select_csa2_backend(sm, params, "swa") == "prims_ts"
 
 
 @pytest.mark.cpu_only
@@ -2715,17 +2737,91 @@ def test_backend_selector_precedence(
         monkeypatch.delenv("TRTLLM_CSA2_COMPUTE_BACKEND", raising=False)
     else:
         monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", environment)
-    assert select_csa2_backend(100, CSA2Params(compute_backend=internal)) == expected
+    params = CSA2Params(compute_backend=internal)
+    assert select_csa2_backend(100, params, "swa_fp8") == expected
     if internal == "auto":
-        assert select_csa2_backend(100) == expected
+        assert select_csa2_backend(100, swa_cache_format="swa_fp8") == expected
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("sm", [100, 103, 107])
-@pytest.mark.parametrize("option", ["use_packed_sparse_attention", "use_fp8_staging"])
-def test_auto_native_only_options(monkeypatch: pytest.MonkeyPatch, sm: int, option: str) -> None:
+def test_unsupported_prims_ts_default_raises(monkeypatch: pytest.MonkeyPatch, sm: int) -> None:
+    """Where the hardware default would be PrimTS but this process cannot run it, selection
+    raises with the reason and the ways out; an explicit or environment provider is kept, and
+    the other KV dtypes never probe."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import params
+
+    monkeypatch.delenv("TRTLLM_CSA2_COMPUTE_BACKEND", raising=False)
+    monkeypatch.setattr(params, "csa2_prims_ts_unsupported_reason", lambda: "no task scheduling")
+    for args in ((CSA2Params(), "swa_fp8"), (None, "swa_fp8")):
+        with pytest.raises(RuntimeError, match="no task scheduling") as error:
+            select_csa2_backend(sm, *args)
+        assert "fp8_ds_mla" in str(error.value)
+        assert "TRTLLM_CSA2_COMPUTE_BACKEND=trtllm" in str(error.value)
+    assert select_csa2_backend(sm, CSA2Params(compute_backend="prims_ts"), "swa_fp8") == "prims_ts"
+    assert select_csa2_backend(sm, CSA2Params(compute_backend="trtllm"), "swa_fp8") == "trtllm"
+    assert select_csa2_backend(sm, CSA2Params(), "swa") == "trtllm"
+    assert select_csa2_backend(sm, CSA2Params(use_fp8_staging=True), "swa_fp8") == "trtllm"
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "prims_ts")
+    assert select_csa2_backend(sm, CSA2Params(), "swa_fp8") == "prims_ts"
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "trtllm")
+    assert select_csa2_backend(sm, CSA2Params(), "swa_fp8") == "trtllm"
+
+
+@pytest.mark.cpu_only
+def test_prims_ts_support_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe reports a missing device, an unsupported toolchain, and vendored PrimTS
+    internals the provider builds on that no longer import or plan, without compiling."""
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_sparse_mla
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed, params
+
+    probe = params._prims_ts_unsupported_reason.__wrapped__
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert csa2_prims_ts_unsupported_reason() == "CUDA is unavailable"
+    toolchain = "nvidia-cutlass-dsl>=4.7 is required."
+    monkeypatch.setattr(
+        prims_ts_sparse_mla, "get_prims_ts_toolchain_unsupported_reason", lambda: toolchain
+    )
+    assert probe(0) == toolchain
+    monkeypatch.setattr(
+        prims_ts_sparse_mla, "get_prims_ts_toolchain_unsupported_reason", lambda: None
+    )
+    plans = []
+
+    def workspace_size(*args, **kwargs):
+        plans.append((args, kwargs))
+        return 1
+
+    monkeypatch.setattr(_prims_ts_packed, "get_packed_sparse_mla_workspace_size", workspace_size)
+    assert probe(0) is None
+    assert plans == [
+        ((0, 1, 64), dict(max_topk=128, max_extra_topk=512, swa_cache_format="swa_fp8"))
+    ]
+
+    def drifted(*args, **kwargs):
+        raise AttributeError("module 'mla_decode' has no attribute '_MLADecodeCompileSpec'")
+
+    monkeypatch.setattr(_prims_ts_packed, "get_packed_sparse_mla_workspace_size", drifted)
+    assert "_MLADecodeCompileSpec" in probe(0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [100, 103, 107])
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("use_packed_sparse_attention", True),
+        ("use_fp8_staging", True),
+        # Pinning BF16 staging keeps the native provider: PrimTS would attend in E4M3.
+        ("use_fp8_staging", False),
+    ],
+)
+def test_auto_native_only_options(
+    monkeypatch: pytest.MonkeyPatch, sm: int, option: str, value: bool
+) -> None:
     monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "auto")
-    assert select_csa2_backend(sm, CSA2Params(**{option: True})) == "trtllm"
+    # On the fp8 KV cache, where PrimTS would otherwise be the default.
+    assert select_csa2_backend(sm, CSA2Params(**{option: value}), "swa_fp8") == "trtllm"
 
 
 @pytest.mark.cpu_only
@@ -2751,6 +2847,9 @@ def test_auto_native_only_options(monkeypatch: pytest.MonkeyPatch, sm: int, opti
         (100, "use_fp8_staging", "FP8 staging requires trtllm-gen without packed attention"),
         (103, "use_fp8_staging", "FP8 staging requires trtllm-gen without packed attention"),
         (107, "use_fp8_staging", "FP8 staging requires trtllm-gen without packed attention"),
+        (100, "no_fp8_staging", r"BF16 staging \(use_fp8_staging=False\) requires trtllm-gen"),
+        (103, "no_fp8_staging", r"BF16 staging \(use_fp8_staging=False\) requires trtllm-gen"),
+        (107, "no_fp8_staging", r"BF16 staging \(use_fp8_staging=False\) requires trtllm-gen"),
         (90, None, "requires SM100, SM103 or SM107"),
         (110, None, "requires SM100, SM103 or SM107"),
         (120, None, "requires SM100, SM103 or SM107"),
@@ -2761,10 +2860,11 @@ def test_prims_ts_rejects_unsupported_options(
     monkeypatch: pytest.MonkeyPatch, source: str, sm: int, option: str | None, error: str
 ) -> None:
     monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "prims_ts")
-    params = CSA2Params(
-        compute_backend="prims_ts" if source == "internal" else "auto",
-        **({option: True} if option is not None else {}),
-    )
+    options = {
+        None: {},
+        "no_fp8_staging": {"use_fp8_staging": False},
+    }.get(option, {option: True})
+    params = CSA2Params(compute_backend="prims_ts" if source == "internal" else "auto", **options)
     with pytest.raises(ValueError, match=error):
         select_csa2_backend(sm, params)
 
@@ -3167,7 +3267,8 @@ def test_hf_factory_auto_backend_and_staging(
         model = DeepseekV41Attention.from_hf_config(
             config, 0, kv_cache_dtype=requested, sparse_params=params
         )
-    prims_ts = get_sm_version() in (100, 103, 107) and staging is not True
+    # PrimTS is the default only on the fp8 KV cache and without an explicit staging choice.
+    prims_ts = get_sm_version() in (100, 103, 107) and staging is None and requested == "fp8"
     fp8 = not prims_ts and staging is not False
     assert model.layout.index_heads == config.index_n_heads
     assert model.layout.index_head_dim == config.index_head_dim

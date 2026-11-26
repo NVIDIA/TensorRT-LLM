@@ -17,7 +17,7 @@ or controller, and enabling the dense PrimTS FMHA library does not select CSA2.
 
 | Architecture | Default module compute path | Computation |
 | --- | --- | --- |
-| SM100/103/107 | `CSA2PrimsTS` | PrimTS sparse MLA reading packed FP8 SWA / NVFP4 MAIN |
+| SM100/103/107, `kv_cache_config.dtype="fp8"` | `CSA2PrimsTS` | PrimTS sparse MLA reading packed FP8 SWA / NVFP4 MAIN |
 | SM100 family, eager context tiles with 64 query heads whose phase shares one converted-KV bank: native provider on FP8 KV caches, PrimTS on the `fp8` one | `CSA2TrtllmAttention.forward_fused_context` | Fused sparse context kernel (`csa2_sparse_context`) over the shared E4M3 bank |
 | SM100 family, native provider | `CSA2TrtllmAttention.forward` | Native trtllm-gen dynamic sparse MLA |
 | SM100 family, native provider, generation tiles with 64 query heads | `CSA2TrtllmAttention.forward_fused_decode` | Fused sparse decode kernel |
@@ -36,20 +36,28 @@ and `flashinfer`. An explicit internal provider takes precedence over
 `TRTLLM_CSA2_COMPUTE_BACKEND`; otherwise that environment variable overrides
 hardware defaults. Resolve the choice when constructing the model. For example,
 set `TRTLLM_CSA2_COMPUTE_BACKEND=trtllm` for native A/B testing or rollback.
-`auto` plus packed attention or explicit `use_fp8_staging=True` keeps the native
-provider on SM100-family GPUs. Forced PrimTS rejects these native-only options
-and GPUs other than SM100/103/107 rather than silently falling back.
+`auto` plus packed attention or an explicit `use_fp8_staging` (`True` or `False`)
+keeps the native provider on SM100-family GPUs. Forced PrimTS rejects these
+native-only options and GPUs other than SM100/103/107 rather than silently falling back.
 
-The PrimTS default favors `kv_cache_config.dtype="fp8"`. The other KV dtypes
+`auto` selects PrimTS only for `kv_cache_config.dtype="fp8"`, whose SWA rows are
+the 512-byte unit-scale E4M3 records PrimTS reads directly. The other KV dtypes
 (`auto`, `bfloat16`, `fp8_ds_mla`) store SWA as the 528-byte scaled records, and
 for those the native fused decode kernel serves generation tiles of 64 query heads
 about twice as fast as PrimTS on SM100, SM103 and SM107 (standalone, 192 to 2,048
-query rows). Such deployments can select it with `TRTLLM_CSA2_COMPUTE_BACKEND=trtllm`.
+query rows), so they keep the native provider. `TRTLLM_CSA2_COMPUTE_BACKEND=prims_ts`
+still selects PrimTS for them. Where this process cannot run PrimTS
+(`csa2_prims_ts_unsupported_reason`: a missing or old CuTe DSL toolchain, or vendored
+PrimTS internals that no longer import or plan), `auto` raises for the fp8 KV cache
+rather than run the native provider on its 512-byte SWA rows, where it has no fused or
+direct decode and stages every generation step. The error names the ways out: the
+`requirements.txt` toolchain, `kv_cache_config.dtype="fp8_ds_mla"`, or
+`TRTLLM_CSA2_COMPUTE_BACKEND=trtllm`. An explicit provider is kept.
 
 With `kv_cache_config.dtype="fp8"`, PrimTS leaves to the fused sparse context kernel
 (`csa2_sparse_context`) every context tile the native provider runs on it: with 64
-query heads, an eager context phase whose rows share one converted-KV bank. Other KV
-dtypes keep these tiles on PrimTS. Its query tile then stages that bank in E4M3 from the packed
+query heads, an eager context phase whose rows share one converted-KV bank. A PrimTS
+provider forced on another KV dtype keeps these tiles on PrimTS. Its query tile then stages that bank in E4M3 from the packed
 caches (`CSA2TrtllmAttention.query_tile_metadata`) and runs the native provider's
 staging, kernel and grouped128 FP8 O-A input unchanged. PrimTS attends the other
 context tiles, such as captured ones, and every generation tile from the packed

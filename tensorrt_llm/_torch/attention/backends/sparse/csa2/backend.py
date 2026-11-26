@@ -156,7 +156,12 @@ class CSA2TrtllmAttention(TrtllmAttention):
         draft_width = spec_config.tokens_per_gen_step if spec_config is not None else 1
         query_capacity = max_batch_size * draft_width
         reserve = 0
-        if select_csa2_backend(get_sm_version(), provider_params) == "prims_ts":
+        # The model loader records kv_cache_config.dtype here; the cache manager resolves
+        # the same SWA encoding, so the reservation follows the provider the layers select.
+        swa_cache_format = resolve_swa_cache_format(
+            getattr(model_config, "extra_attrs", {}).get("kv_cache_dtype", "auto")
+        )
+        if select_csa2_backend(get_sm_version(), provider_params, swa_cache_format) == "prims_ts":
             from .prims_ts import workspace_reservation_bytes
 
             heads = model_config.pretrained_config.num_attention_heads
@@ -254,7 +259,9 @@ class CSA2TrtllmAttention(TrtllmAttention):
         quant_config = kwargs.get("quant_config")
         requested_algo = _csa2_kv_cache_algo(quant_config)
         sparse_params = sparse_params or CSA2Params()
-        self.compute_backend = select_csa2_backend(get_sm_version(), sparse_params)
+        self.compute_backend = select_csa2_backend(
+            get_sm_version(), sparse_params, self.swa_cache_format
+        )
         if self.compute_backend == "prims_ts" and not 0 < num_heads <= 128:
             raise ValueError("CSA2 PrimTS sparse MLA supports up to 128 query heads")
         if self.compute_backend == "trtllm" and not is_sm_100f():

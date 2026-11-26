@@ -5,6 +5,16 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _prims_ts_supported_in_cpu_only_tests(request: pytest.FixtureRequest, monkeypatch):
+    """CPU-only tests model SM100-family GPUs they do not run on, so the PrimTS support probe,
+    which checks the current CUDA device, reports PrimTS as supported in them."""
+    if request.node.get_closest_marker("cpu_only") is not None:
+        from tensorrt_llm._torch.attention.backends.sparse.csa2 import params
+
+        monkeypatch.setattr(params, "csa2_prims_ts_unsupported_reason", lambda: None)
+
+
 @pytest.fixture
 def swa_fp8_storage_exponent(monkeypatch: pytest.MonkeyPatch):
     """Return a setter of this process's swa_fp8 storage-scale exponent ``e`` for one test.

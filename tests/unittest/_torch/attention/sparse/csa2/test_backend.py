@@ -2985,7 +2985,12 @@ def test_swa_format_mismatch_rejects_before_cache_publication(
         CSA2ForwardState,
     )
 
-    attn = _backend(64, compute_backend=implementation, kv_cache_dtype=kv_dtype, fp8_staging=False)
+    # Only the native provider stages; PrimTS attends the persistent rows and rejects
+    # pinned BF16 staging.
+    staging = False if implementation == "trtllm" else None
+    attn = _backend(
+        64, compute_backend=implementation, kv_cache_dtype=kv_dtype, fp8_staging=staging
+    )
     expected = attn.swa_cache_format
     other = "swa" if expected == "swa_fp8" else "swa_fp8"
 
@@ -3016,8 +3021,11 @@ def test_swa_format_mismatch_rejects_before_cache_publication(
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("implementation", ["flashinfer", "prims_ts"])
-@pytest.mark.parametrize("staging", [None, False])
+# PrimTS rejects pinned BF16 staging (use_fp8_staging=False); the selector tests cover that.
+@pytest.mark.parametrize(
+    ("implementation", "staging"),
+    [("flashinfer", None), ("flashinfer", False), ("prims_ts", None)],
+)
 def test_library_backends_keep_bf16_queries_for_fp8_requests(
     implementation: str, staging: bool | None
 ) -> None:

@@ -1303,6 +1303,8 @@ def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
         pretrained_config=SimpleNamespace(**config_layout, num_attention_heads=128),
         sparse_attention_config=SimpleNamespace(use_fp8_staging=None),
         spec_config=None,
+        # PrimTS is the default only on the fp8 KV cache, which the model loader records here.
+        extra_attrs={"kv_cache_dtype": "fp8"},
     )
     mapping = SimpleNamespace(enable_attention_dp=attention_dp, tp_size=2)
     kwargs = dict(
@@ -1323,6 +1325,24 @@ def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
     config.sparse_attention_config.use_fp8_staging = True
     native = backend.CSA2TrtllmAttention.runtime_workspace_fixed_bytes(config, mapping, **kwargs)
     assert automatic == native + 101 * len(widths)
+    assert len(calls) == len(widths)
+    # The other KV dtypes keep the native provider, so they reserve no PrimTS workspace.
+    config.sparse_attention_config.use_fp8_staging = None
+    for kv_cache_dtype in ("auto", "bfloat16", "fp8_ds_mla"):
+        config.extra_attrs["kv_cache_dtype"] = kv_cache_dtype
+        assert (
+            backend.CSA2TrtllmAttention.runtime_workspace_fixed_bytes(config, mapping, **kwargs)
+            == native
+        )
+    assert len(calls) == len(widths)
+    # Where this process cannot run PrimTS, the fp8 KV cache fails at the reservation, before
+    # any layer is built.
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import params
+
+    config.extra_attrs["kv_cache_dtype"] = "fp8"
+    monkeypatch.setattr(params, "csa2_prims_ts_unsupported_reason", lambda: "unsupported")
+    with pytest.raises(RuntimeError, match="unsupported"):
+        backend.CSA2TrtllmAttention.runtime_workspace_fixed_bytes(config, mapping, **kwargs)
     assert len(calls) == len(widths)
 
 
