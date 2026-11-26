@@ -141,21 +141,6 @@ def _st_release_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> N
     )
 
 
-@dsl_user_op
-def fence_proxy_async_global(*, loc=None, ip=None) -> None:
-    """Order this thread's earlier generic-proxy acquires before its later async-proxy (TMA) reads."""
-    llvm.inline_asm(
-        None,
-        [],
-        "fence.proxy.async.global;",
-        "",
-        has_side_effects=True,
-        asm_dialect=0,
-        loc=loc,
-        ip=ip,
-    )
-
-
 class _OneRoundRouter(KernelComponent):
     """One-round push dispatch with the ``_MetadataPushRouter`` output contract (see the module docstring)."""
 
@@ -477,7 +462,7 @@ class _OneRoundRouter(KernelComponent):
         peer_rank_ptr_mapper_host,
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
-        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; every kernel with this router passes one
     ) -> None:
         """Launch the push + sort grid. Not PDL: it starts after its predecessor completed, so it may read the
         staged top-k and activation at entry; it releases the MoE kernel at entry like the metadata-push router."""
@@ -918,4 +903,4 @@ class _OneRoundRouter(KernelComponent):
             )
 
 
-__all__ = ["_OneRoundRouter", "fence_proxy_async_global"]
+__all__ = ["_OneRoundRouter"]

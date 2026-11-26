@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Shared-expert members common to the prefill and gen-phase FC12 mainloops (one copy of the overlaid-ring rules)."""
 
 import dataclasses

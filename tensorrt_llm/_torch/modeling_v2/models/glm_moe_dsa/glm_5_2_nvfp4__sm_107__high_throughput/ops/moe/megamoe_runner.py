@@ -19,10 +19,9 @@ from tensorrt_llm.logger import logger
 
 from ...kernels.moe.constants import GEN_TOKEN_BUCKETS
 
-# This model's gen-phase kernel (kernels/moe) predates the decode scheduler: it runs any
-# non-grouped schedule as phase_interleave without checking the hint. Keep the phase_interleave
-# tactics the shared table used before it moved to decode.
-_GLM_GENPHASE_TACTICS: dict[int, Tuple] = {
+# This model's gen-phase kernel (kernels/moe) runs the grouped and phase_interleave schedules,
+# not the decode scheduler of the shared gen-phase table, so it keeps its own tactics.
+_GLM_GENPHASE_TACTICS: dict[int, tuple] = {
     32: (
         [256, 128, 256],
         [4, 1, 1],
@@ -167,7 +166,7 @@ class RubinMegaMoERunner(Sm100MegaMoENvfp4Runner):
         # The shape/tactic keeps the shared runner's positional key contract.
         return (*super()._build_unique_id(), "glm-rubin-high-throughput")
 
-    def _default_tactic(self, num_tokens: int) -> Tuple:
+    def _default_tactic(self, num_tokens: int) -> tuple:
         tactic = super()._default_tactic(num_tokens)
         if _unpack_tactic(tactic)[3][0] == "decode":
             bucket = shared._sm107_tactic_bucket(self.max_tokens_per_rank)

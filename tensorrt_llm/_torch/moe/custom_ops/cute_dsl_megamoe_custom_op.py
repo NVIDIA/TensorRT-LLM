@@ -794,10 +794,8 @@ _MEGAMOE_NVFP4_COMBINE_BULK_TACTIC: Tuple = (
 # Generation-phase kernel tactics per max_tokens_per_rank bucket. The kernel runs the decode
 # scheduler only: ("decode", L) claims FC1 tiles up to L token blocks ahead of FC2 (None: every FC1
 # tile of a stream before its FC2 tiles; 65535 keeps that order on one shared counter). Each entry
-# was picked on VR200 at EP4 (DSv4-Pro and Kimi K3, balanced and power-law routing) as the decode
-# tactic whose worst case across those four was best; all are within 1% of the phase_interleave
-# table they replace, and DSv4-Pro gains 1-4% at 128-512. N64 tiles are absent: TRT-LLM launches
-# them on a (2, 1) cluster, which the generation-phase kernel refuses.
+# is the decode tactic with the best worst case over DSv4-Pro and Kimi K3 at EP4 on VR200, under
+# balanced and power-law routing.
 _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
     32: (
         [256, 128, 256],
@@ -859,7 +857,6 @@ _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
         1,
         (4, 4),
     ),
-    # 384: re-tuned on the decode-only kernel, where this entry beats N256 / lead 45 by 1-2%.
     384: (
         [256, 128, 256],
         [4, 1, 1],
@@ -1295,8 +1292,8 @@ def _construct_megamoe_kernel(
     bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
     genphase = bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS
     if common.get("combine_dedup", False):
-        # Only the SM107 generic kernel declares the option; ImplDesc drops undeclared keys,
-        # so any other kernel would silently build without it.
+        # TensorRT-LLM enables dedup on the SM107 generic kernel only. ImplDesc drops undeclared
+        # keys, so the generation-phase kernel, which lacks the option, would build without it.
         if sm_version != 107 or genphase:
             raise ValueError("combine_dedup applies to the SM107 generic MegaMoE kernel only.")
         impl_values["combine_dedup"] = True
@@ -1366,7 +1363,7 @@ def _construct_megamoe_kernel(
     return construct(kernel_cls)
 
 
-def _megamoe_tmp_buffer_span(kernel) -> Tuple[int, int]:
+def _megamoe_tmp_buffer_span(kernel: Any) -> Tuple[int, int]:
     """Return (offset, bytes) of the kernel's tmp buffer behind its local workspace state."""
     if not hasattr(kernel, "get_tmp_buffer_bytes"):
         return 0, 0

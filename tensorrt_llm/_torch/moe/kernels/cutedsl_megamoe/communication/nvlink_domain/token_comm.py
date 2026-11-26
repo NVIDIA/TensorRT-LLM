@@ -1887,6 +1887,7 @@ class TokenCommNonDeterministic(KernelComponent):
     ) -> None:
         if cutlass.const_expr(self.one_round_dispatch):
             if cutlass.const_expr(adaptive_route is not None):
+                # TensorRT-LLM local patch: the one-round router (TensorRT-LLM local) has no adaptive route.
                 raise ValueError("The one-round dispatch router has no adaptive route.")
             self._router.launch_router(
                 topk_indices,
