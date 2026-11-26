@@ -6099,6 +6099,15 @@
           "title": "Copy On Partial Reuse",
           "type": "boolean"
         },
+        "copy_stream_busy_skip": {
+          "default": 0,
+          "description": "Pooled CUDA streams that a KV cache block copy skips while they still have work pending (0: it takes the next pooled stream, busy or not). A stream goes back to the pool once its work is submitted, so without skipping, a restore can wait behind an unrelated copy still pending on the stream it is handed, such as a disk write waiting for the disk I/O pool. Skipped streams go back to the pool, which grows until enough streams are idle. Process-wide: the first KV cache manager that sets a nonzero value sets it for the life of the process. Only used by KV cache manager v2.",
+          "maximum": 4096,
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Copy Stream Busy Skip",
+          "type": "integer"
+        },
         "cross_kv_cache_fraction": {
           "anyOf": [
             {
@@ -6295,6 +6304,15 @@
           "title": "Host Cache Bind To Gpu Numa Node",
           "type": "boolean"
         },
+        "host_cache_free_reserve_fraction": {
+          "default": 0.0,
+          "description": "Share of the host cache tier, 0 to 0.25, that evictions to the disk cache keep free ahead of need. A host block freed by an eviction is usable only once it has been copied to disk, so on a full host tier every block evicted from GPU, and the restore waiting for the GPU block it frees, waits for a disk write. With a reserve, evictions run that far ahead of need. 0 evicts only what is needed. Requires a disk cache. Only used by KV cache manager v2.",
+          "maximum": 0.25,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Host Cache Free Reserve Fraction",
+          "type": "number"
+        },
         "host_cache_size": {
           "anyOf": [
             {
@@ -6307,6 +6325,15 @@
           "default": null,
           "description": "Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used.",
           "title": "Host Cache Size"
+        },
+        "host_copy_threads": {
+          "default": 1,
+          "description": "Threads, the CUDA callback thread included, that one host-side KV cache copy (host to host between host-memory cache levels, disk to disk, and host to/from disk when `disk_io_threads` is 0) spreads its blocks over. GPU-to-host offloads and host-to-GPU restores run on the GPU and do not use it. CUDA runs host callbacks one at a time, so with 1 every later host callback, and every copy queued behind one, waits for the whole copy. The copy still completes only once every block is copied. Process-wide: the first KV cache manager that sets a value above 1 sets it for the life of the process. Only used by KV cache manager v2.",
+          "exclusiveMinimum": 0,
+          "maximum": 64,
+          "status": "prototype",
+          "title": "Host Copy Threads",
+          "type": "integer"
         },
         "iteration_stats_interval": {
           "default": 1,

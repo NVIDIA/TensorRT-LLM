@@ -157,6 +157,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` | `int` | `value` |  |
 | `kv_cache_config.cold_tier_offload_min_priority` | `int\|none` | `value` |  |
 | `kv_cache_config.copy_on_partial_reuse` | `bool` | `value` |  |
+| `kv_cache_config.copy_stream_busy_skip` | `int` | `value` |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `float\|none` | `value` |  |
 | `kv_cache_config.disk_cache_size` | `int\|none` | `value` |  |
 | `kv_cache_config.disk_io_threads` | `int` | `value` |  |
@@ -174,7 +175,9 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.fp8_context_mla_kv_len_cap` | `int\|none` | `value` |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `float\|none` | `value` |  |
 | `kv_cache_config.host_cache_bind_to_gpu_numa_node` | `bool` | `value` |  |
+| `kv_cache_config.host_cache_free_reserve_fraction` | `float` | `value` |  |
 | `kv_cache_config.host_cache_size` | `int\|none` | `value` |  |
+| `kv_cache_config.host_copy_threads` | `int` | `value` |  |
 | `kv_cache_config.iteration_stats_interval` | `int` | `value` |  |
 | `kv_cache_config.kv_cache_event_hash_algo` | `literal` | `categorical` | `auto`, `v1_block_key`, `v2_sha256`, `v2_sha256_64` |
 | `kv_cache_config.kv_events_config.buffer_steps` | `int` | `value` |  |
