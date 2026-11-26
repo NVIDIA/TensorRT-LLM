@@ -69,7 +69,10 @@ def _paged_prep_kernel(
     for start in range(0, width, BLOCK_W):
         cols = start + w
         keep = cols < width
-        encoded = tl.load(src_ptr + g64 * src_row_stride + cols, mask=keep, other=0).to(tl.int64) - block_offset
+        encoded = (
+            tl.load(src_ptr + g64 * src_row_stride + cols, mask=keep, other=0).to(tl.int64)
+            - block_offset
+        )
         # (encoded >= 0) * _ctx_block_cols[c], _ctx_block_cols = arange(1, width + 1)
         valid = tl.where((encoded >= 0) & keep, (cols + 1).to(tl.int64), 0)
         extent = tl.maximum(extent, valid)
@@ -120,8 +123,21 @@ class ContextKvPagedPrep(OpWrapper):
     """
 
     def __call__(
-        self, src, table, counts, ctx_len, ctx_base, slots, positions, col, pos_i32,
-        rows: int, layers: int, block_offset: int, divisor: int, page_size: int,
+        self,
+        src,
+        table,
+        counts,
+        ctx_len,
+        ctx_base,
+        slots,
+        positions,
+        col,
+        pos_i32,
+        rows: int,
+        layers: int,
+        block_offset: int,
+        divisor: int,
+        page_size: int,
     ):
         gens = slots.numel()
         _paged_prep_kernel[(gens,)](
@@ -149,8 +165,21 @@ class ContextKvPagedPrep(OpWrapper):
         )
 
     def reference(
-        self, src, table, counts, ctx_len, ctx_base, slots, positions, col, pos_i32,
-        rows: int, layers: int, block_offset: int, divisor: int, page_size: int,
+        self,
+        src,
+        table,
+        counts,
+        ctx_len,
+        ctx_base,
+        slots,
+        positions,
+        col,
+        pos_i32,
+        rows: int,
+        layers: int,
+        block_offset: int,
+        divisor: int,
+        page_size: int,
     ):
         """The built-in statements (``_refresh_ctx_block_tables`` + ``_store_step_context``'s index math)."""
         gens = slots.numel()
@@ -163,7 +192,9 @@ class ContextKvPagedPrep(OpWrapper):
         table[:gens].copy_(decoded.to(torch.int32))
         offsets = torch.arange(rows, dtype=torch.long, device=src.device)
         ctx = ctx_len[slots]
-        col_idx = (ctx if ctx_base is None else ctx - ctx_base[slots]).unsqueeze(1) + offsets.unsqueeze(0)
+        col_idx = (ctx if ctx_base is None else ctx - ctx_base[slots]).unsqueeze(
+            1
+        ) + offsets.unsqueeze(0)
         gen_capacity = counts[torch.arange(gens, device=src.device)] * page_size
         col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
         pos = ctx.unsqueeze(1) + offsets.unsqueeze(0)
@@ -172,19 +203,44 @@ class ContextKvPagedPrep(OpWrapper):
         pos_i32.copy_(pos.reshape(-1).to(torch.int32).repeat_interleave(layers))
 
     def is_valid(
-        self, src, table, counts, ctx_len, ctx_base, slots, positions, col, pos_i32,
-        rows: int, layers: int, block_offset: int, divisor: int, page_size: int,
+        self,
+        src,
+        table,
+        counts,
+        ctx_len,
+        ctx_base,
+        slots,
+        positions,
+        col,
+        pos_i32,
+        rows: int,
+        layers: int,
+        block_offset: int,
+        divisor: int,
+        page_size: int,
     ):
         gens = slots.numel()
         assert src.dim() == 2 and src.stride(1) == 1 and src.shape[0] >= gens
         assert src.dtype in (torch.int32, torch.int64)
-        assert table.dtype == torch.int32 and table.stride(1) == 1 and table.shape[1] == src.shape[1]
-        assert counts.dtype == torch.int64 and ctx_len.dtype == torch.int64 and slots.dtype == torch.int64
+        assert (
+            table.dtype == torch.int32 and table.stride(1) == 1 and table.shape[1] == src.shape[1]
+        )
+        assert (
+            counts.dtype == torch.int64
+            and ctx_len.dtype == torch.int64
+            and slots.dtype == torch.int64
+        )
         assert ctx_base is None or ctx_base.dtype == torch.int64
         n = gens * rows
-        assert positions.dtype == torch.int64 and positions.numel() == n and positions.is_contiguous()
+        assert (
+            positions.dtype == torch.int64 and positions.numel() == n and positions.is_contiguous()
+        )
         assert col.dtype == torch.int64 and col.numel() == n and col.is_contiguous()
-        assert pos_i32.dtype == torch.int32 and pos_i32.numel() == n * layers and pos_i32.is_contiguous()
+        assert (
+            pos_i32.dtype == torch.int32
+            and pos_i32.numel() == n * layers
+            and pos_i32.is_contiguous()
+        )
         assert 1 <= rows <= 64 and 1 <= gens <= MAX_REQUESTS and divisor >= 1 and page_size >= 1
 
 
@@ -230,14 +286,27 @@ def _paged_scatter_kernel(
     m = (h < HEADS)[:, None] & (d < HEAD_DIM)[None, :]
     for layer in tl.static_range(LAYERS):
         base = tl.load(layer_ptrs_ptr + layer).to(tl.pointer_type(k_ptr.dtype.element_ty))
-        k = tl.load(k_ptr + (n * LAYERS + layer) * (HEADS * HEAD_DIM) + h[:, None] * HEAD_DIM + d[None, :], mask=m)
-        # The fused K/V GEMM's row: per layer [K heads | V heads].
-        v = tl.load(
-            kv_ptr + n * kv_row_stride + layer * (2 * HEADS * HEAD_DIM) + HEADS * HEAD_DIM
-            + h[:, None] * HEAD_DIM + d[None, :],
+        k = tl.load(
+            k_ptr + (n * LAYERS + layer) * (HEADS * HEAD_DIM) + h[:, None] * HEAD_DIM + d[None, :],
             mask=m,
         )
-        dst = base + page * page_stride + h[:, None].to(tl.int64) * head_stride + tok * token_stride + d[None, :]
+        # The fused K/V GEMM's row: per layer [K heads | V heads].
+        v = tl.load(
+            kv_ptr
+            + n * kv_row_stride
+            + layer * (2 * HEADS * HEAD_DIM)
+            + HEADS * HEAD_DIM
+            + h[:, None] * HEAD_DIM
+            + d[None, :],
+            mask=m,
+        )
+        dst = (
+            base
+            + page * page_stride
+            + h[:, None].to(tl.int64) * head_stride
+            + tok * token_stride
+            + d[None, :]
+        )
         tl.store(dst, k, mask=m)
         tl.store(dst + plane_stride, v, mask=m)
 
@@ -259,7 +328,20 @@ class ContextKvPagedScatter(OpWrapper):
     ``drafter_kv_side_chain__PAGED``, last launch of the side chain. Copies only.
     """
 
-    def __call__(self, k, kv, col, counts, table, layer_ptrs, pool, rows: int, layers: int, heads: int, head_dim: int):
+    def __call__(
+        self,
+        k,
+        kv,
+        col,
+        counts,
+        table,
+        layer_ptrs,
+        pool,
+        rows: int,
+        layers: int,
+        heads: int,
+        head_dim: int,
+    ):
         total = col.numel()
         _paged_scatter_kernel[(total,)](
             k,
@@ -284,7 +366,20 @@ class ContextKvPagedScatter(OpWrapper):
             num_warps=1,
         )
 
-    def reference(self, k, kv, col, counts, table, layer_ptrs, pool, rows: int, layers: int, heads: int, head_dim: int):
+    def reference(
+        self,
+        k,
+        kv,
+        col,
+        counts,
+        table,
+        layer_ptrs,
+        pool,
+        rows: int,
+        layers: int,
+        heads: int,
+        head_dim: int,
+    ):
         """Index assignment into ``pool`` (the layer-0 pool; the op writes every layer's through ``layer_ptrs``):
         what the built-in append writes for layer 0. Rows clamped onto one slot: the last row's values."""
         total = col.numel()
@@ -297,14 +392,38 @@ class ContextKvPagedScatter(OpWrapper):
             pool[page[i], 0, :, tok[i]] = k[i, 0].view(heads, head_dim)
             pool[page[i], 1, :, tok[i]] = v[i]
 
-    def is_valid(self, k, kv, col, counts, table, layer_ptrs, pool, rows: int, layers: int, heads: int, head_dim: int):
+    def is_valid(
+        self,
+        k,
+        kv,
+        col,
+        counts,
+        table,
+        layer_ptrs,
+        pool,
+        rows: int,
+        layers: int,
+        heads: int,
+        head_dim: int,
+    ):
         total = col.numel()
         assert k.is_contiguous() and k.shape == (total, layers, heads * head_dim)
-        assert kv.stride(1) == 1 and kv.shape[0] == total and kv.shape[1] == layers * 2 * heads * head_dim
-        assert pool.dim() == 5 and pool.shape[1] == 2 and pool.shape[2] == heads and pool.shape[4] == head_dim
+        assert (
+            kv.stride(1) == 1
+            and kv.shape[0] == total
+            and kv.shape[1] == layers * 2 * heads * head_dim
+        )
+        assert (
+            pool.dim() == 5
+            and pool.shape[1] == 2
+            and pool.shape[2] == heads
+            and pool.shape[4] == head_dim
+        )
         assert pool.stride(4) == 1 and pool.dtype == k.dtype == kv.dtype
         assert layer_ptrs.dtype == torch.int64 and layer_ptrs.numel() == layers
-        assert col.dtype == torch.int64 and counts.dtype == torch.int64 and table.dtype == torch.int32
+        assert (
+            col.dtype == torch.int64 and counts.dtype == torch.int64 and table.dtype == torch.int32
+        )
 
 
 context_kv_paged_scatter = ContextKvPagedScatter()

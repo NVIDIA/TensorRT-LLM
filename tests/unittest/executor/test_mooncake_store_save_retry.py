@@ -2,18 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only Store fault and original worker-lifecycle tests; no torch import."""
 
-import ast
 import importlib.util
-import os
-import queue
 import sys
-import threading
-import traceback
 import unittest
-from collections import defaultdict
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "tensorrt_llm/_torch/pyexecutor/connectors/mooncake_store"
@@ -135,8 +127,6 @@ class RetryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             retry.put_with_retries(s, ["a"], [], [])
         self.assertEqual(s.puts, [])
-
-
 
 
 if __name__ == "__main__":

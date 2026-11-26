@@ -28,7 +28,10 @@ def _host():
     body = [
         n
         for n in tree.body
-        if (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in ("GRID", "_GRID_LOGGED") for t in n.targets))
+        if (
+            isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id in ("GRID", "_GRID_LOGGED") for t in n.targets)
+        )
         or (isinstance(n, ast.FunctionDef) and n.name == "configure")
     ]
     mod = types.ModuleType("_fold_host")
@@ -85,7 +88,10 @@ def test_the_grid_body_is_the_loop_body():
         assert stmt in grid, stmt
     assert "tl.store(embed_ids_ptr + num_gens, mask_id)" in grid
     assert "old = tl.atomic_add(counter_ptr, ticket_unit)" in grid
-    assert "counter = (old & 4294967295) + 1" in grid or "counter = (old & 0xFFFFFFFF) + 1" in _FOLD.read_text()
+    assert (
+        "counter = (old & 4294967295) + 1" in grid
+        or "counter = (old & 0xFFFFFFFF) + 1" in _FOLD.read_text()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,14 +115,28 @@ def _gpu():
 def _case(torch, g, k, block, seed, mode, with_kv, with_seq):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     dev = "cuda"
-    target = torch.randint(0, 50, (g * (k + 1),), device=dev, generator=gen, dtype=torch.int64).to(torch.int32)
+    target = torch.randint(0, 50, (g * (k + 1),), device=dev, generator=gen, dtype=torch.int64).to(
+        torch.int32
+    )
     drafts = target.view(g, k + 1)[:, :k].clone()
     flip = torch.rand((g, k), device=dev, generator=gen) < 0.3
     drafts[flip] += 1
     slots = torch.randperm(64, device=dev, generator=gen)[:g].to(torch.int64)
     ctx_len = torch.randint(0, 100000, (64,), device=dev, generator=gen, dtype=torch.int64)
-    kv = torch.randint(0, 1000, (g + 3,), device=dev, generator=gen, dtype=torch.int64).to(torch.int32) if with_kv else None
-    seq = torch.randint(0, 1000, (g + 200,), device=dev, generator=gen, dtype=torch.int64).to(torch.int32) if with_seq else None
+    kv = (
+        torch.randint(0, 1000, (g + 3,), device=dev, generator=gen, dtype=torch.int64).to(
+            torch.int32
+        )
+        if with_kv
+        else None
+    )
+    seq = (
+        torch.randint(0, 1000, (g + 200,), device=dev, generator=gen, dtype=torch.int64).to(
+            torch.int32
+        )
+        if with_seq
+        else None
+    )
     pool = torch.rand((1 << 12,), device=dev, generator=gen)
     counter = torch.tensor([seed * 7], dtype=torch.int64, device=dev)
     return target, drafts, slots, ctx_len, kv, seq, pool, counter
@@ -128,13 +148,29 @@ def test_gpu_grid_matches_the_loop(g, mode):
     torch, mod = _gpu()
     k, block = 7, 8
     for with_kv, with_seq in ((True, True), (False, False)):
-        target, drafts, slots, ctx_len, kv, seq, pool, counter = _case(torch, g, k, block, 11 * g + mode, mode, with_kv, with_seq)
+        target, drafts, slots, ctx_len, kv, seq, pool, counter = _case(
+            torch, g, k, block, 11 * g + mode, mode, with_kv, with_seq
+        )
         kv_a = kv.clone() if kv is not None else None
         kv_b = kv.clone() if kv is not None else None
         c_a, c_b = counter.clone(), counter.clone()
         for call in range(3):
             args = lambda kvx, cx: (  # noqa: E731
-                target, drafts, mode, 2, k + 1, 0.05, pool, cx, slots, ctx_len, 100000, block, 99, kvx, seq
+                target,
+                drafts,
+                mode,
+                2,
+                k + 1,
+                0.05,
+                pool,
+                cx,
+                slots,
+                ctx_len,
+                100000,
+                block,
+                99,
+                kvx,
+                seq,
             )
             mod.configure(grid=False)
             ref = mod.dflash_verify_fold(*args(kv_a, c_a))
@@ -156,14 +192,30 @@ def test_gpu_grid_matches_the_loop(g, mode):
 def _bench(iters=200):
     torch, mod = _gpu()
     for g in (8, 12, 16):
-        target, drafts, slots, ctx_len, kv, seq, pool, counter = _case(torch, g, 7, 8, 3, 2, True, True)
+        target, drafts, slots, ctx_len, kv, seq, pool, counter = _case(
+            torch, g, 7, 8, 3, 2, True, True
+        )
         line = [f"requests {g}:"]
         for grid in (False, True):
             mod.configure(grid=grid)
 
             def step():
                 return mod.dflash_verify_fold(
-                    target, drafts, 2, 2, 8, 0.05, pool, counter, slots, ctx_len, 100000, 8, 99, kv, seq
+                    target,
+                    drafts,
+                    2,
+                    2,
+                    8,
+                    0.05,
+                    pool,
+                    counter,
+                    slots,
+                    ctx_len,
+                    100000,
+                    8,
+                    99,
+                    kv,
+                    seq,
                 )
 
             step()
@@ -176,7 +228,9 @@ def _bench(iters=200):
                 graph.replay()
             end.record()
             torch.cuda.synchronize()
-            line.append(f"{'grid' if grid else 'loop'} {start.elapsed_time(end) * 1000 / iters:.1f} us")
+            line.append(
+                f"{'grid' if grid else 'loop'} {start.elapsed_time(end) * 1000 / iters:.1f} us"
+            )
         mod.configure(grid=False)
         print(" ".join(line), flush=True)
 

@@ -61,7 +61,11 @@ def _host(path: Path, names: set, functions: set, **attrs) -> types.ModuleType:
             isinstance(t, ast.Name) and t.id in names for t in node.targets
         ):
             body.append(node)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id in names:
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id in names
+        ):
             body.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in functions:
             body.append(node)
@@ -216,7 +220,9 @@ def test_the_cuda_constants_match_the_python_ones():
 
 def test_the_draw_topp_schema_matches_its_call():
     src = _HEAD_SAMPLER_CU.read_text()
-    (schema,) = re.findall(r'"draw_topp\((.*?)\) -> Tensor"\);', src.replace('"\n        "', ""), re.S)
+    (schema,) = re.findall(
+        r'"draw_topp\((.*?)\) -> Tensor"\);', src.replace('"\n        "', ""), re.S
+    )
     params = [p.strip().split()[-1].split("=")[0] for p in schema.split(",")]
     assert params == [
         "logits",
@@ -270,7 +276,9 @@ def test_the_test_sweep_uses_the_shipped_statements():
     count then mass."""
     src = _HEAD_SAMPLER_CU.read_text()
     weight = "__expf(__fmul_rn(capOf(__bfloat162float(elems[j]), cap), tempInv) - maxScaled)"
-    count = src.split("splitTopPCountKernel(FusedSamplingParams")[1].split("partials[static_cast")[0]
+    count = src.split("splitTopPCountKernel(FusedSamplingParams")[1].split("partials[static_cast")[
+        0
+    ]
     decide = src.split("splitTopPDecideKernel(FusedSamplingParams")[1].split(
         "if constexpr (!kFinal)\n    {\n        gridDependencyTrigger"
     )[0]
@@ -391,7 +399,9 @@ def _restructured(threads, top_p, uniforms, argmax, vb, rounds):
     rnd = 0
     for k in range(rounds):
         final = k == rounds - 1
-        partials = [_local(ws, cand_w) for ws in threads]  # the sweep kernel (one per virtual thread)
+        partials = [
+            _local(ws, cand_w) for ws in threads
+        ]  # the sweep kernel (one per virtual thread)
         while True:
             if _reduce(partials) <= mass_target:
                 return cand
@@ -399,7 +409,9 @@ def _restructured(threads, top_p, uniforms, argmax, vb, rounds):
             rnd += 1
             if rnd >= _MAX_REJECT_ROUNDS:
                 return argmax
-            drawn, _ = _draw(threads, partials, pivot, next(uniforms), vb)  # no sweep: the partials' mass
+            drawn, _ = _draw(
+                threads, partials, pivot, next(uniforms), vb
+            )  # no sweep: the partials' mass
             if drawn is None:
                 return argmax
             cand, cand_w = drawn
@@ -416,7 +428,8 @@ def _row(rng: random.Random, vb: int, vecs_per_thread: int, sharp: float):
     top = max(range(n), key=lambda i: logits[i])
     ws = [_f32(math.exp(logits[i] - logits[top])) for i in range(n)]
     threads = [
-        [ws[(t + vb * j) * 4 + e] for j in range(vecs_per_thread) for e in range(4)] for t in range(vb)
+        [ws[(t + vb * j) * 4 + e] for j in range(vecs_per_thread) for e in range(4)]
+        for t in range(vb)
     ]
     return threads, top
 
@@ -509,10 +522,23 @@ def test_gpu_draw_topp_matches_kernel_b(rows, mode):
             top_ks[1::5] = 50
             min_ps[2::5] = 0.05
             temps[3::5] = 0.6
-        args = (logits, temps, top_ks, top_ps, min_ps, seeds, offsets, _MULTIPLIER, _SOFT_CAP, states)
+        args = (
+            logits,
+            temps,
+            top_ks,
+            top_ps,
+            min_ps,
+            seeds,
+            offsets,
+            _MULTIPLIER,
+            _SOFT_CAP,
+            states,
+        )
         ref = hs.split_sample(*args)
         for rounds in range(1, hs.TOPP_MAX_ROUNDS + 1):
-            got = hs.split_sample(*args, topp_rounds=rounds, topp_records=records, topp_partials=partials)
+            got = hs.split_sample(
+                *args, topp_rounds=rounds, topp_records=records, topp_partials=partials
+            )
             assert torch.equal(got, ref), (rows, mode, seed, rounds)
 
 

@@ -88,6 +88,7 @@ def _log_prefetch(name: str) -> None:
     except Exception:  # noqa: BLE001 - logging only
         pass
 
+
 if _AVAILABLE:
     import cutlass
     import cutlass.cute as cute
@@ -105,7 +106,12 @@ if _AVAILABLE:
         """flashinfer's RMSNorm + FP4 quantization, reading its row from the pool transport."""
 
         def __init__(
-            self, world: int, capacity: int, guard_ns: int, guard_break: bool, prefetch: bool = False
+            self,
+            world: int,
+            capacity: int,
+            guard_ns: int,
+            guard_break: bool,
+            prefetch: bool = False,
         ):
             major, minor = torch.cuda.get_device_capability()
             super().__init__(
@@ -143,8 +149,13 @@ if _AVAILABLE:
             self.prefetch = bool(prefetch)
             #: 16-element scale blocks per thread (4 at H=4096, 64 threads per row).
             self.sf_per_thread = self.num_sf_blocks_per_row // self.threads_per_row
-            if self.prefetch and self.sf_per_thread * self.threads_per_row != self.num_sf_blocks_per_row:
-                raise ValueError("NORM_PREFETCH: the scale blocks do not split evenly over the row's threads")
+            if (
+                self.prefetch
+                and self.sf_per_thread * self.threads_per_row != self.num_sf_blocks_per_row
+            ):
+                raise ValueError(
+                    "NORM_PREFETCH: the scale blocks do not split evenly over the row's threads"
+                )
 
         def owner(self, v: int) -> int:
             return v // self.per_rank
@@ -230,12 +241,18 @@ if _AVAILABLE:
                     start_pre = (lane_pre + sf_pre * self.threads_per_row) * self.block_size
                     wp0 = _fp4.get_ptr_as_int64(mW, start_pre)
                     wp1 = _fp4.get_ptr_as_int64(mW, start_pre + Int32(8))
-                    w_pre[8 * sf_pre], w_pre[8 * sf_pre + 1], w_pre[8 * sf_pre + 2], w_pre[8 * sf_pre + 3] = (
-                        _fp4.ld_global_v4_u32(wp0)
-                    )
-                    w_pre[8 * sf_pre + 4], w_pre[8 * sf_pre + 5], w_pre[8 * sf_pre + 6], w_pre[8 * sf_pre + 7] = (
-                        _fp4.ld_global_v4_u32(wp1)
-                    )
+                    (
+                        w_pre[8 * sf_pre],
+                        w_pre[8 * sf_pre + 1],
+                        w_pre[8 * sf_pre + 2],
+                        w_pre[8 * sf_pre + 3],
+                    ) = _fp4.ld_global_v4_u32(wp0)
+                    (
+                        w_pre[8 * sf_pre + 4],
+                        w_pre[8 * sf_pre + 5],
+                        w_pre[8 * sf_pre + 6],
+                        w_pre[8 * sf_pre + 7],
+                    ) = _fp4.ld_global_v4_u32(wp1)
                 gs_pre = mGlobalScale[0]
 
             if enable_pdl:
@@ -404,7 +421,9 @@ if _AVAILABLE:
                         out_ptr = _fp4.get_ptr_as_int64(mY, actual_row_idx * (H // 2) + out_offset)
                         _fp4.st_global_u64(out_ptr, packed64)
                 else:
-                    num_sf_per_thread = (num_sf_blocks_per_row + threads_per_row - 1) // threads_per_row
+                    num_sf_per_thread = (
+                        num_sf_blocks_per_row + threads_per_row - 1
+                    ) // threads_per_row
                     for sf_iter in range(num_sf_per_thread):
                         sf_idx = lane_in_row + sf_iter * threads_per_row
                         if sf_idx < num_sf_blocks_per_row:
@@ -433,14 +452,18 @@ if _AVAILABLE:
                             scale_fp8_u32 = _fp4.cvt_f32_to_e4m3(scale_float)
                             scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
 
-                            inv_scale = _fp4.fp8_e4m3_to_f32_and_rcp(scale_fp8_u32) * global_scale_val
+                            inv_scale = (
+                                _fp4.fp8_e4m3_to_f32_and_rcp(scale_fp8_u32) * global_scale_val
+                            )
 
                             mS[actual_row_idx, sf_idx] = scale_fp8
 
                             packed64 = _fp4.quantize_and_pack_16(y_f32, inv_scale)
 
                             out_offset = block_start // 2
-                            out_ptr = _fp4.get_ptr_as_int64(mY, actual_row_idx * (H // 2) + out_offset)
+                            out_ptr = _fp4.get_ptr_as_int64(
+                                mY, actual_row_idx * (H // 2) + out_offset
+                            )
                             _fp4.st_global_u64(out_ptr, packed64)
 
             if enable_pdl:

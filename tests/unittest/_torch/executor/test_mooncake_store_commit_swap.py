@@ -61,7 +61,7 @@ def fake_events(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", lambda *args, **kwargs: _Event())
 
 
-def put_addresses(fake_store):
+def put_addresses(fake_store):  # noqa: F811
     out = {}
     for keys, addresses, _ in fake_store.put_calls:
         for key, address in zip(keys, addresses):
@@ -71,7 +71,9 @@ def put_addresses(fake_store):
 
 def bind_saves(worker, pages, request_id=9, retires=()):
     worker.bind_connector_meta(
-        MooncakeStoreMetadata(saves=[RequestTransfers(request_id, list(pages))], retires=list(retires))
+        MooncakeStoreMetadata(
+            saves=[RequestTransfers(request_id, list(pages))], retires=list(retires)
+        )
     )
 
 
@@ -80,7 +82,11 @@ def finished(worker, request_id):
     return wait_for(lambda: done.extend(worker.get_finished([], [])[0]) or request_id in done)
 
 
-def test_a_save_list_waits_for_the_commit_and_follows_a_swapped_page(store_config, fake_store, fake_events):
+def test_a_save_list_waits_for_the_commit_and_follows_a_swapped_page(
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+    fake_events,  # noqa: F811
+):
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker._save_staging = None  # device addresses go to the store as they are
         table = {9: [[0, 4, 5]]}
@@ -103,7 +109,11 @@ def test_a_save_list_waits_for_the_commit_and_follows_a_swapped_page(store_confi
         assert (worker._swap_checked, worker._swap_retargeted, worker._swap_dropped) == (2, 1, 0)
 
 
-def test_a_block_without_a_page_after_the_commit_is_not_saved(store_config, fake_store, fake_events):
+def test_a_block_without_a_page_after_the_commit_is_not_saved(
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+    fake_events,  # noqa: F811
+):
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker._save_staging = None
         table = {9: [[0, 4, 5]]}
@@ -118,7 +128,10 @@ def test_a_block_without_a_page_after_the_commit_is_not_saved(store_config, fake
 
 
 def test_with_the_guard_off_the_list_goes_out_at_once_from_the_listed_page(
-    store_config, fake_store, fake_events, monkeypatch
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+    fake_events,
+    monkeypatch,  # noqa: F811
 ):
     """The pre-fix hand-off (kept behind COMMIT_SWAP_GUARD=0 for A/B and repro runs): it reads the listed slot."""
     monkeypatch.setenv(worker_module.COMMIT_SWAP_GUARD_ENV, "0")
@@ -131,11 +144,17 @@ def test_with_the_guard_off_the_list_goes_out_at_once_from_the_listed_page(
         table[9] = [[0, 7]]
         assert wait_for(lambda: fake_store.put_calls)
         got = put_addresses(fake_store)
-        assert got[worker._namespaces[0].key(H1)] == list(PageAddressing(make_layout()).buffers(0, 4)[0])
+        assert got[worker._namespaces[0].key(H1)] == list(
+            PageAddressing(make_layout()).buffers(0, 4)[0]
+        )
         assert worker._swap_checked == 0
 
 
-def test_the_fallback_hand_off_at_the_next_pass_drops_a_moved_page(store_config, fake_store, fake_events):
+def test_the_fallback_hand_off_at_the_next_pass_drops_a_moved_page(
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+    fake_events,  # noqa: F811
+):
     """Without a `get_finished` in between, the next scheduling pass may have run: a moved slot is not followed."""
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker._save_staging = None
@@ -152,7 +171,7 @@ def test_the_fallback_hand_off_at_the_next_pass_drops_a_moved_page(store_config,
         assert (worker._swap_retargeted, worker._swap_dropped) == (0, 1)
 
 
-def test_snapshotted_and_unordered_pages_are_kept_as_listed(store_config, fake_store):
+def test_snapshotted_and_unordered_pages_are_kept_as_listed(store_config, fake_store):  # noqa: F811
     with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
         saves = [
             RequestTransfers(
@@ -163,12 +182,14 @@ def test_snapshotted_and_unordered_pages_are_kept_as_listed(store_config, fake_s
                 ],
             )
         ]
-        out = worker._recheck_after_commit(saves, {(1, 4): (0, 0xABC000, 4096)}, lambda rid: [[9, 9], [9, 9]], True)
+        out = worker._recheck_after_commit(
+            saves, {(1, 4): (0, 0xABC000, 4096)}, lambda rid: [[9, 9], [9, 9]], True
+        )
         assert [(p.layer_group_id, p.page_index) for p in out[0].pages] == [(1, 4), (0, 3)]
         assert worker._swap_checked == 0
 
 
-def test_an_emptied_entry_still_retires_its_request(store_config, fake_store, fake_events):
+def test_an_emptied_entry_still_retires_its_request(store_config, fake_store, fake_events):  # noqa: F811
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker._save_staging = None
         table = {9: [[0, 4]]}
@@ -181,7 +202,12 @@ def test_an_emptied_entry_still_retires_its_request(store_config, fake_store, fa
         assert fake_store.put_calls == [] and worker._swap_dropped == 1
 
 
-def test_window_retirements_stay_behind_their_saves(store_config, fake_store, fake_events, monkeypatch):
+def test_window_retirements_stay_behind_their_saves(
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+    fake_events,
+    monkeypatch,  # noqa: F811
+):
     monkeypatch.setenv(worker_module.WINDOW_KEEP_ENV, "2")
     with make_worker(fake_store, layout=make_window_layout(num_slots=32)) as worker:
         worker._save_staging = None
@@ -196,7 +222,7 @@ def test_window_retirements_stay_behind_their_saves(store_config, fake_store, fa
         assert fake_store.put_calls
 
 
-def test_shutdown_hands_over_what_is_held(store_config, fake_store, fake_events):
+def test_shutdown_hands_over_what_is_held(store_config, fake_store, fake_events):  # noqa: F811
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker._save_staging = None
         worker.bind_local_page_indices(lambda request_id: [[0, 4]])
@@ -206,7 +232,7 @@ def test_shutdown_hands_over_what_is_held(store_config, fake_store, fake_events)
     assert worker._outstanding_saves.get(9, 0) == 0
 
 
-def test_the_guard_is_on_by_default(store_config, fake_store, monkeypatch):
+def test_the_guard_is_on_by_default(store_config, fake_store, monkeypatch):  # noqa: F811
     monkeypatch.delenv(worker_module.COMMIT_SWAP_GUARD_ENV, raising=False)
     with make_worker(fake_store, layout=make_layout()) as worker:
         assert worker._swap_guard is True

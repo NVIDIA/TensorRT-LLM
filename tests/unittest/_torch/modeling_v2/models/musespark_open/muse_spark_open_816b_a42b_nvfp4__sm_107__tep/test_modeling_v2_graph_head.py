@@ -49,7 +49,9 @@ def test_overlap_fold_writes_the_builtin_adds_in_a_graph(fold, requests):
     applier = ia.build_applier(fold)
     rows = 8 * requests
     gen = torch.Generator(device="cuda").manual_seed(requests)
-    pos0 = torch.randint(-(2**31), 2**31 - 1, (1, rows), dtype=torch.int32, device="cuda", generator=gen)
+    pos0 = torch.randint(
+        -(2**31), 2**31 - 1, (1, rows), dtype=torch.int32, device="cuda", generator=gen
+    )
     pos0[0, 0] = 2**31 - 1
     pos_off = torch.randint(-50, 50, (rows,), dtype=torch.int32, device="cuda", generator=gen)
     pos_off[0] = 7

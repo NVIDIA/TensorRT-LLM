@@ -48,6 +48,7 @@ def test_agentic_turns_reuse_and_match_from_scratch():
     rng = random.Random(7)
     memo = keys._ChainMemo(256 << 20)
     prompt = _rand(rng, 32 * 300 + 17)
+    prev_len = prev_reused = 0
     for turn in range(8):
         got, _ = _chain(prompt, memo=memo)
         ref, _ = _chain(prompt, memo=None)

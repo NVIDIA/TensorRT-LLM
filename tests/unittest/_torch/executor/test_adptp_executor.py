@@ -33,7 +33,12 @@ TP, GT = 8, 4  # DP2TP4: 8 ranks, 2 groups of 4
 @pytest.fixture
 def clean_env():
     with mock.patch.dict(os.environ, {}, clear=False):
-        for name in (adp_groups.ENV, adp_groups.LEGACY_ENV, adp_groups.CHECK_ENV, adp_groups.LEGACY_CHECK_ENV):
+        for name in (
+            adp_groups.ENV,
+            adp_groups.LEGACY_ENV,
+            adp_groups.CHECK_ENV,
+            adp_groups.LEGACY_CHECK_ENV,
+        ):
             os.environ.pop(name, None)
         yield
 
@@ -45,8 +50,16 @@ def grouped(clean_env):
 
 
 def _mapping(tp_rank=0):
-    return SimpleNamespace(enable_attention_dp=True, tp_size=TP, tp_rank=tp_rank, pp_size=1, cp_size=1,
-                           enable_lm_head_tp_in_adp=False, dp_size=TP, tp_group=list(range(TP)))
+    return SimpleNamespace(
+        enable_attention_dp=True,
+        tp_size=TP,
+        tp_rank=tp_rank,
+        pp_size=1,
+        cp_size=1,
+        enable_lm_head_tp_in_adp=False,
+        dp_size=TP,
+        tp_group=list(range(TP)),
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -55,7 +68,9 @@ def _mapping(tp_rank=0):
 
 
 def _req(rid, ntok, last):
-    return SimpleNamespace(py_request_id=rid, get_num_tokens=lambda beam: ntok, get_last_tokens=lambda beam: last)
+    return SimpleNamespace(
+        py_request_id=rid, get_num_tokens=lambda beam: ntok, get_last_tokens=lambda beam: last
+    )
 
 
 def _batch(reqs):
@@ -84,8 +99,13 @@ class _GatherDist:
 
 
 def _executor_self(dist, group_tp, check):
-    return SimpleNamespace(enable_attention_dp=True, dist=dist, _adp_group_tp=group_tp,
-                           _adp_dp_rank=dist.tp_rank // group_tp, _adp_group_check=check)
+    return SimpleNamespace(
+        enable_attention_dp=True,
+        dist=dist,
+        _adp_group_tp=group_tp,
+        _adp_dp_rank=dist.tp_rank // group_tp,
+        _adp_group_check=check,
+    )
 
 
 class TestCanQueueLockstep:
@@ -104,7 +124,10 @@ class TestCanQueueLockstep:
 
     def test_signature_matches(self, grouped):
         dist = _GatherDist()
-        assert PyExecutor._can_queue(_executor_self(dist, GT, True), _batch(self.REQS)) == (True, True)
+        assert PyExecutor._can_queue(_executor_self(dist, GT, True), _batch(self.REQS)) == (
+            True,
+            True,
+        )
         sig = adp_groups.batch_signature([(11, 100, 7), (12, 40, 3)])
         assert dist.sent == [[2, sig]]
 
@@ -119,18 +142,30 @@ class TestCanQueueLockstep:
         """Different groups schedule different batches; only intra-group divergence is an error."""
         other = adp_groups.batch_signature([(99, 5, 1)])
         dist = _GatherDist(override={r: (lambda v: [1, other]) for r in range(4, 8)})
-        assert PyExecutor._can_queue(_executor_self(dist, GT, True), _batch(self.REQS)) == (True, True)
+        assert PyExecutor._can_queue(_executor_self(dist, GT, True), _batch(self.REQS)) == (
+            True,
+            True,
+        )
 
     def test_empty_group_blocks_queue_like_stock(self, grouped):
-        dist = _GatherDist(override={r: (lambda v: [0, adp_groups.batch_signature([])]) for r in range(4, 8)})
-        assert PyExecutor._can_queue(_executor_self(dist, GT, True), _batch(self.REQS)) == (False, True)
+        dist = _GatherDist(
+            override={r: (lambda v: [0, adp_groups.batch_signature([])]) for r in range(4, 8)}
+        )
+        assert PyExecutor._can_queue(_executor_self(dist, GT, True), _batch(self.REQS)) == (
+            False,
+            True,
+        )
 
 
 class TestAdmissionCapacity:
     def test_capacity(self, clean_env):
         for group_tp, expect in ((1, TP * 16), (4, 2 * 16), (8, 16)):
-            fake = SimpleNamespace(enable_attention_dp=True, dist=SimpleNamespace(tp_size=TP),
-                                   _adp_group_tp=group_tp, max_num_active_requests=16)
+            fake = SimpleNamespace(
+                enable_attention_dp=True,
+                dist=SimpleNamespace(tp_size=TP),
+                _adp_group_tp=group_tp,
+                max_num_active_requests=16,
+            )
             assert PyExecutor._get_request_admission_capacity(fake) == expect
 
 
@@ -217,8 +252,10 @@ def _item(req_id, n=100, conv=None):
 
 
 def _group_states(per_group_active):
-    per_rank = [RankState(rank=r, num_active_requests=per_group_active[r // GT], num_active_tokens=0)
-                for r in range(TP)]
+    per_rank = [
+        RankState(rank=r, num_active_requests=per_group_active[r // GT], num_active_tokens=0)
+        for r in range(TP)
+    ]
     return adp_groups.route_states(per_rank, GT)
 
 
@@ -235,7 +272,9 @@ def test_kv_router_collapses_prefix_matches_to_groups(grouped):
         assert router._group_tp == GT
         router.gather_prefix_matches([_item(7)])
         assert router._all_ranks_prefix_matches == [{7: 0}, {7: 90}]
-        out, _ = router.route_requests(_group_states([0, 0]), [_item(7)], max_num_active_requests=48)
+        out, _ = router.route_requests(
+            _group_states([0, 0]), [_item(7)], max_num_active_requests=48
+        )
         assert set(out) == {0, 1}
         assert [len(out[0]), len(out[1])] == [0, 1]
 
@@ -248,10 +287,14 @@ def test_kv_router_match_len_reads_group_tables(grouped):
 
 
 def test_kv_router_warmup_spans_groups(grouped):
-    router = KVCacheAwareADPRouter(dist=_dist(0), kv_cache_manager=MagicMock(), cold_start_warmup=True)
+    router = KVCacheAwareADPRouter(
+        dist=_dist(0), kv_cache_manager=MagicMock(), cold_start_warmup=True
+    )
     assert router._pending_warmup_ranks == {0, 1}
     router._all_ranks_prefix_matches = [{}, {}]
-    out, _ = router.route_requests(_group_states([0, 0]), [_item(1), _item(2)], max_num_active_requests=48)
+    out, _ = router.route_requests(
+        _group_states([0, 0]), [_item(1), _item(2)], max_num_active_requests=48
+    )
     assert [len(out[0]), len(out[1])] == [1, 1]
     assert router._pending_warmup_ranks == set()
 
@@ -265,7 +308,9 @@ def test_kv_router_load_cap_overrides_affinity(grouped):
 
 def test_kv_router_stock_unchanged_without_groups(clean_env):
     gathered = [[7, r * 10] for r in range(TP)]
-    router = KVCacheAwareADPRouter(dist=_dist(0, gathered), kv_cache_manager=MagicMock(), cold_start_warmup=True)
+    router = KVCacheAwareADPRouter(
+        dist=_dist(0, gathered), kv_cache_manager=MagicMock(), cold_start_warmup=True
+    )
     assert router._group_tp == 1
     assert router._pending_warmup_ranks == set(range(TP))
     router.gather_prefix_matches([_item(7)])
@@ -274,14 +319,27 @@ def test_kv_router_stock_unchanged_without_groups(clean_env):
 
 
 def test_conversation_router_sticks_to_group(grouped):
-    routers = [ConversationAwareADPRouter(dist=_dist(r), new_conv_placement="least_tokens") for r in range(TP)]
-    first = [rt.route_requests(_group_states([0, 0]), [_item(1, conv="a"), _item(2, conv="b")], 48)[0]
-             for rt in routers]
+    routers = [
+        ConversationAwareADPRouter(dist=_dist(r), new_conv_placement="least_tokens")
+        for r in range(TP)
+    ]
+    first = [
+        rt.route_requests(_group_states([0, 0]), [_item(1, conv="a"), _item(2, conv="b")], 48)[0]
+        for rt in routers
+    ]
     assert all(set(o) == {0, 1} for o in first)
-    where = {it.request.py_conversation_params.conversation_id: g for g, its in first[0].items() for it in its}
+    where = {
+        it.request.py_conversation_params.conversation_id: g
+        for g, its in first[0].items()
+        for it in its
+    }
     assert sorted(where.values()) == [0, 1]
     for o in first:  # every rank made the same choice
-        assert {it.request.py_conversation_params.conversation_id: g for g, its in o.items() for it in its} == where
+        assert {
+            it.request.py_conversation_params.conversation_id: g
+            for g, its in o.items()
+            for it in its
+        } == where
     busy = [0, 0]
     busy[where["a"]] = 20
     nxt = routers[0].route_requests(_group_states(busy), [_item(3, conv="a")], 48)[0]

@@ -184,9 +184,13 @@ class RankState:
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
             num_retiring_requests=rank_values[3],
-            iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:stats_end]),
+            iter_stats=RankIterStatsPayload.deserialize(
+                values[rank_state_prefix_field_count:stats_end]
+            ),
             num_connector_transfers=values[stats_end] if len(values) > stats_end else 0,
-            connector_poll_failed=bool(values[stats_end + 1]) if len(values) > stats_end + 1 else False,
+            connector_poll_failed=bool(values[stats_end + 1])
+            if len(values) > stats_end + 1
+            else False,
         )
 
 

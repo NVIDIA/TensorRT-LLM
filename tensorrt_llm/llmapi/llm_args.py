@@ -2552,17 +2552,25 @@ class MooncakeStoreConfig(StrictBaseModel):
         "pin GPU pages; costs a copy each way. Ignored when role is "
         "'capacity'.")
     staging_buffer_bytes: int = Field(
-        512 * (1 << 20), gt=0, telemetry=False,
-        description="Pinned staging budget per direction; split over asynchronous loaders.")
+        512 * (1 << 20),
+        gt=0,
+        telemetry=False,
+        description=
+        "Pinned staging budget per direction; split over asynchronous loaders.")
     async_load: Optional[bool] = Field(
-        None, telemetry=False,
-        description="Park prefix loads for background loading. None turns it on under attention DP "
+        None,
+        telemetry=False,
+        description=
+        "Park prefix loads for background loading. None turns it on under attention DP "
         "or on one rank and off elsewhere; true also turns it on under tensor parallelism, "
         "where every rank loads its own shard and a failed load is fatal. "
         "TRTLLM_MOONCAKE_DISABLE_ASYNC_LOAD=1 turns it off.")
     async_load_workers: int = Field(
-        2, ge=1, telemetry=False,
-        description="Loader threads with independent CUDA streams and staging slots.")
+        2,
+        ge=1,
+        telemetry=False,
+        description=
+        "Loader threads with independent CUDA streams and staging slots.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,

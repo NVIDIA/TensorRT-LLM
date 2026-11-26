@@ -123,7 +123,9 @@ def test_followers_get_the_same_object_graph(world, monkeypatch):
 
 def test_attention_dp_and_single_rank_never_broadcast(world, monkeypatch):
     meta = _metadata()
-    assert _run(_manager(leader=True, keep_root=True, adp=True), lambda: meta, keep_root=True) is meta
+    assert (
+        _run(_manager(leader=True, keep_root=True, adp=True), lambda: meta, keep_root=True) is meta
+    )
     monkeypatch.setattr(kvc, "global_mpi_size", lambda: 1)
     assert _run(_manager(leader=True, keep_root=True), lambda: meta, keep_root=True) is meta
     assert world.broadcasts == [] and world.comm.sent == []

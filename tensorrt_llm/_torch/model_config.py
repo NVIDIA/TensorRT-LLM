@@ -1446,7 +1446,8 @@ class ModelConfig(Generic[TConfig]):
         # Attention DP should not shard attention heads; use attn_tp_size=1 in that case
         # so downstream KV calculations see the full (non-partitioned) head count.
         # (or, with attention-DP groups, the group's attention TP: adp_groups).
-        attn_tp_size = (self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else
+        attn_tp_size = (self.mapping.attn_tp_size
+                        if not self.mapping.enable_attention_dp else
                         adp_groups.attn_tp_size(self.mapping))
         attn_cp_size = self.mapping.attn_cp_size
 

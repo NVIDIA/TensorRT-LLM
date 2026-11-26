@@ -78,7 +78,7 @@ def test_launch_gate_is_off_by_default(monkeypatch):
 
 
 @pytest.mark.parametrize("gated", [False, True])
-def test_gated_async_load_still_lands(store_config, fake_store, staged_copies, monkeypatch, gated):
+def test_gated_async_load_still_lands(store_config, fake_store, staged_copies, monkeypatch, gated):  # noqa: F811
     """With the gate on, a parked load waits for the next launch and then lands as before."""
     if gated:
         monkeypatch.setenv(worker_module.LOAD_AFTER_LAUNCH_ENV, "1")

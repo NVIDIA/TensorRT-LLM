@@ -94,6 +94,7 @@ def batch_copy_mode() -> Optional[str]:
     """The configured batched-copy mode (None when the per-region loop is in use)."""
     return _BATCH_COPY
 
+
 #: Ceiling on the pinned allocation per direction, bounding what a large page
 #: times a large batch could demand. The memory is pinned for the process's
 #: lifetime and comes out of the DRAM the pool segment is charged against.
@@ -160,7 +161,9 @@ def _memcpy_batch_async(dsts: List[int], srcs: List[int], sizes: List[int], stre
         dsts, srcs, sizes, len(dsts), [_BATCH_ATTR], [0], 1, stream
     )[0]
     if status != cudart.cudaError_t.cudaSuccess:
-        raise RuntimeError(f"cudaMemcpyBatchAsync of {len(dsts)} KV page regions failed with {status}")
+        raise RuntimeError(
+            f"cudaMemcpyBatchAsync of {len(dsts)} KV page regions failed with {status}"
+        )
 
 
 def _log_mode_once(mode: str) -> None:
@@ -168,7 +171,9 @@ def _log_mode_once(mode: str) -> None:
         if mode in _MODE_LOGGED:
             return
         _MODE_LOGGED.add(mode)
-    logger.warning(f"mooncake-store staging: {BATCH_COPY_ENV}={_BATCH_COPY}, issuing copies as '{mode}'")
+    logger.warning(
+        f"mooncake-store staging: {BATCH_COPY_ENV}={_BATCH_COPY}, issuing copies as '{mode}'"
+    )
 
 
 def _plan_copies(
@@ -194,7 +199,12 @@ def _plan_copies(
     position = np.arange(flat_sizes.size, dtype=np.int64) - first
     keep = flat_sizes > 0  # an empty region moves no bytes
     if not keep.all():
-        flat_dev, host, flat_sizes, position = flat_dev[keep], host[keep], flat_sizes[keep], position[keep]
+        flat_dev, host, flat_sizes, position = (
+            flat_dev[keep],
+            host[keep],
+            flat_sizes[keep],
+            position[keep],
+        )
         if flat_sizes.size == 0:
             return None
     return flat_dev, host, flat_sizes, position
@@ -293,7 +303,9 @@ def _batched_copy(
             # Copies are idempotent (same source bytes), so re-issuing all of them as 2D runs is safe even if
             # the batch call issued some before failing.
             _BATCH_API_BROKEN = True
-            logger.warning(f"mooncake-store staging: {exc}; using cudaMemcpy2DAsync runs from now on")
+            logger.warning(
+                f"mooncake-store staging: {exc}; using cudaMemcpy2DAsync runs from now on"
+            )
     _issue_2d(dst, src, size, position, kind, stream)
     _log_mode_once("2d")
     return True

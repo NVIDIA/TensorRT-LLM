@@ -21,7 +21,6 @@ from test_mooncake_store_connector import (  # noqa: F401 (fixtures)
 
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.stored_set import LocalStoredSet
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import PrefixHit
 
 pytestmark = pytest.mark.cpu_only
 
@@ -69,7 +68,7 @@ def hashes_for(n, salt=0):
     return [bytes([salt, index % 256, index // 256]) * 5 + b"\x00" for index in range(n)]
 
 
-def random_store(rng, fake_store, peers, hashes, window_group=None, worker=None):
+def random_store(rng, fake_store, peers, hashes, window_group=None, worker=None):  # noqa: F811
     """Full-attention runs per rank with holes and partial-rank saves; windows at a few prompt ends."""
     fake_store.objects.clear()
     n = len(hashes)
@@ -210,13 +209,19 @@ def test_find_prefix_hit_matches_with_windows_rewinds_and_fallback(store_config,
             set_mode(worker, staged=False)
             before = dict(worker._lookup_stats.counts)
             expected = worker.find_prefix_hit(candidates, first_block, rewind)
-            outcome = {k: v - before[k] for k, v in worker._lookup_stats.counts.items() if v != before[k]}
+            outcome = {
+                k: v - before[k] for k, v in worker._lookup_stats.counts.items() if v != before[k]
+            }
             for staged, reuse_ms in ((True, 0), (False, 1000), (True, 1000)):
                 set_mode(worker, staged=staged, reuse_ms=reuse_ms)
                 for _repeat in range(2):
                     before = dict(worker._lookup_stats.counts)
                     assert worker.find_prefix_hit(candidates, first_block, rewind) == expected
-                    got = {k: v - before[k] for k, v in worker._lookup_stats.counts.items() if v != before[k]}
+                    got = {
+                        k: v - before[k]
+                        for k, v in worker._lookup_stats.counts.items()
+                        if v != before[k]
+                    }
                     assert got == outcome
 
 
@@ -345,7 +350,10 @@ def test_loaded_pages_join_the_local_stored_set(store_config, fake_store, monkey
             fake_store.objects.update(keys)
             transfers = RequestTransfers(
                 request_id=1,
-                pages=[PageTransfer(layer_group_id=0, page_index=i, block_hash=h) for i, h in enumerate(hashes)],
+                pages=[
+                    PageTransfer(layer_group_id=0, page_index=i, block_hash=h)
+                    for i, h in enumerate(hashes)
+                ],
             )
             worker._load_pages([transfers], None, 0)
             assert worker._local_stored.known(keys) == [on] * 3

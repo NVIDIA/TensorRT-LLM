@@ -91,7 +91,9 @@ def test_pin_uses_the_executor_device_not_the_threads_current_device(monkeypatch
     monkeypatch.setenv(ea.EXECUTOR_PIN_ENV, "1")
     monkeypatch.setattr(ea, "_pinned", None)
     seen = []
-    monkeypatch.setattr(ea, "_pin", lambda rank, device=None: seen.append((rank, device)) or f"cpus=x gpu={device}")
+    monkeypatch.setattr(
+        ea, "_pin", lambda rank, device=None: seen.append((rank, device)) or f"cpus=x gpu={device}"
+    )
     assert ea.maybe_pin_executor_thread(2, 2) == "cpus=x gpu=2"
     assert seen == [(2, 2)]
     assert "M31_EXEC_PIN_ARMED rank=2 cpus=x gpu=2" in capfd.readouterr().err

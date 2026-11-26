@@ -50,13 +50,20 @@ def _stage_bytes(tactic) -> int:
 def fold_tactic(tactic) -> "_splitk.SplitKTactic | None":
     """``tactic`` (a split-K tuple / ``SplitKTactic``) with its stages lowered until the parent's shared memory plus
     the staging buffer fit the split-K kernel's configured capacity, or None (split_k > 1, no stage fits)."""
-    t = _splitk.SplitKTactic(*tuple(tactic)) if not isinstance(tactic, _splitk.SplitKTactic) else tactic
+    t = (
+        _splitk.SplitKTactic(*tuple(tactic))
+        if not isinstance(tactic, _splitk.SplitKTactic)
+        else tactic
+    )
     if t.split_k != 1 or t.mma_m not in (64, 128):
         return None
     _splitk._resolve_smem_capacity()
     for stages in range(t.ab_stages, 1, -1):
         candidate = _splitk.SplitKTactic(t.mma_m, t.mma_n, 1, stages)
-        if _splitk._smem_bytes(candidate, stages) + _stage_bytes(candidate) + 1024 <= _splitk._SMEM_CAPACITY_BYTES:
+        if (
+            _splitk._smem_bytes(candidate, stages) + _stage_bytes(candidate) + 1024
+            <= _splitk._SMEM_CAPACITY_BYTES
+        ):
             return candidate
     return None
 
@@ -97,7 +104,9 @@ class SiluFoldKernel(_splitk.SplitKDenseGemmKernel):
         self.half_m = tactic.mma_m // 2
         need = _splitk._smem_bytes(tactic, tactic.ab_stages) + _stage_bytes(tactic) + 1024
         self.launch_smem = (
-            _splitk._SMEM_CAPACITY_BYTES if need > _splitk._OPTIN_SMEM_BYTES else _splitk._OPTIN_SMEM_BYTES
+            _splitk._SMEM_CAPACITY_BYTES
+            if need > _splitk._OPTIN_SMEM_BYTES
+            else _splitk._OPTIN_SMEM_BYTES
         )
 
     @cute.experimental.jit
@@ -297,7 +306,9 @@ class SiluFoldKernel(_splitk.SplitKDenseGemmKernel):
         rmem_layout = _cute_ext.make_t2r_rmem_layout(tiled_copy_t2r, sStage_epi, epi_tid)
         rAcc = _cute_ext.allocate(self.acc_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32)
         rD = _cute_ext.allocate(c_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32)
-        rWide = _cute_ext.allocate(self.acc_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32)
+        rWide = _cute_ext.allocate(
+            self.acc_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32
+        )
         thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
@@ -341,7 +352,9 @@ def _bmm_silu(
 
 
 @functools.cache
-def _compiled(dtype: torch.dtype, tactic: "_splitk.SplitKTactic", use_pdl: bool, leading_dims: tuple):
+def _compiled(
+    dtype: torch.dtype, tactic: "_splitk.SplitKTactic", use_pdl: bool, leading_dims: tuple
+):
     kernel = SiluFoldKernel(tactic=tactic, use_pdl=use_pdl)
     compile_tensors = _splitk._make_compile_repr_tensors(dtype, False, *leading_dims)
     stream = _cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -373,7 +386,8 @@ def silu_fold_gemm(
     c_swap = out.unsqueeze(0).transpose(-2, -1)
     leading_dims = tuple(_splitk._detect_leading_dim(t) for t in (a_swap, b_swap, c_swap))
     cute_tensors = tuple(
-        _splitk._from_dlpack_dynamic(t, d) for t, d in zip((a_swap, b_swap, c_swap), leading_dims, strict=True)
+        _splitk._from_dlpack_dynamic(t, d)
+        for t, d in zip((a_swap, b_swap, c_swap), leading_dims, strict=True)
     )
     compiled = _compiled(x.dtype, tactic, bool(enable_pdl), leading_dims)
     compiled(*cute_tensors, _cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream))

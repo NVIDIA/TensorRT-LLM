@@ -124,7 +124,9 @@ class DrafterSiluAndMul(OpWrapper):
         gate_up weight); the output is the plain order's, bit for bit (the same statements per element)."""
         rows, width = x.shape
         if half and width % (2 * half):
-            raise ValueError(f"drafter_silu_and_mul: width {width} is not a multiple of 2 * half ({half})")
+            raise ValueError(
+                f"drafter_silu_and_mul: width {width} is not a multiple of 2 * half ({half})"
+            )
         d = width // 2
         out = torch.empty((rows, d), dtype=x.dtype, device=x.device)
         if rows == 0:
@@ -149,7 +151,10 @@ class DrafterSiluAndMul(OpWrapper):
         """fp32 ``silu(gate) * up``, one rounding to ``x.dtype``. ``entry_trigger`` is ignored."""
         if half:
             tiles = x.reshape(x.shape[0], x.shape[1] // (2 * half), 2, half)
-            x = torch.cat((tiles[:, :, 0].reshape(x.shape[0], -1), tiles[:, :, 1].reshape(x.shape[0], -1)), dim=1)
+            x = torch.cat(
+                (tiles[:, :, 0].reshape(x.shape[0], -1), tiles[:, :, 1].reshape(x.shape[0], -1)),
+                dim=1,
+            )
         d = x.shape[1] // 2
         gate, up = x[:, :d].float(), x[:, d:].float()
         return (gate * torch.sigmoid(gate) * up).to(x.dtype)

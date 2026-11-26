@@ -371,10 +371,14 @@ def _dflash_verify_fold_grid_kernel(
     slot = tl.load(slots_ptr + g)
     ctx_len = tl.load(ctx_len_ptr + slot).to(tl.int64)
     ctx_now = tl.minimum(ctx_len + accepted64, max_ctx)
-    tl.store(query_positions_ptr + g * block_size + qcols, ctx_now + qcols.to(tl.int64), mask=in_block)
+    tl.store(
+        query_positions_ptr + g * block_size + qcols, ctx_now + qcols.to(tl.int64), mask=in_block
+    )
     tl.store(ctx_positions_ptr + g * row_width + cols, ctx_len + cols.to(tl.int64), mask=in_row)
     tl.store(embed_ids_ptr + g, bonus)
-    tl.store(noise_ids_ptr + g * block_size + qcols, tl.where(qcols == 0, bonus, mask_id), mask=in_block)
+    tl.store(
+        noise_ids_ptr + g * block_size + qcols, tl.where(qcols == 0, bonus, mask_id), mask=in_block
+    )
 
 
 class DflashVerifyFold(OpWrapper):

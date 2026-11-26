@@ -26,7 +26,6 @@ from test_mooncake_store_connector import (  # noqa: F401 (fixtures)
 )
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import SchedulerOutput
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import PageAddressing
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     MooncakeStoreMetadata,
@@ -40,17 +39,21 @@ pytestmark = pytest.mark.cpu_only
 HASH = b"\x05" * 16
 
 
-def test_scheduler_tags_every_page_with_its_block_ordinal(store_config):
+def test_scheduler_tags_every_page_with_its_block_ordinal(store_config):  # noqa: F811
     scheduler = make_scheduler(store_config, hit_blocks=2)
     tokens = list(range(5 * TOKENS_PER_BLOCK))
     scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
     output = SchedulerOutput(new_requests=[request_data(1, tokens, [10, 11, 12, 13, 14])])
     metadata = scheduler.build_connector_meta(output)
     assert [(p.page_index, p.block_ordinal) for p in metadata.loads[0].pages] == [(10, 0), (11, 1)]
-    assert [(p.page_index, p.block_ordinal) for p in metadata.saves[0].pages] == [(12, 2), (13, 3), (14, 4)]
+    assert [(p.page_index, p.block_ordinal) for p in metadata.saves[0].pages] == [
+        (12, 2),
+        (13, 3),
+        (14, 4),
+    ]
 
 
-def test_narrowing_does_not_replay_deltas(store_config):
+def test_narrowing_does_not_replay_deltas(store_config):  # noqa: F811
     """release_unstarted_prefix_loads asks again for the trimmed output: ordinals must not shift."""
     scheduler = make_scheduler(store_config, hit_blocks=0)
     tokens = list(range(3 * TOKENS_PER_BLOCK))
@@ -74,7 +77,7 @@ def test_narrowing_does_not_replay_deltas(store_config):
     assert scheduler.narrow_connector_meta(other).saves == []
 
 
-def test_localize_uses_this_ranks_slots(store_config, fake_store):
+def test_localize_uses_this_ranks_slots(store_config, fake_store):  # noqa: F811
     # Rank 0 put request 7's blocks 0..2 on slots 1, 2, 3; this rank on 1, 6, 3.
     tables = {7: [[1, 6, 3]]}
     with make_worker(fake_store, layout=make_layout()) as worker:
@@ -82,7 +85,9 @@ def test_localize_uses_this_ranks_slots(store_config, fake_store):
         metadata = MooncakeStoreMetadata(
             loads=[RequestTransfers(7, [PageTransfer(HASH, 0, 1, 0)])],
             saves=[RequestTransfers(7, [PageTransfer(HASH, 0, 2, 1), PageTransfer(HASH, 0, 3, 2)])],
-            prefix_loads=[PrefixLoadTransfers(4, True, RequestTransfers(7, [PageTransfer(HASH, 0, 2, 1)]))],
+            prefix_loads=[
+                PrefixLoadTransfers(4, True, RequestTransfers(7, [PageTransfer(HASH, 0, 2, 1)]))
+            ],
         )
         worker._localize(metadata)
         assert [p.page_index for p in metadata.loads[0].pages] == [1]
@@ -96,15 +101,17 @@ def test_localize_uses_this_ranks_slots(store_config, fake_store):
         assert [p.page_index for p in metadata.saves[0].pages] == [6, 3]
 
 
-def test_a_transfer_without_an_ordinal_keeps_its_slot(store_config, fake_store):
+def test_a_transfer_without_an_ordinal_keeps_its_slot(store_config, fake_store):  # noqa: F811
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker.bind_local_page_indices(lambda request_id: [[4, 4, 4]])
-        metadata = SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(HASH, 0, 2)])], saves=[])
+        metadata = SimpleNamespace(
+            loads=[RequestTransfers(7, [PageTransfer(HASH, 0, 2)])], saves=[]
+        )
         worker._localize(metadata)
         assert [p.page_index for p in metadata.loads[0].pages] == [2]
 
 
-def test_without_a_resolver_nothing_changes(store_config, fake_store):
+def test_without_a_resolver_nothing_changes(store_config, fake_store):  # noqa: F811
     with make_worker(fake_store, layout=make_layout()) as worker:
         assert worker.get_local_page_indices() is None
         metadata = MooncakeStoreMetadata(saves=[RequestTransfers(7, [PageTransfer(HASH, 0, 2, 1)])])
@@ -112,7 +119,7 @@ def test_without_a_resolver_nothing_changes(store_config, fake_store):
         assert [p.page_index for p in metadata.saves[0].pages] == [2]
 
 
-def test_a_save_page_with_no_slot_here_is_dropped(store_config, fake_store):
+def test_a_save_page_with_no_slot_here_is_dropped(store_config, fake_store):  # noqa: F811
     with make_worker(fake_store, layout=make_layout()) as worker:
         # This rank's cache for request 7 is gone (or the block has no page): never save someone else's page.
         worker.bind_local_page_indices(lambda request_id: [[1, -1]])
@@ -124,7 +131,7 @@ def test_a_save_page_with_no_slot_here_is_dropped(store_config, fake_store):
         assert worker._unresolved_save_pages == 1
 
 
-def test_a_load_with_no_slot_here_raises(store_config, fake_store):
+def test_a_load_with_no_slot_here_raises(store_config, fake_store):  # noqa: F811
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker.bind_local_page_indices(lambda request_id: [[]])
         metadata = MooncakeStoreMetadata(loads=[RequestTransfers(7, [PageTransfer(HASH, 0, 1, 0)])])
@@ -132,7 +139,7 @@ def test_a_load_with_no_slot_here_raises(store_config, fake_store):
             worker._localize(metadata)
 
 
-def test_a_load_lands_in_this_ranks_slot(store_config, fake_store, staged_copies):
+def test_a_load_lands_in_this_ranks_slot(store_config, fake_store, staged_copies):  # noqa: F811
     layout = make_layout(regions_per_group=2)
     with make_staged_worker(fake_store, store_config, layout=layout) as worker:
         fake_store.objects.add(worker._namespaces[0].key(HASH))
@@ -148,7 +155,7 @@ def test_a_load_lands_in_this_ranks_slot(store_config, fake_store, staged_copies
         assert not set(rank0_addresses) & {dst for dst, _, _ in staged_copies}
 
 
-def test_a_save_reads_this_ranks_slot(store_config, fake_store, staged_copies):
+def test_a_save_reads_this_ranks_slot(store_config, fake_store, staged_copies):  # noqa: F811
     layout = make_layout(regions_per_group=2)
     with make_staged_worker(fake_store, store_config, layout=layout) as worker:
         # Rank 0's slot for block 1 is 4; this rank's is 6.
@@ -169,7 +176,7 @@ class _Stream:
         self.cuda_stream = handle
 
 
-def test_hand_off_also_orders_behind_the_execution_stream(store_config, fake_store):
+def test_hand_off_also_orders_behind_the_execution_stream(store_config, fake_store):  # noqa: F811
     with make_worker(fake_store, layout=make_layout()) as worker:
         current, execution = _Stream(11), _Stream(22)
         assert worker._handoff_streams(current) == [current]
@@ -179,7 +186,7 @@ def test_hand_off_also_orders_behind_the_execution_stream(store_config, fake_sto
         assert len(worker._handoff_streams(_Stream(22))) == 1
 
 
-def test_narrowing_keeps_the_window_retirements_of_the_kept_requests(store_config):
+def test_narrowing_keeps_the_window_retirements_of_the_kept_requests(store_config):  # noqa: F811
     """Window retirement (TRTLLM_MOONCAKE_STORE_WINDOW_KEEP) lists prompt ends in the metadata; narrowing keeps them."""
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import WindowRetire
 

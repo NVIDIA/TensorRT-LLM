@@ -506,7 +506,9 @@ def test_put_retries_a_failed_page_unless_disabled(store_config, fake_store, mon
 
     monkeypatch.setattr(fake_store, "batch_put_from_multi_buffers", flaky_put)
     with make_worker(fake_store, layout=make_layout()) as worker:
-        worker._save_staging = None  # the PR always stages; test the put/retry logic without a device copy
+        worker._save_staging = (
+            None  # the PR always stages; test the put/retry logic without a device copy
+        )
         block_hash = b"\x09" * 16
         written, present, _ = worker._put([RequestTransfers(1, [PageTransfer(block_hash, 0, 2)])])
         key = worker._namespaces[0].key(block_hash)
@@ -1308,8 +1310,13 @@ class LifeCycleWindowWorker(FakeWindowWorker):
         return 0, max(0, (history_length + 1 - WINDOW) // TOKENS_PER_BLOCK)
 
 
-@pytest.mark.parametrize("tail, expected", [(0, [24, 25]), (TOKENS_PER_BLOCK - 2, [24, 25]), (TOKENS_PER_BLOCK - 1, [25])])
-def test_scheduler_window_save_skips_the_block_the_full_prompt_commit_releases(store_config, tail, expected):
+@pytest.mark.parametrize(
+    "tail, expected",
+    [(0, [24, 25]), (TOKENS_PER_BLOCK - 2, [24, 25]), (TOKENS_PER_BLOCK - 1, [25])],
+)
+def test_scheduler_window_save_skips_the_block_the_full_prompt_commit_releases(
+    store_config, tail, expected
+):
     """F1 (31 mod 32): with len % tpb == tpb - 1 the last chunk's commit to the full
     length unlocks one more window block than the block-aligned end; it is not saved."""
     scheduler = make_window_scheduler(store_config)
@@ -1769,7 +1776,11 @@ def test_page_digests_record_save_load_and_retirement(
 
         memory[loaded_page] = b"saved-bytes"  # what a correct load leaves on the device
         worker.bind_connector_meta(
-            SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])], saves=[], prefix_loads=())
+            SimpleNamespace(
+                loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])],
+                saves=[],
+                prefix_loads=(),
+            )
         )
         worker.start_load_kv(None)
         path = worker._page_digest.path
@@ -1787,8 +1798,6 @@ def test_page_digests_are_off_by_default(store_config, fake_store, monkeypatch):
     monkeypatch.delenv("TRTLLM_MC_PAGE_DIGEST_DIR", raising=False)
     with make_worker(fake_store, layout=make_layout()) as worker:
         assert worker._page_digest is None
-
-
 
 
 def test_put_ships_window_pages_from_their_snapshot_slots(store_config, fake_store):
@@ -1812,7 +1821,10 @@ def test_put_ships_window_pages_from_their_snapshot_slots(store_config, fake_sto
                 by_key[key] = (address, size)
         assert by_key[worker._namespaces[1].key(window_hash)] == ([0xABC000], [4096])
         full_addresses, full_sizes = PageAddressing(make_layout(num_groups=2)).buffers(0, 2)
-        assert by_key[worker._namespaces[0].key(full_hash)] == (list(full_addresses), list(full_sizes))
+        assert by_key[worker._namespaces[0].key(full_hash)] == (
+            list(full_addresses),
+            list(full_sizes),
+        )
 
 
 def test_drain_releases_window_snapshot_slots(store_config, fake_store):
@@ -1870,9 +1882,14 @@ def test_scheduler_reports_no_prompt_end_by_default_or_for_a_cold_prompt(store_c
     tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
     # Off by default, even for a resumed prompt that saves its window.
     scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
-    scheduler.get_num_new_matched_tokens(make_context_request(1, tokens, position=4 * TOKENS_PER_BLOCK), 0)
+    scheduler.get_num_new_matched_tokens(
+        make_context_request(1, tokens, position=4 * TOKENS_PER_BLOCK), 0
+    )
     data = window_data(
-        1, tokens, [10, 11, 12, 13, 14, 15, 16], [BAD_PAGE_INDEX, BAD_PAGE_INDEX, 22, 23, 24, 25, 26]
+        1,
+        tokens,
+        [10, 11, 12, 13, 14, 15, 16],
+        [BAD_PAGE_INDEX, BAD_PAGE_INDEX, 22, 23, 24, 25, 26],
     )
     metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
     assert metadata.retires == [] and metadata.saves
@@ -1933,11 +1950,15 @@ def test_worker_keeps_the_newest_windows_of_a_chain(store_config, fake_store, mo
         for target, newer in ((7, 10), (10, 13)):
             low = worker.stale_blocks(1, target * TOKENS_PER_BLOCK)[1]
             high = worker.stale_blocks(1, newer * TOKENS_PER_BLOCK)[1]
-            expected |= {worker._namespaces[1].key(hashes[b]) for b in range(max(low, 4), min(target, high))}
+            expected |= {
+                worker._namespaces[1].key(hashes[b]) for b in range(max(low, 4), min(target, high))
+            }
         assert gone == expected and gone
         assert not gone & kept
         assert window_keys(worker, hashes, 4) <= fake_store.objects
-        assert all(worker._namespaces[0].key(block_hash) in fake_store.objects for block_hash in hashes)
+        assert all(
+            worker._namespaces[0].key(block_hash) in fake_store.objects for block_hash in hashes
+        )
         assert kept <= fake_store.objects
         assert all(force is False for _, force in fake_store.remove_calls)
         # Each new end leaves a link to the end it resumed from; a retired end's link goes with its window.
@@ -1965,7 +1986,9 @@ def test_worker_retires_nothing_without_enough_links_or_before_the_delay(
         assert fake_store.remove_calls == [] and len(worker._retire_due) == 1
 
 
-def test_worker_links_no_prompt_end_resumed_from_a_short_prefix(store_config, fake_store, monkeypatch):
+def test_worker_links_no_prompt_end_resumed_from_a_short_prefix(
+    store_config, fake_store, monkeypatch
+):
     with retire_worker(fake_store, monkeypatch, keep=1, delay=0) as worker:
         monkeypatch.setattr(worker, "_link_min_tokens", 5 * TOKENS_PER_BLOCK)
         hashes = chain_with_windows(fake_store, worker, (4, 7))
@@ -1987,10 +2010,16 @@ def test_worker_window_retirement_is_off_by_default(store_config, fake_store, mo
         time.sleep(0.2)
         assert worker._save_queue.qsize() == 0
         assert worker._retire_stats.ends == 0 and worker._retire_due == []
-        assert fake_store.objects == before and fake_store.values == {} and fake_store.remove_calls == []
+        assert (
+            fake_store.objects == before
+            and fake_store.values == {}
+            and fake_store.remove_calls == []
+        )
 
 
-def test_worker_retirement_forgets_removed_keys_in_the_local_stored_set(store_config, fake_store, monkeypatch):
+def test_worker_retirement_forgets_removed_keys_in_the_local_stored_set(
+    store_config, fake_store, monkeypatch
+):
     """With the ldfix F3 local stored-key set on, a removed page must be re-saved, not skipped as known."""
     monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_LOCAL_STORED_SET", "1")
     with retire_worker(fake_store, monkeypatch, keep=1, delay=0) as worker:
@@ -2008,7 +2037,9 @@ def test_worker_retirement_forgets_removed_keys_in_the_local_stored_set(store_co
         assert all(worker._local_stored.known(kept))
 
 
-def test_worker_removes_one_key_at_a_time_without_batch_remove(store_config, fake_store, monkeypatch):
+def test_worker_removes_one_key_at_a_time_without_batch_remove(
+    store_config, fake_store, monkeypatch
+):
     """A binding without `batch_remove` falls back to non-forced per-key `remove`."""
     with retire_worker(fake_store, monkeypatch, keep=1, delay=0) as worker:
         calls = []
@@ -2067,7 +2098,10 @@ def resumed_saves(store_config, monkeypatch, keep, resave=None):
         SchedulerOutput(
             new_requests=[
                 window_data(
-                    1, tokens, [10, 11, 12, 13, 14, 15, 16, 17, 18], [20, 21, 22, 23, 24, 25, 26, 27, 28]
+                    1,
+                    tokens,
+                    [10, 11, 12, 13, 14, 15, 16, 17, 18],
+                    [20, 21, 22, 23, 24, 25, 26, 27, 28],
                 )
             ]
         )

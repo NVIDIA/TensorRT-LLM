@@ -71,7 +71,12 @@ def _transfers(hashes, start=0):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_save_skips_the_probe_for_keys_it_already_confirmed(store_config, fake_store, monkeypatch, enabled):
+def test_save_skips_the_probe_for_keys_it_already_confirmed(
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+    monkeypatch,
+    enabled,  # noqa: F811
+):
     if enabled:
         monkeypatch.setenv(LOCAL_STORED_SET_ENV, "1")
     else:
@@ -79,7 +84,7 @@ def test_save_skips_the_probe_for_keys_it_already_confirmed(store_config, fake_s
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker._save_staging = None  # put/probe logic only, no device copy
         hashes = [bytes([i]) * 16 for i in range(4)]
-        assert worker._put(_transfers(hashes)) [:2] == (4, 0)
+        assert worker._put(_transfers(hashes))[:2] == (4, 0)
         probes_after_first = len(fake_store.exist_calls)
         # The resave of the same pages: identical outcome either way.
         assert worker._put(_transfers(hashes))[:2] == (0, 4)
@@ -95,7 +100,7 @@ def test_save_skips_the_probe_for_keys_it_already_confirmed(store_config, fake_s
         assert len(fake_store.put_calls[-1][0]) == 2
 
 
-def test_an_absent_lookup_probe_invalidates_a_confirmed_key(store_config, fake_store, monkeypatch):
+def test_an_absent_lookup_probe_invalidates_a_confirmed_key(store_config, fake_store, monkeypatch):  # noqa: F811
     monkeypatch.setenv(LOCAL_STORED_SET_ENV, "1")
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker._save_staging = None
@@ -113,7 +118,7 @@ def test_an_absent_lookup_probe_invalidates_a_confirmed_key(store_config, fake_s
         assert key in fake_store.objects
 
 
-def test_a_failed_write_is_not_remembered(store_config, fake_store, monkeypatch):
+def test_a_failed_write_is_not_remembered(store_config, fake_store, monkeypatch):  # noqa: F811
     monkeypatch.setenv(LOCAL_STORED_SET_ENV, "1")
     monkeypatch.setenv("TRTLLM_DISABLE_STORE_SAVE_RETRY", "1")
     monkeypatch.setattr(

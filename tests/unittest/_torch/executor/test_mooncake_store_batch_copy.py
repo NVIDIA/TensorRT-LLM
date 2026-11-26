@@ -96,7 +96,9 @@ class Layout:
 
     def fill_random(self, seed):
         gen = torch.Generator().manual_seed(seed)
-        self.buffer.copy_(torch.randint(0, 256, self.buffer.shape, dtype=torch.uint8, generator=gen))
+        self.buffer.copy_(
+            torch.randint(0, 256, self.buffer.shape, dtype=torch.uint8, generator=gen)
+        )
 
 
 def _pool(layout, num_slots):
@@ -131,8 +133,11 @@ def _gather(mode, layout, pages, monkeypatch):
 @pytest.mark.parametrize("mode", ["2d", "batch", "auto"])
 def test_gather_matches_the_loop_on_random_page_maps(recorder, monkeypatch, seed, mode):
     rng = random.Random(seed)
-    layout = Layout(64, [rng.choice([96, 128, 200]) for _ in range(rng.randint(1, 3))],
-                    cut_pages={rng.randrange(64) for _ in range(5)} if seed % 2 else ())
+    layout = Layout(
+        64,
+        [rng.choice([96, 128, 200]) for _ in range(rng.randint(1, 3))],
+        cut_pages={rng.randrange(64) for _ in range(5)} if seed % 2 else (),
+    )
     layout.fill_random(seed)
     pages = _random_page_map(rng, 64, rng.randint(1, 24), consecutive=seed % 3 != 0)
 
@@ -160,11 +165,16 @@ def _scatter(mode, layout, pages, payload, only, monkeypatch):
 @pytest.mark.parametrize("mode", ["2d", "batch"])
 def test_scatter_matches_the_loop_on_random_page_maps(recorder, monkeypatch, seed, mode):
     rng = random.Random(100 + seed)
-    layout = Layout(48, [rng.choice([64, 136, 256]) for _ in range(rng.randint(1, 3))],
-                    cut_pages={rng.randrange(48) for _ in range(4)} if seed % 2 else ())
+    layout = Layout(
+        48,
+        [rng.choice([64, 136, 256]) for _ in range(rng.randint(1, 3))],
+        cut_pages={rng.randrange(48) for _ in range(4)} if seed % 2 else (),
+    )
     pages = _random_page_map(rng, 48, rng.randint(1, 20), consecutive=seed % 3 != 0)
     gen = torch.Generator().manual_seed(seed)
-    payload = torch.randint(0, 256, (len(pages) * sum(layout.region_sizes),), dtype=torch.uint8, generator=gen)
+    payload = torch.randint(
+        0, 256, (len(pages) * sum(layout.region_sizes),), dtype=torch.uint8, generator=gen
+    )
     only = None if seed % 2 == 0 else sorted(rng.sample(range(len(pages)), max(1, len(pages) // 2)))
 
     expect = _scatter(None, layout, pages, payload, only, monkeypatch)
@@ -290,9 +300,11 @@ def test_device_round_trip_matches_the_loop(monkeypatch, mode):
         pytest.skip("cuda-python has no cudaMemcpyBatchAsync")
     monkeypatch.setattr(staging, "_BATCH_API_BROKEN", False)
     device = torch.device("cuda")
-    regions, region_bytes, num_pages = [512, 448], 512, 64
+    regions, num_pages = [512, 448], 64
     strides = [r + 64 for r in regions]
-    dev = torch.randint(0, 256, (sum(s * num_pages for s in strides),), dtype=torch.uint8, device=device)
+    dev = torch.randint(
+        0, 256, (sum(s * num_pages for s in strides),), dtype=torch.uint8, device=device
+    )
     bases = [dev.data_ptr(), dev.data_ptr() + strides[0] * num_pages]
 
     def buffers(page):
@@ -304,14 +316,20 @@ def test_device_round_trip_matches_the_loop(monkeypatch, mode):
     results = {}
     for m in (None, mode):
         monkeypatch.setattr(staging, "_BATCH_COPY", m)
-        pool = staging.HostStagingPool(slot_bytes=sum(regions), num_slots=len(pages), store=FakeStore(), label="t")
+        pool = staging.HostStagingPool(
+            slot_bytes=sum(regions), num_slots=len(pages), store=FakeStore(), label="t"
+        )
         staging.stage_batch_for_put(pool, list(addresses), list(sizes), stream.cuda_stream)
         stream.synchronize()
         slots = pool._buffer.clone()
         target = torch.zeros_like(dev)
         shift = target.data_ptr() - dev.data_ptr()
         staging.unstage_batch_after_get(
-            pool, [[a + shift for a in page] for page in addresses], list(sizes), stream.cuda_stream, only=[0, 2, 3, 7]
+            pool,
+            [[a + shift for a in page] for page in addresses],
+            list(sizes),
+            stream.cuda_stream,
+            only=[0, 2, 3, 7],
         )
         stream.synchronize()
         results[m] = (slots, target.cpu())

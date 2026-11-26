@@ -43,6 +43,7 @@ def _env_value(env: Mapping[str, str], name: str, legacy: str) -> Tuple[str, str
         return legacy, env[legacy].strip()
     return name, raw
 
+
 T = TypeVar("T")
 
 
@@ -134,8 +135,12 @@ def is_group_leader(mapping: Any, environ: Optional[Mapping[str, str]] = None) -
     return attn_tp_rank(mapping, environ) == 0 if is_grouped(mapping, environ) else True
 
 
-def attention_shard(rank: int, world_size: int, enable_attention_dp: bool,
-                    environ: Optional[Mapping[str, str]] = None) -> Tuple[int, int]:
+def attention_shard(
+    rank: int,
+    world_size: int,
+    enable_attention_dp: bool,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Tuple[int, int]:
     """(shard index, shard count) of this rank's attention KV for keying content shared across workers (the Mooncake
     store namespaces): ``(rank, world_size)`` without attention DP, ``(0, 1)`` under plain attention DP (every rank
     holds every head), ``(rank % t, t)`` under attention-DP groups of ``t`` ranks (the group's TP shard, the same keys a
@@ -216,7 +221,7 @@ def sliced_rank_tokens(all_rank_num_tokens: Sequence[int], attn_tp: int) -> List
         raise ValueError(f"{len(counts)} rank entries do not split into groups of {attn_tp}")
     out = []
     for g in range(len(counts) // attn_tp):
-        rows = counts[g * attn_tp: (g + 1) * attn_tp]
+        rows = counts[g * attn_tp : (g + 1) * attn_tp]
         if len(set(rows)) != 1:
             raise ValueError(f"group {g} ranks report different row counts {rows}")
         width = row_slice(rows[0], attn_tp, 0)[2]
@@ -242,15 +247,19 @@ def batch_signature(entries) -> int:
 # - KVCacheAwareADPRouter: its per-rank prefix-match table is collapsed to one entry per group (the group's first rank:
 #   every rank of a group admits the same requests, so the group's radix trees hold the same blocks) and its cold-start
 #   warmup set spans the groups.
-GROUP_SAFE_ROUTERS = frozenset(("DefaultADPRouter", "ConversationAwareADPRouter", "KVCacheAwareADPRouter"))
+GROUP_SAFE_ROUTERS = frozenset(
+    ("DefaultADPRouter", "ConversationAwareADPRouter", "KVCacheAwareADPRouter")
+)
 
 
 def router_mismatch(router_cls_name: str) -> Optional[str]:
     """Why an ADP router cannot serve attention-DP groups, or None."""
     if router_cls_name in GROUP_SAFE_ROUTERS:
         return None
-    return (f"the {router_cls_name} keeps per-rank tables (prefix matches, warmup ranks) indexed by tp rank; "
-            f"attention-DP groups support {sorted(GROUP_SAFE_ROUTERS)} only")
+    return (
+        f"the {router_cls_name} keeps per-rank tables (prefix matches, warmup ranks) indexed by tp rank; "
+        f"attention-DP groups support {sorted(GROUP_SAFE_ROUTERS)} only"
+    )
 
 
 def check_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -266,5 +275,5 @@ def diverged_groups(signatures: Sequence[int], attn_tp: int) -> List[int]:
     return [
         g
         for g in range(len(signatures) // attn_tp)
-        if len(set(signatures[g * attn_tp: (g + 1) * attn_tp])) != 1
+        if len(set(signatures[g * attn_tp : (g + 1) * attn_tp])) != 1
     ]

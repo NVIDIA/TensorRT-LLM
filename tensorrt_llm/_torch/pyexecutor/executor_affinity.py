@@ -42,7 +42,7 @@ import os
 import sys
 import threading
 import time
-from typing import Dict, FrozenSet, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Optional, Set
 
 from tensorrt_llm.logger import logger
 

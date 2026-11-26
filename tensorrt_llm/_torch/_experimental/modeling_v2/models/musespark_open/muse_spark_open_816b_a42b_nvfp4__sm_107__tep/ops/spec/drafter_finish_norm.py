@@ -37,12 +37,16 @@ THREADS, PER_THREAD = 128, 64
 
 @triton.jit
 def _f32_add(a, b):
-    return tl.inline_asm_elementwise("add.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1)
+    return tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1
+    )
 
 
 @triton.jit
 def _f32_mul(a, b):
-    return tl.inline_asm_elementwise("mul.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1)
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1
+    )
 
 
 @triton.jit
@@ -84,13 +88,13 @@ def _finish_h(x_ptr, delta_ptr, base_ptr, res_ptr, row64, cols, keep, has_prev, 
     """``h = finish_conv(x)[cols] + residual[cols]`` in FP32, statement for statement (both passes)."""
     groups = cols // GROUP
     current = tl.load(x_ptr + row64 * x_row_stride + cols).to(tl.float32)
-    shifted = tl.load(x_ptr + (row64 - 1) * x_row_stride + cols, mask=(cols >= 0) & has_prev, other=0.0).to(
-        tl.float32
-    )
+    shifted = tl.load(
+        x_ptr + (row64 - 1) * x_row_stride + cols, mask=(cols >= 0) & has_prev, other=0.0
+    ).to(tl.float32)
     d0 = tl.load(delta_ptr + row64 * delta_row_stride + groups * delta_group_stride).to(tl.float32)
-    d1 = tl.load(delta_ptr + row64 * delta_row_stride + delta_tap_stride + groups * delta_group_stride).to(
-        tl.float32
-    )
+    d1 = tl.load(
+        delta_ptr + row64 * delta_row_stride + delta_tap_stride + groups * delta_group_stride
+    ).to(tl.float32)
     b0 = tl.load(base_ptr + cols).to(tl.float32)
     b1 = tl.load(base_ptr + base_tap_stride + cols).to(tl.float32)
     r = tl.load(res_ptr + row64 * res_row_stride + cols).to(tl.float32)
@@ -181,7 +185,9 @@ class DrafterFinishNorm(OpWrapper):
     multiplies the FP32 ``h``, as flashinfer and the fused drafter hop do.
     """
 
-    def __call__(self, x, delta, base, residual, weight, eps: float, block_size: int) -> torch.Tensor:
+    def __call__(
+        self, x, delta, base, residual, weight, eps: float, block_size: int
+    ) -> torch.Tensor:
         rows = x.shape[0]
         out = torch.empty_like(x)
         if rows == 0:
@@ -209,24 +215,40 @@ class DrafterFinishNorm(OpWrapper):
         )
         return out
 
-    def reference(self, x, delta, base, residual, weight, eps: float, block_size: int) -> torch.Tensor:
+    def reference(
+        self, x, delta, base, residual, weight, eps: float, block_size: int
+    ) -> torch.Tensor:
         """FP64 conv + add + RMSNorm (unrounded), residual left unchanged; for the tolerance band only."""
         rows = x.shape[0]
-        coefficients = base.double().unsqueeze(0) + delta.double().repeat_interleave(GROUP_SIZE, dim=-1)
+        coefficients = base.double().unsqueeze(0) + delta.double().repeat_interleave(
+            GROUP_SIZE, dim=-1
+        )
         xd = x.double()
         position = torch.arange(rows, device=x.device) % block_size
         shifted = torch.zeros_like(xd)
         shifted[1:] = xd[:-1]
-        conv = coefficients[:, 0] * xd + coefficients[:, 1] * shifted * (position >= 1).double().unsqueeze(-1)
+        conv = coefficients[:, 0] * xd + coefficients[:, 1] * shifted * (
+            position >= 1
+        ).double().unsqueeze(-1)
         h = conv + residual.double()
-        return (h * torch.rsqrt(h.square().mean(-1, keepdim=True) + eps) * weight.double()).to(x.dtype)
+        return (h * torch.rsqrt(h.square().mean(-1, keepdim=True) + eps) * weight.double()).to(
+            x.dtype
+        )
 
     def is_valid(self, x, delta, base, residual, weight, eps: float, block_size: int) -> None:
-        assert x.dtype == delta.dtype == base.dtype == residual.dtype == weight.dtype == torch.bfloat16, "BF16"
-        assert x.dim() == 2 and x.shape[1] == HIDDEN and x.stride(-1) == 1, f"x [T, {HIDDEN}], unit column stride"
+        assert (
+            x.dtype == delta.dtype == base.dtype == residual.dtype == weight.dtype == torch.bfloat16
+        ), "BF16"
+        assert x.dim() == 2 and x.shape[1] == HIDDEN and x.stride(-1) == 1, (
+            f"x [T, {HIDDEN}], unit column stride"
+        )
         assert residual.shape == x.shape and residual.stride(-1) == 1, "residual like x"
-        assert tuple(base.shape) == (TAPS, HIDDEN) and base.stride(-1) == 1, f"base [{TAPS}, {HIDDEN}]"
-        assert tuple(delta.shape) == (x.shape[0], TAPS, HIDDEN // GROUP_SIZE), "delta [T, taps, groups]"
+        assert tuple(base.shape) == (TAPS, HIDDEN) and base.stride(-1) == 1, (
+            f"base [{TAPS}, {HIDDEN}]"
+        )
+        assert tuple(delta.shape) == (x.shape[0], TAPS, HIDDEN // GROUP_SIZE), (
+            "delta [T, taps, groups]"
+        )
         assert tuple(weight.shape) == (HIDDEN,) and weight.is_contiguous(), f"weight [{HIDDEN}]"
         assert block_size >= 1
 

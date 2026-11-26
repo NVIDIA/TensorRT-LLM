@@ -66,7 +66,10 @@ class FakeCache:
 
     def get_base_page_indices(self, layer_group_id):
         self.base_calls += 1
-        row = [s if lk else BAD for s, lk in zip(self.attached[layer_group_id], self.locked[layer_group_id])]
+        row = [
+            s if lk else BAD
+            for s, lk in zip(self.attached[layer_group_id], self.locked[layer_group_id])
+        ]
         for (g, o), v in self.lie.items():
             if g == layer_group_id:
                 row[o] = v
@@ -74,7 +77,9 @@ class FakeCache:
 
 
 def make_manager(caches):
-    return SimpleNamespace(impl=SimpleNamespace(layer_grouping=[[0], [1]]), kv_cache_map=dict(caches))
+    return SimpleNamespace(
+        impl=SimpleNamespace(layer_grouping=[[0], [1]]), kv_cache_map=dict(caches)
+    )
 
 
 def resolver(manager):
@@ -84,8 +89,10 @@ def resolver(manager):
 
 
 def lookup(manager):
-    return lambda request_id, wanted, verify=False: KVCacheManagerV2.lookup_local_page_indices_for_id(
-        manager, request_id, wanted, verify
+    return (
+        lambda request_id, wanted, verify=False: KVCacheManagerV2.lookup_local_page_indices_for_id(
+            manager, request_id, wanted, verify
+        )
     )
 
 
@@ -94,7 +101,9 @@ def random_cache(rng, num_blocks, unlocked_share, pad):
     for _ in range(NUM_GROUPS):
         slots = rng.sample(range(10 * num_blocks + 10), num_blocks)
         a = [s if rng.random() > 0.1 else BAD for s in slots]  # some blocks have no page
-        lk = [s != BAD and rng.random() >= unlocked_share for s in a]  # attached but unlocked (window-passed)
+        lk = [
+            s != BAD and rng.random() >= unlocked_share for s in a
+        ]  # attached but unlocked (window-passed)
         attached.append(a)
         locked.append(lk)
     return FakeCache(attached, locked, pad=pad)
@@ -104,7 +113,9 @@ def random_pages(rng, cache, divergent, *, load, tag_share=0.95):
     """Pages naming blocks of `cache`, with rank 0's slot equal to this rank's unless `divergent` remaps some."""
     pages = []
     for _ in range(rng.randint(0, 40)):
-        g = rng.randrange(NUM_GROUPS + (0 if load else 1))  # saves may name a group this rank does not have
+        g = rng.randrange(
+            NUM_GROUPS + (0 if load else 1)
+        )  # saves may name a group this rank does not have
         n = cache.num_blocks if cache is not None else 4
         o = rng.randrange(n + (0 if load else 3))  # saves may run past the blocks
         local = cache.attached[g][o] if cache is not None and g < NUM_GROUPS and o < n else BAD
@@ -122,7 +133,10 @@ def snapshot(metadata):
     def entry(e):
         for p in e.pages:
             assert type(p.page_index) is int and type(p.block_ordinal) is int
-        return (e.request_id, [(p.block_hash, p.layer_group_id, p.page_index, p.block_ordinal) for p in e.pages])
+        return (
+            e.request_id,
+            [(p.block_hash, p.layer_group_id, p.page_index, p.block_ordinal) for p in e.pages],
+        )
 
     return (
         [entry(e) for e in metadata.loads],
@@ -143,24 +157,28 @@ def run_localize(worker, metadata, manager, mode):
 
 @pytest.mark.parametrize("divergent", [False, True], ids=["same_slots", "divergent"])
 @pytest.mark.parametrize("unlocked_share", [0.0, 0.3], ids=["all_locked", "some_unlocked"])
-def test_fast_localize_equals_the_full_table(store_config, fake_store, divergent, unlocked_share):
+def test_fast_localize_equals_the_full_table(store_config, fake_store, divergent, unlocked_share):  # noqa: F811
     rng = random.Random(1234 + 7 * divergent + int(10 * unlocked_share))
     with make_worker(fake_store, layout=make_layout()) as worker:
         for trial in range(60):
             caches = {
-                rid: random_cache(rng, rng.randint(1, 60), unlocked_share, rng.choice([0, 7])) for rid in range(5)
+                rid: random_cache(rng, rng.randint(1, 60), unlocked_share, rng.choice([0, 7]))
+                for rid in range(5)
             }
             manager = make_manager(caches)
             rids = list(range(7))  # 5 and 6 have no cache on this rank
 
             def transfers(rid, load):
-                return RequestTransfers(rid, random_pages(rng, caches.get(rid), divergent, load=load))
+                return RequestTransfers(
+                    rid, random_pages(rng, caches.get(rid), divergent, load=load)
+                )
 
             metadata = MooncakeStoreMetadata(
                 loads=[transfers(r, True) for r in rng.sample(rids[:5], 2)],
                 saves=[transfers(r, False) for r in rng.sample(rids, 4)],
                 prefix_loads=[
-                    PrefixLoadTransfers(100 + r, bool(r % 2), transfers(r, True)) for r in rng.sample(rids[:5], 2)
+                    PrefixLoadTransfers(100 + r, bool(r % 2), transfers(r, True))
+                    for r in rng.sample(rids[:5], 2)
                 ],
             )
             want = run_localize(worker, copy.deepcopy(metadata), manager, 0)
@@ -172,11 +190,18 @@ def test_fast_localize_equals_the_full_table(store_config, fake_store, divergent
                 assert want[1][0] == 0  # nothing to remap when rank 0's slots are this rank's
 
 
-def test_fast_localize_reads_only_the_published_row_when_every_page_is_locked(store_config, fake_store):
+def test_fast_localize_reads_only_the_published_row_when_every_page_is_locked(
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+):
     cache = FakeCache([[10, 11, 12, 13], [20, 21, 22, 23]], [[True] * 4, [True] * 4], pad=4)
     manager = make_manager({7: cache})
     metadata = MooncakeStoreMetadata(
-        saves=[RequestTransfers(7, [PageTransfer(b"h" * 16, 1, 21, 1), PageTransfer(b"i" * 16, 1, 99, 2)])],
+        saves=[
+            RequestTransfers(
+                7, [PageTransfer(b"h" * 16, 1, 21, 1), PageTransfer(b"i" * 16, 1, 99, 2)]
+            )
+        ],
         loads=[RequestTransfers(7, [PageTransfer(b"j" * 16, 0, 55, 3)])],
     )
     with make_worker(fake_store, layout=make_layout()) as worker:
@@ -189,24 +214,30 @@ def test_fast_localize_reads_only_the_published_row_when_every_page_is_locked(st
         assert (worker._pgfix_lookups, worker._pgfix_fallbacks) == (2, 0)
 
 
-def test_an_unlocked_page_is_answered_by_the_full_query(store_config, fake_store):
+def test_an_unlocked_page_is_answered_by_the_full_query(store_config, fake_store):  # noqa: F811
     # Block 0 of group 0 has a page attached but not locked (the window passed it): the row publishes BAD there.
     cache = FakeCache([[10, 11], [20, 21]], [[False, True], [True, True]])
     manager = make_manager({7: cache})
-    metadata = MooncakeStoreMetadata(saves=[RequestTransfers(7, [PageTransfer(b"h" * 16, 0, 99, 0)])])
+    metadata = MooncakeStoreMetadata(
+        saves=[RequestTransfers(7, [PageTransfer(b"h" * 16, 0, 99, 0)])]
+    )
     with make_worker(fake_store, layout=make_layout()) as worker:
         snap, counts = run_localize(worker, metadata, manager, 1)
         assert snap[1] == [(7, [(b"h" * 16, 0, 10, 0)])] and counts == (1, 0)
         assert worker._pgfix_fallbacks == 1 and cache.aggregated_calls == 1
 
 
-def test_a_load_with_no_slot_here_raises_the_same_error(store_config, fake_store):
+def test_a_load_with_no_slot_here_raises_the_same_error(store_config, fake_store):  # noqa: F811
     cache = FakeCache([[10, BAD], [20, 21]], [[True, False], [True, True]])
     errors = []
     with make_worker(fake_store, layout=make_layout()) as worker:
         for mode in (0, 1):
             metadata = MooncakeStoreMetadata(
-                loads=[RequestTransfers(7, [PageTransfer(b"h" * 16, 1, 99, 0), PageTransfer(b"h" * 16, 0, 5, 1)])]
+                loads=[
+                    RequestTransfers(
+                        7, [PageTransfer(b"h" * 16, 1, 99, 0), PageTransfer(b"h" * 16, 0, 5, 1)]
+                    )
+                ]
             )
             with pytest.raises(RuntimeError, match="no page for block 1 of layer group 0") as info:
                 run_localize(worker, metadata, make_manager({7: cache}), mode)
@@ -214,32 +245,41 @@ def test_a_load_with_no_slot_here_raises_the_same_error(store_config, fake_store
     assert errors[0] == errors[1]
 
 
-def test_switch_off_never_calls_the_lookup(store_config, fake_store, monkeypatch):
+def test_switch_off_never_calls_the_lookup(store_config, fake_store, monkeypatch):  # noqa: F811
     monkeypatch.delenv(worker_module.PGFIX_FAST_ENV, raising=False)
     cache = FakeCache([[10, 11]], [[True, True]])
     manager = SimpleNamespace(impl=SimpleNamespace(layer_grouping=[[0]]), kv_cache_map={7: cache})
     with make_worker(fake_store, layout=make_layout()) as worker:
         assert worker._pgfix_fast == 0
         worker.bind_local_page_indices(resolver(manager))
-        worker.bind_local_page_lookup(lambda *args: pytest.fail("lookup called with the switch off"))
-        metadata = MooncakeStoreMetadata(saves=[RequestTransfers(7, [PageTransfer(b"h" * 16, 0, 3, 1)])])
+        worker.bind_local_page_lookup(
+            lambda *args: pytest.fail("lookup called with the switch off")
+        )
+        metadata = MooncakeStoreMetadata(
+            saves=[RequestTransfers(7, [PageTransfer(b"h" * 16, 0, 3, 1)])]
+        )
         worker._localize(metadata)
         assert [p.page_index for p in metadata.saves[0].pages] == [11]
         assert cache.base_calls == 0 and cache.aggregated_calls == 1
 
 
-def test_switch_on_arms_with_a_receipt(store_config, fake_store, monkeypatch):
+def test_switch_on_arms_with_a_receipt(store_config, fake_store, monkeypatch):  # noqa: F811
     monkeypatch.setenv(worker_module.PGFIX_FAST_ENV, "2")
     with make_worker(fake_store, layout=make_layout()) as worker:
         assert worker._pgfix_fast == 2
 
 
-def test_verify_counts_a_published_slot_that_differs_and_uses_the_full_query(store_config, fake_store):
+def test_verify_counts_a_published_slot_that_differs_and_uses_the_full_query(
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+):
     # An invariant violation (the row publishes slot 77 for a page attached on slot 11): verify catches it.
     cache = FakeCache([[10, 11]], [[True, True]], lie={(0, 1): 77})
     manager = SimpleNamespace(impl=SimpleNamespace(layer_grouping=[[0]]), kv_cache_map={7: cache})
     with make_worker(fake_store, layout=make_layout()) as worker:
-        metadata = MooncakeStoreMetadata(saves=[RequestTransfers(7, [PageTransfer(b"h" * 16, 0, 11, 1)])])
+        metadata = MooncakeStoreMetadata(
+            saves=[RequestTransfers(7, [PageTransfer(b"h" * 16, 0, 11, 1)])]
+        )
         snap, _ = run_localize(worker, metadata, manager, 2)
         assert snap[1] == [(7, [(b"h" * 16, 0, 11, 1)])]
         assert worker._pgfix_mismatches == 1
@@ -247,14 +287,22 @@ def test_verify_counts_a_published_slot_that_differs_and_uses_the_full_query(sto
 
 @pytest.mark.parametrize("retarget", [True, False])
 @pytest.mark.parametrize("unlocked_share", [0.0, 0.3], ids=["all_locked", "some_unlocked"])
-def test_fast_recheck_after_commit_equals_the_full_table(store_config, fake_store, retarget, unlocked_share):
+def test_fast_recheck_after_commit_equals_the_full_table(
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+    retarget,
+    unlocked_share,  # noqa: F811
+):
     rng = random.Random(99 + int(retarget) + int(10 * unlocked_share))
     with make_worker(fake_store, layout=make_layout()) as worker:
         for trial in range(60):
-            caches = {rid: random_cache(rng, rng.randint(1, 50), unlocked_share, 3) for rid in range(4)}
+            caches = {
+                rid: random_cache(rng, rng.randint(1, 50), unlocked_share, 3) for rid in range(4)
+            }
             manager = make_manager(caches)
             saves = [
-                RequestTransfers(r, random_pages(rng, caches.get(r), True, load=False)) for r in rng.sample(range(6), 4)
+                RequestTransfers(r, random_pages(rng, caches.get(r), True, load=False))
+                for r in rng.sample(range(6), 4)
             ]
             overrides = {}
             for entry in saves:
@@ -267,27 +315,43 @@ def test_fast_recheck_after_commit_equals_the_full_table(store_config, fake_stor
                 worker._pgfix_mismatches = 0
                 saves_copy = copy.deepcopy(saves)
                 if mode == 0:
-                    out = worker._recheck_after_commit(saves_copy, overrides, resolver(manager), retarget)
+                    out = worker._recheck_after_commit(
+                        saves_copy, overrides, resolver(manager), retarget
+                    )
                 else:
-                    out = worker._recheck_after_commit_fast(saves_copy, overrides, lookup(manager), retarget)
+                    out = worker._recheck_after_commit_fast(
+                        saves_copy, overrides, lookup(manager), retarget
+                    )
                 snap = [
-                    (e.request_id, [(p.block_hash, p.layer_group_id, p.page_index, p.block_ordinal) for p in e.pages])
+                    (
+                        e.request_id,
+                        [
+                            (p.block_hash, p.layer_group_id, p.page_index, p.block_ordinal)
+                            for p in e.pages
+                        ],
+                    )
                     for e in out
                 ]
                 for e in out:
                     assert all(type(p.page_index) is int for p in e.pages)
-                results.append((snap, worker._swap_checked, worker._swap_retargeted, worker._swap_dropped))
+                results.append(
+                    (snap, worker._swap_checked, worker._swap_retargeted, worker._swap_dropped)
+                )
                 assert worker._pgfix_mismatches == 0
             assert results[1] == results[0] and results[2] == results[0], trial
 
 
-def test_localize_then_commit_swaps_then_recheck_equals_the_full_table(store_config, fake_store):
+def test_localize_then_commit_swaps_then_recheck_equals_the_full_table(store_config, fake_store):  # noqa: F811
     """The re-check of entries `_localize_fast` produced reuses their columns; commits swap slots in between."""
     rng = random.Random(4242)
     with make_worker(fake_store, layout=make_layout()) as worker:
         reused = 0
         for trial in range(60):
-            caches = {rid: random_cache(rng, rng.randint(1, 50), rng.choice([0.0, 0.3]), 5) for rid in range(5)}
+            caches = {
+                rid: random_cache(rng, rng.randint(1, 50), rng.choice([0.0, 0.3]), 5)
+                for rid in range(5)
+            }
+
             def transfers(rid, load):
                 return RequestTransfers(rid, random_pages(rng, caches.get(rid), True, load=load))
 
@@ -314,20 +378,37 @@ def test_localize_then_commit_swaps_then_recheck_equals_the_full_table(store_con
                     for p in e.pages[:2]
                     if p.layer_group_id == 0
                 }
-                for r, g, o, slot in swaps:  # the commit after the pass rebases blocks (or a block loses its page)
+                for (
+                    r,
+                    g,
+                    o,
+                    slot,
+                ) in swaps:  # the commit after the pass rebases blocks (or a block loses its page)
                     state[r].attached[g][o] = slot
                     state[r].locked[g][o] = slot != BAD
                 worker._swap_checked = worker._swap_retargeted = worker._swap_dropped = 0
                 if mode == 0:
-                    out = worker._recheck_after_commit(meta.saves, overrides, resolver(manager), True)
+                    out = worker._recheck_after_commit(
+                        meta.saves, overrides, resolver(manager), True
+                    )
                 else:
                     reused += sum(getattr(e, "_page_cols", None) is not None for e in meta.saves)
-                    out = worker._recheck_after_commit_fast(meta.saves, overrides, lookup(manager), True)
+                    out = worker._recheck_after_commit_fast(
+                        meta.saves, overrides, lookup(manager), True
+                    )
                 snap = [
-                    (e.request_id, [(p.block_hash, p.layer_group_id, p.page_index, p.block_ordinal) for p in e.pages])
+                    (
+                        e.request_id,
+                        [
+                            (p.block_hash, p.layer_group_id, p.page_index, p.block_ordinal)
+                            for p in e.pages
+                        ],
+                    )
                     for e in out
                 ]
-                results.append((snap, worker._swap_checked, worker._swap_retargeted, worker._swap_dropped))
+                results.append(
+                    (snap, worker._swap_checked, worker._swap_retargeted, worker._swap_dropped)
+                )
             assert results[1] == results[0] and results[2] == results[0], trial
         assert reused > 0
 
@@ -337,14 +418,19 @@ def test_lookup_equals_the_unmasked_table_entry_for_entry():
     rng = random.Random(5)
     for trial in range(300):
         caches = {
-            rid: random_cache(rng, rng.randint(1, 40), rng.choice([0.0, 0.2, 1.0]), rng.choice([0, 5]))
+            rid: random_cache(
+                rng, rng.randint(1, 40), rng.choice([0.0, 0.2, 1.0]), rng.choice([0, 5])
+            )
             for rid in range(3)
         }
         manager = make_manager(caches)
         for rid in range(4):
-            table = KVCacheManagerV2.get_page_indices_by_layer_group_for_id(manager, rid, mask_stale=False)
+            table = KVCacheManagerV2.get_page_indices_by_layer_group_for_id(
+                manager, rid, mask_stale=False
+            )
             wanted = {
-                g: np.array([rng.randrange(45) for _ in range(rng.randint(0, 12))], dtype=np.int64) for g in range(3)
+                g: np.array([rng.randrange(45) for _ in range(rng.randint(0, 12))], dtype=np.int64)
+                for g in range(3)
             }
             for verify in (False, True):
                 found, fallbacks, mismatches = KVCacheManagerV2.lookup_local_page_indices_for_id(

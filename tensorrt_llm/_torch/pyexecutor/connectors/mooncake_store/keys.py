@@ -110,7 +110,9 @@ class _ChainMemo:
     def __init__(self, budget_bytes: int):
         self._budget = int(budget_bytes)
         self._bytes = 0
-        self._entries: "OrderedDict[int, Tuple[bytes, int, bytes, Tuple[bytes, ...]]]" = OrderedDict()
+        self._entries: "OrderedDict[int, Tuple[bytes, int, bytes, Tuple[bytes, ...]]]" = (
+            OrderedDict()
+        )
         self._index: Dict[tuple, List[int]] = {}
         self._next = 0
         self._lock = threading.Lock()
@@ -190,7 +192,9 @@ class _ChainMemo:
         self._armed = True
         try:
             print(
-                f"{CHAIN_MEMO_RECEIPT} pid={os.getpid()} budget_mib={self._budget >> 20}", file=sys.stderr, flush=True
+                f"{CHAIN_MEMO_RECEIPT} pid={os.getpid()} budget_mib={self._budget >> 20}",
+                file=sys.stderr,
+                flush=True,
             )
         except Exception:  # noqa: BLE001 - a receipt must never take the server down
             pass
@@ -318,7 +322,9 @@ class BlockHashChain:
             self._hashes.append(parent)
         return self._hashes
 
-    def _extend_through_memo(self, memo: "_ChainMemo", tokens: Sequence[int], end: int) -> Sequence[bytes]:
+    def _extend_through_memo(
+        self, memo: "_ChainMemo", tokens: Sequence[int], end: int
+    ) -> Sequence[bytes]:
         """A fresh chain over tokens[:end]: the longest stored identical prefix's hashes, then digests for the rest."""
         if _PACK_TOKENS:
             # Same payload bytes as struct.pack; the packed path keeps its receipt when the memo serves the chain.

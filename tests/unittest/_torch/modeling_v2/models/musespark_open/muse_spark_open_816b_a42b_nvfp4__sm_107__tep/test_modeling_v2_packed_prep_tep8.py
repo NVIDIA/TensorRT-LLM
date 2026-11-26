@@ -44,9 +44,13 @@ def _inputs(seqs: int, rows_per_seq: int, seed: int, permuted: bool):
     ).to(torch.int32)
     perm = torch.randperm(num_pages, device="cuda", generator=gen)[: seqs * 2 * pages_per_seq]
     tables = perm.view(seqs, 2, pages_per_seq).to(torch.int32).contiguous()
-    pool = torch.randint(0, 255, (num_pages, G, PAGE, D), dtype=torch.uint8, device="cuda", generator=gen)
+    pool = torch.randint(
+        0, 255, (num_pages, G, PAGE, D), dtype=torch.uint8, device="cuda", generator=gen
+    )
     cos_sin = torch.rand(1024, 2, D // 2, device="cuda", generator=gen)
-    positions = (lens.long()[:, None] - rows_per_seq + torch.arange(rows_per_seq, device="cuda")).reshape(-1)
+    positions = (
+        lens.long()[:, None] - rows_per_seq + torch.arange(rows_per_seq, device="cuda")
+    ).reshape(-1)
     return dict(
         qkv=qkv,
         cos_sin=cos_sin,

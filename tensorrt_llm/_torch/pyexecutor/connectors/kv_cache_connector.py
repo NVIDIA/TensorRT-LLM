@@ -110,6 +110,7 @@ def _broadcast_keep_root(obj, is_root: bool, root: int = 0):
         return copy.copy(obj)
     return pickle.loads(mpi_comm().bcast(None, root))  # nosec B301 - bytes from rank root
 
+
 #: See `KvCacheConnectorWorker.get_allocation_fence`.
 AllocationFence = Callable[[Iterable[int]], None]
 
@@ -1575,7 +1576,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if by_id is not None and self._local_page_indices is None:
             self._local_page_indices = lambda request_id: by_id(request_id, mask_stale=False)
         if getattr(self, "_local_page_lookup", None) is None:
-            self._local_page_lookup = getattr(kv_cache_manager, "lookup_local_page_indices_for_id", None)
+            self._local_page_lookup = getattr(
+                kv_cache_manager, "lookup_local_page_indices_for_id", None
+            )
         self._scheduler_output.prefix_loads = [
             load
             for reservation_id, load in self._prefix_loads.items()
@@ -1819,7 +1822,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             if reservation_id not in self._local_finished_prefix_load_ids:
                 raise RuntimeError(f"Prefix load {reservation_id} has not finished locally")
             request = self._prefix_load_requests[load.request_id]
-            _mcb = getattr(request, "py_mcb", None)  # MCB diagnostics: when the executor saw the load complete
+            _mcb = getattr(
+                request, "py_mcb", None
+            )  # MCB diagnostics: when the executor saw the load complete
             if _mcb is not None:
                 _mcb["tr"] = time.time()
                 _mcb["rid"] = reservation_id

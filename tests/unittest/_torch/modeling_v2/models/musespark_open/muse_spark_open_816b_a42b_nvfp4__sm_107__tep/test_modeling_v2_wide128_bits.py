@@ -253,7 +253,9 @@ def test_w1_prerouted_on_assign_tables_equals_stock(rows):
 # (ops/moe/ring_buddy_cuda.rb_tables) instead of the Triton program
 # --------------------------------------------------------------------------------------------------
 def _rb_tables_both(rba, sel, w, rank, tile, tilew=False):
-    band = dict(tile_placement=tilew, tile_min_rows=41, tile_max_rows=64)  # tep8_tile_placement as served at bs6-8
+    band = dict(
+        tile_placement=tilew, tile_min_rows=41, tile_max_rows=64
+    )  # tep8_tile_placement as served at bs6-8
     try:
         rba.configure(cuda_tables=False, **band)
         a = rba.ring_buddy_assign(sel, w, rank, True, None, ranks=8, meta_tile=tile)
@@ -280,7 +282,9 @@ def test_w9_rb_tables_equal_the_triton_program(rows, tilew):
         flat = sel.reshape(-1).tolist()
         for rank in range(8):
             (la, wa, sa, ma), (lb, wb, sb, mb) = _rb_tables_both(rba, sel, w, rank, tile, tilew)
-            assert torch.cuda.current_device() in rbc._KERNELS  # the CUDA program served the second call
+            assert (
+                torch.cuda.current_device() in rbc._KERNELS
+            )  # the CUDA program served the second call
             assert torch.equal(la, lb) and torch.equal(sa, sb), (rows, rank)
             assert torch.equal(wa.view(torch.int16), wb.view(torch.int16)), (rows, rank)
             nnc = int(ma["nnc"][0])
@@ -289,7 +293,9 @@ def test_w9_rb_tables_equal_the_triton_program(rows, tilew):
             assert torch.equal(ma["c2m"][:nnc], mb["c2m"][:nnc]), (rows, rank)
             ea, eb = ma["e2p"].reshape(-1), mb["e2p"].reshape(-1)
             assert torch.equal(ea >= 0, eb >= 0), (rows, rank)
-            model = rbc.model(flat, rank, tile, tilew=tilew and 41 <= rows <= 64, cost=rba._TILE_COST)
+            model = rbc.model(
+                flat, rank, tile, tilew=tilew and 41 <= rows <= 64, cost=rba._TILE_COST
+            )
             assert eb.tolist() == model["e2p"], (rows, rank)
             p2t = mb["p2t"].tolist()
             assert all(p2t[p] == t for p, t in model["p2t"].items()), (rows, rank)
@@ -354,12 +360,16 @@ def test_w9_rb_tables_wait_for_an_early_triggering_producer(rows):
     launch, _keep = _early_producer()
     for rank in range(8):
         tilew = rank % 2 == 1
-        exp = _rb_tables_both(rba, src_sel, src_w, rank, tile, tilew)[0]  # the Triton program on the produced ids
+        exp = _rb_tables_both(rba, src_sel, src_w, rank, tile, tilew)[
+            0
+        ]  # the Triton program on the produced ids
         sel = torch.full_like(src_sel, 255)
         w = torch.full_like(src_w, float("nan"))
         rba.configure(cuda_tables=True, tile_placement=tilew, tile_min_rows=41, tile_max_rows=64)
         try:
-            rba.ring_buddy_assign(src_sel, src_w, rank, True, None, ranks=8, meta_tile=tile)  # rb_tables built (eager)
+            rba.ring_buddy_assign(
+                src_sel, src_w, rank, True, None, ranks=8, meta_tile=tile
+            )  # rb_tables built (eager)
             torch.cuda.synchronize()
             launch(src_sel, src_w, sel, w, 200_000)
             got = rba.ring_buddy_assign(sel, w, rank, True, None, ranks=8, meta_tile=tile)
@@ -371,7 +381,10 @@ def test_w9_rb_tables_wait_for_an_early_triggering_producer(rows):
         assert torch.equal(le, lg) and torch.equal(se, sg), (rows, rank)
         assert torch.equal(we.view(torch.int16), wg.view(torch.int16)), (rows, rank)
         nnc = int(me["nnc"][0])
-        assert int(mg["nnc"][0]) == nnc and torch.equal(me["c2b"][:nnc], mg["c2b"][:nnc]), (rows, rank)
+        assert int(mg["nnc"][0]) == nnc and torch.equal(me["c2b"][:nnc], mg["c2b"][:nnc]), (
+            rows,
+            rank,
+        )
         assert torch.equal(me["c2m"][:nnc], mg["c2m"][:nnc]), (rows, rank)
 
 
@@ -1950,6 +1963,8 @@ def test_w9_cl8w_timing(cl8_wide, capsys):
             f"{res['swa_cl8w']:6.2f} us/call ({res['swa_cl8w'] - res['swa_cl8']:+.2f}); x46 SWA layers: "
             f"{(res['swa_cl8w'] - res['swa_cl8']) * 46 / 1e3:+.3f} ms/step"
         )
+
+
 # W10: 65..128-row TP8 drafter GEMMs in one launch of the 64-row tactic (``tep8_drafter_wide_gemms__MAX_ROWS``)
 # --------------------------------------------------------------------------------------------------
 W10_ROWS = [65, 72, 96, 104, 120, 128]
@@ -1997,7 +2012,9 @@ def _w10_chunks(sk, x, w, tactic, step: int) -> torch.Tensor:
     out = torch.empty(x.shape[0], w.shape[0], dtype=torch.bfloat16, device="cuda")
     for row0 in range(0, x.shape[0], step):
         row1 = min(x.shape[0], row0 + step)
-        sk.run_splitk_dense(x[row0:row1], w.t(), None, out[row0:row1], True, sk.SplitKTactic(*tactic))
+        sk.run_splitk_dense(
+            x[row0:row1], w.t(), None, out[row0:row1], True, sk.SplitKTactic(*tactic)
+        )
     return out
 
 
@@ -2046,15 +2063,22 @@ def test_w10_drafter_call_sites_route_by_max_rows_and_sites(drafter_wide128, mon
     calls = []
     real = sw.fixed_low_m_gemm
     monkeypatch.setattr(
-        sw, "fixed_low_m_gemm", lambda x, w, t, pdl: calls.append((x.shape[0], t)) or real(x, w, t, pdl)
+        sw,
+        "fixed_low_m_gemm",
+        lambda x, w, t, pdl: calls.append((x.shape[0], t)) or real(x, w, t, pdl),
     )
     # The built-in method the fixed one falls back to: cuBLAS, as ``_gemm``'s ``F.linear``.
     monkeypatch.setattr(
-        sw.UnquantizedLinearMethod, "apply", lambda self, module, x, bias: F.linear(x, module.weight)
+        sw.UnquantizedLinearMethod,
+        "apply",
+        lambda self, module, x, bias: F.linear(x, module.weight),
     )
     method = sw.FixedTacticLinearMethod(True)
-    for max_rows, sites in ((64, ("conv_coef", "qkv", "gate_up")), (96, ("conv_coef", "qkv", "gate_up")),
-                            (128, W10_SITES)):
+    for max_rows, sites in (
+        (64, ("conv_coef", "qkv", "gate_up")),
+        (96, ("conv_coef", "qkv", "gate_up")),
+        (128, W10_SITES),
+    ):
         _w10_configure(fl, max_rows, "64x64", sites)
         method.tactics = fl.splitk_tactics()
         for site in W10_SITES:
@@ -2069,7 +2093,9 @@ def test_w10_drafter_call_sites_route_by_max_rows_and_sites(drafter_wide128, mon
                 assert len(calls) == (2 if want else 0), (max_rows, site, rows, calls)
                 assert torch.equal(out.view(torch.int16), via_method.view(torch.int16))
                 if want:
-                    single = real(x, w, fl.tactic_for(rows, *fl._TP8_DRAFTER_WIDE_SHAPES[site]), True)
+                    single = real(
+                        x, w, fl.tactic_for(rows, *fl._TP8_DRAFTER_WIDE_SHAPES[site]), True
+                    )
                     torch.cuda.synchronize()
                     assert torch.equal(out.view(torch.int16), single.view(torch.int16))
         # The fc shard ([rows, 40960] x [1024, 40960]^T) keeps F.linear above 64 rows.
@@ -2109,7 +2135,11 @@ def test_w10_drafter_one_launch_graph_replays(drafter_wide128):
             for (x, w, t), out in zip(calls, outs):
                 want = fl.fixed_low_m_gemm(x, w, t, True)
                 torch.cuda.synchronize()
-                assert torch.equal(out.view(torch.int16), want.view(torch.int16)), (tile, x.shape, rep)
+                assert torch.equal(out.view(torch.int16), want.view(torch.int16)), (
+                    tile,
+                    x.shape,
+                    rep,
+                )
 
 
 def test_w10_drafter_one_launch_timing(drafter_wide128, capsys):
@@ -2189,7 +2219,9 @@ def _w10_window_operands(wa, requests: int, seed: int, m: int = 8, hq: int = 8, 
     capacity = 8_200
     k_cache = _randn(g, requests * capacity, d).view(requests, capacity, 1, d)
     v_cache = _randn(g, requests * capacity, d).view(requests, capacity, 1, d)
-    seqlens = torch.randint(3_000, capacity, (requests,), generator=g, device="cuda").to(torch.int32)
+    seqlens = torch.randint(3_000, capacity, (requests,), generator=g, device="cuda").to(
+        torch.int32
+    )
     slots = torch.randperm(requests, generator=g, device="cuda").to(torch.int32)
     q = _randn(g, requests * m, hq * d).view(requests, m, hq, d)
     k_new = _randn(g, requests * m, d).view(requests * m, 1, d)
@@ -2206,17 +2238,23 @@ def test_w10_window_multi_tile_splits_within_the_one_tile_error(drafter_window, 
     wa = drafter_window
     q, kc, vc, seqlens, slots, k_new, v_new = _w10_window_operands(wa, requests, 1_000 + requests)
     window = wa.WINDOW
-    ref = wa.attention_reference(q, kc, vc, seqlens, slots, window, None, torch.float64, k_new, v_new)
+    ref = wa.attention_reference(
+        q, kc, vc, seqlens, slots, window, None, torch.float64, k_new, v_new
+    )
     outs, caches = {}, {}
     for n in (1, tiles):
         wa.configure(multi_tiles=n, multi_min_rows=65)
         k, v = kc.clone(), vc.clone()
-        outs[n] = wa.dflash_window_attention(q, k, v, seqlens, slots, window, None, True, k_new, v_new)
+        outs[n] = wa.dflash_window_attention(
+            q, k, v, seqlens, slots, window, None, True, k_new, v_new
+        )
         caches[n] = (k, v)
         span, tile_rows = window[0] + q.shape[1], q.shape[2] * q.shape[1]
         assert wa.launch_config(requests, q.shape[1], span, tile_rows)["tiles"] == n
     torch.cuda.synchronize()
-    assert torch.equal(caches[1][0], caches[tiles][0]) and torch.equal(caches[1][1], caches[tiles][1])
+    assert torch.equal(caches[1][0], caches[tiles][0]) and torch.equal(
+        caches[1][1], caches[tiles][1]
+    )
     scale = ref.abs().amax().item()
     err1 = (outs[1].double() - ref).abs().amax().item()
     errn = (outs[tiles].double() - ref).abs().amax().item()
@@ -2440,7 +2478,9 @@ def test_w10_drafter_prefetch_timing(drafter_prefetch, capsys):
         "hop": _w10p_sleep_cycles(14.0),
     }
     g = torch.Generator(device="cuda").manual_seed(1_320)
-    lines = [f"[W10p] {props.name}: L2 {props.L2_cache_size / 2**20:.0f} MiB, {props.multi_processor_count} SMs"]
+    lines = [
+        f"[W10p] {props.name}: L2 {props.L2_cache_size / 2**20:.0f} MiB, {props.multi_processor_count} SMs"
+    ]
     # The rest of a step streams far more than the L2 holds between two drafter forwards: a flush
     # buffer read between replays keeps every replay's weights cold, as in a served step.
     flush = torch.empty(512 * 2**20, dtype=torch.uint8, device="cuda")
@@ -2467,7 +2507,10 @@ def test_w10_drafter_prefetch_timing(drafter_prefetch, capsys):
             times = []
             for _ in range(10):
                 flush.add_(1)
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start, end = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
                 start.record()
                 graph.replay()
                 end.record()
@@ -2476,7 +2519,8 @@ def test_w10_drafter_prefetch_timing(drafter_prefetch, capsys):
             us = sorted(times)[len(times) // 2]
             base = us if base is None else base
             lines.append(
-                f"[W10p] {rows:3d} rows, PREFETCH {level} {','.join(names) if names else 'all'}: {us:7.1f} us/step chain, "
+                f"[W10p] {rows:3d} rows, PREFETCH {level} {','.join(names) if names else 'all'}: "
+                f"{us:7.1f} us/step chain, "
                 f"vs 0: {us - base:+6.1f} us"
             )
     with capsys.disabled():
@@ -2491,7 +2535,9 @@ def _w10f_operands(rows: int, seed: int):
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = _randn(g, rows, 8192, 0.5)
     coefficients = _randn(g, rows * 2 * 2 * 512, 1, 0.1).view(rows, 2, 2, 512)
-    delta = coefficients[:, 1]  # the finish side's [rows, taps, groups] view, as the drafter's prepare returns
+    delta = coefficients[
+        :, 1
+    ]  # the finish side's [rows, taps, groups] view, as the drafter's prepare returns
     base = _randn(g, 2, 8192, 0.3)
     residual = _randn(g, rows, 8192)
     weight = (1.0 + _randn(g, 1, 8192, 0.1).float()).to(torch.bfloat16).view(8192)
@@ -2522,8 +2568,12 @@ def test_w10_finish_norm_equals_the_two_launches(rows):
         assert fn.takes(x, delta, base, res, weight)
         out = fn.drafter_finish_norm(x, delta, base, res, weight, 1e-6, 8)
         torch.cuda.synchronize()
-        assert torch.equal(res.view(torch.int16), res_ref.view(torch.int16)), "residual != the built-in add"
-        assert torch.equal(out.view(torch.int16), out_ref.view(torch.int16)), "output != the built-in norm"
+        assert torch.equal(res.view(torch.int16), res_ref.view(torch.int16)), (
+            "residual != the built-in add"
+        )
+        assert torch.equal(out.view(torch.int16), out_ref.view(torch.int16)), (
+            "output != the built-in norm"
+        )
         ref = fn.drafter_finish_norm.reference(x, delta, base, residual, weight, 1e-6, 8)
         assert torch.allclose(out.float(), ref.float(), rtol=3e-2, atol=3e-2)
 
@@ -2562,7 +2612,10 @@ def test_w10_finish_norm_graph_and_timing(capsys):
                 times = []
                 for _ in range(10):
                     res.copy_(residual)
-                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start, end = (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
+                    )
                     start.record()
                     graph.replay()
                     end.record()
@@ -2583,7 +2636,8 @@ def test_w10_finish_norm_graph_and_timing(capsys):
             assert torch.equal(got.view(torch.int16), want.view(torch.int16))
             assert torch.equal(res.view(torch.int16), want_res.view(torch.int16))
             lines.append(
-                f"[W10f] {rows:3d} rows: one launch {res_us['fused']:6.2f} us, conv + norm {res_us['built-in']:6.2f} us "
+                f"[W10f] {rows:3d} rows: one launch {res_us['fused']:6.2f} us, "
+                f"conv + norm {res_us['built-in']:6.2f} us "
                 f"per hop, x10 hops: {(res_us['fused'] - res_us['built-in']) * 10:+6.1f} us/step"
             )
     with capsys.disabled():
@@ -2591,7 +2645,8 @@ def test_w10_finish_norm_graph_and_timing(capsys):
 
 
 # --------------------------------------------------------------------------------------------------
-# W10 (head): the draft head's vocab-shard GEMM ([rows, 8192] x [25256, 8192]^T per TP8 rank) on cuBLAS vs split-K tactics
+# W10 (head): the draft head's vocab-shard GEMM ([rows, 8192] x [25256, 8192]^T per TP8 rank) on cuBLAS
+# vs split-K tactics
 # (a timing print that decides whether a head lever is worth writing; no lever yet)
 # --------------------------------------------------------------------------------------------------
 def test_w10_draft_head_gemm_timing(capsys):
@@ -2600,8 +2655,17 @@ def test_w10_draft_head_gemm_timing(capsys):
     try:
         g = torch.Generator(device="cuda").manual_seed(1_900)
         k, n = 8192, 202048 // 8
-        weights = [_randn(g, n, k, 0.02) for _ in range(2)]  # two distinct 414 MB shards: cold every call
-        tactics = [(128, 64, 1, 6), (64, 128, 1, 6), (128, 128, 1, 3), (64, 64, 1, 7), (128, 64, 2, 6), (128, 32, 1, 8)]
+        weights = [
+            _randn(g, n, k, 0.02) for _ in range(2)
+        ]  # two distinct 414 MB shards: cold every call
+        tactics = [
+            (128, 64, 1, 6),
+            (64, 128, 1, 6),
+            (128, 128, 1, 3),
+            (64, 64, 1, 7),
+            (128, 64, 2, 6),
+            (128, 32, 1, 8),
+        ]
         lines = []
 
         def per_call(run, x) -> float:
@@ -2639,7 +2703,9 @@ def test_w10_draft_head_gemm_timing(capsys):
                 fit = None
                 for s in range(stages, 0, -1):
                     try:
-                        sk.validate_tactic(sk.SplitKTactic(mma_m, mma_n, split_k, s), min(rows, 64), n, k)
+                        sk.validate_tactic(
+                            sk.SplitKTactic(mma_m, mma_n, split_k, s), min(rows, 64), n, k
+                        )
                         fit = sk.SplitKTactic(mma_m, mma_n, split_k, s)
                         break
                     except ValueError:
@@ -2659,7 +2725,9 @@ def test_w10_draft_head_gemm_timing(capsys):
                     torch.cuda.synchronize()
                     ok = torch.allclose(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
                     us = per_call(run, x)
-                    cells.append(f"{mma_m}x{mma_n}/{split_k}/{fit.ab_stages} {us:6.2f}{'' if ok else ' WRONG'}")
+                    cells.append(
+                        f"{mma_m}x{mma_n}/{split_k}/{fit.ab_stages} {us:6.2f}{'' if ok else ' WRONG'}"
+                    )
                 except Exception as error:  # a timing print: record and go on
                     cells.append(f"{mma_m}x{mma_n}/{split_k} error {type(error).__name__}")
             lines.append(f"[W10h] head {rows:3d} rows: " + " | ".join(cells) + " us/call")
@@ -2687,10 +2755,32 @@ def test_w10_qk_fold_equals_the_qk_norm_rope_launch(drafter_window, requests, ti
     qkv = _randn(g, rows, 1280)
     qw = (1.0 + _randn(g, 1, 128, 0.1).float()).to(torch.bfloat16).view(128)
     kw = (1.0 + _randn(g, 1, 128, 0.1).float()).to(torch.bfloat16).view(128)
-    positions = (seqlens.repeat_interleave(m) - m + torch.arange(m, device="cuda").repeat(requests)).to(torch.int32)
+    positions = (
+        seqlens.repeat_interleave(m) - m + torch.arange(m, device="cuda").repeat(requests)
+    ).to(torch.int32)
     ref_qkv = qkv.clone()
     torch.ops.trtllm.fused_qk_norm_rope(
-        ref_qkv, 8, 1, 1, 128, 128, eps, qw, kw, base, True, positions, 1.0, 0.0, 0.0, 1.0, True, False, False, 0, 0
+        ref_qkv,
+        8,
+        1,
+        1,
+        128,
+        128,
+        eps,
+        qw,
+        kw,
+        base,
+        True,
+        positions,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        True,
+        False,
+        False,
+        0,
+        0,
     )
     kc_ref, vc_ref = kc.clone(), vc.clone()
     want = wa.dflash_window_attention(
@@ -2780,7 +2870,11 @@ def test_w10_silu_fold_equals_gate_up_and_silu(drafter_wide128, rows, deep):
         replay = sf.silu_fold_gemm(x, wi, folded, True)
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (rows, deep, tuple(folded.__dict__.values()))
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+        rows,
+        deep,
+        tuple(folded.__dict__.values()),
+    )
     assert torch.equal(replay.view(torch.int16), want.view(torch.int16)), (rows, deep)
 
 
@@ -2837,10 +2931,15 @@ def test_w10_silu_fold_timing(drafter_wide128, capsys):
         x = _randn(g, rows, k)
         tactic = fl.tactic_for(rows, k, n)
         folded = sf.fold_tactic(tactic)
-        plain = time_calls([(lambda i=i: _w10j_plain(fl, sm, x, ws[i], tactic, True)) for i in range(6)])
-        fold = time_calls([(lambda i=i: sf.silu_fold_gemm(x, wis[i], folded, True)) for i in range(6)])
+        plain = time_calls(
+            [(lambda i=i: _w10j_plain(fl, sm, x, ws[i], tactic, True)) for i in range(6)]
+        )
+        fold = time_calls(
+            [(lambda i=i: sf.silu_fold_gemm(x, wis[i], folded, True)) for i in range(6)]
+        )
         lines.append(
-            f"[W10j] {rows:2d} rows: gate_up s{tactic[3]} + silu {plain:6.2f} us, fold s{folded.ab_stages} {fold:6.2f} us "
+            f"[W10j] {rows:2d} rows: gate_up s{tactic[3]} + silu {plain:6.2f} us, "
+            f"fold s{folded.ab_stages} {fold:6.2f} us "
             f"({fold - plain:+.2f}; x5 layers {5 * (fold - plain):+.1f} us/step)"
         )
     with capsys.disabled():
@@ -3154,7 +3253,6 @@ def test_w11_unpool_tile_timing(pool_tile, capsys):
         print("\n" + "\n".join(lines), flush=True)
 
 
-
 # --------------------------------------------------------------------------------------------------
 # W12: the 65..128-row o_proj scatter producer by mode and stages (PRODUCER / PRODUCER_STAGES)
 # --------------------------------------------------------------------------------------------------
@@ -3214,7 +3312,6 @@ def test_w12_producer_stages_bits_and_timing(hop128, capsys, mode, stages):
         print("\n" + "\n".join(lines), flush=True)
 
 
-
 # --------------------------------------------------------------------------------------------------
 # W13: QKV at 65..128 rows through cuBLAS variants (does one skip the splitKreduce launch?)
 # --------------------------------------------------------------------------------------------------
@@ -3263,7 +3360,10 @@ for rows in rows_list:
         ("addmm-lt", {}),
         ("linear-lt-ws0", {"CUBLASLT_WORKSPACE_SIZE": "0"}),
         ("addmm-lt-ws64m", {"CUBLASLT_WORKSPACE_SIZE": "65536"}),
-        ("linear-ws64m", {"CUBLASLT_WORKSPACE_SIZE": "65536", "CUBLAS_WORKSPACE_CONFIG": ":65536:2"}),
+        (
+            "linear-ws64m",
+            {"CUBLASLT_WORKSPACE_SIZE": "65536", "CUBLAS_WORKSPACE_CONFIG": ":65536:2"},
+        ),
     ],
 )
 def test_w13_qkv_cublas_variants(capsys, mode, env):
@@ -3279,7 +3379,10 @@ def test_w13_qkv_cublas_variants(capsys, mode, env):
         timeout=600,
     )
     with capsys.disabled():
-        print("\n" + "\n".join(line for line in proc.stdout.splitlines() if "[W13]" in line), flush=True)
+        print(
+            "\n" + "\n".join(line for line in proc.stdout.splitlines() if "[W13]" in line),
+            flush=True,
+        )
     assert proc.returncode == 0, proc.stderr[-2000:]
 
 
@@ -3312,7 +3415,10 @@ def test_w14_qkv_2cta_bits(qkv_wide128, rows, name, split_k, prefetch, rs):
     torch.cuda.synchronize()
     assert bool((padded[rows:].view(torch.int16) == -1).all()), f"{name}: wrote past its output"
     differ = int((out.view(torch.int16) != chunks.view(torch.int16)).sum())
-    print(f"[W14] {name} {rows} rows: {differ} elements differ from {ref} (64-row launches)", flush=True)
+    print(
+        f"[W14] {name} {rows} rows: {differ} elements differ from {ref} (64-row launches)",
+        flush=True,
+    )
     assert torch.allclose(out.float(), F.linear(x, w).float(), rtol=2e-2, atol=2e-2), name
     assert differ == 0, f"{name} {rows} rows: not the 64-row launches' bits ({differ} elements)"
     if split_k == 4:
@@ -3550,7 +3656,7 @@ def _w10k_setup(gens: int, rows: int, layers: int, windowed: bool, seed: int):
     perm = torch.randperm(pages - 1, generator=g, device="cuda") + 1
     for b in range(gens):
         e = int(extents[b])
-        src[1, b, :, :e] = (perm[b * width : b * width + e].to(torch.int32) * divisor + offset)
+        src[1, b, :, :e] = perm[b * width : b * width + e].to(torch.int32) * divisor + offset
         # a placeholder inside the allocation, below the step's rows (an evicted page of a sliding layer)
         src[1, b, :, 3] = -7
     ctx_len = torch.zeros(16, dtype=torch.int64, device="cuda")
@@ -3562,10 +3668,23 @@ def _w10k_setup(gens: int, rows: int, layers: int, windowed: bool, seed: int):
     ctx_len[slots[0]] = int(extents[0]) * page - 2
     ctx_base = (ctx_len // 3).to(torch.int64) if windowed else None
     pool_list = [
-        torch.zeros((pages, 2, nkv, page, hd), dtype=torch.bfloat16, device="cuda") for _ in range(layers)
+        torch.zeros((pages, 2, nkv, page, hd), dtype=torch.bfloat16, device="cuda")
+        for _ in range(layers)
     ]
-    return dict(src=src, slots=slots, ctx_len=ctx_len, ctx_base=ctx_base, pools=pool_list, page=page,
-                width=width, divisor=divisor, offset=offset, nkv=nkv, hd=hd, g=g)
+    return dict(
+        src=src,
+        slots=slots,
+        ctx_len=ctx_len,
+        ctx_base=ctx_base,
+        pools=pool_list,
+        page=page,
+        width=width,
+        divisor=divisor,
+        offset=offset,
+        nkv=nkv,
+        hd=hd,
+        g=g,
+    )
 
 
 def _w10k_v2_views(storage: torch.Tensor, layers: int, pages: int, nkv: int, page: int, hd: int):
@@ -3574,8 +3693,12 @@ def _w10k_v2_views(storage: torch.Tensor, layers: int, pages: int, nkv: int, pag
     (shape[0] = pages + layers - 1 - layer) while the strides are shared -- what vrg-zk1b's refusal met."""
     pair = 2 * nkv * page * hd
     return [
-        torch.as_strided(storage, (pages + layers - 1 - layer, 2, nkv, page, hd),
-                         (layers * pair, nkv * page * hd, page * hd, hd, 1), layer * pair)
+        torch.as_strided(
+            storage,
+            (pages + layers - 1 - layer, 2, nkv, page, hd),
+            (layers * pair, nkv * page * hd, page * hd, hd, 1),
+            layer * pair,
+        )
         for layer in range(layers)
     ]
 
@@ -3603,7 +3726,10 @@ def test_w10_paged_side_chain_prologue_and_store_equal_the_built_in(gens, window
         storage = _randn(s["g"], (pages + layers) * layers * pair, 1).view(-1)
         want_storage = storage.clone()
         s["pools"] = _w10k_v2_views(storage, layers, pages, s["nkv"], s["page"], s["hd"])
-        assert len({p.shape[0] for p in s["pools"]}) == layers and len({p.stride() for p in s["pools"]}) == 1
+        assert (
+            len({p.shape[0] for p in s["pools"]}) == layers
+            and len({p.stride() for p in s["pools"]}) == 1
+        )
     src = s["src"][1, :, 0]
     n = gens * rows
     outs = []
@@ -3613,11 +3739,27 @@ def test_w10_paged_side_chain_prologue_and_store_equal_the_built_in(gens, window
         positions = torch.empty(n, dtype=torch.int64, device="cuda")
         col = torch.empty(n, dtype=torch.int64, device="cuda")
         pos_i32 = torch.empty(n * layers, dtype=torch.int32, device="cuda")
-        fn(src, table, counts, s["ctx_len"], s["ctx_base"], s["slots"], positions, col, pos_i32,
-           rows, layers, s["offset"], s["divisor"], s["page"])
+        fn(
+            src,
+            table,
+            counts,
+            s["ctx_len"],
+            s["ctx_base"],
+            s["slots"],
+            positions,
+            col,
+            pos_i32,
+            rows,
+            layers,
+            s["offset"],
+            s["divisor"],
+            s["page"],
+        )
         outs.append((table, counts, positions, col, pos_i32))
     torch.cuda.synchronize()
-    for got, want, name in zip(outs[0], outs[1], ("table", "counts", "positions", "col", "pos_i32")):
+    for got, want, name in zip(
+        outs[0], outs[1], ("table", "counts", "positions", "col", "pos_i32")
+    ):
         assert torch.equal(got, want), name
     table, counts, positions, col, _ = outs[0]
     # The store: K (post norm + RoPE) [n, layers, nkv * hd] and the fused K/V GEMM's output (V read in place).
@@ -3626,7 +3768,9 @@ def test_w10_paged_side_chain_prologue_and_store_equal_the_built_in(gens, window
     kv_flat = _randn(g, n, layers * 2 * nkv * hd)
     k_new = _randn(g, n * layers, nkv * hd).view(n, layers, nkv * hd)
     if v2_pools:
-        want_pools = _w10k_v2_views(want_storage, layers, s["pools"][0].shape[0] - layers + 1, nkv, s["page"], hd)
+        want_pools = _w10k_v2_views(
+            want_storage, layers, s["pools"][0].shape[0] - layers + 1, nkv, s["page"], hd
+        )
     else:
         want_pools = [p.clone() for p in s["pools"]]
     rows_i32 = torch.arange(gens, device="cuda").repeat_interleave(rows).to(torch.int32)
@@ -3646,7 +3790,9 @@ def test_w10_paged_side_chain_prologue_and_store_equal_the_built_in(gens, window
             kv_layout="HND",
         )
     ptrs = torch.tensor([p.data_ptr() for p in s["pools"]], dtype=torch.int64, device="cuda")
-    ps.context_kv_paged_scatter(k_new, kv_flat, col, counts, table, ptrs, s["pools"][0], rows, layers, nkv, hd)
+    ps.context_kv_paged_scatter(
+        k_new, kv_flat, col, counts, table, ptrs, s["pools"][0], rows, layers, nkv, hd
+    )
     torch.cuda.synchronize()
     # Slots two rows of a request clamp onto: the built-in's winner is unspecified; compare everything else.
     dup = torch.zeros(n, dtype=torch.bool, device="cuda")
@@ -3661,10 +3807,18 @@ def test_w10_paged_side_chain_prologue_and_store_equal_the_built_in(gens, window
         for i in torch.nonzero(dup).flatten().tolist():
             got_p[pages_[i], :, :, toks[i]] = 0
             want_p[pages_[i], :, :, toks[i]] = 0
-        assert torch.equal(got_p.view(torch.int16), want_p.view(torch.int16)), (layer, gens, windowed, v2_pools)
+        assert torch.equal(got_p.view(torch.int16), want_p.view(torch.int16)), (
+            layer,
+            gens,
+            windowed,
+            v2_pools,
+        )
     if v2_pools:
         # Nothing outside the layers' (overlapping-free) buffers moved either: the whole interleaved allocation.
-        assert torch.equal(storage.view(torch.int16), want_storage.view(torch.int16)), (gens, windowed)
+        assert torch.equal(storage.view(torch.int16), want_storage.view(torch.int16)), (
+            gens,
+            windowed,
+        )
     assert windowed or int(dup.sum()) >= 1  # request 0 sits at its allocation's end: its rows clamp
 
 

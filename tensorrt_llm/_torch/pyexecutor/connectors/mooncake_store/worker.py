@@ -66,14 +66,19 @@ from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_address, pool_config
+from .digest import PageDigestLog
 from .keys import BlockHashChain, KeyNamespace, chain_memo_stats
 from .ledger import record_segment
-from .digest import PageDigestLog
+from .metadata import (
+    MooncakeStoreMetadata,
+    PageTransfer,
+    PrefixLoadTransfers,
+    RequestTransfers,
+    WindowRetire,
+)
 from .save_retry import put_with_retries
 from .snapshot import SnapshotRing
 from .softpin import SOFTPIN_ENV, SoftPinStore, maybe_softpin_store
-from .stored_set import LocalStoredSet
-from .metadata import MooncakeStoreMetadata, PageTransfer, PrefixLoadTransfers, RequestTransfers, WindowRetire
 from .staging import (
     MAX_STAGING_BUFFER_BYTES,
     HostStagingPool,
@@ -84,6 +89,7 @@ from .staging import (
     unstage_batch_after_get,
 )
 from .staging import sync_stream as _sync_stream
+from .stored_set import LocalStoredSet
 from .validation import validate_layout, validate_llm_args, validate_node_budget
 
 __all__ = ["MooncakeStoreConnectorWorker", "PrefixHit", "resolve_local_worker"]
@@ -238,9 +244,7 @@ LOOKUP_REUSE_STARTS = 4096
 STORED_FROM_LOADS_ENV = "TRTLLM_MOONCAKE_STORE_LOCAL_STORED_FROM_LOADS"
 
 
-def _leading_run_staged(
-    block_count: int, start: int, probe_blocks
-) -> Optional[int]:
+def _leading_run_staged(block_count: int, start: int, probe_blocks) -> Optional[int]:
     """The first block in ``[start, block_count)`` that ``probe_blocks`` reports incomplete, else ``block_count``.
 
     ``probe_blocks(blocks)`` answers, per block ordinal in ``blocks``, whether every key of that block is present,
@@ -285,7 +289,9 @@ class _RunReuse:
         self._ttl = ttl
         self._clock = clock
         # (groups, first hash) -> [(run, last hash, confirmed at)], most recent last.
-        self._runs: "OrderedDict[Tuple[Tuple[int, ...], bytes], List[Tuple[int, bytes, float]]]" = OrderedDict()
+        self._runs: "OrderedDict[Tuple[Tuple[int, ...], bytes], List[Tuple[int, bytes, float]]]" = (
+            OrderedDict()
+        )
         self.reused_lookups = 0
         self.reused_blocks = 0
 
@@ -316,7 +322,9 @@ class _RunReuse:
             self.reused_blocks += best
         return best, confirmed
 
-    def record(self, groups: Tuple[int, ...], block_hashes: Sequence[bytes], run: int, confirmed: float) -> None:
+    def record(
+        self, groups: Tuple[int, ...], block_hashes: Sequence[bytes], run: int, confirmed: float
+    ) -> None:
         if run <= 0:
             return
         key = (groups, block_hashes[0])
@@ -335,6 +343,8 @@ class _RunReuse:
         del entries[:-LOOKUP_REUSE_RUNS_PER_START]
         while len(self._runs) > LOOKUP_REUSE_STARTS:
             self._runs.popitem(last=False)
+
+
 #: Rank-local lookups (off by default; 1 turns them on, tensor parallelism without attention DP only). Without it the
 #: leader probes every rank's keys of a prefix while the other ranks wait in the result broadcast. With it every rank
 #: hashes the prompt and probes only its own shard's keys, concurrently, and the ranks agree through an allreduce(MIN)
@@ -511,13 +521,13 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
     return int(stream.cuda_stream)
 
 
-
 def _save_retry_disabled() -> bool:
     """Kill switch of the save retry (same names as our e930 port)."""
     return (
         os.environ.get("TRTLLM_M31_DISABLE_STORE_SAVE_RETRY") == "1"
         or os.environ.get("TRTLLM_DISABLE_STORE_SAVE_RETRY") == "1"
     )
+
 
 class _LoadStats:
     """The loader thread's running totals, reported once per `LOAD_STATS_INTERVAL`."""
@@ -796,7 +806,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Asynchronous prefix loads run on threads of their own, each with its
         # own staging slots and stream, while their requests wait outside the
         # batch. The threads share one queue.
-        self._load_queue: "Queue[Optional[Tuple[int, RequestTransfers, Optional[List[torch.cuda.Event]], float]]]" = Queue()
+        self._load_queue: "Queue[Optional[Tuple[int, RequestTransfers, Optional[List[torch.cuda.Event]], float]]]" = Queue()  # noqa: E501
         self._load_threads: List[threading.Thread] = []
         self._load_startup_error: Optional[BaseException] = None
         self._async_load_stagings: List[HostStagingPool] = []
@@ -805,7 +815,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._probe_chunk = int(os.environ.get(PROBE_CHUNK_ENV, DEFAULT_PROBE_CHUNK))
         # lkp L1/L2 (off by default): staged leading-run probes, and reuse of runs earlier lookups confirmed.
         self._lookup_staged = os.environ.get(LOOKUP_STAGED_ENV, "0") == "1"
-        self._run_reuse: Optional[_RunReuse] = _RunReuse.from_env() if self._config.role.loads else None
+        self._run_reuse: Optional[_RunReuse] = (
+            _RunReuse.from_env() if self._config.role.loads else None
+        )
         # Keys and `batch_is_exist` rounds the lookup probes issued, read into the lookup statistics.
         self._probe_keys = 0
         self._probe_calls = 0
@@ -1068,15 +1080,24 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if not (self._config.role.saves and self._life_cycles and torch.cuda.is_available()):
             return
         if os.environ.get(WINDOW_SNAPSHOT_ENV, "1") == "0":
-            logger.warning(f"mooncake-store rank {self._rank}: {WINDOW_SNAPSHOT_ENV}=0, window pages are saved live")
+            logger.warning(
+                f"mooncake-store rank {self._rank}: {WINDOW_SNAPSHOT_ENV}=0, window pages are saved live"
+            )
             return
         slot_bytes = max(addressing.bytes_per_page(group) for group in self._life_cycles)
         num_slots = int(os.environ.get(WINDOW_SNAPSHOT_SLOTS_ENV, DEFAULT_WINDOW_SNAPSHOT_SLOTS))
         self._window_snapshot = SnapshotRing(
-            HostStagingPool(slot_bytes=slot_bytes, num_slots=num_slots, store=self._store, label="window-snapshot")
+            HostStagingPool(
+                slot_bytes=slot_bytes,
+                num_slots=num_slots,
+                store=self._store,
+                label="window-snapshot",
+            )
         )
 
-    def _snapshot_window_pages(self, saves: List[RequestTransfers], stream) -> Tuple[List[RequestTransfers], Dict]:
+    def _snapshot_window_pages(
+        self, saves: List[RequestTransfers], stream
+    ) -> Tuple[List[RequestTransfers], Dict]:
         """Copy this pass's window pages to pinned slots on `stream`; returns (saves, overrides).
 
         overrides maps (layer group, page index) to (slot, slot address, bytes). A pass whose window pages
@@ -1095,7 +1116,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             return saves, {}
         slots = ring.try_reserve(len(wanted))
         if slots is None:
-            slots = ring.reserve(len(wanted), alive=lambda: self._save_thread is not None and self._save_thread.is_alive())
+            slots = ring.reserve(
+                len(wanted),
+                alive=lambda: self._save_thread is not None and self._save_thread.is_alive(),
+            )
         if slots is None:
             self._window_snapshot_dropped += len(wanted)
             logger.warning(
@@ -1103,7 +1127,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 f"{ring.num_slots}-slot window snapshot; not saving them ({self._window_snapshot_dropped} so far)"
             )
             kept = [
-                RequestTransfers(entry.request_id, [p for p in entry.pages if p.layer_group_id not in windowed])
+                RequestTransfers(
+                    entry.request_id, [p for p in entry.pages if p.layer_group_id not in windowed]
+                )
                 for entry in saves
             ]
             return kept, {}
@@ -1123,7 +1149,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
                 stream.wait_stream(side)
             else:
-                placed = ring.gather_many(slots, [b[0] for b in buffers], [b[1] for b in buffers], handle)
+                placed = ring.gather_many(
+                    slots, [b[0] for b in buffers], [b[1] for b in buffers], handle
+                )
             for slot, key, (slot_address, total) in zip(slots, wanted, placed):
                 overrides[key] = (slot, slot_address, total)
             return saves, overrides
@@ -1374,7 +1402,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 time.monotonic() - started,
                 keys=self._probe_keys - keys,
                 calls=self._probe_calls - calls,
-                reused_blocks=(self._run_reuse.reused_blocks if self._run_reuse is not None else 0) - reused,
+                reused_blocks=(self._run_reuse.reused_blocks if self._run_reuse is not None else 0)
+                - reused,
             )
             if report:
                 logger.info(f"mooncake-store rank {self._rank} lookups: {report}")
@@ -1622,7 +1651,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         keys_per_block = len(namespaces)
 
         def probe(blocks: List[int]) -> Optional[List[bool]]:
-            present = self._probe(_interleaved_keys(namespaces, [block_hashes[block] for block in blocks]))
+            present = self._probe(
+                _interleaved_keys(namespaces, [block_hashes[block] for block in blocks])
+            )
             if present is None:
                 return None
             return [
@@ -1641,7 +1672,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         present = self._probe(_interleaved_keys(namespaces, block_hashes[start:]))
         if present is None:
             return None
-        first_miss = next((index for index, status in enumerate(present) if status != 1), len(present))
+        first_miss = next(
+            (index for index, status in enumerate(present) if status != 1), len(present)
+        )
         return start + first_miss // len(namespaces)
 
     def _probe(self, keys: List[str]) -> Optional[List[int]]:
@@ -1712,7 +1745,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if now:
             staging = self._load_staging
             _mcb_t0 = time.monotonic()
-            _mcb_bytes = self._load_pages(now, staging, _stream_handle(stream) if staging is not None else 0)
+            _mcb_bytes = self._load_pages(
+                now, staging, _stream_handle(stream) if staging is not None else 0
+            )
             if _MCB_DIAG and self._rank == 0:
                 logger.info(
                     f"[MCB] syncload rank {self._rank} reqs={len(now)} "
@@ -1823,14 +1858,18 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                                 "(counted in the save statistics as remapped)"
                             )
                         self._remapped_pages += 1
-                        page = PageTransfer(page.block_hash, page.layer_group_id, local, page.block_ordinal)
+                        page = PageTransfer(
+                            page.block_hash, page.layer_group_id, local, page.block_ordinal
+                        )
                     pages.append(page)
                 return RequestTransfers(entry.request_id, pages)
 
             metadata.loads = [localize(entry, True) for entry in metadata.loads]
             metadata.saves = [localize(entry, False) for entry in metadata.saves]
             metadata.prefix_loads = [
-                PrefixLoadTransfers(item.reservation_id, item.is_async, localize(item.transfers, True))
+                PrefixLoadTransfers(
+                    item.reservation_id, item.is_async, localize(item.transfers, True)
+                )
                 for item in getattr(metadata, "prefix_loads", ())
             ]
         metadata._localized = True
@@ -1872,7 +1911,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if not wanted.any():
             return local
         positions = {
-            group: np.flatnonzero(wanted & (groups == group)) for group in np.unique(groups[wanted]).tolist()
+            group: np.flatnonzero(wanted & (groups == group))
+            for group in np.unique(groups[wanted]).tolist()
         }
         verify = self._pgfix_fast >= 2
         found, fallbacks, mismatches = lookup(
@@ -1883,7 +1923,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         before = self._pgfix_lookups
         self._pgfix_lookups += len(positions)
         self._pgfix_fallbacks += fallbacks
-        if before == 0 or (before.bit_length() - 1) // 2 != (self._pgfix_lookups.bit_length() - 1) // 2:
+        if (
+            before == 0
+            or (before.bit_length() - 1) // 2 != (self._pgfix_lookups.bit_length() - 1) // 2
+        ):
             # At 1, 4, 16, 64, ... lookups: the save statistics line (every 30 s) may never print in a short run.
             logger.info(
                 f"mooncake-store rank {self._rank}: PGFIX_FAST lookups {self._pgfix_lookups} full-query "
@@ -1942,7 +1985,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                         "(counted in the save statistics as remapped)"
                     )
                 self._remapped_pages += 1
-                out[i] = PageTransfer(page.block_hash, page.layer_group_id, slot, page.block_ordinal)
+                out[i] = PageTransfer(
+                    page.block_hash, page.layer_group_id, slot, page.block_ordinal
+                )
             result = RequestTransfers(
                 entry.request_id, [page for page in out if page is not None] if dropped else out
             )
@@ -1967,7 +2012,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         overridden: Dict[int, List[int]] = {}
         for layer_group_id, page_index in overrides or ():
             overridden.setdefault(layer_group_id, []).append(page_index)
-        overridden_slots = {group: np.array(slots, dtype=np.int64) for group, slots in overridden.items()}
+        overridden_slots = {
+            group: np.array(slots, dtype=np.int64) for group, slots in overridden.items()
+        }
         for entry in saves:
             pages = entry.pages
             if not pages:
@@ -2008,7 +2055,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                         "from the surviving page (counted in the save statistics as commit swaps)"
                     )
                 retargeted += 1
-                kept.append(PageTransfer(page.block_hash, page.layer_group_id, slot, page.block_ordinal))
+                kept.append(
+                    PageTransfer(page.block_hash, page.layer_group_id, slot, page.block_ordinal)
+                )
             out.append(RequestTransfers(entry.request_id, kept))
         self._swap_checked += checked
         self._swap_retargeted += retargeted
@@ -2060,9 +2109,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             gate_note = ""
             if self._launch_gate is not None:
                 _gate_t0 = time.monotonic()
-                gate_note = (
-                    f" gate={self._launch_gate.wait()}:{time.monotonic() - _gate_t0:.4f}"
-                )
+                gate_note = f" gate={self._launch_gate.wait()}:{time.monotonic() - _gate_t0:.4f}"
             began = time.monotonic()
             try:
                 for event in ready or ():
@@ -2282,7 +2329,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                             "from the surviving page (counted in the save statistics as commit swaps)"
                         )
                     retargeted += 1
-                    pages.append(PageTransfer(page.block_hash, page.layer_group_id, current, page.block_ordinal))
+                    pages.append(
+                        PageTransfer(
+                            page.block_hash, page.layer_group_id, current, page.block_ordinal
+                        )
+                    )
             out.append(RequestTransfers(entry.request_id, pages))
         self._swap_checked += checked
         self._swap_retargeted += retargeted
@@ -2307,7 +2358,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         batch_remove = getattr(self._store, "batch_remove", None)
         if batch_remove is not None:
             results = list(batch_remove(keys, False))
-            removed_keys = [key for key, result in zip(keys, results) if isinstance(result, int) and result == 0]
+            removed_keys = [
+                key for key, result in zip(keys, results) if isinstance(result, int) and result == 0
+            ]
         else:
             removed_keys = []
             for key in keys:
@@ -2386,7 +2439,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 stats.total_retired += 1
                 self._retire_seq += 1
                 heapq.heappush(
-                    self._retire_due, (time.monotonic() + self._retire_delay, self._retire_seq, keys)
+                    self._retire_due,
+                    (time.monotonic() + self._retire_delay, self._retire_seq, keys),
                 )
             except Exception as exc:
                 logger.warning(
@@ -2575,7 +2629,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     f"{local_note}"
                 )
 
-    def _put(self, transfers: Sequence[RequestTransfers], overrides: Optional[Dict] = None) -> Tuple[int, int, int]:
+    def _put(
+        self, transfers: Sequence[RequestTransfers], overrides: Optional[Dict] = None
+    ) -> Tuple[int, int, int]:
         """Write the pages the pool does not hold yet.
 
         `overrides` (from `_snapshot_window_pages`) are window pages already copied to pinned slots: they
@@ -2587,8 +2643,17 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         overrides = overrides or {}
         live, snap = [], []
         for entry in transfers:
-            live.append(RequestTransfers(entry.request_id, [p for p in entry.pages if (p.layer_group_id, p.page_index) not in overrides]))
-            snap.extend((entry.request_id, p) for p in entry.pages if (p.layer_group_id, p.page_index) in overrides)
+            live.append(
+                RequestTransfers(
+                    entry.request_id,
+                    [p for p in entry.pages if (p.layer_group_id, p.page_index) not in overrides],
+                )
+            )
+            snap.extend(
+                (entry.request_id, p)
+                for p in entry.pages
+                if (p.layer_group_id, p.page_index) in overrides
+            )
         if self._page_digest is not None:
             # After the pass's event, before the store reads: the bytes a put ships.
             for entry in live:
@@ -2599,7 +2664,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             addresses = [[overrides[(p.layer_group_id, p.page_index)][1]] for _, p in snap]
             sizes = [[overrides[(p.layer_group_id, p.page_index)][2]] for _, p in snap]
             if self._page_digest is not None:
-                self._page_digest.saved_host([(rid, key) for (rid, _), key in zip(snap, keys)], addresses, sizes)
+                self._page_digest.saved_host(
+                    [(rid, key) for (rid, _), key in zip(snap, keys)], addresses, sizes
+                )
             w, pc, wb = self._put_resolved(keys, addresses, sizes, staged=True)
             written, present_count, written_bytes = w, pc, wb
         keys, addresses, sizes, _ = self._resolve(live)

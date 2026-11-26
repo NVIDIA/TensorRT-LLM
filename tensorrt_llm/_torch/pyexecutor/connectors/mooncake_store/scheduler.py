@@ -400,7 +400,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         return MooncakeStoreMetadata(
             loads=[entry for entry in last.loads if entry.request_id in requests],
             saves=[entry for entry in last.saves if entry.request_id in requests],
-            prefix_loads=[item for item in last.prefix_loads if item.reservation_id in reservations],
+            prefix_loads=[
+                item for item in last.prefix_loads if item.reservation_id in reservations
+            ],
             retires=[item for item in last.retires if item.request_id in requests],
         )
 

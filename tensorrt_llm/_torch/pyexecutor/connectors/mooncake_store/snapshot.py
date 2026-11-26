@@ -65,7 +65,9 @@ class SnapshotRing:
             taken, self._free = self._free[:count], self._free[count:]
             return taken
 
-    def reserve(self, count: int, alive: Callable[[], bool], timeout: float = 1.0) -> Optional[List[int]]:
+    def reserve(
+        self, count: int, alive: Callable[[], bool], timeout: float = 1.0
+    ) -> Optional[List[int]]:
         """`count` slots, waiting for the save thread to return some.
 
         Returns None when `count` can never fit or `alive()` turns false while

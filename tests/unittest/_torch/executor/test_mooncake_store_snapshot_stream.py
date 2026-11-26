@@ -11,7 +11,10 @@ the stream order. CPU only: fake streams and a fake snapshot ring record the ord
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as wmod
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import PageTransfer, RequestTransfers
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
+    PageTransfer,
+    RequestTransfers,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -67,15 +70,25 @@ def _worker(log, on):
 
 
 def _saves():
-    return [RequestTransfers(1, [PageTransfer(b"\x01" * 16, 0, 7, 0), PageTransfer(b"\x02" * 16, 1, 9, 1),
-                                 PageTransfer(b"\x03" * 16, 0, 8, 1)])]
+    return [
+        RequestTransfers(
+            1,
+            [
+                PageTransfer(b"\x01" * 16, 0, 7, 0),
+                PageTransfer(b"\x02" * 16, 1, 9, 1),
+                PageTransfer(b"\x03" * 16, 0, 8, 1),
+            ],
+        )
+    ]
 
 
 @pytest.fixture(autouse=True)
 def _batched(monkeypatch):
     monkeypatch.setattr(wmod, "batch_copy_mode", lambda: "auto")
     FakeStream.created = []
-    monkeypatch.setattr(wmod.torch.cuda, "Stream", lambda device=None: FakeStream(device=device, log=_LOG))
+    monkeypatch.setattr(
+        wmod.torch.cuda, "Stream", lambda device=None: FakeStream(device=device, log=_LOG)
+    )
     _LOG.clear()
 
 
@@ -99,7 +112,11 @@ def test_side_stream_order_on_default_stream():
     saves, overrides = w._snapshot_window_pages(_saves(), execs)
     side = FakeStream.created[0]
     assert side.device == "cuda:0"
-    assert _LOG == [("wait", "side", "exec"), ("gather", side.cuda_stream, (0, 1)), ("wait", "exec", "side")]
+    assert _LOG == [
+        ("wait", "side", "exec"),
+        ("gather", side.cuda_stream, (0, 1)),
+        ("wait", "exec", "side"),
+    ]
     # same slots and overrides as without the switch
     ref_log = []
     ref = _worker(ref_log, on=False)
@@ -117,4 +134,3 @@ def test_non_default_stream_used_directly():
     execs = FakeStream(device="cuda:0", handle=0x77, log=_LOG, name="exec")
     w._snapshot_window_pages(_saves(), execs)
     assert _LOG == [("gather", 0x77, (0, 1))] and FakeStream.created == []
-

@@ -55,7 +55,9 @@ class LocalStoredSet:
         self._capacity = int(capacity)
         self._ttl = float(ttl)
         self._clock = clock
-        self._entries: "OrderedDict[str, float]" = OrderedDict()  # key -> confirmed at, oldest first
+        self._entries: "OrderedDict[str, float]" = (
+            OrderedDict()
+        )  # key -> confirmed at, oldest first
         self._lock = threading.Lock()
         #: Keys a save skipped probing, keys confirmed, keys dropped on an absent probe, and expired lookups.
         self.hits = 0

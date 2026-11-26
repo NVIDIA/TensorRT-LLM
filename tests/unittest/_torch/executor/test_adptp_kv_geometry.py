@@ -29,8 +29,14 @@ UNSET = {adp_groups.ENV: ""}
 
 
 def adp_mapping(rank, world=8):
-    return Mapping(world_size=world, tp_size=world, moe_ep_size=world, rank=rank, gpus_per_node=4,
-                   enable_attention_dp=True)
+    return Mapping(
+        world_size=world,
+        tp_size=world,
+        moe_ep_size=world,
+        rank=rank,
+        gpus_per_node=4,
+        enable_attention_dp=True,
+    )
 
 
 def tp_mapping(rank, world=4):
@@ -42,13 +48,24 @@ def _per_rank(heads, tp):
 
 
 def _model_config(mapping):
-    pretrained = SimpleNamespace(num_attention_heads=Q_HEADS, num_key_value_heads=KV_HEADS, head_dim=HEAD_DIM,
-                                 hidden_size=HIDDEN, num_hidden_layers=4)
-    quant_mode = SimpleNamespace(has_fp8_kv_cache=lambda: True, has_fp4_kv_cache=lambda: False,
-                                 has_int8_kv_cache=lambda: False)
-    return SimpleNamespace(pretrained_config=pretrained, mapping=mapping,
-                           quant_config=SimpleNamespace(quant_mode=quant_mode),
-                           get_num_attention_layers=lambda: pretrained.num_hidden_layers)
+    pretrained = SimpleNamespace(
+        num_attention_heads=Q_HEADS,
+        num_key_value_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        hidden_size=HIDDEN,
+        num_hidden_layers=4,
+    )
+    quant_mode = SimpleNamespace(
+        has_fp8_kv_cache=lambda: True,
+        has_fp4_kv_cache=lambda: False,
+        has_int8_kv_cache=lambda: False,
+    )
+    return SimpleNamespace(
+        pretrained_config=pretrained,
+        mapping=mapping,
+        quant_config=SimpleNamespace(quant_mode=quant_mode),
+        get_num_attention_layers=lambda: pretrained.num_hidden_layers,
+    )
 
 
 @pytest.fixture
@@ -84,6 +101,7 @@ class TestHeadSplit:
     def test_static_cache_size_estimates(self, clean_env):
         """Per-token KV bytes of the static estimates (V1 and V2): the grouped ADP rank equals a TEP4 rank; unset
         equals the stock ADP rank (every head)."""
+
         def v1(m):
             return KVCacheManager.get_cache_size_per_token(_model_config(m), m, num_layers=4)
 
@@ -113,6 +131,7 @@ class TestKvCacheCreator:
     def test_dflash_layout_heads(self, clean_env):
         """The unified target/DFlash-draft KV layout (rank-local KV heads) follows the group: a grouped rank holds
         a TEP4 rank's 4 heads (the drafter shares the target's TP4-in-group layout); unset = every head (stock)."""
+
         def heads(m):
             return self._creator(m)._dflash_kv_layout(_model_config(m), torch.bfloat16)[0]
 
@@ -148,11 +167,21 @@ class TestAttentionModule:
         config = ModelConfig(mapping=mapping, skip_create_weights_in_init=True)
         backend = mock.MagicMock()
         backend.support_fused_qkv.return_value = True
-        with mock.patch.object(dist_mod, "AllReduce", _FakeAllReduce), \
-                mock.patch.object(attention_mod, "create_attention", return_value=backend) as create:
-            attn = attention_mod.Attention(hidden_size=HIDDEN, num_attention_heads=Q_HEADS,
-                                           num_key_value_heads=KV_HEADS, max_position_embeddings=4096, bias=False,
-                                           layer_idx=0, dtype=torch.bfloat16, config=config, head_dim=HEAD_DIM)
+        with (
+            mock.patch.object(dist_mod, "AllReduce", _FakeAllReduce),
+            mock.patch.object(attention_mod, "create_attention", return_value=backend) as create,
+        ):
+            attn = attention_mod.Attention(
+                hidden_size=HIDDEN,
+                num_attention_heads=Q_HEADS,
+                num_key_value_heads=KV_HEADS,
+                max_position_embeddings=4096,
+                bias=False,
+                layer_idx=0,
+                dtype=torch.bfloat16,
+                config=config,
+                head_dim=HEAD_DIM,
+            )
         # the backend (and its KV-cache view) is built with the per-rank head counts
         args = create.call_args.args
         assert (args[2], args[4]) == (attn.num_heads, attn.num_key_value_heads)
@@ -173,14 +202,22 @@ class TestAttentionModule:
                     assert list(attn.mapping_o.tp_group) == group
                     assert attn.o_proj.all_reduce is not None
                     assert list(attn.o_proj.all_reduce.mapping.tp_group) == group
-                    assert attn.num_key_value_heads == _per_rank(KV_HEADS, kvm2.kv_head_tp_size(adp_mapping(rank, world)))
+                    assert attn.num_key_value_heads == _per_rank(
+                        KV_HEADS, kvm2.kv_head_tp_size(adp_mapping(rank, world))
+                    )
 
     def test_grouped_matches_tep4_rank(self, clean_env):
         with mock.patch.dict(os.environ, GROUPED):
             g = self._attention(adp_mapping(6))
             t = self._attention(tp_mapping(2))
-        assert (g.tp_size, g.tp_rank, g.num_heads, g.num_key_value_heads, g.q_size, g.kv_size) == \
-            (t.tp_size, t.tp_rank, t.num_heads, t.num_key_value_heads, t.q_size, t.kv_size)
+        assert (g.tp_size, g.tp_rank, g.num_heads, g.num_key_value_heads, g.q_size, g.kv_size) == (
+            t.tp_size,
+            t.tp_rank,
+            t.num_heads,
+            t.num_key_value_heads,
+            t.q_size,
+            t.kv_size,
+        )
 
     def test_unset_is_stock_adp(self, clean_env):
         with mock.patch.dict(os.environ, UNSET):
@@ -192,4 +229,6 @@ class TestAttentionModule:
             assert attn.mapping_o.enable_attention_dp
             # stock ADP: o_proj's all-reduce is over a 1-rank TP group (a no-op)
             assert attn.o_proj.all_reduce is None or attn.o_proj.all_reduce.mapping.tp_size == 1
-            assert attn.num_key_value_heads == _per_rank(KV_HEADS, kvm2.kv_head_tp_size(adp_mapping(5)))
+            assert attn.num_key_value_heads == _per_rank(
+                KV_HEADS, kvm2.kv_head_tp_size(adp_mapping(5))
+            )

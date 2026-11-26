@@ -1038,7 +1038,9 @@ def install(
             logger.info(
                 f"[musespark_open] drafter_fixed_gemms: {len(deep)} drafter GEMM entries of 16..64 rows at deeper "
                 "A/B pipelines, the same tiles and K splits (tep8_drafter_wide_gemms__DEEP_STAGES): "
-                + ", ".join(f"{m}x[{n}, {k}] s{t.ab_stages}" for (m, k, n), t in sorted(deep.items()))
+                + ", ".join(
+                    f"{m}x[{n}, {k}] s{t.ab_stages}" for (m, k, n), t in sorted(deep.items())
+                )
             )
         if sites.changed:
             logger.info(

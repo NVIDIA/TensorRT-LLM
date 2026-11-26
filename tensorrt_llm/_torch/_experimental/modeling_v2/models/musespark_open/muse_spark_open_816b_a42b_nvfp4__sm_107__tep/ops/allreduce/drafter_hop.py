@@ -194,7 +194,11 @@ GATHER_SLOT_BYTES = VECTOR * 4
 def two_shot_area_bytes(max_rows: int, ranks: int = MAX_RANKS) -> int:
     """One two-shot area: the scatter slabs (the one-shot's layout), the gather slots (``ranks`` sources x rows x
     ``THREADS`` threads x ``GATHER_SLOT_BYTES``) and the chain sums (rows x ``THREADS`` FP32)."""
-    return ranks * max_rows * ROW_BYTES + ranks * max_rows * THREADS * GATHER_SLOT_BYTES + max_rows * THREADS * 4
+    return (
+        ranks * max_rows * ROW_BYTES
+        + ranks * max_rows * THREADS * GATHER_SLOT_BYTES
+        + max_rows * THREADS * 4
+    )
 
 
 try:
@@ -779,7 +783,10 @@ if HAS_CUTE_DSL:
                             gather_prev = (
                                 previous
                                 + self.gather_bytes_offset
-                                + ((Int64(crank) * self.max_rows + Int64(reset_row)) * THREADS + Int64(tid))
+                                + (
+                                    (Int64(crank) * self.max_rows + Int64(reset_row)) * THREADS
+                                    + Int64(tid)
+                                )
                                 * GATHER_SLOT_BYTES
                             )
                             _reset_x4(gather_prev, Uint32(1) - is_owner)
@@ -952,7 +959,9 @@ if HAS_CUTE_DSL:
                         gather[j, 1] = g1
                         gather[j, 2] = g2
                         gather[j, 3] = g3
-                        gather_stale = gather_stale | _stale_bit(g0, g1, g2, g3, gather_on[j] << Uint32(j))
+                        gather_stale = gather_stale | _stale_bit(
+                            g0, g1, g2, g3, gather_on[j] << Uint32(j)
+                        )
                     gather_start = Int64(0)
                     if cutlass.const_expr(self.timeout_ns > 0):
                         gather_start = _globaltimer()
@@ -986,7 +995,9 @@ if HAS_CUTE_DSL:
                         if cutlass.const_expr(self.timeout_ns > 0):
                             elapsed = _globaltimer() - gather_start
                             _trap_if(
-                                Uint32((gather_stale != Uint32(0)) & (elapsed > Int64(self.timeout_ns)))
+                                Uint32(
+                                    (gather_stale != Uint32(0)) & (elapsed > Int64(self.timeout_ns))
+                                )
                             )
                     # Early trigger: past the last transport access.
                     if cutlass.const_expr(self.pdl and self.early_trigger):

@@ -281,7 +281,9 @@ def takes(ranks: int, balance: bool, half: bool, slots: int, tile: Optional[int]
     """Whether a ``ring_buddy_assign`` call is this kernel's case: the 8-rank balanced two-window placement (by
     expert count, or by tile cost under ``tep8_tile_placement``) with tables (``meta_tile``) of at most
     ``MAX_SLOTS`` slots. Rank-uniform facts only."""
-    return ranks == RANKS and bool(balance) and not half and 0 < slots <= MAX_SLOTS and tile in TILES
+    return (
+        ranks == RANKS and bool(balance) and not half and 0 < slots <= MAX_SLOTS and tile in TILES
+    )
 
 
 def _ring_x(load: List[int]) -> List[int]:
@@ -353,7 +355,11 @@ def model(
         else:
             moved = bin((word[blk] >> i) >> 1).count("1") < x[blk]
         er = (blk + (1 if moved else 0)) % RANKS
-        local.append((i if blk == rank else BLOCK + i) if er == rank else 2 * BLOCK + g % (EXPERTS - 2 * BLOCK))
+        local.append(
+            (i if blk == rank else BLOCK + i)
+            if er == rank
+            else 2 * BLOCK + g % (EXPERTS - 2 * BLOCK)
+        )
     # the warp-level ranking: per warp the peers of each slot, then an exclusive prefix over warps
     nwarp = THREADS // 32
     wc = [[0] * WINDOW for _ in range(nwarp)]
@@ -382,7 +388,9 @@ def model(
             cta = off[e] + tt
             c2b[cta] = e
             c2m[cta] = min((cta + 1) * tile, off[e] * tile + cnt[e])
-    return dict(local=local, e2p=e2p, p2t=p2t, c2b=c2b, c2m=c2m, nnc=nnc, tnp=nnc * tile, stats=stats)
+    return dict(
+        local=local, e2p=e2p, p2t=p2t, c2b=c2b, c2m=c2m, nnc=nnc, tnp=nnc * tile, stats=stats
+    )
 
 
 def _chk(r):

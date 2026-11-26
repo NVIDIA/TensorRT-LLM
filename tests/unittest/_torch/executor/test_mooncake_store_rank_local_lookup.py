@@ -175,8 +175,8 @@ def _fill_full(fake_store, workers, hashes, rng, num_groups, pattern):  # noqa: 
 @pytest.mark.parametrize("pattern", ["all", "ragged", "holes", "missing_shard"])
 @pytest.mark.parametrize("num_groups", [1, 2])
 def test_rank_local_count_matches_the_leaders_probe(
-    store_config,
-    fake_store,
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
     monkeypatch,
     pattern,
     num_groups,  # noqa: F811
@@ -195,7 +195,10 @@ def test_rank_local_count_matches_the_leaders_probe(
             if pattern == "missing_shard":
                 assert expected == 0
             # Each rank asked only about its own shard's keys.
-            assert sum(len(call) for call in fake_store.exist_calls) == len(hashes) * num_groups * WORLD
+            assert (
+                sum(len(call) for call in fake_store.exist_calls)
+                == len(hashes) * num_groups * WORLD
+            )
             for call in fake_store.exist_calls:
                 assert len({re.search(r"/w\d+r(\d+)/", key).group(1) for key in call}) == 1
 
@@ -258,8 +261,8 @@ def long_hashes(n, salt=0):
 @pytest.mark.parametrize("pattern", ["all", "ragged", "holes", "missing_shard"])
 @pytest.mark.parametrize("staged,reuse_ms", [(True, 0), (False, 60000), (True, 60000)])
 def test_rank_local_count_with_lookup_key_switches_matches_the_leaders_probe(
-    store_config,
-    fake_store,
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
     monkeypatch,
     pattern,
     staged,
@@ -313,7 +316,9 @@ def test_rank_local_count_with_lookup_key_switches_matches_the_leaders_probe(
 
 
 def test_rank_local_window_hit_with_lookup_key_switches_matches(
-    store_config, fake_store, monkeypatch  # noqa: F811
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
+    monkeypatch,  # noqa: F811
 ):
     monkeypatch.setenv(worker_module.LOOKUP_STAGED_ENV, "1")
     monkeypatch.setenv(worker_module.LOOKUP_REUSE_MS_ENV, "60000")
@@ -362,8 +367,8 @@ def _fill_window(fake_store, workers, hashes, rng):  # noqa: F811
 @pytest.mark.parametrize("fallback", [True, False])
 @pytest.mark.parametrize("rewind_tokens", [0, TPB, 3 * TPB])
 def test_rank_local_window_hit_matches_the_leaders_probe(
-    store_config,
-    fake_store,
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
     monkeypatch,
     fallback,
     rewind_tokens,  # noqa: F811
@@ -404,7 +409,10 @@ def test_window_hit_with_a_missing_window_shard_is_a_miss(store_config, fake_sto
                     put(fake_store, worker, 1, hashes[block])
         with leader_view(workers[0]) as leader:
             assert leader.find_prefix_hit(hashes, 0) == PrefixHit(0)
-        assert on_all_ranks(workers, lambda r, w: w.find_prefix_hit(hashes, 0)) == [PrefixHit(0)] * WORLD
+        assert (
+            on_all_ranks(workers, lambda r, w: w.find_prefix_hit(hashes, 0))
+            == [PrefixHit(0)] * WORLD
+        )
 
 
 # ---- the leader's scheduler with follower ranks ----
@@ -422,7 +430,10 @@ def _requests():
         (make_request(6, list(range(9 * TPB + 1)), multimodal_positions=[0]), 0),  # unhashed media
         (make_request(7, list(range(9 * TPB + 1)), cache_salt="tenant-b"), 0),
         (make_request(8, long_tokens), 0),
-        (make_request(1, list(range(9 * TPB + 1))), 4 * TPB),  # the same request again, cached chain
+        (
+            make_request(1, list(range(9 * TPB + 1))),
+            4 * TPB,
+        ),  # the same request again, cached chain
     ]
 
 
@@ -449,8 +460,8 @@ def _store_prompts(fake_store, workers, requests, upto_blocks):  # noqa: F811
 @pytest.mark.parametrize("windowed", [False, True])
 @pytest.mark.parametrize("entry", ["reserve_prefix", "get_num_new_matched_tokens"])
 def test_leader_with_rank_local_followers_offers_what_it_offers_today(
-    store_config,
-    fake_store,
+    store_config,  # noqa: F811
+    fake_store,  # noqa: F811
     monkeypatch,
     windowed,
     entry,  # noqa: F811
@@ -458,7 +469,9 @@ def test_leader_with_rank_local_followers_offers_what_it_offers_today(
     layout = make_window_layout(num_slots=64) if windowed else make_layout(num_groups=2)
     requests = _requests()
     with make_ranks(fake_store, monkeypatch, layout, rewind_tokens=TPB) as workers:
-        _store_prompts(fake_store, workers, requests, lambda rid: {1: 7, 2: 9, 8: 30000}.get(rid, 5))
+        _store_prompts(
+            fake_store, workers, requests, lambda rid: {1: 7, 2: 9, 8: 30000}.get(rid, 5)
+        )
 
         def leader_scheduler(worker):
             llm_args = make_llm_args()
@@ -476,7 +489,9 @@ def test_leader_with_rank_local_followers_offers_what_it_offers_today(
 
         with leader_view(workers[0]):
             today = leader_scheduler(workers[0])
-            expected = [ask(today, request, local, i) for i, (request, local) in enumerate(requests)]
+            expected = [
+                ask(today, request, local, i) for i, (request, local) in enumerate(requests)
+            ]
         assert any(count for count, _ in expected) and not all(count for count, _ in expected)
 
         rank_local = leader_scheduler(workers[0])
@@ -503,9 +518,9 @@ def test_leader_with_rank_local_followers_offers_what_it_offers_today(
             )
 
         assert reservations(rank_local) == reservations(today)
-        assert {rid: (s.load_first_block, s.load_blocks) for rid, s in rank_local._requests.items()} == {
-            rid: (s.load_first_block, s.load_blocks) for rid, s in today._requests.items()
-        }
+        assert {
+            rid: (s.load_first_block, s.load_blocks) for rid, s in rank_local._requests.items()
+        } == {rid: (s.load_first_block, s.load_blocks) for rid, s in today._requests.items()}
 
 
 def test_follower_chain_cache_is_bounded_and_reused(store_config, fake_store, monkeypatch):  # noqa: F811
@@ -546,12 +561,19 @@ def test_manager_runs_the_follower_only_on_non_leaders_with_the_switch(monkeypat
     sent = []
     monkeypatch.setattr(kvc, "mpi_broadcast", lambda obj, root=0: sent.append(obj) or (5, False))
     follows = []
-    on = SimpleNamespace(rank_local_lookup=True, follow_prefix_lookup=lambda r, n: follows.append((r, n)))
-    off = SimpleNamespace(rank_local_lookup=False, follow_prefix_lookup=lambda r, n: follows.append("off"))
+    on = SimpleNamespace(
+        rank_local_lookup=True, follow_prefix_lookup=lambda r, n: follows.append((r, n))
+    )
+    off = SimpleNamespace(
+        rank_local_lookup=False, follow_prefix_lookup=lambda r, n: follows.append("off")
+    )
     request = SimpleNamespace(request_id=1)
 
     follower = _manager(None, on)
-    assert follower._run_on_leader(lambda: 1 / 0, follower._lookup_follower(request, 8)) == (5, False)
+    assert follower._run_on_leader(lambda: 1 / 0, follower._lookup_follower(request, 8)) == (
+        5,
+        False,
+    )
     assert follows == [(request, 8)] and sent == [None]
 
     # Switch off, attention DP, or the leader itself: no follower, the path is today's.

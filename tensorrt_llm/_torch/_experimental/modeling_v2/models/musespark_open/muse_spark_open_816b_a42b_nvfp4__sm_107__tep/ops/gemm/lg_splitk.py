@@ -54,6 +54,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
+
 from . import lg_splitk_ptx as _ptx
 
 #: Default deadline after which a polling warp still finding a sentinel half falls back.
@@ -805,10 +807,13 @@ class LgArena:
         self.tensor = torch.empty((self.rows, self.k), dtype=torch.bfloat16, device=self.device)
         self.control = torch.zeros(CONTROL_WORDS, dtype=torch.int32, device=self.device)
         self.host_fallbacks: Optional[torch.Tensor] = None
-        try:
-            self.host_fallbacks = torch.zeros(4, dtype=torch.int32, pin_memory=True)
-        except Exception:  # noqa: BLE001 - the device word serves instead
-            self.host_fallbacks = None
+        # The kernel writes this word through its host address, so it must be pinned;
+        # where pinning is not preferred (confidential compute) the device word serves.
+        if prefer_pinned():
+            try:
+                self.host_fallbacks = torch.zeros(4, dtype=torch.int32, pin_memory=prefer_pinned())
+            except Exception:  # noqa: BLE001 - the device word serves instead
+                self.host_fallbacks = None
         self.refill()
         torch.cuda.synchronize(self.device)
 

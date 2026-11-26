@@ -38,8 +38,16 @@ G = load_adp_groups()
 class _Mapping:
     """The attributes adp_groups reads from ``tensorrt_llm.mapping.Mapping``."""
 
-    def __init__(self, world=8, tp_rank=0, enable_attention_dp=True, tp_size=None, pp_size=1, cp_size=1,
-                 enable_lm_head_tp_in_adp=False):
+    def __init__(
+        self,
+        world=8,
+        tp_rank=0,
+        enable_attention_dp=True,
+        tp_size=None,
+        pp_size=1,
+        cp_size=1,
+        enable_lm_head_tp_in_adp=False,
+    ):
         self.world_size = world
         self.tp_size = world if tp_size is None else tp_size
         self.tp_rank = tp_rank
@@ -68,7 +76,9 @@ class TestAdpGroups(unittest.TestCase):
                     with self.subTest(env=env, world=world, rank=r):
                         self.assertEqual(G.group_attn_tp(m, env), 1)
                         self.assertFalse(G.is_grouped(m, env))
-                        self.assertEqual(G.attn_tp_size(m, env), 1)  # stock: 1 if enable_attention_dp
+                        self.assertEqual(
+                            G.attn_tp_size(m, env), 1
+                        )  # stock: 1 if enable_attention_dp
                         self.assertEqual(G.attn_tp_rank(m, env), 0)
                         self.assertEqual(G.dp_size(m, env), world)  # stock: tp_size DP ranks
                         self.assertEqual(G.dp_rank(m, env), r)
@@ -128,7 +138,9 @@ class TestAdpGroups(unittest.TestCase):
         env = {ENV: "4"}
         for r in range(4):
             m = mapping(4, r)
-            self.assertEqual((G.dp_size(m, env), G.dp_rank(m, env), G.attn_tp_rank(m, env)), (1, 0, r))
+            self.assertEqual(
+                (G.dp_size(m, env), G.dp_rank(m, env), G.attn_tp_rank(m, env)), (1, 0, r)
+            )
 
     def test_bad_switch_or_mapping_raises(self):
         for raw in ("x", "0", "-4", "2.5"):
@@ -149,7 +161,10 @@ class TestAdpGroups(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     G.group_attn_tp(m, {ENV: "4"})
         self.assertIn("does not divide", G.topology_mismatch(mapping(4), 8))
-        self.assertIn("enable_attention_dp is off", G.topology_mismatch(mapping(4, enable_attention_dp=False), 4))
+        self.assertIn(
+            "enable_attention_dp is off",
+            G.topology_mismatch(mapping(4, enable_attention_dp=False), 4),
+        )
         with self.assertRaises(ValueError):
             G.attention_shard(0, 6, True, {ENV: "4"})
 
@@ -195,7 +210,9 @@ class TestAdpGroups(unittest.TestCase):
         per_rank = [St(r, 10 * (r // 4)) for r in range(8)]
         routed = G.route_states(per_rank, 4)
         self.assertEqual([(s.rank, s.num_active_requests) for s in routed], [(0, 0), (1, 10)])
-        self.assertEqual([s.rank for s in per_rank], list(range(8)))  # the gathered states are not mutated
+        self.assertEqual(
+            [s.rank for s in per_rank], list(range(8))
+        )  # the gathered states are not mutated
         self.assertEqual(G.route_states(per_rank, 1), per_rank)
 
     def test_batch_signature_and_divergence(self):
@@ -203,7 +220,9 @@ class TestAdpGroups(unittest.TestCase):
         self.assertEqual(a, G.batch_signature(iter([(1, 100, 7), (2, 50, 9)])))
         self.assertTrue(-(1 << 63) <= a < (1 << 63))
         self.assertNotEqual(a, G.batch_signature([(2, 50, 9), (1, 100, 7)]))  # order matters
-        self.assertNotEqual(a, G.batch_signature([(1, 100, 7), (2, 50, 8)]))  # a different sampled token
+        self.assertNotEqual(
+            a, G.batch_signature([(1, 100, 7), (2, 50, 8)])
+        )  # a different sampled token
         self.assertNotEqual(a, G.batch_signature([(1, 101, 7), (2, 50, 9)]))
         self.assertEqual(G.batch_signature([]), G.batch_signature(iter(())))
         self.assertEqual(G.diverged_groups([a] * 4 + [a, a, a + 1, a], 4), [1])
@@ -219,7 +238,9 @@ class TestAdpGroups(unittest.TestCase):
     def test_module_imports_no_torch(self):
         src = ADP_GROUPS.read_text()
         self.assertNotIn("import torch", src)
-        self.assertNotIn("tensorrt_llm", re.sub(r'""".*?"""', "", src, flags=re.S).split("ENV =")[0])
+        self.assertNotIn(
+            "tensorrt_llm", re.sub(r'""".*?"""', "", src, flags=re.S).split("ENV =")[0]
+        )
 
 
 class TestAdpGroupsW1(unittest.TestCase):
@@ -245,15 +266,19 @@ class TestAdpGroupsW1(unittest.TestCase):
                     leaders.append(r)
             self.assertEqual(leaders, [k * T for k in range(g)])
             # the groups partition the world
-            self.assertEqual(sorted(x for k in range(g) for x in G.group_tp_ranks(k, T)), list(range(world)))
+            self.assertEqual(
+                sorted(x for k in range(g) for x in G.group_tp_ranks(k, T)), list(range(world))
+            )
 
     def test_attention_tp2(self):
         env = {ENV: "2"}
         for world in (8, 16):
             for r in range(world):
                 m = mapping(world, r)
-                self.assertEqual((G.dp_size(m, env), G.dp_rank(m, env), G.attn_tp_rank(m, env)),
-                                 (world // 2, r // 2, r % 2))
+                self.assertEqual(
+                    (G.dp_size(m, env), G.dp_rank(m, env), G.attn_tp_rank(m, env)),
+                    (world // 2, r // 2, r % 2),
+                )
 
     def test_route_states_and_expand_round_trip(self):
         class S:
@@ -268,7 +293,9 @@ class TestAdpGroupsW1(unittest.TestCase):
                 self.assertEqual([s.rank for s in routed], list(range(g)))
                 self.assertEqual([s.rank for s in states], list(range(world)))
                 per_group = {k: f"req{k}" for k in range(g)}
-                self.assertEqual(G.expand(per_group, T, world), {r: f"req{r // T}" for r in range(world)})
+                self.assertEqual(
+                    G.expand(per_group, T, world), {r: f"req{r // T}" for r in range(world)}
+                )
                 self.assertEqual(G.collapse(list(range(world)), T), [k * T for k in range(g)])
 
     def test_ep_dispatch_sizes(self):
@@ -290,9 +317,13 @@ class TestAdpGroupsW1(unittest.TestCase):
 def _load_router_module():
     """adp_router.py from source with its package imports stubbed (no torch)."""
     sched = ROOT / "tensorrt_llm/_torch/pyexecutor/scheduler"
-    logger = types.SimpleNamespace(debug=lambda *a, **k: None, info=lambda *a, **k: None,
-                                   warning=lambda *a, **k: None, info_once=lambda *a, **k: None,
-                                   warning_once=lambda *a, **k: None)
+    logger = types.SimpleNamespace(
+        debug=lambda *a, **k: None,
+        info=lambda *a, **k: None,
+        warning=lambda *a, **k: None,
+        info_once=lambda *a, **k: None,
+        warning_once=lambda *a, **k: None,
+    )
     trt = types.ModuleType("tensorrt_llm")
     trt.__path__ = []
     tpkg = types.ModuleType("tensorrt_llm._torch")
@@ -304,7 +335,9 @@ def _load_router_module():
         "tensorrt_llm._torch": tpkg,
         "tensorrt_llm._torch.adp_groups": G,
         "tensorrt_llm._torch.pyexecutor": types.ModuleType("tensorrt_llm._torch.pyexecutor"),
-        "tensorrt_llm._torch.pyexecutor.scheduler": types.ModuleType("tensorrt_llm._torch.pyexecutor.scheduler"),
+        "tensorrt_llm._torch.pyexecutor.scheduler": types.ModuleType(
+            "tensorrt_llm._torch.pyexecutor.scheduler"
+        ),
         "tensorrt_llm._torch.pyexecutor.llm_request": types.SimpleNamespace(LlmRequestState=object),
     }
     for pkg in ("tensorrt_llm._torch.pyexecutor", "tensorrt_llm._torch.pyexecutor.scheduler"):
@@ -327,8 +360,11 @@ class TestDefaultRouterOverGroups(unittest.TestCase):
 
     def _items(self, n):
         return [
-            types.SimpleNamespace(id=i, child_req_ids=None,
-                                  request=types.SimpleNamespace(num_input_tokens=100 + i, py_scheduling_params=None))
+            types.SimpleNamespace(
+                id=i,
+                child_req_ids=None,
+                request=types.SimpleNamespace(num_input_tokens=100 + i, py_scheduling_params=None),
+            )
             for i in range(n)
         ]
 
@@ -358,8 +394,10 @@ class TestDefaultRouterOverGroups(unittest.TestCase):
         per_rank = [self.R.RankState(rank=r) for r in range(8)]
         stock, _ = router.route_requests(per_rank, self._items(8), 64)
         via, _ = router.route_requests(G.route_states(per_rank, 1), self._items(8), 64)
-        self.assertEqual({k: [i.id for i in v] for k, v in stock.items()},
-                         {k: [i.id for i in v] for k, v in via.items()})
+        self.assertEqual(
+            {k: [i.id for i in v] for k, v in stock.items()},
+            {k: [i.id for i in v] for k, v in via.items()},
+        )
 
 
 class TestBuiltInSitesSource(unittest.TestCase):
@@ -367,19 +405,33 @@ class TestBuiltInSitesSource(unittest.TestCase):
 
     SITES = {
         "tensorrt_llm/_torch/attention/attention.py": [
-            "adp_groups.group_attn_tp(self.mapping)", "enable_attention_dp=sub_mapping_adp"],
+            "adp_groups.group_attn_tp(self.mapping)",
+            "enable_attention_dp=sub_mapping_adp",
+        ],
         "tensorrt_llm/_torch/model_config.py": ["adp_groups.attn_tp_size(self.mapping)"],
         "tensorrt_llm/_torch/pyexecutor/_util.py": [
-            "adp_groups.dp_size(self._mapping)", "adp_groups.attn_tp_size(self._mapping)"],
+            "adp_groups.dp_size(self._mapping)",
+            "adp_groups.attn_tp_size(self._mapping)",
+        ],
         "tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py": [
-            "adp_groups.attn_tp_size(mapping)", "tp_size = kv_head_tp_size(mapping)"],
+            "adp_groups.attn_tp_size(mapping)",
+            "tp_size = kv_head_tp_size(mapping)",
+        ],
         "tensorrt_llm/_torch/pyexecutor/resource_manager.py": ["adp_groups.attn_tp_size(mapping)"],
-        "tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py": ["adp_groups.collapse(list(all_data)"],
-        "tensorrt_llm/_torch/pyexecutor/connectors/mooncake_store/worker.py": ["adp_groups.attention_shard("],
+        "tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py": [
+            "adp_groups.collapse(list(all_data)"
+        ],
+        "tensorrt_llm/_torch/pyexecutor/connectors/mooncake_store/worker.py": [
+            "adp_groups.attention_shard("
+        ],
         "tensorrt_llm/_torch/pyexecutor/py_executor.py": [
-            "adp_groups.router_mismatch", "adp_groups.route_states(all_rank_states", "adp_groups.diverged_groups",
-            "responses = []", "self._adp_dp_rank if self._adp_group_tp > 1 else self.dist.tp_rank",
-            "self.dist.tp_size // getattr(self, \"_adp_group_tp\", 1)"],
+            "adp_groups.router_mismatch",
+            "adp_groups.route_states(all_rank_states",
+            "adp_groups.diverged_groups",
+            "responses = []",
+            "self._adp_dp_rank if self._adp_group_tp > 1 else self.dist.tp_rank",
+            'self.dist.tp_size // getattr(self, "_adp_group_tp", 1)',
+        ],
     }
 
     def test_sites(self):
@@ -392,14 +444,18 @@ class TestBuiltInSitesSource(unittest.TestCase):
     def test_stock_rules_gone(self):
         """No KV-head / attention-module site still hard-codes 'ADP => tp 1' (the rule moved into adp_groups)."""
         stale = {
-            "tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py":
-                "tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size",
-            "tensorrt_llm/_torch/pyexecutor/resource_manager.py":
-                "tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size",
-            "tensorrt_llm/_torch/pyexecutor/_util.py":
-                "tp_size = 1 if self._mapping.enable_attention_dp else self._mapping.tp_size",
-            "tensorrt_llm/_torch/model_config.py":
-                "attn_tp_size = self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else 1",
+            "tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py": (
+                "tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size"
+            ),
+            "tensorrt_llm/_torch/pyexecutor/resource_manager.py": (
+                "tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size"
+            ),
+            "tensorrt_llm/_torch/pyexecutor/_util.py": (
+                "tp_size = 1 if self._mapping.enable_attention_dp else self._mapping.tp_size"
+            ),
+            "tensorrt_llm/_torch/model_config.py": (
+                "attn_tp_size = self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else 1"
+            ),
         }
         for rel, needle in stale.items():
             with self.subTest(rel=rel):
