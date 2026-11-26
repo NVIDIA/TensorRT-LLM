@@ -249,9 +249,9 @@ def test_ncu_run_targets_top_nsys_kernels_with_bounded_capture():
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     # Targets come from Run A's top-kernel table — never a blind sweep.
     assert "targets the top kernels Run A surfaced" in prompt
-    # Kernel replay serializes the GPU: the replayed benchmark's client
-    # numbers must never be reported as performance results.
-    assert "not measurements" in prompt
+    assert "faithful hotspot microbenchmarks, never the full server" in prompt
+    assert "Do not wrap `trtllm-serve` in ncu" in prompt
+    assert "ContextSaveFailed" in prompt
 
 
 def test_findings_contract_carries_the_ncu_section():
