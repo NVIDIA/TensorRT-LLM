@@ -41,6 +41,10 @@ void invokeMinimaxM3RouterGemv(__nv_bfloat16 const* x, int32_t ldx, int32_t m, i
 void invokeMinimaxM3RouterTc(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t k, float const* w, float* out,
     uint8_t* qOut, uint8_t* sfOut, float const* sfScale, bool pdl, cudaStream_t stream);
 
+//! The cluster size `invokeMinimaxM3RouterTc` launches with (16 or 8): decided once per process from the device's
+//! co-scheduling (device-static) and configures both kernels. SM107 callers use the router only when this is 16.
+int minimaxM3RouterTcCluster(int32_t k);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

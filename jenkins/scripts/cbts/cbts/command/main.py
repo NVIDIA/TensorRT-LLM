@@ -18,7 +18,7 @@ Modes:
   python3 -m cbts.command main --list-needed-diffs
       Print the union of rules' `needs_diff_for` patterns, one per line.
   python3 -m cbts.command main INPUT_JSON
-      INPUT_JSON: {changed_files: [...], diffs: {path: diff}, post_merge: bool}.
+      INPUT_JSON: {changed_files: [...], diffs: {path: diff}}.
       Stages are parsed from jenkins/L0_Test.groovy; YAMLs from
       tests/integration/test_lists/test-db/. Decision JSON goes to stdout
       with keys: scope, affected_stages, reasons, test_db_dir_override,
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
@@ -38,7 +39,6 @@ from typing import Optional
 import click
 
 from cbts.blocks import (
-    ALWAYS_RUN_STAGE_PREFIX,
     Stage,
     YAMLIndex,
     compute_stage_split_counts,
@@ -64,6 +64,7 @@ from cbts.rules.docs import DocsRule
 from cbts.rules.modeling_v2 import ModelingV2Rule
 from cbts.rules.openengine import OpenEngineRule
 from cbts.rules.out_of_scope import OutOfScopeRule, is_out_of_scope
+from cbts.rules.python_formatting import PythonFormattingRule, is_formatting_only_change
 from cbts.rules.spec_dec import SpecDecRule
 from cbts.rules.test_list import TestListRule
 from cbts.rules.tests_def import TestsDefRule
@@ -71,12 +72,13 @@ from cbts.rules.visual_gen import VisualGenRule
 from cbts.rules.waives import WaivesRule
 
 # Files the coverage tier maps to qualnames; without their diffs it stays file-level.
-COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("tensorrt_llm/**/*.py",)
+COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("**/*.py",)
 
 # --- Rule registry -----------------------------------------------------------
 
 # Classes are used for `--list-needed-diffs` (no need to construct).
 RULE_CLASSES: list[type[Rule]] = [
+    PythonFormattingRule,
     WaivesRule,
     TestsDefRule,
     TestListRule,
@@ -96,6 +98,7 @@ def build_rules(
     repo_root: Path,
 ) -> list[Rule]:
     return [
+        PythonFormattingRule(),
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages, repo_root=repo_root),
@@ -205,6 +208,8 @@ def _coverage_decline_category(reason: str) -> str:
         ("a rule forced fallback", "rule_forced_fallback"),
         ("no residual", "no_residual"),
         ("non-core-Python residual file", "non_core_python"),
+        ("non-Python residual file", "non_python"),
+        ("shared test infrastructure change", "shared_test_infrastructure"),
         ("zero-touch residual file", "zero_touch"),
         ("no usable diff", "no_usable_diff"),
         ("import-executed change", "import_executed"),
@@ -232,6 +237,7 @@ def _rule_reason(rule, r) -> dict:
 # combines to a single "testsonly" scope rather than falling back.
 _TESTSONLY_FAMILY: frozenset[str] = frozenset(
     {
+        "testsonly",
         "waiveonly",
         "testdefonly",
         "testlistonly",
@@ -274,7 +280,9 @@ class Selector:
         code_pr = replace(
             pr,
             changed_files=[
-                path for path in pr.changed_files if path not in pr.docstring_only_files
+                path
+                for path in pr.changed_files
+                if path not in pr.docstring_only_files | pr.formatting_only_files
             ],
         )
         pairs: list[tuple[Rule, RuleResult]] = []
@@ -365,15 +373,22 @@ def _load_pr_inputs(input_json_path: Path, repo_root: Path) -> PRInputs:
     # A null diff (PR API omits the patch for binary, rename, or
     # too-large diffs) normalizes to an empty diff.
     raw_diffs = {path: d or "" for path, d in data.get("diffs", {}).items()}
+    raw_diff_counts = Counter(raw_diffs.values())
     diffs = {path: strip_noop_diff_lines(diff) for path, diff in raw_diffs.items()}
     docstring_files: set[str] = set()
     docstring_only_files: set[str] = set()
+    formatting_only_files: set[str] = set()
     for path, raw_diff in raw_diffs.items():
         if not path.endswith(".py") or not raw_diff or is_out_of_scope(path):
             continue
         try:
             source = (repo_root / path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
+            continue
+        # Forge APIs repeat a renamed file's patch for its old and new paths.
+        # Content equivalence alone cannot prove that such a move has no impact.
+        if raw_diff_counts[raw_diff] == 1 and is_formatting_only_change(source, raw_diff):
+            formatting_only_files.add(path)
             continue
         executable, changed = split_docstring_diff(source, raw_diff)
         if changed:
@@ -384,10 +399,10 @@ def _load_pr_inputs(input_json_path: Path, repo_root: Path) -> PRInputs:
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,
-        post_merge=bool(data.get("post_merge", False)),
         raw_diffs=raw_diffs,
         docstring_files=docstring_files,
         docstring_only_files=docstring_only_files,
+        formatting_only_files=formatting_only_files,
     )
 
 
@@ -513,8 +528,7 @@ def _run(args: _Args) -> int:
         return 2
 
     yaml_index = YAMLIndex.load(test_db_dir)
-    # Include post-merge stages; the trigger-mode filter below selects the
-    # subset matching the user's flag.
+    # Return candidates from every stage; Groovy applies the command-selected scope.
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path, repo_root)
     rules = build_rules(yaml_index, stages, repo_root)
@@ -626,23 +640,7 @@ def _run(args: _Args) -> int:
             durations=durations,
         )
 
-    # Added before the trigger-mode filter, and outside the counts Layer 2.5 resizes.
-    if result.scope is not None:
-        result.affected_stages |= {s for s in stages if s.startswith(ALWAYS_RUN_STAGE_PREFIX)}
-
-    # Trigger-mode filter; recompute derived counts. pre-merge drops Post-Merge
-    # stages; post-merge keeps both (adds Post-Merge on top, matching baseline).
-    pre_filter_stages = set(result.affected_stages)
-    if not pr.post_merge:
-        result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" not in s}
-    result.affected_stage_test_counts = {
-        k: v for k, v in result.affected_stage_test_counts.items() if k in result.affected_stages
-    }
-    result.affected_stage_split_counts = {
-        k: v for k, v in result.affected_stage_split_counts.items() if k in result.affected_stages
-    }
-
-    _log_decision_to_stderr(stages, result, pr, pre_filter_stages)
+    _log_decision_to_stderr(stages, result)
     sys.stdout.write(result.to_json())
     return 0
 
@@ -650,24 +648,13 @@ def _run(args: _Args) -> int:
 def _log_decision_to_stderr(
     stages: dict[str, Stage],
     result: SelectionResult,
-    pr: PRInputs,
-    pre_filter_stages: set[str],
 ) -> None:
     """Print the CBTS decision to stderr for Jenkins console diagnostics."""
     out = sys.stderr
-    mode = "post_merge" if pr.post_merge else "pre_merge"
-    dropped = sorted(pre_filter_stages - set(result.affected_stages))
     print("=" * 64, file=out)
-    print(f"CBTS decision (diagnostic; stderr only) [trigger mode: {mode}]:", file=out)
+    print("CBTS decision (diagnostic; stderr only):", file=out)
     print(f"  scope: {result.scope}", file=out)
     print(f"  test_db_dir_override: {result.test_db_dir_override}", file=out)
-    if dropped:
-        print(
-            f"  stages dropped by trigger-mode filter ({len(dropped)}, would run if mode flipped):",
-            file=out,
-        )
-        for s in dropped:
-            print(f"    - {s}", file=out)
     if result.reasons:
         print("  reasons:", file=out)
         for r in result.reasons:

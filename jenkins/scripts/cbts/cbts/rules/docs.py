@@ -17,9 +17,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from cbts.blocks import Stage, YAMLIndex
+from cbts.blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree
 
-from ._helpers import block_filters_for_stem, resolve_affected_stages, stages_by_yaml_stem
+from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 from .out_of_scope import is_out_of_scope
 
@@ -30,6 +30,17 @@ CPU_TEST_YAML_STEM = "l0_cpu"
 
 _DOCS_PREFIX = "docs/"
 _DOCS_SUFFIXES: tuple[str, ...] = (".md", ".rst")
+
+# Documentation helpers/extensions, API documentation contracts, and tests that
+# read documentation as data. Parent YAML entries retain their complete suite.
+_DOCS_CPU_TEST_PATHS = (
+    "unittest/docs",
+    "unittest/api_stability",
+    "unittest/tools",
+    "unittest/usage",
+    "unittest/llmapi/test_trtllm_serve_config_schemas.py",
+    "unittest/_torch/pyexecutor/test_model_loader_mx.py",
+)
 
 
 def is_docs_path(path: str) -> bool:
@@ -49,20 +60,23 @@ class DocsRule(Rule):
         self._stages_by_yaml = stages_by_yaml_stem(stages)
 
     def _cpu_block_filters(self) -> dict[tuple[str, int], dict[str, set[str]]]:
-        """Keep every entry in every CPU test-db block.
-
-        Tests read files under ``docs/`` directly: model-loader validation
-        parses ``docs/source/features/model-express.md``, and telemetry tests
-        import ``docs/source/_ext/llmapi_config_telemetry.py``. Until those
-        consumers have a complete explicit inventory, changes under ``docs/``
-        conservatively run the complete CPU suite. Using each entry's own
-        canonical target and raw text preserves `-k` variants through Layer
-        3's normal subtree and keyword filtering.
-
-        Literal docstrings contribute this same CPU set, which includes API
-        stability and documentation checks, without a consumer-path allowlist.
-        """
-        return block_filters_for_stem(self.yaml_index, CPU_TEST_YAML_STEM)
+        """Select registered documentation consumers, preserving YAML options."""
+        filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+        for block in self.yaml_index.blocks:
+            if block.yaml_stem != CPU_TEST_YAML_STEM:
+                continue
+            entries: dict[str, set[str]] = {}
+            for raw in block.tests:
+                target = _entry_target(raw)
+                if any(
+                    _target_in_filter_subtree(target, path)
+                    or _target_in_filter_subtree(path, target)
+                    for path in _DOCS_CPU_TEST_PATHS
+                ):
+                    entries.setdefault(target, set()).add(raw)
+            if entries:
+                filters[(block.yaml_stem, block.block_index)] = entries
+        return filters
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
         docstring_files = {path for path in pr.docstring_files if not is_out_of_scope(path)}

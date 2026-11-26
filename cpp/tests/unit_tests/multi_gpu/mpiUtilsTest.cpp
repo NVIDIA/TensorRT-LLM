@@ -32,11 +32,18 @@ namespace tr = tensorrt_llm::runtime;
 
 TEST(MPIUtils, SessionRankAndSize)
 {
+    // Exercise local-session startup before any world/session accessor initializes MPI.
+    auto const& localSession = mpi::MpiComm::localSession();
+    EXPECT_LE(0, localSession.getRank());
+    EXPECT_LT(localSession.getRank(), localSession.getSize());
+    EXPECT_EQ(&localSession, &mpi::MpiComm::localSession());
+
     auto& session = mpi::MpiComm::session();
     auto const rank = session.getRank();
     EXPECT_LE(0, rank);
     auto const size = session.getSize();
     EXPECT_LE(rank, size);
+    EXPECT_LE(localSession.getSize(), size);
 }
 
 TEST(MPIUtils, WorldRankAndSize)

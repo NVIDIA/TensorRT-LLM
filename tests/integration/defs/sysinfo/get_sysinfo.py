@@ -27,8 +27,9 @@ import pynvml
 
 try:
     from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
 except ImportError:
-    from cuda import cuda
+    from cuda import cuda, nvrtc
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -199,6 +200,7 @@ def construct_gpu_properties(mako_opts, device_index=0):
             # Use chip name to get the GPU name
             pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
             if pci_info is None:
+                pci_device_id = None
                 logger.warning(
                     "Failed to get PCI information. PCI parameters and chip name won't be reported"
                 )

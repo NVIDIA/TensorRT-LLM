@@ -298,13 +298,13 @@ You can customize these by:
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
 - `image_reference`, `video_reference`, `audio_reference`: reference image(s) for I2V/TI2V, video(s) for V2V, audio(s). In JSON each takes a `{content, format, role}` object or a list of them; a multipart file upload needs no `format`.
-  - `format` declares how to read `content`: `"path"` (a file readable by the server, or a `file://` URI), `"url"` (`http(s)`), or `"base64"` (or a `data:` URI). It is required in JSON, where `"bytes"` is rejected — upload the file instead.
+  - `format` declares how to read `content`: `"path"` (a server-side file under `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, as a bare path or a `file://` URI; at most 200 MiB per file and 512 MiB across the `path` references of one request, so send a larger file as a multipart upload), `"url"` (`http(s)`), or `"base64"` (or a `data:` URI). It is required in JSON, where `"bytes"` is rejected — upload the file instead.
 
     ```json
     {"image_reference": {"content": "iVBORw0KGgoAAAANSUhEUg...", "format": "base64"}}
     ```
 
-  - `"path"` reads a file on the *server*, so it is only meaningful for a co-located client; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject it (the same switch also disables `response_format="path"`). `"url"` is fetched through the SSRF-guarded loader (private-address block, redirect re-validation, timeout, size cap).
+  - `"path"` reads a file on the *server*, so it is only meaningful for a co-located client. It is refused unless the server is started with `TRTLLM_MEDIA_ALLOWED_INPUT_DIR=<directory>`, and then only a regular file inside that directory is read. `"url"` is fetched through the SSRF-guarded loader (private-address block, redirect re-validation, timeout, size cap).
   - `format` here is the *input* wire form; the top-level `format` selects the *output* encoding.
   - `role` disambiguates a model that accepts the same modality in more than one role — Wan 2.1 I2V takes a first frame and an optional last frame. Roles and lists need a JSON body; a multipart upload is a single file with no role.
 
@@ -321,7 +321,7 @@ You can customize these by:
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries every generated tensor, including video, audio, or action, plus scalar metadata in one payload).
 
-> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400. One switch covers both directions: it also rejects a reference sent with `format="path"`.
+> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1` to reject `path` requests with HTTP 400; a VisualGen server refuses to start if the variable holds any value other than `0`, `1` or empty. The former name `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH` is no longer read: a VisualGen server started with it set to a value other than `0` or empty refuses to start and names the new variable. A reference sent with `format="path"` is governed separately, by `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`.
 
 #### Media-storage directory
 
@@ -359,7 +359,7 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
-- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `sigma_grid` (see the Cosmos3 example README), `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
 
 ##### Cosmos3 transfer hints
 
@@ -432,6 +432,32 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F "size=256x256" \
   -F "guidance_scale=5.0"
 ```
+
+### Omni inputs: text, image, video, and audio
+
+A single request can combine `prompt`, `image_reference`, `video_reference`, and
+`audio_reference`. This contract applies to any model that declares the relevant
+reference slots; unsupported modalities and model-specific reference limits are
+rejected. Both `/v1/videos` and `/v1/videos/sync` accept JSON reference objects
+(or lists of objects) and multipart uploads. Repeat a multipart reference field
+for multiple files. Uploads and JSON reference objects/lists can also be mixed
+under the same field, preserving their order within that modality.
+
+Start the server with a model and configuration that support the requested
+combination of inputs. Follow that model's setup instructions for media-decoding
+dependencies, supported formats, and sample rates. For example:
+
+```bash
+curl -X POST "http://localhost:8000/v1/videos" \
+  -F 'prompt=Animate the subject using the reference motion and sound.' \
+  -F 'image_reference=@./subject.png' \
+  -F 'image_reference=@./style.png' \
+  -F 'video_reference=@./motion.mp4' \
+  -F 'audio_reference=@./sound.wav'
+```
+
+Reference roles, count limits, and cross-modality ordering are defined by the
+loaded model. Pass any supported model-specific options through `extra_params`.
 
 ### Video-to-Video (Multipart with File Upload, Cosmos3)
 ```bash

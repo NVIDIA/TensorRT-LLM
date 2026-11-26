@@ -132,10 +132,19 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 * **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tensor_parallel_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
 
-#### `kv_cache_free_gpu_memory_fraction`
+#### `kv_cache_config.free_gpu_memory_fraction`
 
-* **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
-* **Recommendation:** If you experience OOM errors, try reducing this value to `0.7` or lower.
+* **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. **Default:** `0.9`.
+* **Recommendation:** Start with the curated configuration's value. If you experience out-of-memory (OOM) errors, try reducing this value to `0.7` or lower.
+
+Update `free_gpu_memory_fraction` in the existing `kv_cache_config` mapping, preserving all other settings. Add the mapping only if it is absent. The following example shows an OOM mitigation setting of `0.7`:
+
+```yaml
+kv_cache_config:
+  free_gpu_memory_fraction: 0.7
+```
+
+`trtllm-serve --kv_cache_free_gpu_memory_fraction` (alias `--free_gpu_memory_fraction`) sets the same field. When explicitly provided, the CLI flag overrides the YAML value without a warning. If also specified, `--set kv_cache_config.free_gpu_memory_fraction=...` takes precedence over the flag.
 
 #### `max_batch_size`
 

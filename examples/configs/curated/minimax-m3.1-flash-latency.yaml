@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# MiniMax-M3.1-Flash, min latency on 4 Vera Rubin GPUs: TP4 attention and experts, DSpark drafter, NVFP4 KV cache.
+tensor_parallel_size: 4
+moe_expert_parallel_size: 1
+trust_remote_code: true
+max_batch_size: 8
+# Chunked prefill stays off: the DSpark drafter's sliding-window draft pool needs whole-prompt prefill when there is no
+# host KV cache, so max_num_tokens covers max_seq_len.
+max_num_tokens: 32768
+max_seq_len: 32768
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+kv_cache_config:
+  dtype: nvfp4
+  free_gpu_memory_fraction: 0.85
+moe_config:
+  backend: TRTLLM
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  fuse_qkv_index_projection: true
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 7
+  # The drafter ships in the checkpoint's dspark/ subfolder; with a local checkpoint, point this at its dspark/ folder.
+  speculative_model: MiniMaxAI/MiniMax-M3.1-Flash/dspark
+reasoning_parser: minimax_m3

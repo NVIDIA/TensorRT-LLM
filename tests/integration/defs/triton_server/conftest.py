@@ -21,10 +21,7 @@ import tempfile
 
 import pytest
 
-from .test_list_parser import (CorrectionMode, get_test_name_corrections_v2,
-                               handle_corrections)
-from .trt_test_alternative import (SessionDataWriter, check_call, check_output,
-                                   print_info)
+from .trt_test_alternative import check_call, check_output, print_info
 
 
 def find_repo_root():
@@ -71,12 +68,6 @@ def trt_performance_cache_name():
     return "performance.cache"
 
 
-@pytest.fixture(scope="session")
-def trt_performance_cache_fpath(trt_config, trt_performance_cache_name):
-    fpath = os.path.join(trt_config["workspace"], trt_performance_cache_name)
-    return fpath
-
-
 # Get the executing test case name
 @pytest.fixture(autouse=True)
 def test_case_name(request):
@@ -90,33 +81,6 @@ def llm_backend_root():
     assert os.path.isabs(backend_root), "LLM backend path must be absolute"
     assert os.path.exists(backend_root), f"{backend_root} does not exist"
     return backend_root
-
-
-@pytest.fixture(scope="session")
-def llm_session_data_writer(trt_config, trt_gpu_clock_lock,
-                            versions_from_infer_device, output_dir):
-    """
-    Fixture for the SessionDataWriter, used to write session data to output directory.
-    """
-
-    # Attempt to see if we can run infer_device to get the necessary tags for perf_runner
-    perf_tag_data = trt_config["perf_trt_tag"]
-
-    if versions_from_infer_device:
-        for k, v in versions_from_infer_device.items():
-            if k not in perf_tag_data or perf_tag_data[k] is None:
-                perf_tag_data[k] = v
-
-    session_data_writer = SessionDataWriter(
-        perf_trt_tag=perf_tag_data,
-        log_output_directory=output_dir,
-        output_formats=trt_config["perf_log_formats"],
-        gpu_clock_lock=trt_gpu_clock_lock,
-    )
-
-    yield session_data_writer
-
-    session_data_writer.teardown()
 
 
 @pytest.fixture(scope="session")
@@ -386,36 +350,3 @@ def output_dir(request):
     if output:
         os.makedirs(str(output), exist_ok=True)
     return output
-
-
-def deselect_by_regex(regexp, items, test_prefix, config):
-    """Filter out tests based on the patterns specified in the given list of regular expressions.
-        If a test matches *any* of the expressions in the list it is considered selected."""
-    compiled_regexes = []
-    regex_list = []
-    r = re.compile(regexp)
-    compiled_regexes.append(r)
-    regex_list.append(regexp)
-
-    selected = []
-    deselected = []
-
-    corrections = get_test_name_corrections_v2(set(regex_list),
-                                               set(it.nodeid for it in items),
-                                               CorrectionMode.REGEX)
-    handle_corrections(corrections, test_prefix)
-
-    for item in items:
-        found = False
-        for regex in compiled_regexes:
-            if regex.search(item.nodeid):
-                found = True
-                break
-        if found:
-            selected.append(item)
-        else:
-            deselected.append(item)
-
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-    items[:] = selected

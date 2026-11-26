@@ -206,18 +206,21 @@ struct SoftmaxPostprocess
     }
 };
 
-/// SumNormalize: divides each top-K score by the sum of all top-K scores.
-/// Used when softmax has already been applied before topK selection.
+/// SumNormalize: divides each top-K score by the sum of all top-K scores plus epsilon.
+/// Used when softmax or sigmoid has already been applied before topK selection. SigmoidRenorm sets
+/// epsilon=1e-20 so a token whose selected sigmoid scores all underflow to 0 gets 0 weights, not NaN.
 struct SumNormalizePostprocess
 {
     template <typename OutputT>
     struct Params
     {
         bool normTopkProb = true;
+        float sumEpsilon = 0.0f;
 
         void set(routingCustom::Data const& data)
         {
             normTopkProb = data.mNormTopkProb;
+            sumEpsilon = data.mSumEpsilon;
         }
     };
 
@@ -230,7 +233,7 @@ struct SumNormalizePostprocess
         if (params.normTopkProb)
         {
             sum = static_cast<float>(laneIdx < topK ? warpTopKScore[laneIdx] : 0);
-            sum = cg::reduce(warp, sum, cg::plus<float>());
+            sum = cg::reduce(warp, sum, cg::plus<float>()) + params.sumEpsilon;
         }
         if (laneIdx < topK)
         {
@@ -512,6 +515,39 @@ inline bool dispatchTierPairs(TierList<First, Rest...>*, Data const& data, Fn&& 
     return dispatchTierPairs(static_cast<TierList<Rest...>*>(nullptr), data, std::forward<Fn>(fn));
 }
 
+inline char const* toString(RoutingPreprocessType type)
+{
+    switch (type)
+    {
+    case RoutingPreprocessType::None: return "None";
+    case RoutingPreprocessType::Softmax: return "Softmax";
+    case RoutingPreprocessType::Sigmoid: return "Sigmoid";
+    case RoutingPreprocessType::SigmoidBias: return "SigmoidBias";
+    }
+    return "Unknown";
+}
+
+inline char const* toString(RoutingPostprocessType type)
+{
+    switch (type)
+    {
+    case RoutingPostprocessType::None: return "None";
+    case RoutingPostprocessType::Softmax: return "Softmax";
+    case RoutingPostprocessType::SumNormalize: return "SumNormalize";
+    case RoutingPostprocessType::ScaledSumNormalize: return "ScaledSumNormalize";
+    }
+    return "Unknown";
+}
+
+//! Fails the launch when no compiled (experts, topK) tier covers the problem: the routing kernel would be
+//! skipped and the MoE GEMMs would read uninitialized routing buffers.
+template <typename Data>
+inline void checkTierDispatched(bool dispatched, Data const& data)
+{
+    TLLM_CHECK_WITH_INFO(dispatched, "No routing tier covers numExperts=%d topK=%d for the %s + %s routing policy",
+        data.mNumExperts, data.mTopK, toString(data.mPreprocessType), toString(data.mPostprocessType));
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // POLICY TIER CONFIGURATION
 //
@@ -540,19 +576,20 @@ inline bool dispatchTierPairs(TierList<First, Rest...>*, Data const& data, Fn&& 
 // DefaultRoutingLaunchConfig for details.
 //
 // ┌──────────────────────────────────────────────────────────────────────────────┐
-// │  Policy (PreProc + PostProc)           Supported pairs                      │
+// │  Policy (PreProc + PostProc)           Supported pairs                       │
 // ├──────────────────────────────────────────────────────────────────────────────┤
-// │  Softmax + None       (Default)        (128,8)                              │
-// │  None + Softmax       (Renormalize)    (128,4) (128,8) (160,8) (256,8)     │
-// │                                        (256,16) (512,8) (512,16)  │
-// │                                        (512,22) (576,8) (2048,32)          │
-// │  Sigmoid + SumNorm    (SigmoidRenorm)  (128,8)                              │
-// │  SigmoidBias + ScaleS (DS nGroup≤1)    (128,8) (256,8) (384,8) (512,8)    │
-// │                                        (512,22)                            │
-// │  Softmax + SumNorm    (RenormNaive)    (128,4) (128,8) (256,8) (512,8)    │
-// │                                        (2048,8)                             │
-// │  None + None          (fallback)       (128,8)                              │
+// │  Softmax + None       (Default)        (128,8) (256,8) (512,8) (2048,32)     │
+// │  None + Softmax       (Renormalize)    (128,4) (128,8) (160,8) (256,8)       │
+// │                                        (256,16) (512,8) (512,16) (512,22)    │
+// │                                        (576,8) (1024,32) (2048,32)           │
+// │  Sigmoid + SumNorm    (SigmoidRenorm)  same pairs as Default                 │
+// │  SigmoidBias + ScaleS (DS nGroup≤1)    (128,8) (256,8) (384,8) (512,8)       │
+// │                                        (512,22) (1024,32) (2048,32)          │
+// │  Softmax + SumNorm    (RenormNaive)    generic fallback (never dispatched)   │
+// │  None + None          (fallback)       (128,8)                               │
 // └──────────────────────────────────────────────────────────────────────────────┘
+// Every policy the runner selects covers up to 2048 experts and topK 32, the limits runner.cu and
+// the ops check; a dispatch that finds no tier fails the launch (checkTierDispatched).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Default: fallback for new/unknown policies.
@@ -566,11 +603,15 @@ struct PolicyTraits
         Tier<2048, 8>, Tier<2048, 32>>;
 };
 
-/// Softmax + None (Default): single config.
+/// Pairs for the elementwise-or-softmax policies without model-specific tiers (Default, SigmoidRenorm):
+/// tight tiers up to 512 experts / topK 8, plus a catch-all up to the kernel limits.
+using GenericPolicyPairs = TierList<Tier<128, 8>, Tier<256, 8>, Tier<512, 8>, Tier<2048, 32>>;
+
+/// Softmax + None (Default).
 template <>
 struct PolicyTraits<SoftmaxPreprocess, NoOpPostprocess>
 {
-    using Pairs = TierList<Tier<128, 8>>;
+    using Pairs = GenericPolicyPairs;
 };
 
 /// None + Softmax (Renormalize): many model configs.
@@ -593,11 +634,11 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess>
             >;
 };
 
-/// Sigmoid + SumNormalize (SigmoidRenorm): single config.
+/// Sigmoid + SumNormalize (SigmoidRenorm).
 template <>
 struct PolicyTraits<SigmoidPreprocess, SumNormalizePostprocess>
 {
-    using Pairs = TierList<Tier<128, 8>>;
+    using Pairs = GenericPolicyPairs;
 };
 
 /// SigmoidBias + ScaledSumNormalize (DeepSeek nGroup≤1 / MiniMax2 / Kimi-K2 / Nemotron SuperV3).
@@ -609,7 +650,8 @@ struct PolicyTraits<SigmoidBiasPreprocess, ScaledSumNormalizePostprocess>
         Tier<384, 8>,                    // Kimi K2 (384 experts)
         Tier<512, 8>,                    // DeepSeek nGroup≤1 (256 experts → E512 fallback)
         Tier<512, 22>,                   // Nemotron Super V3 (512 experts, topK=22, nGroup≤1)
-        Tier<1024, 32>                   // Default fallback (expert count may grow beyond 512)
+        Tier<1024, 32>,                  // Expert counts beyond 512
+        Tier<2048, 32>                   // Up to the 2048-expert limit
         >;
 };
 
@@ -716,10 +758,7 @@ struct DefaultRoutingLaunchConfig
                 LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, effectiveBlocks_, effectiveThreads_, smemSize,  \
                     stream, PreProc, PostProc, decltype(eTag_)::value, decltype(kTag_)::value);                        \
             });                                                                                                        \
-        if (!dispatched_)                                                                                              \
-        {                                                                                                              \
-            TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
-        }                                                                                                              \
+        checkTierDispatched(dispatched_, data);                                                                        \
     }(PolicyTraits<PreProc, PostProc>{})
 
 #define LAUNCH_ROUTING_FOR_POLICY(                                                                                     \
@@ -747,10 +786,7 @@ struct DefaultRoutingLaunchConfig
                 LAUNCH_ROUTING_WITH_EXPERT_SELECT(data, coopLaunch, kernel, numBlocks, effectiveThreads_, smemSize,    \
                     stream, ExpertSelect, decltype(eTag_)::value, decltype(kTag_)::value);                             \
             });                                                                                                        \
-        if (!dispatched_)                                                                                              \
-        {                                                                                                              \
-            TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
-        }                                                                                                              \
+        checkTierDispatched(dispatched_, data);                                                                        \
     }(PolicyTraits<ExpertSelect, void>{})
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

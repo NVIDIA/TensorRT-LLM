@@ -4,7 +4,7 @@
 
 This article provides a general overview of the components used for device-to-device transmission of KV cache, which is relied upon by disaggregated serving. It is intended as a reference for users who wish to understand the internal implementation or develop extended functionalities. For configuring a deployment, see [Disaggregated Serving](../features/disagg-serving.md) instead.
 
-The implementation described here is the Python transceiver, which lives under [`tensorrt_llm/_torch/disaggregation/`](source:tensorrt_llm/_torch/disaggregation). `cache_transceiver_config.transceiver_runtime` defaults to `auto`, which selects it on the supported NIXL path and otherwise falls back to the older C++ transceiver (`cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp` and friends). That C++ implementation is deprecated and will be removed in a future release; new work should target the Python path.
+The implementation described here is the Python transceiver, which lives under [`tensorrt_llm/_torch/disaggregation/`](source:tensorrt_llm/_torch/disaggregation). `cache_transceiver_config.transceiver_runtime` defaults to `PYTHON`, which selects it. `CPP` or `None`, or `auto` when it falls back, selects the older C++ transceiver (`cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp` and friends). That C++ implementation is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period; new work should target the Python path.
 
 ## Table of Contents
 

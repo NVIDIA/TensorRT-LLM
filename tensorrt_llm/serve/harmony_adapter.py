@@ -957,11 +957,6 @@ class HarmonyAdapter:
         if not msg_recipient or msg_recipient == "assistant":
             return None
 
-        # # Clean up function name by removing constraint tokens that may be incorrectly included
-        # # The harmony library sometimes includes ><|constrain|>json in the recipient
-        # if ">" in function_name:
-        #     function_name = function_name.split(">")[0]
-
         # Extract arguments from message content
         function_call_args = ""
         for content in msg_content:
@@ -1435,12 +1430,8 @@ class HarmonyAdapter:
             stream_state = self.create_stream_state(request_id, available_tools,
                                                     tool_choice)
 
-        # decoded_tokens = self.encoding.decode_utf8(tokens)
-        # logger.info(">> DECODED TOKENS: %r", decoded_tokens)
-
         try:
             deltas = stream_state.process_token_batch(tokens)
-            # logger.info(">> GENERATED DELTAS: %s", deltas)
             return deltas
         except (HarmonyError, UnicodeDecodeError, ValueError):
             logger.error(
@@ -1981,7 +1972,8 @@ def _create_usage_info(num_prompt_tokens,
 
 def maybe_transform_reasoning_effort(
     reasoning_effort: ReasoningEffort
-    | Literal["low", "medium", "high", "max", "none"] | None
+    | Literal["minimal", "low", "medium", "high", "xhigh", "max", "none"]
+    | None
 ) -> ReasoningEffort | None:
     str_to_effort = {
         "low": ReasoningEffort.LOW,
@@ -1991,6 +1983,11 @@ def maybe_transform_reasoning_effort(
         # the nearest harmony level ("none" means no explicit effort).
         "max": ReasoningEffort.HIGH,
         "none": None,
+        # Extended-scale efforts accepted by the shared request schema
+        # (consumed natively by chat templates that support them); map to
+        # the nearest harmony level so harmony deployments keep working.
+        "minimal": ReasoningEffort.LOW,
+        "xhigh": ReasoningEffort.HIGH,
     }
     if reasoning_effort and not isinstance(reasoning_effort, ReasoningEffort):
         return str_to_effort[reasoning_effort]

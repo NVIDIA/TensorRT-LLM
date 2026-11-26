@@ -34,6 +34,15 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggSchedul
 pytestmark = pytest.mark.cpu_only
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
+
 def _params() -> DisaggregatedParams:
     return DisaggregatedParams(
         disagg_request_id=401, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
@@ -46,6 +55,7 @@ def _sender(*, ownership: bool = True) -> transfer_mod.Sender:
     sender._enforce_physical_ownership = ownership
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
     sender._pre_cancelled_rids = {}
+    sender._retired_rids = {}
     sender._peer_requests_lock = threading.Lock()
     sender._peer_requests, sender._peer_requests_timestamps = {}, {}
     sender._shutdown, sender._shutdown_requested = True, False
@@ -85,7 +95,11 @@ def _request_info() -> transfer_mod.RecvReqInfo:
 
 
 def _request_data() -> list[bytes]:
-    return [transfer_mod.MessageType.REQUEST_DATA, _request_info().to_bytes()]
+    return [
+        transfer_mod.MessageType.REQUEST_DATA,
+        _request_info().to_bytes(),
+        _KV_RESULT_REPORT_TOKEN,
+    ]
 
 
 def _older_release_request_info_bytes(bounce_dst_base) -> bytes:
@@ -158,7 +172,14 @@ def test_worker_orders_session_ack_after_piece_reports(
     sender = _sender()
     sender._device_id, sender._thread_local = 0, threading.local()
     work_queue = sender._send_task_queues[0]
-    result = transfer_mod._make_kv_result_msg(7, 401, 0, True, transfer_mod.AgentResult.SUCCESS)
+    result = transfer_mod._make_kv_result_msg(
+        7,
+        401,
+        0,
+        True,
+        transfer_mod.AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     acknowledgement = [transfer_mod.MessageType.SESSION_QUIESCED, b"7", b"401"]
     sent, errors = [], queue.Queue()
     ack_attempts = 0
@@ -197,12 +218,33 @@ def test_worker_orders_session_ack_after_piece_reports(
         task.record_backend_submission(0, Mock(is_completed=Mock(return_value=True)))
         task.mark_physical_operation_in_doubt(0)
         empty = np.empty(0, dtype=np.int64)
-        meta = transfer_mod.WriteMeta(task, 1, "gen", 0, "tcp://gen:1234", 401, empty, empty, empty)
+        meta = transfer_mod.WriteMeta(
+            task,
+            1,
+            "gen",
+            0,
+            "tcp://gen:1234",
+            401,
+            empty,
+            empty,
+            empty,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
         initial = transfer_mod._make_kv_result_msg(
-            7, 401, 0, False, transfer_mod.AgentResult.IN_DOUBT
+            7,
+            401,
+            0,
+            False,
+            transfer_mod.AgentResult.IN_DOUBT,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
         settled = transfer_mod._make_kv_result_msg(
-            7, 401, 0, True, transfer_mod.AgentResult.FAILED_QUIESCED
+            7,
+            401,
+            0,
+            True,
+            transfer_mod.AgentResult.FAILED_QUIESCED,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
         sender._pending_settlements[0][(task, 0)] = transfer_mod._PendingSettlement(meta, initial)
         expected = [initial, settled, acknowledgement]
@@ -454,7 +496,14 @@ def test_adp_candidate_acks_do_not_replace_selected_writer_or_aux_evidence(
     assert not session.resources_drained()
     if actual_writer_results:
         for rank in (2, 3):
-            session.process_kv_agent_result(rank, 0, True, transfer_mod.AgentResult.FAILED)
+            _publish_report_tokens(session)
+            session.process_kv_agent_result(
+                rank,
+                0,
+                True,
+                transfer_mod.AgentResult.FAILED,
+                kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+            )
         assert task._get_physical_owner().all_writers_reported
         assert not session.resources_drained(), "KV completion cannot retire outstanding AUX"
     session.process_session_quiesced(2)
@@ -580,6 +629,17 @@ def test_request_data_from_an_older_release_names_the_release_mismatch(bounce_ds
     assert error.value.req_info.unique_rid == 401
 
 
+def test_request_info_takes_no_report_token_from_the_request_body() -> None:
+    current = msgpack.unpackb(_request_info().to_bytes(), raw=False)
+    older = msgpack.unpackb(_older_release_request_info_bytes(None), raw=False)
+    for fields in (current, older):
+        fields["kv_result_report_token"] = b"x" * 64
+    assert transfer_mod.RecvReqInfo.from_bytes(msgpack.packb(current)).kv_result_report_token == b""
+    with pytest.raises(transfer_mod.OlderReleaseRequestError) as error:
+        transfer_mod.RecvReqInfo.from_bytes(msgpack.packb(older))
+    assert error.value.req_info.kv_result_report_token == b""
+
+
 @pytest.mark.parametrize("ownership", [False, True])
 def test_request_data_from_an_older_generation_server_fails_it_at_once(
     ownership: bool, monkeypatch: pytest.MonkeyPatch
@@ -598,7 +658,14 @@ def test_request_data_from_an_older_generation_server_fails_it_at_once(
     for _ in range(2):
         sender._respond_with_kv(b"gen", older_request)
 
-    failed = transfer_mod._make_kv_result_msg(7, 401, 0, True, transfer_mod.AgentResult.FAILED)
+    failed = transfer_mod._make_kv_result_msg(
+        7,
+        401,
+        0,
+        True,
+        transfer_mod.AgentResult.FAILED,
+        kv_result_report_token=b"",
+    )
     if ownership:
         sent = [sender._send_task_queues[0].get_nowait() for _ in range(2)]
         assert sent == [("tcp://gen:1234", failed)] * 2

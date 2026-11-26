@@ -67,6 +67,8 @@ class MlaResource(MemoryResource):
 
     cfg: cutlass.Constexpr[MlaConfig] = None
     cu_seqlens_q: object = None
+    cp_rank: object = 0
+    runtime_split_kv: object = None
     _alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
     _tmem_alloc: cutlass.Constexpr[Optional[TmemAllocation]] = None
     _tmem_base_addr: object = None

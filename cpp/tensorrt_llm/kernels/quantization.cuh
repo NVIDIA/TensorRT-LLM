@@ -980,6 +980,64 @@ quantize_with_block_size(
 #endif
 }
 
+//! MXFP8 (K32 UE8M0 scales, swizzled 128x4 layout) quantization of one unpadded [numRows, numCols] matrix with the
+//! per-element math of quantize_with_block_size (cvt_warp_fp16_to_mxfp8): one 8-element column chunk per thread
+//! (blockDim.x == numCols / 8) and ROWS rows loaded before any is converted, so more bytes are in flight per thread.
+//! Requires numCols % 128 == 0 and numCols / 8 <= 1024 a multiple of 32.
+template <class Type, int ROWS>
+__global__ void __launch_bounds__(1024)
+    quantize_mxfp8_rows(int32_t numRows, int32_t numCols, Type const* in, uint64_t* out, uint32_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    using PackedVec = PackedVec<Type>;
+    static constexpr int CVT_NUM_THREADS_PER_SF = 32 / CVT_ELTS_PER_THREAD;
+    int const colIdx = threadIdx.x;
+    int const numColThreads = numCols / CVT_ELTS_PER_THREAD;
+    int const numPaddedRowsForSf = PadUpFn(numRows, 128);
+    std::optional<int> const optionalBatchIdx = 0;
+    std::optional<int> const optionalNumRows = numRows;
+
+    cudaGridDependencySynchronize();
+    for (int rowBase = blockIdx.x * ROWS; rowBase < numPaddedRowsForSf; rowBase += gridDim.x * ROWS)
+    {
+        PackedVec inVecs[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+        {
+            if (rowBase + r < numRows)
+            {
+                inVecs[r] = reinterpret_cast<PackedVec const*>(
+                    in)[static_cast<int64_t>(rowBase + r) * numColThreads + colIdx];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+        {
+            int const rowIdx = rowBase + r;
+            if (rowIdx >= numPaddedRowsForSf)
+            {
+                break;
+            }
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols / 32, SFout, QuantizationSFLayout::SWIZZLED);
+            if (rowIdx < numRows)
+            {
+                out[static_cast<int64_t>(rowIdx) * numColThreads + colIdx]
+                    = cvt_warp_fp16_to_mxfp8<Type, 32>(inVecs[r], sf_out);
+            }
+            else
+            {
+                cvt_store_replicated_sf<1>(sf_out, 0x00);
+            }
+        }
+    }
+    // See quantize_with_block_size: every thread's stores are visible before any thread triggers completion.
+    __threadfence();
+    __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 __global__ void block_scale_interleave_kernel(
     int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
 } // namespace kernels

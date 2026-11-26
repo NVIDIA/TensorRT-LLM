@@ -15,10 +15,11 @@
 import gc
 import importlib
 import os
+import traceback
 from functools import wraps
 from pathlib import Path
 from queue import Queue
-from typing import Any, List, Optional, Type
+from typing import TYPE_CHECKING, Any, List, Optional, Type
 
 import ray
 import torch
@@ -41,6 +42,12 @@ from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
 from ..rpc_worker_mixin import RpcWorkerMixin
+
+if TYPE_CHECKING:
+    from tensorrt_llm.logger import Logger
+
+# Bound lazily in __init__ because Ray cannot pickle the logger; declared for type checkers.
+logger: "Logger"
 
 __all__ = [
     "RayGPUWorker",
@@ -114,13 +121,18 @@ class RayWorkerWrapper:
         return self.store.port
 
     def setup_distributed_env_and_worker(self, port: int):
+        # Imported here so that importing the Ray executor in the driver
+        # does not load the torch.distributed communication modules.
+        from tensorrt_llm._torch.distributed.initialization import \
+            init_torch_distributed
+
         if self.rank != 0:
             self.store = self._create_tcp_store(port)
 
-        torch.distributed.init_process_group(backend="cuda:nccl,cpu:gloo",
-                                             store=self.store,
-                                             world_size=self.world_size,
-                                             rank=self.rank)
+        init_torch_distributed(backend="cuda:nccl,cpu:gloo",
+                               store=self.store,
+                               world_size=self.world_size,
+                               rank=self.rank)
         assert torch.distributed.get_world_size(
         ) == self.world_size, "Process group world size must match the expected world size"
         logger.info(
@@ -344,7 +356,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             if mutation_started:
                 self.engine.fail_sleep_wakeup_transition()
             self.engine.abort_sleep_transition()
-            logger.exception("Encountered an error in sleep")
+            logger.error("Encountered an error in sleep:\n"
+                         f"{traceback.format_exc()}")
             raise
         try:
             self.engine.complete_sleep_transition()
@@ -378,7 +391,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             if mutation_started:
                 self.engine.fail_sleep_wakeup_transition()
             self.engine.abort_wakeup_transition()
-            logger.exception("Encountered an error in wakeup")
+            logger.error("Encountered an error in wakeup:\n"
+                         f"{traceback.format_exc()}")
             raise
         try:
             self.engine.complete_wakeup_transition()
@@ -508,9 +522,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         if self.engine is not None:
             self.engine.shutdown()
-            local_cleanup = getattr(self.engine, "local_cleanup", None)
-            if local_cleanup is not None:
-                local_cleanup()
+            if getattr(self.engine, "local_cleanup", None) is not None:
+                self.engine.local_cleanup()
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"

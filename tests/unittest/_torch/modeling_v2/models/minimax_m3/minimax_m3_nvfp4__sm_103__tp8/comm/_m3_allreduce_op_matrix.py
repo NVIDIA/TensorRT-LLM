@@ -212,10 +212,10 @@ def _ulps_at(out: torch.Tensor, ref: torch.Tensor, scale: torch.Tensor) -> float
 def _target(ar: Any, x: torch.Tensor, residual: torch.Tensor, w: torch.Tensor):
     """The draft loop's boundary (``M3Eagle3Draft.ar_norm``): ``m3_allreduce`` plain, then the catalog's
     ``flashinfer_fused_add_rmsnorm``."""
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
         flashinfer_fused_add_rmsnorm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.comm.m3_allreduce import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.comm.m3_allreduce import (  # noqa: E501
         m3_allreduce,
     )
 
@@ -232,10 +232,10 @@ def _check_cells(mapping: Any) -> None:
     import sys as _sys
     from pathlib import Path as _Path
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.comm.m3_allreduce import (  # noqa: E501
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllReduceParams
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.comm.m3_allreduce import (  # noqa: E501
         m3_allreduce,
     )
-    from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllReduceParams
     from tensorrt_llm.functional import AllReduceStrategy
 
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[4]))
