@@ -77,6 +77,8 @@ _LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "SLURM_", "MPI_", "I_MPI_", 
 _STDERR_TAIL = 2000
 # Seconds a stop waits for idle workers to exit before it kills them.
 _STOP_TIMEOUT_S = 60.0
+# Seconds between a worker's checks that the rank that started it still runs.
+_RANK_POLL_S = 1.0
 # Seconds a worker may take to reply to a build (its first includes its imports) before it is
 # stopped; 0 waits without a limit.
 _REPLY_TIMEOUT_ENV = "TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S"
@@ -771,7 +773,7 @@ class _Pool:
                     sys.executable,
                     "-c",
                     "from tensorrt_llm._torch.build_pool import _worker_main; "
-                    f"_worker_main({task_read}, {result_write})",
+                    f"_worker_main({task_read}, {result_write}, {os.getpid()})",
                 ],
                 cwd=self._cwd,
                 env=self._env,
@@ -780,7 +782,8 @@ class _Pool:
                 stdout=subprocess.DEVNULL,
                 stderr=stderr,
                 # The processes a build starts (Ninja, nvcc) join the worker's group, which is
-                # stopped as a whole (_kill_group).
+                # stopped as a whole (_kill_group), and which the worker ends itself once this
+                # process is gone (_watch_rank).
                 start_new_session=True,
             )
         except OSError:
@@ -1071,10 +1074,14 @@ def _recv(stream: IO[bytes]) -> Any:
     return pickle.loads(_read(stream))  # nosec B301 - from this process's own worker
 
 
-def _worker_main(task_read: int, result_write: int) -> None:
-    """A worker: make each build asked for, until asked to stop or the rank ends."""
+def _worker_main(task_read: int, result_write: int, rank: int) -> None:
+    """A worker of the process ``rank``: make each build asked for, until asked to stop or the
+    rank ends."""
     # A crash leaves its stack in the stderr the rank quotes.
     faulthandler.enable()
+    threading.Thread(
+        target=_watch_rank, args=(rank,), name="tllm-build-pool-watch", daemon=True
+    ).start()
     with os.fdopen(task_read, "rb") as tasks, os.fdopen(result_write, "wb") as results:
         while True:
             try:
@@ -1098,6 +1105,16 @@ def _worker_main(task_read: int, result_write: int) -> None:
                 return
             if ends:
                 return
+
+
+def _watch_rank(rank: int) -> None:
+    """In a worker process: once the process ``rank`` that started this worker is gone, end the
+    worker and the processes its build started. The worker leads a process group of its own,
+    which the end of the rank's group does not reach, and it reads its task pipe only between
+    builds."""
+    while os.getppid() == rank:
+        time.sleep(_RANK_POLL_S)
+    os.killpg(os.getpid(), signal.SIGKILL)
 
 
 def _cuda_context_broken() -> bool:

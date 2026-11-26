@@ -9,6 +9,9 @@ The kernels are build_pool_targets.py's picklable stand-ins, so no GPU is needed
 import errno
 import importlib.util
 import os
+import signal
+import subprocess  # nosec B404 - starts a stand-in rank: sys.executable, a fixed argv, no shell
+import sys
 import threading
 import time
 from pathlib import Path
@@ -469,6 +472,62 @@ def test_a_stopped_worker_goes_with_the_processes_its_build_started(
     while _running(pid):
         assert time.monotonic() < deadline, f"the build's process {pid} outlived its worker"
         time.sleep(0.05)
+
+
+# A rank whose one worker runs start_and_stall(<child>, 600): the build starts a process, writes
+# its pid to <child>, and stalls.
+_STALLING_RANK = """
+import sys
+from tensorrt_llm._torch.build_pool import Build, BuildPool
+store, child = sys.argv[1:]
+pool = BuildPool(workers=1, enabled=True, store=store)
+with pool.pass_scope():
+    pool.build([Build("build_pool_targets:start_and_stall", (child, 600.0))])
+"""
+
+
+def _parent(pid: int) -> int:
+    with open(f"/proc/{pid}/stat") as f:
+        return int(f.read().rsplit(")", 1)[1].split()[1])
+
+
+def test_a_worker_whose_rank_is_gone_ends_with_the_processes_its_build_started(
+    tmp_path: Path,
+) -> None:
+    """A worker leads a process group of its own, which the end of the rank's group does not
+    reach, and it reads its task pipe only between builds: once the rank is gone, killed in a
+    build, the worker ends itself and the processes the build started."""
+    child = tmp_path / "child"
+    here = os.path.dirname(os.path.abspath(targets.__file__))
+    env = dict(os.environ)
+    env[targets.IN_WORKER_ENV] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (here, env.get("PYTHONPATH")) if p)
+    rank = subprocess.Popen(  # nosec B603 - sys.executable, a fixed argv
+        [sys.executable, "-c", _STALLING_RANK, str(tmp_path / "store"), str(child)], env=env
+    )
+    worker = None
+    try:
+        deadline = time.monotonic() + 300.0
+        while not (child.exists() and child.read_text()):
+            assert rank.poll() is None, "the rank ended before its build started"
+            assert time.monotonic() < deadline, "the rank's build did not start"
+            time.sleep(0.1)
+        started = int(child.read_text())
+        worker = _parent(started)
+        rank.kill()
+        rank.wait()
+        deadline = time.monotonic() + 30.0
+        while _running(worker) or _running(started):
+            assert time.monotonic() < deadline, (
+                "the worker or its build's process outlived the rank"
+            )
+            time.sleep(0.1)
+    finally:
+        if rank.poll() is None:
+            rank.kill()
+            rank.wait()
+        if worker is not None and _running(worker):
+            os.killpg(worker, signal.SIGKILL)
 
 
 def test_a_worker_whose_serving_thread_does_not_start_is_not_counted(
