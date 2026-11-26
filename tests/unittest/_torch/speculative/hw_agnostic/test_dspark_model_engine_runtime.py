@@ -322,6 +322,8 @@ def test_static_mtp_publishes_bounded_stride_before_attention_prepare():
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
     engine = _engine(_runner(), [])
+    engine._dspark_trims_submitted_tokens = False
+    engine._dspark_confidence_enabled = False
     config = MTPDecodingConfig(max_draft_len=7)
     engine.mapping = SimpleNamespace(has_cp_helix=lambda: False)
     engine.use_beam_search = False
@@ -351,7 +353,10 @@ def test_static_mtp_publishes_bounded_stride_before_attention_prepare():
     engine._prepare_attn_metadata(
         host, batch, None, metadata, None, config, enable_spec_decode=True, is_dummy=False
     )
-    assert observed == [3]
+    engine._prepare_attn_metadata(
+        host, batch, None, metadata, None, None, enable_spec_decode=False, is_dummy=False
+    )
+    assert observed == [3, 8]
 
 
 def test_attach_ragged_layout_refreshes_persistent_buffers_in_place() -> None:

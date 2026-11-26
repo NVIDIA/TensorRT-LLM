@@ -177,7 +177,9 @@ def test_fixed_verify_layout_fits_at_admission(
         budget.fixed_draft_reserve(
             cfg,
             SimpleNamespace(modeling_v2_target=object if fixed_target else None),
-            SimpleNamespace(pp_size=1, tp_size=2, enable_attention_dp=shared),
+            SimpleNamespace(
+                pp_size=1, tp_size=2, enable_attention_dp=shared, has_cp_helix=lambda: False
+            ),
             disaggregated=False,
             overlap=overlap,
         )
@@ -242,3 +244,54 @@ def test_reduced_vocab_padding_uses_target_zero_and_clears_reused_rows(mapped_id
         expand(out[:, :width], real_probs[:, :width], indices, real_tokens[:, :width])
         torch.testing.assert_close(out[:, :width, indices], real_probs[:, :width])
         torch.testing.assert_close(out[:, :width].sum(-1), torch.ones(1, width))
+
+
+@pytest.mark.parametrize(
+    "has_cp_helix, fixed_width_target, pp_size, disaggregated, supports_overlap, overlap, expected",
+    [
+        # Helix CP forces shared fixed width (reserve includes overlap term when overlap=True).
+        (True, False, 1, False, False, False, 7),
+        (True, False, 1, False, False, True, 15),
+        # Target-declared fixed width behaves the same as modeling_v2_target.
+        (False, True, 1, False, False, False, 7),
+        (False, True, 1, False, False, True, 15),
+        # PP > 1 disables in-flight overlap even when overlap=True.
+        (False, True, 2, False, False, True, 7),
+        # Disaggregated workers count overlap burst whenever spec mode supports overlap.
+        (False, True, 1, True, True, False, 15),
+        (False, True, 1, True, False, False, 7),
+    ],
+)
+def test_fixed_draft_reserve_covers_helix_target_pp_and_disagg(
+    has_cp_helix,
+    fixed_width_target,
+    pp_size,
+    disaggregated,
+    supports_overlap,
+    overlap,
+    expected,
+):
+    cfg = SimpleNamespace(
+        max_draft_len=7,
+        tokens_per_gen_step=8,
+        is_linear_tree=True,
+        use_dynamic_tree=False,
+        spec_dec_mode=SimpleNamespace(support_overlap_scheduler=lambda: supports_overlap),
+    )
+    mapping = SimpleNamespace(
+        pp_size=pp_size,
+        tp_size=1,
+        enable_attention_dp=False,
+        has_cp_helix=lambda: has_cp_helix,
+    )
+    assert (
+        budget.fixed_draft_reserve(
+            cfg,
+            SimpleNamespace(modeling_v2_target=None),
+            mapping,
+            disaggregated=disaggregated,
+            overlap=overlap,
+            fixed_width_target=fixed_width_target,
+        )
+        == expected
+    )

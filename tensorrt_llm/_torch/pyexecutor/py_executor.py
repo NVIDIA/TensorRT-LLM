@@ -749,6 +749,10 @@ class PyExecutor:
     is_generation_model = True
     max_seq_len: Optional[int] = None
     _fixed_draft_reserve: int = 0
+    _admission_draft_reserve: int = 0
+    _speculative_headroom: int = 0
+    speculation_gate: Optional[SpeculationGate] = None
+    speculation_permanently_disabled: bool = False
     # True while the overlap loop runs with the execution stream current
     # (_overlap_loop_stream_scope).
     _loop_on_execution_stream = False
@@ -857,6 +861,9 @@ class PyExecutor:
         gen_preemption: Optional[GenPreemptionConfig] = None,
         transfer_budget_is_explicit: bool = False,
         defer_generation_only_release: bool = False,
+        fixed_draft_reserve: Optional[int] = None,
+        admission_draft_reserve: Optional[int] = None,
+        speculative_headroom: Optional[int] = None,
     ) -> None:
         if kv_pool_rebalance_check_interval <= 0:
             raise ValueError(
@@ -953,6 +960,11 @@ class PyExecutor:
         self._resources_released = False
         self._closed = False
         self._gen_preemption_settings = gen_preemption
+        self._explicit_speculative_limits = (
+            fixed_draft_reserve,
+            admission_draft_reserve,
+            speculative_headroom,
+        )
         self._initialize_execution(
             PyExecutorResources(
                 resource_manager=resource_manager,
@@ -1179,10 +1191,40 @@ class PyExecutor:
 
         # Specialized targets can embed a fixed-width verifier. A shared
         # execution group must also keep its existing rank-wide forward layout.
-        self._fixed_draft_reserve = fixed_draft_reserve(
-            model_engine.spec_config, model_engine.model.model_config, dist.mapping,
-            disaggregated=kv_cache_transceiver is not None,
-            overlap=not disable_overlap_scheduler)
+        exp_fixed, exp_admission, exp_headroom = getattr(
+            self, "_explicit_speculative_limits", (None, None, None))
+        if model_engine.spec_config is None:
+            self._fixed_draft_reserve = 0
+            self._admission_draft_reserve = 0
+            self._speculative_headroom = 0
+        elif exp_fixed is not None and exp_admission is not None and exp_headroom is not None:
+            self._fixed_draft_reserve = exp_fixed
+            self._admission_draft_reserve = exp_admission
+            self._speculative_headroom = exp_headroom
+        else:
+            from ._util import compute_speculative_limits
+            kv_manager = self.kv_cache_manager
+            kv_cls = (type(kv_manager) if kv_manager is not None
+                      and type(kv_manager).__module__.startswith("tensorrt_llm.")
+                      else None)
+            computed_fixed, computed_admission, computed_headroom = (
+                compute_speculative_limits(
+                    model_engine,
+                    model_engine.spec_config,
+                    dist.mapping,
+                    max_seq_len=self.max_seq_len,
+                    disaggregated=kv_cache_transceiver is not None,
+                    overlap=not disable_overlap_scheduler,
+                    kv_cache_manager_cls=kv_cls,
+                ))
+            self._fixed_draft_reserve = (exp_fixed if exp_fixed is not None
+                                         else computed_fixed)
+            self._admission_draft_reserve = (exp_admission
+                                             if exp_admission is not None else
+                                             computed_admission)
+            self._speculative_headroom = (exp_headroom
+                                          if exp_headroom is not None else
+                                          computed_headroom)
 
         # Rolling true acceptance-rate tracking for permanent speculation
         # disable.
@@ -5723,7 +5765,8 @@ class PyExecutor:
             return None
         budget = batch_draft_budget(
             scheduled_batch.generation_requests, self.model_engine.max_draft_len,
-            self.max_seq_len, self.dist.cp_size, is_pard=config.spec_dec_mode.is_pard())
+            self.max_seq_len + self._speculative_headroom, self.dist.cp_size,
+            is_pard=config.spec_dec_mode.is_pard())
         if self.drafter is not None:
             budget = min(budget, self.max_total_draft_tokens) if self.use_spec_decode else 0
         return budget
@@ -7600,10 +7643,11 @@ class PyExecutor:
             return frozenset()
         pending_burst = 1 + (self.max_draft_len if pending_width is None else pending_width)
         verify_rows = self.model_engine.spec_config.tokens_per_gen_step if enabled else 1
+        effective_max_seq_len = self.max_seq_len + self._speculative_headroom
         return frozenset(
             request.request_id for request in previous.sample_state.requests
             if not request.is_dummy and request.request_id not in self.inflight_req_ids
-            and remaining_sequence_tokens(request, self.max_seq_len, self.dist.cp_size)
+            and remaining_sequence_tokens(request, effective_max_seq_len, self.dist.cp_size)
             < pending_burst + verify_rows)
 
     def _reserve_one_model_draft_tokens(self) -> None:
@@ -7611,13 +7655,16 @@ class PyExecutor:
         # generation rows before the batch-wide verification width is chosen.
         config = self.model_engine.spec_config
         rejection_on = config is not None and config.use_rejection_sampling
+        effective_max_seq_len = (self.max_seq_len + self._speculative_headroom
+                                 if self.max_seq_len is not None else None)
         for request in self.active_requests:
             if request.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                 continue
-            if self.max_seq_len is not None and config is not None and not self._fixed_draft_reserve:
+            if effective_max_seq_len is not None and config is not None and not self._fixed_draft_reserve:
                 is_pard = config.spec_dec_mode.is_pard()
-                width = request_draft_budget(request, config.max_draft_len, self.max_seq_len,
+                width = request_draft_budget(request, config.max_draft_len,
+                                             effective_max_seq_len,
                                              self.dist.cp_size, is_pard=is_pard)
                 resize_draft_tokens(request, width, is_pard=is_pard, rejection_on=rejection_on)
                 reservation = len(request.py_draft_tokens)
@@ -7632,6 +7679,8 @@ class PyExecutor:
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
+            effective_max_seq_len = (self.max_seq_len + self._speculative_headroom
+                                     if self.max_seq_len is not None else None)
             for req in self.active_requests:
                 if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
                                      LlmRequestState.DISAGG_GENERATION_INIT):
@@ -7644,8 +7693,9 @@ class PyExecutor:
                 width = 0
                 if self.use_spec_decode:
                     width = self.max_total_draft_tokens
-                    if self.max_seq_len is not None and not self._fixed_draft_reserve:
-                        width = request_draft_budget(req, width, self.max_seq_len,
+                    if effective_max_seq_len is not None and not self._fixed_draft_reserve:
+                        width = request_draft_budget(req, width,
+                                                     effective_max_seq_len,
                                                      self.dist.cp_size, is_pard=False)
                 req.draft_tokens = [0] * width
                 req.py_draft_tokens = [0] * width
@@ -9162,7 +9212,7 @@ class PyExecutor:
 
         if getattr(self, "max_seq_len", None) is not None:
             clamp_generation_request(request, self.max_seq_len, self.dist.cp_size,
-                                     draft_reserve=self._fixed_draft_reserve)
+                                     draft_reserve=self._admission_draft_reserve)
 
         if getattr(self, "_decode_only",
                    False) and not request.is_generation_only_request:
@@ -10987,15 +11037,19 @@ class PyExecutor:
         # A target-only step cannot prefill the drafter KV for new contexts.
         # Run terminal rows together and retain the other requests' drafter state.
         generations = scheduler_output.generation_requests
-        held_generation_ids = frozenset()
+        held_ids = frozenset()
+        effective_max_seq_len = (
+            self.max_seq_len + self._speculative_headroom
+            if getattr(self, "max_seq_len", None) is not None else None
+        )
         if (generations and (scheduled_context_requests or len(generations) > 1)
-                and getattr(self, "max_seq_len", None) is not None
+                and effective_max_seq_len is not None
                 and self.max_draft_len and not self._fixed_draft_reserve
                 and not self.speculation_permanently_disabled
                 and (self.drafter is None or self.use_spec_decode)):
             final_rows = [
                 req for req in generations if not req.is_dummy and
-                remaining_sequence_tokens(req, self.max_seq_len, self.dist.cp_size) <= 1
+                remaining_sequence_tokens(req, effective_max_seq_len, self.dist.cp_size) <= 1
             ]
             if final_rows:
                 final_ids = {req.request_id for req in final_rows}
@@ -11003,7 +11057,12 @@ class PyExecutor:
                 deferred.generation_requests = [req for req in generations if req.request_id not in final_ids]
                 if deferred.generation_requests:
                     self._revert_unexecuted_alloc(deferred)
-                held_generation_ids = frozenset(req.request_id for req in deferred.generation_requests)
+                held_ids = frozenset(
+                    [req.request_id for req in deferred.generation_requests]
+                    + [
+                        req.request_id for req in scheduled_context_requests
+                        if not req.is_first_context_chunk
+                    ])
                 scheduled_context_requests = []
                 generations = final_rows
 
@@ -11059,7 +11118,7 @@ class PyExecutor:
                     num_displaced -= 1
             scheduled_requests.paused_in_place_ids = frozenset(retained_ids)
 
-        scheduled_requests.paused_in_place_ids |= held_generation_ids
+        scheduled_requests.paused_in_place_ids |= held_ids
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)
 
@@ -12707,7 +12766,7 @@ class PyExecutor:
             if drafted_step <= 0:
                 continue
             request.py_num_draft_tokens_verified = 0
-            py_num_accepted = request.py_num_accepted_draft_tokens
+            py_num_accepted = min(drafted_step, request.py_num_accepted_draft_tokens)
             # Clamp the drafted count to max_draft_len: with
             # tree-based drafting the request carries up to
             # max_total_draft_tokens draft tokens, but at most

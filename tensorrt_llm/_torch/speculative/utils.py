@@ -732,7 +732,8 @@ def get_spec_decoder(
             fused_sampling=fused_sampling,
             watermark_unsupported_reason=_watermark_unsupported_reason(
                 spec_config, sampler_args.watermark_config),
-            logit_edits_unsupported=logit_edits_unsupported_reason(spec_config))
+            logit_edits_unsupported=logit_edits_unsupported_reason(spec_config),
+            is_pard=spec_config.spec_dec_mode.is_pard())
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

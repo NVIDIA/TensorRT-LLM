@@ -36,6 +36,7 @@ def fixed_draft_reserve(
     *,
     disaggregated: bool,
     overlap: bool,
+    fixed_width_target: bool = False,
 ) -> int:
     """Return admission headroom for targets or execution groups with a fixed verify layout.
 
@@ -47,15 +48,28 @@ def fixed_draft_reserve(
         disaggregated
         or mapping.pp_size > 1
         or (mapping.enable_attention_dp and mapping.tp_size > 1)
+        or mapping.has_cp_helix()
     )
     if not (
         model_config.modeling_v2_target is not None
+        or fixed_width_target
         or shared_width
         or not config.is_linear_tree
         or getattr(config, "use_dynamic_tree", False)
     ):
         return 0
-    return config.tokens_per_gen_step - 1 + (config.max_draft_len + 1 if overlap else 0)
+    in_flight_overlap = (
+        (overlap and mapping.pp_size == 1)
+        or (
+            disaggregated
+            and getattr(
+                getattr(config, "spec_dec_mode", None),
+                "support_overlap_scheduler",
+                lambda: False,
+            )()
+        )
+    )
+    return config.tokens_per_gen_step - 1 + (config.max_draft_len + 1 if in_flight_overlap else 0)
 
 
 def remaining_sequence_tokens(request: LlmRequest, max_seq_len: int, cp_size: int = 1) -> int:

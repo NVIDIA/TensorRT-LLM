@@ -514,7 +514,8 @@ class BaseWorker(GenerationExecutor):
             if cp_size > 1 and self.engine.kv_cache_transceiver is not None:
                 occupancy = longest_helix_prompt_slice(
                     prompt_len, cp_size, self.mapping.cp_config["tokens_per_block"])
-            default_max_tokens = generation_capacity(occupancy, max_seq_len)
+            reserve = getattr(self.engine, "_admission_draft_reserve", 0)
+            default_max_tokens = generation_capacity(occupancy, max_seq_len - reserve)
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:

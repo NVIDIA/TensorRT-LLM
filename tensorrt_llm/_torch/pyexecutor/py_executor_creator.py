@@ -1517,6 +1517,21 @@ def _create_py_executor(
         is_disagg=is_disagg,
     )
 
+    if (kv_cache_creator._admission_draft_reserve > 0
+            and net_max_seq_len - kv_cache_creator._admission_draft_reserve <= 1):
+        raise ValueError(
+            f"max_seq_len ({net_max_seq_len}) must exceed the speculative "
+            f"admission reserve ({kv_cache_creator._admission_draft_reserve}) "
+            "by at least 2 tokens to fit a prompt and generated token.")
+    if ((kv_cache_creator._fixed_draft_reserve > 0
+         or kv_cache_creator._admission_draft_reserve > 0)
+            and mapping.rank == 0):
+        logger.info(
+            "Speculative decoding limits: "
+            f"fixed_reserve={kv_cache_creator._fixed_draft_reserve}, "
+            f"admission_reserve={kv_cache_creator._admission_draft_reserve}, "
+            f"headroom={kv_cache_creator._speculative_headroom}.")
+
     if not skip_est:
         log_memory_usage("after loading weights")
 
@@ -1618,6 +1633,10 @@ def _create_py_executor(
                 dense_dwdp_manager=dense_dwdp_manager
                 if not estimating_kv_cache else None,
                 max_num_sequences=max_num_seq_slots,
+                fixed_draft_reserve=kv_cache_creator._fixed_draft_reserve,
+                admission_draft_reserve=kv_cache_creator.
+                _admission_draft_reserve,
+                speculative_headroom=kv_cache_creator._speculative_headroom,
             )
 
             # Originally, peft_cache_config might be mutated inside

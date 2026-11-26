@@ -69,6 +69,130 @@ from ..speculative.dflash_attention import (DFLASH_FOLDED_DECODE_LOWERING,
                                             dflash_trtllm_supports_page_size)
 from ..speculative.draft_budget import fixed_draft_reserve
 from ..speculative.spec_sampler_base import SpecSampler
+
+
+def uses_fixed_width_recurrent_replay(
+    model_config: ModelConfig,
+    spec_config,
+    manager_cls: Optional[type] = None,
+) -> bool:
+    """Return whether this configuration selects fixed-width KDA/GDN/Mamba2 replay caches."""
+    if spec_config is None or model_config is None:
+        return False
+    pretrained_config = getattr(model_config, "pretrained_config", None)
+    if pretrained_config is None:
+        return False
+    configs = (
+        pretrained_config,
+        getattr(pretrained_config, "text_config", None),
+        getattr(pretrained_config, "llm_config", None),
+    )
+    quant_config = getattr(model_config, "quant_config", None)
+    ssm_cache_dtype = getattr(quant_config, "mamba_ssm_cache_dtype", None)
+    if not isinstance(ssm_cache_dtype, torch.dtype):
+        torch_dtype = getattr(model_config, "torch_dtype", None)
+        ssm_cache_dtype = (torch_dtype if isinstance(torch_dtype, torch.dtype)
+                           else torch.bfloat16)
+
+    is_type = isinstance(manager_cls, type)
+    if any(c is not None and (is_kimi_linear(c) or config_utils.is_glm5_next(c))
+           for c in configs):
+        supports_kda = not is_type or issubclass(
+            manager_cls, (MambaHybridCacheManagerV2, MixedMambaHybridCacheManager))
+        if supports_kda:
+            from ..modules.kimi_kda.cache_manager import get_kda_replay_num_spec
+            if get_kda_replay_num_spec(spec_config,
+                                       manager_supports_replay=True) is not None:
+                return True
+
+    if any(c is not None and (is_qwen3_hybrid(c) or is_qwen4_exp(c))
+           for c in configs):
+        supports_gdn = not is_type or issubclass(
+            manager_cls, (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
+        if supports_gdn:
+            from ..modules.fla.cache_manager import _gdn_replay_gate
+            if _gdn_replay_gate(spec_config, ssm_cache_dtype)[0]:
+                return True
+
+    if any(c is not None and is_nemotron_hybrid(c) for c in configs):
+        from ..modules.mamba.cache_manager import _mamba2_replay_gate
+        stochastic_rounding = bool(
+            getattr(quant_config, "mamba_ssm_stochastic_rounding", False)
+            and ssm_cache_dtype == torch.float16)
+        if _mamba2_replay_gate(spec_config, ssm_cache_dtype,
+                               stochastic_rounding)[0]:
+            return True
+
+    return False
+
+
+def compute_speculative_headroom(
+    spec_config,
+    model_config: Optional[ModelConfig],
+    max_seq_len: Optional[int],
+    *,
+    overlap: bool,
+) -> int:
+    """Return KV headroom above ``max_seq_len`` safe to consume during speculative decode."""
+    if (spec_config is None or not getattr(spec_config, "max_draft_len", 0)
+            or max_seq_len is None):
+        return 0
+    if (spec_config.spec_dec_mode.is_sa()
+            or getattr(spec_config, "sa_config", None) is not None):
+        return 0
+    pretrained_config = getattr(model_config, "pretrained_config", None)
+    max_pos = getattr(pretrained_config, "max_position_embeddings", None)
+    if max_pos is None and hasattr(pretrained_config, "text_config"):
+        max_pos = getattr(pretrained_config.text_config,
+                          "max_position_embeddings", None)
+    if max_pos is None and hasattr(pretrained_config, "llm_config"):
+        max_pos = getattr(pretrained_config.llm_config,
+                          "max_position_embeddings", None)
+    if not isinstance(max_pos, int) or isinstance(max_pos, bool):
+        return 0
+    kv_headroom = (
+        (spec_config.tokens_per_gen_step - 1) * (2 if overlap else 1)
+        + get_num_extra_kv_tokens(spec_config))
+    if max_pos - max_seq_len >= kv_headroom:
+        return kv_headroom
+    return 0
+
+
+def compute_speculative_limits(
+    model_engine: ModelEngine,
+    spec_config,
+    mapping: Mapping,
+    *,
+    max_seq_len: Optional[int],
+    disaggregated: bool,
+    overlap: bool,
+    kv_cache_manager_cls: Optional[type] = None,
+) -> tuple[int, int, int]:
+    """Compute ``(fixed_draft_reserve, admission_draft_reserve, speculative_headroom)``."""
+    if spec_config is None or not getattr(spec_config, "max_draft_len", 0):
+        return 0, 0, 0
+    model = getattr(model_engine, "model", None)
+    model_config = getattr(model, "model_config", None)
+    if model_config is None:
+        return 0, 0, 0
+    fixed_width_target = bool(
+        getattr(model, "requires_fixed_draft_width", False)
+        or uses_fixed_width_recurrent_replay(
+            model_config, spec_config, kv_cache_manager_cls))
+    reserve = fixed_draft_reserve(
+        spec_config,
+        model_config,
+        mapping,
+        disaggregated=disaggregated,
+        overlap=overlap,
+        fixed_width_target=fixed_width_target,
+    )
+    headroom = compute_speculative_headroom(
+        spec_config, model_config, max_seq_len, overlap=overlap)
+    admission_reserve = max(0, reserve - headroom)
+    return reserve, admission_reserve, headroom
+
+
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
@@ -1290,24 +1414,30 @@ class KvCacheCreator:
         self._unification_max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._gen_preemption_headroom = gen_preemption_headroom
-        # The estimation requests go through the same admission policy as serving requests.
-        self._net_max_seq_len = net_max_seq_len
-        if speculative_config is not None:
-            self._net_max_seq_len -= fixed_draft_reserve(
-                speculative_config, model_engine.model.model_config, mapping,
-                disaggregated=is_disagg, overlap=not llm_args.disable_overlap_scheduler)
-        self._dummy_reqs = None
-        self._mla_chunked_profile_length: int | None = None
-        # Prompt length of the fresh-prefill dummies the profiling forward runs.
-        self._profiled_prompt_len = 0
-        self._dummy_encoder_inputs: List[MultimodalParams] = []
-        self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
         self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._execution_stream = execution_stream
         self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls()
         self._is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
                                                   KVCacheManagerV2)
+        (self._fixed_draft_reserve, self._admission_draft_reserve,
+         self._speculative_headroom) = compute_speculative_limits(
+             model_engine,
+             speculative_config,
+             mapping,
+             max_seq_len=net_max_seq_len,
+             disaggregated=is_disagg,
+             overlap=not getattr(llm_args, "disable_overlap_scheduler", False),
+             kv_cache_manager_cls=self._kv_cache_manager_cls,
+         )
+        # The estimation requests go through the same admission policy as serving requests.
+        self._net_max_seq_len = net_max_seq_len - self._admission_draft_reserve
+        self._dummy_reqs = None
+        self._mla_chunked_profile_length: int | None = None
+        # Prompt length of the fresh-prefill dummies the profiling forward runs.
+        self._profiled_prompt_len = 0
+        self._dummy_encoder_inputs: List[MultimodalParams] = []
+        self._profiling_stage_data = profiling_stage_data
         if self._is_agg_helix:
             if not self._is_kv_cache_manager_v2:
                 raise ValueError(
@@ -6015,6 +6145,9 @@ def create_py_executor_instance(
     dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
     transfer_budget_is_explicit: bool = False,
+    fixed_draft_reserve: Optional[int] = None,
+    admission_draft_reserve: Optional[int] = None,
+    speculative_headroom: Optional[int] = None,
 ) -> PyExecutor:
     execution_resources = create_py_executor_resources(
         dist=dist,
@@ -6092,6 +6225,9 @@ def create_py_executor_instance(
                 mapping, llm_args.disable_overlap_scheduler)),
         gen_preemption=llm_args.scheduler_config.gen_preemption
         if headroom_reason is None else None,
+        fixed_draft_reserve=fixed_draft_reserve,
+        admission_draft_reserve=admission_draft_reserve,
+        speculative_headroom=speculative_headroom,
     )
 
 

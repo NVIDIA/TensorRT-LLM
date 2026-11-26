@@ -297,8 +297,8 @@ class DSparkSpecMetadata(SpecMetadata):
             slots = list(map(req_to_slot.get, request_ids, itertools.repeat(scratch)))
             unknown = slots.count(scratch)
             # Live slots not referenced by this batch belong to finished requests, except
-            # those of requests paused in place (GEN slot preemption), which keep their
-            # window. Freed and newly assigned slots are cleared together below.
+            # those held in place (GEN slot preemption or deferred from a terminal-only step),
+            # which keep their window. Freed and newly assigned slots are cleared together below.
             resets = []
             if len(req_to_slot) > len(slots) - unknown:
                 paused = getattr(self, "paused_in_place_ids", frozenset())

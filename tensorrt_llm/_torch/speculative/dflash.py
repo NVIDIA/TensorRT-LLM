@@ -692,7 +692,7 @@ class DFlashSpecMetadata(SpecMetadata):
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
         if worker is not None and worker._ctx_buf_inited:
-            # Requests paused in place (GEN slot preemption) keep their slot.
+            # Requests paused in place or deferred from a terminal-only step keep their slot.
             current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
             # Slot lengths (and bases) written in one batch: evicted slots are
             # emptied, newly assigned ones seeded below.

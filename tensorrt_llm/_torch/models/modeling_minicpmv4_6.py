@@ -918,6 +918,11 @@ class MiniCPMV4_6Model(PreTrainedModel):
         """The Mamba metadata class of the language model's recurrent layers."""
         return getattr(self.llm, "mamba_metadata_cls", None)
 
+    @property
+    def requires_fixed_draft_width(self) -> bool:
+        """Whether the inner language model requires a fixed speculative verify width."""
+        return bool(getattr(self.llm, "requires_fixed_draft_width", False))
+
     @classmethod
     def get_recurrent_state_spec(
         cls,
