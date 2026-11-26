@@ -69,7 +69,6 @@ l0_gb300_multi_gpus:
   # runs them. multi_gpu/test_gqa_kv_replica.py runs in l0_gb300's pre_merge block instead;
   # --ignore arguments do not change the CSV key (test_unittests.py _parallel_config_key).
   - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py TIMEOUT (120)
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_spec/test_k3_spec_decode_head.py::test_mla_replicated_cache_fused_spec_head_ownership
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel

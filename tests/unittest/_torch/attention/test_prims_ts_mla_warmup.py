@@ -293,7 +293,7 @@ def _model(
     # Production wrappers intentionally expose no library implementation state.
     wrapper = object()
     library._mla_context_wrappers = {0: wrapper}
-    library._mla_decode_wrappers = {(1, 6, 1, 1, 128): wrapper}
+    library._mla_decode_wrappers = {(1, 6): wrapper}
     library._mla_context_plan_profiles = set(contexts)
     library._mla_decode_plan_profiles = set(decodes)
     backend = planners.backend()
@@ -395,7 +395,7 @@ def test_decode_all_batches_modes_and_devices_share_maximum_workspace(
         assert workspaces.setdefault(device, workspace) is workspace
         assert call.kwargs["max_kv_len"] == 4608
         assert call.kwargs["zero_empty_rows"] is False
-    assert library._mla_decode_wrappers == {(1, 6, 1, 1, 128): wrapper}
+    assert library._mla_decode_wrappers == {(1, 6): wrapper}
     assert _run(warmer, planners, model, max_batch_size=4, max_num_tokens=19) == (0, 0)
     assert len(planners.allocations) == 2
     del calls, call, workspace, workspaces

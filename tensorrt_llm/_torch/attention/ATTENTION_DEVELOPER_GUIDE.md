@@ -469,22 +469,6 @@ A backend may support the score computation you want, but still be the wrong
 fit because it assumes a different KV-cache layout or a different decode-time
 update pattern.
 
-Physical Helix page ownership comes from `kv_cache_manager.mapping`, not from
-the attention-head partition. `helix_page_owner` in `_torch.utils` returns the
-cache's CP world and rank as Python integers, or `(1, 0)` for a single-rank or
-non-Helix cache.
-Decode plans and native or fused speculative slots must use that ownership;
-the physical page size remains local to the cache.
-
-The executor supplies the same `Mapping` to the model engine and KV-cache
-creator. Host input packing and `helix_local_len_vec` rely on that equality.
-Isolated MLA tests may vary attention-head and cache mappings while supplying
-global positions and lengths directly, bypassing host packing but not the MLA
-zero-KV mask. That mask still follows the attention rank: before its first page,
-it can mark a replicated cache empty even though the replica has visible rows.
-Such fixtures do not establish short-prefix mixed-mapping support or support
-for mixed mappings through the full executor.
-
 CSA2 uses model-native cache ownership and the following policies when block
 reuse is enabled (Encoder SWA is `PRIVATE` when reuse is disabled):
 

@@ -68,7 +68,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MTPDecodingConfig,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
-from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.mapping import Mapping
 
 _DataType = tensorrt_llm.bindings.DataType
 _CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -507,18 +507,11 @@ def test_fp4_mla_cuda_graph_generation_lengths_records_capture_once(monkeypatch)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
 @pytest.mark.parametrize(
-    "tokens_per_block,cp_size,cp_rank,tokens_per_seq,cache_layout",
-    [
-        (64, 16, 0, 8, "helix"),
-        (64, 16, 15, 8, "helix"),
-        (32, 4, 1, 1, "helix"),
-        (128, 2, 1, 6, "helix"),
-        (64, 2, 1, 8, "replica"),
-        (64, 2, 1, 8, "ulysses"),
-    ],
+    "tokens_per_block,cp_size,cp_rank,tokens_per_seq",
+    [(64, 16, 0, 8), (64, 16, 15, 8), (32, 4, 1, 1), (128, 2, 1, 6)],
 )
 def test_recompute_helix_spec_buffers_matches_elementwise_reference(
-    tokens_per_block: int, cp_size: int, cp_rank: int, tokens_per_seq: int, cache_layout: str
+    tokens_per_block: int, cp_size: int, cp_rank: int, tokens_per_seq: int
 ) -> None:
     generator = torch.Generator().manual_seed(7)
     num_seqs = 5
@@ -528,92 +521,50 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     base[0, 0] = tokens_per_block * cp_size - max(1, tokens_per_seq // 2)
     base[1, 0] = 7 * tokens_per_block - max(1, tokens_per_seq // 2)
     positions = (base + torch.arange(tokens_per_seq)).reshape(-1).to(torch.int32).cuda()
-    mapping = Mapping(
-        world_size=cp_size, rank=cp_rank, cp_size=cp_size, cp_config={"cp_type": CpType.HELIX}
+    metadata = object.__new__(trtllm_backend.TrtllmAttentionMetadata)
+    metadata.kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
+    metadata.mapping = SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank)
+    metadata._num_contexts = 1
+    metadata._num_generations = num_seqs
+    untouched = 77
+    # The helix buffers are generation-relative; kv_lens_cuda is batch-indexed.
+    metadata.helix_position_offsets = torch.cat(
+        [positions, torch.full((2,), untouched, dtype=torch.int32, device="cuda")]
     )
-    cache_mapping = (
-        Mapping()
-        if cache_layout == "replica"
-        else Mapping(
-            world_size=cp_size,
-            rank=cp_rank,
-            cp_size=cp_size,
-            cp_config={"cp_type": CpType.ULYSSES if cache_layout == "ulysses" else CpType.HELIX},
-        )
+    metadata.helix_local_slots = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.helix_kv_bounds = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.helix_global_kv_lens = torch.full(
+        (num_seqs + 2,), untouched, dtype=torch.int32, device="cuda"
     )
-    manager = trtllm_backend.KVCacheManagerV2(
-        LlmKvCacheConfig(
-            max_tokens=tokens_per_block * 16, enable_block_reuse=False, host_cache_size=0
-        ),
-        _CacheType.SELFKONLY,
-        num_layers=1,
-        num_kv_heads=1,
-        head_dim=576,
-        tokens_per_block=tokens_per_block,
-        max_seq_len=int(positions.max().item()) + 1,
-        max_batch_size=num_seqs + 3,
-        mapping=cache_mapping,
-        dtype=_DataType.BF16,
-    )
-    try:
-        metadata = trtllm_backend.TrtllmAttentionMetadata(
-            seq_lens=torch.tensor([1] + [tokens_per_seq] * num_seqs, dtype=torch.int32),
-            request_ids=list(range(num_seqs + 1)),
-            max_num_requests=num_seqs + 3,
-            num_contexts=1,
-            prompt_lens=[0] + base.flatten().tolist(),
-            max_num_tokens=num_tokens + 3,
-            kv_cache_manager=manager,
-            mapping=mapping,
-            runtime_features=trtllm_backend.AttentionRuntimeFeatures(
-                has_speculative_draft_tokens=True
-            ),
-        )
-        untouched = 77
-        # The helix buffers are generation-relative; kv_lens_cuda is batch-indexed.
-        metadata.helix_position_offsets.fill_(untouched)
-        metadata.update_helix_param(positions.cpu().tolist(), [False] * num_seqs)
-        metadata.helix_local_slots.fill_(untouched)
-        metadata.helix_kv_bounds.fill_(untouched)
-        metadata.helix_global_kv_lens.fill_(untouched)
-        metadata.kv_lens_cuda.fill_(untouched)
+    metadata.kv_lens_cuda = torch.full((num_seqs + 3,), untouched, dtype=torch.int32, device="cuda")
 
-        metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
-        torch.cuda.synchronize()
+    metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
+    torch.cuda.synchronize()
 
-        # Replicated caches use global positions, independently of the attention mapping.
-        if cache_layout == "helix":
-            owner = torch.div(positions, tokens_per_block, rounding_mode="floor") % cp_size
-            expected_slots = torch.where(
-                owner == cp_rank,
-                metadata.helix_local_len_vec(positions),
-                torch.full_like(positions, -1),
-            )
-            expected_bounds = metadata.helix_local_len_vec(positions + 1)
-        else:
-            owner = torch.full_like(positions, cp_rank)
-            expected_slots = positions
-            expected_bounds = positions + 1
-        gen = slice(0, num_tokens)
-        torch.testing.assert_close(metadata.helix_local_slots[gen], expected_slots)
-        torch.testing.assert_close(metadata.helix_kv_bounds[gen], expected_bounds)
-        torch.testing.assert_close(
-            metadata.kv_lens_cuda[1 : 1 + num_seqs],
-            expected_bounds.view(num_seqs, tokens_per_seq)[:, -1],
-        )
-        torch.testing.assert_close(
-            metadata.helix_global_kv_lens[:num_seqs],
-            positions.view(num_seqs, tokens_per_seq)[:, -1] + 1,
-        )
-        assert (metadata.helix_local_slots[num_tokens:] == untouched).all()
-        assert (metadata.helix_kv_bounds[num_tokens:] == untouched).all()
-        assert metadata.kv_lens_cuda[0].item() == untouched
-        assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
-        assert (metadata.helix_global_kv_lens[num_seqs:] == untouched).all()
-        # Any group of the sequence that this rank does not own writes no slot.
-        assert ((metadata.helix_local_slots[gen] == -1) == (owner != cp_rank)).all()
-    finally:
-        manager.shutdown()
+    # Reference: the per-op formulation (helix_local_len_vec mirrors the cache manager).
+    owner = torch.div(positions, tokens_per_block, rounding_mode="floor") % cp_size
+    expected_slots = torch.where(
+        owner == cp_rank, metadata.helix_local_len_vec(positions), torch.full_like(positions, -1)
+    )
+    expected_bounds = metadata.helix_local_len_vec(positions + 1)
+    gen = slice(0, num_tokens)
+    torch.testing.assert_close(metadata.helix_local_slots[gen], expected_slots)
+    torch.testing.assert_close(metadata.helix_kv_bounds[gen], expected_bounds)
+    torch.testing.assert_close(
+        metadata.kv_lens_cuda[1 : 1 + num_seqs],
+        expected_bounds.view(num_seqs, tokens_per_seq)[:, -1],
+    )
+    torch.testing.assert_close(
+        metadata.helix_global_kv_lens[:num_seqs],
+        positions.view(num_seqs, tokens_per_seq)[:, -1] + 1,
+    )
+    assert (metadata.helix_local_slots[num_tokens:] == untouched).all()
+    assert (metadata.helix_kv_bounds[num_tokens:] == untouched).all()
+    assert metadata.kv_lens_cuda[0].item() == untouched
+    assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
+    assert (metadata.helix_global_kv_lens[num_seqs:] == untouched).all()
+    # Any group of the sequence that this rank does not own writes no slot.
+    assert ((metadata.helix_local_slots[gen] == -1) == (owner != cp_rank)).all()
 
 
 @pytest.mark.parametrize("preemption", [False, True])

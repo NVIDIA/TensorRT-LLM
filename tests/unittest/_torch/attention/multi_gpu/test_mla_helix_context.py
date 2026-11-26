@@ -67,29 +67,6 @@ def test_prims_ts_k3_mla_helix_mtp7() -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
 @skip_pre_blackwell
-@pytest.mark.skipif(
-    getSMVersion() not in PrimsTSFmha.SUPPORTED_MLA_SMS,
-    reason="PrimTS MLA requires SM100, SM103, or SM107",
-)
-@pytest.mark.parametrize("ulysses_cache", [False, True], ids=["single-rank-cache", "ulysses-cache"])
-def test_prims_ts_mla_replicated_verify_group(ulysses_cache: bool) -> None:
-    """Append and read a full-cache verify group spanning a physical page boundary."""
-    run_helix_test(
-        _check_context_heads,
-        _Scenario(
-            cp_size=2,
-            generation_query_width=8,
-            strict_prims_ts=True,
-            ulysses_cache=ulysses_cache,
-        ),
-        "nccl",
-        world_size=2,
-        max_mismatch_ratio=0.0,
-    )
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
-@skip_pre_blackwell
 @pytest.mark.parametrize("fp8_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16-weights", "fp8-weights"])
 @pytest.mark.parametrize(

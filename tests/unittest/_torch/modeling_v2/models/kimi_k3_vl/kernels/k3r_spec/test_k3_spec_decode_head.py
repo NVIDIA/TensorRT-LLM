@@ -34,7 +34,6 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec.k3_spec_decode_h
     k3_spec_decode_head,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
-from tensorrt_llm.mapping import CpType, Mapping
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
@@ -43,7 +42,7 @@ def _helix_metadata(kv_lens, helix_pos, tokens_per_block, cp_size, cp_rank, max_
     def buffer(dtype, fill):
         return torch.full((max_tokens,), fill, dtype=dtype, device="cuda")
 
-    metadata = SimpleNamespace(
+    return SimpleNamespace(
         num_contexts=0,
         num_generations=num_gen,
         kv_lens_cuda=kv_lens,
@@ -53,10 +52,6 @@ def _helix_metadata(kv_lens, helix_pos, tokens_per_block, cp_size, cp_rank, max_
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
         mapping=SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank),
     )
-    metadata.kv_cache_manager.mapping = Mapping(
-        world_size=cp_size, rank=cp_rank, cp_size=cp_size, cp_config={"cp_type": CpType.HELIX}
-    )
-    return metadata
 
 
 @requires_cuda
@@ -188,9 +183,6 @@ def _step_metadata(num_ctx, num_ctx_tokens, num_gen, num_chunked, helix, gen_pos
     md.kv_lens_cuda = md.kv_lens_cuda.to(torch.int32)
     md.kv_cache_manager = SimpleNamespace(tokens_per_block=32)
     md.mapping = SimpleNamespace(cp_size=4, cp_rank=1)
-    md.kv_cache_manager.mapping = Mapping(
-        world_size=4, rank=1, cp_size=4, cp_config={"cp_type": CpType.HELIX}
-    )
     md._helix_spec_tokens_valid = helix
     md.helix_position_offsets = torch.zeros(max_tokens, dtype=torch.int32, device="cuda")
     md.helix_position_offsets[: gen_positions.numel()] = gen_positions
@@ -355,117 +347,3 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — fixture by name
     for name, value in expected.items():
         assert torch.equal(written[name], value), name
     assert torch.equal(args[1], pos_offsets) and torch.equal(args[4], kv_offsets)
-
-
-@pytest.mark.skipif(not _on_archs(k3_spec_decode_head), reason="not an ARCHS architecture")
-@pytest.mark.parametrize("ulysses_cache", [False, True], ids=["single-rank-cache", "ulysses-cache"])
-def test_mla_replicated_cache_fused_spec_head_ownership(ulysses_cache: bool) -> None:
-    """The fused hook writes full-cache slots and bounds without native-produced outputs."""
-    from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, input_preparer
-
-    from tensorrt_llm._torch.attention.backends.interface import (
-        AttentionRuntimeFeatures,
-        KVCacheParams,
-    )
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.spec_decode_head import (
-        SpecDecodeHead,
-    )
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputBuffers
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-    from tensorrt_llm.bindings import DataType
-    from tensorrt_llm.bindings.internal.batch_manager import CacheType
-    from tensorrt_llm.llmapi import KvCacheConfig
-    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
-    from tensorrt_llm.mapping import CpType, Mapping
-
-    width = 8
-    positions = list(range(127, 127 + width))
-    mapping = Mapping(world_size=2, rank=1, cp_size=2, cp_config={"cp_type": CpType.HELIX})
-    cache_mapping = (
-        Mapping(world_size=2, rank=1, cp_size=2, cp_config={"cp_type": CpType.ULYSSES})
-        if ulysses_cache
-        else Mapping()
-    )
-    manager = KVCacheManagerV2(
-        KvCacheConfig(max_tokens=256, enable_block_reuse=False, host_cache_size=0),
-        CacheType.SELFKONLY,
-        num_layers=1,
-        num_kv_heads=1,
-        head_dim=576,
-        tokens_per_block=64,
-        max_seq_len=192,
-        max_batch_size=1,
-        mapping=cache_mapping,
-        dtype=DataType.BF16,
-    )
-    try:
-        requests = manager.add_dummy_requests([0], [positions[-1] + 1])
-        assert requests is not None
-        requests[0].state = LlmRequestState.GENERATION_IN_PROGRESS
-        requests[0].prompt_len = positions[0]
-        requests[0].py_prompt_len = positions[0]
-        metadata = TrtllmAttentionMetadata(
-            seq_lens=torch.tensor([width], dtype=torch.int32),
-            request_ids=[0],
-            max_num_requests=1,
-            num_contexts=0,
-            prompt_lens=[positions[0]],
-            max_num_tokens=width + 4,
-            kv_cache_manager=manager,
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[positions[0]]),
-            mapping=mapping,
-            runtime_features=AttentionRuntimeFeatures(has_speculative_draft_tokens=True),
-        )
-        metadata.update_helix_param(positions, [False], [width])
-        metadata.prepare()
-        metadata.update_spec_dec_param(
-            batch_size=1,
-            is_spec_decoding_enabled=True,
-            is_spec_dec_tree=False,
-            is_spec_dec_dynamic_tree=False,
-            max_draft_len=width - 1,
-            max_total_draft_tokens=width - 1,
-            num_contexts=0,
-        )
-        metadata.num_chunked_ctx_requests = 0
-        metadata.helix_local_slots.fill_(-7)
-        metadata.helix_kv_bounds.fill_(-11)
-        metadata.kv_lens_cuda.fill_(-13)
-        config = decoder_config(
-            max_batch_size=1,
-            max_num_tokens=width + 4,
-            max_seq_len=192,
-            disable_overlap_scheduler=True,
-            spec_config=DSparkDecodingConfig(
-                max_draft_len=width - 1,
-                block_size=width - 1,
-                mask_token_id=0,
-                target_layer_ids=[0],
-            ),
-        )
-        preparer = input_preparer(
-            config,
-            model=torch.nn.Identity(),
-            mapping=mapping,
-            buffers=DecoderInputBuffers.for_config(config, use_beam_search=False),
-        )
-        expected_positions = torch.tensor(positions, dtype=torch.int32, device="cuda")
-        assert SpecDecodeHead()(
-            preparer,
-            {
-                "attn_metadata": metadata,
-                "input_ids": torch.zeros(width, dtype=torch.int32, device="cuda"),
-                "position_ids": expected_positions[None].clone(),
-            },
-            enable_spec_decode=True,
-            runtime_draft_len=width - 1,
-        )
-        torch.testing.assert_close(metadata.helix_local_slots[:width], expected_positions)
-        torch.testing.assert_close(metadata.helix_kv_bounds[:width], expected_positions + 1)
-        torch.testing.assert_close(metadata.kv_lens_cuda[:1], expected_positions[-1:] + 1)
-        assert torch.all(metadata.helix_local_slots[width:] == -7)
-        assert torch.all(metadata.helix_kv_bounds[width:] == -11)
-    finally:
-        manager.shutdown()

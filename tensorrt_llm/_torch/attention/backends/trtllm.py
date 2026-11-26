@@ -58,8 +58,7 @@ from ...pyexecutor.device_copy import CopySite
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
-                      get_model_extra_attrs, helix_local_len_tensor,
-                      helix_page_owner)
+                      get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
@@ -1072,10 +1071,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.helix_context_local_slots = None
         cache_mapping = getattr(self.kv_cache_manager, "mapping", None)
         if (not self.enable_context_mla_with_cached_kv or self.num_contexts == 0
-                or cached_token_lens is None or cache_mapping is None):
-            return
-        cp_world, cp_rank = helix_page_owner(cache_mapping)
-        if cp_world == 1:
+                or cached_token_lens is None or cache_mapping is None
+                or not cache_mapping.has_cp_helix()):
             return
         # Context batches run eagerly. Build once per batch on the host,
         # then share the device view across all MLA layers.
@@ -1087,8 +1084,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         positions += torch.repeat_interleave(
             cached_token_lens[:self.num_contexts] - starts, lengths)
         page = self.kv_cache_manager.tokens_per_block
-        owned = (positions // page) % cp_world == cp_rank
-        slots = helix_local_len_tensor(positions, page, cp_world, cp_rank)
+        owned = (positions //
+                 page) % cache_mapping.cp_size == cache_mapping.cp_rank
+        slots = helix_local_len_tensor(positions, page, cache_mapping.cp_size,
+                                       cache_mapping.cp_rank)
         slots.masked_fill_(~owned, -1)
         self.helix_context_local_slots = maybe_pin_memory(slots.to(
             torch.int32)).to(self.seq_lens_cuda.device, non_blocking=True)
@@ -1150,7 +1149,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # replaces a chain of elementwise ops on the step's critical path.
         # Static shapes and allocation-free, so it is safe under CUDA graph
         # capture.
-        cp_world, cp_rank = helix_page_owner(self.kv_cache_manager.mapping)
         populate_helix_spec_buffers(
             self.helix_position_offsets[:num_gen_tokens],
             self.helix_local_slots[:num_gen_tokens],
@@ -1160,8 +1158,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             num_tokens=num_gen_tokens,
             tokens_per_seq=tokens_per_gen_seq,
             tokens_per_block=self.kv_cache_manager.tokens_per_block,
-            cp_size=cp_world,
-            cp_rank=cp_rank,
+            cp_size=self.mapping.cp_size,
+            cp_rank=self.mapping.cp_rank,
             global_kv_lens=(self.helix_global_kv_lens[:num_gen_seqs]
                             if self.helix_global_kv_lens is not None else None))
 

@@ -1159,7 +1159,7 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
     fmha.run_mla_generation(params)
     if max_seq_len < 128:
         # Auto policy must fall back when the 1CTA profile cannot cover this capacity.
-        wrapper = fmha._mla_decode_wrappers[(batch_size, 1, 1, 1, 32)]
+        wrapper = fmha._mla_decode_wrappers[(batch_size, 1)]
         assert dict(wrapper._plan_state.policy)["kernel"] == "throughput_2cta"
     check_output()
     graph = torch.cuda.CUDAGraph()

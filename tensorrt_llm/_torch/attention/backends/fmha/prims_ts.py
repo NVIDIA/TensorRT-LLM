@@ -32,7 +32,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import helix_page_owner
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -279,9 +278,7 @@ class PrimsTSFmha(PhasedFmha):
         self._contiguous_context_wrappers: dict[tuple[Any, ...], "BatchPrefillTSWrapper"] = {}
         # VC-Attention-QK16 K/V preparation with its token permutation, one per layer.
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
-        self._mla_decode_wrappers: dict[
-            tuple[int, int, int, int, int], "BatchMLADecodePagedTSWrapper"
-        ] = {}
+        self._mla_decode_wrappers: dict[tuple[int, int], "BatchMLADecodePagedTSWrapper"] = {}
         self._mla_decode_plan_capacity: int | None = None
         self._mla_context_wrappers: dict[
             tuple[int, int, int, str, bool], "BatchPrefillTSWrapper"
@@ -1052,9 +1049,9 @@ class PrimsTSFmha(PhasedFmha):
     ) -> "BatchMLADecodePagedTSWrapper":
         if batch_size <= 0:
             raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
-        # A dense MLA instance fixes heads, dtypes, mask and LSE mode for one layer.
-        # Workspace-allocation and page-table-capacity changes clear the cache.
-        key = (batch_size, max_q_len, cp_world, cp_interleave_size, page_size)
+        # Within a prepared KV capacity, dense MLA instances fix the mask,
+        # dtypes, Helix geometry and LSE mode. Only batch and verify width vary.
+        key = (batch_size, max_q_len)
         wrapper = self._mla_decode_wrappers.get(key)
         if wrapper is not None:
             return wrapper
@@ -1090,13 +1087,11 @@ class PrimsTSFmha(PhasedFmha):
         return wrapper
 
     @staticmethod
-    def _mla_cp_geometry(metadata: "TrtllmAttentionMetadata") -> tuple[int, int, int]:
-        """Return (world, rank, interleave), or (1, 0, 1) without Helix pages."""
+    def _mla_cp_geometry(metadata: "TrtllmAttentionMetadata") -> tuple[int, int]:
+        """Return model-invariant CP geometry while keeping page capacity local."""
         if metadata.helix_position_offsets is None:
-            return 1, 0, 1
-        cp_world, cp_rank = helix_page_owner(metadata.kv_cache_manager.mapping)
-        cp_interleave_size = int(metadata.tokens_per_block) if cp_world > 1 else 1
-        return cp_world, cp_rank, cp_interleave_size
+            return 1, 1
+        return int(metadata.mapping.cp_size), int(metadata.tokens_per_block)
 
     def forward(
         self,
@@ -1330,7 +1325,7 @@ class PrimsTSFmha(PhasedFmha):
                     self._mla_decode_plan_profiles.clear()
                 self._mla_decode_plan_capacity = max_seq_len
 
-            cp_world, _, cp_interleave_size = self._mla_cp_geometry(metadata)
+            cp_world, cp_interleave_size = self._mla_cp_geometry(metadata)
             required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
                 batch_size,
                 self.attn.num_heads,
@@ -2000,6 +1995,7 @@ class PrimsTSFmha(PhasedFmha):
         max_seq_len = int(block_tables.shape[-1]) * params.tokens_per_block
         mask_type = self._get_prims_mask_type(params.fwd)
         sequence_lengths = params.sequence_lengths
+        cp_rank = 0
         if meta.helix_position_offsets is not None:
             if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
                 raise RuntimeError(
@@ -2011,8 +2007,9 @@ class PrimsTSFmha(PhasedFmha):
             sequence_lengths = meta.helix_global_kv_lens
             if sequence_lengths is None:
                 raise RuntimeError("Helix MLA requires global KV lengths.")
+            cp_rank = int(meta.mapping.cp_rank)
         seq_lens = self._get_sequence_lengths(sequence_lengths, batch_size)
-        cp_world, cp_rank, cp_interleave_size = self._mla_cp_geometry(meta)
+        cp_world, cp_interleave_size = self._mla_cp_geometry(meta)
         stats = params.fwd.softmax_stats_tensor
         params.fwd.softmax_stats_is_lse = stats is not None
         if stats is not None:
