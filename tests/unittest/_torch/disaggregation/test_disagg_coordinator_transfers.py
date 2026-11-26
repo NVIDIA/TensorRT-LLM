@@ -327,6 +327,53 @@ def test_send_completion_does_not_release_a_claim_the_connector_still_holds() ->
     assert h.effects.terminated == [req]
 
 
+@pytest.mark.parametrize(
+    "observed_during_receive", [False, True], ids=["clean-cancel", "observed-deadline"]
+)
+def test_connector_save_after_a_cancelled_receive_has_no_transfer_deadline(
+    clock, observed_during_receive: bool
+) -> None:
+    """Only the receive's own deadline counts; connector save time after a cancel does not."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    req = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        is_disagg_generation_transmission_in_progress=True,
+        py_kv_transfer_start_time=clock["t"],
+    )
+    h.active.append(req)
+    if observed_during_receive:
+        clock["t"] += 1.5
+        h.coordinator.check_transfer_timeouts()
+        assert req.py_kv_transfer_timed_out
+    # A client abort finishes the request: the executor's cancellation path counts
+    # an observed timeout and clears the flag, but the receive clock stays set.
+    req.py_kv_transfer_timed_out = False
+    req.is_disagg_generation_transmission_in_progress = False
+    req.is_finished = req.is_finished_due_to_cancellation = True
+    h.active.remove(req)
+    h.transfers.start_transfer(req)  # The KV connector accepts an asynchronous save.
+
+    clock["t"] += 10.0
+    for _ in range(2):
+        h.coordinator.check_transfer_timeouts()
+        h.coordinator.reap_context_sends(0)
+
+    assert h.coordinator.transfer_outcomes == ((0, 0, 1) if observed_during_receive else (0, 0, 0))
+    assert not req.py_kv_transfer_timed_out
+    assert h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    # A late outcome vote can still flag the retired receive; the save's claim stays.
+    req.py_kv_transfer_timed_out = True
+    h.coordinator.reap_context_sends(0)
+    assert h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    h.coordinator.release_transfer(req)  # The connector reports the save.
+    assert not h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
+
+
 def test_legacy_timeout_cancels_and_releases_a_queued_send(clock) -> None:
     """Without in-flight cancellation a timed-out send that the transceiver can
     cancel is released from the manager at once."""

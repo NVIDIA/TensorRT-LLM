@@ -453,6 +453,11 @@ class DisaggTransferCoordinator:
         # the peers have asked, the transfer is measured from that moment
         # rather than charged with their queueing delay.
         for req in self._transfers.requests_in_transfer().values():
+            if getattr(req, "is_context_only_request", True) is False:
+                # A KV connector save can keep any request here after its
+                # disaggregated transfer ended; only a context send has a
+                # transfer deadline.
+                continue
             now = time.monotonic()
             if self._context_send_awaits_peer(req, now, timeout_ms):
                 continue
@@ -1168,6 +1173,8 @@ class DisaggTransferCoordinator:
             request = requests_in_transfer[request_id]
             if (
                 not request.py_kv_transfer_timed_out
+                # A KV connector save can hold a request without a context send.
+                or getattr(request, "is_context_only_request", True) is False
                 or request_id in completed_req_ids
                 or request_id in self._timed_out_ctx_cancelled_ids
                 # Only the send's own claim is released here; another owner
