@@ -256,6 +256,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
         # Opt-in persistent scheduler for the separate top-k reduce.
+        # TensorRT-LLM local patch: refuse the persistent reduce with the in-kernel one rather than drop it silently.
+        if impl_desc.get("topk_reduce_persistent") and self.reduce_topk_in_kernel:
+            raise ValueError("topk_reduce_persistent applies to the separate top-k reduce; reduce_topk_in_kernel has none.")
         self.topk_reduce_persistent = bool(
             impl_desc.get("topk_reduce_persistent") and not self.reduce_topk_in_kernel
         )

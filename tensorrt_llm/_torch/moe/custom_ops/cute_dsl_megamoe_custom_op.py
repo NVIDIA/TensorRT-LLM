@@ -1668,6 +1668,9 @@ def _expand_megamoe_ready_tactics(
 ) -> list[Tuple]:
     """Return canonical tactics for every legal token-back READY mode."""
     choices = _token_back_ready_granularity_choices(load_balance=load_balance)
+    if sm_version != 107:
+        # No SM100/SM103 test compares token_tile readiness with expert yet, so tune expert only.
+        choices = ("expert",)
     if sm_version == 107 and choices != ("expert",):
         # At every token bucket include a legal local-TMA/atomic-counter
         # base; the curated SM107 candidates otherwise exclude token_tile.
