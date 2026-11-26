@@ -33,6 +33,7 @@ import torch as _torch
 from cutlass import Int32, Int64
 from cutlass.cute import experimental as cute_ext
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 from ..k3r_comm import k3_lamport_ar
 from ..k3r_comm.k3_latent_ar_norm import _asm, _iv, _unpack
@@ -462,6 +463,7 @@ class SplitKArPushGemmKernel(SplitKDenseGemmKernel):
     ):
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         acc_view = cute.make_tensor(
             cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
             acc_layout,
@@ -485,8 +487,13 @@ class SplitKArPushGemmKernel(SplitKDenseGemmKernel):
         thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        # Order the MMA's completion (observed through the commit) before the loads.
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
+        # Make tcgen05.ld visible before TMEM release and RMEM use, and order the
+        # completed loads before the arrive that hands TMEM back for deallocation.
         cute.arch.fence_view_async_tmem_load()
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
         if cutlass.const_expr(self.split_k > 1):
