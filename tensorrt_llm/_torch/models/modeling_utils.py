@@ -1379,14 +1379,20 @@ def resolve_recurrent_state_spec(
     """Return the recurrent-state declaration of the model class of a config.
 
     The class is the one registered for ``pretrained_config.architectures[0]``.
-    ``None`` means that class declares no recurrent state, or that no class
-    can be found: the config names no architecture, or the name is not
-    registered.
+    A modeling_v2 family without a built-in model class declares the state in
+    its routing module instead. ``None`` means that class declares no
+    recurrent state, or that no declaration can be found: the config names no
+    architecture, or the name is neither registered nor declared.
     """
     architectures = getattr(pretrained_config, 'architectures', None)
     if not architectures:
         return None
     model_cls = get_registered_model_class(architectures[0])
+    if model_cls is None:
+        from tensorrt_llm._torch.modeling_v2 import \
+            modeling_v2_recurrent_state_spec
+        return modeling_v2_recurrent_state_spec(pretrained_config,
+                                                quant_config=quant_config)
     get_spec = getattr(model_cls, 'get_recurrent_state_spec', None)
     if get_spec is None:
         return None

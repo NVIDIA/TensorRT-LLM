@@ -168,7 +168,7 @@ class RecurrentStateSpec:
 def recurrent_state_spec_from_mamba_params(
     params: MambaKVCacheParams,
     *,
-    conv_sections: Literal["x_b_c", "q_k_v"],
+    conv_sections: Literal["x_b_c", "q_k_v"] | tuple[int, ...],
     extra_planes: Mapping[int, tuple[StatePlaneSpec, ...]] | None = None,
 ) -> RecurrentStateSpec:
     """Declare the state of a model whose recurrent layers share one Mamba-style geometry.
@@ -180,14 +180,16 @@ def recurrent_state_spec_from_mamba_params(
     Args:
         params: Geometry, target-layer masks and dtypes of the model.
         conv_sections: Order of the channel sections of the convolution plane: ``"x_b_c"`` is
-            ``(inner, grouped, grouped)`` and ``"q_k_v"`` is ``(grouped, grouped, inner)``.
+            ``(inner, grouped, grouped)`` and ``"q_k_v"`` is ``(grouped, grouped, inner)``. A
+            family with another split passes the section sizes.
         extra_planes: Further planes of individual layers, keyed by layer index.
 
     Returns:
         The declaration of the target-model layers.
 
     Raises:
-        ValueError: If ``conv_sections`` is neither order.
+        ValueError: If ``conv_sections`` is neither order nor a tuple of sizes that add up to
+            the convolution plane.
     """
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaRole
 
@@ -197,6 +199,8 @@ def recurrent_state_spec_from_mamba_params(
         sections = (inner_dim, grouped_dim, grouped_dim)
     elif conv_sections == "q_k_v":
         sections = (grouped_dim, grouped_dim, inner_dim)
+    elif isinstance(conv_sections, tuple):
+        sections = conv_sections
     else:
         raise ValueError(f"Unsupported convolution section order: {conv_sections!r}")
     conv_plane = StatePlaneSpec(

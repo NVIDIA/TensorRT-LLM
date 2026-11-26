@@ -4,9 +4,10 @@
 # Recurrent State Developer Guide
 
 Some model layers carry state from one step to the next instead of a KV cache: Mamba2
-(Nemotron-H), GDN (Qwen3-Next, Qwen3.5, Qwen4Exp) and KDA (Kimi K3, GLM5Next). This guide
-describes the contract between shared runtime code and such a model family: what the model class
-declares, how the declaration is found, and what the family provides once a cache manager exists.
+(Nemotron-H), GDN (Qwen3-Next, Qwen3.5, Qwen4Exp), KDA (Kimi K3, GLM5Next) and GDP (Nemotron
+Shortcut). This guide describes the contract between shared runtime code and such a model family:
+what the model class declares, how the declaration is found, and what the family provides once a
+cache manager exists.
 
 Code: `tensorrt_llm/_torch/recurrent_state_spec.py` (the declaration),
 `tensorrt_llm/_torch/models/modeling_utils.py` (`get_recurrent_state_spec`,
@@ -55,7 +56,7 @@ The declared planes, with `inner = head_dim * num_heads` and `grouped = n_groups
 | Plane | Shape of one slot | Split across ranks |
 |---|---|---|
 | SSM (`MambaRole.SSM_STATE`) | `[num_heads, head_dim, state_size]` | Axis 0 |
-| Convolution (`MambaRole.CONV_STATE`) | `[inner + 2 * grouped, conv_kernel - 1]` | Axis 0, in three sections: `(inner, grouped, grouped)` for Mamba2, `(grouped, grouped, inner)` for GDN and KDA |
+| Convolution (`MambaRole.CONV_STATE`) | `[inner + 2 * grouped, conv_kernel - 1]` | Axis 0, in three sections: `(inner, grouped, grouped)` for Mamba2, `(grouped, grouped, inner)` for GDN and KDA. Nemotron Shortcut declares the sections of `gdp_conv_section_widths` |
 | Qwen4Exp PLE (`PLE_CONV_STATE`, `PLE_NGRAM_CONTEXT`), on the layer that runs PLE | `[hc_count * hidden_size, (ple_conv_kernel_size - 1) * ngram_size]` and `[ngram_size - 1]` | None |
 
 Rules:
@@ -106,6 +107,11 @@ well.
 after the model is built. It does not ask the class of the built model: a `modeling_v2` target
 can be a class of its own without the hook, which then inherits the `None` of
 `DecoderModelForCausalLM`, while the architecture name still leads to the class that declares.
+
+A `modeling_v2` family without a built-in model class has no class registered for the name. Its
+`routing.py` declares the state in a function decorated with `@recurrent_state_specs(...)`, which
+takes the same arguments as the classmethod, and the entry asks that function when no class is
+registered (Nemotron Shortcut).
 
 The entry returns `None` for a recurrent model in three situations. A site that can meet one of
 them keeps its family predicate:
@@ -165,8 +171,9 @@ The manager itself answers the rest:
 
 ## Adding a recurrent family
 
-1. Implement `get_recurrent_state_spec` on the model class. Declare one entry per target layer and
-   only base state; give each plane its whole shape and how ranks split it.
+1. Implement `get_recurrent_state_spec` on the model class, or declare the state in `routing.py`
+   for a `modeling_v2` family without a built-in model class. Declare one entry per target layer
+   and only base state; give each plane its whole shape and how ranks split it.
 2. In every VLM wrapper around the model, forward the classmethod with the config the wrapper
    builds the language model from, and accept that config as well as the composite one.
 3. Add the family to what shared code reads, in `pyexecutor/config_utils.py`: its predicate to

@@ -209,6 +209,10 @@ Check in `route` every requirement the target has, not only in the target's
 constructor. A configuration that `route` declines falls back to Modeling V1
 under `auto`; one that the constructor rejects with an assertion fails.
 
+A family without a Modeling V1 model can use `@recurrent_state_specs(...)`
+in its routing module to declare its recurrent state.
+[Nemotron Shortcut routing](models/nemotron_shortcut/routing.py) is an example.
+
 `route` reads no MoE tactic (`moe_config.tactic`, `speculative_config.moe_tactic`),
 so a target with MoE layers declares the MoE implementation ids it runs.
 `moe_impls_honored` lists the ids a `moe_config.tactic` may resolve to for the

@@ -75,6 +75,53 @@ def registered_routes() -> Dict[str, Callable[..., type]]:
     return _ROUTES
 
 
+def _declares(registry: Dict[str, Callable], what: str, architectures: Tuple[str, ...]):
+    """Fill ``registry`` with the decorated function for each of ``architectures``."""
+
+    def register(declared):
+        for arch in architectures:
+            assert arch not in registry, (
+                f"{arch} {what} declared by both "
+                f"{registry[arch].__module__} and {declared.__module__}"
+            )
+            registry[arch] = declared
+        return declared
+
+    return register
+
+
+# architectures[0] -> the function that declares its recurrent state, filled by
+# ``@recurrent_state_specs``.
+_RECURRENT_STATE_SPECS: Dict[str, Callable[..., object]] = {}
+
+
+def recurrent_state_specs(*architectures: str):
+    """Declare that the decorated function declares the recurrent state for these ``architectures[0]`` values.
+
+    A family whose checkpoint has no built-in model declares one in its
+    ``routing.py``. It takes the checkpoint config and ``quant_config``, like
+    ``get_recurrent_state_spec`` of a built-in model class, and returns the
+    ``RecurrentStateSpec``.
+    """
+    return _declares(_RECURRENT_STATE_SPECS, "recurrent state", architectures)
+
+
+def modeling_v2_recurrent_state_spec(pretrained_config, *, quant_config=None):
+    """The recurrent state a family declares for a checkpoint without a built-in model.
+
+    Returns ``None`` when no family declares one for ``architectures[0]``.
+    """
+    architectures = getattr(pretrained_config, "architectures", None)
+    if not architectures:
+        return None
+    from . import models  # noqa: F401
+
+    declare = _RECURRENT_STATE_SPECS.get(architectures[0])
+    if declare is None:
+        return None
+    return declare(pretrained_config, quant_config=quant_config)
+
+
 #: Turns the step contract check on. Off by default, so a served engine runs
 #: the forward and nothing else: the checks describe facts fixed at engine
 #: construction, and a check that can only ever hold is a check whose failure
