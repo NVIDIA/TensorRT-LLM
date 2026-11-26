@@ -1393,6 +1393,10 @@ def _construct_megamoe_kernel(
         "token_back_ready_granularity": str(common.get("token_back_ready_granularity", "expert")),
         "reduce_topk_in_kernel": bool(common["in_kernel_fc2_reduce"]),
     }
+    if common.get("shared_intermediate_size") is not None:
+        # The fused shared expert covers the live rows of the forward's live-row word only (the op's
+        # shared_live_row_word; every row when the caller passes none), as the staged routes do.
+        impl_values["shared_live_rows"] = True
     if sm_version == 107:
         impl_values.update(
             mma_instruction_mnk=(
@@ -1478,6 +1482,21 @@ def _construct_megamoe_kernel(
             ) from exc
     kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
     return construct(kernel_cls)
+
+
+def _shared_live_row_word_tensor(
+    word: Optional[torch.Tensor], device: torch.device
+) -> torch.Tensor:
+    """The live-row word the fused shared expert reads: the caller's, else a word that keeps every row."""
+    if word is None:
+        from tensorrt_llm._torch.moe import live_rows
+
+        return live_rows.all_rows_word(device)
+    if word.dtype != torch.int32 or word.numel() != 1 or word.device != device:
+        raise ValueError(
+            f"shared_live_row_word must be one int32 on {device}, got {word.numel()} {word.dtype} on {word.device}."
+        )
+    return word
 
 
 def _megamoe_tmp_buffer_span(kernel: Any) -> Tuple[int, int]:
@@ -2993,6 +3012,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Set by the op right after construction; never a codegen input.
             self._helper_ready_flags = None
             self._helper_ready_generation = 0
+            # Per-launch live-row word of the fused shared expert (int32[1] on the device), set by the op like the
+            # READY bundle; never a codegen input.
+            self._shared_live_row_word = None
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
@@ -3679,6 +3701,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     shared_activation_sf=_to_cute_w(shared_activation_sf),
                     # A runtime scalar, never a compile-time constant.
                     shared_num_tokens=cutlass.Int32(int(shared_num_tokens)),
+                    # A fixed device address: a captured graph reads the word each replay writes.
+                    shared_live_word=cutlass.Int64(
+                        _shared_live_row_word_tensor(
+                            self._shared_live_row_word, local_workspace.device
+                        ).data_ptr()
+                    ),
                 )
             # The gen-phase entry has no tmp_buffer operand; the others require it.
             if hasattr(kernel, "get_tmp_buffer_bytes"):
@@ -3902,6 +3930,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
         ugpu_weight_layout: str = "none",
+        # The forward's live-row word (int32[1], moe/live_rows.py) bounding the fused shared expert's rows; None keeps
+        # every row of shared_num_tokens.
+        shared_live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3982,6 +4013,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # values across calls, even when the runner itself is cached.
         runner._helper_ready_flags = hot_expert_weight_ready_flags
         runner._helper_ready_generation = int(hot_expert_weight_ready_generation)
+        runner._shared_live_row_word = shared_live_row_word
         inputs = [
             activation,
             activation_sf,
@@ -4026,6 +4058,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # Release the cached runner reference to this generation's terminal tensor.
                 # The next call supplies fresh READY inputs.
                 runner._helper_ready_flags = None
+                runner._shared_live_row_word = None
             return
         tuner = AutoTuner.get()
         # Opt-IN: in tuning mode the MERGE lockstep sweep runs (made safe by
@@ -4086,6 +4119,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
         finally:
             runner._helper_ready_flags = None
+            runner._shared_live_row_word = None
 
     # Eager callers may call ``run_cute_dsl_megamoe_nvfp4_blackwell`` directly
     # and skip the custom-op dispatch; traced code must use the registered op.
@@ -4147,5 +4181,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
         ugpu_weight_layout: str = "none",
+        shared_live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         return None

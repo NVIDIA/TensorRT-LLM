@@ -2363,6 +2363,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 shared_num_tokens=num_tokens,
                 shared_intermediate_size=self._shared_expert["intermediate_size"],
                 shared_gate_up_clamp=self._shared_expert["gate_up_clamp"],
+                # The shared expert drops the rows the staging dropped from the routes: only the live rows of
+                # the forward's word get its output, so the dropped rows of the result stay zero.
+                shared_live_row_word=(
+                    live_rows.current_word(combine_output.device)
+                    if launch_max_T in self._padding_drop_buckets
+                    else None
+                ),
             )
             if num_tokens > 0:
                 # The bucket's combine buffer is overwritten by the next layer, and no add

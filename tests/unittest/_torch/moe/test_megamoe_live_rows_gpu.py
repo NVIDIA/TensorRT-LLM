@@ -3,10 +3,9 @@
 """MegaMoE CuteDSL on four ranks drops the padding rows of a forward end to end.
 
 One layer runs twice over the same inputs: every row live, then each rank's padding requests
-dropped. Live rows must match bit for bit, and the per-expert counts the router publishes must
-equal the histogram of the live rows' routes. The drop covers the routed experts: without a fused
-shared expert the dropped rows are zero; a shared expert fused into the kernel still computes every
-row, so there they hold its output. Generic routing stages through megamoe_stage_inputs;
+dropped. Live rows must match bit for bit, the dropped rows must be zero (a shared expert fused into
+the kernel included: it reads the same word), and the per-expert counts the router publishes must
+equal the histogram of the live rows' routes. Generic routing stages through megamoe_stage_inputs;
 DeepSeek-V4 routing through its fused route+quant.
 """
 
@@ -307,8 +306,8 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing
         assert torch.equal(counts_all, histogram_all)
         assert torch.equal(counts_drop, histogram_live)
         assert torch.equal(out_drop[:live], out_all[:live])
-        if not shared:  # the fused shared expert still writes its output into the dropped rows
-            assert not out_drop[live:].any()
+        # The fused shared expert reads the same word: the dropped rows get no output of any expert.
+        assert not out_drop[live:].any()
         if dsv4:
             assert fused_words and all(w is not None for w in fused_words), fused_words
         else:

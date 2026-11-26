@@ -25,6 +25,7 @@ from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.fc2_ready_geometry import derive_fc2_ready_geometry
 from .....helpers.iket_compat import iket
+from .....helpers.live_rows import live_rows_at
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.route_reset import ClearInvalidRoutes
 from .....helpers.smem_workspace import SmemWorkspace
@@ -157,6 +158,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # > 0: the router maps this many experts' staged ids to slots and counts them (adaptive load balancer;
             # communication/nvlink_domain/adaptive_route.py). 0 (the default) builds the kernel without it.
             "adaptive_route_experts": OptionalRequirement(int),
+            # True with a fused shared expert: its tiles cover only the live rows of the forward's live-row word
+            # (helpers/live_rows.py), the shared_live_word operand, as the staged routes do; False (the default)
+            # covers all shared_num_tokens rows.
+            "shared_live_rows": OptionalRequirement(bool),
             "total_helper_slots": OptionalRequirement(int),
             # Master switch of the internode code paths (False: main's NVLink-domain kernel), the
             # component selection it implies ("nvlink" / "internode_gin") and the internode
@@ -212,6 +217,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.shared_intermediate_size = problem_desc.get("shared_intermediate_size")
         self.shared_gate_up_clamp = problem_desc.get("shared_gate_up_clamp")
         self.fuse_shared = self.shared_intermediate_size is not None
+        self.shared_live_rows = bool(impl_desc.get("shared_live_rows", False))
+        if self.shared_live_rows and not self.fuse_shared:
+            raise ValueError("shared_live_rows bounds the fused shared expert: it needs shared_intermediate_size.")
+        if self.shared_live_rows:
+            # The word's address travels with the shared expert's other kernel arguments.
+            self._shared_param_keys = type(self)._shared_param_keys + ("live_word",)
         # Set by _init_shared_expert once the scheduler is known.
         self.shared_fc2_claims = False
         # One-round push dispatch (``_OneRoundRouter``) for buckets of at most 256 tokens per rank at EP16 and
@@ -1203,7 +1214,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     def _shared_name_suffix(self) -> str:
         if not self.fuse_shared:
             return ""
-        return f"_sharedfp8i{self.shared_intermediate_size}clamp{self.shared_gate_up_clamp}"
+        return (
+            f"_sharedfp8i{self.shared_intermediate_size}clamp{self.shared_gate_up_clamp}"
+            + ("_live_v1" if self.shared_live_rows else "")
+        )
 
     default_dedup_poll_max_sleep_ns: ClassVar[int] = 1000
 
@@ -1346,6 +1360,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 ),
                 shared_num_tokens=Int32(0),
             )
+            if self.shared_live_rows:
+                fake_arguments.update(shared_live_word=Int64(0))
         if self.fc1_activation_per_token_scale:
             # Local (tokens,) fp32 read by the router on the source rank; only in the ABI when enabled.
             fake_arguments.update(
@@ -1447,8 +1463,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         adaptive_route_live_word: Optional[Int64] = None,
         adaptive_route_stats_tokens: Optional[Int32] = None,
         adaptive_route_stats_first: Optional[Int32] = None,
+        # Iff shared_live_rows: the device address of the forward's live-row word (int32). The shared expert's tiles
+        # and its term in the top-k reduce cover the live rows of shared_num_tokens only.
+        shared_live_word: Optional[Int64] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
+        if cutlass.const_expr((shared_live_word is not None) != self.shared_live_rows):
+            raise ValueError("shared_live_word is passed iff the kernel is built with shared_live_rows.")
         if cutlass.const_expr(self.combine_dedup):
             # TopkReduceDedup stores 256-bit rows: the caller declares 32 B (as on Rubin).
             check_reduce_operand_alignment(output_activation=output_activation)
@@ -1802,6 +1823,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 self.epilogue.prepare_shared_tma_store_params(shared_tensors["fc2_b"])
             )
             shared_params["num_tokens"] = Int32(shared_num_tokens)
+            if cutlass.const_expr(self.shared_live_rows):
+                shared_params["live_word"] = Int64(shared_live_word)
             shared_params = tuple(shared_params[key] for key in self._shared_param_keys)
 
         grid = self.scheduler.get_grid_shape(max_active_clusters=self.launch_cluster_count)
@@ -1882,6 +1905,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 )
                 shared_term = self._device_workspace.tensor(self.shared_output_region)
                 self._device_workspace.remove_device_members()
+            shared_bound_args = {}
+            if cutlass.const_expr(self.shared_live_rows):
+                shared_bound_args = dict(shared_live_word=Int64(shared_live_word), shared_rows=Int32(shared_num_tokens))
             if cutlass.const_expr(self.topk_reduce_persistent):
                 # Fixed grid; the token count is read from device memory
                 # (num_valid_tokens), so one captured launch covers every T.
@@ -1895,6 +1921,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     num_tokens_dev=num_valid_tokens,
                     topk_indices=topk_indices,
                     shared_term=shared_term,
+                    **shared_bound_args,
                 )
             else:
                 self._topk_reduce(
@@ -1908,6 +1935,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     topk_indices=topk_indices,
                     local_rank=local_rank,
                     shared_term=shared_term,
+                    **shared_bound_args,
                 )
 
     @cute.jit
@@ -2028,6 +2056,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         shared = None
         if cutlass.const_expr(self.fuse_shared):
             shared = dict(zip(self._shared_param_keys, shared_params))
+            if cutlass.const_expr(self.shared_live_rows):
+                # Every use of the shared row count (gate/up and down tiles, the claimed down-projection tiles)
+                # reads this one bound, so no tile covers a row past it.
+                shared["num_tokens"] = live_rows_at(shared["live_word"], shared["num_tokens"])
             shared_fc1_done_counter = self._device_workspace.tensor(
                 SharedExpertTileSchedule.done_counter_region
             )
