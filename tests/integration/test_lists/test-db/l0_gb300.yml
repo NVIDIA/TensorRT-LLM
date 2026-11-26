@@ -176,6 +176,9 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/comm
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_long_context TIMEOUT (60)
+  # Kimi K3 truncated-model (first 4 layers: KDA + first MLA + MoE + SA spec-dec) e2e logits
+  # parity on 4xGB300; fails if <LLM_MODELS_ROOT>/Kimi-K3 is not staged.
+  - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (40)
 
 # K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
 # NVLink domain.
