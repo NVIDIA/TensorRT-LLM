@@ -144,6 +144,8 @@ class _KVCacheManagerConfigFieldSpec:
     regions: object = None
     host_mem_backing: object = None
     cold_typical_step: object = None
+    host_copy_threads: int = 1
+    copy_stream_busy_skip: int = 0
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__

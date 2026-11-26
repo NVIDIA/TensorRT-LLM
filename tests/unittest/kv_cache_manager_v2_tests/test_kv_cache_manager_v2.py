@@ -12395,6 +12395,56 @@ class TestNoBatchingDiskCopyPathOptions(TestNoBatchingDiskOptions):
         self.manager.clear_reusable_blocks()
 
 
+@pytest.mark.cpu_only
+class TestKVCacheManagerConfigReplace(unittest.TestCase):
+    """dataclasses.replace() on the KVCacheManagerConfig binding keeps every constructor field.
+
+    The binding is not a dataclass: __init__.py grafts a field spec onto it, and replace() rebuilds the config from
+    exactly those fields. The cache managers call replace() on the config they build (_lay_out_regions, the host
+    sparse pool quota), so a constructor keyword missing from the spec is silently reset to its default there.
+    """
+
+    _OPTIONS = {
+        "host_copy_threads": 4,
+        "copy_stream_busy_skip": 8,
+    }
+
+    @staticmethod
+    def _config(**options) -> KVCacheManagerConfig:
+        return create_config(32, 64 << 20, 64 << 20, 1 << 30, 2, None, 0, manager_options=options)
+
+    def test_replace_keeps_the_copy_path_options(self) -> None:
+        cfg = self._config(**self._OPTIONS)
+        for rebuilt in (replace(cfg), replace(cfg, regions=[])):
+            self.assertEqual({k: getattr(rebuilt, k) for k in self._OPTIONS}, self._OPTIONS)
+
+    def test_every_writable_constructor_field_is_in_the_field_spec(self) -> None:
+        import inspect
+
+        cfg = self._config()
+        spec = set(KVCacheManagerConfig.__dataclass_fields__)
+        base = {name: getattr(cfg, name) for name in spec}
+        checked, missing = set(), []
+        for name in dir(KVCacheManagerConfig):
+            if name.startswith("_"):
+                continue
+            attr = inspect.getattr_static(KVCacheManagerConfig, name)
+            if not hasattr(type(attr), "__set__") or (
+                isinstance(attr, property) and attr.fset is None
+            ):
+                continue  # a method or a read-only property: not a constructor field
+            checked.add(name)
+            if name in spec:
+                continue
+            try:
+                KVCacheManagerConfig(**base, **{name: getattr(cfg, name)})
+            except TypeError:
+                continue  # writable, but not a constructor keyword: replace() never passes it
+            missing.append(name)
+        self.assertIn("tokens_per_block", checked)
+        self.assertEqual(missing, [], "constructor fields that dataclasses.replace() would reset")
+
+
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS
 
