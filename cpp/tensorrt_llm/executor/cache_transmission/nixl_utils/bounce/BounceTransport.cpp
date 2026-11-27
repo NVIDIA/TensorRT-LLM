@@ -1210,10 +1210,22 @@ bool BounceSender::progressPostedChunks()
 {
     std::lock_guard<std::mutex> lk(mReqMu);
     bool didWork = false;
-    std::vector<std::pair<std::uint64_t, BounceFailReason>> toFail;
+    std::vector<std::uint64_t> toFail;
+    auto failPending = [&](BounceFailReason reason)
+    {
+        for (auto const rid : toFail)
+        {
+            auto it = mRequests.find(rid);
+            if (it != mRequests.end())
+            {
+                failRequest(rid, it->second, reason);
+                didWork = true;
+            }
+        }
+        toFail.clear();
+    };
     for (auto& [rid, req] : mRequests)
     {
-        bool gatherFailed = false;
         for (auto& p : req.posted)
         {
             if (p.state == PostState::Writing || p.state == PostState::Sent)
@@ -1223,7 +1235,7 @@ bool BounceSender::progressPostedChunks()
             if (p.state == PostState::GatherFailed)
             {
                 // Gather launch / event-record failed in pumpRequest -> never trust the event; fail.
-                gatherFailed = true;
+                toFail.push_back(rid);
                 break;
             }
             if (p.state == PostState::Gathering)
@@ -1238,7 +1250,7 @@ bool BounceSender::progressPostedChunks()
                 {
                     // Gather kernel / stream error -> fail the request deterministically (never hang).
                     (void) cudaGetLastError();
-                    gatherFailed = true;
+                    toFail.push_back(rid);
                     break;
                 }
                 // Gather done — return the exec context immediately for another chunk to reuse (the
@@ -1272,12 +1284,12 @@ bool BounceSender::progressPostedChunks()
                 req.lastProgress = std::chrono::steady_clock::now();
             }
         }
-        if (gatherFailed)
-        {
-            toFail.emplace_back(rid, BounceFailReason::kGatherFailed);
-            continue;
-        }
-        // Drive this request's writes together, then notify its receiver before posting another request.
+    }
+    failPending(BounceFailReason::kGatherFailed);
+
+    // Give each active request a chance to post before processing completed writes.
+    for (auto& [rid, req] : mRequests)
+    {
         for (auto& p : req.posted)
         {
             if (p.state != PostState::Writing)
@@ -1327,20 +1339,12 @@ bool BounceSender::progressPostedChunks()
             }
             else if (st == TransferState::kFAILURE)
             {
-                toFail.emplace_back(rid, BounceFailReason::kWriteFailed);
+                toFail.push_back(rid);
                 break;
             }
         }
     }
-    for (auto const& [rid, reason] : toFail)
-    {
-        auto it = mRequests.find(rid);
-        if (it != mRequests.end())
-        {
-            failRequest(rid, it->second, reason);
-            didWork = true;
-        }
-    }
+    failPending(BounceFailReason::kWriteFailed);
     return didWork;
 }
 
