@@ -126,7 +126,7 @@ def test_fast2_is_bitwise_the_two_token_sort(rows, local):
 @pytest.mark.parametrize("rows, local, tile", [(528, 128, 32), (640, 128, 32), (832, 128, 64)])
 @pytest.mark.parametrize("ties", [False, True])
 def test_preload_and_early_are_bitwise_the_plain_launch(rows, local, tile, ties):
-    """dep4's F1 shapes (33..52 requests a rank of 16 gathered rows): `fast2=2` and `early`, alone
+    """dep4's measured shapes (33..52 requests a rank of 16 rows): `fast2=2` and `early`, alone
     and together, write the codes, scales, experts, weights and tables of the two-token sort with
     the release at the end, bit for bit; with `ties` every row's top-10 sits in one lane's 16
     experts (the fast path's fallback to the full sort)."""

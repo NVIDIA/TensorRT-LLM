@@ -2767,13 +2767,14 @@ def _gdn_lean_step(core, num_gens: int, rows: int, p: int) -> None:
 #: a CTA whole v heads (tpc 8 or 24: every count of `DP_GDN_REPLAY_MAP_ENV`'s table, and 16) and
 #: an even number of rows a request. Values: unset or `1` -- `_GDN_REPLAY_NORM_REQUESTS`;
 #: `<lo>:<hi>` -- that request range, taken as written (inside it; with `DP_LOWROWS_ENV` = r its
-#: floor reaches r, so 873205's `2:64` reads as it did there); `0` -- the norm launch.
+#: floor reaches r, so `2:64` starts at 2 requests under `DP_LOWROWS_ENV=2`); `0` -- the norm
+#: launch.
 #: `DP_LOWROWS_ENV` lowers the floor of the default range (counts whose mapping splits a v head
 #: still keep the launch). With the in-proj
 #: release and its conv epilogue, part of the -0.47..-0.49 ms dep4 trunk-loop micro; dep8 left
 #: 8-CTX share 68.3 -> 70.6% with the bf16 output projections. Read once, at each bind.
 DP_GDN_REPLAY_NORM_BF16_ENV = "TRTLLM_QWEN4_EXP_DP_GDN_REPLAY_NORM_BF16"
-#: Requests a rank the switch above serves (the front's `5:64`).
+#: Requests a rank the switch above serves (`5:64`, the range measured at dep4 / dep8).
 _GDN_REPLAY_NORM_REQUESTS = (5, 64)  # capacity: fixed: dispatch thresholds
 
 
@@ -3842,8 +3843,8 @@ def _dp_rs_inject_build(core, device) -> "_DpRsInject | None":
 
     def fin_at(r: int) -> bool:
         # The route front serves the gathered rows and the finalize grid is one resident wave
-        # (`fin_resident`: dep8 up to 152 rows a rank, dep4 up to 152; F1's 160..208 keep the
-        # runner's finalize, as F1 ran).
+        # (`fin_resident`: dep8 up to 152 rows a rank, dep4 up to 152; the measured
+        # dep4 caps 160..208 keep the runner's finalize, as they ran).
         return (
             fin
             and trip.world * r in st.tactics
@@ -3991,7 +3992,7 @@ DP_MOE_PACK_ROUTER_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_PACK_ROUTER"
 DP_MOE_OWNK_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_OWNK"
 #: Gathered rows the default serves: the routing front's two-tokens-a-warp launch up to the
 #: largest measured cap (17..28 requests a rank at dep8 MTP-3; caps 18 / 20 / 24 by A/B, 26 / 28
-#: in the F2 servers that ran it). At a token a warp it measured within noise; caps 29..32
+#: in the dep8 deployments that ran it). At a token a warp it measured within noise; caps 29..32
 #: (928..1024 rows) were never run and take `all`.
 _DP_MOE_OWNK_ROWS = (513, 896)  # capacity: fixed: dispatch thresholds
 #: The most gathered rows a routing-only front takes (`moe_route_front__decode.MAX_ROWS`).

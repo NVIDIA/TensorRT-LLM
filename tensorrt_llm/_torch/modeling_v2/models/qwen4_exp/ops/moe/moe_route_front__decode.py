@@ -226,7 +226,7 @@ class MoeRouteFront(OpWrapper):
             832,
             384,
             64,
-            "dep4 fast2=2: 52 a rank (832 rows, F1's cap), window 3, early",
+            "dep4 fast2=2: 52 a rank (832 rows, the measured dep4 cap), window 3, early",
             128,
             2,
             True,

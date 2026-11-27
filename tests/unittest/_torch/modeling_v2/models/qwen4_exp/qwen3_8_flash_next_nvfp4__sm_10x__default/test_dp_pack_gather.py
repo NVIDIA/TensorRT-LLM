@@ -470,7 +470,7 @@ def test_check_holds_the_codes_to_what_the_transport_delivers(monkeypatch, ownk)
     transport, which delivers a 16-bit half equal to its marker 0x8000 as 0x0000. In both modes the
     check compares the gathered codes to `dep_lamport_transported_codes` of the reference, so a
     row count whose check data holds such a half is not declined (the logits gather declined 15
-    of 27 dep8 row counts on raw codes before the full3 gate fix)."""
+    of 27 dep8 row counts on raw codes before this fix)."""
     raw = torch.tensor([[0x00, 0x80, 0x12, 0x34]], dtype=torch.uint8)
     delivered = torch.tensor([[0x00, 0x00, 0x12, 0x34]], dtype=torch.uint8)
     scales = torch.zeros([1, 2], dtype=torch.uint8)

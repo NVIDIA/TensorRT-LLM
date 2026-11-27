@@ -371,7 +371,7 @@ def test_block_runs_the_conv_gemm_behind_a_releasing_site(monkeypatch, inconv):
         ("1", None, (5, 64)),
         ("0", None, None),
         ("2:64", None, "raise"),
-        # 873205's spelling: with `DP_LOWROWS=2` a named range may start at 2 requests.
+        # A measured run's spelling: with `DP_LOWROWS=2` a named range may start at 2 requests.
         ("2:64", "2", (2, 64)),
         ("1:64", "2", "raise"),
         ("5:32", None, (5, 32)),

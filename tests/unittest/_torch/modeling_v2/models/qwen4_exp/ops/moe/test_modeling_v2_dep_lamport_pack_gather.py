@@ -143,7 +143,7 @@ def test_a_row_is_1232_lanes():
 @pytest.mark.cpu_only
 def test_transported_codes_zero_only_the_marker_halves():
     """Host only: a code half 0x8000 (little-endian bytes 0x00, 0x80) becomes 0x0000; a -0 nibble
-    anywhere else, and every other byte, is unchanged (the full3 dep8 build check declined 15 of 27
+    anywhere else, and every other byte, is unchanged (a dep8 build check declined 15 of 27
     row counts on raw `fp4_quantize` codes, each with one to three such halves)."""
     codes = torch.tensor(
         [

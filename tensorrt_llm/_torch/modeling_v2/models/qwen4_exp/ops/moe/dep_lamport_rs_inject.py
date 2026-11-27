@@ -916,7 +916,7 @@ class DepLamportRsInject(OpWrapper):
         for world, rows, step, fin, why in (
             (4, 12, False, False, "dep4 MTP-3 verify, 3 requests a rank, device-counter slots"),
             (4, 12, True, False, "dep4 MTP-3 verify, 3 requests a rank, host-index slots"),
-            (4, 208, True, False, "dep4 52 requests a rank (F1's widest), 2 streams a CTA"),
+            (4, 208, True, False, "dep4 52 requests a rank (widest measured cap), 2 streams a CTA"),
             (8, 12, True, False, "dep8 3 requests a rank, 4 CTAs a row"),
             (8, 72, True, False, "dep8 18 requests a rank: 4 CTAs a row only under dep8's layouts"),
             (8, 112, True, False, "dep8 28 requests a rank, 2 streams a CTA"),
