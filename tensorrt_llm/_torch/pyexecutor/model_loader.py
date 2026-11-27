@@ -1623,6 +1623,8 @@ class ModelLoader:
             # prior to zero-copy mapping, then refreshes derived state after
             # real GMS tensors are bound.
             if load_format != LoadFormat.GMS:
+                # Release unused checkpoint buffers before post-load tensors
+                # can pin their cached segments.
                 torch.cuda.empty_cache()
                 mx_loading.run_post_load_walks_and_publish(
                     checkpoint_loader,
@@ -1656,8 +1658,8 @@ class ModelLoader:
             # allocator otherwise holds onto). Returning them to the driver
             # gives downstream stages (KV cache estimation, attention workspace
             # alloc, autotuner warmup symmetric-fabric setup) full visibility
-            # of free HBM. Single one-shot call after all modules are
-            # finalized; per-layer empty_cache here is unsafe because it can
+            # of free HBM. Release once after all modules are finalized;
+            # per-layer empty_cache here is unsafe because it can
             # perturb NVLink barrier synchronization in multi-rank DG init.
             torch.cuda.empty_cache()
 

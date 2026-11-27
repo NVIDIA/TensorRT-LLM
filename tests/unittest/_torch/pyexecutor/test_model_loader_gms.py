@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for ``LoadFormat.GMS`` loading, driven through ``ModelLoader.load``."""
+"""Unit tests for disk and GMS loading, driven through ``ModelLoader.load``."""
 
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -16,6 +16,8 @@ from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.models.checkpoints import memory_init, model_hooks
 from tensorrt_llm._torch.models.checkpoints.gms import model_loading as gms_loading
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loading
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
@@ -102,9 +104,9 @@ def _pool_scope(events):
     events.append("pool_exit")
 
 
-def _make_loader(monkeypatch, *, events, spec_config=None):
+def _make_loader(monkeypatch, *, events, spec_config=None, load_format=LoadFormat.GMS):
     llm_args = SimpleNamespace(
-        load_format=LoadFormat.GMS,
+        load_format=load_format,
         lm_head_output_dtype="auto",
         gms_config=SimpleNamespace(socket_path="/tmp/gms.sock", mode="auto", tag="weights"),
     )
@@ -249,6 +251,77 @@ def _tiny_profile_registry() -> PostTransformProfileRegistry:
             ),
         )
     )
+
+
+@pytest.mark.parametrize(
+    "load_format, is_rw, expected_releases",
+    [
+        pytest.param(LoadFormat.AUTO, None, 2, id="auto"),
+        pytest.param(LoadFormat.GMS, True, 2, id="gms-rw"),
+        pytest.param(LoadFormat.GMS, False, 1, id="gms-ro"),
+    ],
+)
+def test_load_releases_checkpoint_cache_without_changing_gms(
+    monkeypatch, load_format, is_rw, expected_releases
+):
+    events = []
+    loader = _make_loader(monkeypatch, events=events, load_format=load_format)
+    empty_cache = MagicMock()
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    releases_at_post_load = []
+    releases_at_pool_commit = []
+    weights = {"weight": object()}
+
+    def populate_model(_model, loaded_weights, _mapper):
+        assert loaded_weights["weight"] is weights["weight"]
+        empty_cache.assert_not_called()
+        events.append("weights_populated")
+
+    def record_cache_state(_model):
+        if load_format == LoadFormat.AUTO:
+            assert "weight_session_closed" in events
+        releases_at_post_load.append(empty_cache.call_count)
+
+    monkeypatch.setattr(_TinyModel, "load_weights", populate_model)
+    monkeypatch.setattr(_TinyModel, "post_load_weights", record_cache_state)
+    monkeypatch.setattr(_TinyModel, "cache_derived_state", record_cache_state)
+    if load_format == LoadFormat.AUTO:
+        weight_loader = HfWeightLoader(checkpoint_io_policy="rank_striped_read_ahead")
+        checkpoint_loader = HfCheckpointLoader(
+            weight_loader=weight_loader, weight_mapper=MagicMock()
+        )
+
+        @contextmanager
+        def open_weight_session(checkpoint_dir, **_kwargs):
+            assert checkpoint_dir == "/ckpt"
+            empty_cache.assert_not_called()
+            yield weights
+            assert "weights_populated" in events
+            empty_cache.assert_not_called()
+            events.append("weight_session_closed")
+
+        monkeypatch.setattr(weight_loader, "open_weight_session", open_weight_session)
+        monkeypatch.setattr(
+            checkpoint_loader,
+            "load_weights",
+            MagicMock(side_effect=AssertionError("AUTO must use the rank-striped weight session")),
+        )
+    else:
+        checkpoint_loader = MagicMock(name="checkpoint_loader")
+        checkpoint_loader.checkpoint_format = "HF"
+        checkpoint_loader.load_weights.return_value = weights
+        backend = _build_gms_backend(is_rw=is_rw, events=events)
+        backend.finalize_write.side_effect = lambda _model: releases_at_pool_commit.append(
+            empty_cache.call_count
+        )
+        _install_gms_backend(monkeypatch, backend)
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    early_releases = int(load_format != LoadFormat.GMS)
+    assert releases_at_post_load == [early_releases]
+    assert releases_at_pool_commit == ([1] if is_rw else [])
+    assert empty_cache.call_count == expected_releases
 
 
 def test_gms_artifact_identity_failure_remains_fatal(monkeypatch):
