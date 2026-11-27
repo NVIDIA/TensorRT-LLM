@@ -52,8 +52,9 @@ from ..executor.postproc_worker import PostprocParams
 from ..executor.postprocessor_hook import (PostProcessorHook,
                                            load_post_processor_hook)
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
-from ..executor.utils import (RequestError, create_mpi_comm_session,
-                              get_spawn_proxy_process_env)
+from ..executor.utils import (EngineDeadError, EngineUnavailableError,
+                              RequestError, create_mpi_comm_session,
+                              get_spawn_proxy_process_env, sync_submission)
 from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
@@ -796,29 +797,31 @@ class BaseLLM:
                     f"priority must be a float in [0.0, 1.0], got {priority}")
 
         futures = []
-        for i, request_input in enumerate(request_inputs_list):
-            future = self.generate_async(
-                request_input,
-                sampling_params=self._item_at(sampling_params, i),
-                lora_request=self._item_at(lora_request, i),
-                prompt_adapter_request=self._item_at(prompt_adapter_request, i),
-                kv_cache_retention_config=self._item_at(
-                    kv_cache_retention_config, i),
-                disaggregated_params=self._item_at(disaggregated_params, i),
-                scheduling_params=self._item_at(scheduling_params, i),
-                conversation_params=self._item_at(conversation_params, i),
-                cache_salt=self._item_at(cache_salt, i),
-                priority=self._item_at(priority, i),
-                kv_hints=self._item_at(kv_hints, i),
-                streaming=False,
-            )
-            futures.append(future)
+        with sync_submission(futures):
+            for i, request_input in enumerate(request_inputs_list):
+                future = self.generate_async(
+                    request_input,
+                    sampling_params=self._item_at(sampling_params, i),
+                    lora_request=self._item_at(lora_request, i),
+                    prompt_adapter_request=self._item_at(
+                        prompt_adapter_request, i),
+                    kv_cache_retention_config=self._item_at(
+                        kv_cache_retention_config, i),
+                    disaggregated_params=self._item_at(disaggregated_params, i),
+                    scheduling_params=self._item_at(scheduling_params, i),
+                    conversation_params=self._item_at(conversation_params, i),
+                    cache_salt=self._item_at(cache_salt, i),
+                    priority=self._item_at(priority, i),
+                    kv_hints=self._item_at(kv_hints, i),
+                    streaming=False,
+                )
+                futures.append(future)
 
-        for future in tqdm(futures,
-                           desc="Processed requests",
-                           dynamic_ncols=True,
-                           disable=not use_tqdm):
-            future.result()
+            for future in tqdm(futures,
+                               desc="Processed requests",
+                               dynamic_ncols=True,
+                               disable=not use_tqdm):
+                future.result()
 
         if unbatched:
             futures = futures[0]
@@ -864,15 +867,28 @@ class BaseLLM:
 
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
+
+        Raises:
+            tensorrt_llm.executor.EngineUnavailableError: The request was not admitted, but the engine has not failed: the executor command queue is full (retry later; a call from a thread that runs an event loop is rejected, a call from any other thread waits for capacity), or the LLM is shutting down in an orderly way (retry on another instance).
+            tensorrt_llm.executor.EngineDeadError: The engine has failed terminally. This instance will not serve further requests.
         """
         if self._encode_only:
             raise RuntimeError(
                 "generate_async() is not available when encode_only=True. "
                 "Use llm.encode() for encoder-only models.")
 
-        # Check if the worker is shutting down
-        if self._executor is None or self._executor.is_shutdown():
-            raise RuntimeError("LLM is shutting down")
+        # A dead engine is not retryable on this instance; an orderly
+        # shutdown is. Check death first: is_shutdown() is true for both.
+        executor = self._executor
+        if executor is None:
+            dead_error = getattr(self, "_dead_engine_error", None)
+            if dead_error is not None:
+                raise EngineDeadError(dead_error)
+            raise EngineUnavailableError("LLM is shutting down")
+        if executor.engine_dead:
+            raise EngineDeadError(executor.fatal_error)
+        if executor.is_shutdown():
+            raise EngineUnavailableError("LLM is shutting down")
 
         sampling_params = self._prepare_sampling_params(sampling_params)
 
@@ -1821,6 +1837,10 @@ class BaseLLM:
         """Release executors and any LLM-owned MPI session."""
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
+            if self._executor.engine_dead:
+                # Keep reporting the failure after the executor is released.
+                self._dead_engine_error = self._executor.fatal_error or EngineDeadError(
+                )
             self._executor = None
 
         if hasattr(self,

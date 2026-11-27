@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import hashlib
-import hmac
 import os
 import pickle  # nosec B403
 import threading
@@ -31,6 +29,7 @@ from tensorrt_llm.logger import logger
 from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
+from .hmac_framing import sign_frame, verify_frame
 
 # Linger applied by ZeroMqQueue.close() to a socket still at zmq's infinite
 # default, so closing never waits forever for a peer that has exited.
@@ -55,7 +54,11 @@ class ZeroMqQueue:
                  is_server: bool,
                  is_async: bool = False,
                  name: Optional[str] = None,
-                 use_hmac_encryption: bool = True):
+                 use_hmac_encryption: bool = True,
+                 send_hwm: Optional[int] = None,
+                 receive_hwm: Optional[int] = None,
+                 ipv6: bool = False,
+                 socket_options: Optional[dict[int, int | bytes]] = None):
         '''
         Parameters:
             address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
@@ -64,6 +67,12 @@ class ZeroMqQueue:
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
+            send_hwm (int, optional): ZMQ_SNDHWM in messages. None leaves the send queue unlimited.
+            receive_hwm (int, optional): ZMQ_RCVHWM in messages. None leaves the receive queue unlimited.
+            ipv6 (bool): Enable IPv6 before binding or connecting. Defaults to False.
+            socket_options (dict, optional): Extra ZMQ socket options applied
+                before binding or connecting. Some options, such as
+                MAXMSGSIZE, have no effect when set after bind.
         '''
 
         if not use_hmac_encryption:
@@ -82,7 +91,15 @@ class ZeroMqQueue:
         self._setup_done = False
         self.name = name
         self.socket = self.context.socket(socket_type)
+        if ipv6:
+            self.socket.setsockopt(zmq.IPV6, 1)
         self.socket.set_hwm(0)
+        if send_hwm is not None:
+            self.socket.setsockopt(zmq.SNDHWM, send_hwm)
+        if receive_hwm is not None:
+            self.socket.setsockopt(zmq.RCVHWM, receive_hwm)
+        for option, value in (socket_options or {}).items():
+            self.socket.setsockopt(option, value)
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
         self._last_identity = None
@@ -109,9 +126,17 @@ class ZeroMqQueue:
             )
 
         if self.should_bind_socket():
-            self.socket.bind(
-                self.address_endpoint
-            )  # Binds to the address and occupy a port immediately
+            try:
+                # Binds to the address and occupies a port immediately.
+                self.socket.bind(self.address_endpoint)
+            except zmq.ZMQError:
+                # The caller never receives this queue, so release it here.
+                # Clear the handles so close() from __del__ does nothing.
+                self.socket.close(linger=0)
+                self.context.term()
+                self.socket = None
+                self.context = None
+                raise
             self.address_endpoint = self.socket.getsockopt(
                 zmq.LAST_ENDPOINT).decode()
             logger_debug(
@@ -169,6 +194,15 @@ class ZeroMqQueue:
             self.poller = zmq.Poller()
             self.poller.register(self.socket, zmq.POLLIN)
 
+    @property
+    def zmq_debug_enabled(self) -> bool:
+        """Whether TLLM_LLMAPI_ZMQ_DEBUG limits the socket to one thread.
+
+        In this mode, using the socket from a thread other than the first one
+        that used it raises RuntimeError.
+        """
+        return self._zmq_debug_enabled
+
     def _check_thread_safety(self):
         """Check if the current thread is the same as the thread that first used the socket."""
         if not self._zmq_debug_enabled:
@@ -204,17 +238,86 @@ class ZeroMqQueue:
         else:
             return False
 
-    def put(self, obj: Any, routing_id: Optional[bytes] = None):
+    def put(self,
+            obj: Any,
+            routing_id: Optional[bytes] = None,
+            *,
+            timeout: Optional[float] = None) -> None:
+        """Send an object, optionally bounding the wait for a writable peer.
+
+        Args:
+            obj: Object to send.
+            routing_id: Destination identity for a ROUTER socket.
+            timeout: Maximum wait in seconds, or None to wait indefinitely.
+
+        Raises:
+            ValueError: If timeout is negative.
+            zmq.Again: If the message cannot be sent within timeout.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be nonnegative")
         self.setup_lazily()
         self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
+            flags = self._wait_writable(timeout)
             if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
                 # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
-                self._send_data(data, routing_id=routing_id)
+                self._send_data(data, flags=flags, routing_id=routing_id)
             else:
                 # Standard socket without encryption - use pyobj directly
-                self.socket.send_pyobj(obj)
+                self.socket.send_pyobj(obj, flags=flags)
+
+    def sign_pickled(self, pickled: bytes) -> bytes:
+        """Return the message that sends an object the caller already pickled.
+
+        get() on the receiving queue returns the object, as if put() had sent
+        it. Signing does not use the socket, so a caller can sign outside the
+        lock that serializes its socket use and send the message later with
+        put_signed().
+        """
+        return self._sign_data(pickled)
+
+    def put_signed(self,
+                   message: bytes,
+                   *,
+                   timeout: Optional[float] = None) -> None:
+        """Send a message returned by sign_pickled().
+
+        Args:
+            message: Message to send.
+            timeout: Maximum wait in seconds, or None to wait indefinitely.
+
+        Raises:
+            ValueError: If timeout is negative.
+            zmq.Again: If the message cannot be sent within timeout.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be nonnegative")
+        self.setup_lazily()
+        self._check_thread_safety()
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            self._send_data(message, flags=self._wait_writable(timeout))
+
+    def _wait_writable(self, timeout: Optional[float]) -> int:
+        """Wait up to timeout for a writable peer; return the send flags.
+
+        Raises:
+            zmq.Again: If the socket is not writable within timeout.
+        """
+        if timeout is None:
+            return 0
+        if timeout == 0:
+            # ZMQ_EVENTS processes pending pipe updates like a zero-timeout
+            # zmq_poll but does not release the GIL, so callers holding a
+            # lock do not make others wait for it.
+            writable = self.socket.getsockopt(zmq.EVENTS) & zmq.POLLOUT
+        else:
+            writable = self.socket.poll(int(timeout * 1000), zmq.POLLOUT)
+        if not writable:
+            raise zmq.Again()
+        # A peer can disappear after poll reports writability.
+        return zmq.NOBLOCK
 
     def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
         """Send an object without waiting for a writable peer.
@@ -419,16 +522,9 @@ class ZeroMqQueue:
             self.context.term()
             self.context = None
 
-    def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
-        """Verify the HMAC of received pickle data."""
-        expected_hmac = hmac.new(self.hmac_key, data, hashlib.sha256).digest()
-        return hmac.compare_digest(expected_hmac, actual_hmac)
-
     def _sign_data(self, data_before_encoding: bytes) -> bytes:
         """Generate HMAC for data."""
-        hmac_signature = hmac.new(self.hmac_key, data_before_encoding,
-                                  hashlib.sha256).digest()
-        return data_before_encoding + hmac_signature
+        return sign_frame(self.hmac_key, data_before_encoding)
 
     def __del__(self):
         self.close()
@@ -441,17 +537,14 @@ class ZeroMqQueue:
         return data
 
     def _parse_data(self, data: bytes) -> Any:
-        """Parse data and optionally verify HMAC signature."""
+        """Parse data and optionally verify HMAC signature.
+
+        Raises:
+            HmacVerificationError: If HMAC is enabled and the signature does
+                not match; nothing is unpickled then.
+        """
         if self.use_hmac_encryption:
-            # Split data and HMAC
-            message_data = data[:-32]
-            actual_hmac = data[-32:]
-
-            # Verify HMAC
-            if not self._verify_hmac(message_data, actual_hmac):
-                raise RuntimeError("HMAC verification failed")
-
-            return pickle.loads(message_data)  # nosec B301
+            return pickle.loads(verify_frame(self.hmac_key, data))  # nosec B301
         else:
             return pickle.loads(data)  # nosec B301
 

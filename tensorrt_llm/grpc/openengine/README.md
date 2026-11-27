@@ -39,6 +39,10 @@ OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC 
 
 The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. A check that runs longer than five seconds makes inference `NOT_SERVING`; the server keeps at most one engine check in flight and discards a late result before polling again. `Control.Health` reads the same engine predicate directly, so its result can lead the published status by a poll interval or the check deadline. The multi-frontend coordinator reads the monitor's latest engine result without running another engine check. A known fatal executor or worker failure makes both services `NOT_SERVING` and stops the serving process. Other readiness failures leave liveness `SERVING` and can recover. During orderly shutdown, inference reports `NOT_SERVING` while liveness retains its previous status until the listener closes. Each `Watch` ends after its final status. A stopped server cannot answer the probe.
 
+A lost executor command connection is a fatal executor failure: pending requests fail, both services report `NOT_SERVING`, and commands are never replayed after a reconnection.
+
+`Generate` rejects a request that the engine does not admit with gRPC `UNAVAILABLE`. This covers a full executor command queue, which leaves health unchanged; an orderly shutdown; and a dead engine, which the request metrics also count as an engine failure. A request that fails after acceptance ends with an engine error response. For the admission rule and the retry contract, see [Request admission and engine failure](../../../docs/source/llm-api/index.md#request-admission-and-engine-failure). For opt-in detection of remote worker loss with `TRTLLM_WORKER_WATCH=1`, see [Remote MPI process supervision](../../../docs/source/llm-api/index.md#remote-mpi-process-supervision).
+
 For a Pod with a Dynamo sidecar and native Kubernetes gRPC probes, bind one listener to all Pod interfaces:
 
 ```bash

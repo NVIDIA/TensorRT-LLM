@@ -17,7 +17,9 @@
 import asyncio
 import io
 import os
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -36,6 +38,7 @@ pytest.importorskip(
 
 import grpc  # noqa: E402
 
+from tensorrt_llm.executor.utils import EngineUnavailableError  # noqa: E402
 from tensorrt_llm.grpc.smg.bindings import trtllm_service_pb2 as pb2  # noqa: E402
 from tensorrt_llm.grpc.smg.request_manager import (  # noqa: E402
     GrpcRequestManager,
@@ -99,6 +102,67 @@ def test_streaming_empty_token_history(token_ids: list[int] | None) -> None:
     sent: dict[int, int] = {}
     assert servicer._chunk_responses("request", result, [], sent) == []
     assert sent == {}
+
+
+@pytest.mark.cpu_only
+def test_admission_failure_preserves_retryability() -> None:
+    """An overloaded executor lets the router retry the rejected request."""
+
+    async def reject(**kwargs: object) -> AsyncIterator[None]:
+        raise EngineUnavailableError("command queue is full")
+        yield  # pragma: no cover
+
+    manager = SimpleNamespace(
+        get_model_config=lambda: {}, generate=reject, abort=AsyncMock(return_value=False)
+    )
+    servicer = TrtllmServiceServicer(manager)
+    request = pb2.GenerateRequest(
+        request_id="rejected", tokenized=pb2.TokenizedInput(input_token_ids=[1]), max_tokens=4
+    )
+    context = _MockContext()
+
+    async def collect() -> list[pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, context)]
+
+    with pytest.raises(grpc.aio.AbortError):
+        asyncio.run(collect())
+    assert context.code == grpc.StatusCode.UNAVAILABLE
+    assert context.details == "command queue is full"
+    manager.abort.assert_awaited_once_with("rejected")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("responded, code", [(False, "UNAVAILABLE"), (True, "INTERNAL")])
+def test_dead_engine_is_unavailable_until_output_reaches_the_client(responded, code) -> None:
+    """A dead engine's refusal can be retried elsewhere; a broken stream cannot."""
+    from tensorrt_llm.executor.utils import EngineDeadError
+
+    output = SimpleNamespace(index=0, token_ids=[10], logprobs=None, finish_reason=None)
+
+    async def fail(**kwargs: object) -> AsyncIterator[object]:
+        if responded:
+            yield SimpleNamespace(outputs=[output], cached_tokens=0, finished=False)
+        raise EngineDeadError(RuntimeError("rank 1 died"))
+
+    manager = SimpleNamespace(
+        get_model_config=lambda: {}, generate=fail, abort=AsyncMock(return_value=False)
+    )
+    servicer = TrtllmServiceServicer(manager)
+    request = pb2.GenerateRequest(
+        request_id="dead",
+        tokenized=pb2.TokenizedInput(input_token_ids=[1]),
+        max_tokens=4,
+        streaming=True,
+    )
+    context = _MockContext()
+
+    async def collect() -> list[pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, context)]
+
+    with pytest.raises(grpc.aio.AbortError):
+        asyncio.run(collect())
+    assert context.code == getattr(grpc.StatusCode, code)
+    manager.abort.assert_awaited_once_with("dead")
 
 
 @pytest.mark.cpu_only

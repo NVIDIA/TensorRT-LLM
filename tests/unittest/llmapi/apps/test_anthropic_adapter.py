@@ -1454,6 +1454,37 @@ def test_stream_reframer_reads_the_upstream_to_its_end_before_message_stop():
     assert after_done == ["ran"]
 
 
+def test_stream_reframer_ends_an_upstream_error_event_with_an_anthropic_error():
+    """An upstream error event ends the message with that error, after the upstream ends."""
+    after_done = []
+    upstream_error = {
+        "error": {
+            "message": "Engine has died",
+            "type": "ServiceUnavailableError",
+            "code": 503,
+            "param": None,
+        }
+    }
+
+    async def source():
+        yield f"data: {chunk({'role': 'assistant', 'content': 'partial'}).model_dump_json()}\n\n"
+        yield f"data: {json.dumps(upstream_error)}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    names = [name for name, _ in events]
+    assert "message_stop" not in names
+    assert events[-1] == (
+        "error",
+        {"type": "error", "error": {"type": "api_error", "message": "Engine has died"}},
+    )
+    assert after_done == ["ran"]
+
+
 def test_stream_reframer_drops_anything_after_done():
     """Lines after [DONE] are read to reach the end, never reframed."""
 

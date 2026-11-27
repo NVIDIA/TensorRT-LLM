@@ -7,6 +7,7 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 
 from tensorrt_llm._utils import nvtx_range_debug
+from tensorrt_llm.executor.utils import sync_submission
 from tensorrt_llm.inputs import create_input_processor, prompt_inputs
 from tensorrt_llm.inputs.data import PromptInputs
 from tensorrt_llm.sampling_params import SamplingParams
@@ -114,15 +115,16 @@ class MultimodalEncoder(_TorchLLM):
         inputs = [prompt_inputs(i) for i in inputs]
 
         futures = []
-        for request_inputs in inputs:
-            future = self.generate_async(request_inputs)
-            futures.append(future)
+        with sync_submission(futures):
+            for request_inputs in inputs:
+                future = self.generate_async(request_inputs)
+                futures.append(future)
 
-        for future in tqdm(futures,
-                           desc="Processed requests",
-                           dynamic_ncols=True,
-                           disable=not use_tqdm):
-            future.result()
+            for future in tqdm(futures,
+                               desc="Processed requests",
+                               dynamic_ncols=True,
+                               disable=not use_tqdm):
+                future.result()
 
         if unbatched:
             futures = futures[0]
