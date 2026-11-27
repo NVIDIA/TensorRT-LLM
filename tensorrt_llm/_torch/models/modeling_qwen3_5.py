@@ -772,6 +772,7 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
 
     supports_encoder_cache = True
+    supports_multimodal_breakable_cuda_graph = True
     # The inner Qwen3.5 decoder implements them (see Qwen3NextForCausalLM).
     model_specific_llm_args = Qwen3NextForCausalLM.model_specific_llm_args
     # The inner decoder's GDN layers read it.
@@ -831,6 +832,15 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         return super().prepare_mrope_config(
             multimodal_params, num_generation_requests, None, **kwargs
         )
+
+    def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        prepared_inputs = super().prepare_breakable_cuda_graph_inputs(inputs)
+        # The Qwen3.5 body never reads these. Without a cos/sin table the MRoPE deltas
+        # appear only while a media request decodes, so keeping them would send those
+        # mixed batches eager. MTP takes `orig_input_ids` from the outer model's kwargs.
+        prepared_inputs.pop("mrope_config", None)
+        prepared_inputs.pop("orig_input_ids", None)
+        return prepared_inputs
 
     def load_weights(
         self,
