@@ -1168,6 +1168,26 @@ def _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_ind
         )
 
 
+def _byte_span(t: torch.Tensor) -> tuple[int, int]:
+    """The bytes `t` addresses, `[first, last + 1)`, from its pointer, shape and strides (a
+    tensor's strides are never negative); `(0, 0)` when it is empty."""
+    if t.numel() == 0:
+        return 0, 0
+    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return t.data_ptr(), t.data_ptr() + (last + 1) * t.element_size()
+
+
+def _overlapping_input(out: torch.Tensor, inputs: dict) -> str | None:
+    """The name of the first of `inputs` whose bytes `out`'s bytes meet, or None. A span test:
+    two strided views can share a span without sharing an element, which it refuses too."""
+    lo, hi = _byte_span(out)
+    for name, t in inputs.items():
+        t_lo, t_hi = _byte_span(t)
+        if lo < t_hi and t_lo < hi:
+            return name
+    return None
+
+
 def rows_per_group(group_size: int) -> int:
     """Rows of one request a row-tile item serves: the most whose `rows x group_size` MMA
     rows fill whole 8-row swizzle atoms of the 128-row tile (10 at 12 heads, 20 at 6)."""
@@ -1193,7 +1213,8 @@ def qsa_rowtile_sparse_gqa(
 ) -> torch.Tensor:
     """Group plan (or bitmap pass and plan pass), lone-row pass, row-tile pass
     (`qsa_rowtile_attention_cute`); returns `[rows, Hq, D]` contiguous: `out` when given (q's
-    dtype and device, contiguous, 16-byte aligned), written in place, else a fresh tensor."""
+    dtype and device, contiguous, 16-byte aligned, apart from every input), written in place,
+    else a fresh tensor."""
     _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_indices,
                   tokens_per_block, softmax_scale, query_positions, compress_ratio)  # fmt: skip
     rows, num_q_heads, head_dim = q.shape
@@ -1212,6 +1233,18 @@ def qsa_rowtile_sparse_gqa(
             "QSA row-tile `out` must be a contiguous, 16-byte-aligned [rows, Hq, D] of q's dtype"
         )
     else:
+        # The passes read the inputs while they write `out`: a view into one (a cache plane,
+        # the projection q is read from) would be overwritten, and read back by a later call.
+        overlapped = _overlapping_input(
+            out,
+            dict(
+                q=q, k_cache=k_cache, v_cache=v_cache, block_table=block_table,
+                selected_tokens=selected_tokens, request_indices=request_indices,
+                query_positions=query_positions,
+            ),
+        )  # fmt: skip
+        if overlapped is not None:
+            raise ValueError(f"QSA row-tile `out` must not overlap `{overlapped}`")
         output = out
     if rows == 0:
         return output
