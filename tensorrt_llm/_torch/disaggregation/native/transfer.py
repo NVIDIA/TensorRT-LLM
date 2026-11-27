@@ -1616,7 +1616,7 @@ class Sender(SenderBase):
         on_submitted: Optional[Callable[[], None]],
         session: Optional["TxSession"],
         owned: bool,
-        bounce_window_key: bytes,
+        bounce_window_key: bytes = b"",
     ) -> tuple[bool, Optional[str]]:
         def submit_member(member):
             if bounce_window_key:

@@ -326,6 +326,7 @@ private:
         std::string flow;
         bool orphaned{false};
     };
+
     std::unordered_map<std::uint64_t, ActiveScatter> mRegions;
 };
 
