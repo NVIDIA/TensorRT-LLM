@@ -47,7 +47,7 @@ Why a new manager rather than an extension of the existing one? We tried the ext
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog38_v1_vs_v2_architecture.png" width="900">
+  <img src="../media/tech_blog38_v1_vs_v2_architecture.png" alt="V1 splits cache management by window size with separate recurrent state; V2 shares lifecycle, tree and storage services across per-request caches that supply page indices." width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: V1 and V2 KV cache manager architectures.</em></sub></p>
@@ -108,7 +108,7 @@ V1 coalesces across layers too, but on a proxy: every layer sharing a window siz
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog38_lifecycle_coalescing.png" width="900">
+  <img src="../media/tech_blog38_lifecycle_coalescing.png" alt="Buffers group by lifecycle and size: full attention retains all blocks, sliding-window attention retains sinks and its live window, and SSM retains the latest checkpoint." width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Lifecycles group buffers into big pages, and why the grouping must be by lifecycle.</em></sub></p>
@@ -125,7 +125,7 @@ Multi-turn conversations show what this buys. Under the `per_conversation` reuse
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog38_one_tree_many_lifecycles.png" width="800">
+  <img src="../media/tech_blog38_one_tree_many_lifecycles.png" alt="One radix-tree block has independent lifecycle slots: a full-attention page on GPU, a stale sliding-window slot, and an SSM checkpoint on host." width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: A radix-tree block holds one page slot per lifecycle.</em></sub></p>
@@ -140,7 +140,7 @@ A page need not keep the same representation on every tier. A pluggable **cold-p
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog38_page_states_and_tiers.png" width="800">
+  <img src="../media/tech_blog38_page_states_and_tiers.png" alt="Locks pin pages, holders permit migration, and unreferenced pages may be dropped; transfers between GPU, host and disk wait on page readiness events." width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: Page status and tier migration.</em></sub></p>
@@ -161,7 +161,7 @@ Within each level, lifecycles map to pool groups with a per-group quota and prio
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog38_elastic_pools_vmm.png" width="800">
+  <img src="../media/tech_blog38_elastic_pools_vmm.png" alt="Rebalancing moves two physical chunks from the full-attention pool to the sliding-window pool while both virtual base addresses stay fixed, preserving captured CUDA graphs." width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: Elastic pools over CUDA virtual memory.</em></sub></p>
@@ -176,7 +176,7 @@ Two capabilities fall directly out of the page-status machine.
 
 ### Block Keys and Reuse Scopes
 
-Prefix identity is a SHA-256 chain: the root key is the digest of the request's reuse scope — an optional LoRA task ID and an optional user-supplied `cache_salt` — and each block key is the digest of the previous key concatenated with that block's tokens. A cryptographic hash is a deliberate security boundary, since the tree is a cross-tenant index matched purely by digest equality, and each distinct reuse scope gets its own root, so tenant isolation is structural rather than probabilistic. Because the chain folds in both the scope and the entire preceding history, a block key is globally unique on its own: the tree is a convenience, not a requirement, and the same keys would work unchanged in a flat hash map.
+Prefix identity is a SHA-256 chain: the root key is the digest of the request's reuse scope — an optional LoRA task ID and an optional user-supplied `cache_salt` — and each block key is the digest of the previous key concatenated with that block's tokens. Collision resistance matters because the shared tree matches scopes and blocks by digest equality. Each distinct reuse scope gets its own root, but requests that omit `cache_salt` share a root within the same LoRA task scope, including requests with no LoRA task ID. Tenant isolation therefore requires a trusted serving layer to bind distinct salts to tenant identities; a caller-supplied salt alone does not enforce that boundary. Because the chain folds in both the scope and the entire preceding history, a block key identifies that scoped prefix on its own, subject to SHA-256 collision resistance: the tree is a convenience, not a requirement, and the same keys would work unchanged in a flat hash map.
 
 ### The Public API
 
