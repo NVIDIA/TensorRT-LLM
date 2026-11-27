@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,6 +86,11 @@ torch::Tensor symmetric_dequantize_activation(torch::Tensor activation, torch::T
 torch::Tensor symmetric_dequantize_per_tensor(torch::Tensor input, torch::Tensor scales);
 
 std::tuple<torch::Tensor, torch::Tensor> vectorized_per_token_fp8_quant(torch::Tensor input);
+
+std::tuple<torch::Tensor, torch::Tensor> quantize_mxe4m3_host(torch::Tensor x_fp32, bool is_sf_swizzled_layout = true);
+
+torch::Tensor dequantize_mxe4m3_host(
+    torch::Tensor value_e4m3, torch::Tensor scale_ue8m08sf, bool is_sf_swizzled_layout = true);
 
 } // namespace torch_ext
 

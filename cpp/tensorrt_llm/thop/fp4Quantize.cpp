@@ -381,27 +381,3 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_residual(
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
-{
-    m.def(
-        "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
-        "isSfSwizzledLayout=True) -> (Tensor, Tensor)");
-    m.def(
-        "fp4_quantize.sm_budget(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
-        "isSfSwizzledLayout=True, int reserved_sms=0) -> (Tensor, Tensor)");
-    m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
-    m.def(
-        "fp4_quantize_with_reorder_residual(Tensor X, Tensor input_scale, Tensor reorder_index, int KE, bool is_act) "
-        "-> (Tensor, Tensor)");
-    m.def("fp4_quantize_with_residual(Tensor X, Tensor input_scale, int KE, bool is_act) -> (Tensor, Tensor)");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("fp4_quantize", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize));
-    m.impl("fp4_quantize.sm_budget", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_sm_budget));
-    m.impl("calculate_nvfp4_global_scale", TORCH_FN(tensorrt_llm::torch_ext::calculate_nvfp4_global_scale));
-    m.impl("fp4_quantize_with_reorder_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_reorder_residual));
-    m.impl("fp4_quantize_with_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_residual));
-}

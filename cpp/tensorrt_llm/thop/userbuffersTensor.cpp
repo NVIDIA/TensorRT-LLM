@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,18 +39,6 @@ std::pair<torch::Tensor, tensorrt_llm::runtime::ub::UBBuffer> create_userbuffers
         torch::from_blob(ptr.release(), shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA)), ub);
 }
 
-// Custom op interface for create_userbuffers_tensor.
-// Python side does not need the UBBuffer object.
-torch::Tensor create_userbuffers_tensor_op(at::IntArrayRef shape, torch::ScalarType dtype)
-{
-    return create_userbuffers_tensor(shape, dtype).first;
-}
-
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
-{
-    m.def("create_userbuffers_tensor", &tensorrt_llm::torch_ext::create_userbuffers_tensor_op);
-}
