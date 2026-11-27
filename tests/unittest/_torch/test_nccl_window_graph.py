@@ -558,6 +558,95 @@ def test_eager_decoder_layer_hooks_scope_each_invocation(tensor_scope_events):
     assert tensor_scope_events[-1][-1] is False
 
 
+def test_module_inputs_keep_unmarked_metadata_inside_tensor_containers() -> None:
+    @dataclass
+    class Metadata:
+        shared: torch.Tensor
+
+    @nccl_window_tensor_scope.nccl_window_tensor_container
+    @dataclass
+    class Activations:
+        hidden_states: torch.Tensor
+        metadata: Metadata
+
+    with FakeTensorMode():
+        hidden_states = torch.empty(2, device="cuda")
+        metadata = Metadata(torch.empty(2, device="cuda"))
+    activations = Activations(hidden_states, metadata)
+
+    tensors = nccl_window_tensor_scope._module_call_cuda_tensors((activations,), {})
+
+    assert nccl_window_tensor_scope.is_nccl_window_tensor_container(Activations)
+    assert not nccl_window_tensor_scope.is_nccl_window_tensor_container(Metadata)
+    assert list(map(id, tensors)) == [id(hidden_states)]
+
+
+def test_eager_decoder_layer_scope_consumes_mhc_activations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+    from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
+
+    @dataclass
+    class Metadata:
+        shared: torch.Tensor
+
+    class Producer(DecoderLayer):
+        def forward(
+            self,
+            position_ids: torch.Tensor,
+            hidden_states: torch.Tensor,
+            attn_metadata: Metadata,
+        ) -> HCState:
+            return HCState.deferred(
+                residual=hidden_states,
+                post_mix=hidden_states.new_empty((2, 4)),
+                comb_mix=hidden_states.new_empty((2, 4, 4)),
+                x_prev=hidden_states.new_empty((2, 8)),
+            )
+
+    class Consumer(DecoderLayer):
+        def forward(
+            self,
+            position_ids: torch.Tensor,
+            hc_state: HCState,
+            attn_metadata: Metadata,
+        ) -> torch.Tensor:
+            return hc_state.residual
+
+    scoped_input_ids: set[int] = set()
+
+    def begin(inputs: list[torch.Tensor]) -> int:
+        scoped_input_ids.update(map(id, inputs))
+        return 0
+
+    def end(
+        _inputs: list[torch.Tensor],
+        _outputs: list[torch.Tensor],
+        _failed: bool,
+        _entry_depth: int,
+    ) -> None:
+        pass
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    layers = torch.nn.ModuleList([Producer(), Consumer()])
+    handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layers)
+    try:
+        with FakeTensorMode():
+            hidden_states = torch.empty((2, 4, 8), device="cuda")
+            position_ids = torch.arange(2, device="cuda")
+            metadata = Metadata(torch.empty(2, device="cuda"))
+            state = layers[0](position_ids, hidden_states, metadata)
+            layers[1](position_ids, state, metadata)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert id(metadata.shared) not in scoped_input_ids
+    assert id(state.x_prev) in scoped_input_ids
+
+
 def test_eager_encoder_decoder_hooks_scope_stacks_and_layers(tensor_scope_events):
     scoped = nccl_window_tensor_scope.nccl_window_tensor_scoped_module
 

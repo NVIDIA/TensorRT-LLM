@@ -5,23 +5,27 @@
 and its pipeline wiring: scheduler loading, recipe validation, generation
 defaults, mode resolution, and the guidance-1.0 denoise-loop contract."""
 
-import json
+import dataclasses
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from cosmos3_fixtures import bare_resolver, write_checkpoint_files
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_720P_PARAMS,
-    COSMOS3_T2I_PARAMS,
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_DEFAULTS
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
+    CONFIG_FILE,
+    MODEL_INDEX_FILE,
+    SCHEDULER_FILE,
+    RequestParameters,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     Cosmos3OmniMoTPipeline,
-    _resolve_use_system_prompt,
     _validate_request_compatibility,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
@@ -37,6 +41,9 @@ from tensorrt_llm._torch.visual_gen.profiler import VisualGenProfiler
 from tensorrt_llm.visual_gen.params import VisualGenParams
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
+
+QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["video"]
+QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["image"]
 
 # The relevant subset of the 4-Step checkpoint's scheduler config
 # (values verbatim; keys unrelated to distilled detection omitted).
@@ -67,10 +74,23 @@ SKIP_NON_SCHEDULER = ["text_tokenizer", "tokenizer", "vae", "sound_tokenizer"]
 
 
 def _write_scheduler_config(checkpoint_dir: Path, config: dict) -> None:
-    scheduler_dir = checkpoint_dir / "scheduler"
-    scheduler_dir.mkdir(parents=True, exist_ok=True)
-    with open(scheduler_dir / "scheduler_config.json", "w") as f:
-        json.dump(config, f)
+    write_checkpoint_files(checkpoint_dir, {SCHEDULER_FILE: config}, vae=True)
+
+
+def _write_trained_config(checkpoint_dir: Path, use_system_prompt: Optional[bool]) -> None:
+    """The training config's prompt flag; ``None`` writes a config without it."""
+    vlm_config = {} if use_system_prompt is None else {"use_system_prompt": use_system_prompt}
+    write_checkpoint_files(
+        checkpoint_dir, {CONFIG_FILE: {"model": {"config": {"vlm_config": vlm_config}}}}
+    )
+
+
+def _load_scheduler(pipeline: Cosmos3OmniMoTPipeline, checkpoint_dir: Path) -> None:
+    """Load the checkpoint's settings and its scheduler, in the loader's order."""
+    pipeline._read_checkpoint_settings(str(checkpoint_dir))
+    pipeline.load_standard_components(
+        str(checkpoint_dir), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
+    )
 
 
 # The schedule every request on a distilled checkpoint resolves to.
@@ -79,7 +99,7 @@ _FIXED = SamplingSchedule(grid="fixed", flow_shift=1.0)
 
 def _distilled_policy() -> Cosmos3SamplingPolicy:
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
-    return Cosmos3SamplingPolicy.from_scheduler(scheduler)
+    return Cosmos3SamplingPolicy.from_scheduler(scheduler, fixed_sigmas=DISTILLED_SIGMAS)
 
 
 def _base_scheduler() -> UniPCMultistepScheduler:
@@ -91,7 +111,9 @@ def _base_policy() -> Cosmos3SamplingPolicy:
 
 
 def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
-    """A pipeline instance without heavyweight ``__init__``."""
+    """A pipeline instance without heavyweight ``__init__``. ``default_use_system_prompt``
+    goes into the resolver, as the checkpoint would put it; the resolver sees the distilled
+    schedule of ``sampling``."""
     pipeline = object.__new__(Cosmos3OmniMoTPipeline)
     defaults = dict(
         _device=torch.device("cpu"),
@@ -99,13 +121,22 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
         action_gen=False,
         has_action_weights=False,
         sampling=Cosmos3SamplingPolicy(),
-        default_use_system_prompt=False,
         family=QWEN3_RECIPE.name,
         use_native_flow_schedule=False,
     )
     defaults.update(attrs)
     defaults.setdefault("_scheduler_cache", {})
     defaults.setdefault("_base_scheduler", defaults.get("scheduler"))
+    use_system_prompt = defaults.pop("default_use_system_prompt", False)
+    sigmas = getattr(defaults["sampling"], "fixed_sigmas", None)
+    defaults.setdefault(
+        "resolver",
+        bare_resolver(
+            defaults["family"],
+            fixed_sigmas=sigmas,
+            use_system_prompt=use_system_prompt,
+        ),
+    )
     for key, value in defaults.items():
         setattr(pipeline, key, value)
     return pipeline
@@ -120,9 +151,9 @@ def _fake_request(output_type: str = "video", **param_overrides) -> SimpleNamesp
     the pipeline's default table rather than from the caller.
     """
     params = VisualGenParams(
-        num_frames=COSMOS3_720P_PARAMS["num_frames"],
-        max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
-        frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+        num_frames=QWEN3_VIDEO_DEFAULTS["num_frames"],
+        max_sequence_length=QWEN3_VIDEO_DEFAULTS["max_sequence_length"],
+        frame_rate=QWEN3_VIDEO_DEFAULTS["frame_rate"],
         seed=0,
         extra_params={"output_type": output_type},
     )
@@ -171,30 +202,6 @@ class TestPolicyFacts:
         assert not _base_policy().is_distilled
         assert not Cosmos3SamplingPolicy().is_distilled
 
-    def test_diffusers_retains_unexpected_config_keys(self):
-        """Canary: diffusers must keep the unexpected fixed_step_sampler_config
-        key in scheduler.config; if an upgrade drops it, distilled detection
-        silently breaks."""
-        scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
-        policy = Cosmos3SamplingPolicy.from_scheduler(scheduler)
-        assert policy.fixed_sigmas == DISTILLED_SIGMAS
-        assert scheduler.config.stochastic_sampling is True
-
-    def test_sigma_values_coerced_to_floats(self):
-        config = {
-            **DISTILLED_SCHEDULER_CONFIG,
-            "fixed_step_sampler_config": {"t_list": [1, "0.5"]},
-        }
-        scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
-        assert Cosmos3SamplingPolicy.from_scheduler(scheduler).fixed_sigmas == (1.0, 0.5)
-
-    def test_generation_default_overrides(self):
-        assert _distilled_policy().generation_default_overrides() == {
-            "num_inference_steps": 4,
-            "guidance_scale": DISTILLED_GUIDANCE_SCALE,
-        }
-        assert _base_policy().generation_default_overrides() == {}
-
     def test_num_steps(self):
         assert _distilled_policy().num_steps(2) == 4
         assert _base_policy().num_steps(2) == 2
@@ -213,15 +220,31 @@ class TestMalformedRecipeValidation:
     """Only two recipes are valid; everything else must fail at load."""
 
     @pytest.mark.parametrize("broken_fixed_step", [None, {}, {"t_list": []}])
-    def test_required_sigmas_missing_raises(self, broken_fixed_step):
+    def test_required_sigmas_missing_raises(self, tmp_path, broken_fixed_step):
+        """Through the checkpoint files: every shape of a missing ``t_list`` resolves to
+        no fixed sigmas, which a scheduler that requires them rejects at load."""
         config = {k: v for k, v in DISTILLED_SCHEDULER_CONFIG.items()}
         config.pop("fixed_step_sampler_config")
         if broken_fixed_step is not None:
             config["fixed_step_sampler_config"] = broken_fixed_step
-        scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
+        _write_scheduler_config(tmp_path, config)
+        _write_trained_config(tmp_path, False)
+        pipeline = _bare_pipeline(resolver=None)
+        pipeline._read_checkpoint_settings(str(tmp_path))
+        assert pipeline.resolver.config().sampling.fixed_sigmas is None
 
         with pytest.raises(ValueError, match="fixed_step_requires_explicit_sigmas"):
-            Cosmos3SamplingPolicy.from_scheduler(scheduler)
+            pipeline.load_standard_components(
+                str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
+            )
+
+    def test_diffusers_retains_unexpected_config_keys(self):
+        """Canary: the policy reads keys diffusers does not know from ``scheduler.config``.
+        If an upgrade drops unknown keys, the malformed-recipe checks stop firing."""
+        scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
+        assert scheduler.config.fixed_step_requires_explicit_sigmas is True
+        assert scheduler.config.fixed_step_sampler_config["sample_type"] == "sde"
+        assert scheduler.config.stochastic_sampling is True
 
     def test_t_list_on_unipc_raises(self):
         """UniPC cannot honor the distilled policy (no seeded step noise,
@@ -233,7 +256,7 @@ class TestMalformedRecipeValidation:
         scheduler = UniPCMultistepScheduler.from_config(config)
 
         with pytest.raises(ValueError, match="Unsupported Cosmos3 sampling recipe"):
-            Cosmos3SamplingPolicy.from_scheduler(scheduler)
+            Cosmos3SamplingPolicy.from_scheduler(scheduler, fixed_sigmas=DISTILLED_SIGMAS)
 
     def test_unipc_with_declared_requirement_but_no_sigmas_raises(self):
         config = {**UNIPC_SCHEDULER_CONFIG, "fixed_step_requires_explicit_sigmas": True}
@@ -251,7 +274,7 @@ class TestMalformedRecipeValidation:
         scheduler = UniPCMultistepScheduler.from_config(config)
 
         with pytest.raises(ValueError, match="Unsupported Cosmos3 sampling recipe"):
-            Cosmos3SamplingPolicy.from_scheduler(scheduler)
+            Cosmos3SamplingPolicy.from_scheduler(scheduler, fixed_sigmas=DISTILLED_SIGMAS)
 
     def test_flow_match_without_sigmas_raises(self):
         config = {k: v for k, v in DISTILLED_SCHEDULER_CONFIG.items()}
@@ -274,7 +297,7 @@ class TestMalformedRecipeValidation:
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
 
         with pytest.raises(ValueError, match="stochastic_sampling"):
-            Cosmos3SamplingPolicy.from_scheduler(scheduler)
+            Cosmos3SamplingPolicy.from_scheduler(scheduler, fixed_sigmas=DISTILLED_SIGMAS)
 
     def test_declared_non_sde_sample_type_raises(self):
         config = {
@@ -287,7 +310,7 @@ class TestMalformedRecipeValidation:
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
 
         with pytest.raises(ValueError, match="sample_type"):
-            Cosmos3SamplingPolicy.from_scheduler(scheduler)
+            Cosmos3SamplingPolicy.from_scheduler(scheduler, fixed_sigmas=DISTILLED_SIGMAS)
 
 
 class TestValidateRequest:
@@ -398,8 +421,8 @@ class TestGenerationDefaults:
         params = _bare_pipeline(sampling=_distilled_policy()).default_generation_params
         assert params["num_inference_steps"] == 4
         assert params["guidance_scale"] == DISTILLED_GUIDANCE_SCALE
-        assert params["height"] == COSMOS3_720P_PARAMS["height"]
-        assert params["num_frames"] == COSMOS3_720P_PARAMS["num_frames"]
+        assert params["height"] == QWEN3_VIDEO_DEFAULTS["height"]
+        assert params["num_frames"] == QWEN3_VIDEO_DEFAULTS["num_frames"]
 
     def test_base_defaults_report_the_video_table(self):
         """The declared defaults are concrete video-mode values, so
@@ -407,9 +430,9 @@ class TestGenerationDefaults:
         A request in another mode re-resolves them in ``infer()``."""
         params = _bare_pipeline().default_generation_params
         for field in ("height", "width", "num_inference_steps", "guidance_scale"):
-            assert params[field] == COSMOS3_720P_PARAMS[field]
-        assert params["num_frames"] == COSMOS3_720P_PARAMS["num_frames"]
-        assert params["max_sequence_length"] == COSMOS3_720P_PARAMS["max_sequence_length"]
+            assert params[field] == QWEN3_VIDEO_DEFAULTS[field]
+        assert params["num_frames"] == QWEN3_VIDEO_DEFAULTS["num_frames"]
+        assert params["max_sequence_length"] == QWEN3_VIDEO_DEFAULTS["max_sequence_length"]
         assert "flow_shift" not in params
 
 
@@ -422,24 +445,24 @@ class TestInferModeResolution:
 
     def test_video_unset_resolves_to_video_table(self):
         got = self._captured_forward_kwargs(_bare_pipeline(), _fake_request("video"))
-        assert got["height"] == COSMOS3_720P_PARAMS["height"]
-        assert got["width"] == COSMOS3_720P_PARAMS["width"]
-        assert got["num_inference_steps"] == COSMOS3_720P_PARAMS["num_inference_steps"]
-        assert got["guidance_scale"] == COSMOS3_720P_PARAMS["guidance_scale"]
+        assert got["height"] == QWEN3_VIDEO_DEFAULTS["height"]
+        assert got["width"] == QWEN3_VIDEO_DEFAULTS["width"]
+        assert got["num_inference_steps"] == QWEN3_VIDEO_DEFAULTS["num_inference_steps"]
+        assert got["guidance_scale"] == QWEN3_VIDEO_DEFAULTS["guidance_scale"]
 
     def test_t2i_unset_resolves_to_t2i_table(self):
         got = self._captured_forward_kwargs(_bare_pipeline(), _fake_request("image"))
-        assert got["height"] == COSMOS3_T2I_PARAMS["height"]
-        assert got["width"] == COSMOS3_T2I_PARAMS["width"]
-        assert got["num_inference_steps"] == COSMOS3_T2I_PARAMS["num_inference_steps"]
-        assert got["guidance_scale"] == COSMOS3_T2I_PARAMS["guidance_scale"]
+        assert got["height"] == QWEN3_IMAGE_DEFAULTS["height"]
+        assert got["width"] == QWEN3_IMAGE_DEFAULTS["width"]
+        assert got["num_inference_steps"] == QWEN3_IMAGE_DEFAULTS["num_inference_steps"]
+        assert got["guidance_scale"] == QWEN3_IMAGE_DEFAULTS["guidance_scale"]
 
     def test_explicit_values_pass_through(self):
         req = _fake_request("image", height=512, num_inference_steps=20)
         got = self._captured_forward_kwargs(_bare_pipeline(), req)
         assert got["height"] == 512
         assert got["num_inference_steps"] == 20
-        assert got["width"] == COSMOS3_T2I_PARAMS["width"]
+        assert got["width"] == QWEN3_IMAGE_DEFAULTS["width"]
 
     def test_action_keeps_every_mode_field_unset(self):
         """Action resolves its own canvas, steps, guidance and frame rate from
@@ -468,7 +491,7 @@ class TestInferModeResolution:
         """Only action drops it: the serve layer derives num_frames from
         seconds x frame_rate, so the video default has to stay materialised."""
         got = self._captured_forward_kwargs(_bare_pipeline(), _fake_request("video"))
-        assert got["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
+        assert got["frame_rate"] == QWEN3_VIDEO_DEFAULTS["frame_rate"]
 
     def test_action_keeps_an_explicit_frame_rate(self):
         """Dropping the materialised default is what lets the embodiment preset
@@ -494,13 +517,13 @@ class TestInferModeResolution:
         """Same hazard for the other mode-dependent fields."""
         req = _fake_request(
             "video",
-            height=COSMOS3_720P_PARAMS["height"],
-            guidance_scale=COSMOS3_720P_PARAMS["guidance_scale"],
+            height=QWEN3_VIDEO_DEFAULTS["height"],
+            guidance_scale=QWEN3_VIDEO_DEFAULTS["guidance_scale"],
             extra_params={"action_mode": "policy"},
         )
         got = self._captured_forward_kwargs(_bare_pipeline(), req)
-        assert got["height"] == COSMOS3_720P_PARAMS["height"]
-        assert got["guidance_scale"] == COSMOS3_720P_PARAMS["guidance_scale"]
+        assert got["height"] == QWEN3_VIDEO_DEFAULTS["height"]
+        assert got["guidance_scale"] == QWEN3_VIDEO_DEFAULTS["guidance_scale"]
         assert got["width"] is None
 
     def test_distilled_merged_defaults_pass_through(self):
@@ -508,7 +531,7 @@ class TestInferModeResolution:
         got = self._captured_forward_kwargs(_bare_pipeline(sampling=_distilled_policy()), req)
         assert got["num_inference_steps"] == 4
         assert got["guidance_scale"] == DISTILLED_GUIDANCE_SCALE
-        assert got["height"] == COSMOS3_T2I_PARAMS["height"]
+        assert got["height"] == QWEN3_IMAGE_DEFAULTS["height"]
 
     def test_merged_video_defaults_reresolve_for_t2i(self):
         """The regression this contract exists for: values merged from the
@@ -516,14 +539,14 @@ class TestInferModeResolution:
         selects text-to-image."""
         req = _merged_request(
             "image",
-            height=COSMOS3_720P_PARAMS["height"],
-            width=COSMOS3_720P_PARAMS["width"],
-            num_inference_steps=COSMOS3_720P_PARAMS["num_inference_steps"],
-            guidance_scale=COSMOS3_720P_PARAMS["guidance_scale"],
+            height=QWEN3_VIDEO_DEFAULTS["height"],
+            width=QWEN3_VIDEO_DEFAULTS["width"],
+            num_inference_steps=QWEN3_VIDEO_DEFAULTS["num_inference_steps"],
+            guidance_scale=QWEN3_VIDEO_DEFAULTS["guidance_scale"],
         )
         got = self._captured_forward_kwargs(_bare_pipeline(), req)
         for field in ("height", "width", "num_inference_steps", "guidance_scale"):
-            assert got[field] == COSMOS3_T2I_PARAMS[field]
+            assert got[field] == QWEN3_IMAGE_DEFAULTS[field]
 
     def test_distilled_merged_steps_survive_reresolution(self):
         """Distilled steps/guidance are checkpoint facts, not mode defaults:
@@ -535,11 +558,11 @@ class TestInferModeResolution:
 
     def test_caller_values_survive_a_mode_switch(self):
         """An explicitly assigned value outranks the mode table."""
-        req = _merged_request("image", height=COSMOS3_720P_PARAMS["height"])
+        req = _merged_request("image", height=QWEN3_VIDEO_DEFAULTS["height"])
         req.params.width = 777  # caller assignment marks it
         got = self._captured_forward_kwargs(_bare_pipeline(), req)
         assert got["width"] == 777
-        assert got["height"] == COSMOS3_T2I_PARAMS["height"]
+        assert got["height"] == QWEN3_IMAGE_DEFAULTS["height"]
 
 
 class TestDefaultMarksThroughRealPath:
@@ -574,14 +597,14 @@ class TestDefaultMarksThroughRealPath:
     def test_default_params_are_concrete_yet_unmarked(self):
         params = self._visual_gen(_bare_pipeline()).default_params
         for field in self.MODE_FIELDS:
-            assert getattr(params, field) == COSMOS3_720P_PARAMS[field]
+            assert getattr(params, field) == QWEN3_VIDEO_DEFAULTS[field]
             assert field not in params.model_fields_set
 
     def test_merge_defaults_fills_without_marking(self):
         pipeline = _bare_pipeline()
         req = self._merge(pipeline, VisualGenParams())
         for field in self.MODE_FIELDS:
-            assert getattr(req.params, field) == COSMOS3_720P_PARAMS[field]
+            assert getattr(req.params, field) == QWEN3_VIDEO_DEFAULTS[field]
             assert field not in req.params.model_fields_set
 
     def test_assignment_marks_the_field(self):
@@ -600,7 +623,7 @@ class TestDefaultMarksThroughRealPath:
         ):
             assert "width" in clone.model_fields_set, label
             assert "height" not in clone.model_fields_set, label
-            assert clone.height == COSMOS3_720P_PARAMS["height"], label
+            assert clone.height == QWEN3_VIDEO_DEFAULTS["height"], label
 
     def test_full_chain_mode_switch_resolves_to_t2i(self):
         """default_params -> switch mode -> deep copy -> pickle -> merge -> infer."""
@@ -616,17 +639,16 @@ class TestDefaultMarksThroughRealPath:
         pipeline.infer(req)
 
         for field in self.MODE_FIELDS:
-            assert captured[field] == COSMOS3_T2I_PARAMS[field]
+            assert captured[field] == QWEN3_IMAGE_DEFAULTS[field]
 
 
 class TestPipelineSchedulerLoading:
     def test_distilled_checkpoint_loads_flow_match(self, tmp_path):
         _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline()
 
-        pipeline.load_standard_components(
-            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
-        )
+        _load_scheduler(pipeline, tmp_path)
 
         assert isinstance(pipeline.scheduler, FlowMatchEulerDiscreteScheduler)
         assert pipeline.sampling.is_distilled
@@ -634,11 +656,10 @@ class TestPipelineSchedulerLoading:
 
     def test_base_checkpoint_loads_unipc(self, tmp_path):
         _write_scheduler_config(tmp_path, UNIPC_SCHEDULER_CONFIG)
+        _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline()
 
-        pipeline.load_standard_components(
-            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
-        )
+        _load_scheduler(pipeline, tmp_path)
 
         assert isinstance(pipeline.scheduler, UniPCMultistepScheduler)
         assert not pipeline.sampling.is_distilled
@@ -646,11 +667,10 @@ class TestPipelineSchedulerLoading:
 
     def test_audio_scheduler_is_separate_same_class_instance(self, tmp_path):
         _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline(audio_gen=True)
 
-        pipeline.load_standard_components(
-            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
-        )
+        _load_scheduler(pipeline, tmp_path)
 
         assert isinstance(pipeline.audio_scheduler, FlowMatchEulerDiscreteScheduler)
         assert pipeline.audio_scheduler is not pipeline.scheduler
@@ -1045,19 +1065,16 @@ class TestForwardConditioningWiring:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         pipeline, captured = self._wiring_pipeline()
-        original_resolver = pipeline._resolve_generation_params
+        original_request = pipeline.resolver.request
         expected_interval = (123.0, 456.0)
 
-        def resolve_with_interval(
-            mode: str, **values: int | float | None
-        ) -> dict[str, int | float | tuple[float, float] | None]:
-            assert values["guidance_interval"] is None
-            return {
-                **original_resolver(mode, **values),
-                "guidance_interval": expected_interval,
-            }
+        def request_with_interval(params: RequestParameters) -> RequestParameters:
+            assert params.guidance_interval is None
+            return dataclasses.replace(
+                original_request(params), guidance_interval=expected_interval
+            )
 
-        monkeypatch.setattr(pipeline, "_resolve_generation_params", resolve_with_interval)
+        monkeypatch.setattr(pipeline.resolver, "request", request_with_interval)
 
         self._forward(pipeline, image=None)
 
@@ -1065,44 +1082,67 @@ class TestForwardConditioningWiring:
 
 
 class TestSystemPromptDefault:
-    """use_system_prompt defaults are checkpoint-declared via model_index.json."""
+    """use_system_prompt default: config.json's vlm_config, else model_index.json."""
 
     def _write_model_index(self, checkpoint_dir: Path, content: dict) -> None:
-        with open(checkpoint_dir / "model_index.json", "w") as f:
-            json.dump(content, f)
+        write_checkpoint_files(checkpoint_dir, {MODEL_INDEX_FILE: content})
 
     def _loaded_pipeline(self, tmp_path) -> Cosmos3OmniMoTPipeline:
         _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
         pipeline = _bare_pipeline()
-        pipeline.load_standard_components(
-            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
-        )
+        _load_scheduler(pipeline, tmp_path)
         return pipeline
 
     def test_checkpoint_declared_true(self, tmp_path):
         self._write_model_index(tmp_path, {"default_use_system_prompt": True})
         pipeline = self._loaded_pipeline(tmp_path)
 
-        assert pipeline.default_use_system_prompt is True
+        assert pipeline.resolver.config().prompt.use_system_prompt is True
         # The published spec default stays None ("model decides"): the executor
         # materializes spec defaults into every request, so publishing the
         # checkpoint boolean here would destroy "unset" before forward() could
-        # resolve it by mode. The checkpoint value lives on the pipeline.
+        # resolve it by mode. The checkpoint value lives in the resolver.
         assert pipeline.extra_param_specs["use_system_prompt"].default is None
         # The shared spec table must stay untouched.
         from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
 
         assert COSMOS3_EXTRA_SPECS["use_system_prompt"].default is None
 
-    def test_missing_model_index_keeps_false(self, tmp_path):
-        pipeline = self._loaded_pipeline(tmp_path)
-        assert pipeline.default_use_system_prompt is False
-        assert pipeline.extra_param_specs["use_system_prompt"].default is None
-
-    def test_model_index_without_field_keeps_false(self, tmp_path):
+    def test_undeclared_system_prompt_is_a_load_error(self, tmp_path):
+        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
+            self._loaded_pipeline(tmp_path)
         self._write_model_index(tmp_path, {"_class_name": "Cosmos3OmniPipeline"})
+        _write_trained_config(tmp_path, None)
+        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
+            self._loaded_pipeline(tmp_path)
+
+    def test_rejected_settings_fail_before_the_weights_are_read(self, tmp_path):
+        # No transformer directory exists, so reaching the weights would raise
+        # FileNotFoundError; the settings error comes first.
+        _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
+            _bare_pipeline().load_transformer_weights(str(tmp_path))
+
+    def test_components_need_the_settings_first(self, tmp_path):
+        _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        _write_trained_config(tmp_path, False)
+        with pytest.raises(RuntimeError, match="has not been loaded"):
+            _bare_pipeline(resolver=None).load_standard_components(
+                str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
+            )
+
+    @pytest.mark.parametrize("trained", [False, True])
+    def test_trained_config_wins_over_model_index(self, tmp_path, trained):
+        self._write_model_index(tmp_path, {"default_use_system_prompt": not trained})
+        _write_trained_config(tmp_path, trained)
         pipeline = self._loaded_pipeline(tmp_path)
-        assert pipeline.default_use_system_prompt is False
+        assert pipeline.resolver.config().prompt.use_system_prompt is trained
+
+    def test_trained_config_without_key_keeps_model_index(self, tmp_path):
+        self._write_model_index(tmp_path, {"default_use_system_prompt": True})
+        _write_trained_config(tmp_path, None)
+        pipeline = self._loaded_pipeline(tmp_path)
+        assert pipeline.resolver.config().prompt.use_system_prompt is True
 
     def _captured_use_system_prompt(self, pipeline, extra_params):
         captured = {}
@@ -1188,15 +1228,11 @@ class TestSystemPromptResolution:
     def test_resolution_precedence(
         self, requested, checkpoint_default, is_v2v, is_transfer, expected
     ):
-        assert (
-            _resolve_use_system_prompt(
-                requested,
-                checkpoint_default=checkpoint_default,
-                is_v2v=is_v2v,
-                is_transfer=is_transfer,
-            )
-            is expected
+        resolver = bare_resolver(QWEN3_RECIPE.name, use_system_prompt=checkpoint_default)
+        resolved = resolver.request(
+            RequestParameters(is_v2v=is_v2v, is_transfer=is_transfer, use_system_prompt=requested)
         )
+        assert resolved.use_system_prompt is expected
 
 
 class TestRequestCompatibility:
@@ -1342,8 +1378,7 @@ class TestAudioWeightPresenceGuard:
 
 class TestRegistryDispatch:
     def test_model_index_class_name_dispatches(self, tmp_path):
-        with open(tmp_path / "model_index.json", "w") as f:
-            json.dump({"_class_name": "Cosmos3OmniPipeline"}, f)
+        write_checkpoint_files(tmp_path, {MODEL_INDEX_FILE: {"_class_name": "Cosmos3OmniPipeline"}})
         assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "Cosmos3OmniMoTPipeline"
 
     def test_hf_id_registered(self):
@@ -1385,10 +1420,10 @@ class TestDistilledForwardDefaults:
             pipeline.forward(
                 prompt="a distilled render",
                 negative_prompt="",
-                num_frames=COSMOS3_720P_PARAMS["num_frames"],
+                num_frames=QWEN3_VIDEO_DEFAULTS["num_frames"],
                 seed=1,
                 max_sequence_length=8,
-                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+                frame_rate=QWEN3_VIDEO_DEFAULTS["frame_rate"],
                 use_duration_template=False,
                 use_resolution_template=False,
                 use_system_prompt=False,
@@ -1403,12 +1438,12 @@ class TestDistilledForwardDefaults:
         assert f"num_inference_steps={len(DISTILLED_SIGMAS)}" in dims
         assert f"guidance_scale={DISTILLED_GUIDANCE_SCALE:.2f}" in dims
         # The base video table's values must not have been substituted.
-        assert f"num_inference_steps={COSMOS3_720P_PARAMS['num_inference_steps']}" not in dims
-        assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" not in dims
+        assert f"num_inference_steps={QWEN3_VIDEO_DEFAULTS['num_inference_steps']}" not in dims
+        assert f"guidance_scale={QWEN3_VIDEO_DEFAULTS['guidance_scale']:.2f}" not in dims
 
     def test_base_checkpoint_still_uses_the_mode_table(self, monkeypatch):
-        """The checkpoint-first step must be a no-op for a base checkpoint:
-        ``generation_default_overrides()`` is empty, so the mode tables win."""
+        """The checkpoint-first step must be a no-op for a base checkpoint: there is no
+        fixed schedule, so the mode tables win."""
         import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as mod
 
         pipeline = _bare_pipeline()
@@ -1429,20 +1464,20 @@ class TestDistilledForwardDefaults:
             pipeline.forward(
                 prompt="a base render",
                 negative_prompt="",
-                num_frames=COSMOS3_720P_PARAMS["num_frames"],
+                num_frames=QWEN3_VIDEO_DEFAULTS["num_frames"],
                 num_inference_steps=None,
                 guidance_scale=None,
                 seed=1,
                 max_sequence_length=8,
-                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+                frame_rate=QWEN3_VIDEO_DEFAULTS["frame_rate"],
                 use_duration_template=False,
                 use_resolution_template=False,
                 use_system_prompt=False,
                 use_guardrails=False,
             )
         dims = next(line for line in lines if "Cosmos3 generation dims" in line)
-        assert f"num_inference_steps={COSMOS3_720P_PARAMS['num_inference_steps']}" in dims
-        assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" in dims
+        assert f"num_inference_steps={QWEN3_VIDEO_DEFAULTS['num_inference_steps']}" in dims
+        assert f"guidance_scale={QWEN3_VIDEO_DEFAULTS['guidance_scale']:.2f}" in dims
 
 
 class TestSystemPromptSurvivesDefaultMerge:
@@ -1458,8 +1493,7 @@ class TestSystemPromptSurvivesDefaultMerge:
         from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor
         from tensorrt_llm.visual_gen.params import VisualGenParams
 
-        pipeline = _bare_pipeline()
-        pipeline.default_use_system_prompt = False  # base checkpoint
+        pipeline = _bare_pipeline()  # base checkpoint: no system prompt
         pipeline.derive_output_size_from_reference = False
         executor = object.__new__(DiffusionExecutor)
         executor.pipeline = pipeline

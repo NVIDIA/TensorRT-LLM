@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,58 +17,158 @@
 name: L0-Test
 on:
   workflow_dispatch:
-      inputs:
-          sha:
-            description: 'commit sha'
-            required: true
-          test_result:
-            description: 'test result'
-            required: false
-          test_results_url:
-            description: 'test results url'
-            required: true
+    inputs:
+      sha:
+        description: 'commit sha'
+        required: true
+      test_result:
+        description: 'test result'
+        required: false
+      test_results_url:
+        description: 'test results url'
+        required: true
+
+permissions:
+  statuses: write
+
 jobs:
   Upload-Test:
     name: Upload test results
     runs-on: linux-amd64-cpu4
-    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 15
+    if: github.repository == 'NVIDIA/TensorRT-LLM' && github.event_name == 'workflow_dispatch'
     steps:
       - name: Update commit status
         uses: actions/github-script@v8
+        env:
+          COMMIT_SHA: ${{ inputs.sha }}
+          TEST_RESULT: ${{ inputs.test_result }}
+          TEST_RESULTS_URL: ${{ inputs.test_results_url }}
         with:
           script: |
-            state = 'pending'
-            description = 'collecting test results'
-            if ('${{ github.event.inputs.test_result }}' == 'success') {
-              state = 'success'
-              description = 'test passed, collecting test results'
+            const sha = process.env.COMMIT_SHA || '';
+            if (!/^[0-9a-f]{40}$/i.test(sha)) {
+              core.setFailed(`Invalid commit SHA: ${sha}`);
+              return;
             }
-            github.rest.repos.createCommitStatus({
+            const rawUrl = process.env.TEST_RESULTS_URL || '';
+            let parsed;
+            try {
+              parsed = new URL(rawUrl);
+            } catch {
+              core.setFailed('Invalid test_results_url.');
+              return;
+            }
+            const pathSegments = parsed.pathname.split('/').slice(1);
+            const validUrl =
+              parsed.href === rawUrl &&
+              parsed.protocol === 'https:' &&
+              parsed.hostname === 'edge.urm.nvidia.com' &&
+              !parsed.port &&
+              !parsed.username &&
+              !parsed.password &&
+              !rawUrl.includes('?') &&
+              !rawUrl.includes('#') &&
+              /^\/artifactory\/sw-tensorrt-llm-generic-local\/redacted\/llm-artifacts\/[A-Za-z0-9._/-]+\/test-results\.tar\.gz$/.test(parsed.pathname) &&
+              !pathSegments.includes('') &&
+              !pathSegments.includes('.') &&
+              !pathSegments.includes('..');
+            if (!validUrl) {
+              core.setFailed('test_results_url is outside the allowed Artifactory prefix.');
+              return;
+            }
+            const testResult = (process.env.TEST_RESULT || '').toLowerCase();
+            const state = testResult === 'success' ? 'success' : 'pending';
+            const description =
+              testResult === 'success'
+                ? 'test passed, collecting test results'
+                : 'collecting test results';
+            await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               context: 'blossom-ci',
-              sha: '${{ github.event.inputs.sha }}',
-              target_url: 'https://github.com/NVIDIA/TensorRT-LLM/actions/runs/' + context.runId,
-              state: state,
-              description: description,
-            })
+              sha,
+              target_url: `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              state,
+              description,
+            });
+
       - name: Collect test result
-        run: rm -rf results && mkdir results && cd results && curl --user svc_tensorrt:${{ secrets.ARTIFACTORY_TOKEN }} -L ${{ github.event.inputs.test_results_url }} | tar -xz
+        env:
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+          TEST_RESULTS_URL: ${{ inputs.test_results_url }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ARTIFACTORY_TOKEN}" ]; then
+            echo "::error::ARTIFACTORY_TOKEN is not set"
+            exit 1
+          fi
+          if [[ ! "${TEST_RESULTS_URL}" =~ ^https://edge\.urm\.nvidia\.com/artifactory/sw-tensorrt-llm-generic-local/redacted/llm-artifacts/[A-Za-z0-9._/-]+/test-results\.tar\.gz$ ]] ||
+             [[ "${TEST_RESULTS_URL}" =~ (^|/)\.\.?(/|$) ]] ||
+             [[ "${TEST_RESULTS_URL#https://}" =~ // ]]; then
+            echo "::error::test_results_url is outside the allowed Artifactory prefix"
+            exit 1
+          fi
+          rm -rf results
+          mkdir -p results
+          archive="${RUNNER_TEMP}/test-results.tar.gz"
+          netrc="${RUNNER_TEMP}/artifactory.netrc"
+          trap 'rm -f "${netrc}" "${archive}"' EXIT
+          (
+            umask 077
+            printf 'machine edge.urm.nvidia.com\nlogin svc_tensorrt\npassword %s\n' "${ARTIFACTORY_TOKEN}" > "${netrc}"
+          )
+          curl -fsSL \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --max-redirs 5 \
+            --netrc-file "${netrc}" \
+            -o "${archive}" \
+            -- "${TEST_RESULTS_URL}"
+          rm -f "${netrc}"
+          tar -tzvf "${archive}" | awk 'substr($1, 1, 1) !~ /^[-d]$/ { print "Unsupported archive entry: " $0 > "/dev/stderr"; exit 1 }'
+          tar -tzf "${archive}" | awk '/^\// || /(^|\/)\.\.(\/|$)/ { print "Unsafe archive path: " $0 > "/dev/stderr"; exit 1 }'
+          tar --no-same-owner --no-same-permissions -xzf "${archive}" -C results
+
       - name: Create test summary
         id: test_summary
-        uses: test-summary/action@dist
+        # v2.6
+        uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5
         with:
           paths: results/**/results*.xml
+
       - name: Update commit status
         uses: actions/github-script@v8
+        env:
+          COMMIT_SHA: ${{ inputs.sha }}
+          TEST_RESULT: ${{ inputs.test_result }}
+          PASSED_COUNT: ${{ steps.test_summary.outputs.passed }}
+          FAILED_COUNT: ${{ steps.test_summary.outputs.failed }}
+          SKIPPED_COUNT: ${{ steps.test_summary.outputs.skipped }}
         with:
           script: |
-            github.rest.repos.createCommitStatus({
+            const sha = process.env.COMMIT_SHA || '';
+            const passed = Number(process.env.PASSED_COUNT) || 0;
+            const failed = Number(process.env.FAILED_COUNT) || 0;
+            const skipped = Number(process.env.SKIPPED_COUNT) || 0;
+            const rawResult = (process.env.TEST_RESULT || '').toLowerCase();
+            const validStates = new Set(['error', 'failure', 'pending', 'success']);
+            let state;
+            if (failed > 0) {
+              state = 'failure';
+            } else if (!rawResult) {
+              state = 'success';
+            } else if (validStates.has(rawResult)) {
+              state = rawResult;
+            } else {
+              state = 'failure';
+            }
+            await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               context: 'blossom-ci',
-              sha: '${{ github.event.inputs.sha }}',
-              target_url: 'https://github.com/NVIDIA/TensorRT-LLM/actions/runs/' + context.runId,
-              state: '${{ steps.test_summary.outputs.failed > 0 && 'failure' || github.event.inputs.test_result || 'success' }}',
-              description: '${{ steps.test_summary.outputs.passed }} passed, ${{ steps.test_summary.outputs.failed }} failed, ${{ steps.test_summary.outputs.skipped }} skipped',
-            })
+              sha,
+              target_url: `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              state,
+              description: `${passed} passed, ${failed} failed, ${skipped} skipped`,
+            });

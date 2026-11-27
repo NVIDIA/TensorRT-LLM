@@ -10,7 +10,7 @@ from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
-from tensorrt_llm.sampling_params import LogitsProcessor, LogprobMode
+from tensorrt_llm.sampling_params import EmbeddingBias, LogitsProcessor, LogprobMode
 from tensorrt_llm.scheduling_params import SchedulingParams
 
 
@@ -43,6 +43,7 @@ class PythonRequestInputs:
     kv_hints: KvHintsSnapshot | None = None
     watermarking: bool | None = None
     prompt_trimmed_prefix: int = 0
+    sparse_embedding_bias: EmbeddingBias | None = None
 
     @classmethod
     def from_native_request(cls, request: Request) -> "PythonRequestInputs":

@@ -15,6 +15,7 @@ from ..attention.backends.interface import PredefinedAttentionMask
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.fla.chunk import chunk_gated_delta_rule
+from ..modules.fla.gdn_metadata import GDNMambaMetadata
 from ..modules.linear import Linear
 from ..modules.mamba.causal_conv1d import causal_conv1d_fn
 from ..modules.mamba.fuse_elementwise_ops import (
@@ -157,6 +158,9 @@ class PplxDeciderModel(Qwen3NextModel):
 @register_auto_model("PplxDeciderForDecision")
 class PplxDeciderForDecision(DecoderModelForCausalLM[PplxDeciderModel, Qwen3NextConfig]):
     """Return raw float32 decision logits with shape ``[batch, 255]``."""
+
+    # The GDN layers read the GDN Mamba metadata, whichever cache manager serves the model.
+    mamba_metadata_cls = GDNMambaMetadata
 
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
         nn.Module.__init__(self)
