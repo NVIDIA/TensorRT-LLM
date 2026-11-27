@@ -20,6 +20,7 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     INPLACE_MAX_TOKENS,
     RANK4_GEOMETRY,
@@ -28,7 +29,15 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_g
 from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
 from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 
-assert torch.cuda.is_available(), "flashinfer_chunk_gdn_inforward_split requires a CUDA device"
+# The op runs FlashInfer's chunked GDN kernels on the GPUs the family serves (its `ARCHS`) and
+# needs a CUDA 13 torch (FlashInfer raises otherwise). Checked before any operand is built.
+_CUDA_MAJOR = int((torch.version.cuda or "0").split(".")[0])
+pytestmark = pytest.mark.skipif(
+    _CUDA_MAJOR < 13
+    or not torch.cuda.is_available()
+    or not archs.served(torch.cuda.get_device_capability()),
+    reason=f"flashinfer_chunk_gdn_inforward_split runs on {archs.served_names()} with CUDA >= 13",
+)
 
 DEV = "cuda"
 #: The band of flashinfer_chunk_gated_delta_rule against fp64 (its test's constants).

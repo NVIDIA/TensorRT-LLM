@@ -20,10 +20,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (
     qsa_paged_sparse_gqa,
 )
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     modeling as M,
 )
@@ -176,10 +176,24 @@ def test_grouped_fp8_context_pass_is_within_the_band(monkeypatch) -> None:
         )
         is None
     )
+    # `_call` falls back to the per-row kernel where the row-tile pass declines, so the outputs
+    # alone cannot show which launch took the pass: record what the pass answers each launch.
+    answered = []
+    rowtile = M._sparse_gqa_rowtile
+
+    def recording(core, kv, q, *args):
+        out = rowtile(core, kv, q, *args)
+        answered.append((q.shape[0], out is not None))
+        return out
+
+    monkeypatch.setattr(M, "_sparse_gqa_rowtile", recording)
     # The second group (47 pages) is past the scratch on its own too, so only the first takes
     # the row-tile pass; both answer within the band.
     grouped = torch.cat([_call(step, lo, hi, n) for lo, hi, n in groups])
+    assert answered == [(500, True), (100, False)]
+    answered.clear()
     per_row = _call(step, 0, num_rows, pages)
+    assert answered == [(600, False)]
     want = qsa_paged_sparse_gqa.reference(
         q=step["q"],
         k_cache=step["kv"].k,
