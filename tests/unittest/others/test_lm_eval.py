@@ -1641,6 +1641,7 @@ def test_e2e_windowed_matches_final_score(monkeypatch):
 
 from tensorrt_llm.evaluate.post_processing import (  # noqa: E402
     extract_kimi_k3_mmmu_answer,
+    extract_mmmu_answer,
     strip_thinking,
     strip_thinking_and_extract_mmmu_answer,
 )
@@ -1776,6 +1777,38 @@ def test_k3_channel_extracting_to_nothing_falls_back_to_cascade():
     """
     out = _k3_output("Elimination shows the answer is (B).", "** **")
     assert extract_kimi_k3_mmmu_answer(out) == "B"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("The answer is clearly (B).", "The answer is clearly (B)."),
+        ("The answer is approximately 12.5 cm.", "The answer is approximately 12.5 cm."),
+        ("Answer: about 3 kg", "Answer: about 3 kg"),
+        ("The answer is (C) 50.4 kip.", "C"),
+        ("the answer is b", "B"),
+    ],
+)
+def test_mmmu_answer_phrase_ignores_letters_inside_words(text, expected):
+    """``answer is`` followed by a word must not yield that word's first letter.
+
+    Text without a standalone letter is passed through for lm-eval's parser.
+    """
+    assert extract_mmmu_answer(text) == expected
+
+
+@pytest.mark.parametrize(
+    "last_line, expected",
+    [
+        ("The sample was collected in the USA.", "The sample was collected in the USA."),
+        ("So the final choice is (D).", "D"),
+        ("Therefore\n\nE", "E"),
+    ],
+)
+def test_mmmu_trailing_option_ignores_last_letter_of_word(last_line, expected):
+    """A long response ending in a word such as ``USA.`` is not option A."""
+    text = "Step-by-step reasoning about the figure. " * 4 + "\n" + last_line
+    assert extract_mmmu_answer(text) == expected
 
 
 # ===========================================================================
