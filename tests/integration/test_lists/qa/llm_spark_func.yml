@@ -14,7 +14,6 @@ llm_spark_func:
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-8b-fp8-Qwen3/nvidia-Qwen3-8B-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-8b-nvfp4-Qwen3/nvidia-Qwen3-8B-NVFP4]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-8B-bf16-Qwen3/Qwen3-8B]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_1gpu[cutlass-one_model]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-14b-fp8-Qwen3/nvidia-Qwen3-14B-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-14b-nvfp4-Qwen3/nvidia-Qwen3-14B-NVFP4]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-14B-bf16-Qwen3/Qwen3-14B]
@@ -27,21 +26,13 @@ llm_spark_func:
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3.6-35B-A3B-nvfp4-Qwen3.6-35B-A3B-NVFP4]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4_no_mtp
   - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
   - test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
   - examples/serve/test_serve.py::test_nemotron3_super_120b_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestNemotron35Lightning::test_nvfp4_cutedsl_mtp3_chunked_prefill
   - examples/serve/test_serve.py::test_nemotron35_lightning_30b[nvfp4]
   - examples/serve/test_serve.py::test_nemotron35_lightning_30b[bf16]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_fp8
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_auto_dtype
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-3-Nano-4B-fp8-NVIDIA-Nemotron-3-Nano-4B-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-3-Nano-4B-bf16-NVIDIA-Nemotron-3-Nano-4B-BF16]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano4B::test_fp8
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano4B::test_auto_dtype
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8_27B::test_nvfp4
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_on]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_off]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_streaming]
@@ -58,11 +49,5 @@ llm_spark_func:
         lte: 2
   tests:
   - test_e2e.py::test_ptp_quickstart_advanced_multinode[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-tp2]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass_eagle3]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass_cuda_graph_overlap]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass_attention_dp]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8_27B::test_auto_dtype_2gpus
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_tp2_cutedsl
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_tp2_cutlass
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_2gpus

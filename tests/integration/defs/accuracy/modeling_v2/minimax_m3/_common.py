@@ -62,7 +62,7 @@ skip_not_sm107 = pytest.mark.skipif(
     reason="these MiniMax-M3 modeling_v2 targets are certified on sm_107 only",
 )
 
-# The chat-GSM8K acceptance floors of the in-tree test on an NVFP4 KV cache (test_llm_api_pytorch.TestMiniMaxM3).
+# The chat-GSM8K acceptance floors on an NVFP4 KV cache.
 MIN_ACCEPTANCE_RATE = 0.78
 MIN_ACCEPTANCE_LENGTH = 3.3
 
