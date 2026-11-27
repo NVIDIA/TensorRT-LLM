@@ -1227,6 +1227,11 @@ class DecoderCudaGraphs:
             # Dummy warmup requests carry no sampling params, so the greedy pass
             # needs no override while the advanced one has to force the flag.
             variants = self._sampling_variants_to_capture(temperature_only_graphs)
+            if getattr(self._metadata.spec_metadata, "merged_sampling_graph", False):
+                # One graph per key: the sampling variant's structure, recording the greedy
+                # path under a conditional node a device-side predicate selects at replay.
+                variants = frozenset({"merged"})
+                _capture_variant("merged greedy+sampling", force_non_greedy=True)
             if "greedy" in variants:
                 _capture_variant("greedy")
             if "advanced" in variants:

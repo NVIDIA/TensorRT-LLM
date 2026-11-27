@@ -48,6 +48,7 @@ from .interface import (
     SpecMetadata,
     SpecWorkerBase,
 )
+from . import graph_conditional
 from .vocab_parallel import markov_sampled_chain, tp_pair_exchange
 
 if TYPE_CHECKING:
@@ -1154,6 +1155,37 @@ class DSv4DSparkWorker(SpecWorkerBase):
         vocab_sharded: bool = False,
         prepare: Optional[tuple] = None,
     ):
+        """``_fused_accept_impl``; in a merged greedy/sampling CUDA graph, both variants recorded
+        under conditional nodes, ``spec_metadata.greedy_pred_dev`` selecting one at replay."""
+        if vocab_sharded or not graph_conditional.merged_sampling_active(spec_metadata):
+            return self._fused_accept_impl(
+                logits, attn_metadata, spec_metadata, vocab_sharded, prepare
+            )
+
+        def variant(all_greedy: bool):
+            def run():
+                with graph_conditional.sampling_variant_override(spec_metadata, all_greedy):
+                    return self._fused_accept_impl(
+                        logits, attn_metadata, spec_metadata, vocab_sharded, prepare
+                    )
+
+            return run
+
+        return graph_conditional.graph_if_else(
+            spec_metadata.greedy_pred_dev,
+            variant(True),
+            variant(False),
+            host_pred=bool(spec_metadata.is_all_greedy_sample),
+        )
+
+    def _fused_accept_impl(
+        self,
+        logits: torch.Tensor,
+        attn_metadata,
+        spec_metadata: "DSparkSpecMetadata",
+        vocab_sharded: bool = False,
+        prepare: Optional[tuple] = None,
+    ):
         """``sample_and_accept_draft_tokens`` through ``dspark_strict_accept`` (which also takes
         the greedy argmax), or None where it does not apply (``_fused_accept_applies``).
 
@@ -1790,6 +1822,13 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if accepted is None:
             if vocab_sharded_logits:
                 raise RuntimeError("Vocabulary-sharded target logits need the fused acceptance")
+            if graph_conditional.merged_sampling_active(
+                spec_metadata
+            ) and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "merged greedy/sampling CUDA graphs need DSpark's fused acceptance "
+                    f"(e.g. no guided decoding): unset {graph_conditional.MERGE_SAMPLING_GRAPHS_ENV}"
+                )
             accepted = self.sample_and_accept_draft_tokens(logits, attn_metadata, spec_metadata)
         accepted_tokens, num_accepted_tokens = accepted[:2]
         prepared = accepted[2:] or None

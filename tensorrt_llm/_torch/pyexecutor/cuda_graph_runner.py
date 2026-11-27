@@ -28,6 +28,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..nccl_window_graph import (nccl_window_graph_capture,
                                  release_nccl_window_graph_owner)
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from ..speculative import graph_conditional
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
@@ -164,7 +165,13 @@ class KeyType(NamedTuple):
 
 
 def sampling_variant(spec_metadata: Optional[SpecMetadata]) -> str:
-    """The one-engine sampling variant of a batch, as cuda_graph_config.sampling_variants names it."""
+    """The one-engine sampling variant of a batch, as cuda_graph_config.sampling_variants names it.
+
+    With merged greedy/sampling graphs every batch replays the one merged graph, whose key
+    is the advanced variant's; the graph picks the greedy or sampling path on the device.
+    """
+    if getattr(spec_metadata, "merged_sampling_graph", False):
+        return "advanced"
     if getattr(spec_metadata, "is_all_greedy_sample", True):
         return "greedy"
     # The one-engine fast paths' flag, or the vocabulary-shard sampler's.
@@ -1059,7 +1066,8 @@ class CUDAGraphRunner:
         # DP the agreement below then takes every rank's step eager with it.
         can_run_cuda_graph = (
             self._can_run_cuda_graph_batch(batch) and
-            (spec_metadata is None or self.config.sampling_variants is None or
+            (spec_metadata is None or self.config.sampling_variants is None
+             or getattr(spec_metadata, "merged_sampling_graph", False) or
              sampling_variant(spec_metadata) in self.config.sampling_variants))
         if can_run_cuda_graph and getattr(
                 attn_metadata, "beam_shared_prefix_enabled", False) is True:
@@ -1321,8 +1329,15 @@ class CUDAGraphRunner:
             # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
             # This also lets us initialize states in the attn_metadata and
             # resize the shared attention workspace before any graph is captured.
+            # A merged greedy/sampling graph is captured once, so the warmup runs both
+            # of its variants: neither may meet lazily built state while capturing.
+            merged_sampling = getattr(initial_inputs.get("spec_metadata", None),
+                                      "merged_sampling_graph", False)
+
             def run_warmup():
-                result = forward_fn(capture_inputs)
+                with (graph_conditional.warm_up_both_branches()
+                      if merged_sampling else contextlib.nullcontext()):
+                    result = forward_fn(capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
                 _restore_spec_decode_capture_state(attn_metadata,

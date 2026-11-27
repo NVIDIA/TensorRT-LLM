@@ -54,6 +54,7 @@ from tensorrt_llm.llmapi.llm_args import (AdvancedSamplingMode,
 
 from ...watermark.sampling import gumbel_sample_from_probs, keyed_recovery
 from ..pyexecutor.sampler import penalties as penalty_ops
+from . import graph_conditional
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import (GREEDY_TEMPERATURE_THRESHOLD,
@@ -854,6 +855,12 @@ class SpecMetadata:
     is_all_temperature_only: bool = False
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
+    # Merged greedy/sampling CUDA graphs (graph_conditional): the sampling sites record
+    # both variants under conditional nodes and ``greedy_pred_dev`` -- one scalar bool,
+    # true when the whole batch is greedy -- selects the executed one at replay. Every
+    # graph view shares the one tensor.
+    merged_sampling_graph: bool = False
+    greedy_pred_dev: Optional[torch.Tensor] = None
     # Whether this step's target logits are this rank's vocabulary shard (set
     # by SpecWorkerBase.target_logits), so the worker samples the target
     # tokens with a cross-rank argmax (Gumbel-max for the temperature rows of
@@ -1583,6 +1590,24 @@ class SpecMetadata:
         """
         self.prepare_rejection_sampling_buffers()
 
+    def prepare_greedy_pred_buffer(self) -> None:
+        """Allocate the device-side "all requests greedy" predicate of merged graphs.
+
+        No-op unless ``merged_sampling_graph`` is set. Allocated once before the graph
+        views are copied, so every view and the live metadata share one tensor.
+        """
+        if self.merged_sampling_graph and self.greedy_pred_dev is None:
+            self.greedy_pred_dev = torch.ones((), dtype=torch.bool, device='cuda')
+
+    def write_greedy_pred(self) -> None:
+        """Publish this step's all-greedy decision to the device predicate.
+
+        An asynchronous fill on the current stream, ordered after the previous replay
+        and before this step's, so a replayed merged graph reads the batch's own value.
+        """
+        if self.greedy_pred_dev is not None:
+            self.greedy_pred_dev.fill_(bool(self.is_all_greedy_sample))
+
     def create_cuda_graph_metadata(self, max_batch_size: int):
         """
         Creates metadata for CUDA graph execution.
@@ -1597,6 +1622,7 @@ class SpecMetadata:
         self.prepare_penalty_buffers()
         self.prepare_logit_edit_buffers()
         self.prepare_watermark_buffers()
+        self.prepare_greedy_pred_buffer()
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
@@ -1779,6 +1805,10 @@ class SpecMetadata:
 
         per_request_normalized, per_request_slot_ids = (
             self._scan_one_model_sampling(requests))
+        # A merged greedy/sampling graph reads the batch's all-greedy decision on the
+        # device; the group-synchronized value the scan honors is final here.
+        self.prepare_greedy_pred_buffer()
+        self.write_greedy_pred()
 
         tokens_per_request = (self.max_total_draft_tokens + 1 if
                               self.is_spec_dec_tree else self.max_draft_len + 1)
@@ -3021,7 +3051,7 @@ class SpecWorkerBase(nn.Module, ABC):
         return edited
 
     def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
-                             batch_size, spec_metadata):
+                                  batch_size, spec_metadata):
         """
         Accept draft tokens with optional rejection sampling support.
 

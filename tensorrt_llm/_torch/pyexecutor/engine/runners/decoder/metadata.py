@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     RuntimeHooks,
     runtime_hooks_of,
 )
-from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
+from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata, graph_conditional
 from tensorrt_llm._torch.speculative.interface import supports_sharded_target_sampling
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -374,6 +375,30 @@ def captures_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mappi
     )
 
 
+def merged_sampling_graphs_blocker(metadata: SpecMetadata, config: DecoderRunnerConfig) -> str | None:
+    """Why this engine cannot merge its greedy and sampling graphs, or None when it can.
+
+    Merged graphs record the greedy and the sampling variant of DSpark's fused acceptance
+    under conditional nodes (``graph_conditional``); any other engine keeps two graphs.
+    """
+    from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
+
+    if not graph_conditional.conditional_nodes_available():
+        return "this torch cannot capture CUDA graph conditional nodes"
+    if type(metadata) is not DSparkSpecMetadata:
+        return f"{type(metadata).__name__} has no conditional sampling sites"
+    # The branches are rank-local launches with no collective, so ranks may take different ones.
+    if os.environ.get("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS", "0") not in ("", "0", "0.0"):
+        return "forced acceptance mutates host RNG state per traced branch"
+    if getattr(config.spec_config, "enable_penalty", False):
+        return "occurrence penalties are applied per variant outside the conditional sites"
+    if metadata.use_rejection_sampling:
+        return "rejection sampling takes the unmerged acceptance path"
+    if config.samples_from_vocab_shards:
+        return "vocabulary-sharded sampling takes the unmerged acceptance path"
+    return None
+
+
 def create_spec_metadata(
     config: DecoderRunnerConfig,
     pretrained_config: object,
@@ -398,6 +423,19 @@ def create_spec_metadata(
         listed = getattr(config.cuda_graph_config, "sampling_variants", None)
         metadata.greedy_graphs = listed is None or "greedy" in listed
         metadata.shard_temperature_only_graphs = listed is None or "temperature_only" in listed
+        if graph_conditional.merge_sampling_graphs_requested():
+            blocker = merged_sampling_graphs_blocker(metadata, config)
+            if blocker is None:
+                metadata.merged_sampling_graph = True
+                logger.info(
+                    "Merged greedy/sampling CUDA graphs: one graph per key, selected by a "
+                    "device-side predicate"
+                )
+            else:
+                logger.warning(
+                    f"{graph_conditional.MERGE_SAMPLING_GRAPHS_ENV}=1 ignored, keeping separate "
+                    f"greedy and sampling graphs: {blocker}"
+                )
     return metadata
 
 
