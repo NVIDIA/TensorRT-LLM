@@ -511,10 +511,12 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     FLASHINFER_REPLAY_RING_SIZE,
     flashinfer_cached_replay_update,
 )
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
+from tensorrt_llm._torch.speculative.vocab_parallel import vocab_parallel_argmax_enabled
 from tensorrt_llm._torch.utils import (
     ActivationType,
     is_gdn_replay_enabled,
@@ -7574,15 +7576,40 @@ class MTPLayer:
     def __init__(self, core: Qwen4ExpDefaultModelingV2, logits_processor) -> None:
         self.core = core
         self.logits_processor = logits_processor
+        # The spec worker when it samples with the TP key exchange (`_sharded_head`).
+        self.worker = None
+        # The engine step's `spec_metadata`, set by the shell before the worker runs.
+        self.spec_metadata = None
 
     def __call__(self, *args, **kwargs) -> torch.Tensor:
         return self.forward(*args, **kwargs)
+
+    def _sharded_head(self, lm_head, rows: int) -> bool:
+        """Whether the draft logits may stay this rank's vocabulary shard under attention TP:
+        the worker then takes the greedy draft tokens through the TP key exchange (row maxima
+        and one exchange, the gathered head's argmax with ties to the lowest id) instead of
+        the all-gather. Not under advanced draft sampling or guided decoding, which read the
+        gathered logits. Host values every rank shares, as the FP8 target decides it."""
+        worker, md = self.worker, self.spec_metadata
+        if worker is None or md is None:
+            return False
+        exchange = worker.key_exchange
+        return bool(
+            exchange is not None
+            and not md.wants_advanced_draft_sampling
+            and worker.guided_decoder is None
+            and 1 <= rows <= exchange.MAX_ROWS
+            and lm_head.tp_mode == TensorParallelMode.COLUMN
+            and lm_head.gather_output
+            and lm_head.padding_size == 0
+        )
 
     def shared_head(self, hidden_states, lm_head, attn_metadata, return_context_logits):
         """The module's own head: its stack-final hyper-connection mixer (a gated mixer with
         its own parameters, not a plain RMS norm) over the grouped norm, then the trunk's
         `lm_head` through the shell's logits processor (vocab-parallel and gathered under
-        attention TP). The norm and the mixer are the trunk's stack-final site's."""
+        attention TP; this rank's bf16 vocabulary shard where `_sharded_head` allows). The norm
+        and the mixer are the trunk's stack-final site's."""
         core = self.core
         M = core._mtp
         _, normed = qwen4_exp_hc_inject_norm(
@@ -7591,6 +7618,8 @@ class MTPLayer:
         final, _ = _hc_mixer(core, normed, M.fhc_first, M.fhc_up, False)
         draft_head = getattr(core, "draft_head", None)
         if draft_head is None:
+            if self._sharded_head(lm_head, final.shape[0]):
+                return lm_head(final, gather_output=False)
             return self.logits_processor.forward(
                 final, lm_head, attn_metadata, return_context_logits
             )
@@ -8295,17 +8324,33 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(self.spec_config)
             self.spec_decode_fast_paths = True
             self.runtime_hooks = RuntimeHooks(loop_on_execution_stream=True)
+            # Under attention TP the TP group's key exchange, as the FP8 target builds it: the
+            # worker then takes the target tokens of greedy and temperature-only batches, and
+            # the greedy draft tokens, from this rank's vocabulary shard (argmax or Gumbel-max
+            # in one exchange) instead of the all-gather. Collective over the TP group (every
+            # rank constructs the model in step); None at one rank, under attention DP, without
+            # peer memory or with `TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0`.
+            key_exchange = None
+            if not self.one_rank and vocab_parallel_argmax_enabled():
+                from tensorrt_llm._torch.distributed import ll_exchange
+
+                key_exchange = ll_exchange.create_tp_key_exchange(
+                    model_config.mapping, model_config.max_num_tokens
+                )
             self.spec_worker = get_spec_worker(
                 self.spec_config,
                 model_config,
                 model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+                key_exchange=key_exchange,
                 spec_decode_fast_paths=self.spec_decode_fast_paths,
             )
             assert self.spec_worker is not None, (
                 f"the engine resolved no spec worker for spec_dec_mode "
                 f"{self.spec_config.spec_dec_mode!r}"
             )
+            if getattr(self.spec_worker, "key_exchange", None) is not None:
+                self.draft_model.mtp_layers[0].worker = self.spec_worker
             self.spec_worker.set_draft_model(self.draft_model)
             # The PLE pools and the QSA side caches are written per verify row and nothing the
             # runtime owns rolls them back; the worker calls this after its draft loop, inside
@@ -8408,6 +8453,17 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 True,
                 widen=not verify_argmax_only,
             )
+        elif getattr(self.spec_worker, "key_exchange", None) is not None:
+            # This rank's vocabulary shard for a greedy or temperature-only batch (the worker
+            # marks `spec_metadata.sharded_target_logits`), else the gathered fp32 logits.
+            logits = self.spec_worker.target_logits(
+                nn.functional.embedding(spec_metadata.gather_ids, final),
+                self.lm_head,
+                self.logits_processor,
+                attn_metadata,
+                spec_metadata,
+                self.draft_model,
+            )
         else:
             logits = self.logits_processor.forward(
                 nn.functional.embedding(spec_metadata.gather_ids, final),
@@ -8415,6 +8471,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 attn_metadata,
                 True,
             )
+        # The draft head decides from the same batch whether its logits may stay sharded.
+        self.draft_model.mtp_layers[0].spec_metadata = spec_metadata
         # A prefill CUDA graph pads the step's rows; the worker reshapes generation rows per
         # request, so it takes the batch's own.
         if attn_metadata.padded_num_tokens is not None:

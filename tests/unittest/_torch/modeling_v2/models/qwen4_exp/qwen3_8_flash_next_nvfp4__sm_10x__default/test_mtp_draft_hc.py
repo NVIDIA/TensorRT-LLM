@@ -19,6 +19,7 @@ the band of that reference that the unfused composition (per-stream `flashinfer_
 and `qwen4_exp_gated_residual`) reaches, widened by half.
 """
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -316,15 +317,26 @@ def test_the_tail_sites(rows, moe_identity) -> None:
     )
 
 
+def _head(core) -> SimpleNamespace:
+    """A stand-in `MTPLayer` for `shared_head`, its logits processor the identity: no spec
+    worker, so its own `_sharded_head` keeps the gathered head."""
+    head = SimpleNamespace(
+        core=core,
+        worker=None,
+        spec_metadata=None,
+        logits_processor=SimpleNamespace(forward=lambda final, *args: final),
+    )
+    head._sharded_head = functools.partial(MOD.MTPLayer._sharded_head, head)
+    return head
+
+
 # 32: a shared head over one attention-DP rank's decode batch (ht_dep4 drafts under MTP).
 @pytest.mark.parametrize("rows", (1, 4, 32))
 def test_the_head_site(rows) -> None:
     raw = _raw(13)
     core, _ = _core(raw)
     _, hs, _, _ = _inputs(rows, 301 + rows)
-    head = SimpleNamespace(
-        core=core, logits_processor=SimpleNamespace(forward=lambda final, *args: final)
-    )
+    head = _head(core)
     final = MOD.MTPLayer.shared_head(head, hs, None, None, False)
     _within(f"head[{rows}]", final, _head64(raw, hs), _head_unfused(raw, hs))
 
@@ -335,9 +347,7 @@ def test_a_captured_draft_step_replays_the_eager_bits(moe_identity) -> None:
     raw = _raw(14)
     core, M = _core(raw)
     ids, hs, attn, _ = _inputs(4, 401, strided=True)
-    head = SimpleNamespace(
-        core=core, logits_processor=SimpleNamespace(forward=lambda final, *args: final)
-    )
+    head = _head(core)
 
     def step():
         x, _, inject = MOD._mtp_front(core, M, raw["embed"], ids, hs)
