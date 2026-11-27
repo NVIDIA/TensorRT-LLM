@@ -66,6 +66,8 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+add_compile_definitions(TRTLLM_ENABLE_NANOBIND_PROFILING=0)
+add_compile_definitions(TRTLLM_ENABLE_NCCL_PROFILING=0)
 option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
 option(CUBLAS_DYNAMIC_LINKING
        "Link against the dynamic cublas/cublasLt libraries" ON)
