@@ -53,7 +53,7 @@ def server(request, tmp_path_factory):
         request.cls.subcommand,
         str(path),
         "--host",
-        "127.0.0.1",
+        "localhost",
         "--port",
         str(port),
         "--max_batch_size",
@@ -68,7 +68,7 @@ def server(request, tmp_path_factory):
             "enable_autotuner: false\nkv_cache_config:\n  enable_block_reuse: false\n"
         )
         args += ["--max_seq_len", "4096", "--config", str(config)]
-    url = f"http://127.0.0.1:{port}"
+    url = f"http://localhost:{port}"
     with popen(args) as proc:
         _wait_for_server_ready(proc, http_port=port, timeout=1800)
         models = requests.get(f"{url}/v1/models", timeout=30)

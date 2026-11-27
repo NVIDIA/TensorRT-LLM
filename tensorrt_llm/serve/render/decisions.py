@@ -19,7 +19,8 @@ from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from .chat import render_conversation
 from .resources import RenderResources
 
-# PPLX-Decider v1.1 uses the system message from Perplexity's decision_messages().
+# Perplexity's decision_messages() supplies this text for PPLX-Decider v1.1
+# before the tokenizer applies the checkpoint's chat template.
 # https://huggingface.co/perplexity-ai/pplx-decider-v1.1-27b/blob/14c9d90137962d300f3de95633f7b6535e80c5ce/source/src/autojev/model.py#L95-L113
 _PPLX_SYSTEM = (
     "Classify the supplied state using the question and option descriptions. "

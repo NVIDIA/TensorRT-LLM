@@ -25,8 +25,8 @@ if TYPE_CHECKING:
 
 __all__ = ["ReadQuestion", "ReadResult", "score_decision_questions"]
 
-# Each generation read holds a full vocabulary row. This per-request scheduling
-# limit bounds those buffers even when the engine allows larger batches.
+# One HTTP request can submit many model reads, one per question. Limit how many
+# it submits at once because each generation read returns a full row of logits.
 _MAX_CONCURRENT_READS = 8
 
 
