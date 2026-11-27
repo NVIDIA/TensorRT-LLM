@@ -36,7 +36,8 @@
       "name": "nccl_extensions_download",
       "display_name": "nccl_extensions",
       "git_repository": "${github_base_url}/NVIDIA/nccl-extensions",
-      "git_tag": "af42925a9cc6a818b04681eb8bdbedaed506aa30",
+      "git_tag": "e5789801527d5d8b68ac8c068e769c13857db887",
+      "_comment": "nccl-extensions-v0.2.0 (NCCL EP v0.3.0)",
       "use_url": true,
       "patch_file": "patches/nccl_ep_group_timeout.patch"
     },
