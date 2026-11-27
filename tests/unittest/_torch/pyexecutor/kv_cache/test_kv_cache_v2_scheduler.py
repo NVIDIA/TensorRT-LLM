@@ -18,6 +18,7 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+import random
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, call, patch
@@ -3885,6 +3886,92 @@ class TestDisagg:
         # In production, this would crash IndexMapper (only 3 slots = 2+1 dummy).
         assert ids(out2.fitting_disagg_gen_init_requests) == [2, 3]
         assert prepare_count[0] == 4  # <-- proves the overflow
+
+
+class TestGenHandoffSeat:
+    """scheduler_config.gen_handoff_seat: a forward runs at most max_batch_size - 1
+    requests; the last seat only takes the next request's KV handoff."""
+
+    @staticmethod
+    def _received(request_id):
+        req = make_gen_request(request_id)
+        req.state_value = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE.value
+        return req
+
+    def test_off_by_default(self):
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=3)
+        out = sched.schedule_request([make_gen_request(i) for i in range(3)], set())
+        assert ids(out.generation_requests) == [0, 1, 2]
+
+    def test_last_seat_takes_only_the_handoff(self):
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=3, gen_handoff_seat=True)
+        out = sched.schedule_request([make_gen_request(i) for i in range(3)], set())
+        assert ids(out.generation_requests) == [0, 1]
+        out = sched.schedule_request(
+            [make_gen_request(0), make_gen_request(1), make_disagg_request(2)], set()
+        )
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.fitting_disagg_gen_init_requests) == [2]
+
+    def test_decoding_requests_go_first(self):
+        """A request whose transfer landed first does not take a decoding one's place."""
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=3, gen_handoff_seat=True)
+        reqs = [self._received(0), make_gen_request(1), make_gen_request(2)]
+        assert ids(sched.schedule_request(reqs, set()).generation_requests) == [1, 2]
+
+    def test_ignored_below_two_seats(self):
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=1, gen_handoff_seat=True)
+        assert ids(sched.schedule_request([make_gen_request(0)], set()).generation_requests) == [0]
+
+    def test_ignored_with_first_token_priority(self, monkeypatch):
+        monkeypatch.setenv("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "1")
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=3, gen_handoff_seat=True)
+        assert sched.max_num_requests == 3
+
+    @pytest.mark.parametrize("seats", [2, 3, 5])
+    def test_generation_server_loop_never_exceeds_the_cap(self, seats):
+        """A model of the generation server loop: the executor fetches requests in
+        arrival order into free seats, each KV transfer takes 1-6 passes, so
+        transfers land out of order, and each request decodes 1-8 steps. No forward
+        holds more than seats - 1 requests, a decoding request is never left out,
+        the handoff seat is used, and every request finishes once."""
+        rng = random.Random(seats)
+        cap = seats - 1
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=seats, gen_handoff_seat=True)
+        queue, active, finished = deque(range(60)), [], []
+        transfer, steps = {}, {}
+        handoff_beside_full_forward = 0
+        for _ in range(2_000):
+            while queue and len(active) < seats:
+                req = make_gen_request(queue.popleft())
+                req.state_value = DISAGG_GEN_INIT
+                active.append(req)
+            out = sched.schedule_request(list(active), set())
+            forward = out.generation_requests
+            assert len(forward) <= cap
+            decoding = {r.py_request_id for r in active if r.state_value == GEN_IN_PROGRESS}
+            assert decoding <= set(ids(forward))
+            for req in out.fitting_disagg_gen_init_requests:
+                req.state_value = DISAGG_GEN_TRANS_IN_PROGRESS
+                transfer[req.py_request_id] = rng.randint(1, 6)
+                steps[req.py_request_id] = rng.randint(1, 8)
+            in_transfer = [r for r in active if r.state_value == DISAGG_GEN_TRANS_IN_PROGRESS]
+            if len(forward) == cap and in_transfer:
+                handoff_beside_full_forward += 1
+            for req in forward:
+                req.state_value = GEN_IN_PROGRESS
+                steps[req.py_request_id] -= 1
+                if steps[req.py_request_id] == 0:
+                    active.remove(req)
+                    finished.append(req.py_request_id)
+            for req in in_transfer:
+                transfer[req.py_request_id] -= 1
+                if transfer[req.py_request_id] == 0:
+                    req.state_value = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE.value
+            if not queue and not active:
+                break
+        assert sorted(finished) == list(range(60))
+        assert handoff_beside_full_forward > 0
 
 
 # ===========================================================================

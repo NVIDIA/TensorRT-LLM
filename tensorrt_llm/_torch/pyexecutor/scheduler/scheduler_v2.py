@@ -224,6 +224,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         context_demote_max_iters: Optional[int] = None,
         exact_context_demotion: bool = False,
         context_demote_probe: bool = False,
+        gen_handoff_seat: bool = False,
     ) -> None:
         """``recover_lost_kv_per_rank`` False is for ranks that schedule in lock step (TP without attention DP, CP,
         PP): a failed remote cache level then raises RemoteMemError out of ``schedule_request`` instead of re-matching,
@@ -341,6 +342,33 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
+
+        # Handoff seat (scheduler_config.gen_handoff_seat, disaggregated
+        # generation server): a forward runs at most max_batch_size - 1
+        # requests. A generation-init request bypasses the request budget, so
+        # the last seat only takes the next request's KV handoff, whose
+        # transfer then runs beside the decoding requests instead of holding
+        # one of their places. Decoding requests are walked first: transfers
+        # land out of order, and one received earlier would otherwise take a
+        # decoding request's place and leave it out of the forward.
+        self._gen_handoff_seat = False
+        if gen_handoff_seat:
+            if self.max_num_requests < 2:
+                logger.warning(
+                    "scheduler_config.gen_handoff_seat is ignored: it needs max_batch_size >= 2"
+                )
+            elif self._prioritize_first_token_gen:
+                logger.warning(
+                    "scheduler_config.gen_handoff_seat is ignored with "
+                    "TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN=1, which puts received requests first"
+                )
+            else:
+                self._gen_handoff_seat = True
+                self.max_num_requests -= 1
+                logger.info(
+                    f"KVCacheV2Scheduler: generation handoff seat on, at most "
+                    f"{self.max_num_requests} requests a forward"
+                )
 
         # Long-prefill demotion (opt-in). Context scheduling is FCFS, so a
         # multi-hundred-k-token prefill takes the whole token budget for as many
@@ -783,6 +811,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                     0 if (req.is_generation_only_request and req.py_decoding_iter == 0) else 1
                 )
             )
+
+        if self._gen_handoff_seat:
+            generation_in_progress = LlmRequestState.GENERATION_IN_PROGRESS.value
+            requests_list.sort(key=lambda req: req.state_value != generation_in_progress)
 
         # Resume deadlines take precedence over the first-token preference.
         if self._gen_resumed_ids:

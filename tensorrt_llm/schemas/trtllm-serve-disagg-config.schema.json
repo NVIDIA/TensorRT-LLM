@@ -9955,6 +9955,13 @@
           "title": "Enable Prefix Aware Scheduling",
           "type": "boolean"
         },
+        "gen_handoff_seat": {
+          "default": false,
+          "description": "On a disaggregated generation server (KV cache manager V2, no attention DP, max_batch_size >= 2): a forward runs at most max_batch_size - 1 requests, so the last seat only takes the next request's KV transfer, which then runs beside the decoding requests instead of holding one of their places. Decoding requests are scheduled ahead of received ones. Set it on generation servers only: a context server would lose a forward place. Changes batch composition only.",
+          "status": "prototype",
+          "title": "Gen Handoff Seat",
+          "type": "boolean"
+        },
         "gen_preemption": {
           "$ref": "#/$defs/GenPreemptionConfig",
           "description": "GEN slot preemption on disaggregated generation workers.",

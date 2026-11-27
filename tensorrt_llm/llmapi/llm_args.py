@@ -5737,6 +5737,19 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "never demoted. Changes the context order only."),
         status="prototype")
 
+    gen_handoff_seat: bool = Field(
+        default=False,
+        description=(
+            "On a disaggregated generation server (KV cache manager V2, no "
+            "attention DP, max_batch_size >= 2): a forward runs at most "
+            "max_batch_size - 1 requests, so the last seat only takes the next "
+            "request's KV transfer, which then runs beside the decoding "
+            "requests instead of holding one of their places. Decoding "
+            "requests are scheduled ahead of received ones. Set it on "
+            "generation servers only: a context server would lose a forward "
+            "place. Changes batch composition only."),
+        status="prototype")
+
     @model_validator(mode="after")
     def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
         if (self.waiting_queue_max_wait_s is not None

@@ -5810,6 +5810,16 @@ def create_py_executor_resources(
             and scheduler_config.context_demote_probe):
         logger.warning("scheduler_config.context_demote_probe is ignored: it "
                        "needs the KV cache manager V2 scheduler")
+    gen_handoff_seat = (scheduler_config is not None
+                        and scheduler_config.gen_handoff_seat)
+    if gen_handoff_seat and not (isinstance(kv_cache_manager, KVCacheManagerV2)
+                                 and is_disagg
+                                 and not mapping.enable_attention_dp):
+        logger.warning(
+            "scheduler_config.gen_handoff_seat is ignored: it needs a "
+            "disaggregated server, the KV cache manager V2 scheduler and no "
+            "attention DP")
+        gen_handoff_seat = False
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -5852,6 +5862,7 @@ def create_py_executor_resources(
                 model_engine.model).exact_context_demotion,
             context_demote_probe=(scheduler_config.context_demote_probe
                                   if scheduler_config is not None else False),
+            gen_handoff_seat=gen_handoff_seat,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
