@@ -434,13 +434,23 @@ def test_gemma4_vision_gpu_normalize_fallback(processor_class, case):
 def test_gemma4_vision_gpu_normalize_mixed_fallback(processor_class):
     image_processor = processor_class(max_soft_tokens=70, do_resize=False)
     processor = _make_normalization_processor(image_processor)
-    # An empty video list exercises the existing mixed preprocessing path without frame decoding.
+    video_processor = Gemma4VideoProcessor(max_soft_tokens=70, do_resize=False)
+    processor._processor.video_processor = video_processor
+    frames = np.random.default_rng(42).integers(0, 256, (2, 48, 48, 3), dtype=np.uint8)
+    image = Image.fromarray(frames[0])
     inputs = {
-        "prompt": "image and video",
-        "multi_modal_data": {"image": [Image.new("RGB", (48, 48))], "video": []},
+        "prompt": "image and <|video|>",
+        "multi_modal_data": {"image": [image], "video": [frames]},
     }
     _, output = processor.call_with_text_prompt(inputs, None)
-    assert "vision_normalization" not in output["multimodal_data"]["image"]
+    expected_image = image_processor(images=[image], return_tensors="pt")["pixel_values"]
+    expected_video = video_processor(videos=[frames], do_sample_frames=False, return_tensors="pt")[
+        "pixel_values_videos"
+    ].flatten(0, 1)
+    for modality, expected in (("image", expected_image), ("video", expected_video)):
+        bucket = output["multimodal_data"][modality]
+        assert "vision_normalization" not in bucket
+        assert torch.equal(bucket["pixel_values"], expected.to(processor.dtype))
     assert Gemma4ForConditionalGeneration.supports_vision_gpu_normalize
     assert Gemma4UnifiedForConditionalGeneration.supports_vision_gpu_normalize
 

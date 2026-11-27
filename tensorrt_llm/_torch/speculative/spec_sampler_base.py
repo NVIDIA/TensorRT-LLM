@@ -29,10 +29,11 @@ from typing import Optional
 import torch
 
 from ..._device_copy import DeviceCopyBuffer
-from ..._utils import prefer_pinned
+from ..._utils import current_cuda_stream, prefer_pinned
 from ...bindings.executor import FinishReason
 from ...sampling_params import SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
+from ..modules.multi_stream_utils import _record_stream
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.runtime_hooks import SpecStepFold
@@ -50,6 +51,7 @@ from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, to
 from ..pyexecutor.sampler.sampler_features import max_token_room, meet_stop_token_criteria
 from ..pyexecutor.sampler.watermark import request_carries_watermark
 from ..pyexecutor.scheduler import ScheduledRequests
+from . import logit_edits
 from .spec_store_scatter import spec_store_scatter
 
 # Rejection messages for the sampling features the one-model speculative path
@@ -61,18 +63,10 @@ UNSUPPORTED_MIN_LENGTH_MSG = (
     "min_length is not supported with one-model speculative decoding. "
     "Drop min_length from the request, or disable speculative decoding."
 )
-UNSUPPORTED_BAD_WORDS_MSG = (
-    "bad_words is not supported with one-model speculative decoding. "
-    "Drop bad_words from the request, or disable speculative decoding."
-)
 UNSUPPORTED_NO_REPEAT_NGRAM_MSG = (
     "no_repeat_ngram_size is not supported with one-model speculative "
     "decoding. Drop no_repeat_ngram_size from the request, or disable "
     "speculative decoding."
-)
-UNSUPPORTED_EMBEDDING_BIAS_MSG = (
-    "embedding_bias is not supported with one-model speculative decoding. "
-    "Drop embedding_bias from the request, or disable speculative decoding."
 )
 UNSUPPORTED_TOP_P_DECAY_MSG = (
     "top_p_decay is not supported with one-model speculative decoding. "
@@ -89,10 +83,113 @@ UNSUPPORTED_MIN_P_MSG = (
     "config when using one-model speculative decoding. Restore that default, "
     "drop min_p from the request, or disable speculative decoding."
 )
+# embedding_bias and bad_words are served only where the deploy opted into rewriting the
+# target logits ahead of acceptance, and by the workers that verify through that pass.
+LOGIT_EDITS_DISABLED_MSG = (
+    "embedding_bias (logit_bias) and bad_words require 'enable_penalty: true' in the "
+    "speculative decoding config when using one-model speculative decoding. Enable that "
+    "flag, drop them from the request, or disable speculative decoding."
+)
+LOGIT_EDITS_TREE_MSG = (
+    "embedding_bias (logit_bias) and bad_words are not supported with tree speculative "
+    "decoding (dynamic tree) yet. Drop them from the request, use a linear speculation "
+    "mode, or disable speculative decoding."
+)
+LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG = (
+    "embedding_bias (logit_bias) and bad_words are not supported with relaxed acceptance "
+    "for thinking. Drop them from the request, disable "
+    "use_relaxed_acceptance_for_thinking, or disable speculative decoding."
+)
+LOGIT_EDITS_MODE_MSG = (
+    "embedding_bias (logit_bias) and bad_words are not supported with this speculative "
+    "decoding mode (SA). Drop them from the request, or disable speculative decoding."
+)
+# The occurrence penalties are applied by the same pass, so the same deploys cannot serve them.
+PENALTY_TREE_MSG = (
+    "repetition_penalty / presence_penalty / frequency_penalty are not "
+    "supported with tree speculative decoding (dynamic tree) yet. Drop "
+    "the penalties, use a linear speculation mode, or disable "
+    "speculative decoding."
+)
+PENALTY_RELAXED_ACCEPTANCE_MSG = (
+    "repetition_penalty / presence_penalty / frequency_penalty are not supported with "
+    "relaxed acceptance for thinking. Drop the penalties, disable "
+    "use_relaxed_acceptance_for_thinking, or disable speculative decoding."
+)
+PENALTY_MODE_MSG = (
+    "repetition_penalty / presence_penalty / frequency_penalty are not supported with this "
+    "speculative decoding mode (SA). Drop the penalties, or disable speculative decoding."
+)
+
+# What keeps a deploy's worker from verifying through the logits-edit pass, mapped to the
+# (embedding_bias and bad_words, occurrence penalties) rejection messages.
+_EDIT_PASS_LIMIT_MSGS = {
+    "tree": (LOGIT_EDITS_TREE_MSG, PENALTY_TREE_MSG),
+    "relaxed_acceptance": (LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG, PENALTY_RELAXED_ACCEPTANCE_MSG),
+    "mode": (LOGIT_EDITS_MODE_MSG, PENALTY_MODE_MSG),
+}
+
+
+def _edit_pass_limit(spec_config) -> Optional[str]:
+    """What keeps this one-model deploy's worker from verifying through the logits-edit
+    pass (``SpecWorkerBase._edit_target_logits``): a key of ``_EDIT_PASS_LIMIT_MSGS``, or
+    None when it does.
+
+    The pass maps one logits row to each verified position of a linear draft, and strict
+    or rejection acceptance reads its output. Tree rows, relaxed acceptance and SA, which
+    verifies outside it, are not covered. This follows ``get_spec_worker``: Eagle3 serves
+    a tree of top-K 1 with its linear worker, while MTP picks its tree worker on the flag
+    alone. Only fields the user sets are read, so the LLM API and the executor reach the
+    same answer before and after the checkpoint resolves an MTP config's mode.
+    """
+    spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
+    if getattr(spec_config, "use_dynamic_tree", False):
+        linear_eagle3 = (
+            spec_dec_mode is not None
+            and spec_dec_mode.is_eagle3_one_model()
+            and (getattr(spec_config, "dynamic_tree_max_topK", None) or 0) <= 1
+        )
+        if not linear_eagle3:
+            return "tree"
+    if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
+        return "relaxed_acceptance"
+    if spec_dec_mode is not None and spec_dec_mode.is_sa():
+        return "mode"
+    return None
+
+
+def verifies_through_edit_pass(spec_config) -> bool:
+    """Whether this one-model deploy's worker verifies against the logits the edit pass
+    returns, on every step. The occurrence penalties, embedding_bias and bad_words are
+    served only where it does."""
+    return _edit_pass_limit(spec_config) is None
+
+
+def logit_edits_unsupported_reason(spec_config) -> Optional[str]:
+    """Why this one-model deploy cannot serve embedding_bias and bad_words, or None.
+
+    Both are applied to the target logits a worker verifies against, in the pass
+    ``enable_penalty`` turns on, so the deploy must enable it and verify through it
+    (``verifies_through_edit_pass``).
+    """
+    if not getattr(spec_config, "enable_penalty", False):
+        return LOGIT_EDITS_DISABLED_MSG
+    limit = _edit_pass_limit(spec_config)
+    return None if limit is None else _EDIT_PASS_LIMIT_MSGS[limit][0]
+
+
+def penalty_unsupported_reason(spec_config) -> Optional[str]:
+    """Why this one-model deploy cannot serve the occurrence penalties even with
+    ``enable_penalty`` on, or None when it can."""
+    limit = _edit_pass_limit(spec_config)
+    return None if limit is None else _EDIT_PASS_LIMIT_MSGS[limit][1]
 
 
 def one_model_sampling_rejection_reason(
-    sampling_params: Optional[SamplingParams], *, fused_sampling: bool = False
+    sampling_params: Optional[SamplingParams],
+    *,
+    fused_sampling: bool = False,
+    logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
 ) -> Optional[str]:
     """Why ``sampling_params`` cannot be served by the one-model speculative path.
 
@@ -104,6 +201,9 @@ def one_model_sampling_rejection_reason(
     This mirrors the subset of those rules ``SamplingParams`` alone can decide,
     so the request can be rejected before the stream opens; the executor-side
     check stays as the backstop for submission paths that bypass the LLM API.
+
+    ``logit_edits_unsupported`` is ``logit_edits_unsupported_reason`` of the deploy: why it
+    cannot serve embedding_bias and bad_words, or None when it can.
 
     Returns ``None`` when nothing in ``sampling_params`` is unsupported.
     """
@@ -118,12 +218,19 @@ def one_model_sampling_rejection_reason(
         return UNSUPPORTED_MIN_LENGTH_MSG
     # Either form populates py_bad_words; the string form needs a tokenizer to
     # resolve, so test the raw fields rather than _get_bad_words().
-    if sampling_params.bad or sampling_params.bad_token_ids:
-        return UNSUPPORTED_BAD_WORDS_MSG
+    has_bad_words = bool(sampling_params.bad or sampling_params.bad_token_ids)
+    if has_bad_words or sampling_params.embedding_bias is not None:
+        if logit_edits_unsupported is not None:
+            return logit_edits_unsupported
+        # The string form counts once it is tokenized; the executor-side check sees
+        # every word either way.
+        bad_words = [[token] for token in sampling_params.bad_token_ids or ()]
+        bad_words += sampling_params._bad_word_ids or []
+        reason = logit_edits.rejection_reason(sampling_params.embedding_bias, bad_words)
+        if reason is not None:
+            return reason
     if sampling_params.no_repeat_ngram_size:
         return UNSUPPORTED_NO_REPEAT_NGRAM_MSG
-    if sampling_params.embedding_bias is not None:
-        return UNSUPPORTED_EMBEDDING_BIAS_MSG
     # A per-request callback becomes py_logits_post_processors; the one-model path never
     # calls it (a fused verify may not even materialize the full logits).
     if sampling_params.logits_processor:
@@ -141,6 +248,16 @@ def one_model_sampling_rejection_reason(
 
 
 @dataclass(kw_only=True)
+class StepOutputRows:
+    """A decode-only step's forward outputs in request order, with the requests' slots."""
+
+    next_new_tokens: torch.Tensor  # int32 [rows, >= tokens per step]
+    new_tokens_lens: torch.Tensor  # int32 [rows]
+    next_draft_tokens: torch.Tensor  # int32 [rows, >= draft length]
+    slots: tuple[int, ...]
+
+
+@dataclass(kw_only=True)
 class SampleStateTensorsSpec(SampleStateTensors):
     """Tensors for speculative decoding sample state."""
 
@@ -149,6 +266,11 @@ class SampleStateTensorsSpec(SampleStateTensors):
     # Actual token windows, aligned with SampleStateSpec.requests, when the
     # worker selects verification lengths on device.
     verify_lens: Optional[torch.Tensor] = None
+    # Recorded on the sampler's side stream once it has written this step into the stores,
+    # when that update runs there: a reader of the stores on another stream waits on it.
+    stores_ready: Optional[torch.cuda.Event] = None
+    # The forward's outputs the stores are updated from (a decode-only step's, with stores_ready).
+    rows: Optional[StepOutputRows] = None
 
 
 @dataclass(kw_only=True)
@@ -191,6 +313,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     static_slot_ids: bool = False
     _slot_ids_host: Optional[list[int]] = None
     _slot_ids_cuda: Optional[torch.Tensor] = None
+    # Set where the engine's steady MTP prepare reads a step's output rows: the store update then
+    # runs on the D2H side stream.
+    stores_on_side_stream = False
 
     SampleState = SampleStateSpec
 
@@ -226,7 +351,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         min_p = sampling_config.min_p
         if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(UNSUPPORTED_MIN_P_MSG)
-        self._validate_unsupported_logits_processors(request)
+        self._validate_unsupported_logits_processors(
+            request,
+            logit_edits_unsupported=getattr(
+                self, "_logit_edits_unsupported", LOGIT_EDITS_DISABLED_MSG
+            ),
+        )
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
         # allocated when the deploy opted in, so a request asking for them while the
         # flag is off cannot be honored. Reject instead of silently decoding from an
@@ -243,22 +373,24 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # Tree speculation lays each request's logits out as tree nodes, where a
         # row's history is its root path rather than the rows before it. Applying
         # the linear mapping there would let sibling branches penalize each other,
-        # so reject until tree-aware prefixes are implemented.
-        if not self._penalty_supported:
-            raise ValueError(
-                "repetition_penalty / presence_penalty / frequency_penalty are not "
-                "supported with tree speculative decoding (dynamic tree) yet. Drop "
-                "the penalties, use a linear speculation mode, or disable "
-                "speculative decoding."
-            )
+        # so reject until tree-aware prefixes are implemented. Relaxed acceptance
+        # and SA verify outside the pass that applies the penalties.
+        if self._penalty_unsupported_reason is not None:
+            raise ValueError(self._penalty_unsupported_reason)
 
     @staticmethod
-    def _validate_unsupported_logits_processors(request: LlmRequest) -> None:
+    def _validate_unsupported_logits_processors(
+        request: LlmRequest,
+        *,
+        logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
+    ) -> None:
         """Reject logits-side sampling features the one-model path cannot apply.
 
         TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
         embedding_bias, top_p_decay and logits post-processor callbacks by editing
-        the target logits before sampling. The one-model path has no logits-editing hook, so each is
+        the target logits before sampling. The one-model path applies embedding_bias and
+        bad_words inside the worker where the deploy supports it (``logit_edits_unsupported``
+        is None) and the request fits the per-slot tables; everything else is
         rejected here instead of being silently dropped.
 
         Each check gates on a non-neutral value rather than on presence, since a
@@ -271,12 +403,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         min_length = getattr(request, "py_min_length", None)
         if min_length and min_length > 0:
             raise ValueError(UNSUPPORTED_MIN_LENGTH_MSG)
-        if getattr(request, "py_bad_words", None):
-            raise ValueError(UNSUPPORTED_BAD_WORDS_MSG)
+        if logit_edits.request_has_logit_edits(request):
+            reason = logit_edits_unsupported or logit_edits.rejection_reason(
+                getattr(request, "py_embedding_bias", None),
+                getattr(request, "py_bad_words", None),
+            )
+            if reason is not None:
+                raise ValueError(reason)
         if getattr(request, "py_no_repeat_ngram_size", None):
             raise ValueError(UNSUPPORTED_NO_REPEAT_NGRAM_MSG)
-        if getattr(request, "py_embedding_bias", None) is not None:
-            raise ValueError(UNSUPPORTED_EMBEDDING_BIAS_MSG)
         # The one-model sampler never calls a request's logits post-processors, and a fused
         # verify (e.g. the MiniMax-M3 shard verify) does not even gather the full logits, so
         # the callback would be skipped silently.
@@ -355,9 +490,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         args: TorchSampler.Args,
         *,
         enable_penalty: bool = False,
-        penalty_supported: bool = True,
+        penalty_unsupported_reason: Optional[str] = None,
         fused_sampling: bool = False,
         watermark_unsupported_reason: Optional[str] = None,
+        logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
     ):
         """
         Initialize the speculative sampler.
@@ -367,17 +503,21 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             enable_penalty: whether the deploy enabled the occurrence penalties.
                 Only used to decide whether a request asking for them is admitted;
                 the penalties themselves are applied inside the worker.
-            penalty_supported: whether this speculation mode's row layout is one
-                the penalties can map (linear modes yes, tree modes not yet).
+            penalty_unsupported_reason: why this deploy cannot serve the occurrence
+                penalties even when it enabled them (None when it can).
             fused_sampling: whether the configured sampler supports min_p.
             watermark_unsupported_reason: why this speculation mode cannot serve watermarked
                 requests (None when it can). Such requests are rejected at admission.
+            logit_edits_unsupported: why this deploy cannot serve embedding_bias and
+                bad_words (None when it can). Such requests are rejected at admission;
+                the edits themselves are applied inside the worker.
         """
         self._enable_penalty = enable_penalty
-        self._penalty_supported = penalty_supported
+        self._penalty_unsupported_reason = penalty_unsupported_reason
         self._watermark_config = args.watermark_config
         self._watermark_unsupported_reason = watermark_unsupported_reason
         self._fused_sampling = fused_sampling
+        self._logit_edits_unsupported = logit_edits_unsupported
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -640,6 +780,35 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             self.store.next_draft_tokens,
         )
 
+    def _scatter_on_side_stream(
+        self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
+    ) -> bool:
+        """Update the stores from the outputs on the D2H side stream; False, writing nothing, if
+        the store update kernel does not take the step."""
+        side = self._d2h_side_stream
+        # The update reads the outputs this step's forward wrote on the current stream.
+        side.wait_stream(current_cuda_stream())
+        with self._d2h_side_stream_ctx:
+            # A step whose batch is unchanged leaves the slot table as it is.
+            if slots != self._slot_table_slots:
+                self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
+                self._slot_table_slots = slots
+            scattered = self._store_scatter.scatter(
+                outputs,
+                num_skip,
+                len(slots),
+                self._slot_table_buffer.tensor,
+                self.store.new_tokens,
+                self.store.next_new_tokens,
+                self.store.new_tokens_lens,
+                self.store.next_draft_tokens,
+            )
+        if scattered:
+            for name in ("new_tokens", "next_new_tokens", "new_tokens_lens", "next_draft_tokens"):
+                # Keep the caching allocator from reusing the outputs before the side stream read them.
+                _record_stream(outputs[name], side)
+        return scattered
+
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
@@ -723,15 +892,37 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_verify_lens = o_verify_lens[num_skip : num_skip + num_sampling_requests]
 
         runtime_draft_len = outputs["next_draft_tokens"].shape[1]
-        if self._store_copies_done is not None:
-            # The previous step's host copies may still be reading the stores.
-            torch.cuda.current_stream().wait_event(self._store_copies_done)
         slots = [r.py_seq_slot for r in sampling_requests]
         step_fold = self.spec_step_fold
-        forward_stored_rows = step_fold is not None and step_fold.sampler_rows_stored(
-            outputs, num_skip, slots
-        )
-        scattered = forward_stored_rows
+        stores_ready, rows = None, None
+        scattered = False
+        if (
+            self.stores_on_side_stream
+            and step_fold is None
+            and self._store_scatter is not None
+            and o_verify_lens is None
+            and not self._async_worker_active()
+        ):
+            scattered = self._scatter_on_side_stream(outputs, num_skip, slots)
+            if scattered:
+                stores_ready = torch.cuda.Event()
+                stores_ready.record(self._d2h_side_stream)
+                if num_skip == 0 and not finished_context_requests:
+                    n = len(slots)
+                    rows = StepOutputRows(
+                        next_new_tokens=outputs["next_new_tokens"][:n],
+                        new_tokens_lens=outputs["new_tokens_lens"][:n],
+                        next_draft_tokens=outputs["next_draft_tokens"][:n],
+                        slots=tuple(slots),
+                    )
+        if not scattered and self._store_copies_done is not None:
+            # The previous step's host copies may still be reading the stores.
+            current_cuda_stream().wait_event(self._store_copies_done)
+        forward_stored_rows = False
+        if not scattered and step_fold is not None:
+            scattered = forward_stored_rows = step_fold.sampler_rows_stored(
+                outputs, num_skip, slots
+            )
         # A model's step fold scatters the stores itself, in _scatter_to_stores.
         if not scattered and step_fold is None and self._store_scatter is not None:
             # A step whose batch is unchanged leaves the slot table as it is.
@@ -756,6 +947,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens=self.store.next_new_tokens,
             new_tokens_lens=self.store.new_tokens_lens,
             next_draft_tokens=self.store.next_draft_tokens,
+            stores_ready=stores_ready,
+            rows=rows,
         )
 
         store_copies_done = getattr(step_fold, "store_copies_done", None) if step_fold else None

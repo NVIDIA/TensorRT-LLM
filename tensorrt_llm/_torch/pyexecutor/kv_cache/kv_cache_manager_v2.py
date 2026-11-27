@@ -66,6 +66,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     IndexMapper,
     copy_base_page_rows_to_device,
     copy_batch_block_offsets_to_device,
+    copy_per_layer_block_offsets_to_device,
     gather_base_page_rows,
 )
 from tensorrt_llm.llmapi.llm_args import (
@@ -506,6 +507,20 @@ PAGE_PRIORITY_DEFAULT = 35
 
 PagePriorityCallback = Callable[[int, object], int]
 """Maps (block ordinal, life cycle) to the eviction priority of a page created by one cache."""
+
+
+def _kept_generation_capacity(
+    capacity: int, rewind: int, growth: int, tokens_per_block: int
+) -> int:
+    """``capacity - rewind``, raised to the first slot of the last allocated block when that shrink
+    would release the block and the next growth by ``growth`` slots would allocate it again."""
+    new_capacity = capacity - rewind
+    if rewind <= 0 or capacity <= 0:
+        return new_capacity
+    last_start = ((capacity - 1) // tokens_per_block) * tokens_per_block
+    if new_capacity <= last_start < new_capacity + growth:
+        return last_start + 1
+    return new_capacity
 
 
 def _swa_endpoint_priority(
@@ -1850,9 +1865,26 @@ def _update_kv_cache_draft_token_location(
 
 
 @maybe_compile(options={"max-autotune": True})
-def _copy_swa_block_offsets_with_scratch_compiled(
+def _copy_per_layer_block_offsets_compiled(
     block_offsets: torch.Tensor,
     copy_idx: torch.Tensor,
+    pool_ids: torch.Tensor,
+    scales: torch.Tensor,
+    layer_offsets: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
+    converted = torch.where(
+        base == BAD_PAGE_INDEX,
+        BAD_PAGE_INDEX,
+        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
+    )
+    output.copy_(converted.permute(0, 2, 1, 3))
+
+
+@maybe_compile(options={"max-autotune": True})
+def _overlay_swa_scratch_pages_compiled(
+    tables: torch.Tensor,
     pool_ids: torch.Tensor,
     scales: torch.Tensor,
     layer_offsets: torch.Tensor,
@@ -1862,15 +1894,11 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     scratch_ends: torch.Tensor,
     scratch_slots: torch.Tensor,
     num_contexts: torch.Tensor,
-    output: torch.Tensor,
 ) -> None:
-    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
-    converted = torch.where(
-        base == BAD_PAGE_INDEX,
-        BAD_PAGE_INDEX,
-        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
-    )
+    """Point each context row's scratch block range at its scratch slots.
 
+    ``tables`` already holds the converted per-layer pages for every row.
+    """
     context_positions = torch.arange(
         scratch_begs.shape[1],
         dtype=torch.int32,
@@ -1895,10 +1923,9 @@ def _copy_swa_block_offsets_with_scratch_compiled(
         slot_id * scales[:, :, None, None]
         + (offset + layer_offsets[:, :, None, None]) % scales[:, :, None, None]
     )
-    scratch_mask = scratch_mask_by_pool[pool_ids] & (base == BAD_PAGE_INDEX)
-    converted = torch.where(scratch_mask, scratch_index, converted)
-
-    output.copy_(converted.permute(0, 2, 1, 3))
+    converted = tables.permute(0, 2, 1, 3)
+    scratch_mask = scratch_mask_by_pool[pool_ids] & (converted == BAD_PAGE_INDEX)
+    tables.copy_(torch.where(scratch_mask, scratch_index, converted).permute(0, 2, 1, 3))
 
 
 def _rewind_context_cursor(req: LlmRequest, reuse: int) -> None:
@@ -2518,6 +2545,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # The manager config offload is sized from, built once with a placeholder
     # device quota; None until offload sizing first asks for it.
     _offload_sizing_config: Optional[KVCacheManagerConfigPy] = None
+    # On the class for instances built without running __init__.
+    _keep_growth_block = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -3580,6 +3609,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # so the latest width in _allocated_draft_lens belongs to step N+1;
         # update_resources must rewind step N by the width step N was given.
         self._inflight_draft_lens: dict[int, list[int]] = {}
+        # Armed by keep_growth_blocks().
+        self._keep_growth_block = False
+        # Per request, the slots kept above the rewound capacity; the next update gives them back.
+        self._kept_growth_slack: dict[int, int] = {}
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -4572,6 +4605,28 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
+    def get_gpu_pool_bytes(self) -> list[int]:
+        """Return the device-backed bytes of each GPU pool group: slot count times slot bytes.
+
+        With sparse KV cache offload a GPU-level pool group also holds pools of pinned host
+        memory mapped into the device. The storage statistics give a slot size for every pool
+        of the group, so the host-backed pools' slot bytes are left out.
+        """
+        host_slot_bytes = {
+            int(group.pool_group_index): sum(
+                int(pool.slot_bytes)
+                for pool in group.pools
+                if pool.storage_medium != CacheTier.GPU_MEM
+            )
+            for group in self.impl.pool_group_descs
+        }
+        pool_bytes = []
+        for pool_group_id, stat in enumerate(self._get_storage_statistics(GPU_LEVEL)):
+            slot_bytes = sum(int(size) for size in stat.slot_sizes)
+            slot_bytes -= host_slot_bytes.get(pool_group_id, 0)
+            pool_bytes.append(int(stat.total) * slot_bytes)
+        return pool_bytes
+
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
         for layer in self.kv_cache_manager_py_config.layers:
@@ -4637,15 +4692,30 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype=torch.int32,
             device=device,
         )
-        self._device_copy_idx_staging = torch.zeros(
-            staging_capacity,
-            dtype=torch.long,
-            device=device,
-        )
         self._device_num_contexts = torch.empty((), dtype=torch.int32, device=device)
         self._device_attention_op_pool_ids = pool_ids.to(device=device)
         self._device_attention_op_scales = scales.to(device=device)
         self._device_attention_op_layer_offsets = layer_offsets.to(device=device)
+        if self.enable_swa_scratch_reuse:
+            # Lane ``layer * 2 + role`` is relative to the full per-layer output.
+            lane_pools = pool_ids.reshape(-1)
+            pool_lanes = torch.argsort(lane_pools, stable=True).to(dtype=torch.int32)
+            pool_lane_offsets = torch.zeros(self.num_pools + 1, dtype=torch.int32)
+            pool_lane_offsets[1:] = torch.cumsum(
+                torch.bincount(lane_pools, minlength=self.num_pools), dim=0
+            )
+            self._device_copy_idx_int32_staging = torch.zeros(
+                staging_capacity, dtype=torch.int32, device=device
+            )
+            self._device_attention_op_converters = torch.stack(
+                (pool_ids.to(dtype=torch.int32), scales, layer_offsets), dim=-1
+            ).to(device=device)
+            self._device_attention_op_pool_lanes = pool_lanes.to(device=device)
+            self._device_attention_op_pool_lane_offsets = pool_lane_offsets.to(device=device)
+        else:
+            self._device_copy_idx_staging = torch.zeros(
+                staging_capacity, dtype=torch.long, device=device
+            )
         self._device_attention_op_scratch_pages = scratch_pages.to(device=device)
         self._device_block_positions = torch.arange(
             self.max_blocks_per_seq,
@@ -4700,10 +4770,6 @@ class KVCacheManagerV2(BaseResourceManager):
             device=device,
         )
 
-    def _copy_idx_to_device(self, copy_idx: torch.Tensor) -> torch.Tensor:
-        self._device_copy_idx_staging[: copy_idx.size(0)].copy_(copy_idx, non_blocking=True)
-        return self._device_copy_idx_staging
-
     def _copy_scratch_metadata_to_device(
         self,
         request_ids: List[int],
@@ -4750,6 +4816,40 @@ class KVCacheManagerV2(BaseResourceManager):
             self._device_scratch_slots_staging,
         )
 
+    def _copy_per_layer_block_offsets(
+        self,
+        dst_tensor: torch.Tensor,
+        copy_idx: torch.Tensor,
+        num_seqs: int,
+        num_blocks: int,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Convert the batch's base-table rows into per-layer tables in ``dst_tensor``."""
+        if self._page_table_materializer.uses_device_staging:
+            # The kernel cannot read the host table here, so it reads a device copy.
+            with torch.cuda.stream(stream):
+                self._device_kv_cache_block_offsets_input.copy_(
+                    self.host_kv_cache_block_offsets,
+                    non_blocking=True,
+                )
+                rows = self._device_copy_idx_int32_staging[:num_seqs]
+                rows.copy_(copy_idx, non_blocking=True)
+            source = self._device_kv_cache_block_offsets_input
+        else:
+            # Both the table and IndexMapper's int32 row map are pinned host buffers.
+            source = self.host_kv_cache_block_offsets
+            rows = copy_idx
+        copy_per_layer_block_offsets_to_device(
+            source,
+            dst_tensor[: self.num_attention_op_pools],
+            rows,
+            self._device_attention_op_converters,
+            self._device_attention_op_pool_lane_offsets,
+            self._device_attention_op_pool_lanes,
+            num_blocks,
+            stream.cuda_stream,
+        )
+
     def _copy_batch_block_offsets_per_layer(
         self,
         dst_tensor: torch.Tensor,
@@ -4757,20 +4857,59 @@ class KVCacheManagerV2(BaseResourceManager):
         copy_idx: torch.Tensor,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int],
     ) -> None:
-        device_copy_idx = self._copy_idx_to_device(copy_idx)
-        self._device_kv_cache_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets,
-            non_blocking=True,
+        if not self.enable_swa_scratch_reuse:
+            self._device_kv_cache_block_offsets_input.copy_(
+                self.host_kv_cache_block_offsets, non_blocking=True
+            )
+            self._device_copy_idx_staging[:num_seqs].copy_(copy_idx, non_blocking=True)
+            # Conversion tensors and staging can contain only a subclass's output layers.
+            _copy_per_layer_block_offsets_compiled(
+                self._device_kv_cache_block_offsets_input,
+                self._device_copy_idx_staging,
+                self._device_attention_op_pool_ids,
+                self._device_attention_op_scales,
+                self._device_attention_op_layer_offsets,
+                self._device_attention_op_block_offsets_staging,
+            )
+            dst_tensor[: self.num_attention_op_pools, :num_seqs].copy_(
+                self._device_attention_op_block_offsets_staging[:, :num_seqs],
+                non_blocking=True,
+            )
+            return
+        has_scratch = num_contexts > 0 and any(
+            self.kv_cache_map[request_id].has_scratch_slots
+            for request_id in request_ids[:num_contexts]
+        )
+        uses_device_staging = self._page_table_materializer.uses_device_staging
+        if not has_scratch:
+            # A staged copy stays on the current stream, where the scratch path
+            # also refills the shared device input.
+            self._copy_per_layer_block_offsets(
+                dst_tensor,
+                copy_idx,
+                num_seqs,
+                self.max_blocks_per_seq if max_blocks is None else max_blocks,
+                torch.cuda.current_stream() if uses_device_staging else self._stream,
+            )
+            return
+        # The compiled overlay works on the full fixed-shape staging buffer, so
+        # convert every column there; both run on the current stream.
+        self._copy_per_layer_block_offsets(
+            self._device_attention_op_block_offsets_staging,
+            copy_idx,
+            num_seqs,
+            self.max_blocks_per_seq,
+            torch.cuda.current_stream(),
         )
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
             request_ids,
             num_contexts,
         )
         self._device_num_contexts.fill_(num_contexts)
-        _copy_swa_block_offsets_with_scratch_compiled(
-            self._device_kv_cache_block_offsets_input,
-            device_copy_idx,
+        _overlay_swa_scratch_pages_compiled(
+            self._device_attention_op_block_offsets_staging,
             self._device_attention_op_pool_ids,
             self._device_attention_op_scales,
             self._device_attention_op_layer_offsets,
@@ -4780,7 +4919,6 @@ class KVCacheManagerV2(BaseResourceManager):
             scratch_ends,
             scratch_slots,
             self._device_num_contexts,
-            self._device_attention_op_block_offsets_staging,
         )
         dst_tensor[: self.num_attention_op_pools, :num_seqs].copy_(
             self._device_attention_op_block_offsets_staging[
@@ -6917,7 +7055,9 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         self._set_page_index_bufs(request_id, kv_cache)
 
-    def _resume_and_restore(self, req_id: int, kv_cache, optional_reuse_groups=None) -> bool:
+    def _resume_and_restore(
+        self, req_id: int, kv_cache, optional_reuse_groups=None, *, optional_reuse_endpoints=None
+    ) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
         Returns True if the cache is (or becomes) active, False on failure.
@@ -6927,8 +7067,12 @@ class KVCacheManagerV2(BaseResourceManager):
         stream = self._cache_stream(req_id)
         if not (
             kv_cache.resume(stream)
-            if optional_reuse_groups is None
-            else kv_cache.resume(stream, optional_reuse_groups=optional_reuse_groups)
+            if optional_reuse_groups is None and optional_reuse_endpoints is None
+            else kv_cache.resume(
+                stream,
+                optional_reuse_groups=optional_reuse_groups,
+                optional_reuse_endpoints=optional_reuse_endpoints,
+            )
         ):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
@@ -8897,6 +9041,36 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return and reset the page-table conversions: reused, row updates, full builds, full ms."""
         return (0, 0, 0, 0.0)
 
+    @staticmethod
+    def _utilization(total: int, remaining: int) -> float | None:
+        """Return ``1 - remaining / total``, or ``None`` for a pool without capacity."""
+        return 1.0 - remaining / total if total else None
+
+    def get_kv_cache_pool_utilization(self) -> dict[str, list[float | None] | None]:
+        """Read per-pool-group utilization from CPU-side counters.
+
+        Returns:
+            ``"gpu"`` maps to ``1 - available / total`` per GPU pool group, where
+            ``available`` counts free and evictable slots. ``"host"`` maps to the occupancy
+            ``1 - free / total`` per host pool group, including evictable cached pages, or to
+            ``None`` when there is no host tier. List positions are tier-local pool group ids;
+            zero-capacity groups read ``None``. Disk tiers are not reported.
+        """
+        pool_utilization: dict[str, list[float | None] | None] = {
+            "gpu": [
+                self._utilization(stat.total, stat.available)
+                for stat in self._get_storage_statistics(GPU_LEVEL)
+            ],
+            "host": None,
+        }
+        for level, tier in enumerate(self.impl.cache_tier_list):
+            if tier == CacheTier.HOST_MEM:
+                pool_utilization["host"] = [
+                    self._utilization(stat.total, stat.free)
+                    for stat in self._get_storage_statistics(CacheLevel(level))
+                ]
+        return pool_utilization
+
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
         pool_group_stats = self._get_storage_statistics(GPU_LEVEL)
@@ -9877,6 +10051,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self._waiter_snapshot_points.pop(request.py_request_id, None)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         self._inflight_draft_lens.pop(request.py_request_id, None)
+        if self._keep_growth_block:
+            self._kept_growth_slack.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -10823,10 +10999,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 and req.context_remaining_length > 0
                 and req.context_current_position in req.expect_snapshot_points
             )
-            should_resize = not should_block_reuse or not is_all_reusable
+            should_advance_history = not should_block_reuse or not is_all_reusable
             should_commit = is_all_reusable or is_branch_point or req.context_remaining_length == 0
 
-            if should_resize:
+            if should_advance_history:
                 self._resize_context_history(req, kv_cache, req.context_current_position)
             if should_commit:
                 self.try_commit_blocks(req)
@@ -10852,10 +11028,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return req.max_beam_num_tokens - 1
 
     def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
-        """Advance a context cache's history marker, or raise."""
-        if not kv_cache.resize(None, history_length):
+        """Report completed context computation and reclaim stale KV pages, or raise."""
+        if not kv_cache.resize(None, history_length, complete_optional_recovery=True):
             raise ValueError(
-                "Failed to resize history length of KV cache for request "
+                "Failed to advance computed history of KV cache for request "
                 f"{req.py_request_id} to {history_length} tokens at context update"
             )
 
@@ -10916,11 +11092,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # Reclaim every reserved slot that was not occupied by an accepted
             # draft token.
             rewind_len = max(allocated_draft_slots - accepted_draft_len, 0)
-            new_capacity = (
-                None
-                if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
-                else kv_cache.capacity - rewind_len
-            )
+            if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT):
+                new_capacity = None
+            elif self._keep_growth_block and not self.kv_compression_manages_history:
+                new_capacity = self._kept_generation_update(
+                    req.py_request_id, kv_cache.capacity, rewind_len, allocated_draft_slots
+                )
+            else:
+                new_capacity = kv_cache.capacity - rewind_len
             history_length = self._generation_history_length(req)
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
@@ -10935,6 +11114,26 @@ class KVCacheManagerV2(BaseResourceManager):
             self._allocated_draft_lens.pop(req.py_request_id, None)
             self.try_commit_generation_blocks(req)
 
+    def keep_growth_blocks(self) -> None:
+        """Keep a decoding request's growth block across a draft shrink (``_kept_generation_capacity``),
+        except in a draft pool, under helix or under attention DP. Call before any request runs."""
+        self._keep_growth_block = (
+            not self.is_draft and not self._has_cp_helix and not self.mapping.enable_attention_dp
+        )
+
+    def _kept_generation_update(
+        self, request_id: int, capacity: int, rewind_len: int, draft_slots: int
+    ) -> int:
+        """The capacity a generation update shrinks to when it keeps its growth block (see
+        ``_kept_generation_capacity``); records the slack it keeps, gives back the previous one."""
+        rewind = rewind_len + self._kept_growth_slack.pop(request_id, 0)
+        # The next growth takes the width of the latest allocation.
+        growth = 1 + self._allocated_draft_lens.get(request_id, draft_slots)
+        new_capacity = _kept_generation_capacity(capacity, rewind, growth, self.tokens_per_block)
+        if new_capacity > capacity - rewind:
+            self._kept_growth_slack[request_id] = new_capacity - (capacity - rewind)
+        return new_capacity
+
     def copy_batch_block_offsets(
         self,
         dst_tensor: torch.Tensor,
@@ -10944,8 +11143,6 @@ class KVCacheManagerV2(BaseResourceManager):
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ):
-        # max_blocks is accepted for signature parity with KVCacheManager; the
-        # device-side copy op here already scales with allocated blocks only.
         assert beam_width <= self.max_copy_beam_width
 
         # Cross KV is request-scoped: generation beams share the encoder K/V
@@ -10960,7 +11157,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if self._use_per_layer_page_tables:
             self._copy_batch_block_offsets_per_layer(
-                dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
+                dst_tensor, request_ids, copy_idx, num_contexts, num_seqs, max_blocks
             )
             return
 
@@ -11064,6 +11261,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
         custom_priority_callback: PagePriorityCallback | None = None,
         locality_domain_id: int | None = None,
+        optional_reuse_max_backtrack: int = 0,
     ):
         """Create the cache of one request.
 
@@ -11136,6 +11334,7 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
             locality_domain_id=locality_domain_id,
+            optional_reuse_max_backtrack=optional_reuse_max_backtrack,
             **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache

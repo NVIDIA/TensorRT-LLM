@@ -137,6 +137,7 @@ def _make_v1_manager(**attributes: object) -> KVCacheManager:
 
 def _make_v2_manager(**attributes: object) -> KVCacheManagerV2:
     manager = object.__new__(KVCacheManagerV2)
+    manager._use_per_layer_page_tables = False
     for name, value in attributes.items():
         setattr(manager, name, value)
     return manager
@@ -833,9 +834,9 @@ def test_phase_support_check_preserves_whole_request_semantics(phase: FmhaPhase)
     "selection,sm,is_mla,input_type,kernel_supported,expected",
     [
         (None, 107, True, AttentionInputType.generation_only, True, True),
-        (None, 100, True, AttentionInputType.generation_only, False, False),
-        (None, 100, True, AttentionInputType.generation_only, True, True),
-        (None, 103, True, AttentionInputType.generation_only, True, True),
+        (None, 107, True, AttentionInputType.generation_only, False, False),
+        (None, 100, True, AttentionInputType.generation_only, True, False),
+        (None, 103, True, AttentionInputType.generation_only, True, False),
         (None, 90, True, AttentionInputType.generation_only, True, False),
         (None, 107, True, AttentionInputType.context_only, True, False),
         (None, 107, True, AttentionInputType.mixed, True, False),

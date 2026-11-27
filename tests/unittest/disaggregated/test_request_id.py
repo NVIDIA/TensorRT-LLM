@@ -98,6 +98,7 @@ def _make_recv_task(
         ),
         _unique_rid=unique_rid,
         _chunk=SimpleNamespace(block_ids_per_layer_groups=[]),
+        _enforce_physical_ownership=False,
         _aux_slot=None,
         slice_id=0,
     )

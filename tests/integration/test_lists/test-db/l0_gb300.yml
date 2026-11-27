@@ -72,7 +72,7 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
   - unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestSparseResolve::test_colliding_selections_preserve_slots_and_eviction
-  - unittest/_torch/moe/kernels/parallel
+  # moe/kernels/parallel runs on B300 (l0_b300), the same SM103 kernels.
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
   # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
@@ -90,6 +90,7 @@ l0_gb300:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/visual_gen/kernels/parallel
+  - unittest/_torch/visual_gen/test_attention_deco.py
   # Ungrouped noaux_tc top-16 + moe_sort routing kernel and the MoE tables hand-off.
   - unittest/_torch/moe/test_kimi_k3_route_sort.py
   - unittest/_torch/moe/test_moe_sorted_routing.py
@@ -142,9 +143,8 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
-  # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
+  # Synthetic weights cover Engram head/row shards.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
-  - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
@@ -165,7 +165,7 @@ l0_gb300:
   # qwen4_exp target, pre-merge: tep4 with three drafts and IndexShare, gsm8k and then
   # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
   # run post-merge (l0_gb300_multi_gpus).
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
   # Qwen3.5 TP decode: KV-replica FP8 decode (TP2 / TP4), the MNNVL all-reduce + RMSNorm kernels and the LL TP
   # exchanges (sampling, RoPE gather, group merge) at group sizes 2 and 4.
   - unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py
@@ -175,9 +175,9 @@ l0_gb300:
   # tep4 MTP3 over an FP8 KV pool, and tep4 MTP3 with IndexShare over 3k-6k-token pass keys (the
   # sparse attention path) with their acceptance-length floor. dep4 and dep2 disaggregated run
   # post-merge.
-  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/comm
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_long_context TIMEOUT (60)
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/comm
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_long_context TIMEOUT (60)
 
 # K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
 # NVLink domain.

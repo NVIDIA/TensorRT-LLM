@@ -836,11 +836,6 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def get_vocab_size(self) -> int:
         return int(unwrap_glm5_next_text_config(self._config).vocab_size)
 
-    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # PIL is the HF processor's native input; the server's default float
-        # CHW tensor would be decoded, hashed and converted back for nothing.
-        return {"image": {"format": "pil"}}
-
     def get_mm_token_ids(self) -> torch.Tensor:
         """In-vocab ``<|image|>`` / ``<|video|>`` ids: the frontend's
         out-of-vocabulary fallback (``ids >= vocab_size``) would find no
@@ -960,9 +955,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             # milliseconds on long prompts.
             return self._tokenizer(text_prompt).input_ids, None
 
-        # Media loaders may deliver pre-rescaled float tensors (the server
-        # default) instead of PIL / uint8; tell the HF processor not to
-        # rescale those a second time (Qwen2-VL precedent).
+        # Caller-supplied float tensors are already scaled to [0, 1].
         images_kwargs = dict(mm_processor_kwargs.get("images_kwargs") or {})
         videos_kwargs = dict(mm_processor_kwargs.get("videos_kwargs") or {})
         if images and "do_rescale" not in mm_processor_kwargs:

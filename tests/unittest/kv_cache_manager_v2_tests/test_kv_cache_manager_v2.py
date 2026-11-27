@@ -9009,8 +9009,8 @@ class TestSSMSupport(unittest.TestCase):
         # prefill
         prompt = [self.next_token() for _ in range(63)]
         kv_cache.capacity = len(prompt)
-        kv_cache.history_length = len(prompt)
         engine.execute([Step(kv_cache, prompt, [])], stream)
+        kv_cache.history_length = len(prompt)
         history = list(prompt)
         # decode
         for _ in range(52):
@@ -9091,8 +9091,8 @@ class TestSSMSupport(unittest.TestCase):
         kv1 = self.manager.create_kv_cache()
         kv1.resume(stream)
         kv1.capacity = len(prompt)
-        kv1.history_length = len(prompt)
         engine.execute([Step(kv1, prompt, [])], stream)
+        kv1.history_length = len(prompt)
         kv1.commit(prompt)
         kv1.stop_committing()
         kv1.close()

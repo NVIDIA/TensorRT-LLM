@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fp4_mla.cache_layout import Fp4MlaCacheLayout
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
     Fp4MlaKVCacheManagerV2,
     Fp4MlaV2CacheLayoutPolicy,
@@ -413,6 +414,17 @@ def test_kda_replay_caches_never_move(manager_cls, kda_replay):
     assert (str(replay_role) in spec.untransferred_roles) == kda_replay
 
 
+def _attach_fp4_mla_layout(manager, cache_layers, tail_layers, local_layers, hp_pool_size=19):
+    """Give ``manager`` an FP4 MLA layout: the latent caches of its local layers ``local_layers``
+    in the internal layers ``cache_layers``, their high-precision tails in ``tail_layers``."""
+    layout = Fp4MlaCacheLayout(manager)
+    layout._cache_manager_layer_ids = [LayerId(layer) for layer in cache_layers]
+    layout._hp_manager_layer_ids = [LayerId(layer) for layer in tail_layers]
+    layout._fp4_mla_compact_to_local = list(local_layers)
+    layout._fp4_mla_hp_pool_size = hp_pool_size
+    manager.fp4_mla_layout = layout
+
+
 def _fp4_mla_manager(hp_pool_size=19):
     """An FP4 MLA manager over model layers 0 and 1: latent caches in internal layers 0 and 1,
     their high-precision tails in 2 and 3, one layer group each."""
@@ -420,22 +432,19 @@ def _fp4_mla_manager(hp_pool_size=19):
     def buffers(layers, role):
         return [SimpleNamespace(layer_id=LayerId(layer), role=role) for layer in layers]
 
-    return _stub(
+    manager = _stub(
         Fp4MlaKVCacheManagerV2,
         dtype=DataType.NVFP4,
         kv_factor=1,
         pp_layers=[0, 1],
         head_dim_per_layer=[96, 96],
-        _cache_manager_layer_ids=[LayerId(0), LayerId(1)],
-        _hp_manager_layer_ids=[LayerId(2), LayerId(3)],
-        _fp8_mla_manager_layer_ids=[],
-        _fp4_mla_compact_to_local=[0, 1],
-        _fp4_mla_hp_pool_size=hp_pool_size,
         impl=SimpleNamespace(
             layer_grouping=[[LayerId(0), LayerId(1)], [LayerId(2), LayerId(3)]],
             buffer_grouping=[buffers((0, 1), Role.KEY), buffers((2, 3), Role.MLA_HP_TAIL)],
         ),
     )
+    _attach_fp4_mla_layout(manager, (0, 1), (2, 3), (0, 1), hp_pool_size)
+    return manager
 
 
 def test_fp4_mla_lays_latents_token_major_and_its_tail_as_a_ring():
@@ -483,11 +492,6 @@ def test_hybrid_fp4_mla_lays_its_attention_roles_and_layer_names_over_its_state(
         pp_layers=[0, 1, 2, 3],
         _mamba_layer_mask=[True, False, True, False],
         head_dim_per_layer=[96] * 4,
-        _cache_manager_layer_ids=[LayerId(1), LayerId(3)],
-        _hp_manager_layer_ids=[LayerId(4), LayerId(5)],
-        _fp8_mla_manager_layer_ids=[],
-        _fp4_mla_compact_to_local=[1, 3],
-        _fp4_mla_hp_pool_size=19,
         impl=SimpleNamespace(
             layer_grouping=[
                 [LayerId(0), LayerId(2)],
@@ -502,7 +506,7 @@ def test_hybrid_fp4_mla_lays_its_attention_roles_and_layer_names_over_its_state(
         ),
     )
     manager._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
-    Fp4MlaV2CacheLayoutPolicy.install_manager_capabilities(manager)
+    _attach_fp4_mla_layout(manager, (1, 3), (4, 5), (1, 3))
     roles = (
         *STATE_ROLES,
         Role.KEY,

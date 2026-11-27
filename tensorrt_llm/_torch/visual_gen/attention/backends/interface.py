@@ -102,7 +102,20 @@ class AttentionBackend(ABC):
         * ``batch_size``, ``seq_len``, ``seq_len_kv``: the batch and the query and
           key row counts, padding included, as the Attention module derives them from
           the tensor shapes.
-        * ``attention_mask``, ``key_padding_mask``: the mask, if the backend takes one.
+        * ``attention_mask``: the mask type, if the backend takes one.
+        * ``key_padding_mask``: a bool tensor ``[B, S_kv]``, True where a key row holds a
+          token; the other keys get no attention weight. Honoured by backends whose
+          ``support_key_padding_mask()`` is true; one whose ``requires_trailing_padding()``
+          is true reads it as one valid prefix per sample.
+        * ``valid_seq_len``: a host integer, the number of leading rows that hold tokens.
+          Backends whose ``support_valid_seq_len()`` is true attend the keys of that prefix
+          only and return zeros in the rows after it; TRTLLM does so on calls that also
+          pass ``discard_padded_queries=True``.
+        * ``token_tags``: an integer tensor ``[S]``, one layout for the batch, with the
+          modality of every row of a packed multimodal sequence: 0 video or image,
+          positive text or audio, negative a row that holds a token in no sample. A row
+          that ``key_padding_mask`` or ``valid_seq_len`` excludes is padding whatever its
+          tag. Advisory: a backend that samples tokens by modality reads it.
         * ``kv``: a ``ForwardPlan`` from a ``RolloutKVCacheInterface``; only backends
           whose ``support_kv_cache()`` is true accept it. ``k``/``v`` are then this
           call's new tokens, staged into the cache and attended together with what the
@@ -136,6 +149,26 @@ class AttentionBackend(ABC):
 
     @classmethod
     def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_key_padding_mask(cls) -> bool:
+        """Whether ``forward`` honours ``key_padding_mask`` on dense attention. A backend
+        that does not drops the keyword through ``**kwargs`` and attends the padding.
+
+        A model asks this and the two capabilities below of the backend class of its config
+        before it builds its layers (``get_padding_support``)."""
+        return False
+
+    @classmethod
+    def requires_trailing_padding(cls) -> bool:
+        """Whether ``forward`` reads a ``key_padding_mask`` as one valid prefix per sample,
+        so that the padding of every sample must follow its tokens."""
+        return False
+
+    @classmethod
+    def support_valid_seq_len(cls) -> bool:
+        """Whether ``forward`` honours ``valid_seq_len`` on dense self-attention."""
         return False
 
     @classmethod

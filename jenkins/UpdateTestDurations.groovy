@@ -108,9 +108,6 @@ pipeline {
         timeout(time: 1, unit: 'HOURS')
         disableConcurrentBuilds(abortPrevious: true)
     }
-    triggers {
-        cron('H 2 * * 1')
-    }
     parameters {
         string(
             name: 'DAYS',

@@ -22,8 +22,9 @@ The deployment is the one the targets route (``models/minimax_m3/routing.py``): 
 (GB300, 4 or 8 ranks) or sm_107 (Rubin, 2, 4 or 8 ranks), tensor-parallel attention and experts, the MiniMax-M3 MSA
 sparse attention with the fused five-way QKV/index projection, an FP8 indexer and an NVFP4 KV cache.
 ``_MiniMaxM3Target`` runs GSM8K without speculation and with one-model Eagle3, where a chat-GSM8K acceptance probe
-also guards the drafter (accuracy alone does not notice a corrupted draft KV). Each target subclass sets only its TP
-size.
+also guards the drafter (accuracy alone does not notice a corrupted draft KV). On the sm_107 targets the run without
+speculation uses fullgraph piecewise prefill CUDA graphs, the context-server compile setup of the VR200 serving
+configs. Each target subclass sets only its TP size.
 """
 
 import json
@@ -41,7 +42,9 @@ from tensorrt_llm.llmapi import (
     KvCacheConfig,
     MiniMaxM3SparseAttentionConfig,
     MoeConfig,
+    PrefillCudaGraphBackend,
     SamplingParams,
+    TorchCompileConfig,
 )
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -63,6 +66,9 @@ skip_not_sm107 = pytest.mark.skipif(
 MIN_ACCEPTANCE_RATE = 0.78
 MIN_ACCEPTANCE_LENGTH = 3.3
 
+# The prefill buckets of the VR200 MiniMax-M3 context servers.
+PIECEWISE_CAPTURE_NUM_TOKENS = [256, 384, 512, 1024, 2048, 4096, 6144, 8192]
+
 
 def _drain_spec_stats(llm):
     drafted = accepted = steps = 0
@@ -82,11 +88,22 @@ class _MiniMaxM3Target(LlmapiAccuracyTestHarness):
     TP = 4
 
     @contextmanager
-    def _llm(self, eagle3: bool) -> Iterator[LLM]:
+    def _llm(self, eagle3: bool, piecewise: bool = False) -> Iterator[LLM]:
         spec = (
             Eagle3DecodingConfig(max_draft_len=3, speculative_model=self.EAGLE_PATH)
             if eagle3
             else None
+        )
+        compile_args = (
+            dict(
+                torch_compile_config=TorchCompileConfig(
+                    enable_fullgraph=True, enable_userbuffers=True, max_num_streams=3
+                ),
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                prefill_capture_num_tokens=PIECEWISE_CAPTURE_NUM_TOKENS,
+            )
+            if piecewise
+            else {}
         )
         with (
             scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
@@ -105,6 +122,7 @@ class _MiniMaxM3Target(LlmapiAccuracyTestHarness):
                 max_batch_size=64,
                 cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=64),
                 speculative_config=spec,
+                **compile_args,
                 enable_iter_perf_stats=eagle3,
                 max_stats_len=5000,
                 trust_remote_code=True,
@@ -114,8 +132,8 @@ class _MiniMaxM3Target(LlmapiAccuracyTestHarness):
         ):
             yield llm
 
-    def _gsm8k(self, eagle3: bool) -> None:
-        with self._llm(eagle3) as llm:
+    def _gsm8k(self, eagle3: bool, piecewise: bool = False) -> None:
+        with self._llm(eagle3, piecewise) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)

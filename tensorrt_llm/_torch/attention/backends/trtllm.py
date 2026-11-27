@@ -20,8 +20,8 @@ import os
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
-                    List, Optional, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet,
+                    Iterator, List, Optional, Tuple)
 
 import numpy as np
 import torch
@@ -52,23 +52,27 @@ from tensorrt_llm.quantization.mode import QuantMode
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...locality_domain.runtime import LocalityDomainRuntime
-from ...pyexecutor import h2d_cache, step_inputs
+from ...pyexecutor import device_copy, h2d_cache, step_inputs
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.device_copy import CopySite
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fmha.registry import is_fmha_lib_enabled
-from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
+from .fmha.registry import is_fmha_lib_enabled, step_planning_fmha_lib_classes
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, fp4_mla_cache_layout,
+                      has_fp4_mla_cache_layout, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        AttentionRuntimeFeatures, KVCacheParams, MLAParams,
-                        PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams, merge_attention_forward_args)
+                        AttentionRuntimeFeatures, GraphVariant, KVCacheParams,
+                        MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams,
+                        merge_attention_forward_args)
 from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import has_sparse_mla_hooks, prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
@@ -88,6 +92,19 @@ def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
     """Whether MLA context attention with an FP8 or NVFP4 KV cache runs the op's
     FP8 context MLA FMHA on this SM (``mFP8ContextMLA`` in thop/attentionOp.cpp)."""
     return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
+
+
+def trtllm_supports_swa_scratch_reuse(sm_version: Optional[int] = None) -> bool:
+    """Whether TRTLLM attention can run with SWA scratch reuse on this GPU.
+
+    Scratch reuse needs per-layer page tables, which keep BAD_PAGE_INDEX for
+    blocks that left the window. The SM90 and SM100-family context kernels
+    load paged KV through TMA, which does not fault on those entries. The
+    fmha_v2 flash kernels used on other GPUs start the KV loop at a tile
+    boundary before the window and dereference every page in that tile.
+    """
+    sm = get_sm_version() if sm_version is None else sm_version
+    return sm == 90 or is_sm_100f(sm)
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -240,6 +257,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     beam_shared_prefix_enabled: bool = field(default=False,
                                              init=False,
                                              repr=False)
+    # Per-step device tensors that FMHA libraries derive once and share across
+    # the layers of a forward (e.g. page tables); emptied by every prepare().
+    fmha_step_caches: Dict[str, dict] = field(default_factory=dict,
+                                              init=False,
+                                              repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
     context_plan: Optional[_ContextPlan] = field(init=False,
                                                  default=None,
@@ -506,6 +528,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
 
     def __post_init__(self) -> None:
+        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
+                and self.kv_cache_manager.enable_swa_scratch_reuse):
+            self._validate_swa_scratch_reuse()
         super().__post_init__()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
@@ -519,9 +544,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fmha_plan_caches = {}
         self.beam_shared_prefix_enabled = is_fmha_lib_enabled(
             "beam_shared_prefix")
+        self.fmha_step_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _validate_swa_scratch_reuse(self) -> None:
+        """Require context kernels that safely read per-layer scratch page tables."""
+        if not trtllm_supports_swa_scratch_reuse():
+            raise ValueError(
+                "TRTLLM attention supports SWA scratch reuse only on SM90 and "
+                "SM100-family GPUs. Set "
+                "kv_cache_config.enable_swa_scratch_reuse=False.")
 
     def _post_init_with_buffers(self, buffers) -> None:
 
@@ -742,9 +776,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=prefer_pinned(),
                 )
 
-        if callable(
-                getattr(self.kv_cache_manager, "get_fp4_mla_page_table_spec",
-                        None)):
+        if has_fp4_mla_cache_layout(self.kv_cache_manager):
             self.fp4_mla_state = Fp4MlaState.create(self, buffers)
 
         # Allocate static buffers for helix parallelism support.
@@ -874,27 +906,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.update_for_spec_dec(self)
 
-    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
-        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+    def set_decode_graph_variant(self, name: str, value: Optional[int]) -> None:
+        # Only the FP4 MLA decode serves graph variants.
         state = self.fp4_mla_state
-        if state is not None:
-            state.kv_regime_max_kv = kv_regime
+        if state is None:
+            return super().set_decode_graph_variant(name, value)
+        state.set_decode_graph_variant(name, value)
 
-    @property
-    def decode_kv_regime(self) -> Optional[int]:
+    def decode_graph_variant(self, name: str) -> Optional[int]:
         state = self.fp4_mla_state
-        return None if state is None else state.kv_regime_max_kv
-
-    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
-        # The FP4 MLA packed decode launches its split budget only when True.
-        state = self.fp4_mla_state
-        if state is not None:
-            state.packed_split = packed_split
-
-    @property
-    def decode_packed_split(self) -> Optional[bool]:
-        state = self.fp4_mla_state
-        return None if state is None else state.packed_split
+        return None if state is None else state.decode_graph_variant(name)
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
@@ -1373,6 +1394,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
+        self.fmha_step_caches = {}
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
         self._steady_block_table_keys = (None, None)
@@ -1401,7 +1423,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        if not self._upload_to_device(
+        if device_copy.current() is not None:
+            # The model declares a copy plan, which owns the engine's copies. Never
+            # skipped: CUDA graph metadata of every graph key takes this buffer from
+            # one pool, so no host record proves its device contents.
+            device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                             self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs])
+        elif not self._upload_to_device(
                 "prompt_lens", self.prompt_lens_cuda[:self.num_seqs],
                 self.prompt_lens_cpu[:self.num_seqs], h2d_cache.enabled()):
             copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
@@ -1461,7 +1490,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        if not self._upload_to_device(
+        if device_copy.current() is not None:
+            device_copy.copy(CopySite.ATTN_KV_LENS,
+                             self.kv_lens_cuda[:self.num_seqs],
+                             maybe_pin_memory(kv_lens[:self.num_seqs]))
+        elif not self._upload_to_device(
                 "kv_lens", self.kv_lens_cuda[:self.num_seqs],
                 kv_lens[:self.num_seqs], step_inputs.is_open()):
             step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
@@ -1729,6 +1762,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                 pool_block_offsets[:, 1],
                                 out=pool_block_offsets[:, 1])
 
+        # Per-step host planning of the enabled FMHA libraries that plan steps
+        # (Fmha.plan_step). It must run here, ahead of every forward of the
+        # step, so that under CUDA graphs it precedes both capture and replay.
+        for fmha_cls in step_planning_fmha_lib_classes():
+            fmha_cls.plan_step(self)
+
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
         batch = len(view.page_counts)
@@ -1812,7 +1851,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        if device_copy.current() is not None:
+            device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                             self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        else:
+            copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens
@@ -1848,17 +1891,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @property
     def supports_steady_decode_step(self) -> bool:
-        """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
-        prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
-        mixed-precision KV or full generation page table) and prepare() is this class's."""
+        """Whether prepare_steady_decode_step may stand in for this metadata's prepare()."""
         return (type(self).prepare is TrtllmAttentionMetadata.prepare
-                and self.kv_cache_manager is not None
-                and not self.enable_flash_mla and not self.enable_helix
+                and self._steady_decode_config_supported())
+
+    def _steady_decode_config_supported(self) -> bool:
+        """Whether the common prepare() needs no host state beyond the KV lengths and
+        block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
+        mixed-precision KV, full generation page table or FMHA step plan)."""
+        return (self.kv_cache_manager is not None and not self.enable_flash_mla
+                and not self.enable_helix
                 and not self.enable_context_mla_with_cached_kv
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()
                 and self.mixed_precision_high_block_table is None
-                and not self.kv_cache_params.use_full_generation_page_table)
+                and not self.kv_cache_params.use_full_generation_page_table
+                # No enabled FMHA library plans steps in prepare().
+                and not step_planning_fmha_lib_classes())
 
     def key_prepared_block_offsets(self) -> None:
         """Key the block offsets the last prepare() copied, so that the next prepare_steady_decode_step skips
@@ -1871,14 +1920,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         batch_block_table_key(self.request_ids))
         self._steady_block_table_keys = tuple(keys)
 
-    def prepare_steady_decode_step(self, kv_lens: List[int]) -> None:
+    def prepare_steady_decode_step(
+            self,
+            kv_lens: List[int],
+            prompt_lens: Optional[List[int]] = None) -> None:
         """prepare() of a generation-only step that runs the batch of the previous prepare() one step later.
 
-        Requires supports_steady_decode_step and the same requests, prompt lengths, request types and beam width
-        as that prepare(); kv_lens_cuda[:num_seqs] already holds the new lengths on the device. Sets the host
-        state that follows from ``kv_lens`` (KV lengths without the extra speculative tokens) and copies the
-        block offsets of a KV cache manager only when its batch_block_table_key changed. Speculative decoding
-        copies the full table width (max_blocks None), as prepare() does.
+        Requires supports_steady_decode_step, the same request types and beam width as that prepare() and, without
+        ``prompt_lens``, its requests; kv_lens_cuda[:num_seqs] already holds the new lengths on the device. Sets
+        the host state that follows from ``kv_lens`` (KV lengths without the extra speculative tokens) and copies
+        the block offsets of a KV cache manager only when its batch_block_table_key changed. Speculative decoding
+        copies the full table width (max_blocks None), as prepare() does. With ``prompt_lens``, other requests
+        took the rows: prompt_lens_cuda[:num_seqs] already holds their prompt lengths too.
         """
         AttentionMetadata.prepare(self)
         self._invalidate_mla_scheduler_buffers()
@@ -1886,6 +1939,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             get_global_attrs().attention_metadata = weakref.ref(self)
         num_seqs = self.num_seqs
         assert len(kv_lens) == num_seqs and self.num_contexts == 0
+        if prompt_lens is not None:
+            self.prompt_lens_cpu[:num_seqs].copy_(
+                torch.as_tensor(prompt_lens, dtype=torch.int, device='cpu'))
+            h2d_cache.forget(self.prompt_lens_cuda)
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
         host_kv_lens = torch.tensor(kv_lens, dtype=torch.int)
         self.kv_lens[:num_seqs].copy_(host_kv_lens + num_extra_kv_tokens)
@@ -3630,12 +3687,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         local_layer_idx = self.get_local_layer_idx(metadata)
         if metadata.kv_cache_manager is None:
             return local_layer_idx
-        to_compact = getattr(metadata.kv_cache_manager,
-                             "_fp4_mla_compact_layer_idx", None)
-        if not callable(to_compact):
+        layout = fp4_mla_cache_layout(metadata.kv_cache_manager)
+        if layout is None:
             raise RuntimeError(
                 "FP4 MLA requires a cache manager with compact layer mapping.")
-        return to_compact(local_layer_idx)
+        return layout._fp4_mla_compact_layer_idx(local_layer_idx)
 
     def use_nvfp4_output(
         self,
@@ -4683,6 +4739,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def support_fp4_kv_cache(cls) -> bool:
         return True
 
+    @classmethod
+    def decode_graph_variants(
+            cls, *, kv_cache_manager: Any, model: torch.nn.Module,
+            mapping: "Mapping",
+            sm_count_fn: Callable[[], int]) -> List[GraphVariant]:
+        # Only the FP4 MLA decode declares graph variants. Any other KV cache
+        # gets none, before a switch is read or the device probed.
+        from .fp4_mla import graph_resolvers
+
+        return graph_resolvers.resolve_fp4_mla_graph_variants(
+            kv_cache_manager=kv_cache_manager,
+            model=model,
+            mapping=mapping,
+            sm_count_fn=sm_count_fn)
+
     def has_cached_kv_for_mla_context(
         self,
         metadata: TrtllmAttentionMetadata,
@@ -5010,12 +5081,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q_pe: Optional[torch.Tensor],
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
-        cu_q_seqlens: torch.Tensor,
-        cu_kv_seqlens: torch.Tensor,
-        fmha_scheduler_counter: torch.Tensor,
-        mla_bmm1_scale: torch.Tensor,
-        mla_bmm2_scale: torch.Tensor,
-        quant_q_buffer: torch.Tensor,
+        cu_q_seqlens: Optional[torch.Tensor] = None,
+        cu_kv_seqlens: Optional[torch.Tensor] = None,
+        fmha_scheduler_counter: Optional[torch.Tensor] = None,
+        mla_bmm1_scale: Optional[torch.Tensor] = None,
+        mla_bmm2_scale: Optional[torch.Tensor] = None,
+        quant_q_buffer: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
@@ -5072,6 +5143,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 fuse_q_quant=fuse_fp4_q_quant,
             )
             return
+
+        assert cu_q_seqlens is not None
+        assert cu_kv_seqlens is not None
+        assert fmha_scheduler_counter is not None
 
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
@@ -5136,7 +5211,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         fmha_scheduler_counter: torch.Tensor,
         mla_bmm1_scale: Optional[torch.Tensor],
         mla_bmm2_scale: Optional[torch.Tensor],
-        quant_q_buffer: torch.Tensor,
+        quant_q_buffer: Optional[torch.Tensor],
         out_scale: Optional[torch.Tensor],
         helix_tensor_params: List[Optional[torch.Tensor]],
         kv_norm_weight: Optional[torch.Tensor],
