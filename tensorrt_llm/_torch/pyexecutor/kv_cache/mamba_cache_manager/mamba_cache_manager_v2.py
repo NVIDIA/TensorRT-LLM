@@ -117,6 +117,38 @@ def _equal_state_slices(capacity: int, num_states: int) -> List[KVCacheDesc]:
     ]
 
 
+def format_insufficient_mamba_gpu_quota_error(
+    gpu_quota: int,
+    minimum_live_quota: int,
+    max_batch_size: int,
+    pp_size: int,
+    feasible_max_batch_size: int,
+) -> str:
+    """Explain a too-small V2 Mamba GPU quota and how to shrink max_batch_size."""
+    message = (
+        "The V2 Mamba GPU cache quota is too small for live recurrent "
+        f"states and attention pages: got {gpu_quota} bytes, need at "
+        f"least {minimum_live_quota} bytes. This floor reserves recurrent "
+        "state on each pipeline-parallel rank for max_batch_size * pp_size = "
+        f"{max_batch_size * pp_size} sequences (max_batch_size={max_batch_size}, "
+        f"pp_size={pp_size}), plus GEN preemption headroom and CUDA graph "
+        "padding dummy slots."
+    )
+    if feasible_max_batch_size > 0:
+        message += (
+            " Reduce max_batch_size in the configuration (a value of "
+            f"{feasible_max_batch_size} would fit this quota) or increase "
+            "the GPU KV-cache budget."
+        )
+    else:
+        message += (
+            " Even max_batch_size=1 does not fit this quota. Increase the "
+            "GPU KV-cache budget, for example by raising "
+            "kv_cache_config.max_tokens or free GPU memory."
+        )
+    return message
+
+
 class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
@@ -948,6 +980,34 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 high = mid
         return low
 
+    def _largest_max_batch_size_for_gpu_quota(self, gpu_quota: int) -> int:
+        """Largest max_batch_size whose live-state floor fits in gpu_quota.
+
+        The live floor grows with max_batch_size (resident sequences scale
+        with max_batch_size * pp_size). Search in [0, max_batch_size).
+        The CUDA-graph padding dummy slots also depend on max_batch_size
+        (draft_len_schedule), so each candidate uses its own count.
+        """
+        original = self.max_batch_size
+        original_dummy_slots = self._num_reserved_dummy_slots
+        if original <= 0:
+            return 0
+        try:
+            low, high = 0, original
+            while low + 1 < high:
+                mid = (low + high) // 2
+                self.max_batch_size = mid
+                dummy_slots = _get_num_cuda_graph_padding_dummy_slots(self.spec_config, mid)
+                self._num_reserved_dummy_slots = dummy_slots + int(self.mapping.enable_attention_dp)
+                if self._minimum_live_gpu_quota() <= gpu_quota:
+                    low = mid
+                else:
+                    high = mid
+            return low
+        finally:
+            self.max_batch_size = original
+            self._num_reserved_dummy_slots = original_dummy_slots
+
     def _minimum_live_gpu_quota(self) -> int:
         """Return the minimum quota for live states, one attention page and the fixed regions."""
         attention_block_quota = self._attention_cache_bytes_per_token() * self.tokens_per_block
@@ -966,9 +1026,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         minimum_live_quota = self._minimum_live_gpu_quota()
         if minimum_live_quota > gpu_quota:
             raise ValueError(
-                "The V2 Mamba GPU cache quota is too small for live recurrent "
-                f"states and attention pages: got {gpu_quota} bytes, need at "
-                f"least {minimum_live_quota} bytes."
+                format_insufficient_mamba_gpu_quota_error(
+                    gpu_quota,
+                    minimum_live_quota,
+                    self.max_batch_size,
+                    self.mapping.pp_size,
+                    self._largest_max_batch_size_for_gpu_quota(gpu_quota),
+                )
             )
         # _build_base_config already constructed every attention layer,
         # including dtype-specific scale and subclass-provided side buffers.
