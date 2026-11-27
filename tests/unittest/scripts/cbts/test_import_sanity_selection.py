@@ -210,7 +210,7 @@ def test_import_only_needs_no_named_stages(setup_case: Case, tmp_path: Path) -> 
 
 
 def test_repository_import_edit_uses_existing_package_sanity(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     root = Path(__file__).resolve().parents[4]
     path = "tensorrt_llm/__init__.py"
@@ -230,7 +230,7 @@ def test_repository_import_edit_uses_existing_package_sanity(
         json.dumps({"changed_files": [path], "diffs": {path: _diff(before, source)}})
     )
     assert _run(_Args(str(payload), False, str(root), None, None, None, None, "file")) == 0
-    decision = json.loads(capsys.readouterr().out)
+    decision = json.loads(capfd.readouterr().out)
     assert decision["scope"] == "importsanityonly"
     assert decision["sanity_required"]
     assert not decision["perfsanity_required"]
