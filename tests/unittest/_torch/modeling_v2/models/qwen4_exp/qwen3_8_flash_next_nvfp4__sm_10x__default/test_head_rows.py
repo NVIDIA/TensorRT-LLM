@@ -36,19 +36,28 @@ class _Cuda(torch.Tensor):
     ],
 )
 def test_dispatch(monkeypatch, dp_size, rows, dtype, strided, expected):
+    """Each path is handed the step's own ids and table and its result is what `_head_rows`
+    returns."""
     calls = []
-    monkeypatch.setattr(
-        M,
-        "embed_rows",
-        lambda ids, table, copies, clamp: calls.append(("embed_rows", copies, clamp)),
-    )
-    monkeypatch.setattr(
-        M.nn.functional, "embedding", lambda ids, table: calls.append(("embedding",))
-    )
+    sentinel = {"embed_rows": torch.zeros(1), "embedding": torch.zeros(2)}
     final = torch.zeros(64, 16)
     if strided:
         final = torch.zeros(16, 64).t()
     final = final.as_subclass(_Cuda)
     ids = torch.arange(rows, dtype=dtype)
-    M._head_rows(SimpleNamespace(dp_size=dp_size), final, ids)
+
+    def embed_rows(ids_, table, copies, clamp):
+        assert ids_ is ids and table is final
+        calls.append(("embed_rows", copies, clamp))
+        return sentinel["embed_rows"]
+
+    def embedding(ids_, table):
+        assert ids_ is ids and table is final
+        calls.append(("embedding",))
+        return sentinel["embedding"]
+
+    monkeypatch.setattr(M, "embed_rows", embed_rows)
+    monkeypatch.setattr(M.nn.functional, "embedding", embedding)
+    got = M._head_rows(SimpleNamespace(dp_size=dp_size), final, ids)
     assert calls == ([("embed_rows", 1, False)] if expected == "embed_rows" else [("embedding",)])
+    assert got is sentinel[expected]

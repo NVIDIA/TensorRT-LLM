@@ -104,26 +104,32 @@ def test_build_declines(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_dispatch(monkeypatch):
+    """Each call takes the expected projection and returns what that projection returned."""
     calls = []
+    mid_out, dense_out = torch.full((48, 2560), 1.0), torch.full((48, 2560), 2.0)
     monkeypatch.setattr(
         M,
         "mid_mm_raw",
-        lambda x, w, plan, pdl=True, mpad=None: calls.append(("mid", mpad, w.shape)),
+        lambda x, w, plan, pdl=True, mpad=None: calls.append(("mid", mpad, w.shape)) or mid_out,
     )
     weight = torch.zeros(2560, 6144, dtype=torch.bfloat16)
     core = SimpleNamespace(_out_proj={"gdn_out": {48: (48, M.MidPlan())}, "attn_o": {}})
 
     def dense():
         calls.append(("dense",))
+        return dense_out
 
-    M._out_proj(core, torch.zeros(48, 6144), weight.t(), "gdn_out", dense)
-    M._out_proj(core, torch.zeros(48, 6144), weight.t(), "attn_o", dense)
-    M._out_proj(core, torch.zeros(44, 6144), weight.t(), "gdn_out", dense)
-    M._out_proj(core, torch.zeros(48, 12288)[:, ::2], weight.t(), "gdn_out", dense)  # strided
-    M._out_proj(
-        SimpleNamespace(_out_proj=None), torch.zeros(48, 6144), weight.t(), "gdn_out", dense
-    )
+    got = [
+        M._out_proj(core, torch.zeros(48, 6144), weight.t(), "gdn_out", dense),
+        M._out_proj(core, torch.zeros(48, 6144), weight.t(), "attn_o", dense),
+        M._out_proj(core, torch.zeros(44, 6144), weight.t(), "gdn_out", dense),
+        M._out_proj(core, torch.zeros(48, 12288)[:, ::2], weight.t(), "gdn_out", dense),  # strided
+        M._out_proj(
+            SimpleNamespace(_out_proj=None), torch.zeros(48, 6144), weight.t(), "gdn_out", dense
+        ),
+    ]
     assert calls == [("mid", 48, (2560, 6144))] + [("dense",)] * 4
+    assert got[0] is mid_out and all(g is dense_out for g in got[1:])
 
 
 _GPU = pytest.mark.skipif(

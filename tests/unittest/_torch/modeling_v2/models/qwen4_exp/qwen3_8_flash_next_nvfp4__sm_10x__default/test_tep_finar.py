@@ -52,7 +52,8 @@ def test_build_is_off_without_the_switch(monkeypatch):
 
 def _agree_core(route_front, peers_rows=None, layers=48):
     """A tep4 core whose `tp_sum` adds three peers' flags to this rank's: each peer serves
-    `peers_rows` (default: what this rank's route front serves)."""
+    `peers_rows` (default: what this rank's route front serves), or with a list of three, peer
+    i serves `peers_rows[i]`."""
     st = None
     mine = ()
     if route_front is not None:
@@ -61,11 +62,16 @@ def _agree_core(route_front, peers_rows=None, layers=48):
         st.layers = {i: i for i in range(layers)}
         mine = route_front
 
+    each = [mine if peers_rows is None else peers_rows] * 3
+    if isinstance(peers_rows, list):
+        each = peers_rows
+
     def tp_sum(flags):
-        peer = torch.zeros_like(flags)
-        for r in mine if peers_rows is None else peers_rows:
-            peer[0, r - 1] = 1.0
-        return flags + 3 * peer
+        total = flags.clone()
+        for rows in each:
+            for r in rows:
+                total[0, r - 1] += 1.0
+        return total
 
     return SimpleNamespace(
         tep_fast=True,
@@ -95,6 +101,9 @@ def test_build_needs_the_tep4_route_front(monkeypatch):
         (None, (4, 8), 48, ()),  # this rank has no route front, its peers do
         ((4, 8), (), 48, ()),  # the peers have none
         ((4, 8), None, 47, ()),  # MoE layers not a multiple of the slots
+        # This rank and two peers serve 8, the third does not: 8 is out (all four, not most).
+        ((4, 8, 16), [(4, 8, 16), (4, 8, 16), (4, 16)], 48, (4, 16)),
+        ((4, 8), [(4, 8), (8,), (4,)], 48, ()),  # every count misses on some peer
     ],
 )
 def test_ranks_agree_on_the_rows(mine, peers, layers, agreed):
@@ -116,7 +125,7 @@ def _setup(monkeypatch, capturing: bool, layers=6):
     monkeypatch.setattr(M, "_route_front_run", front)
 
     def fused(fc2, wts, perm, rows, slot, op):
-        calls.append(("fused", fc2, wts, tuple(perm.shape), rows, slot))
+        calls.append(("fused", fc2, wts, tuple(perm.shape), rows, slot, perm.data_ptr()))
         return "summed"
 
     monkeypatch.setattr(M, "tep_finalize_allreduce", fused)
@@ -146,6 +155,9 @@ def test_a_captured_step_folds_every_layer_on_rotating_slots(monkeypatch):
     fused = [c for c in calls if c[0] == "fused"]
     assert [c[5] for c in fused] == [0, 1, 2, 0, 1, 2] * 2
     assert all(c[1:5] == ("fc2", "wts", (4, TOPK), 4) for c in fused)
+    # Each layer's launch reads that layer's own routing table at the step's row count.
+    tables = core._route_front.views[4]
+    assert [c[6] for c in fused] == [tables[i][0].data_ptr() for i in range(len(weights))] * 2
     assert all(c[2:] == (True, False) for c in calls if c[0] == "front")
 
 

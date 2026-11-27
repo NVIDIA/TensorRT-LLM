@@ -689,9 +689,11 @@ def test_dp_replay_map_is_bitwise_the_default_mapping(n, pdl) -> None:
         assert torch.equal(x, y), f"{name}: {cfg} vs the kernel's own mapping at {n} requests"
 
 
-def test_precompile_covers_the_dp_replay_map() -> None:
+def test_precompile_covers_the_dp_replay_map(monkeypatch) -> None:
     """`precompile(configs=...)`, as the target runs it at bind with the launch-map table, leaves
-    nothing to compile for a step at a table mapping."""
+    nothing to compile for a step at a table mapping. The compile cache starts empty, so kernels
+    an earlier test compiled cannot stand in for the ones `precompile` must compile."""
+    monkeypatch.setattr(cr, "_COMPILED", {})
     t, partition_from = 4, CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
     width = trep.REPLAY_WORK_ITEM_WIDTH
     configs = {n: M._gdn_replay_map(n) for n in range(1, 49)}
@@ -701,6 +703,7 @@ def test_precompile_covers_the_dp_replay_map() -> None:
         configs=configs,
     )  # fmt: skip
     compiled = len(cr._COMPILED)
+    assert compiled > 0
     for n in (5, 13, 17, 48):
         path = "all_layer" if n >= partition_from else "small"
         spec = _rank_spec((16, 48), path=path, n=n, t=t, steps=1, layers=1, slots=2 * n + 8)

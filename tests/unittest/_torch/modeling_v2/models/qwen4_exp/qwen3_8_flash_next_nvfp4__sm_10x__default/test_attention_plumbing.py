@@ -299,16 +299,17 @@ def _select(scores, starts, ends) -> torch.Tensor:
 
 
 @_cuda
-@pytest.mark.parametrize("width", [2080, 65600])
-@pytest.mark.parametrize("form", ["cluster", "fused", "apart"])
+@pytest.mark.parametrize(
+    "width, form",
+    # The cluster launch serves the 65600-wide table only (2080 is below its narrowest).
+    [(2080, "fused"), (2080, "apart"), (65600, "cluster"), (65600, "fused"), (65600, "apart")],
+)
 def test_selection_matches_the_canonical_composition(width, form, monkeypatch):
     """The selection keeps the canonical tie order and expansion in each of its three forms:
     the cluster launch (`qsa_topk_expand_cluster`, where its table widths reach), the
     one-CTA-a-row launch, and the selection and the expansion apart."""
-    if form == "cluster" and not M._topk_expand_cluster_supports(
-        torch.empty((4, width), device=DEV)
-    ):
-        pytest.skip("the cluster launch does not serve this table width")
+    table = torch.empty((4, width), device=DEV)
+    assert M._topk_expand_cluster_supports(table) == (width == 65600)
     positions = torch.tensor([2043, 2047, 84000, 99999], dtype=torch.int64, device=DEV)
     visible = ((positions + 1) // 4).to(torch.int32)
     visible.clamp_(max=width)
@@ -329,9 +330,25 @@ def test_selection_matches_the_canonical_composition(width, form, monkeypatch):
         monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores, max_rows: False)
     if form == "apart":
         monkeypatch.setattr(M, "_topk_expand_supports", lambda scores: False)
+    launched = []
+    for name in ("qsa_topk_expand_cluster", "qsa_topk_expand_decode"):
+        real = getattr(M, name)
+        monkeypatch.setattr(
+            M,
+            name,
+            lambda *a, _real=real, _name=name, **k: (launched.append(_name), _real(*a, **k))[1],
+        )
     result = torch.full_like(expected, -7)
     selected = torch.full_like(expected_tokens, -7)
     M._selection(core, scores, visible, positions, lengths, result, starts, selected)
+    assert (
+        launched
+        == {
+            "cluster": ["qsa_topk_expand_cluster"],
+            "fused": ["qsa_topk_expand_decode"],
+            "apart": [],
+        }[form]
+    )
     assert torch.equal(result, expected)
     assert torch.equal(selected, expected_tokens)
 

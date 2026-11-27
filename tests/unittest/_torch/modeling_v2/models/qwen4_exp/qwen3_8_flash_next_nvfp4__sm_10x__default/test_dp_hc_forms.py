@@ -24,6 +24,14 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 )
 
 
+@pytest.fixture(autouse=True)
+def _default_switches(monkeypatch):
+    """Both build switches at their default (on: unset) whatever the shell exports; a test of
+    the switched-off form sets its own."""
+    monkeypatch.delenv(M.DP_HC_TILES_ENV, raising=False)
+    monkeypatch.delenv(M.DP_INPROJ_RELEASE_ENV, raising=False)
+
+
 def _first_recorder(monkeypatch):
     calls = []
 

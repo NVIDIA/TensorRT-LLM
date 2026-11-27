@@ -87,20 +87,27 @@ def _verify_core(state_dtype, mapped):
 @pytest.mark.parametrize(
     "state_dtype, mapped, expected",
     [
-        (torch.bfloat16, True, M._GDN_REPLAY_MAP_B),
-        (torch.bfloat16, False, "absent"),
-        (torch.float32, True, "absent"),  # the Triton replay
+        (torch.bfloat16, True, ("cute", M._GDN_REPLAY_MAP_B)),
+        (torch.bfloat16, False, ("cute", "absent")),
+        (torch.float32, True, ("triton", "absent")),  # the Triton replay takes no mapping
     ],
 )
 def test_verify_hands_the_mapping_to_the_cute_replay(monkeypatch, state_dtype, mapped, expected):
+    """A bf16 state runs the CuTe replay (with the table's mapping when it is on), an fp32 state
+    the Triton one, which is never handed a mapping."""
     seen = []
 
-    def replay(**kw):
-        seen.append(kw.get("config", "absent"))
-        return torch.zeros(kw["q"].shape[0] * kw["q"].shape[1] * 16)
+    def recorder(backend):
+        def replay(**kw):
+            seen.append((backend, kw.get("config", "absent")))
+            return torch.zeros(kw["q"].shape[0] * kw["q"].shape[1] * 16)
 
-    monkeypatch.setattr(M, "gdn_cached_replay_cute", replay)
-    monkeypatch.setattr(M, "fused_recurrent_gated_delta_rule_cached_replay_update", replay)
+        return replay
+
+    monkeypatch.setattr(M, "gdn_cached_replay_cute", recorder("cute"))
+    monkeypatch.setattr(
+        M, "fused_recurrent_gated_delta_rule_cached_replay_update", recorder("triton")
+    )
     monkeypatch.setattr(M, "causal_conv1d_triton_update", lambda **kw: kw["x"].clone())
     monkeypatch.setattr(M, "_GDN_REPLAY_PDL", False)
     core, mq, a, n, p, verify = _verify_core(state_dtype, mapped)
