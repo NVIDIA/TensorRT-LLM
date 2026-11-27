@@ -27,6 +27,7 @@ from ..model_config import ModelConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .attention import Attention
+from .backends.fmha.registry import FmhaCls
 from .backends.interface import PositionalEmbeddingParams
 from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
                                               fused_sigmoid_mul_fp8,
@@ -180,6 +181,7 @@ class QKNormRoPEAttention(Attention):
         fp8_output_gate: bool = False,
         context_fmha_head_dim_per_stage_kv: int = 0,
         context_last_rows_only: bool = False,
+        fmha_libs: list[str | FmhaCls] | None = None,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -224,6 +226,7 @@ class QKNormRoPEAttention(Attention):
             context_fmha_head_dim_per_stage_kv=
             context_fmha_head_dim_per_stage_kv,
             context_last_rows_only=context_last_rows_only,
+            fmha_libs=fmha_libs,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,

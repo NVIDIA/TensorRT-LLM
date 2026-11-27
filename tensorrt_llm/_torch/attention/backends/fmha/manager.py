@@ -23,7 +23,7 @@ import inspect
 import os
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Sequence
 
 import torch
 
@@ -341,17 +341,34 @@ def generation_cell_bound(num_generations: int, q_len: int) -> tuple[int, int]:
 class FmhaManager:
     """Own the FMHA libraries, dispatch policy, and selection cache for one attention layer."""
 
-    def __init__(self, attn: TrtllmAttention) -> None:
+    def __init__(
+        self,
+        attn: TrtllmAttention,
+        fmha_libs: Sequence[str | type[Fmha]] | None = None,
+        use_fmha_libs_env: bool = True,
+    ) -> None:
+        """Resolve and construct the available libraries for one layer.
+
+        Args:
+            attn: The owning attention layer.
+            fmha_libs: Ordered base FMHA names or classes. None selects the
+                defaults, and [] selects an empty base list. The layer's
+                legacy prepends are tried first.
+            use_fmha_libs_env: Apply TLLM_FMHA_LIBS to the base candidates.
+                Shared metadata uses the process-wide setting.
+        """
         self._cache: dict[_FmhaCacheKey, Fmha] = {}
         self._cache_inputs: dict[_FmhaCacheKey, _FmhaCacheInputs] = {}
         # Environment configuration is fixed for the manager lifetime so
         # normal forwarding never pays for an environment lookup.
         self._cache_sanity_check_enabled = _is_fmha_cache_sanity_check_enabled()
         self.fmha_libs: list[Fmha] = []
-        for fmha_cls in (
-            *getattr(attn, "prepended_fmha_lib_classes", ()),
-            *get_enabled_fmha_lib_classes(),
-        ):
+        candidates = get_enabled_fmha_lib_classes(
+            fmha_libs,
+            use_fmha_libs_env=use_fmha_libs_env,
+            prepended_fmha_lib_classes=getattr(attn, "prepended_fmha_lib_classes", ()),
+        )
+        for fmha_cls in candidates:
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         # Libraries of this layer that prepare() plans every step (Fmha.plan_step): their

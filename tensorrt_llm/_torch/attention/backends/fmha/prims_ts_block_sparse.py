@@ -44,6 +44,7 @@ from .prims_ts import (
     get_paged_kv_policy_unsupported_reason,
     get_paged_kv_storage_unsupported_reason,
 )
+from .registry import fmha_lib
 from .utils import get_kv_page_offset, get_multi_processor_count_for_device
 
 if TYPE_CHECKING:
@@ -223,6 +224,7 @@ def _sage_recipe(
     return config, qk_dtype
 
 
+@fmha_lib("prims_ts_block_sparse")
 class PrimsTSBlockSparseFmha(PrimsTSFmha):
     """Contiguous context and fixed-Q paged generation block-sparse FMHA.
 

@@ -28,6 +28,7 @@ import torch
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import DenseDecodeWorkspaceLayout
 
 
+@fmha_lib("msa_decode")
 class MsaDecodeFmha(PhasedFmha):
     """MiniMax-M3 generation attention on the Triton and trtllm-gen kernels.
 

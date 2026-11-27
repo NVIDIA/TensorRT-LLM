@@ -74,6 +74,7 @@ from .flash_attn4_kernels import (
 )
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -132,6 +133,7 @@ def _split_workspace(
     return workspace
 
 
+@fmha_lib(LIB_NAME)
 class FlashAttn4GenerationFmha(PhasedFmha):
     """Generation-phase library on FlashAttention-4; see the module docstring."""
 

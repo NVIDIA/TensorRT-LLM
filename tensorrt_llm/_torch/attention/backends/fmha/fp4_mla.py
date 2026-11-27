@@ -40,6 +40,7 @@ from tensorrt_llm.bindings import DataType
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     )
 
 
+@fmha_lib("fp4_mla")
 class Fp4MlaFmha(PhasedFmha):
     """TRTLLM FMHA library for FP4 MLA context and no-dequant decode."""
 
