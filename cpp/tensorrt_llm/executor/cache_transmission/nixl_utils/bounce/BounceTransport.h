@@ -294,13 +294,12 @@ public:
     [[nodiscard]] std::shared_future<BounceResult> submit(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
         std::string const& peer, std::string const& windowKey);
 
-    [[nodiscard]] bool verifyReply(std::string const& peer, std::uint64_t rid, std::string const& frame);
     void onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
-    void onAck(std::string const& peer, BounceMsgHeader const& h);
+    void onAck(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope);
     void onDrainAck(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope);
     /// The receiver reported it cannot complete a chunk/request: fail the request now (kPeerNack)
     /// instead of waiting out requestTimeoutMs. Unknown / wrong-peer NACKs are dropped like ACKs.
-    void onNack(std::string const& peer, BounceMsgHeader const& h);
+    void onNack(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope);
     /// Issue the RDMA write for any chunk whose gather kernel has now completed (poll ctx->event,
     /// non-blocking). Decouples the IO thread from gather latency on a shared GPU. Returns true if it
     /// posted a write (or failed a request) this pass — used to drive the IO loop's idle backoff.
@@ -495,6 +494,7 @@ private:
     std::mutex mReqMu;
     using RequestTable = std::unordered_map<std::uint64_t, Request>;
     static RequestTable::iterator findReply(RequestTable& requests, std::string const& peer, std::uint64_t rid);
+    RequestTable::iterator findVerifiedReply(std::string const& peer, std::uint64_t rid, std::string const& envelope);
     RequestTable mRequests;
     std::atomic<std::uint64_t> mNextRid{1};
 

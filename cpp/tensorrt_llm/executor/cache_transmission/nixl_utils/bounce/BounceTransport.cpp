@@ -894,13 +894,14 @@ BounceSender::RequestTable::iterator BounceSender::findReply(
     RequestTable& requests, std::string const& peer, std::uint64_t rid)
 {
     auto it = requests.find(rid);
-    if (it != requests.end() && it->second.peer != peer)
-    {
-        TLLM_LOG_WARNING("BounceTransport: dropped reply from peer %s for peer %s rid=%llu", peer.c_str(),
-            it->second.peer.c_str(), static_cast<unsigned long long>(rid));
-        return requests.end();
-    }
-    return it;
+    return it != requests.end() && it->second.peer == peer ? it : requests.end();
+}
+
+BounceSender::RequestTable::iterator BounceSender::findVerifiedReply(
+    std::string const& peer, std::uint64_t rid, std::string const& envelope)
+{
+    auto it = findReply(mRequests, peer, rid);
+    return it != mRequests.end() && verifyBounceFrame(envelope, it->second.windowKey) ? it : mRequests.end();
 }
 
 bool BounceSender::Request::acceptsCredit(std::uint64_t packedBytes, std::uint32_t creditBytes)
@@ -929,14 +930,10 @@ BounceFailReason BounceSender::Request::failureReason(BounceFailReason fallback)
 
 void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob)
 {
-    std::vector<BounceCreditEntry> credits;
-    if (!decodeCredits(blob, h, credits))
-    {
-        return;
-    }
     std::lock_guard<std::mutex> lk(mReqMu);
-    auto it = findReply(mRequests, peer, h.requestId);
-    if (it == mRequests.end())
+    auto it = findVerifiedReply(peer, h.requestId, blob);
+    std::vector<BounceCreditEntry> credits;
+    if (it == mRequests.end() || !decodeCredits(blob, h, credits))
     {
         return;
     }
@@ -1355,10 +1352,10 @@ bool BounceSender::pollSenderHandles()
     return didWork;
 }
 
-void BounceSender::onNack(std::string const& peer, BounceMsgHeader const& h)
+void BounceSender::onNack(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope)
 {
     std::lock_guard<std::mutex> lk(mReqMu);
-    auto it = findReply(mRequests, peer, h.requestId);
+    auto it = findVerifiedReply(peer, h.requestId, envelope);
     if (it == mRequests.end())
     {
         return;
@@ -1384,7 +1381,7 @@ void BounceSender::onDrainAck(std::string const& peer, BounceMsgHeader const& h,
     }
 }
 
-void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
+void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope)
 {
     // Starts BEFORE taking mReqMu: the span exposes ACK-processing latency INCLUDING lock wait —
     // pumpRequest holds mReqMu during gather launches, so a long onAck here means the ACK stalled
@@ -1392,7 +1389,7 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
     BounceNvtxScope ackScope(
         kNvtxOnAck, "onAck rid=%llu chunk=%u", static_cast<unsigned long long>(h.requestId), h.chunkIdx);
     std::lock_guard<std::mutex> lk(mReqMu);
-    auto it = findReply(mRequests, peer, h.requestId);
+    auto it = findVerifiedReply(peer, h.requestId, envelope);
     if (it == mRequests.end())
     {
         return;
@@ -2144,17 +2141,10 @@ void BounceTransport::tick(std::string& peer, std::string& blob)
     }
 }
 
-bool BounceSender::verifyReply(std::string const& peer, std::uint64_t rid, std::string const& frame)
-{
-    std::lock_guard lock(mReqMu);
-    auto const it = mRequests.find(rid);
-    return it != mRequests.end() && it->second.peer == peer && verifyBounceFrame(frame, it->second.windowKey);
-}
-
 void BounceTransport::dispatch(std::string const& peer, std::string const& envelope)
 {
     BounceMsgHeader h{};
-    std::string id;
+    std::string_view id;
     if (!decodeHeader(envelope, h)
         || !readBounceWindowId(envelope, sizeof(h) + static_cast<std::size_t>(h.payloadBytes), id))
     {
@@ -2182,20 +2172,12 @@ void BounceTransport::dispatch(std::string const& peer, std::string const& envel
         }
         return;
     }
-    if (type == BounceMsgType::kDRAIN_ACK)
+    switch (type)
     {
-        mSender.onDrainAck(peer, h, envelope);
-        return;
-    }
-    if (!mSender.verifyReply(peer, h.requestId, envelope))
-    {
-        return;
-    }
-    switch (static_cast<BounceMsgType>(h.msgType))
-    {
-    case BounceMsgType::kGRANT: mSender.onGrant(peer, h, envelope); break; // [S]
-    case BounceMsgType::kACK: mSender.onAck(peer, h); break;               // [S]
-    case BounceMsgType::kNACK: mSender.onNack(peer, h); break;             // [S]
+    case BounceMsgType::kGRANT: mSender.onGrant(peer, h, envelope); break;
+    case BounceMsgType::kACK: mSender.onAck(peer, h, envelope); break;
+    case BounceMsgType::kNACK: mSender.onNack(peer, h, envelope); break;
+    case BounceMsgType::kDRAIN_ACK: mSender.onDrainAck(peer, h, envelope); break;
     default: break;
     }
 }

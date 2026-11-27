@@ -24,6 +24,7 @@
 #include <shared_mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -92,7 +93,7 @@ public:
         std::string peer, std::string endpoint, std::string key, std::vector<BounceWriteWindow::Range> ranges);
     std::shared_ptr<BounceWriteWindow> addSlots(std::string peer, std::string endpoint, std::string key,
         std::span<std::int64_t const> slots, BounceSlotLayout const& layout);
-    [[nodiscard]] std::shared_ptr<BounceWriteWindow> find(std::string const& id, std::string const& peer) const;
+    [[nodiscard]] std::shared_ptr<BounceWriteWindow> find(std::string_view id, std::string const& peer) const;
     //! Stop destination writes while the owner waits for the writer's cancellation acknowledgement.
     void seal(std::string const& id);
     void remove(std::string const& id);
@@ -100,7 +101,7 @@ public:
 
 private:
     mutable std::mutex mMutex;
-    std::map<std::string, std::shared_ptr<BounceWriteWindow>> mWindows;
+    std::map<std::string, std::shared_ptr<BounceWriteWindow>, std::less<>> mWindows;
 };
 
 // Domain-separated from KV result reporting. The key is never transmitted in
@@ -108,7 +109,7 @@ private:
 std::string bounceWindowId(std::string const& key);
 std::string signBounceFrame(std::string frame, std::string const& key);
 std::string signBounceFrame(std::string frame, std::string const& key, std::string const& id);
-bool readBounceWindowId(std::string const& envelope, std::size_t payloadEnd, std::string& id);
+bool readBounceWindowId(std::string_view envelope, std::size_t payloadEnd, std::string_view& id);
 bool verifyBounceFrame(std::string const& envelope, std::string const& key);
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

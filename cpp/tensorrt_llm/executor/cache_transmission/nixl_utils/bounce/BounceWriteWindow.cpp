@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceWriteWindow.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceMessage.h"
 
 #include <openssl/crypto.h>
 #include <openssl/hmac.h>
@@ -34,7 +35,6 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 namespace
 {
-constexpr std::size_t kTagBytes = 16;
 constexpr std::size_t kKeyBytes = 16;
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -68,11 +68,11 @@ std::array<unsigned char, EVP_MAX_MD_SIZE> signature(std::string const& key, std
     std::size_t length{};
     if (!EVP_MAC_init(ctx.get(), reinterpret_cast<unsigned char const*>(key.data()), key.size(), nullptr)
         || !EVP_MAC_update(ctx.get(), data, bytes.size())
-        || !EVP_MAC_final(ctx.get(), digest.data(), &length, digest.size()) || length < kTagBytes)
+        || !EVP_MAC_final(ctx.get(), digest.data(), &length, digest.size()) || length < kBounceTagBytes)
 #else
     unsigned int length{};
     if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), data, bytes.size(), digest.data(), &length)
-        || length < kTagBytes)
+        || length < kBounceTagBytes)
 #endif
     {
         throw std::runtime_error("Cannot sign bounce control frame");
@@ -84,7 +84,7 @@ std::array<unsigned char, EVP_MAX_MD_SIZE> signature(std::string const& key, std
 std::string bounceWindowId(std::string const& key)
 {
     auto const digest = signature(key, "TRTLLM bounce window id v1");
-    return {reinterpret_cast<char const*>(digest.data()), kTagBytes};
+    return {reinterpret_cast<char const*>(digest.data()), kBounceTagBytes};
 }
 
 std::string signBounceFrame(std::string frame, std::string const& key)
@@ -94,32 +94,32 @@ std::string signBounceFrame(std::string frame, std::string const& key)
 
 std::string signBounceFrame(std::string frame, std::string const& key, std::string const& id)
 {
-    frame.reserve(frame.size() + 2 * kTagBytes);
+    frame.reserve(frame.size() + 2 * kBounceTagBytes);
     frame.append(id);
     auto const digest = signature(key, frame);
-    frame.append(reinterpret_cast<char const*>(digest.data()), kTagBytes);
+    frame.append(reinterpret_cast<char const*>(digest.data()), kBounceTagBytes);
     return frame;
 }
 
-bool readBounceWindowId(std::string const& envelope, std::size_t payloadEnd, std::string& id)
+bool readBounceWindowId(std::string_view envelope, std::size_t payloadEnd, std::string_view& id)
 {
-    if (envelope.size() < payloadEnd || envelope.size() - payloadEnd != 2 * kTagBytes)
+    if (envelope.size() < payloadEnd || envelope.size() - payloadEnd != 2 * kBounceTagBytes)
     {
         return false;
     }
-    id.assign(envelope, payloadEnd, kTagBytes);
+    id = envelope.substr(payloadEnd, kBounceTagBytes);
     return true;
 }
 
 bool verifyBounceFrame(std::string const& envelope, std::string const& key)
 {
-    if (envelope.size() < 2 * kTagBytes)
+    if (envelope.size() < 2 * kBounceTagBytes)
     {
         return false;
     }
-    auto const end = envelope.size() - kTagBytes;
+    auto const end = envelope.size() - kBounceTagBytes;
     auto const tag = signature(key, std::string_view(envelope.data(), end));
-    return CRYPTO_memcmp(envelope.data() + end, tag.data(), kTagBytes) == 0;
+    return CRYPTO_memcmp(envelope.data() + end, tag.data(), kBounceTagBytes) == 0;
 }
 
 BounceWriteWindow::BounceWriteWindow(std::string peer, std::string endpoint, std::string key, std::vector<Range> ranges)
@@ -250,7 +250,7 @@ std::shared_ptr<BounceWriteWindow> BounceWriteWindows::addSlots(std::string peer
     return add(std::move(peer), std::move(endpoint), std::move(key), std::move(ranges));
 }
 
-std::shared_ptr<BounceWriteWindow> BounceWriteWindows::find(std::string const& id, std::string const& peer) const
+std::shared_ptr<BounceWriteWindow> BounceWriteWindows::find(std::string_view id, std::string const& peer) const
 {
     std::lock_guard lock(mMutex);
     auto it = mWindows.find(id);

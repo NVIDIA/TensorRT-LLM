@@ -101,7 +101,7 @@ TEST(BounceReceiveWindow, SignedMessageUsesTheIssuedWindow)
     EXPECT_EQ(b::bounceWindowId(otherKey), "\xcc\x87\xc9\x23\xce\xac\xcd\xe5\xfc\x39\x7b\x75\x67\x4e\xf4\xa9");
     std::string const message = "completed";
     auto const envelope = b::signBounceFrame(message, key);
-    std::string id;
+    std::string_view id;
     ASSERT_TRUE(b::readBounceWindowId(envelope, message.size(), id));
     EXPECT_EQ(id, b::bounceWindowId(key));
     EXPECT_TRUE(b::verifyBounceFrame(envelope, key));

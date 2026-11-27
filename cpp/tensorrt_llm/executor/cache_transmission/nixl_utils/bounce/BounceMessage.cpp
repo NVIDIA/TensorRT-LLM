@@ -44,11 +44,19 @@ BounceMsgHeader makeHeader(BounceMsgType type, std::uint64_t requestId, std::uin
     return header;
 }
 
+std::string makeFrameBuffer(std::size_t payloadBytes)
+{
+    std::string frame;
+    auto const size = sizeof(BounceMsgHeader) + payloadBytes;
+    frame.reserve(size + 2 * kBounceTagBytes);
+    frame.resize(size);
+    return frame;
+}
+
 template <typename Entry>
 std::string encodeWithEntries(BounceMsgHeader const& header, std::vector<Entry> const& entries)
 {
-    std::string blob;
-    blob.resize(sizeof(BounceMsgHeader) + header.payloadBytes);
+    auto blob = makeFrameBuffer(header.payloadBytes);
     std::memcpy(blob.data(), &header, sizeof(BounceMsgHeader));
     if (!entries.empty())
     {
@@ -79,8 +87,7 @@ bool decodeEntries(std::string const& blob, BounceMsgHeader const& header, std::
 
 std::string encodeHeaderOnly(BounceMsgHeader const& header)
 {
-    std::string blob;
-    blob.resize(sizeof(BounceMsgHeader));
+    auto blob = makeFrameBuffer(0);
     std::memcpy(blob.data(), &header, sizeof(BounceMsgHeader));
     return blob;
 }
@@ -95,8 +102,7 @@ std::string encodeWant(
     auto const epLen = static_cast<std::uint32_t>(endpoint.size());
     auto const payloadBytes = sizesBytes + static_cast<std::uint32_t>(sizeof(std::uint32_t)) + epLen;
     auto h = makeHeader(BounceMsgType::kWANT, requestId, 0, 0, 0, n, payloadBytes);
-    std::string blob;
-    blob.resize(sizeof(BounceMsgHeader) + payloadBytes);
+    auto blob = makeFrameBuffer(payloadBytes);
     std::memcpy(blob.data(), &h, sizeof(BounceMsgHeader));
     auto* payload = blob.data() + sizeof(BounceMsgHeader);
     if (sizesBytes > 0)
