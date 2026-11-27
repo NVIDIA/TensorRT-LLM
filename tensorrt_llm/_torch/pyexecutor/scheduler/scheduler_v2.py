@@ -1732,7 +1732,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self.enable_prefix_aware_scheduling:
             req_tokens = pre_prepare_context_tokens + draft_len
             if not budget.can_fit_tokens(req_tokens):
-                return ScheduleAction.STOP, 0, False
+                return self._stop_or_fail_unfittable(req, req_tokens), 0, False
             assert (
                 self.max_context_length is None
                 or pre_prepare_context_tokens <= self.max_context_length
@@ -1754,7 +1754,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             req_tokens = context_tokens + replay_tokens + draft_len
 
             if not budget.can_fit_tokens(req_tokens):
-                return ScheduleAction.STOP, 0, False
+                return self._stop_or_fail_unfittable(req, req_tokens), 0, False
 
             assert (
                 self.max_context_length is None
@@ -1779,6 +1779,27 @@ class KVCacheV2Scheduler(RequestScheduler):
             return cross_action, 0, False
 
         return ScheduleAction.SCHEDULED, req_tokens, False
+
+    def _stop_or_fail_unfittable(self, req: LlmRequest, req_tokens: int) -> ScheduleAction:
+        """STOP the context loop at an unchunked request that does not fit this pass's token budget.
+
+        A request needing more than max_num_tokens fits no pass, for example a recompute-paused
+        request whose prompt plus generated tokens now prefill at once. It is failed
+        (take_lost_kv_requests) and skipped, so it does not block every context request behind it.
+        """
+        if self.max_num_tokens is None or req_tokens <= self.max_num_tokens:
+            return ScheduleAction.STOP
+        message = (
+            f"Request {req.py_request_id} needs {req_tokens} tokens in one context step (prompt "
+            f"plus any tokens generated before a recompute pause), more than max_num_tokens="
+            f"{self.max_num_tokens}, and chunked prefill is disabled. Enable chunked prefill, "
+            f"raise max_num_tokens, or give the KV cache more capacity."
+        )
+        logger.error(f"[V2Scheduler] {message}")
+        self._clear_request_runtime_state(req)
+        if all(failed is not req for failed, _ in self._lost_kv_requests):
+            self._lost_kv_requests = (*self._lost_kv_requests, (req, message))
+        return ScheduleAction.SKIP
 
     def _has_context_chunk_budget(self, budget: BudgetTracker) -> bool:
         remaining = budget.remaining_tokens
