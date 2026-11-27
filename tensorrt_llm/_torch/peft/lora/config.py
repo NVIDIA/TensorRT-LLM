@@ -96,8 +96,7 @@ class LoraConfig(StrictBaseModel):
         "(e.g., {'attn_q': 'q_proj'}). If empty, uses default mappings.")
     max_loras: Optional[int] = Field(
         default=None,
-        description=
-        "Sizes the device-side LoRA cache for this many adapters at "
+        description="Sizes the device-side LoRA cache for this many adapters at "
         "max_lora_rank, taking precedence over "
         "peft_cache_config.device_cache_percent when positive. Also sets "
         "the number of adapter slots in LoRA CUDA graphs (8 when unset). "
