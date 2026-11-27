@@ -115,6 +115,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
         monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{target}", Mock())
 
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._disagg_coordinator = _recording_coordinator(calls)
     executor._flush_pending_transfer_responses = lambda **kwargs: calls.append(
         ("flush_pending_transfer_responses",)
@@ -217,7 +218,7 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
         executor.scheduler = Mock()
         executor.scheduler.can_schedule.return_value = True
         executor.scheduler.schedule_request.return_value = SimpleNamespace(
-            fitting_disagg_gen_init_requests=[]
+            fitting_disagg_gen_init_requests=[], failed_requests=[]
         )
         executor.kv_cache_manager = Mock(spec=["prepare_expect_snapshot_points"])
     return executor
@@ -233,7 +234,7 @@ _SCHEDULE_HEAD = [
     ("align_gen_admission_across_cp", []),
     # No step is in flight in an idle iteration, so no receive is deferred.
     ("receive_gen_init", [], "defer=False"),
-    ("poll_progress_when_idle",),
+    ("poll_progress_when_idle", "batch_is_empty=True"),
 ]
 # Non-PP loops flush at loop exit; the PP loop does not.
 _SHUTDOWN_PASS = [("handle_errors_synced",), ("flush_pending_transfer_responses",)]
@@ -332,6 +333,7 @@ def test_kv_pool_rebalance_flushes_deferred_closes_before_adjust(defer: bool) ->
     """adjust() moves pages, so a deferred close must not hold any: the rebalance closes them before it suspends
     the active requests and adjusts."""
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._defer_generation_only_release = defer
     manager = Mock()
     manager.is_request_active.return_value = True
@@ -569,7 +571,7 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
             ("poll_gen_transfers",),
             ("admit", []),
             ("receive_gen_init", []),
-            ("poll_progress_when_idle",),
+            ("poll_progress_when_idle", "batch_is_empty=True"),
             ("flush_pending_transfer_responses",),
             ("pace_idle",),
         ]
@@ -591,7 +593,7 @@ def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
             ("poll_gen_transfers",),
             ("revert_deferred_gen_init", [], []),
             ("receive_gen_init", []),
-            ("poll_progress_when_idle",),
+            ("poll_progress_when_idle", "batch_is_empty=True"),
             ("flush_pending_transfer_responses",),
             ("pace_idle",),
         ]

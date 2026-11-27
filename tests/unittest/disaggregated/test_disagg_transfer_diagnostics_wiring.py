@@ -1431,7 +1431,7 @@ def test_backend_wait_continues_when_submission_diagnostic_callback_fails(
     sender._agent = SimpleNamespace(submit_transfer_requests=Mock(return_value=status))
     sender._ownership_poison_lock = threading.Lock()
     sender._ownership_poisoned = None
-    task = Mock()
+    task = Mock(lock=threading.Lock(), _native_inflight=0)
     task._enforce_physical_ownership = enforce_physical_ownership
     request = Mock()
     callback = Mock(side_effect=RuntimeError("diagnostics failed"))

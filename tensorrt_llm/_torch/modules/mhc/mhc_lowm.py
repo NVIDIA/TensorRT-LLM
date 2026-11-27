@@ -293,6 +293,32 @@ def _placeholder_moe_operands(hidden: int, device_index: int):
     )
 
 
+_EARLY_CLEAR_LOGGED: set = set()
+
+
+def _early_clear(x_partial, allreduce, use_pdl: bool, m: int) -> bool:
+    """Whether the MNNVL MoE-finalize boundary clears before its wait: only right behind a captured
+    CuTe FC2, which starts it after its own wait."""
+    if not (
+        use_pdl
+        and allreduce.mnnvl
+        and isinstance(x_partial, MoeUnfinalized)
+        and is_blackwell_datacenter()
+    ):
+        return False
+    from ...moe.fused_moe.trtllm_gen import decode_moe
+
+    ok, why = decode_moe.precedes(x_partial.fc2)
+    if (m, why) not in _EARLY_CLEAR_LOGGED:
+        _EARLY_CLEAR_LOGGED.add((m, why))
+        from tensorrt_llm.logger import logger
+
+        logger.debug(
+            f"mHC MoE all-reduce boundary, {m} rows: early clear {'on' if ok else 'off'} ({why})"
+        )
+    return ok
+
+
 @functools.lru_cache(maxsize=None)
 def _compiled_allreduce_boundary(
     m: int,
@@ -304,6 +330,12 @@ def _compiled_allreduce_boundary(
     ctas_per_token: int = 1,
     mnnvl: bool = False,
     quant: str | None = None,
+    mbar_exchange: bool = False,
+    early_moe_rows: bool = False,
+    early_clear: bool = False,
+    own_slot: bool = False,
+    handover_warp: bool = False,
+    l2_prefetch: bool = False,
 ):
     """``moe`` = (fc2 rows, top_k, scale dtype) for the MoE-finalize input, None otherwise."""
     import cuda.bindings.driver as cuda
@@ -321,6 +353,12 @@ def _compiled_allreduce_boundary(
         ctas_per_token=ctas_per_token,
         mnnvl=mnnvl,
         quant=quant,
+        mbar_exchange=mbar_exchange,
+        early_moe_rows=early_moe_rows,
+        early_clear=early_clear,
+        own_slot=own_slot,
+        handover_warp=handover_warp,
+        l2_prefetch=l2_prefetch,
     )
     dev = torch.device("cuda")
     x = torch.empty((m, hidden), dtype=torch.bfloat16, device=dev)
@@ -358,6 +396,10 @@ def _compiled_allreduce_boundary(
         cutlass.Int64(0),
         cutlass.Int64(0),
         cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
         stream,
     )
 
@@ -373,6 +415,7 @@ def mhc_allreduce_post_collapse_norm(
     allreduce: "LamportAllReduce | MnnvlLamportAllReduce",
     mxfp8: bool = False,
     nvfp4_scale: torch.Tensor | None = None,
+    l2_prefetch: tuple[torch.Tensor, ...] = (),
 ) -> tuple[torch.Tensor, ...]:
     """:func:`mhc_post_collapse_norm` of the TP sum of ``x_partial`` (one-shot all-reduce in-kernel).
 
@@ -380,7 +423,9 @@ def mhc_allreduce_post_collapse_norm(
     so the outputs equal ``mhc_post_collapse_norm(allreduce(x_partial), ...)`` bit for bit. A
     :class:`MoeUnfinalized` partial is finalized in the same launch (``x_partial.finalize()``,
     up to the FP32 summation order). ``mxfp8`` / ``nvfp4_scale`` add a quantized copy of the
-    normalized output as :func:`mhc_post_collapse_norm` does.
+    normalized output as :func:`mhc_post_collapse_norm` does. Up to two contiguous
+    ``l2_prefetch`` tensors (sizes multiples of 16 bytes) are read into L2 by the launch, for a
+    later kernel.
     """
     import cuda.bindings.driver as cuda
     import cutlass
@@ -418,18 +463,29 @@ def mhc_allreduce_post_collapse_norm(
     ]
     # Unfinalized MoE uses shared as x too; keep the alias to avoid a second copy.
     x = shared.view(m, hidden) if moe_key is not None else (x.clone() if x.data_ptr() % 16 else x)
+    use_pdl = get_env_enable_pdl()
     fn = _compiled_allreduce_boundary(
         m,
         hidden,
         float(norm_eps),
         allreduce.nranks,
-        get_env_enable_pdl(),
+        use_pdl,
         moe_key,
         # A cluster of 4 CTAs per token for the smallest batches, when the token's warps
         # (8 channels per thread) split evenly over them.
         4 if m <= 12 and hidden % (4 * 32 * 8) == 0 else 1,
         mnnvl=allreduce.mnnvl,
         quant=quant,
+        mbar_exchange=is_blackwell_datacenter(),
+        early_moe_rows=is_blackwell_datacenter(),
+        early_clear=_early_clear(x_partial, allreduce, use_pdl, m),
+        own_slot=is_blackwell_datacenter(),
+        handover_warp=is_blackwell_datacenter(),
+        l2_prefetch=bool(l2_prefetch),
+    )
+    regions = [(t.data_ptr(), t.numel() * t.element_size()) for t in l2_prefetch] + [(0, 0)] * 2
+    assert len(l2_prefetch) <= 2 and all(
+        t.is_contiguous() and n % 16 == 0 for t, (_, n) in zip(l2_prefetch, regions)
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
@@ -450,6 +506,10 @@ def mhc_allreduce_post_collapse_norm(
         cutlass.Int64(quantized[0].data_ptr() if quant else 0),
         cutlass.Int64(quantized[1].data_ptr() if quant else 0),
         cutlass.Int64(scale_addr),
+        cutlass.Int64(regions[0][0]),
+        cutlass.Int64(regions[0][1]),
+        cutlass.Int64(regions[1][0]),
+        cutlass.Int64(regions[1][1]),
         stream,
     )
     if quant:
