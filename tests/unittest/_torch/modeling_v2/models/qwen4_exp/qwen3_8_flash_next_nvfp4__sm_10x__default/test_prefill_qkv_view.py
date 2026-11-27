@@ -155,3 +155,56 @@ def test_the_row_tile_entry_refuses_an_out_it_cannot_write(monkeypatch) -> None:
         op(**args, out=strided)
     with pytest.raises(ValueError, match="contiguous"):
         op(**args, out=torch.empty(rows, core.heads_q, D, dtype=torch.float32, device=DEV))
+    # Contiguous, q's dtype and shape, at a 2-byte offset: only the alignment check refuses it.
+    flat = torch.empty(rows * core.heads_q * D + 1, dtype=torch.bfloat16, device=DEV)
+    shifted = flat[1:].view(rows, core.heads_q, D)
+    assert shifted.is_contiguous() and shifted.dtype == args["q"].dtype
+    assert shifted.data_ptr() % 16 == 2
+    with pytest.raises(ValueError, match="16-byte-aligned"):
+        op(**args, out=shifted)
+
+
+@_served_gpu
+def test_the_row_tile_entry_refuses_an_out_over_an_input() -> None:
+    """An `out` that meets every layout check but lies over an input (a cache plane, the
+    projection q is read from) is refused before either pass runs; nothing is written."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
+        qsa_sparse_gqa_rowtile as op,
+    )
+
+    step = _step(torch.bfloat16)
+    core, rows = step["core"], step["rows"]
+    numel = rows * core.heads_q * D
+    # The pool with spare pages past the mapped ones (K and V alike: their shapes must match):
+    # room for an aligned `out` inside K's span.
+    k, v = step["kv"].k, step["kv"].v
+    spare = math.ceil(numel / k[0].numel())
+    k_cache, v_cache = (
+        torch.cat([t, torch.randn(spare, *t.shape[1:], device=DEV).to(t.dtype)]) for t in (k, v)
+    )
+    proj = step["proj"]
+    args = dict(
+        q=M._packed_q(core, proj[:, : core.qkv_width]),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_table=step["block_table"],
+        selected_tokens=step["selected"],
+        request_indices=step["req_idx"],
+        tokens_per_block=TPB,
+        softmax_scale=core.softmax_scale,
+        query_positions=step["logical"],
+        compress_ratio=RATIO,
+    )
+    in_k = k_cache[k.shape[0] :].reshape(-1)[:numel].view(rows, core.heads_q, D)
+    in_proj = proj.reshape(-1)[:numel].view(rows, core.heads_q, D)
+    for out, name in ((in_k, "k_cache"), (in_proj, "q")):
+        assert out.is_contiguous() and out.dtype == args["q"].dtype and out.data_ptr() % 16 == 0
+        before = (k_cache.clone(), proj.clone())
+        with pytest.raises(ValueError, match=f"must not overlap `{name}`"):
+            op(**args, out=out)
+        torch.cuda.synchronize()
+        assert torch.equal(k_cache.view(torch.int16), before[0].view(torch.int16))
+        assert torch.equal(proj.view(torch.int16), before[1].view(torch.int16))
+    # The target's own output buffer is still taken.
+    own = torch.empty(rows, core.heads_q, D, dtype=torch.bfloat16, device=DEV)
+    assert op(**args, out=own).data_ptr() == own.data_ptr()
