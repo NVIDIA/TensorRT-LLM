@@ -19,6 +19,10 @@
 
 #include <openssl/crypto.h>
 #include <openssl/hmac.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -33,27 +37,54 @@ namespace
 constexpr std::size_t kTagBytes = 16;
 constexpr std::size_t kKeyBytes = 16;
 
-std::string signature(std::string const& key, std::string_view bytes)
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+auto makeMacContext()
+{
+    std::unique_ptr<EVP_MAC, decltype(&EVP_MAC_free)> mac(EVP_MAC_fetch(nullptr, "HMAC", nullptr), EVP_MAC_free);
+    std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> ctx(
+        mac ? EVP_MAC_CTX_new(mac.get()) : nullptr, EVP_MAC_CTX_free);
+    char digest[] = "SHA256";
+    OSSL_PARAM params[]
+        = {OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0), OSSL_PARAM_construct_end()};
+    if (!ctx || !EVP_MAC_CTX_set_params(ctx.get(), params))
+    {
+        throw std::runtime_error("Cannot initialize bounce control authentication");
+    }
+    return ctx;
+}
+#endif
+
+std::array<unsigned char, EVP_MAX_MD_SIZE> signature(std::string const& key, std::string_view bytes)
 {
     if (key.size() != kKeyBytes)
     {
         throw std::invalid_argument("Invalid bounce window key size");
     }
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    auto const* data = reinterpret_cast<unsigned char const*>(bytes.data());
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    // Only the provider setup is shared between calls. Each message starts with its own window key.
+    thread_local auto ctx = makeMacContext();
+    std::size_t length{};
+    if (!EVP_MAC_init(ctx.get(), reinterpret_cast<unsigned char const*>(key.data()), key.size(), nullptr)
+        || !EVP_MAC_update(ctx.get(), data, bytes.size())
+        || !EVP_MAC_final(ctx.get(), digest.data(), &length, digest.size()) || length < kTagBytes)
+#else
     unsigned int length{};
-    if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
-            reinterpret_cast<unsigned char const*>(bytes.data()), bytes.size(), digest.data(), &length)
+    if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), data, bytes.size(), digest.data(), &length)
         || length < kTagBytes)
+#endif
     {
         throw std::runtime_error("Cannot sign bounce control frame");
     }
-    return {reinterpret_cast<char const*>(digest.data()), kTagBytes};
+    return digest;
 }
 } // namespace
 
 std::string bounceWindowId(std::string const& key)
 {
-    return signature(key, "TRTLLM bounce window id v1");
+    auto const digest = signature(key, "TRTLLM bounce window id v1");
+    return {reinterpret_cast<char const*>(digest.data()), kTagBytes};
 }
 
 std::string signBounceFrame(std::string frame, std::string const& key)
@@ -65,7 +96,8 @@ std::string signBounceFrame(std::string frame, std::string const& key, std::stri
 {
     frame.reserve(frame.size() + 2 * kTagBytes);
     frame.append(id);
-    frame.append(signature(key, frame));
+    auto const digest = signature(key, frame);
+    frame.append(reinterpret_cast<char const*>(digest.data()), kTagBytes);
     return frame;
 }
 
