@@ -300,11 +300,12 @@ def _rubin_dsv4_o_lora_quantized_input(
 
 
 def _deepseek_v4_fp8_o_a_proj(
-    self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor
+    self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor, o_b=None
 ) -> torch.Tensor:
-    """Run o_a_proj and o_b_proj on the FP8 inverse-RoPE output."""
+    """Run o_a_proj and o_b_proj (or ``o_b``) on the FP8 inverse-RoPE output."""
+    o_b = o_b or self.o_b_proj
     if _uses_rubin_dsv4_o_b_proj_out(self):
-        return self.o_b_proj(_rubin_dsv4_o_lora_quantized_input(self, attn_fp8, attn_scale))
+        return o_b(_rubin_dsv4_o_lora_quantized_input(self, attn_fp8, attn_scale))
     from tensorrt_llm._torch.attention.mla import _cute_dsl_fp8_bmm_out
 
     num_tokens = attn_fp8.shape[1]
@@ -320,7 +321,7 @@ def _deepseek_v4_fp8_o_a_proj(
         self.o_a_proj_scale,
         o_lora.transpose(0, 1),
     )
-    return self.o_b_proj(o_lora.flatten(1))
+    return o_b(o_lora.flatten(1))
 
 
 def _run_dsv4_o_lora_bmms(
@@ -446,9 +447,11 @@ def project_sparse_attn_output(
     attn_metadata: Optional[AttentionMetadata] = None,
     all_reduce_params: Optional["AllReduceParams"] = None,
     prequantized: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    o_b=None,
 ) -> torch.Tensor:
     """``prequantized``: the FP8 data and scales the inverse-RoPE quantization below would make of
-    ``attn_output``, written by the attention kernel; ``attn_output`` is then not read."""
+    ``attn_output``, written by the attention kernel; ``attn_output`` is then not read. ``o_b``
+    replaces ``self.o_b_proj`` for the output projection."""
     del attn_metadata, all_reduce_params
     attn_output_tensor = attn_output[0]
     # The fused epilogue already ran both O-LoRA projections inside the custom op
@@ -480,7 +483,7 @@ def project_sparse_attn_output(
             128,
             self.inverse_rotary_emb.is_neox,
         )
-        return _deepseek_v4_fp8_o_a_proj(self, attn_fp8, attn_scale)
+        return _deepseek_v4_fp8_o_a_proj(self, attn_fp8, attn_scale, o_b)
 
     # Restore the RoPE portion before output projection.
     torch.ops.trtllm.mla_rope_inplace(
@@ -530,8 +533,7 @@ def project_sparse_attn_output(
     else:
         raise NotImplementedError(f"Missing bmm impl for dtype: {self.o_a_proj.dtype}.")
     o_lora = o_lora.flatten(1)
-    output = self.o_b_proj(o_lora)
-    return output
+    return (o_b or self.o_b_proj)(o_lora)
 
 
 # Context and generation attention execution paths.
