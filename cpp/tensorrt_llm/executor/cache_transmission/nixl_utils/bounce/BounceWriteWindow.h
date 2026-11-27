@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -73,11 +74,24 @@ private:
     bool mOpen{true};
 };
 
+//! Receiver-local geometry of one pool view for one writer. The offsets are relative to slot zero.
+struct BounceSlotLayout
+{
+    std::uint64_t base;
+    std::uint64_t stride;
+    std::uint64_t slotBytes;
+    std::uint64_t numSlots;
+    std::span<std::int64_t const> offsets;
+    std::span<std::int64_t const> lengths;
+};
+
 class BounceWriteWindows
 {
 public:
     std::shared_ptr<BounceWriteWindow> add(
         std::string peer, std::string endpoint, std::string key, std::vector<BounceWriteWindow::Range> ranges);
+    std::shared_ptr<BounceWriteWindow> addSlots(std::string peer, std::string endpoint, std::string key,
+        std::span<std::int64_t const> slots, BounceSlotLayout const& layout);
     [[nodiscard]] std::shared_ptr<BounceWriteWindow> find(std::string const& id, std::string const& peer) const;
     void remove(std::string const& id);
     void removeIntersecting(std::uint64_t address, std::uint64_t length);

@@ -16,6 +16,9 @@
 import os
 import time
 
+import numpy as np
+from numpy.typing import NDArray
+
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (  # noqa: E402
@@ -209,6 +212,23 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         self, peer: str, endpoint: str, key: bytes, destinations: MemoryDescs
     ) -> None:
         self._cpp_agent.register_bounce_window(peer, endpoint, key, destinations)
+
+    def register_bounce_window_slots(
+        self,
+        peer: str,
+        endpoint: str,
+        key: bytes,
+        slots: NDArray[np.int64],
+        base: int,
+        stride: int,
+        slot_bytes: int,
+        num_slots: int,
+        offsets: NDArray[np.int64],
+        lengths: NDArray[np.int64],
+    ) -> None:
+        self._cpp_agent.register_bounce_window_slots(
+            peer, endpoint, key, slots, base, stride, slot_bytes, num_slots, offsets, lengths
+        )
 
     def revoke_bounce_window(self, key: bytes) -> None:
         self._cpp_agent.revoke_bounce_window(key)

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #ifdef ENABLE_NIXL
+#include "bounce/BounceWriteWindow.h"
 #include "transferAgent.h"
 #endif
 
@@ -31,6 +32,7 @@
 
 namespace nb = nanobind;
 namespace kvc = tensorrt_llm::executor::kv_cache;
+using Int64Array = nb::ndarray<std::int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
 {
@@ -338,6 +340,21 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
                 nb::gil_scoped_release release;
                 agent.registerBounceWindow(peer, endpoint, key, descs);
             })
+        .def("register_bounce_window_slots",
+            [](kvc::NixlTransferAgent& agent, std::string const& peer, std::string const& endpoint, nb::bytes token,
+                Int64Array slots, std::uint64_t base, std::uint64_t stride, std::uint64_t slotBytes,
+                std::uint64_t numSlots, Int64Array offsets, Int64Array lengths)
+            {
+                std::string key(token.c_str(), token.size());
+                std::span<std::int64_t const> selected(slots.data(), slots.size());
+                kvc::bounce::BounceSlotLayout layout{
+                    base, stride, slotBytes, numSlots, {offsets.data(), offsets.size()}, {lengths.data(), lengths.size()}};
+                nb::gil_scoped_release release;
+                agent.registerBounceWindowSlots(peer, endpoint, key, selected, layout);
+            },
+            nb::arg("peer"), nb::arg("endpoint"), nb::arg("key"), nb::arg("slots").noconvert(), nb::arg("base"),
+            nb::arg("stride"), nb::arg("slot_bytes"), nb::arg("num_slots"), nb::arg("offsets").noconvert(),
+            nb::arg("lengths").noconvert())
         .def("revoke_bounce_window",
             [](kvc::NixlTransferAgent& agent, nb::bytes token)
             {

@@ -934,6 +934,18 @@ void NixlTransferAgent::registerBounceWindow(
 #endif
 }
 
+void NixlTransferAgent::registerBounceWindowSlots(std::string const& peer, std::string const& endpoint,
+    std::string const& key, std::span<std::int64_t const> slots, bounce::BounceSlotLayout const& layout)
+{
+#ifdef TLLM_BOUNCE_V2
+    std::shared_lock lock(mLock);
+    TLLM_CHECK_WITH_INFO(mBounce && !mShutdown.load(), "Bounce receiver is not active");
+    mBounce->transport->receiveWindows().addSlots(peer, endpoint, key, slots, layout);
+#else
+    TLLM_THROW("Bounce receiver is not available in this build");
+#endif
+}
+
 void NixlTransferAgent::revokeBounceWindow(std::string const& key)
 {
 #ifdef TLLM_BOUNCE_V2

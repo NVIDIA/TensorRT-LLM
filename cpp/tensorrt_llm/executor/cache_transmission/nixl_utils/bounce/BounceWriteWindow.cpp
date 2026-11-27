@@ -198,6 +198,58 @@ std::shared_ptr<BounceWriteWindow> BounceWriteWindows::add(
     return window;
 }
 
+std::shared_ptr<BounceWriteWindow> BounceWriteWindows::addSlots(std::string peer, std::string endpoint, std::string key,
+    std::span<std::int64_t const> slots, BounceSlotLayout const& layout)
+{
+    if (layout.slotBytes == 0 || layout.slotBytes > layout.stride || layout.offsets.size() != layout.lengths.size())
+    {
+        throw std::invalid_argument("Invalid bounce receive pool geometry");
+    }
+    auto const available = std::numeric_limits<std::uint64_t>::max() - layout.base;
+    if (layout.numSlots && (layout.slotBytes > available
+            || layout.numSlots - 1 > (available - layout.slotBytes) / layout.stride))
+    {
+        throw std::invalid_argument("Bounce receive pool exceeds the address space");
+    }
+
+    std::vector<BounceWriteWindow::Range> pieces;
+    pieces.reserve(layout.offsets.size());
+    for (std::size_t i = 0; i < layout.offsets.size(); ++i)
+    {
+        auto const offset = layout.offsets[i];
+        auto const length = layout.lengths[i];
+        if (offset < 0 || length <= 0 || static_cast<std::uint64_t>(offset) > layout.slotBytes
+            || static_cast<std::uint64_t>(length) > layout.slotBytes - static_cast<std::uint64_t>(offset))
+        {
+            throw std::invalid_argument("Bounce writer range exceeds the slot payload");
+        }
+        pieces.emplace_back(offset, length);
+    }
+    std::vector<BounceWriteWindow::Range> ranges;
+    if (!pieces.empty() && slots.size() > ranges.max_size() / pieces.size())
+    {
+        throw std::invalid_argument("Too many bounce receive ranges");
+    }
+    ranges.reserve(slots.size() * pieces.size());
+    for (auto slot : slots)
+    {
+        if (slot < 0)
+        {
+            continue;
+        }
+        if (static_cast<std::uint64_t>(slot) >= layout.numSlots)
+        {
+            throw std::invalid_argument("Bounce receive slot exceeds the local pool");
+        }
+        auto const base = layout.base + static_cast<std::uint64_t>(slot) * layout.stride;
+        for (auto const& [offset, length] : pieces)
+        {
+            ranges.emplace_back(base + offset, length);
+        }
+    }
+    return add(std::move(peer), std::move(endpoint), std::move(key), std::move(ranges));
+}
+
 std::shared_ptr<BounceWriteWindow> BounceWriteWindows::find(std::string const& id, std::string const& peer) const
 {
     std::lock_guard lock(mMutex);

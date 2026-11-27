@@ -26,6 +26,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -38,6 +39,7 @@ namespace bounce
 // ENABLE_UCX), an empty struct otherwise; the member below is always present so the
 // NixlTransferAgent layout is identical across all translation units.
 struct NixlBounceState;
+struct BounceSlotLayout;
 
 /// Why NixlTransferAgent::shouldUseBounce declined a request (bounce enabled + built). `!mBounce`
 /// is "disabled", not a rejection, and is not counted. Order is the evaluation order of the gate.
@@ -175,6 +177,8 @@ public:
     [[nodiscard]] std::string getBounceEndpoint() const;
     void registerBounceWindow(
         std::string const& peer, std::string const& endpoint, std::string const& key, MemoryDescs const& destinations);
+    void registerBounceWindowSlots(std::string const& peer, std::string const& endpoint, std::string const& key,
+        std::span<std::int64_t const> slots, bounce::BounceSlotLayout const& layout);
     void revokeBounceWindow(std::string const& key);
 
     /// Number of transfer requests routed to the bounce fast path so far.

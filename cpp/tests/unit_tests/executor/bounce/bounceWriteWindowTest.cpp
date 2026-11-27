@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <future>
@@ -105,4 +106,40 @@ TEST(BounceReceiveWindow, SignedMessageUsesTheIssuedWindow)
     EXPECT_EQ(id, b::bounceWindowId(key));
     EXPECT_TRUE(b::verifyBounceFrame(envelope, key));
     EXPECT_FALSE(b::verifyBounceFrame(envelope, otherKey));
+}
+
+TEST(BounceReceiveWindow, SelectedSlotsPreservePaddingHolesAndWriterPieces)
+{
+    std::array<std::int64_t, 3> const slots{2, -1, 0};
+    std::array<std::int64_t, 2> const offsets{0, 12};
+    std::array<std::int64_t, 2> const lengths{4, 4};
+    b::BounceWriteWindows windows;
+    auto window = windows.addSlots("writer", "endpoint", std::string(16, 'w'), slots, {64, 32, 20, 3, offsets, lengths});
+    for (auto base : {64U, 128U})
+    {
+        EXPECT_TRUE(window->contains(base, 4));
+        EXPECT_TRUE(window->contains(base + 12, 4));
+        EXPECT_FALSE(window->contains(base + 3, 2));
+        EXPECT_FALSE(window->contains(base + 16, 1));
+        EXPECT_FALSE(window->contains(base + 20, 1));
+    }
+    EXPECT_FALSE(window->contains(96, 1));
+}
+
+TEST(BounceReceiveWindow, InvalidSlotLayoutDoesNotPublishAWindow)
+{
+    std::array<std::int64_t, 1> const offsets{8};
+    std::array<std::int64_t, 1> const lengths{8};
+    std::array<std::int64_t, 2> const slots{0, 2};
+    b::BounceSlotLayout layout{64, 32, 16, 2, offsets, lengths};
+    std::string const key(16, 'w');
+    b::BounceWriteWindows windows;
+    EXPECT_THROW(windows.addSlots("writer", "endpoint", key, slots, layout), std::invalid_argument);
+    layout.numSlots = 3;
+    layout.slotBytes = 12;
+    EXPECT_THROW(windows.addSlots("writer", "endpoint", key, slots, layout), std::invalid_argument);
+    layout.slotBytes = 16;
+    layout.base = std::numeric_limits<std::uint64_t>::max() - 64;
+    EXPECT_THROW(windows.addSlots("writer", "endpoint", key, slots, layout), std::invalid_argument);
+    EXPECT_EQ(windows.find(b::bounceWindowId(key), "writer"), nullptr);
 }
