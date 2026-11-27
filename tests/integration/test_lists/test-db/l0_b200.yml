@@ -408,7 +408,7 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
-  - unittest/_torch/modeling/test_modeling_gemma4.py
+  - unittest/_torch/modeling/test_modeling_gemma4.py -k "not kv_shared_row_pruning_prefill_speedup"
   - unittest/_torch/modeling/test_gemma4_multimodal.py
   - unittest/_torch/modeling/test_gemma4_assistant.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
@@ -631,6 +631,9 @@ l0_b200:
   # Kimi K3 routing shape (896 experts, top_k 16) on the TRTLLM backend.
   # Single-GPU, random weights; too heavy for pre_merge.
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
+  # Gemma4 prefill benchmark of the KV-shared row pruning at the E4B geometry.
+  # Single-GPU, random weights (about 8 GB) and a timing assertion; too heavy for pre_merge.
+  - unittest/_torch/modeling/test_modeling_gemma4.py -k "kv_shared_row_pruning_prefill_speedup"
   # Keep new full-corpus EAGLE-3 baselines in post_merge until repeated green
   # runs establish stable references.
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_1gpu[cutlass-one_model] TIMEOUT (60)

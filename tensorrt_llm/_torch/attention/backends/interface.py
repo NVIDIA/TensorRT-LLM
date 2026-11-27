@@ -409,6 +409,30 @@ class AttentionMetadata:
         """Whether ``prepare_steady_gen_step`` may advance this metadata."""
         return False
 
+    def can_present_last_rows(self) -> bool:
+        """Whether ``presented_last_rows`` can present this prepared step."""
+        return False
+
+    def presented_last_rows(
+            self) -> contextlib.AbstractContextManager["AttentionMetadata"]:
+        """Present this prepared step with the last query row of every sequence only.
+
+        The context manager yields the metadata of a generation-only step over
+        the same KV cache: every sequence, context or generation, is one
+        request with one query token, its last, and the KV length this step
+        leaves it with. A layer that writes no K/V of its own (a Q-only layer
+        over the K/V of another layer) computes the last output row of every
+        sequence on it, once the layers that write the K/V it reads have run
+        on this metadata. The yielded metadata is valid inside the ``with``
+        block only.
+
+        Raises:
+            NotImplementedError: The backend has no such presentation; check
+                ``can_present_last_rows`` first.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot present the last rows of a step.")
+
     def _has_mixed_precision_staging(self) -> bool:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have

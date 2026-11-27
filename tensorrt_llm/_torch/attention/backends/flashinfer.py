@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import functools
 import math
@@ -20,7 +21,8 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, NewType, Optional, Tuple, TypeAlias, cast
+from typing import (Any, Dict, Iterator, NewType, Optional, Tuple, TypeAlias,
+                    cast)
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -396,6 +398,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _multi_item_params: Optional[FlashInferMultiItemParams] = field(
         init=False, default=None)
     _draft_metadata: Optional["FlashInferAttentionMetadata"] = field(
+        init=False, default=None, repr=False)
+    # Generation-only metadata of presented_last_rows(), created on first use.
+    _last_rows_metadata: Optional["FlashInferAttentionMetadata"] = field(
         init=False, default=None, repr=False)
     _draft_kv_runtime_lens: torch.Tensor = field(init=False, repr=False)
     _is_shared_kv_draft_view: bool = field(init=False,
@@ -778,6 +783,60 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     @property
     def positions(self) -> torch.Tensor:
         return self._positions[:self.num_tokens]
+
+    def can_present_last_rows(self) -> bool:
+        """Whether ``presented_last_rows`` can present this prepared step.
+
+        It needs a paged KV cache whose page table holds the logical KV
+        lengths and one query token per generation request, and leaves out
+        CUDA graph metadata, draft views and mixed-precision staging copies.
+        """
+        return (self.kv_cache_manager is not None and not self.is_cross
+                and not self.is_cuda_graph and not self._is_shared_kv_draft_view
+                and not self._is_separate_kv_draft_view
+                and not self._uses_full_generation_page_table
+                and not self._has_mixed_precision_staging() and
+                self.num_tokens - self.num_ctx_tokens == self.num_generations)
+
+    @contextlib.contextmanager
+    def presented_last_rows(self) -> Iterator["FlashInferAttentionMetadata"]:
+        """Prepare and yield a generation-only metadata of one query token per sequence, its last.
+
+        A decode call is planned from the page table of the generation
+        requests, so the presentation is a second metadata object over the
+        same KV cache manager, prepared like a generation step in which every
+        sequence already holds all its tokens of this step but the last. It is
+        created on first use and prepared again on every call.
+        """
+        view = self._last_rows_metadata
+        if view is None or view.kv_cache_manager is not self.kv_cache_manager:
+            view = type(self)(
+                max_num_requests=self.max_num_requests,
+                max_num_tokens=self.max_num_requests,
+                max_num_sequences=self.max_num_sequences,
+                kv_cache_manager=self.kv_cache_manager,
+                mapping=self.mapping,
+                kv_layout=self.kv_layout,
+                runtime_features=self.runtime_features,
+                workspace_buffer=self.workspace_buffer,
+            )
+            self._last_rows_metadata = view
+        view.seq_lens = torch.ones((self.num_seqs, ), dtype=torch.int)
+        view.num_contexts = 0
+        view.request_ids = self.request_ids
+        view.prompt_lens = self.prompt_lens
+        view.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=[
+                num_cached + seq_len - 1 for num_cached, seq_len in zip(
+                    self.kv_cache_params.num_cached_tokens_per_seq,
+                    self.seq_lens_kv.tolist(),
+                    strict=True)
+            ],
+            num_extra_kv_tokens=self.kv_cache_params.num_extra_kv_tokens,
+        )
+        view.prepare()
+        yield view
 
     def get_draft_metadata(
         self,
