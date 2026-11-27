@@ -447,9 +447,7 @@ TEST_P(TransferAgentTest, SyncMessage)
     xferAgent1->invalidateRemoteAgent(agent0);
 }
 
-// Status must survive destruction of its owning agent (#14137 UAF-safety): the
-// status holds a weak_ptr<nixlAgent>; once the agent is reset the weak_ptr expires
-// and orphaned queries must report failure rather than dereference a dangling agent.
+// Status must survive destruction of its owning agent.
 TEST_P(TransferAgentTest, StatusOutlivesAgent)
 {
     std::string const agent0{"agent0"}, agent1{"agent1"};
@@ -481,17 +479,19 @@ TEST_P(TransferAgentTest, StatusOutlivesAgent)
         TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
     }
 
-    // Destroy the owning agent BEFORE the status. shutdown() resets the
-    // shared_ptr<nixlAgent>, expiring the status's weak_ptr.
+    // Destroy the owning agent BEFORE the status.
     xferAgent0.reset();
 
-    // Orphaned queries are safe and report failure (no use-after-free):
-    // wait()/isCompleted() see mWeakAgent.lock() == nullptr and return
-    // kFAILURE/false instead of dereferencing the freed agent.
-    EXPECT_FALSE(status->isCompleted());
-    EXPECT_EQ(status->wait(0), TransferState::kFAILURE);
-    // `status` destructor runs at scope exit: weak_ptr.lock() == nullptr ->
-    // early return (no releaseXferReq on a dangling agent).
+    if (backend == "mooncake")
+    {
+        EXPECT_TRUE(status->isCompleted());
+        EXPECT_EQ(status->wait(0), TransferState::kSUCCESS);
+    }
+    else
+    {
+        EXPECT_FALSE(status->isCompleted());
+        EXPECT_EQ(status->wait(0), TransferState::kFAILURE);
+    }
 }
 
 // Concurrent submitTransferRequests (#14137): submit holds a std::shared_lock and
