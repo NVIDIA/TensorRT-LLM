@@ -509,6 +509,20 @@ PagePriorityCallback = Callable[[int, object], int]
 """Maps (block ordinal, life cycle) to the eviction priority of a page created by one cache."""
 
 
+def _kept_generation_capacity(
+    capacity: int, rewind: int, growth: int, tokens_per_block: int
+) -> int:
+    """``capacity - rewind``, raised to the first slot of the last allocated block when that shrink
+    would release the block and the next growth by ``growth`` slots would allocate it again."""
+    new_capacity = capacity - rewind
+    if rewind <= 0 or capacity <= 0:
+        return new_capacity
+    last_start = ((capacity - 1) // tokens_per_block) * tokens_per_block
+    if new_capacity <= last_start < new_capacity + growth:
+        return last_start + 1
+    return new_capacity
+
+
 def _swa_endpoint_priority(
     prompt_length: int, tokens_per_block: int, rewind_tokens: int
 ) -> Callable[[int, object], int]:
@@ -2533,6 +2547,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # The manager config offload is sized from, built once with a placeholder
     # device quota; None until offload sizing first asks for it.
     _offload_sizing_config: Optional[KVCacheManagerConfigPy] = None
+    # On the class for instances built without running __init__.
+    _keep_growth_block = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -3595,6 +3611,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # so the latest width in _allocated_draft_lens belongs to step N+1;
         # update_resources must rewind step N by the width step N was given.
         self._inflight_draft_lens: dict[int, list[int]] = {}
+        # Armed by keep_growth_blocks().
+        self._keep_growth_block = False
+        # Per request, the slots kept above the rewound capacity; the next update gives them back.
+        self._kept_growth_slack: dict[int, int] = {}
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -4586,6 +4606,28 @@ class KVCacheManagerV2(BaseResourceManager):
                                 f"layer_group_id={int(variant.layer_group_id)}"
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
+
+    def get_gpu_pool_bytes(self) -> list[int]:
+        """Return the device-backed bytes of each GPU pool group: slot count times slot bytes.
+
+        With sparse KV cache offload a GPU-level pool group also holds pools of pinned host
+        memory mapped into the device. The storage statistics give a slot size for every pool
+        of the group, so the host-backed pools' slot bytes are left out.
+        """
+        host_slot_bytes = {
+            int(group.pool_group_index): sum(
+                int(pool.slot_bytes)
+                for pool in group.pools
+                if pool.storage_medium != CacheTier.GPU_MEM
+            )
+            for group in self.impl.pool_group_descs
+        }
+        pool_bytes = []
+        for pool_group_id, stat in enumerate(self._get_storage_statistics(GPU_LEVEL)):
+            slot_bytes = sum(int(size) for size in stat.slot_sizes)
+            slot_bytes -= host_slot_bytes.get(pool_group_id, 0)
+            pool_bytes.append(int(stat.total) * slot_bytes)
+        return pool_bytes
 
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
@@ -9001,6 +9043,36 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return and reset the page-table conversions: reused, row updates, full builds, full ms."""
         return (0, 0, 0, 0.0)
 
+    @staticmethod
+    def _utilization(total: int, remaining: int) -> float | None:
+        """Return ``1 - remaining / total``, or ``None`` for a pool without capacity."""
+        return 1.0 - remaining / total if total else None
+
+    def get_kv_cache_pool_utilization(self) -> dict[str, list[float | None] | None]:
+        """Read per-pool-group utilization from CPU-side counters.
+
+        Returns:
+            ``"gpu"`` maps to ``1 - available / total`` per GPU pool group, where
+            ``available`` counts free and evictable slots. ``"host"`` maps to the occupancy
+            ``1 - free / total`` per host pool group, including evictable cached pages, or to
+            ``None`` when there is no host tier. List positions are tier-local pool group ids;
+            zero-capacity groups read ``None``. Disk tiers are not reported.
+        """
+        pool_utilization: dict[str, list[float | None] | None] = {
+            "gpu": [
+                self._utilization(stat.total, stat.available)
+                for stat in self._get_storage_statistics(GPU_LEVEL)
+            ],
+            "host": None,
+        }
+        for level, tier in enumerate(self.impl.cache_tier_list):
+            if tier == CacheTier.HOST_MEM:
+                pool_utilization["host"] = [
+                    self._utilization(stat.total, stat.free)
+                    for stat in self._get_storage_statistics(CacheLevel(level))
+                ]
+        return pool_utilization
+
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
         pool_group_stats = self._get_storage_statistics(GPU_LEVEL)
@@ -9981,6 +10053,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self._waiter_snapshot_points.pop(request.py_request_id, None)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         self._inflight_draft_lens.pop(request.py_request_id, None)
+        if self._keep_growth_block:
+            self._kept_growth_slack.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -11020,11 +11094,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # Reclaim every reserved slot that was not occupied by an accepted
             # draft token.
             rewind_len = max(allocated_draft_slots - accepted_draft_len, 0)
-            new_capacity = (
-                None
-                if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
-                else kv_cache.capacity - rewind_len
-            )
+            if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT):
+                new_capacity = None
+            elif self._keep_growth_block and not self.kv_compression_manages_history:
+                new_capacity = self._kept_generation_update(
+                    req.py_request_id, kv_cache.capacity, rewind_len, allocated_draft_slots
+                )
+            else:
+                new_capacity = kv_cache.capacity - rewind_len
             history_length = self._generation_history_length(req)
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
@@ -11038,6 +11115,26 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._after_shrink(req.py_request_id, kv_cache)
             self._allocated_draft_lens.pop(req.py_request_id, None)
             self.try_commit_generation_blocks(req)
+
+    def keep_growth_blocks(self) -> None:
+        """Keep a decoding request's growth block across a draft shrink (``_kept_generation_capacity``),
+        except in a draft pool, under helix or under attention DP. Call before any request runs."""
+        self._keep_growth_block = (
+            not self.is_draft and not self._has_cp_helix and not self.mapping.enable_attention_dp
+        )
+
+    def _kept_generation_update(
+        self, request_id: int, capacity: int, rewind_len: int, draft_slots: int
+    ) -> int:
+        """The capacity a generation update shrinks to when it keeps its growth block (see
+        ``_kept_generation_capacity``); records the slack it keeps, gives back the previous one."""
+        rewind = rewind_len + self._kept_growth_slack.pop(request_id, 0)
+        # The next growth takes the width of the latest allocation.
+        growth = 1 + self._allocated_draft_lens.get(request_id, draft_slots)
+        new_capacity = _kept_generation_capacity(capacity, rewind, growth, self.tokens_per_block)
+        if new_capacity > capacity - rewind:
+            self._kept_growth_slack[request_id] = new_capacity - (capacity - rewind)
+        return new_capacity
 
     def copy_batch_block_offsets(
         self,

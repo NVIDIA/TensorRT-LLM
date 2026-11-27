@@ -33,7 +33,7 @@ _MAX_VOCAB = (1 << 18) - 1
 MAX_ROWS = 8
 MAX_POSITIONS = 8
 # One launch writes one 16-byte candidate per (position, row, source rank, CTA) into every rank's
-# slot; CTAs = SM count.
+# slot. There is at most one CTA per SM.
 _SLOT_VECTOR_BYTES = 16
 
 
@@ -132,7 +132,7 @@ def allocate_markov_workspace(mapping) -> Optional[MarkovWorkspace]:
     """
     from tensorrt_llm._ipc_utils import can_access_peer
 
-    if not _device_supported():
+    if not _device_supported(mapping.tp_size):
         return None
     if mapping.enable_attention_dp or mapping.tp_size not in (2, 4, 8):
         return None
@@ -153,20 +153,28 @@ def allocate_markov_workspace(mapping) -> Optional[MarkovWorkspace]:
 
 
 @functools.lru_cache(maxsize=None)
-def _device_supported() -> bool:
+def _device_supported(tp_size: int) -> bool:
     from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
-    return (
-        IS_CUTLASS_DSL_AVAILABLE
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
-    )
+    if not IS_CUTLASS_DSL_AVAILABLE or not torch.cuda.is_available():
+        return False
+    capability = torch.cuda.get_device_capability()
+    if capability == (10, 7) and tp_size != 8:
+        logger.info_once(
+            f"DSpark SM107 uses the unfused Markov chain at TP{tp_size}; packed exchange needs TP8",
+            key="dspark_markov_sm107_tp_fallback",
+        )
+    return capability in ((10, 0), (10, 3)) or (capability == (10, 7) and tp_size == 8)
 
 
 @functools.lru_cache(maxsize=None)
 def _num_ctas(local_vocab: int, device_index: int) -> int:
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return sms if ceil_div(local_vocab, sms) <= 256 else 0
+    rows_per_cta = ceil_div(local_vocab, sms)
+    if not 0 < rows_per_cta <= 256:
+        return 0
+    # Launch only nonempty vocabulary slices. Each CTA loads W2 and exchanges a candidate.
+    return ceil_div(local_vocab, rows_per_cta)
 
 
 @functools.lru_cache(maxsize=None)
@@ -178,6 +186,7 @@ def _compiled(
     vocab: int,
     nranks: int,
     num_ctas: int,
+    packed: bool,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -193,6 +202,7 @@ def _compiled(
         vocab=vocab,
         nranks=nranks,
         num_ctas=num_ctas,
+        packed=packed,
     )
     dev = torch.device("cuda")
     base = torch.empty((batch * block, local_vocab), dtype=torch.bfloat16, device=dev)
@@ -220,11 +230,22 @@ def markov_chain_supported(
     base: torch.Tensor, w2: torch.Tensor, w1: torch.Tensor, workspace: Optional[MarkovWorkspace]
 ) -> bool:
     """Whether ``markov_chain_fused`` serves these operands (shapes, dtypes, layout, workspace)."""
-    if workspace is None or base.dim() != 3 or not 0 < base.shape[0] <= MAX_ROWS:
-        return False
-    if base.dtype != torch.bfloat16:
+    if workspace is None or base.dim() != 3 or base.dtype != torch.bfloat16:
         return False
     batch, block, local_vocab = base.shape
+    if torch.cuda.get_device_capability(base.device) == (10, 7) and (
+        batch not in (1, 2)
+        or (block, local_vocab, w1.shape[0], workspace.nranks) != (5, 16160, 129280, 8)
+    ):
+        logger.info_once(
+            f"DSpark SM107 uses the unfused Markov chain for TP{workspace.nranks}, "
+            f"batch {batch}, block {block}, local vocabulary {local_vocab}, "
+            f"and global vocabulary {w1.shape[0]}",
+            key="dspark_markov_sm107_shape_fallback",
+        )
+        return False
+    if not 0 < batch <= MAX_ROWS:
+        return False
     num_ctas = _num_ctas(local_vocab, base.device.index)
     return (
         w2.shape == (local_vocab, w1.shape[1])
@@ -265,6 +286,7 @@ def markov_chain_fused(
         vocab,
         workspace.nranks,
         num_ctas,
+        packed=torch.cuda.get_device_capability(base.device) == (10, 7),
     )
     bonus = bonus.to(torch.int64).contiguous()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)

@@ -62,6 +62,12 @@ class HandleLogits:
         total_context_logits = num_context_logits_prefix_sum[-1]
         for batch_index, llm_req in enumerate(generation_requests):
             if llm_req.state == LlmRequestState.GENERATION_COMPLETE:
+                # With the overlap scheduler, a request that stopped on its
+                # previous token (end id, stop words) is still in this batch,
+                # and its logits stop here. Keep its last stored row: no extra
+                # row follows for exclude_last_generation_logits to drop.
+                if llm_req.py_return_generation_logits:
+                    llm_req.set_exclude_last_generation_logits(False)
                 continue
 
             logits_begin = total_context_logits + batch_index * beam_width

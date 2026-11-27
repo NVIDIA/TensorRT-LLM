@@ -974,11 +974,136 @@ def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
     tokenizer = MagicMock()
     tokenizer.return_value.input_ids = [torch.tensor(prompt_ids)]
     with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor") as auto_processor:
-        auto_processor.from_pretrained.return_value = MagicMock()
+        auto_processor.from_pretrained.return_value = MagicMock(mm_special_token_ids=None)
         processor = processor_cls("unused", config, tokenizer, trust_remote_code=True)
     # A Qwen3-VL embedding row also holds one deepstack level.
     width = hidden_size * (2 if model == "qwen3" else 1)
     return processor, width
+
+
+def _make_qwen_media_processor(model):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import (
+        PreTrainedTokenizerFast,
+        Qwen2_5_VLProcessor,
+        Qwen2VLImageProcessor,
+        Qwen2VLVideoProcessor,
+        Qwen3VLProcessor,
+        Qwen3VLVideoProcessor,
+    )
+
+    image_token, video_token = "<|image_pad|>", "<|video_pad|>"
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        pad_token="[UNK]",
+        additional_special_tokens=[image_token, video_token, "<|vision_start|>", "<|vision_end|>"],
+    )
+    cls = Qwen3VLProcessor if model == "qwen3" else Qwen2_5_VLProcessor
+    video_cls = Qwen3VLVideoProcessor if model == "qwen3" else Qwen2VLVideoProcessor
+    hf = cls(
+        image_processor=Qwen2VLImageProcessor(patch_size=16),
+        video_processor=video_cls(patch_size=16),
+        tokenizer=tokenizer,
+    )
+    processor, _ = _make_qwen_vl_embedding_processor(model, [])
+    processor._processor = hf
+    return processor
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+@pytest.mark.parametrize(
+    "image_kind,video_kind",
+    [
+        ("pil", "uint8"),
+        ("tensor", "uint8"),
+        ("tensor_with_options", "uint8"),
+        ("scaled_array", "tensor"),
+        ("tensor", "scaled_array"),
+    ],
+)
+def test_qwen_mixed_media_rescale(model, image_kind, video_kind):
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+
+    processor = _make_qwen_media_processor(model)
+    frames = np.random.default_rng(42).integers(0, 256, (4, 64, 64, 3), dtype=np.uint8)
+    image = Image.fromarray(frames[0])
+    video = frames
+    options = {}
+    reference = {}
+    if image_kind != "pil":
+        image = frames[0].astype(np.float32) / 255
+        if image_kind != "scaled_array":
+            image = torch.from_numpy(image).permute(2, 0, 1)
+        reference["images_kwargs"] = {"do_rescale": False}
+    if image_kind == "tensor_with_options":
+        options = {"images_kwargs": {"do_normalize": False}}
+        reference["images_kwargs"]["do_normalize"] = False
+    if video_kind != "uint8":
+        video = frames.astype(np.float32) / 255
+        if video_kind == "tensor":
+            video = [torch.from_numpy(frame).permute(2, 0, 1) for frame in video]
+        reference = {"do_rescale": False}
+    metadata = {"total_num_frames": 4, "fps": 2.0, "duration": 2.0, "frames_indices": [0, 1, 2, 3]}
+    if model == "qwen3":
+        reference["video_metadata"] = [dict(metadata)]
+    prompt = (
+        "<|vision_start|><|image_pad|><|vision_end|><|vision_start|><|video_pad|><|vision_end|>"
+    )
+    actual = processor._preprocess(
+        prompt, {"image": [image], "video": [VideoData(video, metadata)]}, options
+    )
+    expected = processor.processor(
+        text=[prompt],
+        images=[image],
+        videos=[video],
+        padding=True,
+        return_tensors="pt",
+        **reference,
+    )
+    for key in (
+        "pixel_values",
+        "pixel_values_videos",
+        "input_ids",
+        "image_grid_thw",
+        "video_grid_thw",
+    ):
+        assert torch.equal(actual[key], expected[key])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dark_image_first", [True, False])
+def test_qwen_raw_float_array_batch_rescale(dark_image_first):
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+
+    processor = _make_qwen_media_processor("qwen2.5")
+    dark = np.zeros((4, 64, 64, 3), dtype=np.float32)
+    bright = np.full_like(dark, 255)
+    clips = [bright, dark] if dark_image_first else [dark, bright]
+    images = [clip[0] for clip in reversed(clips)]
+    prompt = "<|vision_start|><|image_pad|><|vision_end|>" * 2
+    prompt += "<|vision_start|><|video_pad|><|vision_end|>" * 2
+    actual = processor._preprocess(
+        prompt, {"image": images, "video": [VideoData(clip, {}) for clip in clips]}, {}
+    )
+    expected = processor.processor(
+        text=[prompt],
+        images=images,
+        videos=clips,
+        padding=True,
+        return_tensors="pt",
+        do_rescale=True,
+    )
+    for key in (
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "input_ids",
+    ):
+        assert torch.equal(actual[key], expected[key])
 
 
 @pytest.mark.cpu_only
@@ -2032,7 +2157,9 @@ def test_normalization_processor_uses_config(
         "default_float64",
     )
     assert bool(processed.get("vision_normalization")) is expected
-    assert hf_processor.call_args.kwargs["do_rescale"] is overrides.get("do_rescale", not expected)
+    call_kwargs = hf_processor.call_args.kwargs
+    rescale = call_kwargs.get("images_kwargs", {}).get("do_rescale", call_kwargs.get("do_rescale"))
+    assert rescale is overrides.get("do_rescale", not expected and input_kind != "float")
     assert hf_processor.call_args.kwargs.get("do_normalize") is (
         False if expected else overrides.get("do_normalize")
     )

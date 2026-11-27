@@ -84,8 +84,16 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fu
     assert intercept == 2 * 16 * 576 * 2
 
 
+@pytest.mark.parametrize("reported", [False, True])
+def test_context_only_kv_cache_predicate(reported: bool) -> None:
+    assert is_context_only_kv_cache(SimpleNamespace(is_context_only_cache=reported)) is reported
+    # A Mock manager answers any attribute with a truthy Mock; only True counts.
+    assert is_context_only_kv_cache(Mock()) is False
+    assert is_context_only_kv_cache(None) is False
+
+
 def _dummy_requests(monkeypatch, context_only: bool):
-    cache = SimpleNamespace(fp4_mla_context_only_cache=context_only, context_swa_layer_limit=None)
+    cache = SimpleNamespace(is_context_only_cache=context_only, context_swa_layer_limit=None)
     resources = SimpleNamespace(
         get_resource_manager=lambda key: cache
         if key == ResourceManagerType.KV_CACHE_MANAGER

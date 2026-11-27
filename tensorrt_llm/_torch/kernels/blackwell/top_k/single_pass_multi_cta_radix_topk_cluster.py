@@ -27,6 +27,7 @@ import functools
 
 import cutlass
 import cutlass.cute as cute
+import torch
 from cuda.bindings import driver
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import Int32 as CuteInt32
@@ -49,15 +50,15 @@ from .single_pass_multi_cta_radix_topk import (
 )
 
 
-@functools.lru_cache(maxsize=1)
 def _query_max_cluster_size() -> int:
-    """Query the hardware max cluster size using an empty kernel.
+    """Return the hardware max cluster size for the current CUDA device."""
+    return _query_max_cluster_size_for_device(torch.cuda.current_device())
 
-    Uses ``cuOccupancyMaxPotentialClusterSize`` with a lightweight dummy
-    kernel compiled via CuTE DSL.  The result reflects the GPC topology
-    (number of SMs in the largest GPC) of the current device.
-    """
-    hw = HardwareInfo()
+
+@functools.cache
+def _query_max_cluster_size_for_device(device: int) -> int:
+    """Use a lightweight CuTE kernel to query the cluster limit of this device's GPCs."""
+    hw = HardwareInfo(device_id=device)
     func = hw._get_device_function()
 
     # Allow non-portable cluster sizes for accurate detection.

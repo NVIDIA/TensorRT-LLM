@@ -733,6 +733,7 @@ class DecoderCudaGraphs:
         position_id_offsets: torch.Tensor | None,
         is_dummy: bool = False,
         static_inputs_staged: int = 0,
+        pre_replay_staged: bool = False,
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
 
@@ -757,6 +758,7 @@ class DecoderCudaGraphs:
                 position_id_offsets=position_id_offsets,
                 is_dummy=is_dummy,
                 static_inputs_staged=static_inputs_staged,
+                pre_replay_staged=pre_replay_staged,
             )
 
     def _run(
@@ -774,6 +776,7 @@ class DecoderCudaGraphs:
         position_id_offsets: torch.Tensor | None,
         is_dummy: bool = False,
         static_inputs_staged: int = 0,
+        pre_replay_staged: bool = False,
     ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
         if key is None:
@@ -827,6 +830,8 @@ class DecoderCudaGraphs:
                         inputs,
                         position_id_offsets=position_id_offsets,
                         static_inputs_staged=static_inputs_staged,
+                        # Capture can update the inputs the Engram hook reads.
+                        pre_replay_staged=False,
                     )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -841,6 +846,7 @@ class DecoderCudaGraphs:
                             inputs,
                             position_id_offsets=position_id_offsets,
                             static_inputs_staged=static_inputs_staged,
+                            pre_replay_staged=pre_replay_staged,
                         )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -1262,12 +1268,8 @@ class DecoderCudaGraphs:
         listed = getattr(self._config.cuda_graph_config, "sampling_variants", None)
         if listed is not None:
             # Judged from the config: the speculative metadata may not exist before the first pass.
-            # Batches never select temperature_only with rejection sampling or penalties, which
-            # the vocabulary-shard sampler (DSpark) excludes too.
-            spec_config = self._config.spec_config
             temperature_only_graphs = self._config.samples_from_vocab_shards or (
                 supports_temperature_only_graphs(self._config, self.mapping)
-                and not (spec_config.use_rejection_sampling or spec_config.enable_penalty)
             )
         supported = {"greedy"}
         if supports_advanced_draft_sampling(self._config.spec_config):
@@ -1404,10 +1406,12 @@ class DecoderCudaGraphs:
                                     runtime_draft_len=runtime_draft_len,
                                 ),
                                 self._warmup_inputs,
-                                can_capture=lambda: getattr(
-                                    self._metadata.attn_metadata, "decoder_replay_plan", None
-                                )
-                                is None,
+                                can_capture=lambda: (
+                                    getattr(
+                                        self._metadata.attn_metadata, "decoder_replay_plan", None
+                                    )
+                                    is None
+                                ),
                             )
                             if not captured:
                                 logger.info(

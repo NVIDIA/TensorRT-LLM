@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, Mock, patch
 import numpy as np
 import pytest
 import torch
+from _torch.disaggregation.fake_dist import FakeDistGroup
 from _torch.pyexecutor.executor_test_utils import make_partial_executor
 from torch.multiprocessing.reductions import StorageWeakRef
 
@@ -43,6 +44,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ExecutorRequest,
@@ -272,6 +274,34 @@ def test_forward_step_keeps_draft_len_when_forward_fails():
 
     executor._handle_errors.assert_called_once()
     assert executor.runtime_draft_len == 2
+
+
+@pytest.mark.parametrize("case", ["real", "dummy", "empty", "failure", "no_outputs", "warmup"])
+def test_scheduler_progress_requires_a_successful_real_forward(case):
+    engine = Mock(route_capture=None)
+    engine.forward.return_value = None if case == "no_outputs" else {}
+    if case == "failure":
+        engine.forward.side_effect = RuntimeError("decoder failure")
+    executor = _forward_step_executor(engine)
+    executor._is_kv_manager_v2 = True
+    executor.is_warmup = case == "warmup"
+    executor._scheduler_progress_since_vote = False
+    executor._scheduler_stall_rounds = 2
+    executor._wait_for_model_engine_input_copy = Mock()
+    executor.dist = types.SimpleNamespace(tp_size=1, cp_size=1, pp_size=1)
+    batch = ScheduledRequests()
+    if case != "empty":
+        batch.generation_requests = [types.SimpleNamespace(is_dummy=case == "dummy")]
+    _run_forward_step(executor, batch)
+    assert executor._scheduler_progress_since_vote is (case == "real")
+    if case == "failure":
+        executor._handle_errors.assert_called_once()
+    else:
+        executor._handle_errors.assert_not_called()
+    # A completed forward clears the next stall vote even if its request has
+    # already left the scheduler's current batch.
+    PyExecutor._fail_scheduler_requests(executor, ScheduledRequests())
+    assert executor._scheduler_stall_rounds == (0 if case == "real" else 2)
 
 
 @pytest.mark.parametrize("end_id", [None, -1, 0, 127])
@@ -897,8 +927,16 @@ def test_remote_tail_source_with_empty_prefix_remains_schedulable(
     assert request.py_csa2_remote_tail_start == transfer_end
 
 
+@pytest.mark.parametrize(
+    ("manager_cls", "enable_spec_decode"),
+    [(None, False), (None, True), (KVCacheManager, True), (KVCacheManagerV2, True)],
+)
 @pytest.mark.parametrize("accepted", [False, True])
-def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: bool) -> None:
+def test_disagg_generation_model_state_is_prepared_after_first_token(
+    accepted: bool,
+    manager_cls: type[KVCacheManager] | type[KVCacheManagerV2] | None,
+    enable_spec_decode: bool,
+) -> None:
     events = []
     request = types.SimpleNamespace(
         is_disagg_generation_transmission_complete=True,
@@ -915,11 +953,16 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         prepare_disagg_generation_request=lambda req: events.append(("draft", req))
     )
     executor = types.SimpleNamespace(
-        model_engine=types.SimpleNamespace(model=target),
-        enable_spec_decode=False,
+        model_engine=types.SimpleNamespace(model=target, max_total_draft_tokens=0),
+        enable_spec_decode=enable_spec_decode,
         draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=types.SimpleNamespace(
-            resource_managers={ResourceManagerType.SEQ_SLOT_MANAGER: Mock()}
+            resource_managers={
+                ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
+                ResourceManagerType.KV_CACHE_MANAGER: object.__new__(manager_cls)
+                if manager_cls is not None
+                else None,
+            }
         ),
         kv_cache_transceiver=None,
         disagg=types.SimpleNamespace(
@@ -939,7 +982,10 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         assert events == []
 
 
-def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> None:
+@pytest.mark.parametrize("enable_spec_decode", [False, True])
+def test_disagg_generation_rebuilds_imported_cache_before_first_forward(
+    enable_spec_decode: bool,
+) -> None:
     events = []
     received = types.SimpleNamespace(
         is_disagg_generation_transmission_complete=True,
@@ -953,6 +999,9 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
     )
 
     def setup_sampler_step(_requests):
+        events.append(
+            ("sampler", [req.py_request_id for req in _requests.context_requests_last_chunk])
+        )
         # A failed sampler setup terminates the request before generation.
         terminated.is_disagg_generation_transmission_complete = False
 
@@ -961,12 +1010,13 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
         return False
 
     kv_cache_manager = types.SimpleNamespace(
+        on_state_transfer_complete=lambda ids: events.append(("transfer", ids)),
         rebuild_disagg_imported_cache=lambda requests: events.append(
             ("rebuild", [req.py_request_id for req in requests])
-        )
+        ),
     )
     executor = types.SimpleNamespace(
-        enable_spec_decode=False,
+        enable_spec_decode=enable_spec_decode,
         resource_manager=types.SimpleNamespace(
             resource_managers={
                 ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
@@ -984,7 +1034,12 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
         executor, types.SimpleNamespace(generation_requests=[received, terminated])
     )
 
-    assert events == [("rebuild", [41]), ("finish", 41), ("finish", 42)]
+    transfer = [("transfer", [41, 42])] if enable_spec_decode else []
+    assert events == [("sampler", [41, 42])] + transfer + [
+        ("rebuild", [41]),
+        ("finish", 41),
+        ("finish", 42),
+    ]
 
 
 def test_free_request_resources_releases_target_and_draft_model_state() -> None:
@@ -2615,9 +2670,30 @@ class TestDisaggTransferAdmissionPP:
         assert wait_for_progress
 
 
+def _snapshot_point_manager(
+    manager_kind: str, calls: list[tuple]
+) -> Mock | KVCacheManager | KVCacheManagerV2 | None:
+    """A recording stand-in, no manager, or a plain V1 or V2 manager."""
+    if manager_kind == "hook":
+        manager = Mock()
+        manager.prepare_expect_snapshot_points.side_effect = lambda requests: calls.append(
+            ("prepare", requests)
+        )
+        return manager
+    manager_cls = {"none": None, "v1": KVCacheManager, "v2": KVCacheManagerV2}[manager_kind]
+    return None if manager_cls is None else object.__new__(manager_cls)
+
+
+def _expected_schedule_calls(executor: PyExecutor, manager_kind: str) -> list[tuple]:
+    prepare = [("prepare", executor.active_requests)] if manager_kind == "hook" else []
+    return prepare + [("schedule", executor.active_requests, executor.inflight_req_ids)]
+
+
+@pytest.mark.parametrize("manager_kind", ["hook", "none", "v1", "v2"])
 def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
-    monkeypatch,
-):
+    monkeypatch: pytest.MonkeyPatch,
+    manager_kind: str,
+) -> None:
     class StopLocalSchedule(RuntimeError):
         pass
 
@@ -2641,13 +2717,10 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     request = Mock()
     executor.active_requests = [request]
     executor.inflight_req_ids = set()
-    executor.kv_cache_manager = Mock()
-    executor.scheduler = Mock()
-
     calls = []
-    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = lambda requests: (
-        calls.append(("prepare", requests))
-    )
+    executor.kv_cache_manager = _snapshot_point_manager(manager_kind, calls)
+    request.expect_snapshot_points = [13]
+    executor.scheduler = Mock()
 
     def stop_after_schedule(requests, inflight_req_ids):
         calls.append(("schedule", requests, inflight_req_ids))
@@ -2662,10 +2735,8 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     with pytest.raises(StopLocalSchedule):
         PyExecutor._executor_loop_pp(executor)
 
-    assert calls == [
-        ("prepare", executor.active_requests),
-        ("schedule", executor.active_requests, executor.inflight_req_ids),
-    ]
+    assert calls == _expected_schedule_calls(executor, manager_kind)
+    assert request.expect_snapshot_points == [13]
 
 
 @pytest.mark.parametrize(
@@ -2692,6 +2763,7 @@ def test_each_pp_rank_schedules_once_per_iteration(
         pass
 
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._is_kv_manager_v2 = True
     executor._pp_rebalance_drain_iters = None
     executor._can_pause_for_rebalance = Mock(return_value=False)
@@ -2715,6 +2787,9 @@ def test_each_pp_rank_schedules_once_per_iteration(
     executor.inflight_req_ids = set()
     executor.kv_cache_manager = Mock()
     executor.scheduler = Mock()
+    executor.scheduler.schedule_request.return_value = types.SimpleNamespace(
+        failed_requests=[], fitting_disagg_gen_init_requests=[]
+    )
 
     def schedule_and_propagate(microbatch_id):
         if executor._pp_rank_schedules():
@@ -2743,7 +2818,11 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
         pass
 
     executor = object.__new__(PyExecutor)
-    executor.dist = Mock(pp_rank=1, rank=1, is_first_pp_rank=False)
+    executor._reset_scheduler_failure_state()
+    executor.enable_attention_dp = False
+    executor.dist = Mock(
+        pp_rank=1, rank=1, tp_size=1, cp_size=1, pp_size=2, world_size=2, is_first_pp_rank=False
+    )
     executor.device_id = 0
     profiler = MagicMock()
     profiler.__enter__.return_value = Mock()
@@ -2776,7 +2855,7 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
         return_value=(scheduled_batch, [canonical], 0, False)
     )
     executor.scheduler.schedule_request.return_value = types.SimpleNamespace(
-        fitting_disagg_gen_init_requests=[local_canonical, local_only]
+        fitting_disagg_gen_init_requests=[local_canonical, local_only], failed_requests=[]
     )
     # Gen-transfer polling and the receive start live in the coordinator, so
     # stub them there. Touch ``executor.disagg`` only after ``_is_kv_manager_v2``
@@ -2800,7 +2879,8 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     executor._revert_ctx_alloc.assert_called_once_with([local_only])
 
 
-def test_schedule_prepares_snapshot_points_before_scheduling():
+@pytest.mark.parametrize("manager_kind", ["hook", "none", "v1", "v2"])
+def test_schedule_prepares_snapshot_points_before_scheduling(manager_kind: str) -> None:
     class StopSchedule(RuntimeError):
         pass
 
@@ -2808,13 +2888,10 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     request = Mock()
     executor.active_requests = [request]
     executor.inflight_req_ids = set()
-    executor.kv_cache_manager = Mock()
-    executor.scheduler = Mock()
-
     calls = []
-    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = lambda requests: (
-        calls.append(("prepare", requests))
-    )
+    executor.kv_cache_manager = _snapshot_point_manager(manager_kind, calls)
+    request.expect_snapshot_points = [13]
+    executor.scheduler = Mock()
 
     def stop_after_schedule(requests, inflight_req_ids):
         calls.append(("schedule", requests, inflight_req_ids))
@@ -2825,10 +2902,213 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     with pytest.raises(StopSchedule):
         PyExecutor._schedule(executor)
 
-    assert calls == [
-        ("prepare", executor.active_requests),
-        ("schedule", executor.active_requests, executor.inflight_req_ids),
+    assert calls == _expected_schedule_calls(executor, manager_kind)
+    assert request.expect_snapshot_points == [13]
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
+    from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+
+    class StopSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    executor.dist = types.SimpleNamespace(pp_size=pp_size)
+    executor._is_kv_manager_v2 = True
+    held = types.SimpleNamespace(request_id=1, py_request_id=1, lora_task_id=7)
+    healthy = types.SimpleNamespace(py_request_id=2, lora_task_id=8)
+    executor.active_requests = [held, healthy]
+    executor.inflight_req_ids = ReqIdsSet()
+    executor.inflight_req_ids.insert(9)
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+    executor.scheduler.schedule_request.side_effect = StopSchedule
+    executor._held_transfer_failures()[id(held)] = (held, "transfer failed")
+
+    with pytest.raises(StopSchedule):
+        executor._schedule()
+
+    executor.scheduler.schedule_request.assert_called_once()
+    requests, inflight = executor.scheduler.schedule_request.call_args.args
+    assert requests == ([healthy] if pp_size == 1 else [held, healthy])
+    assert inflight is executor.inflight_req_ids
+    if pp_size == 1:
+        executor.scheduler.set_transfer_held_requests.assert_called_once_with([held])
+    else:
+        executor.scheduler.set_transfer_held_requests.assert_not_called()
+    assert set(executor.inflight_req_ids) == {9}
+
+
+def _partial_prefill_rank(dist, tp_size, *, write_in_flight):
+    """One CTX rank whose pipelined send has an earlier chunk's write submitted."""
+    from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    class PartialSendSession:
+        disagg_request_id = 5
+
+        def __init__(self):
+            self.status = SessionStatus.READY
+            self.write_in_flight = write_in_flight
+            self.cancel_calls = 0
+            self.closed = False
+
+        def cancel(self):
+            self.cancel_calls += 1
+            self.status = SessionStatus.CANCELLED
+
+        def has_failed(self):
+            return self.status == SessionStatus.CANCELLED
+
+        def is_completed(self):
+            return False
+
+        def has_transferring_tasks(self):
+            return self.write_in_flight
+
+        def wait_complete(self, blocking=True):
+            return WaitResult.FAILED if self.has_failed() else None
+
+        def close(self):
+            self.closed = True
+            return True
+
+    request = types.SimpleNamespace(
+        py_request_id=5,
+        request_id=5,
+        py_client_id=105,
+        py_disaggregated_params=None,
+        is_context_only_request=True,
+        state=LlmRequestState.CONTEXT_INIT,
+        context_remaining_length=4,
+        context_current_position=4,
+        py_kv_send_session_retired=False,
+    )
+    session = PartialSendSession()
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {5: session}
+    transceiver._send_reqs = {5: request}
+    transceiver._recv_sessions = {}
+    transceiver._wait_reqs = {}
+    transceiver._rank_info_start_failures = None
+    transceiver._pending_rank_info_admissions = None
+    transceiver._ever_had_send_session = True
+    transceiver._dist = dist
+    transceiver._ctx_need_tp_sync = tp_size > 1
+    transceiver._ctx_need_pp_sync = False
+    transceiver._transfer_worker = Mock()
+
+    coordinator = object.__new__(DisaggTransferCoordinator)
+    coordinator._transceiver = transceiver
+    coordinator._unpublished_gen_receives = {}
+    # The partial send is not in the transfer manager; only the reaper retires it.
+    coordinator._dist = dist
+    coordinator._transfers = Mock()
+    coordinator._transfers.has_any_inflight_requests.return_value = False
+    coordinator._transfers.requests_in_transfer.return_value = {}
+    coordinator._context_cancellation_drains = set()
+    coordinator._pending_ctx_transfer_failures = set()
+    coordinator._timed_out_ctx_cancelled_ids = set()
+    coordinator._check_transfer_errors = Mock()
+
+    executor = object.__new__(PyExecutor)
+    executor._error_budget = Mock()
+    executor._fatal_error = None
+    executor.enable_attention_dp = False
+    executor.dist = Mock(world_size=tp_size)
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor.kv_cache_transceiver = transceiver
+    executor._disagg_coordinator = coordinator
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
+    responses = []
+    executor._enqueue_responses = Mock(side_effect=responses.extend)
+    executor._terminate_request = Mock()
+    executor._wait_for_model_engine_input_copy = Mock()
+    executor.active_requests = [request]
+    return types.SimpleNamespace(
+        request=request,
+        session=session,
+        transceiver=transceiver,
+        coordinator=coordinator,
+        executor=executor,
+        responses=responses,
+    )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch, tp_size):
+    """A forward failure after an earlier pipelined chunk retires that send on every rank.
+
+    The failure is parked, so no later chunk runs and the send never gets its
+    last slice, and the generation side never cancels. The send is cancelled
+    when the failure is parked. The request is the only one and is excluded
+    from scheduling, so only the idle poll of an empty batch drives the reaper.
+    On TP2 the first rank's write has already drained while the last rank's is
+    in flight: the drained rank keeps its session, so both ranks retire it in
+    the same idle pass once the last write drains, and each reports the
+    original error exactly once.
+    """
+    from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    group = FakeDistGroup(world_size=tp_size, tp_size=tp_size)
+    ranks = [
+        _partial_prefill_rank(group.rank(rank), tp_size, write_in_flight=rank == tp_size - 1)
+        for rank in range(tp_size)
     ]
+
+    def reap_round(rank):
+        state = ranks[rank]
+        state.coordinator.poll_progress_when_idle(batch_is_empty=True)
+        state.executor._sweep_transfer_held_failures()
+
+    for state in ranks:
+        state.executor._handle_errors(
+            "forward failed", requests=[state.request], charge_budget=False
+        )
+        # A later error while the write is in flight keeps the original outcome.
+        state.executor._handle_errors(
+            "transfer failed", requests=[state.request], charge_budget=False
+        )
+
+    # Cancelled locally (which notifies the generation side), but a submitted
+    # write still reads the pages on one rank: nothing is released or reported.
+    for _ in range(5):
+        for state in ranks:
+            assert state.session.status == SessionStatus.CANCELLED
+            assert state.session.cancel_calls == 2
+            assert state.transceiver._send_sessions == {5: state.session}
+            assert not state.session.closed
+            assert state.executor._held_transfer_failures() == {
+                id(state.request): (state.request, "forward failed")
+            }
+            assert state.executor.active_requests == [state.request]
+            state.executor._terminate_request.assert_not_called()
+            assert state.responses == []
+        group.run(reap_round)
+
+    ranks[-1].session.write_in_flight = False
+    group.run(reap_round)
+    for state in ranks:
+        assert state.session.closed
+        assert state.transceiver._send_sessions == {}
+        assert state.request.py_kv_send_session_retired
+        assert state.executor._held_transfer_failures() == {}
+        assert state.executor.active_requests == []
+
+    group.run(reap_round)
+    for state in ranks:
+        state.executor._terminate_request.assert_called_once_with(state.request)
+        assert [(req_id, response.error_msg) for req_id, response in state.responses] == [
+            (5, "forward failed")
+        ]
+    collectives = [[name for name, _ in group.rank(rank).calls] for rank in range(tp_size)]
+    assert all(names == collectives[0] for names in collectives)
+    assert bool(collectives[0]) == (tp_size > 1)
 
 
 class TestComputeScheduledTokens:
@@ -3467,7 +3747,7 @@ class _StubADPExecutor:
         )
         kv_cache_manager.num_extra_kv_tokens = 0
         kv_cache_manager.tokens_per_block = 128
-        kv_cache_manager.kda_context_only = False
+        kv_cache_manager.is_context_only_cache = False
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -4438,9 +4718,9 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
 
-def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
+def test_pad_empty_batch_uses_context_dummy_on_context_only_cache():
     stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.kda_context_only = True
+    stub.kv_cache_manager.is_context_only_cache = True
     stub.max_total_draft_tokens = 3
 
     _run_pad_empty(stub, scheduled_batch)
@@ -4458,38 +4738,17 @@ def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
     assert stub._pending_adp_dummy_request is dummy
 
 
-def test_pad_empty_batch_uses_context_dummy_on_context_only_fp4_mla_cache():
-    stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.fp4_mla_context_only_cache = True
-    stub.max_total_draft_tokens = 3
-
-    _run_pad_empty(stub, scheduled_batch)
-
-    # A context-only FP4 MLA cache keeps no V scales, so a generation dummy
-    # would fail in attention.
-    assert scheduled_batch.generation_requests == []
-    assert len(scheduled_batch.context_requests) == 1
-    dummy = scheduled_batch.context_requests[0]
-    assert dummy.is_attention_dp_dummy is True
-    call = stub.add_dummy_calls[0]
-    assert call["is_gen"] is False
-    assert call["token_nums"] == [1]
-    assert call["max_num_draft_tokens"] == 0
-    assert stub._pending_adp_dummy_request is dummy
-
-
 @pytest.mark.parametrize("enable_non_overlap_adp_forward_intent", [False, True])
-@pytest.mark.parametrize("context_only_attr", ["fp4_mla_context_only_cache", "kda_context_only"])
 def test_pad_dummy_is_context_on_context_only_cache(
-    enable_non_overlap_adp_forward_intent, context_only_attr
-):
+    enable_non_overlap_adp_forward_intent: bool,
+) -> None:
     # The default role and the peers' intent say generation, but a
     # context-only cache cannot run a generation row.
     stub = _StubADPExecutor(
         enable_non_overlap_adp_forward_intent=enable_non_overlap_adp_forward_intent,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
     )
-    setattr(stub.kv_cache_manager, context_only_attr, True)
+    stub.kv_cache_manager.is_context_only_cache = True
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -4513,7 +4772,7 @@ def test_pad_dummy_keeps_generation_role_on_full_cache():
 
 def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
     stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.kda_context_only = True
+    stub.kv_cache_manager.is_context_only_cache = True
     stub.max_total_draft_tokens = 3
     # The dummy role can still say generation when no transceiver drives it.
     stub._adp_dummy_is_gen = True

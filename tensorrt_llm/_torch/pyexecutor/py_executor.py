@@ -36,8 +36,8 @@ from tensorrt_llm._utils import (CUASSERT, CudaStreamScope, current_cuda_stream,
                                  customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
                                  is_trace_enabled, mpi_comm, mpi_disabled,
-                                 nvtx_range, set_thread_local_mpi_comm,
-                                 trace_func)
+                                 nvtx_range, run_with_frame_stack_reserve,
+                                 set_thread_local_mpi_comm, trace_func)
 # yapf: disable
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
@@ -67,6 +67,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
+from ..attention.backends.fmha.registry import (fmha_step_stats,
+                                                reset_fmha_step_stats,
+                                                step_stats_fmha_lib_classes)
 from ..disaggregation import diagnostics as disagg_diagnostics
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import (
@@ -105,7 +108,8 @@ from .benchmark_request_stages import (BenchmarkRequestStage,
                                        parse_benchmark_request_stages)
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .connectors.kv_cache_layout import build_kv_cache_layout_v2
+from .connectors.kv_cache_layout import (build_kv_cache_layout_v2,
+                                         has_state_layers)
 from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
@@ -822,6 +826,9 @@ class PyExecutor:
     # Whether the model opted into running the overlap loop on the execution
     # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
     _execution_stream_loop_armed = False
+    # Whether an FMHA library that keeps per-step counters is enabled
+    # (TLLM_FMHA_LIBS); read once at construction, False by default.
+    _fmha_step_stats_enabled = False
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
@@ -1070,6 +1077,7 @@ class PyExecutor:
                                      disable_overlap_scheduler)
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
+        self._reset_scheduler_failure_state()
         self._profile_controller.reset_iterations()
 
         self._metrics = {}
@@ -1147,6 +1155,7 @@ class PyExecutor:
         self._intake_window = threading.Event()
         self._intake_window_started = 0.0
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
+        self._fmha_step_stats_enabled = bool(step_stats_fmha_lib_classes())
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.iter_perf_stats_interval = self.llm_args.iter_perf_stats_interval
         # Request counts not yet reported by an IterationStats record. They
@@ -1440,7 +1449,7 @@ class PyExecutor:
                 self.async_transfer_manager)
         if hasattr(self.scheduler, "set_retiring_gen_receives_probe"):
             self.scheduler.set_retiring_gen_receives_probe(
-                lambda: self.disagg.has_local_retiring_gen_receives)
+                self._has_scheduler_transfer_holds)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -1605,6 +1614,9 @@ class PyExecutor:
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
             self.kv_cache_manager.snapshot_warmup_baseline()
+        # Likewise drop the warmup steps from the FMHA libraries' step counters.
+        if self._fmha_step_stats_enabled:
+            reset_fmha_step_stats(self.kv_cache_manager)
 
         self.is_shutdown = False
         # Set at the executor loops' normal-exit `break` sites, and ONLY
@@ -2086,7 +2098,14 @@ class PyExecutor:
                     "is registered with a single primary pool, but VSWA "
                     "models allocate one pool per window size.")
 
-            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
+            # A V2 cache says in its layout which layers keep recurrent state.
+            # V1 has no layout to ask, so its recurrent managers are named.
+            if is_kv_cache_manager_v2:
+                keeps_recurrent_state = has_state_layers(self.kv_cache_manager)
+            else:
+                keeps_recurrent_state = isinstance(self.kv_cache_manager,
+                                                   BaseMambaCacheManager)
+            if keeps_recurrent_state:
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with Mamba / hybrid "
                     "linear-attention models. Mamba layers carry SSM state "
@@ -2300,7 +2319,7 @@ class PyExecutor:
             with host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 try:
-                    self.event_loop()
+                    run_with_frame_stack_reserve(self.event_loop)
                 except _PeriodicTpFatalShutdown:
                     self._event_loop_completed = True
             loop_exited_cleanly = True
@@ -4323,7 +4342,9 @@ class PyExecutor:
             scheduler_mode=scheduler_mode,
             gpu_forward_time_ms=gpu_forward_time_ms,
             mm_encoder_stats=mm_encoder_stats,
-            executor_loop=loop_metrics)
+            executor_loop=loop_metrics,
+            fmha_step_stats=(fmha_step_stats(self.kv_cache_manager)
+                             if self._fmha_step_stats_enabled else None))
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
@@ -4743,18 +4764,21 @@ class PyExecutor:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
-                    if hasattr(self.kv_cache_manager,
-                               "prepare_expect_snapshot_points"):
+                    if self.kv_cache_manager is not None:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
                         self.active_requests, self.inflight_req_ids)
+                    scheduled_batch.failed_requests.extend(
+                        local_scheduler_output.failed_requests)
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
                     self.disagg.revert_deferred_gen_init(
                         local_disagg_candidates,
                         fitting_disagg_gen_init_requests)
+
+                self._fail_scheduler_requests(scheduled_batch)
 
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
@@ -4766,7 +4790,8 @@ class PyExecutor:
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 self.disagg.receive_gen_init(fitting_disagg_gen_init_requests)
-                self.disagg.poll_progress_when_idle()
+                self.disagg.poll_progress_when_idle(
+                    batch_is_empty=scheduled_batch.batch_size == 0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
                 self.num_dummy_requests = sum(
@@ -6531,6 +6556,7 @@ class PyExecutor:
             )
         if getattr(self, "_check_helix_schedule", False):
             self._check_helix_schedule_consistency(scheduled_batch)
+        self._fail_scheduler_requests(scheduled_batch)
 
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.
@@ -6555,7 +6581,8 @@ class PyExecutor:
             self.disagg.receive_gen_init(admitted_disagg_gen_init_requests,
                                          defer=defer_gen_receives)
 
-            self.disagg.poll_progress_when_idle()
+            self.disagg.poll_progress_when_idle(
+                batch_is_empty=scheduled_batch.batch_size == 0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the
@@ -9211,6 +9238,8 @@ class PyExecutor:
                     raise ValueError(
                         f"Embedding bias index must be in [0, {self._num_embeddings - 1}]"
                     )
+                if not math.isfinite(val):
+                    raise ValueError("Embedding bias values must be finite")
 
     def _validate_encoder_output_len(self, request: LlmRequest) -> None:
         """Reject an encoder input that no iteration can serve.
@@ -9494,7 +9523,9 @@ class PyExecutor:
         transfer_manager = getattr(self, "async_transfer_manager", None)
         if transceiver is None or transfer_manager is None:
             return None
-        local_inflight = bool(transfer_manager.has_any_inflight_requests())
+        local_inflight = bool(
+            transfer_manager.has_any_inflight_requests()) or (getattr(
+                transceiver, "has_pending_agent_recovery", False) is True)
         tp_size = getattr(self.dist, "tp_size", 1)
         if getattr(self, "enable_attention_dp", False) and tp_size > 1:
             any_inflight = bool(
@@ -11089,15 +11120,25 @@ class PyExecutor:
     def _schedule(self):
         self._maybe_record_hang_diagnostic_phase("scheduling",
                                                  forward_completion="clear")
-        if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
+        if self.kv_cache_manager is not None:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
         cancelled_model_ids = self._cancelled_disagg_model_request_ids()
+        excluded_model_ids = cancelled_model_ids
+        held_failures = self._held_transfer_failures()
+        if held_failures and self.dist.pp_size == 1:
+            held_requests = [req for req, _ in held_failures.values()]
+            excluded_model_ids = cancelled_model_ids | {
+                req.py_request_id
+                for req in held_requests
+            }
+            if self._is_kv_manager_v2:
+                self.scheduler.set_transfer_held_requests(held_requests)
         scheduling_requests = [
             request for request in self.active_requests
-            if request.py_request_id not in cancelled_model_ids
-        ] if cancelled_model_ids else self.active_requests
+            if request.py_request_id not in excluded_model_ids
+        ] if excluded_model_ids else self.active_requests
         if any(request.py_request_id in cancelled_model_ids
                and request.lora_task_id is not None
                for request in self.active_requests) or any(
@@ -11219,6 +11260,7 @@ class PyExecutor:
                     retained_ids.add(req.py_request_id)
                     num_displaced -= 1
             scheduled_requests.paused_in_place_ids = frozenset(retained_ids)
+        scheduled_requests.failed_requests = scheduler_output.failed_requests
 
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)
@@ -11240,6 +11282,100 @@ class PyExecutor:
             failed_request_ids = set(e.request_ids or scheduled_items)
             self._handle_multimodal_encoder_request_error(
                 scheduled_requests, error_msg, failed_request_ids)
+
+    def _has_scheduler_transfer_holds(self) -> bool:
+        return bool(self._held_transfer_failures()
+                    ) or self.disagg.has_local_retiring_gen_receives
+
+    def _reset_scheduler_failure_state(self) -> None:
+        self._pending_scheduler_failures: set[int] = set()
+        self._scheduler_failure_sync_tick = 0
+        self._scheduler_progress_since_vote = False
+        self._scheduler_stall_rounds = 0
+
+    def _fail_scheduler_requests(self,
+                                 scheduled_batch: ScheduledRequests) -> None:
+        """Agree on admission failures before freeing any rank's request state."""
+        if not self._is_kv_manager_v2:
+            return
+        local_ids = {
+            req.py_request_id
+            for req in scheduled_batch.failed_requests
+        }
+        rank_local = self.enable_attention_dp and self.dist.cp_size == 1 and self.dist.pp_size == 1
+        if rank_local or (self.dist.tp_size == self.dist.cp_size ==
+                          self.dist.pp_size == 1):
+            failed_ids = local_ids
+            made_progress = self._scheduler_progress_since_vote
+        else:
+            pending = self._pending_scheduler_failures
+            # Withdraw proposals for every row kind the vote would remove.
+            pending.difference_update(
+                req.py_request_id
+                for rows in (scheduled_batch.encoder_requests,
+                             scheduled_batch.all_requests(),
+                             scheduled_batch.recompute_paused_requests)
+                for req in rows)
+            pending.update(local_ids)
+            self._scheduler_failure_sync_tick += 1
+            scheduled_batch.failed_requests = []
+            # Every participant advances once per scheduling pass, including
+            # empty passes. Phase rebinding resets the counter on every rank.
+            if self._scheduler_failure_sync_tick % 64:
+                return
+            active_ids = {req.py_request_id for req in self.active_requests}
+            vote = (list(pending & active_ids),
+                    self._scheduler_progress_since_vote)
+            if self.enable_attention_dp:
+                # ADP owns distinct requests across TP, but replicas span both
+                # CP and PP. Reduce CP first, then propagate that union over PP.
+                votes = self.dist.cp_allgather(
+                    vote) if self.dist.cp_size > 1 else [vote]
+                vote = ([rid for ids, _ in votes for rid in ids],
+                        any(progress for _, progress in votes))
+                votes = self.dist.pp_allgather(
+                    vote) if self.dist.pp_size > 1 else [vote]
+            elif self.dist.pp_size > 1:
+                votes = self.dist.allgather(vote)
+            elif self.dist.cp_size > 1:
+                votes = self.dist.tp_cp_allgather(vote)
+            else:
+                votes = self.dist.tp_allgather(vote)
+            pending.clear()
+            failed_ids = {rid for ids, _ in votes for rid in ids}
+            made_progress = any(progress for _, progress in votes)
+        self._scheduler_progress_since_vote = False
+        if made_progress:
+            self._scheduler_stall_rounds = 0
+        elif failed_ids:
+            self._scheduler_stall_rounds += 1
+            if self._scheduler_stall_rounds >= 3:
+                # The event-loop rank-crash path contains this systemic stall;
+                # an ADP subgroup must not enter world response collectives.
+                raise RuntimeError(
+                    "KV cache admission made no progress after three failure rounds"
+                )
+        scheduled_batch.failed_requests = []
+        if not failed_ids:
+            return
+        failed = [
+            req for req in self.active_requests
+            if req.py_request_id in failed_ids
+        ]
+
+        def surviving(rows):
+            return [req for req in rows if req.py_request_id not in failed_ids]
+
+        batch = scheduled_batch
+        batch.encoder_requests = surviving(batch.encoder_requests)
+        batch.reset_context_requests(surviving(batch.context_requests))
+        batch.generation_requests = surviving(batch.generation_requests)
+        batch.recompute_paused_requests = surviving(
+            batch.recompute_paused_requests)
+        self._handle_errors(
+            "KV cache admission made no progress within the scheduler limit",
+            requests=failed,
+            charge_budget=False)
 
     def _handle_multimodal_encoder_request_error(
             self, scheduled_requests: ScheduledRequests, error_msg: str,
@@ -12192,7 +12328,7 @@ class PyExecutor:
         if self.enable_spec_decode:
             kv_mgr = self.resource_manager.resource_managers.get(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            if isinstance(kv_mgr, BaseMambaCacheManager):
+            if kv_mgr is not None:
                 kv_mgr.on_state_transfer_complete([
                     req.py_request_id for req in cache_trans_complete_requests
                 ])
@@ -12675,6 +12811,13 @@ class PyExecutor:
 
             self._maybe_record_hang_diagnostic_phase("forward_complete",
                                                      scheduled_requests)
+            # Only executed work can clear a capacity stall. Admission votes
+            # may remove every locally scheduled row before forward runs.
+            if (self._is_kv_manager_v2 and not self.is_warmup
+                    and outputs is not None
+                    and any(not req.is_dummy
+                            for req in scheduled_requests.all_requests())):
+                self._scheduler_progress_since_vote = True
 
             return outputs
         except Exception as e:
@@ -13105,6 +13248,16 @@ class PyExecutor:
                 request for request in failed_requests
                 if self._transfer_owns_request_blocks(request)
             ]
+            # A held context request's pipelined send never gets its last
+            # chunk. Cancel it so the send reaper retires the session once
+            # its writes drain; a session retired here no longer holds it.
+            for request in held_requests:
+                if getattr(request, "is_context_only_request", False) is True:
+                    self.disagg.request_cancellation(request)
+            held_requests = [
+                request for request in held_requests
+                if self._transfer_owns_request_blocks(request)
+            ]
             if held_requests:
                 held_ids = {id(request) for request in held_requests}
                 failed_requests = [
@@ -13113,7 +13266,7 @@ class PyExecutor:
                 ]
                 parked = self._held_transfer_failures()
                 for request in held_requests:
-                    parked[id(request)] = (request, error_msg)
+                    parked.setdefault(id(request), (request, error_msg))
                 logger.warning(
                     f"Deferring failure of {len(held_requests)} request(s) "
                     "whose KV blocks a transfer still owns")
@@ -13132,9 +13285,12 @@ class PyExecutor:
             if (getattr(request, "context_remaining_length", 0) > 0 and getattr(
                     request, "context_current_position", None) == 0):
                 request.py_kv_reuse_poisoned = True
+            # A failure parked earlier is the outcome; a later error does not
+            # replace it.
+            held = self._held_transfer_failures().pop(id(request), None)
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
-                error_msg=error_msg,
+                error_msg=error_msg if held is None else held[1],
                 client_id=request.py_client_id)
         if requests is None:
             parked = self._held_transfer_failures()
@@ -13575,9 +13731,8 @@ class PyExecutor:
                 # request has filled; give it the same finish handshake the
                 # post-batch cancellation path runs before pages are freed.
                 self._start_connector_async_save(request)
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -13656,10 +13811,8 @@ class PyExecutor:
                 continue
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
-            request.decoding_iter = request.py_decoding_iter
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -13796,9 +13949,11 @@ class PyExecutor:
             if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
                     and request.is_generation_only_request
                     and self.kv_cache_transceiver is not None
-                    and getattr(self, "kv_connector_manager", None) is None
-                    and self.kv_cache_transceiver.
-                    supports_idle_request_cancellation(request) is True):
+                    and getattr(self, "kv_connector_manager", None) is None and
+                (self.kv_cache_transceiver.supports_idle_request_cancellation(
+                    request) is True
+                 or getattr(self.kv_cache_transceiver, "_agent_recovery",
+                            False) is True)):
                 # Drop the pending cancel so synchronized error cleanup
                 # can report the committed failure without rewriting it.
                 continue

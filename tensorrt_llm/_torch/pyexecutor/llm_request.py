@@ -388,6 +388,7 @@ class PyResult:
             extra_token_for_overlap_scheduler=False,
             use_chunked_generation_logits=False
         ) if return_context_logits else None
+        self._context_logits_copy_event: torch.cuda.Event | None = None
         self._generation_logits = LogitsStorage(
             seq_length=max_new_tokens,
             use_device_memory=use_device_memory,
@@ -407,6 +408,8 @@ class PyResult:
             name: []
             for name in additional_outputs
         } if additional_outputs else None
+        self._additional_context_output_lengths: dict[str, int] | None = None
+        self._additional_generation_output_lengths: dict[str, int] | None = None
         self._encoder_output: Optional[torch.Tensor] = None
         self.diff = PyResult.Diff()
 
@@ -415,13 +418,21 @@ class PyResult:
 
         Single-sequence streaming logprobs move to the response, preserving
         cumulative totals in fresh request storage. Beam search publishes full
-        histories, so it copies their lists instead of consuming them.
+        histories, so it copies their lists instead of consuming them. Additional
+        outputs share their lists with response-time lengths for reads and IPC.
+
+        Retaining an in-process response keeps the shared additional-output
+        dictionaries and lists alive, including tensors appended after its
+        captured lengths. An early response can therefore retain outputs for
+        the entire stream even after the request is released. Reads and
+        serialized state still include only the captured prefixes.
         """
+        self._wait_for_context_logits_copy()
         result = copy(self)
         if self.context_prompt_logprob_rows is not None:
             result.context_prompt_logprob_rows = self.context_prompt_logprob_rows.copy(
             )
-        result.diff = PyResult.Diff()
+        del result.diff
         if self._log_probs is not None:
             if self._streaming and beam_width <= 1 and self.log_probs:
                 self._log_probs = LogProbStorage()
@@ -447,22 +458,49 @@ class PyResult:
                 result._generation_logits._device_fragments = self._generation_logits._device_fragments.copy(
                 )
         if self._additional_context_outputs is not None:
-            result._additional_context_outputs = {
-                name: outputs.copy()
+            result._additional_context_output_lengths = {
+                name: len(outputs)
                 for name, outputs in self._additional_context_outputs.items()
             }
         if self._additional_generation_outputs is not None:
-            result._additional_generation_outputs = {
-                name: outputs.copy()
+            result._additional_generation_output_lengths = {
+                name: len(outputs)
                 for name, outputs in
                 self._additional_generation_outputs.items()
             }
         return result
 
+    @staticmethod
+    def _bounded_additional_outputs(
+        outputs: dict[str, list[torch.Tensor]] | None,
+        lengths: dict[str, int] | None,
+    ) -> dict[str, list[torch.Tensor]] | None:
+        if outputs is None or lengths is None:
+            return outputs
+        return {
+            name: outputs[name][:length]
+            for name, length in lengths.items()
+        }
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        # Queued responses may be serialized after the request appends more outputs.
+        state.update(
+            _additional_context_outputs=self._bounded_additional_outputs(
+                self._additional_context_outputs,
+                self._additional_context_output_lengths),
+            _additional_generation_outputs=self._bounded_additional_outputs(
+                self._additional_generation_outputs,
+                self._additional_generation_output_lengths),
+            _additional_context_output_lengths=None,
+            _additional_generation_output_lengths=None)
+        return state
+
     def reset_diff(self):
         self.diff = PyResult.Diff()
 
     def get_diff(self) -> Diff:
+        self._wait_for_context_logits_copy()
         if self._context_logits is not None and self._context_logits._storage is not None:
             self.diff.context_logits_on_cpu = self.context_logits_on_cpu
         for i, context_logits in enumerate(self.diff.context_logits_list):
@@ -571,14 +609,36 @@ class PyResult:
     def append_context_logits(self,
                               context_logits: torch.Tensor,
                               *,
-                              reusable: bool = False):
+                              reusable: bool = False,
+                              retain_owned: bool = False) -> None:
+        """Store context logits and record the current chunk for rank updates.
+
+        Args:
+            context_logits: Logits with shape [tokens, vocab] or
+                [tokens, beam_width, vocab].
+            reusable: The source can be overwritten immediately after this
+                call, so a host copy must complete before returning.
+            retain_owned: Keep the stored destination view in the rank diff.
+                A pending host copy completes before context_logits is read or
+                snapshot, get_diff, or drop_context_logits returns.
+        """
         if self._context_logits:
             self._context_logits.append(context_logits, reusable=reusable)
-            if reusable:
-                # Retain the owned destination view, never the next chunk's scratch.
-                begin, end = self._context_logits._logits_indices[-1]
-                context_logits = self._context_logits._storage[begin:end, 0]
+            if reusable or retain_owned:
+                stored = self._context_logits.get(all_logits=False,
+                                                  exclude_last=False)
+                assert stored is not None
+                if not reusable and context_logits.is_cuda and not stored.is_cuda:
+                    # Later chunks on the same stream finish after earlier copies.
+                    self._context_logits_copy_event = torch.cuda.Event()
+                    self._context_logits_copy_event.record()
+                context_logits = stored[:, 0]
             self.diff.context_logits_list.append(context_logits)
+
+    def _wait_for_context_logits_copy(self) -> None:
+        if self._context_logits_copy_event is not None:
+            self._context_logits_copy_event.synchronize()
+            self._context_logits_copy_event = None
 
     def append_generation_logits(self, generation_logits: torch.Tensor):
         if self._generation_logits:
@@ -649,6 +709,7 @@ class PyResult:
 
     def drop_context_logits(self) -> None:
         """Drop the stored context logits; no response will deliver them."""
+        self._wait_for_context_logits_copy()
         self._context_logits = None
         self.diff.context_logits_list = []
 
@@ -695,6 +756,7 @@ class PyResult:
         if self._context_logits is None or (storage := self._context_logits.get(
                 all_logits=True, exclude_last=False)) is None:
             return None
+        self._wait_for_context_logits_copy()
         return storage[:, 0]  # remove beam_width axis for context
 
     @property
@@ -763,27 +825,27 @@ class PyResult:
 
     @property
     def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
-        if self._additional_context_outputs is None:
+        outputs = self._bounded_additional_outputs(
+            self._additional_context_outputs,
+            self._additional_context_output_lengths)
+        if outputs is None:
             return None
-        outputs = {}
-        for name, output_list in self._additional_context_outputs.items():
-            if len(output_list) == 0:
-                continue
-            outputs[name] = torch.cat(
-                output_list, dim=0) if len(output_list) > 1 else output_list[0]
-        return outputs
+        return {
+            name: torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            for name, chunks in outputs.items() if chunks
+        }
 
     @property
     def additional_generation_outputs(self) -> Dict[str, torch.Tensor] | None:
-        if self._additional_generation_outputs is None:
+        outputs = self._bounded_additional_outputs(
+            self._additional_generation_outputs,
+            self._additional_generation_output_lengths)
+        if outputs is None:
             return None
-        outputs = {}
-        for name, output_list in self._additional_generation_outputs.items():
-            if len(output_list) == 0:
-                continue
-            outputs[name] = torch.cat(
-                output_list, dim=0) if len(output_list) > 1 else output_list[0]
-        return outputs
+        return {
+            name: torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            for name, chunks in outputs.items() if chunks
+        }
 
     @property
     def encoder_output(self) -> torch.Tensor | None:
@@ -1490,6 +1552,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
             locality_domain_id=self.py_locality_domain_id,
+            _validation_error=self._validation_error,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size

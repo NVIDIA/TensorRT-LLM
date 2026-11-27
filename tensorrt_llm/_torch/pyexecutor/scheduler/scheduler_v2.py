@@ -434,6 +434,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Generation requests paused in place (GEN slot preemption).
         self._gen_paused_ids: frozenset[int] = frozenset()
+        self._transfer_held_requests: RequestList = []
         self._gen_resumed_ids: frozenset[int] = frozenset()
         self._gen_preemption_enabled = False
 
@@ -614,12 +615,14 @@ class KVCacheV2Scheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        held_requests, self._transfer_held_requests = self._transfer_held_requests, []
         self._sched_iter += 1
         self.periodic_snapshot_extra_budget = 0
         self._reuse_probes.clear()
         # A level that failed since the last pass (e.g. in an eviction WRITE during prepare_resources) has already
         # dropped pages from this rank's reuse tree only.
         self._raise_if_lockstep_remote_level_failed()
+        self._failed_requests: RequestList = []
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
         (
@@ -630,7 +633,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused,
             disagg_candidates,
             has_chunking,
-        ) = self._schedule_loop(active_requests, inflight_request_ids)
+        ) = self._schedule_loop(
+            active_requests, inflight_request_ids, transfer_held_requests=held_requests
+        )
         # One that failed in this pass, e.g. in an eviction WRITE that the C++ retried past it, before the batch runs.
         self._raise_if_lockstep_remote_level_failed()
 
@@ -644,6 +649,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             generation_requests=scheduled_gen,
             paused_requests=evicted,
             recompute_paused_requests=recompute_paused,
+            failed_requests=self._failed_requests,
             fitting_disagg_gen_init_requests=disagg_candidates,
             num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
         )
@@ -662,6 +668,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.remote_tail_phase = phase
         self._remote_tail_context_ids = context_request_ids
         self._remote_tail_generation_ids = generation_request_ids
+
+    def set_transfer_held_requests(self, requests: RequestList) -> None:
+        self._transfer_held_requests = requests
 
     def set_gen_paused_ids(
         self, request_ids: frozenset[int], resumed_ids: frozenset[int] = frozenset()
@@ -714,6 +723,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         inflight_request_ids,
         *,
         defer_remote_tail_context=False,
+        transfer_held_requests=(),
         prefix_waits=None,
     ):
         scheduled_ctx: RequestList = []
@@ -797,12 +807,24 @@ class KVCacheV2Scheduler(RequestScheduler):
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
         if self.peft_cache_manager is not None:
+            # Transfer-held requests still pin resident adapters but cannot contribute prefixes.
+            for req in transfer_held_requests:
+                if req.lora_task_id is not None and self.peft_cache_manager.is_task_cached_device(
+                    req.lora_task_id
+                ):
+                    budget.pre_claim_peft(req)
             for req in active_requests:
                 if req.state_value == self._gen_to_complete_state_value or (
                     self._gen_preemption_enabled
                     and req.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
                 ):
                     # Paused and displaced decode requests still hold their adapters.
+                    budget.pre_claim_peft(req)
+                elif (
+                    req.request_id in inflight_request_ids
+                    and req.lora_task_id is not None
+                    and self.peft_cache_manager.is_task_cached_device(req.lora_task_id)
+                ):
                     budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
@@ -1285,7 +1307,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._detect_deadlock(
             requests_list,
             inflight_request_ids,
-            pending_ctx,
+            pending_ctx + starved_ctx,
             preempted_ids,
             made_progress=made_progress,
         )
@@ -2927,8 +2949,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         preempted_ids: set[int],
         made_progress: bool,
     ) -> None:
-        """Fail loudly when no request can be scheduled or reclaimed.
+        """Record a stalled request in `_failed_requests` for request-scoped executor cleanup.
 
+        After `_DEADLOCK_STALL_ITERS` passes in a row that schedule nothing while
+        a candidate waits, the newest candidate that holds pages (or the newest
+        candidate, if none does) is failed and the count starts over.
         Unchecked, the executor spins at full speed while scheduling nothing,
         which looks healthy to the hang detector and to `/health`. Context
         candidates count alongside generation ones because a disaggregated
@@ -3008,7 +3033,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         self._stalled_schedules += 1
         if self._stalled_schedules < self._DEADLOCK_STALL_ITERS:
-            # Warn as the stall builds so the raise is not a surprise. A quarter
+            # Warn as the stall builds so the failed request is not a surprise. A quarter
             # of the threshold keeps this to a handful of lines beforehand.
             if self._stalled_schedules == 1:
                 logger.debug(
@@ -3058,20 +3083,42 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "Configure kv_cache_config.host_cache_size, increase "
                 "kv_cache_config.max_tokens, or lower max_batch_size."
             )
-        # Logged before the raise so the diagnostic survives even if the
-        # exception is caught or truncated upstream.
+        # Keep the capacity diagnostic separate from request error responses.
         logger.warning(
-            f"[V2Scheduler] Declaring deadlock after {self._stalled_schedules} passes: "
+            f"[V2Scheduler] Failing stalled admissions after {self._stalled_schedules} passes: "
             f"{self._summarize_stall(active_requests, pending_ctx, inflight_request_ids, preempted_ids)} "
             f"{remedy}"
         )
-        raise RuntimeError(
-            f"V2 scheduler deadlock: {num_gen_candidates} generation and "
-            f"{num_ctx_candidates} context request(s) active but none could "
-            f"be scheduled, suspended or preempted in "
-            f"{self._stalled_schedules} consecutive attempts. The KV cache "
-            f"pool is likely exhausted. {remedy}"
-        )
+        candidates = [
+            req
+            for req in active_requests
+            if req.is_generation_in_progress_state
+            and not req.is_generation_to_complete_state
+            and req.request_id not in inflight_request_ids
+            and not self._has_pending_connector_load(req)
+        ]
+        failed_ids = {req.py_request_id for req in candidates}
+        for req in pending_ctx:
+            if (
+                req.py_request_id not in failed_ids
+                and req.py_request_id not in preempted_ids
+                and req.request_id not in inflight_request_ids
+            ):
+                candidates.append(req)
+                failed_ids.add(req.py_request_id)
+        # Match preemption's newest-first ordering. Prefer a page holder so
+        # freeing one request can admit the older work instead of rejecting
+        # every arrival while a starved partial prefill keeps the pool pinned.
+        holders = {
+            req.py_request_id
+            for req in candidates
+            if req.is_generation_in_progress_state or req.context_current_position > 0
+        }
+        ordered = [
+            req for req in reversed(active_requests) if req.py_request_id in (holders or failed_ids)
+        ]
+        self._failed_requests = ordered[:1]
+        self._stalled_schedules = 0
 
     def _summarize_stall(
         self,

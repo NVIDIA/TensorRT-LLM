@@ -54,7 +54,8 @@ from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
-from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
+                                            _validate_media_io_kwargs)
 from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
@@ -78,6 +79,8 @@ from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
+from tensorrt_llm.serve._visual_gen_errors import \
+    render_visual_gen_validation_error
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
     convert_anthropic_count_tokens_request, convert_anthropic_request,
@@ -140,8 +143,9 @@ from tensorrt_llm.serve.postprocess_handlers import (
 from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        UnsupportedRenderError,
                                        mount_render_endpoints,
-                                       prepare_chat_request, render_chat,
-                                       render_chat_for_length,
+                                       prepare_chat_request,
+                                       prompt_tokens_excluded_from_usage,
+                                       render_chat, render_chat_for_length,
                                        render_conversation_with_media)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
@@ -702,6 +706,7 @@ class OpenAIServer(_VideoRoutesMixin):
         ip = getattr(self.generator, "input_processor", None)
         if isinstance(ip, BaseMultimodalInputProcessor):
             model_pref = ip.get_preferred_media_io_kwargs() or {}
+            _validate_media_io_kwargs(model_pref)
             if model_pref:
                 cfg = self.multimodal_server_config or MultimodalServerConfig()
                 merged = {m: dict(kw) for m, kw in model_pref.items()}
@@ -946,7 +951,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 return anthropic_error_response(str(exc),
                                                 "invalid_request_error", 400)
             if self.server_role is ServerRole.VISUAL_GEN:
-                return self._create_visual_gen_validation_error_response(exc)
+                return render_visual_gen_validation_error(
+                    exc, self.create_error_response)
             # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
             # response shape that integration tests (e.g.
             # ``test_malformed_json_request``) and existing clients
@@ -1241,36 +1247,6 @@ class OpenAIServer(_VideoRoutesMixin):
             err_type="NotImplementedError",
             message=message,
             status_code=HTTPStatus.NOT_IMPLEMENTED,
-        )
-
-    def _create_visual_gen_validation_error_response(
-            self, exc: RequestValidationError) -> Response:
-        """Render a ``RequestValidationError`` as the visual-gen 422 envelope.
-
-        The body has the LLM-style ``{message, type, code}`` shape with
-        HTTP 422. The ``message`` field names the offending field(s) for
-        each error in ``exc.errors()`` so clients can fix the request
-        without parsing the full Pydantic payload.
-        """
-        parts: List[str] = []
-        for err in exc.errors():
-            loc = ".".join(
-                str(seg) for seg in err.get("loc", ()) if seg != "body")
-            etype = err.get("type", "")
-            msg = err.get("msg", "")
-            if etype == "extra_forbidden":
-                parts.append(
-                    f"Unknown request field {loc!r}. Pass model-specific "
-                    "parameters via 'extra_params' instead.")
-            elif loc:
-                parts.append(f"{loc}: {msg}")
-            else:
-                parts.append(msg)
-        message = "; ".join(parts) if parts else str(exc)
-        return self.create_error_response(
-            message=message,
-            err_type="BadRequestError",
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
         )
 
     def _check_health(self) -> bool:
@@ -2534,14 +2510,9 @@ class OpenAIServer(_VideoRoutesMixin):
             self._apply_spec_decode_stats_opt_in(postproc_args)
             # Some models' prompt-token accounting excludes trailing rendered
             # tokens (kimi_k3: the generation channel opener); the model still
-            # sees the full prompt.
+            # sees the full prompt. count_tokens leaves out the same tokens.
             postproc_args.num_prompt_tokens_offset = (
-                render_resources.prompt_tokens_excluded_from_usage(
-                    add_generation_prompt=request.add_generation_prompt,
-                    pre_tokenized=request.prompt_token_ids is not None
-                    or request.prompt_token_ids_b64 is not None,
-                    request_chat_template=request.chat_template,
-                ))
+                prompt_tokens_excluded_from_usage(request, render_resources))
             if dynamic_tool_params:
                 # The tool parser must see dynamic tools to recognize their
                 # calls in the model output.
@@ -2603,7 +2574,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Render (and append the forced named-tool prefix, see
                 # ``_build_forced_tool_call_decoding``) while the media loads,
                 # or once it has loaded for a renderer that needs it.
-                # Tokenization stays with the engine's input processor.
+                # Tokenization stays with the engine's input processor, except
+                # that a tokenizer-native renderer's own ids are taken: it
+                # keeps control-token strings in message content as text, and
+                # encoding its rendered string would not. Only for text-only
+                # prompts, since the input processor expands media placeholders
+                # in the text.
                 rendered, (
                     mm_data,
                     mm_embeddings) = await render_conversation_with_media(
@@ -2619,6 +2595,9 @@ class OpenAIServer(_VideoRoutesMixin):
                         injected_chat_template_kwargs=request.
                         injected_chat_template_kwargs,
                         forced_prefix=forced_tool_begin_prefix,
+                        prefer_native_ids=not any(
+                            message.get("media") for message in conversation),
+                        add_special_tokens=request.add_special_tokens,
                         truncate_prompt_tokens=request.truncate_prompt_tokens,
                     )
                 if rendered.text is None:
@@ -2896,7 +2875,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     # Media, an own-processor model or an unconvertible Harmony
                     # request: count the text, tools and template without the media.
                     rendered = render_chat_for_length(chat_request, resources)
-                return len(rendered.token_ids)
+                # Reported like the chat route's prompt usage, which leaves out
+                # the rendered tokens the model extension excludes from it.
+                excluded = prompt_tokens_excluded_from_usage(
+                    chat_request, resources)
+                return max(0, len(rendered.token_ids) - excluded)
 
             input_tokens = await asyncio.to_thread(_count)
         except Exception:
@@ -3714,6 +3697,19 @@ class OpenAIServer(_VideoRoutesMixin):
             for initial_response in initial_responses:
                 yield initial_response
 
+            # The promise yields itself as each result, so a promise that is
+            # already finished is its own first and last result and the
+            # stream ends with that result's terminal event.
+            first_response = await anext(promise, promise)
+            raw_request.state.server_first_token_time = (
+                self._adjusted_steady_clock.now())
+            pp_results = first_response.outputs[
+                0]._postprocess_result if self.postproc_worker_enabled else post_processor(
+                    first_response, args)
+            for pp_res in pp_results:
+                yield pp_res
+            # The loop below binds nothing when there is only one result.
+            res = first_response
             async for res in promise:
                 pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
@@ -4539,7 +4535,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 output = self.generator.generate(inputs=request.prompt,
                                                  params=params)
             except ValidationError as exc:
-                return self._render_pydantic_validation_error(exc)
+                return render_visual_gen_validation_error(
+                    exc, self.create_error_response)
             except ValueError as exc:
                 logger.error(f"Image edit request error: {exc}")
                 return self.create_error_response(
@@ -4601,7 +4598,8 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=response.model_dump(), headers=headers)
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(
+                exc, self.create_error_response)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(

@@ -955,6 +955,10 @@ TYPED_TEST(GemmAllReduceFixture, RunnerTest)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    if (::testing::GTEST_FLAG(list_tests))
+    {
+        return RUN_ALL_TESTS();
+    }
 
     bool notSupported = false;
     // CUDA 12 minimum required

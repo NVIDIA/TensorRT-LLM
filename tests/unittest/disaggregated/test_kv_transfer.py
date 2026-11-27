@@ -2325,13 +2325,13 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
         _unique_rid=1,
         slice_id=0,
     )
-    req_info = SimpleNamespace(
+    req_info = transfer_mod.RecvReqInfo(
+        sender_req_id=task._unique_rid,
         instance_name="gen",
         instance_rank=cp_rank,
-        block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
-        dst_start_token=None,
+        block_ids_per_layer_groups=[np.asarray(dst_table, dtype=np.int64)],
+        unique_rid=task._unique_rid,
         slice_id=0,
-        kv_result_report_token=b"",
     )
     meta = transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info
@@ -2421,13 +2421,13 @@ def _helix_ring_write_meta(
         _unique_rid=1,
         slice_id=0,
     )
-    req_info = SimpleNamespace(
+    req_info = transfer_mod.RecvReqInfo(
+        sender_req_id=task._unique_rid,
         instance_name="gen",
         instance_rank=cp_rank,
-        block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
-        dst_start_token=None,
+        block_ids_per_layer_groups=[np.asarray(dst_table, dtype=np.int64)],
+        unique_rid=task._unique_rid,
         slice_id=0,
-        kv_result_report_token=b"",
     )
     return transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info

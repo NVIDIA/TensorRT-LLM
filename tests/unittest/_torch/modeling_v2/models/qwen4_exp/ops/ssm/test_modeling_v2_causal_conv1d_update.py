@@ -105,7 +105,7 @@ _TP2 = dict(dim=5120, x_row_stride=8240, pool_slots=7768, pool_layers=GDN_PAGE_L
 
 #: The shapes each target calls this entry with beyond its own cells, by target directory.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default": (
         Cell(
             why="fp8 tp2/tep2 decode, 1 row at 5120 / stride 8240: the top addressable slot",
             spec=dict(_TP2, batch=1, slots=_spread(1, 7768)),

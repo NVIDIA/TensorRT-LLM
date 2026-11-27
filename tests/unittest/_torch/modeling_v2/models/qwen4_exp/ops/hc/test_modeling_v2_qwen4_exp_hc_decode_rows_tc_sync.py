@@ -28,7 +28,7 @@ _QWEN4_EXP = Path(tensorrt_llm.__file__).parent.joinpath(
 _FAMILY = _QWEN4_EXP / "ops" / "hc" / "qwen4_exp_hc_decode_rows_tc.py"
 _FP8_TARGET = (
     _QWEN4_EXP
-    / "qwen3_8_flash_next_fp8__sm_103__unified"
+    / "qwen3_8_flash_next_fp8__sm_10x__default"
     / "ops"
     / "hc"
     / "qwen4_exp_hc_decode_rows_tc__decode.py"

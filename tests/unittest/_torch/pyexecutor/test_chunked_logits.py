@@ -147,6 +147,71 @@ class TestPyResult:
         torch.testing.assert_close(diff.encoder_output, encoder_output.cpu())
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("consumer", ["property", "diff", "snapshot", "drop"])
+def test_pending_context_logits_host_copy(monkeypatch, consumer):
+
+    class DeviceRows(torch.Tensor):
+
+        @property
+        def is_cuda(self):
+            return True
+
+    pending = []
+    original_copy = torch.Tensor.copy_
+
+    def defer_copy(destination, source, *, non_blocking):
+        assert isinstance(source, DeviceRows)
+        assert non_blocking
+        pending.append((destination, source.as_subclass(torch.Tensor)))
+
+    class CopyEvent:
+        recorded = False
+
+        def record(self):
+            assert len(pending) == 1
+            self.recorded = True
+
+        def synchronize(self):
+            assert self.recorded
+            destination, source = pending.pop()
+            original_copy(destination, source)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", defer_copy)
+    monkeypatch.setattr(torch.cuda, "Event", CopyEvent)
+    expected = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    result = PyResult(prompt_len=2,
+                      max_new_tokens=1,
+                      use_device_memory=False,
+                      return_context_logits=True)
+    result.append_context_logits(expected.as_subclass(DeviceRows),
+                                 retain_owned=True)
+    assert len(pending) == 1
+    assert result._context_logits_copy_event is not None
+    owned, = result.diff.context_logits_list
+    assert owned.data_ptr() != expected.data_ptr()
+
+    if consumer == "property":
+        actual = result.context_logits
+    elif consumer == "diff":
+        actual, = result.get_diff().context_logits_list
+    elif consumer == "snapshot":
+        snapshot = result.snapshot(beam_width=1)
+        assert snapshot._context_logits_copy_event is None
+        actual = snapshot.context_logits
+    else:
+        result.drop_context_logits()
+        assert result.context_logits is None
+        assert not result.diff.context_logits_list
+        actual = None
+
+    assert not pending
+    assert result._context_logits_copy_event is None
+    if consumer != "drop":
+        torch.testing.assert_close(actual, expected)
+        assert actual.data_ptr() == owned.data_ptr()
+
+
 class TestGetLatestLogitsUnexcluded:
     """Tests for PyResult.get_latest_logits_unexcluded"""
 

@@ -14,6 +14,28 @@
 # limitations under the License.
 
 # A workflow to trigger ci on hybrid infra (github + self hosted runner)
+#
+# IMPORTANT: this file must match the Blossom template. On every /bot command the Blossom
+# runner compares the parsed YAML of this file with the template. If they differ, the command
+# is rejected with "Workflow file integrity check failed".
+#
+# You can change:
+#   - the `if` of the Authorization job (command prefixes and the user list)
+#   - the version of an action in `uses:`, for example actions/checkout@v6. The action itself
+#     must stay the same.
+#   - comments
+#
+# You cannot change anything else. For example, do not:
+#   - add a job or a step
+#   - add a key such as `permissions`, `concurrency`, `env` or `needs`
+#   - change `on:`, `runs-on`, `needs`, a step name, or the `run`, `env` and `with` of a step
+#
+# A change cannot be tested in a pull request, because this workflow always runs from the
+# default branch.
+#
+# Before you change this file, read the code that does the comparison (`compareYaml` and
+# `checkWorkflowFile`) and make sure your change is allowed: http://nv/blossom-ci-yml-check
+# (NVIDIA internal link). The rules above come from that code and may be out of date.
 name: Blossom-CI
 on:
   issue_comment:
@@ -42,7 +64,6 @@ jobs:
         startsWith(github.event.comment.body, '/bot kill')) && contains(
         fromJson('[
         "2ez4bz",
-        "a-mccarthy",
         "aalanwyr",
         "abc99lr",
         "achartier",
@@ -62,7 +83,6 @@ jobs:
         "arysef",
         "asfiyab-nvidia",
         "aswinvisva",
-        "athena-nv",
         "atrifex",
         "Autumn1998",
         "baize97",
@@ -71,14 +91,12 @@ jobs:
         "bashimao",
         "BatshevaBlack",
         "belgarten-nv",
-        "benzh-2025",
         "BestJuly",
         "binghanc",
         "biswapanda",
         "bmarimuthu-nv",
         "bo-nv",
         "bobboli",
-        "Boreas618",
         "BowenFu",
         "BoyueZ",
         "brb-nv",
@@ -96,7 +114,6 @@ jobs:
         "chuangz0",
         "chzblych",
         "cjluo-nv",
-        "connorcarpenter15",
         "ConstBob",
         "crazydemo",
         "daichu-nv",
@@ -107,7 +124,6 @@ jobs:
         "dbari",
         "dc3671",
         "dcampora",
-        "dcaox",
         "dhansen-nvidia",
         "Dido0o0",
         "djns99",
@@ -137,7 +153,6 @@ jobs:
         "Fridah-nv",
         "fsaady",
         "funatiq",
-        "fzmu727",
         "galagam",
         "galletas1712",
         "GalSha",
@@ -147,7 +162,6 @@ jobs:
         "guangyunh-nv",
         "GuanhuaWang2001",
         "GuanLuo",
-        "guqiqi",
         "h-guo18",
         "HandongLi-01",
         "hanjingtian",
@@ -169,9 +183,7 @@ jobs:
         "ishovkun",
         "itamar-rauch",
         "ixlmar",
-        "IzzyPutterman",
         "Jackch-NV",
-        "JacobHu-NV",
         "JadoTu",
         "jaedeok-nvidia",
         "janbernloehr",
@@ -187,14 +199,12 @@ jobs:
         "Jie-Fang",
         "jiefangz-nv",
         "jieli-matrix",
-        "jingyu-ml",
         "JintaoPengCS",
         "jinyangyuan-nvidia",
         "jinzh-nvidia",
         "jloftin-nv",
         "jmydurant",
         "johncalesp",
-        "jonghyunchoe",
         "joyang-nv",
         "jthomson04",
         "juney-nvidia",
@@ -202,14 +212,11 @@ jobs:
         "jupiterepoch",
         "JyChang012",
         "kaiyux",
-        "Kambili",
         "kanghui0204",
         "karljang",
-        "karthikvetrivel",
         "katec846",
         "Kefeng-Duan",
         "KingsleyLiu-NV",
-        "KleinBlueC",
         "kris1025",
         "KrishnanPrash",
         "krishung5",
@@ -237,7 +244,6 @@ jobs:
         "longlee0622",
         "lori-ren",
         "lowsfer",
-        "lucaslie",
         "lucifer1004",
         "luyiyun1021",
         "lyxxn0414",
@@ -251,7 +257,6 @@ jobs:
         "mikeiovine",
         "milesial",
         "MinaHuai",
-        "ming-wei",
         "mingyangHao",
         "mk-nvidia",
         "mlefeb01",
@@ -268,7 +273,6 @@ jobs:
         "nv-guomingz",
         "nv-lschneider",
         "nv-xtf",
-        "nv-yilinf",
         "nv-yna",
         "nvamyt",
         "nvbrantz",
@@ -283,7 +287,6 @@ jobs:
         "nvyocox",
         "nvzhihanj",
         "nvzhou",
-        "nzmora-nvidia",
         "o-stoner",
         "omera-nv",
         "pamelap-nvidia",
@@ -295,7 +298,6 @@ jobs:
         "peihu-nv",
         "pengbowang-nv",
         "PerkzZheng",
-        "poweiw",
         "pranav-nvidia",
         "pst2154",
         "qiangxu1996",
@@ -303,12 +305,10 @@ jobs:
         "QiJune",
         "qixiang-99",
         "qsang-nv",
-        "raayandhar",
         "rabiel",
         "rahul-steiger-nv",
         "rakib-hasan",
         "RayenTian",
-        "raymochen",
         "reasonsolo",
         "richardc-nv",
         "richardhuo-nv",
@@ -337,7 +337,6 @@ jobs:
         "shuyixiong",
         "shyeh25",
         "SimengLiu-nv",
-        "siyidNV",
         "skasetty-Siri",
         "sklevtsov-nvidia",
         "StanleySun639",
@@ -345,7 +344,6 @@ jobs:
         "StudyingShao",
         "sugunav14",
         "sunnyqgg",
-        "Superjomn",
         "suyoggupta",
         "sychen52",
         "symphonylyh",
@@ -360,12 +358,9 @@ jobs:
         "tedzhouhk",
         "tfogal",
         "thorjohnsen",
-        "tianyuxbear",
         "tianyuz-nv",
         "tiffany940107",
-        "tijyojwad",
         "timlee0212",
-        "timothygao8710",
         "tingyangk",
         "Tom-Zheng",
         "tomeras91",
@@ -395,7 +390,6 @@ jobs:
         "Wong4j",
         "wu6u3tw",
         "wyw1267",
-        "xavier-nvidia",
         "xd-nv",
         "xguannv",
         "xiaoweiw-nv",
@@ -426,12 +420,9 @@ jobs:
         "ynpandey-nv",
         "yongzhiz",
         "yt0428",
-        "yuanjings-nvda",
         "yuanjingx87",
-        "yuantailing",
         "Yuening-wa",
         "yufeiwu-nv",
-        "yuhengxnv",
         "yuhsuan-t",
         "yuki-666",
         "yumin066",
@@ -451,7 +442,6 @@ jobs:
         "zhenhuaw-me",
         "zheyuf",
         "zhhuang-nv",
-        "zhou-yuxin",
         "zhuolingwang",
         "zhuoyao1012",
         "zihaok",
@@ -478,6 +468,7 @@ jobs:
           repository: ${{ fromJson(needs.Authorization.outputs.args).repo }}
           ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}
           lfs: 'true'
+          persist-credentials: false
 
       - name: Run blossom action
         uses: NVIDIA/blossom-action@main

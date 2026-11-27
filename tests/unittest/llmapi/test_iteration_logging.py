@@ -39,6 +39,7 @@ async def _produce(address: str, count: int, request_seen: bool = True) -> None:
     manager = asynchronous.LlmManager.__new__(asynchronous.LlmManager)
     manager.llm = _Stats(count)
     manager._stop = asyncio.Event()
+    manager._worker_wakeup = asyncio.Event()
     manager.request_seen = asyncio.Event()
     if request_seen:
         manager.request_seen.set()
