@@ -18,9 +18,9 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
-from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
-                                            MultimodalParams,
-                                            split_multimodal_embedding_items)
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalParams, split_multimodal_embedding_items)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
@@ -202,7 +202,21 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     def _postprocess(
         self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,
                                                           List[torch.Tensor]]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        """Expand image placeholders and flatten the attached features.
+
+        Args:
+            input_ids: Prompt token IDs with one placeholder per image.
+            mm_features: A list with one `[rows, hidden]` or
+                `[frames, rows, hidden]` tensor per placeholder, or one tensor
+                split into equal parts along its first dimension, one per
+                placeholder. A single placeholder takes one
+                `[frames, rows, hidden]` tensor.
+
+        Returns:
+            The expanded input IDs, the features as `[total_rows, hidden]`,
+            and each image's row count in prompt order.
+        """
         # Define model specific variables here before shared logic
         mm_tokens = torch.tensor([self.config.image_token_index
                                   ]).to(input_ids.device)
@@ -284,7 +298,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         # [num_frames, feature_length, hidden_dim] -> [num_frames * feature_length, hidden_dim]
         mm_features = mm_features.view(-1, mm_features.shape[-1])
-        return fused_input_ids, mm_features
+        return fused_input_ids, mm_features, mm_lengths_per_split
 
     def build_disagg_prefill_multimodal_inputs(
         self,
@@ -407,9 +421,17 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             # image_grid_thw, which LLaVA-NeXT does not use. A bare tensor is
             # left as is: _postprocess splits it across the images.
             mm_features, _ = split_multimodal_embedding_items(mm_features)
-        fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
-        multimodal_data = {}
-        multimodal_data["multimodal_embedding"] = mm_features
+        fused_input_ids, mm_features, mm_lengths = self._postprocess(
+            input_ids, mm_features)
+        multimodal_data = {
+            "multimodal_embedding":
+            mm_features,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+            MultimodalItemMetadata(
+                [("image", i) for i in range(len(mm_lengths))],
+                output_embedding_lengths=mm_lengths,
+            ),
+        }
         return fused_input_ids.to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data
         }

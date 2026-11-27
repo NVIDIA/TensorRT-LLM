@@ -640,6 +640,7 @@ class ShortcutDecoder(DecoderModel):
 
 
 class ShortcutForCausalLM(DecoderModelForCausalLM):
+    EPLB_MODES = frozenset({"static", "online"})
     resets_recurrent_state_in_context = True
 
     @classmethod

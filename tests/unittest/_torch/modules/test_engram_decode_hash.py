@@ -605,5 +605,5 @@ def test_engram_decode_padded_batches_take_the_fused_path(
             rtol=0,
         )
     # The fused refresh runs up to its row limit, the one-launch scatter beyond it.
-    fused = refresh if num_tokens <= engram_module._DECODE_REFRESH_MAX_ROWS else scatter
+    fused = refresh if num_tokens <= engram_module.DECODE_REFRESH_MAX_ROWS else scatter
     assert fused.call_count >= 4, (refresh.call_count, scatter.call_count)

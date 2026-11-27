@@ -184,14 +184,9 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return frozenset(("image",))
 
     def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
-        options = {"image": {"format": "pil"}}
-        if "video" in self.supported_modalities:
-            options["video"] = {
-                "format": "np",
-                "num_frames": _MAX_VIDEO_FRAMES,
-                "fps": _DEFAULT_VIDEO_FPS,
-            }
-        return options
+        if "video" not in self.supported_modalities:
+            return {}
+        return {"video": {"num_frames": _MAX_VIDEO_FRAMES, "fps": _DEFAULT_VIDEO_FPS}}
 
     @cached_property
     def _video_prompt_processor(self):

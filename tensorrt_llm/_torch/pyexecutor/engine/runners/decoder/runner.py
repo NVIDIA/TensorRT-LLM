@@ -340,6 +340,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs.attach_cuda_graph_runners(
             self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
         )
+        self._metadata.keep_steady_growth_blocks = self._inputs.steady_decode_prepare_enabled
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -721,14 +722,17 @@ class DecoderRunner(ScheduledModelRunner):
                     host,
                     torch.cuda.current_stream().record_event(),
                 )
-        context_plan = (
+        output_plan = (
             ContextLogitsPlan.for_batch(
                 self._context_logits_heads,
                 semantic_requests,
                 is_spec_decode=self._config.is_spec_decode or enable_spec_decode,
             )
-            if gather_context_logits
+            if gather_context_logits and self._mapping.is_last_pp_rank()
             else None
+        )
+        context_plan = (
+            output_plan if output_plan is not None and output_plan.project_in_forward else None
         )
         scheduled_requests = self._graphs.attention_dp_execution_batch(
             scheduled_requests, runtime_draft_len
@@ -976,6 +980,7 @@ class DecoderRunner(ScheduledModelRunner):
                     enable_spec_decode=enable_spec_decode,
                     gather_context_logits=gather_context_logits,
                     static_inputs_staged=prepared.static_inputs_staged,
+                    pre_replay_staged=prepared.pre_replay_staged,
                     position_id_offsets=(
                         self._buffers.previous_pos_id_offsets_cuda
                         if enable_spec_decode
@@ -999,6 +1004,16 @@ class DecoderRunner(ScheduledModelRunner):
 
             if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:
                 outputs = self._logits_for_greedy_tokens(semantic_requests, outputs)
+            if output_plan is not None and output_plan.replay_rows and not output_plan.handled:
+                # A custom LM head can return all physical rows. Normalize them
+                # before post-processors, HandleLogits and sampling share the result.
+                logits = outputs.get("logits") if isinstance(outputs, dict) else None
+                if isinstance(logits, torch.Tensor) and not logits.is_nested and logits.ndim == 2:
+                    outputs = {
+                        **outputs,
+                        "logits": output_plan.store_full_logits(logits),
+                        "context_logits_handled": True,
+                    }
             self._execute_logit_post_processors(
                 semantic_requests, outputs, pending_beam_histories, pending_single_tokens
             )
@@ -1420,6 +1435,11 @@ class DecoderRunner(ScheduledModelRunner):
     @_dspark_device_budget.setter
     def _dspark_device_budget(self, value) -> None:
         self._inputs._dspark_device_budget = value
+
+    @property
+    def steady_mtp_reads_output_rows(self) -> bool:
+        """Whether steady MTP graph prepare can read the previous step's output rows."""
+        return self._graphs.enabled and self._inputs.steady_decode_prepare_enabled
 
     @property
     def previous_request_ids(self):

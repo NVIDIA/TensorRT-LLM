@@ -31,7 +31,12 @@ BLOCK = 128
 @pytest.fixture(autouse=True)
 def _strict_precompile_workers(monkeypatch):
     """A precompile worker failure is an error here, not a logged fallback."""
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import _workspace_size
+
     monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
+    _workspace_size.cache_clear()
+    yield
+    _workspace_size.cache_clear()
 
 
 pytestmark = pytest.mark.skipif(
@@ -171,11 +176,10 @@ def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
             planned.append((device, rows, heads, kwargs, self.workspace_buffer))
 
     def fake_resolve(device, rows, heads, **kwargs):
-        # The wrapper's resolver returns the workspace byte extent fifth.
-        return (device, None, None, {}, 1024 * (1 + kwargs["max_extra_topk"] // 256), None, None)
+        return 1024 * (1 + kwargs["max_extra_topk"] // 256)
 
     monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
-    monkeypatch.setattr(mla_decode, "_resolve_sparse_mla_plan", fake_resolve)
+    monkeypatch.setattr(mla_decode, "get_prims_ts_sparse_mla_decode_workspace_size", fake_resolve)
 
     class _Attn:  # weak-referenceable stand-in for TrtllmAttention
         num_heads = 16
@@ -279,7 +283,7 @@ def test_plan_keeps_the_hole_checking_path(monkeypatch, offload, heuristic_topk)
 
     monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
     monkeypatch.setattr(
-        mla_decode, "_resolve_sparse_mla_plan", lambda *a, **k: (None,) * 4 + (1024, None, None)
+        mla_decode, "get_prims_ts_sparse_mla_decode_workspace_size", lambda *a, **k: 1024
     )
 
     class _Attn:
@@ -400,10 +404,9 @@ def test_offloaded_layer_reads_the_sparse_cache_arena(monkeypatch):
         DeepseekV4AttentionType,
     )
 
-    # Request validation and kernel warmup are covered elsewhere; this test
+    # Request validation is covered elsewhere; this test
     # pins down which pool the compressed indices address.
     monkeypatch.setattr(PrimsTSSparseMlaFmha, "_check_request", lambda *args: None)
-    monkeypatch.setattr(PrimsTSSparseMlaFmha, "_warm_kernel_variants", lambda *a, **k: None)
 
     torch.manual_seed(11)
     device = torch.device("cuda")
@@ -472,14 +475,37 @@ def test_offloaded_layer_reads_the_sparse_cache_arena(monkeypatch):
     torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
 
 
-def test_reloaded_kernel_accepts_the_same_launch():
+@pytest.fixture
+def isolated_prims_ts_disk_cache(monkeypatch, tmp_path):
+    reason = get_prims_ts_toolchain_unsupported_reason()
+    if reason is not None:
+        pytest.skip(reason)
+
+    from flashinfer.jit import env as jit_env
+
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path))
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    relative = jit_env.FLASHINFER_JIT_DIR.relative_to(jit_env.FLASHINFER_CACHE_DIR)
+    monkeypatch.setattr(
+        jit_env, "FLASHINFER_JIT_DIR", tmp_path / ".cache" / "flashinfer" / relative
+    )
+    mla_decode._get_compiled_mla_decode.cache_clear()
+    yield
+    mla_decode._get_compiled_mla_decode.cache_clear()
+
+
+@pytest.mark.usefixtures("isolated_prims_ts_disk_cache")
+def test_reloaded_kernel_accepts_the_same_launch(monkeypatch):
     """A kernel reloaded from the persistent compile cache runs the adapter's launch.
 
     CI processes always compile cold, while every later process (and
     production restarts) reload the exported TVM-FFI kernels, whose positional
     entry has no Python defaults. Drop the in-process kernel memo after the
     first run so the second plan takes the reload path, and require identical
-    output from both the full and prepared launches.
+    results from validated and trusted launches.
     """
     _skip_unless_toolchain()
     from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
@@ -492,13 +518,10 @@ def test_reloaded_kernel_accepts_the_same_launch():
     )
     indices, lengths, extra_indices, extra_lengths = sets[0]
 
-    def run_fresh_plan() -> torch.Tensor:
-        wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
-        wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk)
-        out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
+    def launch(wrapper, primary, out, *, validate):
         wrapper.run(
             query,
-            pool,
+            primary,
             indices,
             lengths,
             extra_pool,
@@ -507,29 +530,51 @@ def test_reloaded_kernel_accepts_the_same_launch():
             softmax_scale=LATENT**-0.5,
             output_scale=1.0,
             out=out,
+            validate=validate,
         )
-        prepared_out = torch.empty_like(out)
-        wrapper.run(
-            query,
-            pool,
-            indices,
-            lengths,
-            extra_pool,
-            extra_indices=extra_indices,
-            extra_lengths=extra_lengths,
-            softmax_scale=LATENT**-0.5,
-            output_scale=1.0,
-            out=prepared_out,
-            validate=False,
-        )
-        torch.cuda.synchronize()
-        torch.testing.assert_close(prepared_out, out, rtol=0, atol=0)
-        return out
 
-    first = run_fresh_plan()
+    def run_fresh_plan(primary):
+        wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+        kwargs = dict(max_topk=topk, max_extra_topk=extra_topk)
+        cache_info = mla_decode._get_compiled_mla_decode.cache_info()
+        wrapper.plan(device, rows, heads, compile=False, **kwargs)
+        spec = wrapper._state["compile_spec"]
+        assert wrapper._state["compiled"] is None
+        assert mla_decode._get_compiled_mla_decode.cache_info() == cache_info
+        with pytest.raises(RuntimeError, match="plan\\(compile=True\\)"):
+            wrapper.run(None, None, None, None)
+        wrapper.plan(device, rows, heads, **kwargs)
+        compiled = wrapper._state["compiled"]
+        assert compiled is not None and wrapper._state["compile_spec"] == spec
+        # A planning-only replan must not retain an old executable kernel.
+        wrapper.plan(device, rows, heads, compile=False, **kwargs)
+        assert wrapper._state["compiled"] is None
+        wrapper.plan(device, rows, heads, **kwargs)
+        assert wrapper._state["compiled"] is compiled
+        out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
+        launch(wrapper, primary, out, validate=True)
+        torch.cuda.synchronize()
+        return wrapper, out
+
+    wrapper, first = run_fresh_plan(pool)
+    for _ in range(2):
+        launch(wrapper, pool, first, validate=False)
+    # Reuse the bound views after a data update at the same address.
+    pool.neg_()
+    first.fill_(torch.nan)
+    launch(wrapper, pool, first, validate=False)
+    previous = first.clone()
+    replacement_pool = -pool
+    rebound = torch.full_like(first, torch.nan)
+    launch(wrapper, replacement_pool, rebound, validate=False)
+
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
     mla_decode._get_compiled_mla_decode.cache_clear()
-    second = run_fresh_plan()
-    torch.testing.assert_close(second, first, rtol=0, atol=0)
+    _, second = run_fresh_plan(pool)
+    torch.testing.assert_close(second, previous, rtol=0, atol=0)
+    _, reference = run_fresh_plan(replacement_pool)
+    torch.testing.assert_close(rebound, reference, rtol=0, atol=0)
+    torch.testing.assert_close(first, previous, rtol=0, atol=0)
 
 
 def test_graph_replay_follows_new_indices_and_lengths():
@@ -582,81 +627,6 @@ def test_graph_replay_follows_new_indices_and_lengths():
     torch.cuda.synchronize()
     torch.testing.assert_close(replayed, out, rtol=0, atol=0)
     assert not torch.equal(replayed, torch.zeros_like(replayed))
-
-
-def test_prepared_launch_matches_the_full_path_per_layer():
-    """A validate=False run with the pools and sinks of an earlier full run takes
-    the prepared launch, byte-identical to the full path, with one prepared
-    entry per (pools, sinks) key so layers sharing the plan do not evict each
-    other; a new pool or new sinks address goes back through the full path.
-    """
-    _skip_unless_toolchain()
-    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
-
-    torch.manual_seed(3)
-    device = torch.device("cuda")
-    rows, heads, topk, extra_topk = 6, 64, 128, 256
-    pool, extra_pool, query, sets = _two_source_case(
-        rows, heads, topk, extra_topk, device, torch.bfloat16
-    )
-    indices, lengths, extra_indices, extra_lengths = sets[0]
-    sinks_a = torch.randn(heads, dtype=torch.float32, device=device)
-    sinks_b = torch.randn(heads, dtype=torch.float32, device=device)
-    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
-    wrapper.plan(
-        device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, use_attention_sinks=True
-    )
-    prepared_launches = []
-    original = wrapper._run_prepared
-
-    def counting_run_prepared(*args, **kwargs):
-        prepared_launches.append(1)
-        return original(*args, **kwargs)
-
-    wrapper._run_prepared = counting_run_prepared
-
-    def launch(sinks, kv=pool, validate=False, idx=0):
-        out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
-        wrapper.run(
-            query,
-            kv,
-            sets[idx][0],
-            sets[idx][1],
-            extra_pool,
-            extra_indices=sets[idx][2],
-            extra_lengths=sets[idx][3],
-            softmax_scale=LATENT**-0.5,
-            output_scale=1.0,
-            attention_sinks=sinks,
-            out=out,
-            validate=validate,
-        )
-        torch.cuda.synchronize()
-        return out
-
-    ref_a = launch(sinks_a, validate=True)  # full path records layer A
-    ref_b = launch(sinks_b, validate=True)  # full path records layer B
-    assert not prepared_launches and len(wrapper._prepared) == 2
-    got_a = launch(sinks_a)
-    got_b = launch(sinks_b)
-    assert len(prepared_launches) == 2, "both layers must hit their prepared launch"
-    torch.testing.assert_close(got_a, ref_a, rtol=0, atol=0)
-    torch.testing.assert_close(got_b, ref_b, rtol=0, atol=0)
-    assert not torch.equal(got_a, got_b)
-    # The prepared launch reads the live index set, not the recorded one.
-    got_a1 = launch(sinks_a, idx=1)
-    assert len(prepared_launches) == 3
-    torch.testing.assert_close(got_a1, launch(sinks_a, validate=True, idx=1), rtol=0, atol=0)
-    # A different pool storage or sinks address is not prepared: full path.
-    other_pool = pool.clone()
-    launch(sinks_a, kv=other_pool)
-    launch(sinks_a.clone())
-    assert len(prepared_launches) == 3 and len(wrapper._prepared) == 4
-    # Re-planning drops every prepared launch.
-    wrapper.plan(
-        device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, use_attention_sinks=True
-    )
-    assert not wrapper._prepared
 
 
 def test_request_check_runs_once_per_geometry(monkeypatch) -> None:
@@ -715,66 +685,6 @@ def test_request_check_runs_once_per_geometry(monkeypatch) -> None:
     q5, metadata5, fwd5 = make(4)
     with pytest.raises(RuntimeError, match="nope"):
         adapter._check_request(q5, None, None, metadata5, fwd5)
-
-
-def test_prepared_launch_single_pool_matches_the_full_path():
-    """SWA-only layers plan no extra pool; their prepared launch must match the
-    full path and reject extra indices."""
-    _skip_unless_toolchain()
-    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
-
-    torch.manual_seed(4)
-    device = torch.device("cuda")
-    rows, heads, topk = 6, 64, 128
-    pool, _, query, sets = _two_source_case(rows, heads, topk, 256, device, torch.bfloat16)
-    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
-    wrapper.plan(device, rows, heads, max_topk=topk)
-    prepared_launches = []
-    original = wrapper._run_prepared
-
-    def counting_run_prepared(*args, **kwargs):
-        prepared_launches.append(1)
-        return original(*args, **kwargs)
-
-    wrapper._run_prepared = counting_run_prepared
-
-    def launch(validate: bool, idx: int = 0) -> torch.Tensor:
-        out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
-        wrapper.run(
-            query,
-            pool,
-            sets[idx][0],
-            sets[idx][1],
-            softmax_scale=LATENT**-0.5,
-            output_scale=1.0,
-            out=out,
-            validate=validate,
-        )
-        torch.cuda.synchronize()
-        return out
-
-    ref = launch(validate=True)
-    assert not prepared_launches and len(wrapper._prepared) == 1
-    got = launch(validate=False)
-    assert len(prepared_launches) == 1
-    torch.testing.assert_close(got, ref, rtol=0, atol=0)
-    ref1 = launch(validate=True, idx=1)
-    got1 = launch(validate=False, idx=1)
-    assert len(prepared_launches) == 2
-    torch.testing.assert_close(got1, ref1, rtol=0, atol=0)
-    with pytest.raises(ValueError, match="extra indices"):
-        wrapper.run(
-            query,
-            pool,
-            sets[0][0],
-            sets[0][1],
-            extra_indices=sets[0][2],
-            extra_lengths=sets[0][3],
-            softmax_scale=LATENT**-0.5,
-            output_scale=1.0,
-            out=torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device),
-            validate=False,
-        )
 
 
 def test_sinks_pass_through_or_are_prepared_once_per_layer() -> None:
@@ -979,6 +889,28 @@ def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_d
             fallback_calls.append(1)
         return original_fallback(self, q, k, v, metadata, forward_args, *args, **kwargs)
 
+    if (library, batch_name, kv_cache_dtype) == ("prims_ts", "single_decode", "auto"):
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
+            warmup_prims_ts_sparse_mla,
+        )
+        from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+        from .. import test_sparse_mla_forward as unified
+
+        gen = unified.forward_generation_deepseek_v4_mla
+
+        def forward_after_warmup(mla, *, attn_metadata, **kwargs):
+            compiled = mla_decode._get_compiled_mla_decode
+            compiled.cache_clear()
+            warmup_prims_ts_sparse_mla(mla, attn_metadata)
+            warmed = compiled.cache_info()
+            assert warmed.currsize > 0
+            result = gen(mla, attn_metadata=attn_metadata, **kwargs)
+            assert compiled.cache_info().misses == warmed.misses
+            return result
+
+        monkeypatch.setattr(unified, "forward_generation_deepseek_v4_mla", forward_after_warmup)
+
     monkeypatch.setattr(PrimsTSSparseMlaFmha, "forward", counting_forward)
     monkeypatch.setattr(FallbackFmha, "forward", counting_fallback)
     _run_unified_sparse_mla_forward(batch_name, kv_cache_dtype, "deepseek_v4")
@@ -1165,75 +1097,138 @@ def test_forward_sparse_mla_unified_fused_epilogue(monkeypatch, batch_name, kv_c
     _assert_fused_close(got, got_sc, ref, ref_sc, channels, device)
 
 
-def test_kernel_variants_are_warmed_once_per_profile(monkeypatch) -> None:
-    """The first eager forward of a static profile plans one representative row count
-    per distinct kernel compile signature, largest first, on the eager metadata only;
-    the same profile is not warmed again in the process and a second extra capacity
-    (another layer group) warms its own variants."""
+def test_warmup_collects_only_enabled_layer_profiles(monkeypatch) -> None:
+    import builtins
+    from unittest.mock import Mock
+
     import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
-    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
-
-    planned = []
-
-    class _FakeWrapper:
-        def __init__(self, workspace_buffer=None):
-            pass
-
-        def plan(self, device, rows, heads, **kwargs):
-            planned.append((rows, kwargs["max_extra_topk"]))
-
-    class _FakeKernel:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def compile_signature(self):
-            return (self.rows // 8,)  # one variant per 8 row counts
-
-    def fake_resolve(device, rows, heads, **kwargs):
-        return (None, None, SimpleNamespace(kernel=_FakeKernel(rows)), None, 1024, None, None)
-
-    monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
-    monkeypatch.setattr(mla_decode, "_resolve_sparse_mla_plan", fake_resolve)
-    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
-    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "0")  # in-process planning only
-
-    class _Attn:
-        num_heads = 16
-        sparse_attention_config = SimpleNamespace(
-            window_size=128, enable_kv_cache_offload=False, enable_heuristic_topk=False
-        )
-
-    attn = _Attn()
-    lib = PrimsTSSparseMlaFmha(attn)
-    profile = dict(
-        device=torch.device("cuda"), q_dtype=torch.bfloat16, has_sinks=False, fused_groups=None
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import module
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
+        DeepseekV4TrtllmAttention,
     )
-    eager = SimpleNamespace(
-        fmha_plan_caches={},
-        max_num_tokens=20,
-        max_num_requests=20,
-        max_total_draft_tokens=None,
-        mapping=None,
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    real_import = builtins.__import__
+
+    def no_vendor_import(name, *args, **kwargs):
+        assert name != "tensorrt_llm._torch.attention.backends.prims_ts"
+        return real_import(name, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "__import__", no_vendor_import)
+        mod._warmup_profiles([], SimpleNamespace())
+
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.models.modeling_utils import remove_weights
+
+    layers = []
+    for enabled, fused, sinks, dtype in (
+        ("prims", True, True, torch.bfloat16),
+        ("prims", False, False, torch.bfloat16),
+        ("disabled", False, False, torch.bfloat16),
+        ("prims", False, False, torch.float16),
+        ("fallback_first", False, True, torch.bfloat16),
+    ):
+        attn = Mock(spec=DeepseekV4TrtllmAttention)
+        attn.compress_ratio = 4
+        attn.attn_sink = object() if sinks else None
+        attn.is_mla_enable = True
+        libraries = [FallbackFmha(attn)] if enabled == "fallback_first" else []
+        if enabled != "disabled":
+            libraries.append(PrimsTSSparseMlaFmha(attn))
+        attn._fmha_manager = SimpleNamespace(fmha_libs=libraries)
+        layer = MLA.__new__(MLA)
+        torch.nn.Module.__init__(layer)
+        layer.mqa, layer.dtype = attn, dtype
+        layer.o_a_proj = torch.nn.Parameter(torch.empty(1))
+        layer.n_local_groups, layer.fused = 8, fused
+        layer.mapping = SimpleNamespace(has_cp_helix=lambda: False)
+        layers.append(layer)
+    # PP keeps the backend on a remote stage's layer after stripping its parameters.
+    remote = MLA.__new__(MLA)
+    torch.nn.Module.__init__(remote)
+    remote.mqa, remote.o_a_proj = layers[0].mqa, layers[0].o_a_proj
+    remove_weights(remote)
+    assert not hasattr(remote, "o_a_proj")
+    layers.append(remote)
+    metadata = SimpleNamespace(
+        beam_width=1,
         is_cuda_graph=False,
+        token_positions_cuda=SimpleNamespace(device=torch.device("cuda", 0)),
+        max_compressed_indices={4: 512},
     )
-    lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
-    assert planned == [(20, 512), (15, 512), (7, 512)]  # one per signature, largest first
-    lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
-    assert len(planned) == 3  # same profile: already warmed in this process
-    graph = SimpleNamespace(
-        fmha_plan_caches={},
-        max_num_tokens=20,
-        max_num_requests=20,
-        max_total_draft_tokens=None,
-        mapping=None,
-        is_cuda_graph=True,
+    captured = []
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(mod.PrimsTSSparseMlaFmha, "_is_fp8_cache", staticmethod(lambda _: True))
+    monkeypatch.setattr(module, "supports_dsv4_epilogue_fusion", lambda layer: layer.fused)
+    monkeypatch.setattr(mod, "_warmup_profiles", lambda profiles, meta: captured.extend(profiles))
+    mod.warmup_prims_ts_sparse_mla(SimpleNamespace(modules=lambda: iter(layers)), metadata)
+    assert [(p.extra, p.q_dtype, p.has_sinks, p.fused_groups) for p in captured] == [
+        (512, torch.float8_e4m3fn, True, 8),
+        (512, torch.float8_e4m3fn, False, None),
+        (512, torch.float8_e4m3fn, True, None),
+    ]
+    metadata.is_cuda_graph = True
+    with pytest.raises(RuntimeError, match="outside graph capture"):
+        mod.warmup_prims_ts_sparse_mla(SimpleNamespace(modules=lambda: iter(layers)), metadata)
+
+
+def test_warmup_combines_profiles_and_loads_largest_workspace_first(monkeypatch) -> None:
+    """One worker group serves all distinct layer profiles before local plan loading."""
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
+
+    planned, fanned, workspace_calls = [], [], []
+    mla_decode = _fake_sparse_plan(monkeypatch, planned)
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "2")
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+
+    def workspace_size(device, rows, heads, **kwargs):
+        workspace_calls.append((rows, kwargs["max_extra_topk"]))
+        return rows * kwargs["max_extra_topk"]
+
+    monkeypatch.setattr(mla_decode, "get_prims_ts_sparse_mla_decode_workspace_size", workspace_size)
+    monkeypatch.setattr(pp, "precompile_payloads", lambda payloads, **kw: fanned.append(payloads))
+    attn, profile, eager = _attn_and_profile()
+    lib = PrimsTSSparseMlaFmha(attn)
+    profiles = [mod._PlanProfile(lib, extra=extra, **profile) for extra in (32, 512, 32)]
+    mod._warmup_profiles(profiles, eager)
+    assert len(fanned) == 1
+    assert [(p["rows"], p["plan_kwargs"]["max_extra_topk"]) for p in fanned[0]] == [
+        (20, 32),
+        (15, 32),
+        (7, 32),
+        (20, 512),
+        (15, 512),
+        (7, 512),
+    ]
+    assert planned == [(20, 512), (15, 512), (7, 512), (20, 32), (15, 32), (7, 32)]
+    workspace = eager.fmha_plan_caches[lib.WORKSPACE_CACHE_KEY]["buffer"]
+    assert workspace.numel() == 20 * 512
+    representative = lib._get_plan(metadata=eager, rows=15, extra=512, **profile)
+    assert len(planned) == 6
+    compiler = mla_decode.BatchSparseMLADecodePagedTSWrapper.compile_kernel
+    misses = compiler.cache_info().misses
+    with monkeypatch.context() as no_jit:
+        no_jit.setenv("FLASHINFER_DISABLE_JIT", "1")
+        next_plan = lib._get_plan(metadata=eager, rows=14, extra=512, **profile)
+    assert next_plan is not representative and planned[6:] == [(14, 512)]
+    assert next_plan.wrapper._state["compiled"] is representative.wrapper._state["compiled"]
+    assert compiler.cache_info().misses == misses
+    assert len(fanned) == 1
+    assert len(workspace_calls) == 40  # One public size query per distinct shape.
+
+    # Workspace requirements need not grow with rows within one compile spec.
+    monkeypatch.setattr(
+        mla_decode,
+        "get_prims_ts_sparse_mla_decode_workspace_size",
+        lambda device, rows, heads, **kw: 100000 if rows == 6 else rows * 64,
     )
-    lib._warm_kernel_variants(metadata=graph, extra=32, **profile)
-    assert len(planned) == 3  # CUDA graph metadata never warms
-    lib._warm_kernel_variants(metadata=eager, extra=32, **profile)
-    assert planned[3:] == [(20, 32), (15, 32), (7, 32)]  # another layer group warms its own
-    assert lib._get_plan(metadata=eager, rows=15, extra=512, **profile) is not None
-    assert len(planned) == 6  # the warmed plan is reused
+    planned.clear()
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=64, **profile)], eager)
+    assert planned == [(6, 64), (20, 64), (15, 64)]
+    assert eager.fmha_plan_caches[lib.WORKSPACE_CACHE_KEY]["buffer"].numel() == 100000
 
 
 def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
@@ -1244,7 +1239,6 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
 
     planned: list = []
     _fake_sparse_plan(monkeypatch, planned, signature_div=8)
-    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
     monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "0")
     attn, profile, _ = _attn_and_profile()
     lib = PrimsTSSparseMlaFmha(attn)
@@ -1253,11 +1247,11 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
         fmha_plan_caches={},
         max_num_tokens=256,
         max_num_requests=4,
-        max_total_draft_tokens=5,  # DeepSeek-V4 MTP: next_n = 6 rows per request
+        max_total_draft_tokens=5,
         mapping=None,
         is_cuda_graph=False,
     )
-    lib._warm_kernel_variants(metadata=mtp, extra=512, **profile)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=512, **profile)], mtp)
     rows = [r for r, _ in planned]
     assert rows[0] == 4 * (1 + 5), rows
     assert rows == sorted(rows, reverse=True)
@@ -1265,7 +1259,6 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
 
     # The step's token budget bounds the rows even when the MTP ceiling is larger.
     planned.clear()
-    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
     budget = SimpleNamespace(
         fmha_plan_caches={},
         max_num_tokens=10,
@@ -1274,16 +1267,28 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
         mapping=None,
         is_cuda_graph=False,
     )
-    lib._warm_kernel_variants(metadata=budget, extra=512, **profile)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=512, **profile)], budget)
     assert [r for r, _ in planned][0] == 10
 
+    # A larger capacity includes every reachable signature up to a non-power-of-two limit.
+    planned.clear()
+    larger = SimpleNamespace(
+        **{
+            **vars(mtp),
+            "max_num_requests": 32,
+            "max_num_tokens": 183,
+            "fmha_plan_caches": {},
+        }
+    )
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=512, **profile)], larger)
+    assert [row for row, _ in planned] == [183, *range(175, 0, -8)]
+
     # A metadata class that does not declare the fields fails loudly.
-    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
     renamed = SimpleNamespace(
         fmha_plan_caches={}, max_num_tokens=10, max_num_requests=4, is_cuda_graph=False
     )
     with pytest.raises(AttributeError):
-        lib._warm_kernel_variants(metadata=renamed, extra=512, **profile)
+        mod._warmup_profiles([mod._PlanProfile(lib, extra=512, **profile)], renamed)
 
 
 def test_index_contract_is_validated_once_per_process(monkeypatch) -> None:
@@ -1300,28 +1305,46 @@ def test_index_contract_is_validated_once_per_process(monkeypatch) -> None:
 
 
 def _fake_sparse_plan(monkeypatch, planned, *, signature_div=8):
-    """Replace the sparse wrapper and plan resolver with fakes that record plan() calls."""
+    """Record executable plans and expose specs from planning-only calls."""
+    import os
+    from functools import cache
+
+    from flashinfer.jit.core import MissingJITCacheError
+
     import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
 
     class _FakeWrapper:
+        discovery_rows = []
+        cached_specs: set = set()
+
+        @staticmethod
+        @cache
+        def compile_kernel(spec):
+            if os.environ.get("FLASHINFER_DISABLE_JIT") and spec not in _FakeWrapper.cached_specs:
+                raise MissingJITCacheError(f"Missing kernel for {spec}")
+            return object()
+
+        def is_kernel_cached(self):
+            return self._state["compile_spec"] in self.cached_specs
+
         def __init__(self, workspace_buffer=None):
-            pass
+            self._state = None
 
-        def plan(self, device, rows, heads, **kwargs):
-            planned.append((rows, kwargs["max_extra_topk"]))
-
-    class _FakeKernel:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def compile_signature(self):
-            return (self.rows // signature_div,)
-
-    def fake_resolve(device, rows, heads, **kwargs):
-        return (None, None, SimpleNamespace(kernel=_FakeKernel(rows)), None, 1024, None, None)
+        def plan(self, device, rows, heads, *, compile=True, **kwargs):
+            spec = (rows // signature_div, kwargs["max_extra_topk"])
+            self._state = {
+                "compile_spec": spec,
+                "compiled": self.compile_kernel(spec) if compile else None,
+            }
+            if compile:
+                planned.append((rows, kwargs["max_extra_topk"]))
+            else:
+                self.discovery_rows.append(rows)
 
     monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
-    monkeypatch.setattr(mla_decode, "_resolve_sparse_mla_plan", fake_resolve)
+    monkeypatch.setattr(
+        mla_decode, "get_prims_ts_sparse_mla_decode_workspace_size", lambda *a, **kw: 1024
+    )
     return mla_decode
 
 
@@ -1347,83 +1370,84 @@ def _attn_and_profile():
     return attn, profile, eager
 
 
-def test_warm_up_fans_out_only_when_a_variant_is_missing(monkeypatch) -> None:
-    """The warm-up probes the cache first: all cached -> no workers; a miss -> every
-    representative row count goes to the workers as a JSON-safe payload before the
-    in-process plan loop; a failing helper never breaks the warm-up; strict mode raises."""
+def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> None:
+    """Workers see only representative plans; their failure falls back to the parent."""
+    import json
+
+    from flashinfer.jit.core import MissingJITCacheError
+
     import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
     import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
-    import tensorrt_llm._torch.attention.backends.prims_ts._compile_cache as cc
 
     planned, fanned = [], []
-    _fake_sparse_plan(monkeypatch, planned)
-    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+    mla_decode = _fake_sparse_plan(monkeypatch, planned)
     monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "2")
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
 
     def fake_workers(payloads, workers):
+        assert not planned  # Discovery must not compile serially in the parent.
         fanned.append((list(payloads), workers))
-        return True
 
     monkeypatch.setattr(pp, "run_precompile_workers", fake_workers)
     attn, profile, eager = _attn_and_profile()
     lib = PrimsTSSparseMlaFmha(attn)
-
-    # 1. Every variant cached: the probe plans (under probe mode) and no worker runs.
-    lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
-    assert fanned == []
-    # probe planned the three variants, then the real loop planned them again
-    assert planned == [(20, 512), (15, 512), (7, 512)] * 2
-
-    # 2. A cache miss during the probe -> workers get every representative row count.
-    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
-
-    real_plan = mla_decode.BatchSparseMLADecodePagedTSWrapper.plan
-
-    def probing_plan(self, device, rows, heads, **kwargs):
-        if cc._PRECOMPILE_MODE.get() == "probe":
-            raise cc.KernelNotCached("missing")
-        return real_plan(self, device, rows, heads, **kwargs)
-
-    monkeypatch.setattr(mla_decode.BatchSparseMLADecodePagedTSWrapper, "plan", probing_plan)
-    planned.clear()
-    lib._warm_kernel_variants(metadata=eager, extra=32, **profile)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], eager)
     assert planned == [(20, 32), (15, 32), (7, 32)]
-    assert len(fanned) == 1
+    # A later pass can also dispatch newly encountered variants before preparing its local plans.
+    planned.clear()
+    fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=64, **profile)], fresh)
+    assert planned == [(20, 64), (15, 64), (7, 64)]
+    assert (
+        mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows == list(range(20, 0, -1)) * 2
+    )
+    assert len(fanned) == 2
+    assert [p["plan_kwargs"]["max_extra_topk"] for p in fanned[1][0]] == [64, 64, 64]
     payloads, workers = fanned[0]
-    assert workers == 2  # capped by the env value, below the three variants
+    assert workers == 2
     assert [p["rows"] for p in payloads] == [20, 15, 7]
-    assert payloads[0]["plan_kwargs"]["q_dtype"] == "bfloat16"  # JSON-safe dtype
-    assert payloads[0]["plan_kwargs"]["max_extra_topk"] == 32
+    assert payloads[0]["plan_kwargs"]["q_dtype"] == "bfloat16"
     assert payloads[0]["device_index"] == 0
-    import json
+    json.dumps(payloads)
 
-    json.dumps(payloads)  # every payload field crosses the subprocess boundary
+    # Only missing specializations go to workers; every new metadata still gets all its plans.
+    cached = mla_decode.BatchSparseMLADecodePagedTSWrapper.cached_specs
+    for cached_bucket in (0, 1, 2):
+        cached.add((cached_bucket, 32))
+        planned.clear()
+        fanned.clear()
+        fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
+        mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], fresh)
+        assert planned == [(20, 32), (15, 32), (7, 32)]
+        assert [[p["rows"] for p in ps] for ps, _ in fanned] == (
+            [[20, 15]] if cached_bucket == 0 else []
+        )
+    cached.clear()
 
-    # 3. A failing helper is logged and the in-process loop still plans everything...
     def broken_workers(payloads, workers):
         raise OSError("no subprocesses here")
 
     monkeypatch.setattr(pp, "run_precompile_workers", broken_workers)
-    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
-    monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "0")  # the module fixture sets strict mode
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "0")
     planned.clear()
-    fresh = SimpleNamespace(  # a new metadata object: the earlier plans are cached on `eager`
-        fmha_plan_caches={},
-        max_num_tokens=20,
-        max_num_requests=20,
-        max_total_draft_tokens=None,
-        mapping=None,
-        is_cuda_graph=False,
-    )
-    lib._warm_kernel_variants(metadata=fresh, extra=32, **profile)
+    fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], fresh)
     assert planned == [(20, 32), (15, 32), (7, 32)]
-    # ...unless strict mode asks for the failure.
     monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
-    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
     with pytest.raises(OSError):
-        lib._warm_kernel_variants(metadata=eager, extra=32, **profile)
+        mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], eager)
+
+    # The smaller cached variant is still loaded after the larger variants miss.
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    cached.add((0, 32))
+    mla_decode.BatchSparseMLADecodePagedTSWrapper.compile_kernel.cache_clear()
+    planned.clear()
+    fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], fresh)
+    assert planned == [(7, 32)]
+    with pytest.raises(MissingJITCacheError):
+        lib._get_plan(metadata=fresh, rows=20, extra=32, **profile)
 
 
 def test_precompile_worker_count_follows_the_env(monkeypatch) -> None:
@@ -1480,200 +1504,185 @@ def test_default_worker_count_is_capped_by_the_ranks_on_the_host(monkeypatch) ->
     assert pp.local_rank_count(None) == 4
 
 
-def test_precompile_worker_entry_compiles_its_shard_first_then_the_rest(monkeypatch) -> None:
-    """The worker entry point runs the real plan path under precompile_only(): own
-    shard first, the rest afterwards, busy kernels deferred to a blocking pass."""
-    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
-    import tensorrt_llm._torch.attention.backends.prims_ts._compile_cache as cc
-
-    planned, modes = [], []
-    mla_decode = _fake_sparse_plan(monkeypatch, planned)
-    real_plan = mla_decode.BatchSparseMLADecodePagedTSWrapper.plan
-    busy_once = {"rows": 15, "armed": True}
-
-    def recording_plan(self, device, rows, heads, **kwargs):
-        modes.append((rows, cc._PRECOMPILE_MODE.get(), cc._SKIP_BUSY.get()))
-        if rows == busy_once["rows"] and busy_once["armed"] and cc._SKIP_BUSY.get():
-            busy_once["armed"] = False
-            raise cc.KernelBusy("another worker owns it")
-        return real_plan(self, device, rows, heads, **kwargs)
-
-    monkeypatch.setattr(mla_decode.BatchSparseMLADecodePagedTSWrapper, "plan", recording_plan)
-    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
-    monkeypatch.setattr(cc, "expected_cache_meta", lambda: {"probe": "meta"})
-    payloads = [
-        pp.encode_payload(
-            0, rows, 16, dict(max_topk=128, max_extra_topk=512, q_dtype=torch.bfloat16)
-        )
-        for rows in (20, 15, 7, 3)
-    ]
+@pytest.mark.usefixtures("isolated_prims_ts_disk_cache")
+def test_workers_publish_cold_variants_for_jit_disabled_parent(monkeypatch) -> None:
     import json
+    from pathlib import Path
+    from unittest.mock import patch
 
-    assert pp._main(["worker", json.dumps(payloads), "1", "2"]) == 0
-    # slot 1 of 2 owns rows 15 and 3; 15 was busy once and is retried blocking at the end
-    assert [m[0] for m in modes] == [15, 3, 20, 7, 15]
-    assert all(m[1] == "persist" for m in modes)
-    assert [m[2] for m in modes] == [True, True, True, True, False]
-    assert [r for r, _ in planned] == [3, 20, 7, 15]
-    assert pp.shard_order([0, 1, 2, 3, 4], 1, 2) == [1, 3, 0, 2, 4]
-    assert pp.shard_order([0, 1], 5, 8) == [0, 1]  # a slot past the list owns nothing
+    from flashinfer.jit.core import MissingJITCacheError
+
+    from tensorrt_llm._torch.attention.backends._cute_dsl_compat import JitSpecCuteDsl
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_precompile as pp
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts_dsa_sparse_mla import (
+        PrimsTSDsaSparseMlaFmha,
+    )
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
+        _plan_kernel_variants,
+    )
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "2")
+    device = torch.device("cuda", torch.cuda.current_device())
+    kwargs = PrimsTSDsaSparseMlaFmha._plan_kwargs(256)
+    _, misses = _plan_kernel_variants(device, 64, kwargs, range(1, 17), local_ranks=1)
+    payloads = misses[:2]
+    assert len(payloads) == 2
+    stale = JitSpecCuteDsl("prims_ts_mla_decode", "obsolete", lambda: None, "stale")
+    stale.module_dir.mkdir(parents=True)
+    stale.meta_path.write_text(json.dumps(stale.expected_meta))
+    stale.object_path.touch()
+    assert stale.is_compiled
+    with patch.object(Path, "open", side_effect=PermissionError("unreadable marker")):
+        assert not stale.is_compiled
+    with patch.object(stale, "_load_from_disk", side_effect=PermissionError("unreadable object")):
+        with pytest.raises(PermissionError, match="unreadable object"):
+            stale.load()
+
+    def invalidate_during_load():
+        new_marker = stale.meta_path.with_suffix(".new")
+        new_marker.write_text("{}")
+        new_marker.replace(stale.meta_path)
+        raise FileNotFoundError("object invalidated during load")
+
+    retained = object()
+    with (
+        patch.object(stale, "_compiled_kernel", retained),
+        patch.object(stale, "_load_from_disk", side_effect=invalidate_during_load),
+    ):
+        assert stale.load() is retained
+
+    pp.precompile_payloads(payloads)
+    assert not stale.object_path.exists()
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    mla_decode._get_compiled_mla_decode.cache_clear()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends._cute_dsl_compat.get_tmpdir",
+        lambda: pytest.fail("JIT-disabled cache lookups must not request a lock"),
+    )
+    with pytest.raises(MissingJITCacheError) as miss:
+        stale.build_and_load()
+    assert miss.value.spec is stale
+    for payload in payloads:
+        wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+        wrapper.plan(device, payload["rows"], 64, **kwargs)
+        assert wrapper.is_kernel_cached() and callable(wrapper._state["compiled"])
+
+
+def test_precompile_worker_imports_vendor_without_runtime() -> None:
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from tensorrt_llm._torch.attention.backends.fmha import _prims_ts_worker
+
+    source = """
+import json, runpy, sys
+worker = runpy.run_path(sys.argv[1])
+worker["_init_worker"](json.load(sys.stdin))
+from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+from tensorrt_llm._torch.attention.backends import _cute_dsl_compat
+assert mla_decode.BatchSparseMLADecodePagedTSWrapper.__module__ == mla_decode.__name__
+assert sys.modules["tensorrt_llm"].__spec__.origin is None
+assert "tensorrt_llm._bootstrap" not in sys.modules and "mpi4py.MPI" not in sys.modules
+print(mla_decode.__file__)
+"""
+    worker = Path(_prims_ts_worker.__file__)
+    result = subprocess.run(
+        [sys.executable, "-c", source, str(worker)],
+        input=json.dumps(sys.path),
+        timeout=120,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert (
+        Path(result.stdout.splitlines()[-1]).resolve()
+        == worker.parents[1] / "prims_ts" / "mla_decode.py"
+    )
 
 
 def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch, tmp_path) -> None:
-    """The runner strips the MPI launcher environment, forwards sys.path and the
-    worker count 0, assigns one slot per worker, kills workers on timeout, and
-    reports a worker whose cache key differs from the parent's."""
-    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
-
-    spawned = []
-
-    class _FakeProc:
-        def __init__(self, argv, env, stdout, returncode=0, text="", hang=False):
-            self.argv, self.env, self.returncode, self._hang = argv, env, returncode, hang
-            stdout.write(text)
-            self._done = False
-
-        def wait(self, timeout=None):
-            if self._hang and not getattr(self, "killed", False):
-                raise subprocess.TimeoutExpired(self.argv, timeout)
-            self._done = True  # like Popen.wait() after kill()
-            return self.returncode
-
-        def poll(self):
-            return None if (self._hang and not self._done) else self.returncode
-
-        def kill(self):
-            self._done = True
-            self.killed = True
-
     import subprocess
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
 
-    def make_popen(**behaviour):
-        def fake_popen(argv, env, stdout, stderr, text):
-            proc = _FakeProc(argv, env, stdout, **behaviour)
-            spawned.append(proc)
-            return proc
+    import psutil
 
-        return fake_popen
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_precompile as pp
 
     monkeypatch.setenv("OMPI_COMM_WORLD_RANK", "2")
     monkeypatch.setenv("SLURM_PROCID", "2")
-    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "4")
-    monkeypatch.setattr(pp, "_expected_cache_meta", lambda: {"k": 1})
-    meta_ok = "[prims-ts precompile] meta={'k': 1}\n"
-    monkeypatch.setattr(subprocess, "Popen", make_popen(text=meta_ok))
-    payloads = [{"rows": r} for r in (20, 15, 7)]
-    assert pp.run_precompile_workers(payloads, 2) is True
-    assert len(spawned) == 2
-    env = spawned[0].env
-    assert "OMPI_COMM_WORLD_RANK" not in env and "SLURM_PROCID" not in env
-    assert env["TLLM_PRIMTS_WARM_WORKERS"] == "0"
-    import json
-    import sys
-
-    assert json.loads(env["TLLM_PRIMTS_PRECOMPILE_SYS_PATH"]) == sys.path
-    assert [p.argv[-2:] for p in spawned] == [["0", "2"], ["1", "2"]]
-    assert spawned[0].argv[0] == sys.executable and spawned[0].argv[1] == "-c"
-    assert json.loads(spawned[0].argv[3]) == payloads
-
-    spawned.clear()
-    monkeypatch.setattr(
-        subprocess, "Popen", make_popen(text="[prims-ts precompile] meta={'k': 2}\n")
+    monkeypatch.setattr(pp, "__file__", str(tmp_path / "prims_ts_precompile.py"))
+    worker = tmp_path / "_prims_ts_worker.py"
+    worker.write_text(
+        "import json, multiprocessing, os, signal, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "assert 'OMPI_COMM_WORLD_RANK' not in os.environ and 'SLURM_PROCID' not in os.environ\n"
+        "request = json.load(sys.stdin)\n"
+        "assert request['sys_path'] and sys.argv[1] == '2'\n"
+        "payload = request['payloads'][0]\n"
+        "if payload:\n"
+        "    semaphore = multiprocessing.get_context('spawn').Semaphore()\n"
+        "    child = subprocess.Popen([sys.executable, '-c', payload['child']], stdout=subprocess.PIPE)\n"
+        "    assert child.stdout.readline() == b'ready\\n'\n"
+        "    Path(payload['pids']).write_text(f'{os.getpid()} {child.pid} {semaphore._semlock.name}')\n"
+        "    if 'failure' in payload:\n"
+        "        print(payload['failure'], flush=True)\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
+        "    print('waiting for child', flush=True)\n"
+        "    child.wait()\n"
     )
-    assert pp.run_precompile_workers(payloads, 1 + 1) is False  # cache key mismatch is a failure
-
-    spawned.clear()
-    monkeypatch.setattr(subprocess, "Popen", make_popen(returncode=3, text="boom"))
-    assert pp.run_precompile_workers(payloads, 2) is False
-
-    spawned.clear()
-    monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "0.01")
-    monkeypatch.setattr(subprocess, "Popen", make_popen(hang=True))
-    assert pp.run_precompile_workers(payloads, 2) is False
-    assert all(getattr(p, "killed", False) for p in spawned)  # nothing left running
-    assert pp.run_precompile_workers(payloads, 1) is False  # one worker: nothing to fan out
-
-
-def test_precompile_only_persists_without_loading(monkeypatch) -> None:
-    """Under precompile_only(), build_and_load_attention_kernel compiles and persists
-    through the unlocked path and hands back a placeholder that refuses to launch;
-    under probe_cached() a missing kernel raises; with the cache disabled both refuse."""
-    import tensorrt_llm._torch.attention.backends.prims_ts._compile_cache as cc
-
-    persisted, probed = [], []
-    monkeypatch.setattr(
-        cc,
-        "_precompile_kernel",
-        lambda module, kernel, fn, files: persisted.append((module, kernel)),
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "inf")
+    pp.run_precompile_workers([{}], 2)
+    pid_file = tmp_path / "pids"
+    release = tmp_path / "release"
+    child = (
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ready', flush=True)\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.05)\n"
     )
-    monkeypatch.setattr(
-        cc, "_probe_kernel", lambda module, kernel, fn, files: probed.append(kernel)
-    )
-    monkeypatch.setattr(cc, "_kernel_source_files", lambda: ("a.py",))
-    monkeypatch.setattr(cc, "_compile_cache_key", lambda spec, options, extra: "deadbeef")
-    monkeypatch.setattr(
-        "flashinfer.jit.cute_dsl_core.cute_dsl_cache_disabled", lambda: False, raising=False
-    )
-    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
-    compiled = []
 
-    def compile_fn():
-        compiled.append(True)
-        return "kernel"
+    def is_live(pid):
+        try:
+            return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
 
-    with cc.precompile_only():
-        placeholder = cc.build_and_load_attention_kernel(
-            "mla_decode", "main", object(), "", compile_fn
-        )
-    assert persisted and persisted[0][0] == "prims_ts_mla_decode"
-    assert persisted[0][1].startswith("main_sm") and persisted[0][1].endswith("_deadbeef")
-    assert not compiled  # the helper owns the compile; nothing was loaded in-process
-    with pytest.raises(RuntimeError, match="precompile-only"):
-        placeholder()
-    assert cc._PRECOMPILE_MODE.get() is None  # the context manager restores the mode
-    with cc.probe_cached():
-        cc.build_and_load_attention_kernel("mla_decode", "main", object(), "", compile_fn)
-    assert probed == [persisted[0][1]]
-    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
-    with cc.precompile_only(), pytest.raises(RuntimeError, match="FLASHINFER_DISABLE_JIT"):
-        cc.build_and_load_attention_kernel("mla_decode", "main", object(), "", compile_fn)
-    # Outside the precompile modes FLASHINFER_DISABLE_JIT keeps the disk-cache path:
-    # the kernel goes through FlashInfer's builder, never a compile_fn() here.
-    loaded = []
-    monkeypatch.setattr(
-        "flashinfer.jit.cute_dsl_core.build_and_load_cute_dsl_kernel",
-        lambda module, kernel, fn, extra_key_files=(): loaded.append((module, kernel)) or "loaded",
-    )
-    assert (
-        cc.build_and_load_attention_kernel("mla_decode", "main", object(), "", compile_fn)
-        == "loaded"
-    )
-    assert loaded == [("prims_ts_mla_decode", persisted[0][1])] and not compiled
-    monkeypatch.delenv("FLASHINFER_DISABLE_JIT")
+    def assert_pool_stopped():
+        supervisor, child_pid, semaphore_name = pid_file.read_text().split()
+        deadline = time.monotonic() + 3
+        while (
+            any(is_live(int(pid)) for pid in (supervisor, child_pid))
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert not is_live(int(supervisor))
+        assert not is_live(int(child_pid))
+        assert not (Path("/dev/shm") / f"sem.{semaphore_name.lstrip('/')}").exists()
 
+    payload = {"pids": str(pid_file), "child": child}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "2147484")
+            call = pool.submit(
+                pp.run_precompile_workers, [payload | {"failure": "test compile error"}], 2
+            )
+            with pytest.raises(RuntimeError, match="test compile error"):
+                call.result(timeout=15)
+            assert_pool_stopped()
+            pid_file.unlink()
 
-def test_precompile_placeholders_are_never_memoized(monkeypatch) -> None:
-    """A probe or persist build must not poison the compiled-kernel memo of the
-    serving process: the next real request compiles / loads the kernel."""
-    import tensorrt_llm._torch.attention.backends.prims_ts._compile_cache as cc
-    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
-
-    calls = []
-
-    def fake_compile(spec):
-        calls.append(cc._PRECOMPILE_MODE.get())
-        return cc._unloaded_kernel if cc._PRECOMPILE_MODE.get() else "real kernel"
-
-    monkeypatch.setattr(mla_decode, "_compile_mla_decode", fake_compile)
-    mla_decode._get_compiled_mla_decode.cache_clear()
-    spec = ("fake", "compile", "spec")
-    with cc.probe_cached():
-        assert cc.is_placeholder(mla_decode._get_compiled_mla_decode(spec))
-    with cc.precompile_only():
-        assert cc.is_placeholder(mla_decode._get_compiled_mla_decode(spec))
-    assert (
-        mla_decode._get_compiled_mla_decode(spec) == "real kernel"
-    )  # not the memoized placeholder
-    assert mla_decode._get_compiled_mla_decode(spec) == "real kernel"
-    assert calls == ["probe", "persist", None]  # the real result is memoized
-    mla_decode._get_compiled_mla_decode.cache_clear()
+            monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "3")
+            call = pool.submit(pp.run_precompile_workers, [payload], 2)
+            with pytest.raises(subprocess.TimeoutExpired) as timed_out:
+                call.result(timeout=15)
+            assert b"waiting for child" in timed_out.value.output
+            assert_pool_stopped()
+        finally:
+            # Unblock both processes even if group termination regresses.
+            release.touch()

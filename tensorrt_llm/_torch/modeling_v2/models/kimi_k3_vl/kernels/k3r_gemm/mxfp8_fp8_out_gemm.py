@@ -16,9 +16,6 @@ Overridden from the shared kernel (the rest is inherited):
 * ``kernel_impl``: the shared device code with the FP8 output's alpha type (BF16) and epilogue store;
 * ``_setup_attributes``: the shared setup with the ``epi_tile_n`` override of the epilogue subtile;
 * ``can_implement``: the shared checks with an E4M3 C (MXFP8 operands, split-K 1, 16-byte C rows).
-
-``tests/.../ops/gemm/test_k3_mxfp8_gemm_fp8_out_source.py`` checks that the two copied methods are
-the shared ones apart from those changes.
 """
 
 from typing import Literal, Optional, Tuple, Type, Union
@@ -38,6 +35,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from tensorrt_llm._torch.kernels.rubin.dense_blockscaled_gemm_persistent import (
     Sm107BlockScaledPersistentDenseGemmKernel,
     Sm107BlockScaledPersistentDenseGemmMixedClustersKernel,
+    _retire_tmem_loads,
 )
 
 from .mxfp8_fp8_out_epilogue import epilogue_tma_store_fp8
@@ -616,6 +614,8 @@ class K3Sm107MXFP8Fp8OutGemmKernel(Sm107BlockScaledPersistentDenseGemmKernel):
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
+        # Initialize the allocator before the warp roles diverge.
+        tmem.allocate(self.num_tmem_alloc_cols)
 
         #
         # Construct the scheduler
@@ -1026,11 +1026,6 @@ class K3Sm107MXFP8Fp8OutGemmKernel(Sm107BlockScaledPersistentDenseGemmKernel):
         #
         if warp_idx < self.mma_warp_id:
             #
-            # Alloc tensor memory buffer
-            #
-            tmem.allocate(self.num_tmem_alloc_cols)
-
-            #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
             tmem.wait_for_alloc()
@@ -1066,7 +1061,7 @@ class K3Sm107MXFP8Fp8OutGemmKernel(Sm107BlockScaledPersistentDenseGemmKernel):
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
-                if cutlass.const_expr(self.split_k > 1):
+                if cutlass.const_expr(self.split_k > 1 and not self.split_k_partials):
                     mma_tile_coord_mnl = (
                         mma_tile_coord_mnl[0],
                         mma_tile_coord_mnl[1],
@@ -1096,7 +1091,7 @@ class K3Sm107MXFP8Fp8OutGemmKernel(Sm107BlockScaledPersistentDenseGemmKernel):
                     tCgC,
                     epi_tile,
                     epi_tiles_executed,
-                    lambda x: epilogue_op(alpha_value * x),
+                    lambda x: epilogue_op(alpha_value * _retire_tmem_loads(x)),
                     mma_tile_coord_mnl,
                     acc_consumer_state,
                     acc_pipeline,
@@ -1104,12 +1099,6 @@ class K3Sm107MXFP8Fp8OutGemmKernel(Sm107BlockScaledPersistentDenseGemmKernel):
                 )
 
             c_pipeline.producer_tail()
-
-            #
-            # Dealloc the tensor memory buffer
-            #
-            tmem.relinquish_alloc_permit()
-            tmem.free(acc_tmem_ptr)
 
         #
         # Specialized scheduler warp (CLC dynamic only)
@@ -1131,6 +1120,12 @@ class K3Sm107MXFP8Fp8OutGemmKernel(Sm107BlockScaledPersistentDenseGemmKernel):
                     clc_pipeline.consumer_release(clc_consumer_state)
                     clc_consumer_state.advance()
                 clc_pipeline.producer_tail(clc_producer_state)
+
+        # All roles must drain their pipelines before TMEM can be released.
+        cute.arch.sync_threads()
+        if warp_idx < self.mma_warp_id:
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem.retrieve_ptr(self.acc_dtype))
 
     @staticmethod
     def can_implement(

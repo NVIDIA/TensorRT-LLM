@@ -35,6 +35,61 @@ from tensorrt_llm.mapping import Mapping
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    ("model_kind", "has_ple"),
+    [
+        ("plain", False),
+        ("text", False),
+        ("text", True),
+        ("vlm", False),
+        ("vlm", True),
+        ("compiled_text", False),
+        ("compiled_text", True),
+        ("compiled_vlm", False),
+        ("compiled_vlm", True),
+    ],
+)
+def test_context_promotion_follows_qwen4_exp_ple(model_kind: str, has_ple: bool) -> None:
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import (
+        Qwen4ExpForCausalLM,
+        Qwen4ExpForConditionalGeneration,
+    )
+
+    model = torch.nn.Identity()
+    if model_kind != "plain":
+        text_model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+        torch.nn.Module.__init__(text_model)
+        text_model.model = torch.nn.Identity()
+        text_model.model.has_ple = has_ple
+        if model_kind.startswith("compiled"):
+            # Production compiles the decoder inside the causal LM.
+            text_model.model = torch.compile(text_model.model, backend="eager")
+        model = text_model
+        if "vlm" in model_kind:
+            model = Qwen4ExpForConditionalGeneration.__new__(Qwen4ExpForConditionalGeneration)
+            torch.nn.Module.__init__(model)
+            model.llm = text_model
+
+    graphs = decoder_graphs(decoder_config(), model=model)
+    graphs.cuda_graph_runner.enabled = True
+    context = _make_request_stub(10, prompt_len=1)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [context]
+
+    graph_batch, promoted_ids = graphs.promote_final_contexts(
+        batch,
+        SimpleNamespace(context_swa_layer_limit=None),
+        enable_spec_decode=False,
+        runtime_draft_len=0,
+        ced_enabled=False,
+    )
+
+    blocked = model_kind != "plain" and has_ple
+    assert promoted_ids == (frozenset() if blocked else frozenset({10}))
+    assert (graph_batch is batch) is blocked
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     ("runner_type", "graphs_path"),
     [
         (

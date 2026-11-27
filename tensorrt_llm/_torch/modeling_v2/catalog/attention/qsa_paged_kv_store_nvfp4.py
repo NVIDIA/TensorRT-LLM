@@ -395,7 +395,7 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
     of K are the caller's; the QSA index plane is not touched.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     CELLS: tuple[Cell, ...] = (
         Cell(

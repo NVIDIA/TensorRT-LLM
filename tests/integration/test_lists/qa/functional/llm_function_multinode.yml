@@ -57,7 +57,7 @@ tests:
     launch:
       mode: mpi
       world_size: 8
-  - case: accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp8::test_gsm8k TIMEOUT (60)
+  - case: accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp8::test_gsm8k_piecewise_cuda_graph TIMEOUT (60)
     launch:
       mode: mpi
       world_size: 8
@@ -75,6 +75,11 @@ tests:
       mode: mpi
       world_size: 8
   - case: accuracy/modeling_v2/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep/test_accuracy.py::TestModelingV2MiniMaxM31FlashNvfp4Sm107Dep::test_dspark_gsm8k TIMEOUT (60)
+    launch:
+      mode: mpi
+      world_size: 8
+  # ModelingV2 Qwen3.8-Flash-Next NVFP4: attention DP over two nodes of four GPUs, three drafts.
+  - case: accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k[dep8] TIMEOUT (60)
     launch:
       mode: mpi
       world_size: 8

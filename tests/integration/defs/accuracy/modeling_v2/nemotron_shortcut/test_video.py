@@ -19,6 +19,7 @@ def test_decoded_video_frames(model_root, precision, tmp_path):
     from transformers import AutoTokenizer
 
     from tensorrt_llm.inputs.media_io import VideoMediaIO
+    from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
     from tensorrt_llm.inputs.registry import (
         create_input_processor,
         create_input_processor_with_hash,
@@ -43,8 +44,10 @@ def test_decoded_video_frames(model_root, precision, tmp_path):
             writer.write(frame)
     finally:
         writer.release()
-    video_options = processor.get_preferred_media_io_kwargs()["video"]
-    decoded = VideoMediaIO.create(video_options, {}).load_bytes(clip.read_bytes())
+    media_config = MultimodalServerConfig(media_io_kwargs=processor.get_preferred_media_io_kwargs())
+    decoded = VideoMediaIO.create(media_config.media_io_kwargs["video"], {}).load_bytes(
+        clip.read_bytes()
+    )
     indices = decoded.metadata["frames_indices"]
     # Eight frames at 4 FPS, sampled by the shared reader at 2 FPS.
     assert len(decoded.frames) == len(indices) == 4
