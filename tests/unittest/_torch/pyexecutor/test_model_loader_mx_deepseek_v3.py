@@ -15,6 +15,7 @@
 """MX post-transform qualification tests for the DeepSeek-V3 MLA + CUTLASS MoE root."""
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -262,6 +263,63 @@ def _hf_checkpoint_loader(state_dict: dict[str, torch.Tensor]):
         model.load_weights(dict(state_dict))
 
     return _load
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("attention_dp", [False, True], ids=["unaligned-tp", "replicated-adp"])
+def test_fp8_kv_b_proj_dequant_uses_global_scale_rows(
+    monkeypatch: pytest.MonkeyPatch, attention_dp: bool
+) -> None:
+    # At TP2 rank 1, head 4 starts at row 192, halfway through a 128-row scale block.
+    config = _hf_config(num_attention_heads=8, qk_nope_head_dim=32, v_head_dim=16, kv_lora_rank=16)
+    local_heads = 8 if attention_dp else 4
+    model = nn.Module()
+    model.config = config
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_size=2, tp_rank=1, cp_size=1, cp_rank=0, enable_attention_dp=attention_dp
+        ),
+        quant_config=QuantConfig(exclude_modules=["kv_b_proj"]),
+        sparse_attention_config=None,
+    )
+    attention = model.self_attn = nn.Module()
+    attention.kv_b_proj = nn.Linear(16, local_heads * 48, bias=False, dtype=torch.bfloat16)
+    attention.k_b_proj_trans = torch.empty(local_heads, 16, 32, dtype=torch.bfloat16)
+    attention._bind_v_b_proj_weight = MagicMock()
+
+    # Use CPU block scaling in place of the CUDA kernel. The loader still selects
+    # the weight and scale rows and rearranges the three destination projections.
+    def dequant(weight, scales, block_size=128):
+        return weight.float() * scales.repeat_interleave(block_size, dim=0)[: weight.size(0)]
+
+    transfer_shapes = []
+
+    def record_transfer(tensor):
+        transfer_shapes.append(tensor.shape)
+        return tensor
+
+    dequantize = MagicMock(wraps=dequant)
+    monkeypatch.setattr(torch.Tensor, "cuda", record_transfer)
+    monkeypatch.setattr(modeling_deepseekv3_mod, "weight_dequant", dequantize)
+    weight = (torch.arange(384 * 16).reshape(384, 16) % 7).to(torch.float8_e4m3fn)
+    scales = torch.tensor([[1.0], [2.0], [4.0]])
+    modeling_deepseekv3_mod.DeepseekV3WeightLoader(model).load_weights(
+        {"self_attn.kv_b_proj.weight": weight, "self_attn.kv_b_proj.weight_scale_inv": scales}
+    )
+
+    full = dequant(weight, scales, 128).to(torch.bfloat16).reshape(8, 48, 16)
+    heads = full if attention_dp else full[4:]
+    k, v = heads.split([32, 16], dim=1)
+    assert torch.equal(attention.kv_b_proj.weight, torch.cat([k.flatten(0, 1), v.flatten(0, 1)]))
+    assert torch.equal(attention.k_b_proj_trans, k.transpose(1, 2))
+    attention._bind_v_b_proj_weight.assert_called_once()
+    assert torch.equal(attention._bind_v_b_proj_weight.call_args.args[0], v)
+
+    # TP needs two aligned scale blocks; replicated attention needs the full checkpoint.
+    expected_shapes = [(384, 16), (3, 1)] if attention_dp else [(256, 16), (2, 1)]
+    assert transfer_shapes == expected_shapes
+    dequantize.assert_called_once()
+    assert [arg.shape for arg in dequantize.call_args.args[:2]] == expected_shapes
 
 
 def _qualify(model: nn.Module) -> PostTransformQualificationDecision:
