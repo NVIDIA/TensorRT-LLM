@@ -209,7 +209,10 @@ def test_decode_forms_line_names_what_engaged(monkeypatch):
         tep_fast=True,
         tep_draft_layer=True,
         tep_proj=False,
+        tep_gqa_e4m3=True,
     )
     line = M._decode_forms(tep)
     assert "decode front rows [4, 16]" in line and "draft layer True" in line
     assert "finar False" in line and "proj split-k False" in line
+    assert "finar shared False" in line and "index prefetch False" in line
+    assert "gqa e4m3 True" in line and "index key fp8 False" in line
