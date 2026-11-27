@@ -20,7 +20,38 @@ import sys
 from pathlib import Path
 
 from setuptools import find_namespace_packages, find_packages, setup
+from setuptools.command.build_py import build_py
 from setuptools.dist import Distribution
+
+
+class MsaBuildPy(build_py):
+    """Stage the complete FMHA package afresh for each wheel build."""
+
+    def run(self) -> None:
+        import shutil
+
+        if getattr(self, "editable_mode", False):
+            return super().run()
+        package_dir = Path(self.build_lib) / "fmha_sm100"
+        source = Path(self.get_package_dir("fmha_sm100"))
+        source_dir = source.resolve()
+        if (package_dir.parent.resolve() /
+                package_dir.name == source.parent.resolve() / source.name):
+            raise RuntimeError(
+                f"Refusing to stage over the FMHA source package: {package_dir}"
+            )
+        if package_dir.is_symlink():
+            package_dir.unlink()
+        else:
+            staged = package_dir.resolve()
+            if (staged == source_dir or staged.is_relative_to(source_dir)
+                    or source_dir.is_relative_to(staged)):
+                raise RuntimeError(
+                    f"Refusing to clean or stage inside the FMHA source package: {package_dir}"
+                )
+            if package_dir.exists():
+                shutil.rmtree(package_dir)
+        super().run()
 
 
 def parse_requirements(filename: os.PathLike):
@@ -743,6 +774,7 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
+    cmdclass={"build_py": MsaBuildPy},
     options=get_build_state_options(),
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
@@ -759,6 +791,8 @@ setup(
             'cutlass/include/**/*',
             'cutlass/tools/util/include/**/*',
             'cutlass/LICENSE.txt',
+            '_aot/*/*.so',
+            '_aot/*/*.json',
         ],
         **msa_vllm_package_data,
         **nccl_extensions_package_data,

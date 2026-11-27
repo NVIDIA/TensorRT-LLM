@@ -62,6 +62,22 @@ def test_wheel_contains_serving_schemas(tmp_path: Path, missing_schema: bool) ->
     if missing_schema:
         (staging / "tensorrt_llm/schemas/trtllm-serve-config.schema.json").unlink()
 
+    fmha = staging / "3rdparty/fmha_sm100"
+    for relative in (
+        "csrc/renamed.h",
+        "csrc/kept.h",
+        "cutlass/include/cutlass/deleted.h",
+        "cutlass/include/cutlass/kept.h",
+        "_aot/old/manifest.json",
+        "_aot/old/kernel.so",
+    ):
+        path = fmha / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture")
+    build = tmp_path / "build-state"
+    build.mkdir()
+    (staging / "build").symlink_to(build, target_is_directory=True)
+
     env = os.environ.copy()
     for name in (
         "TRTLLM_USE_PRECOMPILED",
@@ -86,6 +102,8 @@ def test_wheel_contains_serving_schemas(tmp_path: Path, missing_schema: bool) ->
     wheels = list((staging / "dist").glob("*.whl"))
     assert len(wheels) == 1
     with zipfile.ZipFile(wheels[0]) as wheel:
+        assert "fmha_sm100/_aot/old/kernel.so" in wheel.namelist()
+        assert "fmha_sm100/csrc/renamed.h" in wheel.namelist()
         scripts = {Path(name).name for name in wheel.namelist() if ".data/scripts/" in name}
         assert {
             "trtllm-llmapi-launch",
@@ -102,3 +120,36 @@ def test_wheel_contains_serving_schemas(tmp_path: Path, missing_schema: bool) ->
         assert names == expected
         for name in names:
             assert wheel.read(name) == (_REPO_ROOT / name).read_bytes()
+
+    (fmha / "csrc/renamed.h").rename(fmha / "csrc/new.h")
+    (fmha / "cutlass/include/cutlass/deleted.h").unlink()
+    shutil.rmtree(fmha / "_aot")
+    new = fmha / "_aot/new/kernel.so"
+    new.parent.mkdir(parents=True)
+    new.write_bytes(b"new")
+    result = subprocess.run(
+        [sys.executable, "setup.py", "bdist_wheel"],
+        cwd=staging,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    with zipfile.ZipFile(wheels[0]) as wheel:
+        entries = set(wheel.namelist())
+        assert {
+            "fmha_sm100/csrc/kept.h",
+            "fmha_sm100/csrc/new.h",
+            "fmha_sm100/cutlass/include/cutlass/kept.h",
+            "fmha_sm100/_aot/new/kernel.so",
+        } <= entries
+        assert (
+            not {
+                "fmha_sm100/csrc/renamed.h",
+                "fmha_sm100/cutlass/include/cutlass/deleted.h",
+                "fmha_sm100/_aot/old/kernel.so",
+                "fmha_sm100/_aot/old/manifest.json",
+            }
+            & entries
+        )

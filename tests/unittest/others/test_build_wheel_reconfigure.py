@@ -11,8 +11,10 @@ fix fingerprints the configure arguments into
 reconfigure when the fingerprint changes.
 """
 
+import ast
 import importlib.util
 import sys
+from argparse import ArgumentParser
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,15 @@ def build_wheel():
     spec.loader.exec_module(module)
     yield module
     sys.modules.pop(spec.name, None)
+
+
+@pytest.mark.parametrize("option", ["--job_count", "-j"])
+def test_job_count_cli_is_an_integer_for_fmha_build(build_wheel, option):
+    parser = ArgumentParser()
+    build_wheel.add_arguments(parser)
+    jobs = parser.parse_args([option, "48"]).job_count
+    assert isinstance(jobs, int)
+    assert jobs == 48
 
 
 def test_fingerprint_ignores_argument_order(build_wheel):
@@ -185,3 +196,85 @@ def test_explicit_configure_modes_are_left_to_the_caller(build_wheel, tmp_path, 
     # the way (and must not fire on a mismatch it did not need to handle).
     _record(build_wheel, tmp_path, "old")
     assert _reason(build_wheel, tmp_path, "cur", **{mode: True}) is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_msa_aot_cli_is_explicit_opt_in(build_wheel, enabled):
+    parser = ArgumentParser()
+    build_wheel.add_arguments(parser)
+    assert parser.parse_args(["--msa_aot"] if enabled else []).msa_aot is enabled
+
+
+def test_main_passes_msa_aot_gate_to_real_staging_function():
+    tree = ast.parse(_BUILD_WHEEL.read_text())
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    call = next(
+        n
+        for n in ast.walk(main)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "stage_msa_package"
+    )
+    gate = next(kw.value for kw in call.keywords if kw.arg == "enabled")
+    code = compile(ast.Expression(gate), str(_BUILD_WHEEL), "eval")
+    for enabled, windows, skip, expected in [
+        (False, False, False, False),
+        (True, False, False, True),
+        (True, True, False, False),
+        (True, False, True, False),
+    ]:
+        assert (
+            eval(code, {"msa_aot": enabled, "on_windows": windows, "skip_building_wheel": skip})
+            is expected
+        )
+
+
+def test_msa_staging_runs_worker_only_when_enabled(build_wheel, tmp_path, monkeypatch):
+    build = tmp_path / "build"
+    source = build / "_deps/msa-src/python/fmha_sm100"
+    for name in ("__init__.py", "jit.py", "cute/interface.py", "csrc/kept.h"):
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fixture")
+    for name in ("LICENSE", "NOTICE"):
+        (source.parents[1] / name).write_text("fixture")
+    for name in ("include/cutlass/kept.h", "tools/util/include/kept.h", "LICENSE.txt"):
+        target = build / "_deps/cutlass-src" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fixture")
+    compiler = "/configured/cuda/bin/nvcc"
+    (build / "CMakeCache.txt").write_text(f"CMAKE_CUDA_COMPILER:FILEPATH={compiler}\n")
+    project, staging = tmp_path / "project", tmp_path / "package"
+    destination = staging / "3rdparty/fmha_sm100"
+    calls = []
+
+    def run_worker(command, **kwargs):
+        calls.append((command, kwargs))
+        artifact = destination / "_aot/old/fixture.so"
+        artifact.parent.mkdir(parents=True)
+        artifact.touch()
+
+    monkeypatch.setattr(build_wheel, "run", run_worker)
+    args = (project, staging, build, Path("/python"), "100;103", 48)
+    build_wheel.stage_msa_package(*args)
+    assert not calls
+    build_wheel.stage_msa_package(*args, enabled=True)
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command == [
+        "/python",
+        str(project / "scripts/build_msa_aot.py"),
+        str(destination),
+        str(build / "_deps/msa-src/scripts/warmup_fmha_sm100.py"),
+        "100;103",
+        "8",
+        "--build-dir",
+        str(build),
+    ]
+    assert kwargs["check"] is True
+    assert kwargs["env"]["CMAKE_CUDA_COMPILER"] == compiler
+    assert (destination / "_aot").is_dir()
+    build_wheel.stage_msa_package(*args)
+    assert len(calls) == 1
+    assert not (destination / "_aot").exists()
+    assert (destination / "csrc/kept.h").is_file()
