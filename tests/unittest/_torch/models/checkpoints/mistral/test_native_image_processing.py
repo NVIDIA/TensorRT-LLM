@@ -277,9 +277,10 @@ def test_token_ids_carry_whole_image_grids_without_reencoding(native_processor):
     first, second = (encoded[a:b] for a, b in native_processor._image_blocks(encoded))
     actual = [1, 1000, *first, 2000, *second, 3000]
     assert process(actual)[0] == actual
-    # One [IMG] per image is not a grid: the ids are checked, never expanded.
+    # One [IMG] per image expands to the same grids as the rendered prompt.
     one_marker_each = [1, 1000, img, 2000, img, 3000]
-    for invalid in (one_marker_each, actual[:-2], actual + [img_end], [1, img], [1, img_break]):
+    assert process(one_marker_each)[0] == actual
+    for invalid in (actual[:-2], actual + [img_end], [1, img], [1, img_break]):
         with pytest.raises(ValueError, match="[Ii]mage"):
             process(invalid)
     with pytest.raises(ValueError, match="sizes and order"):
