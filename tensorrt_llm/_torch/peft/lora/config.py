@@ -97,8 +97,11 @@ class LoraConfig(StrictBaseModel):
     max_loras: Optional[int] = Field(
         default=None,
         description=
-        "Maximum number of LoRA adapters that can be loaded simultaneously in GPU memory. "
-        "Controls device-side LoRA cache size.")
+        "Sizes the device-side LoRA cache for this many adapters at "
+        "max_lora_rank, taking precedence over "
+        "peft_cache_config.device_cache_percent when positive. Also sets "
+        "the number of adapter slots in LoRA CUDA graphs (8 when unset). "
+        "See the CUDA Graph Adapter Capacity section of the LoRA guide.")
     max_cpu_loras: Optional[int] = Field(
         default=None,
         description=
