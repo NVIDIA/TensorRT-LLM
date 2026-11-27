@@ -20,7 +20,7 @@ from .....helpers.cute_py_helpers import (
 )
 from .....helpers.dsl_helpers import spin_wait, tma_multicast_mask
 from .....helpers.iket_compat import iket
-from .....helpers.ptx_helpers import TmaCacheHintEvictFirst
+from .....helpers.ptx_helpers import TmaCacheHintEvictFirst, red_add_relaxed_gpu_s32
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.utils import ceil_div, round_up, strides_equal_ignoring_singletons
 from .....quant_def import QuantKind
@@ -1617,8 +1617,15 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         ab_pipeline_state: pipeline.PipelineState,
         acc_pipeline: pipeline.PipelineAsync,
         sched_consumer: SchedulerConsumer,
+        ring_device_workspace=None,
+        ring_retire_region: Optional[str] = None,
     ) -> None:
-        """Run the MMA warp over both FC1 and FC2 work tiles."""
+        """Run the MMA warp over both FC1 and FC2 work tiles.
+
+        With a ring workspace whose blocks are retired by the FC2 operand load (``ring_retire_region`` names the
+        retire counter in ``ring_device_workspace``) the leader CTA also counts every FC2 tile inside the FC2
+        output width for its pool token block.
+        """
         fragment_a = self.tiled_mma.make_fragment_A(self.a_smem_tensor)
         fragment_b = self.tiled_mma.make_fragment_B(self.b_smem_tensor)
 
@@ -1732,6 +1739,18 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 next_ab_pipeline_state.advance()
                 full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
                 acc_pipeline.producer_acquire(acc_producer_state)
+                if cutlass.const_expr(ring_retire_region is not None):
+                    # Ring workspace: the pool token block this tile counts for after its MMAs, held by lane 0;
+                    # -1 in the other lanes and for a tile that does not count (not a routed FC2 tile, or beyond
+                    # the FC2 output). Taken before the K loop, and per lane on purpose: a lane-dependent value
+                    # lives in a general register, which this warp barely uses, while a warp-uniform one would take
+                    # a uniform register across the loop. This region is at the limit of those (later warp roles
+                    # keep theirs live through it), and one more pushes the kernel's warp index to the stack.
+                    ring_retire_block = Int32(-1)
+                    if cute.arch.lane_idx() == Int32(0):
+                        if work_tile.phase == Int32(BlockPhase.Linear2):
+                            if work_tile.tile_m_idx * Int32(self.cta_tile_m) < Int32(self.hidden_size):
+                                ring_retire_block = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
 
                 if is_shared:
                     if cutlass.const_expr(self.fuse_shared):
@@ -1805,6 +1824,24 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                         next_ab_pipeline_state.advance()
                         full_status = next_full_status
 
+                if cutlass.const_expr(ring_retire_region is not None):
+                    # Ring workspace: count this FC2 MMA tile for its token block. The K loop waited for every
+                    # operand stage of the tile, so every operand byte bound for this CTA (with two-CTA
+                    # instructions: for this CTA pair) has landed and the tile no longer reads the block's
+                    # FC1-output rows; a copy multicast to another pair is covered by that pair's count. When
+                    # every in-bound FC2 MMA tile of the block has counted, the block is retired: nothing reads
+                    # its ring slot any more, and token_in may write the next block of that slot (the slot
+                    # lease). This warp counts and not the epilogue: it is idle until the epilogue frees an
+                    # accumulator, the epilogue is not. It counts before the commit: the epilogue of this tile,
+                    # the finalize barrier and the tail reset of the counter all follow the commit, so the count
+                    # of the last tile cannot land after the reset. The add is relaxed: it makes no write of this
+                    # thread visible. Lane 0 alone holds a block. The address is formed here from the buffer
+                    # base (element_ptr), not from a counter pointer made at the kernel entry, which would be
+                    # one more value this region has to carry.
+                    if ring_retire_block >= Int32(0):
+                        red_add_relaxed_gpu_s32(
+                            ring_device_workspace.element_ptr(ring_retire_region, ring_retire_block), Int32(1)
+                        )
                 acc_pipeline.producer_commit(acc_producer_state)
             acc_producer_state.advance()
             work_tile = sched_consumer.consume_work()

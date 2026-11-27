@@ -1,6 +1,6 @@
 """General-purpose CuTe DSL helpers."""
 
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -112,6 +112,21 @@ def spin_wait(
         while not condition(value):
             nanosleep(sleep_cycles)
             value = cute.arch.load(pointer, pointer.dtype, sem="acquire", scope=scope)
+
+
+class ReadyFlag:
+    """A counter a producer raises to ``target``, read with acquire loads at ``scope`` (see ``wait_ready``)."""
+
+    def __init__(self, pointer: Pointer, target: Union[int, Int32], scope: str = "gpu") -> None:
+        self.pointer = pointer
+        self.target = target
+        self.scope = scope
+
+
+@cute.jit
+def wait_ready(flag: ReadyFlag, sleep_cycles: int = 150) -> None:
+    """Every calling thread polls until the flag reaches its target."""
+    spin_wait(flag.pointer, lambda value: value == Int32(flag.target), scope=flag.scope, sleep_cycles=sleep_cycles)
 
 
 def _tma_multicast_pattern(
@@ -232,4 +247,13 @@ def tma_multicast_mask(
     return Int16(result)
 
 
-__all__ = ["mark_alignment", "smem_exclusive_prefix", "spin_peek", "spin_wait", "tma_multicast_mask"]
+
+__all__ = [
+    "ReadyFlag",
+    "mark_alignment",
+    "smem_exclusive_prefix",
+    "spin_peek",
+    "spin_wait",
+    "tma_multicast_mask",
+    "wait_ready",
+]

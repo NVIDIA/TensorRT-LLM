@@ -29,10 +29,11 @@ TmaAtomOrPair = Union[cute.CopyAtom, Tuple[cute.CopyAtom, cute.CopyAtom]]
 @cute.jit
 def make_executable_tma_atom(atom: cute.CopyAtom) -> cute.CopyAtom:
     """Materialize a bare executable TMA atom without per-issue fields."""
-    executable_value = _cute_nvgpu_ir.atom_make_exec_tma(atom._trait.value)
     if cutlass.const_expr(isinstance(atom._trait, CopyBulkTensorTileG2SMulticastNonExecTrait)):
+        executable_value = _cute_nvgpu_ir.atom_make_exec_tma(atom._trait.value)
         executable_trait = CopyBulkTensorTileG2SMulticastTrait(executable_value)
     elif cutlass.const_expr(isinstance(atom._trait, CopyBulkTensorTileG2SNonExecTrait)):
+        executable_value = _cute_nvgpu_ir.atom_make_exec_tma(atom._trait.value)
         executable_trait = CopyBulkTensorTileG2STrait(executable_value)
     else:
         raise TypeError(f"Unsupported non-executable TMA load trait {type(atom._trait)}.")

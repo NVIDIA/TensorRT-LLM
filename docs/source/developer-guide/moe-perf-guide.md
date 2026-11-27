@@ -412,7 +412,7 @@ All three options switch for the same reason. Every configuration pays two kinds
 
 An NVL72 system keeps up to 72 GPUs in one domain, while B300 keeps 8 per node. Once expert parallelism extends beyond that, the tokens go over the network, where per-GPU bandwidth drops. The same bytes then cost close to twenty times more, which moves every crossover earlier and is why the cross-domain branch switches on absolute dispatch bytes (`dispatch_KB`) rather than on a token count (`activated_tokens_per_rank`).
 
-> The thresholds above were obtained from sweeps over typical workloads on key models, all measured with `--use_low_precision_moe_combine` enabled. This flag speeds up `NVLINK_ONE_SIDED` by about 4% while leaving the fused `NONE` path untouched.
+> The thresholds above were obtained from sweeps over typical workloads on key models, all measured with `--use_low_precision_moe_combine` enabled. This flag speeds up `NVLINK_ONE_SIDED` by about 4% while leaving the fused `NONE` path untouched on these GPUs. On SM107, `MEGAMOE_CUTEDSL` combines capacity rungs of at least 4096 tokens per rank in MXFP8 under this flag.
 
 ### Typical Deployment Scenarios
 

@@ -32,11 +32,22 @@ class BlockScaledSwapAbFc12Extension:
     fc1_done_counter_pointer: Pointer
     fc2_spin_threshold: Int32
     fc1_ready_counter_pointer: Optional[Pointer] = None
+    # Ring workspace (0: off). The dispatched-token pool and the FC1 output hold ``ring_token_blocks`` token
+    # blocks instead of the worst case: pool token block b lives in slot b % ring_token_blocks, a slot is
+    # ``ring_data_rows_per_block`` data rows (one token tile) and ``ring_sf_rows_per_block`` scale rows, a whole
+    # multiple of the data rows (the kernels validate the ring and its token tile when they are constructed).
+    ring_token_blocks: int = 0
+    ring_data_rows_per_block: int = 0
+    ring_sf_rows_per_block: int = 0
 
     def __post_init__(self) -> None:
         if self.sf_vec_size <= 0:
             raise ValueError(f"sf_vec_size must be positive, got {self.sf_vec_size}.")
         object.__setattr__(self, "fc2_spin_threshold", Int32(self.fc2_spin_threshold))
+
+    @property
+    def ring_enabled(self) -> bool:
+        return self.ring_token_blocks > 0
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -70,12 +81,22 @@ class BlockScaledSwapAbFc12Extension:
             fc1_done_counter_pointer=fc1_done_counter_pointer,
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
+            ring_token_blocks=self.ring_token_blocks,
+            ring_data_rows_per_block=self.ring_data_rows_per_block,
+            ring_sf_rows_per_block=self.ring_sf_rows_per_block,
         )
 
     @cute.jit
     def prepare_work_tile(self, work_tile: SwapAbFc12WorkTileInfo) -> SwapAbFc12WorkTileInfo:
-        """Pack kernel readiness observations into the published tile flags."""
+        """Pack kernel readiness observations into the published tile flags.
+
+        With a ring workspace the tile is also republished in block form (the last branch).
+        """
         phase_and_flags = work_tile.phase_and_flags
+        tile_n_idx = work_tile.tile_n_idx
+        data_physical_row = work_tile.cumulative_data_physical_row
+        sf_physical_row = work_tile.cumulative_sf_physical_row
+        token_block_count = work_tile.cumulative_token_block_count
         if work_tile.is_valid_tile:
             counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
             is_fc1 = work_tile.phase == Int32(BlockPhase.Linear1)
@@ -96,13 +117,26 @@ class BlockScaledSwapAbFc12Extension:
                     peek_flag = Int32(peek_ready_bit)
                 phase_and_flags = work_tile.phase_and_flags | peek_flag
 
+            if cutlass.const_expr(self.ring_enabled):
+                # A tile is published in block form: the token block is the whole tile (tile_n_idx 0),
+                # cumulative_token_block_count is the pool token block itself, the data row is the absolute pool
+                # row of the block (metadata, scores and per-token scales stay pool-indexed) and the scale row is
+                # the row of the block's ring slot. Every consumer that adds tile_n_idx * tile to a base keeps
+                # working, and the ring pools are addressed from the scale row alone (see get_gmem_tensor).
+                data_physical_row = work_tile.cumulative_data_physical_row + work_tile.tile_n_idx * Int32(
+                    self.ring_data_rows_per_block
+                )
+                sf_physical_row = (counter_slot % Int32(self.ring_token_blocks)) * Int32(self.ring_sf_rows_per_block)
+                token_block_count = counter_slot
+                tile_n_idx = Int32(0)
+
         return SwapAbFc12WorkTileInfo(
             expert_idx=work_tile.expert_idx,
             tile_m_idx=work_tile.tile_m_idx,
-            tile_n_idx=work_tile.tile_n_idx,
-            cumulative_data_physical_row=(work_tile.cumulative_data_physical_row),
-            cumulative_sf_physical_row=(work_tile.cumulative_sf_physical_row),
-            cumulative_token_block_count=(work_tile.cumulative_token_block_count),
+            tile_n_idx=tile_n_idx,
+            cumulative_data_physical_row=data_physical_row,
+            cumulative_sf_physical_row=sf_physical_row,
+            cumulative_token_block_count=token_block_count,
             valid_tokens_in_cta_tile=(work_tile.valid_tokens_in_cta_tile),
             phase_and_flags=phase_and_flags,
         )
@@ -127,6 +161,11 @@ class BlockScaledSwapAbFc12Extension:
         expert_idx = work_tile.expert_idx
         data_token_offset = work_tile.cumulative_data_physical_row
         sf_token_offset = work_tile.cumulative_sf_physical_row
+        # Row of the token block in the pools read as B and written as C. With a ring workspace the tile carries
+        # its ring scale row (prepare_work_tile); the data row of the slot follows from it.
+        pool_token_offset = data_token_offset
+        if cutlass.const_expr(self.ring_enabled):
+            pool_token_offset = sf_token_offset // Int32(self.ring_sf_rows_per_block // self.ring_data_rows_per_block)
         shape = tensor.shape
         stride = tensor.stride
         singleton = Int32(1)
@@ -136,7 +175,7 @@ class BlockScaledSwapAbFc12Extension:
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name == "b"):
-            result = cute.domain_offset((data_token_offset, 0, 0), tensor)
+            result = cute.domain_offset((pool_token_offset, 0, 0), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name == "sfa"):
@@ -152,7 +191,7 @@ class BlockScaledSwapAbFc12Extension:
             return (cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)), None)
 
         if cutlass.const_expr(tensor_name == "c"):
-            result = cute.domain_offset((data_token_offset, 0, 0), tensor)
+            result = cute.domain_offset((pool_token_offset, 0, 0), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name in ("topk", "fc1_act_scale")):

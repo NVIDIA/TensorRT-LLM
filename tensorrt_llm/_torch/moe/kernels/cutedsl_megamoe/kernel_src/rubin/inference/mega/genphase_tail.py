@@ -1,22 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Generation-phase kernel tail: one arrival counter, one cross-rank barrier.
+"""Generation-phase kernel tail: one arrival counter and, only where it is needed, one cross-rank barrier.
 
-The tail has to guarantee three things before the next call can touch this rank:
+The tail has to guarantee before the next call can touch this rank:
 
   1. every CTA of this rank has finished (its counters are no longer read),
-  2. the tail-reset span is zero again,
-  3. every peer has finished its FC2 stores into this rank's pre-reduced plane
-     (the top-k reduce reads it) and has itself finished 1 and 2 (the next
-     call's communication writes into its counters).
+  2. the tail-reset span is zero again (rank-local state: only this rank's CTAs touch it),
+  3. in-kernel reduce builds only: every peer has finished its reduce-adds into this rank's output.
+     That is a real cross-rank dependency (``cross_rank_barrier``). Standalone-reduce builds have none:
+     the reduce polls its own cells, and the cross-rank ready counters are not in the tail-reset span
+     (they count in two slots that alternate direction and are never reset), so no peer has to be told
+     that a reset happened.
 
-Instead of two grid-wide syncs around a CTA-parallel reset, every CTA arrives
-once on a local counter and leaves; the CTA whose arrival completes the count
-(it has acquired every other arrival) resets the small tail span itself and then
-runs the sense-reversing all-rank barrier alone. The barrier alternates between
-two signal slots and between counting up and down, keyed by a per-call epoch that
-lives in the workspace like the baseline's phase counter, so its signals never
-need resetting.
+Instead of two grid-wide syncs around a CTA-parallel reset, every CTA arrives once on a local counter
+and leaves; the CTA whose arrival completes the count (it has acquired every other arrival) resets the
+small tail span itself, then either runs the sense-reversing all-rank barrier alone (in-kernel reduce) or
+just advances the epoch (standalone reduce). The barrier alternates between two signal slots and between
+counting up and down, keyed by a per-call epoch that lives in the workspace like the baseline's phase
+counter, so its signals never need resetting.
 """
 
 from typing import ClassVar
@@ -98,34 +99,17 @@ class GenphaseTail:
             pass
 
     @cute.jit
-    def signal_done(self, workspace: DeviceWorkspace, peer_rank_ptr_mapper, epoch: Int32) -> None:
-        """Single thread: the barrier's arrival half only. Tells every rank that this
-        rank has reset its tail span for call ``epoch``; the next call's communication
-        kernel waits for it (``wait_previous_done``) before it adds into a peer's
-        tail-reset counters.
+    def advance_epoch(self, workspace: DeviceWorkspace, epoch: Int32) -> None:
+        """Single thread: publish this rank's tail as complete for call ``epoch`` (standalone-reduce builds).
 
-        System fence: the peer that acquires the signal (sys scope) then adds into this
-        rank's tail-reset counters, so the reset has to be released at the scope of that
-        observer; a gpu-scope fence is only morally strong against gpu-scope readers. The
-        FC2 stores still in flight to peers carry their own arrival through the
-        self-validating combine plane and are not what this fence is for.
+        Nothing is signalled to the peers. A peer never touches this rank's tail-reset span: the cross-rank
+        ready counters count in two slots that alternate direction (see ``GenphaseTokenComm.ready_counter_slot``)
+        and are never reset, so no peer has to learn that a reset happened. The epoch is released behind a
+        gpu-scope fence because its readers are on this GPU: the next call's communication kernel (entry wait),
+        and the standalone reduce's last CTA.
         """
-        status = epoch & Int32(3)
-        signal_phase = status & Int32(1)
-        signal_delta = Int32(1)
-        if (status >> Int32(1)) != Int32(0):
-            signal_delta = Int32(-1)
-        # The epoch first, behind a gpu-scope release: the standalone reduce's last CTA waits for it,
-        # so it must not sit behind the system fence that the peer-facing signals need.
         cute.arch.fence_acq_rel_gpu()
         cute.arch.store(workspace.ptr(self.epoch_region), epoch + Int32(1), sem="relaxed", scope="gpu")
-        cute.arch.fence_acq_rel_sys()
-        signal_address = workspace.ptr(self.signal_region).toint()
-        for destination_rank in cutlass.range_constexpr(self.world_size):
-            red_add_relaxed_sys_s32(
-                peer_rank_ptr_mapper.map(signal_address, Int32(destination_rank), Int64(signal_phase * Int32(4))),
-                signal_delta,
-            )
 
     @cute.jit
     def previous_done_observation(self, workspace: DeviceWorkspace) -> Int32:

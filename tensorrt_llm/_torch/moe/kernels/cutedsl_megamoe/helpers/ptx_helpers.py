@@ -54,6 +54,88 @@ def exit(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] =
 
 
 @dsl_user_op
+def opaque_i32(value, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int32:
+    """Copy ``value`` through a side-effecting move: the result is defined at this
+    program point and cannot be hoisted or merged with an earlier copy."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,r",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def tanh_approx_f32(value, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Float32:
+    """``tanh.approx.f32``: one MUFU.TANH."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "tanh.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def sigmoid_pair_ex2_rcp(pair):
+    """``sigmoid(x) = rcp(1 + exp2(-x * log2e))`` on one f32x2 pair: one ``ex2.approx`` and one ``rcp.approx``
+    (MUFU.EX2 + MUFU.RCP) per element, the epilogue's default sigmoid. The tester's hardware-matched SiTU reference
+    calls this; the epilogue spells out the same packed sequence."""
+    neg_log2e = Float32(-1.4426950408889634)
+    one = Float32(1.0)
+    neg = cute.arch.mul_packed_f32x2(pair, (neg_log2e, neg_log2e))
+    e = (cute.math.exp2(neg[0], fastmath=True), cute.math.exp2(neg[1], fastmath=True))
+    d = cute.arch.add_packed_f32x2(e, (one, one))
+    return (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
+
+
+def sigmoid_pair_tanh_approx(pair):
+    """``sigmoid(x) = 0.5 * tanh(0.5 * x) + 0.5`` on one f32x2 pair: one ``tanh.approx.f32`` (MUFU.TANH) per element
+    instead of the MUFU.EX2 + MUFU.RCP of ``sigmoid_pair_ex2_rcp``. The ``use_tanh_sigmoid`` problem field selects it
+    for the SwiGLU and SiTU cores; the Rubin and Blackwell inference epilogues and the tester's hardware-matched
+    references all call this, so they run the same instruction sequence."""
+    half = (Float32(0.5), Float32(0.5))
+    scaled = cute.arch.mul_packed_f32x2(pair, half)
+    return cute.arch.fma_packed_f32x2((tanh_approx_f32(scaled[0]), tanh_approx_f32(scaled[1])), half, half)
+
+
+def situ_pair_tanh_approx(gate_pair, up_pair, beta: float, linear_beta: Optional[float], sigmoid_gate):
+    """Kimi K3 SiTU on one f32x2 pair, its two tanh on ``tanh.approx.f32`` (one MUFU.TANH each):
+
+        beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta),
+
+    where ``sigmoid_gate`` is sigmoid of the raw gate pair (not the soft-capped one), from
+    ``sigmoid_pair_ex2_rcp`` or, with ``use_tanh_sigmoid``, ``sigmoid_pair_tanh_approx``. The betas fold at trace
+    time into the input scales and one output factor. ``linear_beta=None`` (the Blackwell epilogue accepts it) leaves
+    the up branch unbounded: ``beta * tanh(gate / beta) * sigmoid(gate) * up``. The Rubin and Blackwell inference
+    epilogues and the tester's hardware-matched reference all call this, so they run the same instruction sequence.
+    """
+    def scaled_tanh(pair, scale):
+        scaled = cute.arch.mul_packed_f32x2(pair, (Float32(scale), Float32(scale)))
+        return (tanh_approx_f32(scaled[0]), tanh_approx_f32(scaled[1]))
+
+    tanh_gate = scaled_tanh(gate_pair, 1.0 / beta)
+    if linear_beta is None:
+        soft_up = cute.arch.mul_packed_f32x2(up_pair, (Float32(beta), Float32(beta)))
+    else:
+        tanh_up = scaled_tanh(up_pair, 1.0 / linear_beta)
+        beta_product = Float32(beta * linear_beta)
+        soft_up = cute.arch.mul_packed_f32x2(tanh_up, (beta_product, beta_product))
+    return cute.arch.mul_packed_f32x2(cute.arch.mul_packed_f32x2(tanh_gate, sigmoid_gate), soft_up)
+
+
+@dsl_user_op
 def read_clock64(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int64:
     """Read the per-SM 64-bit cycle counter."""
     return Int64(
@@ -110,6 +192,36 @@ def movmatrix_b16(input_regs: cute.Tensor) -> cute.Tensor:
 
 
 @dsl_user_op
+def fmin_nan(
+    lhs, rhs, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> Float32:
+    """NaN-propagating f32 minimum.
+
+    ``cute.arch.fmin(..., nan=True)`` lowers to this same ``min.NaN.f32``, but that
+    keyword only exists from cutlass-dsl 4.6.1 while ``ci/requirements.txt`` pins
+    4.6.0. Emitting the instruction directly keeps the NaN contract on every DSL
+    build -- dropping it would silently return the non-NaN operand and turn a NaN
+    activation into a finite scale instead of propagating it.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(lhs).ir_value(loc=loc, ip=ip),
+                Float32(rhs).ir_value(loc=loc, ip=ip),
+            ],
+            "min.NaN.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def cvt_f32_to_fp8_to_f32(
     value, fp8_type, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
 ) -> Float32:
@@ -145,6 +257,57 @@ def cvt_f32_to_fp8_to_f32(
     bf16_pair = llvm.bitcast(bf16_pair_type, packed_bf16, loc=loc, ip=ip)
     rounded_bf16 = vector.extract(bf16_pair, [], [0], loc=loc, ip=ip)
     return Float32(arith.extf(Float32.mlir_type, rounded_bf16, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def cvt_f32x2_to_fp8x2_to_f32x2(
+    value0,
+    value1,
+    fp8_type,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+):
+    """Round two f32 values through the selected FP8 format and widen both back."""
+    if cutlass.const_expr(fp8_type is cutlass.Float8E8M0FNU):
+        downcast_instruction = "cvt.rp.satfinite.ue8m0x2.f32"
+        upcast_instruction = "cvt.rn.bf16x2.ue8m0x2"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E4M3FN):
+        downcast_instruction = "cvt.rn.satfinite.e4m3x2.f32"
+        upcast_instruction = "cvt.rn.bf16x2.e4m3x2"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E5M2):
+        downcast_instruction = "cvt.rn.satfinite.e5m2x2.f32"
+        upcast_instruction = "cvt.rn.bf16x2.e5m2x2"
+    else:
+        raise ValueError(f"Unsupported FP8 type {fp8_type}.")
+
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [
+            Float32(value0).ir_value(loc=loc, ip=ip),
+            Float32(value1).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        "  .reg .b16 converted;\n"
+        "  .reg .b32 bf16x2, lo, hi;\n"
+        f"  {downcast_instruction} converted, $3, $2;\n"
+        f"  {upcast_instruction} bf16x2, converted;\n"
+        "  shl.b32 lo, bf16x2, 16;\n"
+        "  and.b32 hi, bf16x2, 0xffff0000;\n"
+        "  mov.b32 $0, lo;\n"
+        "  mov.b32 $1, hi;\n"
+        "}",
+        "=f,=f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
 
 
 @dsl_user_op
@@ -414,6 +577,52 @@ def stg_b64(address: Int64, value: Int64, predicate: Optional[Int32] = None, *, 
 
 
 @dsl_user_op
+def stg_256b_l2_evict_first(
+    address: Int64,
+    v0: Int32,
+    v1: Int32,
+    v2: Int32,
+    v3: Int32,
+    v4: Int32,
+    v5: Int32,
+    v6: Int32,
+    v7: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store 32 bytes in one PTX operation with an L2 evict-first hint.
+
+    Keep the payload as ``v8.b32``: this matches CopyUniversal's original
+    256-bit store. Repacking it as ``v4.b64`` changes the register datapath and
+    measurably regresses the epilogue despite having the same byte width.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            address.ir_value(),
+            v0.ir_value(),
+            v1.ir_value(),
+            v2.ir_value(),
+            v3.ir_value(),
+            v4.ir_value(),
+            v5.ir_value(),
+            v6.ir_value(),
+            v7.ir_value(),
+        ],
+        "{\n"
+        "  st.global.L2::evict_first.v8.b32 "
+        "[$0], {$1, $2, $3, $4, $5, $6, $7, $8};\n"
+        "}",
+        "l,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_relaxed_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
@@ -483,6 +692,24 @@ def red_async_add_release_gpu_s32(
         None,
         [counter_pointer.toint(loc=loc, ip=ip).ir_value(), value.ir_value()],
         "red.async.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_relaxed_gpu_s32(
+    counter_pointer, value: Int32, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> None:
+    """Counter bump with no release ordering: for a count that publishes no data of the issuing thread."""
+    llvm.inline_asm(
+        None,
+        [counter_pointer.toint(loc=loc, ip=ip).ir_value(), value.ir_value()],
+        "red.relaxed.gpu.global.add.s32 [$0], $1;",
         "l,r",
         has_side_effects=True,
         is_align_stack=False,
@@ -565,6 +792,36 @@ def fma_rn_f32x2_bf16x2(
             Int64(acc2).ir_value(loc=loc, ip=ip),
         ],
         "fma.rn.f32x2.bf16x2.f32x2.f32x2 $0, $1, $2, $3;",
+        "=l,r,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
+@dsl_user_op
+def fma_rn_f32x2_bf16x2_unpacked(
+    word, scale2, acc2, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> Int64:
+    """``fma_rn_f32x2_bf16x2`` for sm_100 / sm_103 (no ``fma.f32x2.bf16x2``): widen to f32x2, then ``fma.rn.f32x2``."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [
+            Int32(word).ir_value(loc=loc, ip=ip),
+            Int64(scale2).ir_value(loc=loc, ip=ip),
+            Int64(acc2).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        "  .reg .b32 lo, hi;\n"
+        "  .reg .b64 w2;\n"
+        "  shl.b32 lo, $1, 16;\n"
+        "  and.b32 hi, $1, 0xFFFF0000;\n"
+        "  mov.b64 w2, {lo, hi};\n"
+        "  fma.rn.f32x2 $0, w2, $2, $3;\n"
+        "}",
         "=l,r,l,l",
         has_side_effects=False,
         is_align_stack=False,
@@ -826,12 +1083,38 @@ def stg_e8m0x8_from_f32(
     )
 
 
+@dsl_user_op
+def barrier_sync_unaligned(barrier_id, num_threads, *, loc=None, ip=None):
+    """``barrier.cta.sync id, count`` without ``.aligned``: a named barrier whose participating warps
+    reach it from different code paths (the gen-phase gather rendezvous and TMEM allocation wait).
+
+    TODO(nvidia-cutlass-dsl 4.9): up to the 4.8 wheel ``cute.arch.barrier`` has no ``aligned`` switch and
+    always emits the ``.aligned`` form (``bar.sync``), although ``cute.arch.barrier_arrive`` already takes
+    ``aligned=False``; 4.9 closes that gap. When the project moves to the 4.9 wheel, switch the call sites
+    to ``cute.arch.barrier(..., aligned=False)`` and delete this helper.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[Int32(barrier_id).ir_value(loc=loc, ip=ip), Int32(num_threads).ir_value(loc=loc, ip=ip)],
+        asm_string="barrier.cta.sync $0, $1;",
+        constraints="r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+
 __all__ = [
+    "barrier_sync_unaligned",
     "TmaCacheHintEvictFirst",
     "cp_async_bulk_s2g",
     "cp_reduce_async_bulk_add_bf16_s2g",
     "cp_reduce_async_bulk_add_u32_s2g",
     "cvt_f32_to_fp8_to_f32",
+    "cvt_f32x2_to_fp8x2_to_f32x2",
     "cvt_f32_to_ue8m0_raw_i32",
     "cvt_f32x4_to_f8x4_pack_i32",
     "cvt_f32x4_to_f8x4_scaled4_pack_i32",
@@ -843,7 +1126,9 @@ __all__ = [
     "movmatrix_b16",
     "nanosleep",
     "read_clock64",
+    "opaque_i32",
     "read_globaltimer_ns",
+    "red_add_relaxed_gpu_s32",
     "red_add_relaxed_sys_f32",
     "red_add_relaxed_sys_s32",
     "red_add_relaxed_sys_v2_bf16x2",
@@ -852,6 +1137,7 @@ __all__ = [
     "red_add_release_gpu_s32",
     "red_add_release_sys_s32",
     "store_i32_to_peer_cluster_smem_async",
+    "stg_256b_l2_evict_first",
     "stg_b64",
     "stg_e8m0_from_f32",
     "stg_e8m0x8_from_f32",
@@ -861,5 +1147,6 @@ __all__ = [
     "fence_acq_rel_gpu",
     "f32x2_pack",
     "fma_rn_f32x2_bf16x2",
+    "fma_rn_f32x2_bf16x2_unpacked",
     "cvt_rn_bf16x2_f32x2",
 ]

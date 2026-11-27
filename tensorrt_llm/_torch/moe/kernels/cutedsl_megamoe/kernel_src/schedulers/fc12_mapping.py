@@ -30,12 +30,11 @@ class Fc12WorkTileState(IntEnum):
 
 
 class BlockPhase(IntEnum):
-    """FC1/FC2 phase encoded in one fused work tile."""
+    """FC1/FC2 phase of one fused work tile; ``SharedLinear1/2`` are the shared expert's tiles on the same ABI."""
 
     None_ = 0
     Linear1 = 1
     Linear2 = 2
-    # The fused FP8 shared expert's gate/up and down projections.
     SharedLinear1 = 3
     SharedLinear2 = 4
 
@@ -322,7 +321,17 @@ class Fc12TaskMappingState:
         cursor_state: _Fc12TaskCursorState,
         num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks,
+        expert_split_factor: int = 1,
+        expert_split_chunk_tokens: int = 0,
+        raster_group_n: int | Tuple[int, int] = 0,
     ) -> None:
+        # With expert_split_factor K > 1 the mapper walks K virtual experts per real
+        # expert, each covering at most expert_split_chunk_tokens rows. expert_count is
+        # then the virtual count (real * K); work tiles still report the real expert.
+        self.expert_split_factor = expert_split_factor
+        self.expert_split_chunk_tokens = expert_split_chunk_tokens
+        phase_raster_group_n(raster_group_n)
+        self.raster_group_n = tuple(raster_group_n) if isinstance(raster_group_n, list) else raster_group_n
         self.expert_count = expert_count
         self.mapping_cta_tile_shape_mnk = mapping_cta_tile_shape_mnk
         self.mapping_cluster_shape_mn = mapping_cluster_shape_mn
@@ -391,6 +400,9 @@ class Fc12TaskMappingState:
                 if isinstance(self.num_fc2_hidden_blocks, Int32)
                 else self.num_fc2_hidden_blocks
             ),
+            expert_split_factor=self.expert_split_factor,
+            expert_split_chunk_tokens=self.expert_split_chunk_tokens,
+            raster_group_n=self.raster_group_n,
         )
         if value_index != len(values):
             raise ValueError(
@@ -413,6 +425,9 @@ def create_fc12_task_mapping_state(
     is_swap_ab: bool,
     expert_token_sizes: Optional[cute.Tensor],
     expert_token_prefix_sum: Optional[cute.Tensor],
+    expert_split_factor: int = 1,
+    expert_split_chunk_tokens: int = 0,
+    raster_group_n: int | Tuple[int, int] = 0,
 ) -> Fc12TaskMappingState:
     """Create the register-resident state for one CTA's FC12 mapper."""
     cursor_state = _make_initial_fc12_cursor()
@@ -432,6 +447,9 @@ def create_fc12_task_mapping_state(
         cursor_state=cursor_state,
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks=num_fc2_hidden_blocks,
+        expert_split_factor=expert_split_factor,
+        expert_split_chunk_tokens=expert_split_chunk_tokens,
+        raster_group_n=raster_group_n,
     )
 
 
@@ -493,7 +511,16 @@ def _load_expert_batch_metrics(
 ) -> Tuple[Int32, Int32, Int32, Int32, Int32, Int32, Int32]:
     expert_idx = batch_base + lane_idx
     token_count = Int32(0)
-    if cutlass.const_expr(mapping_state.expert_token_sizes is not None):
+    if cutlass.const_expr(mapping_state.expert_split_factor > 1):
+        if cutlass.const_expr(mapping_state.expert_token_sizes is None):
+            raise ValueError("Expert splitting requires expert_token_sizes.")
+        if expert_idx < mapping_state.expert_count:
+            real_expert = expert_idx // Int32(mapping_state.expert_split_factor)
+            chunk_idx = expert_idx - real_expert * Int32(mapping_state.expert_split_factor)
+            chunk_tokens = Int32(mapping_state.expert_split_chunk_tokens)
+            remaining = mapping_state.expert_token_sizes[real_expert] - chunk_idx * chunk_tokens
+            token_count = cutlass.min(cutlass.max(remaining, Int32(0)), chunk_tokens)
+    elif cutlass.const_expr(mapping_state.expert_token_sizes is not None):
         if expert_idx < mapping_state.expert_count:
             token_count = mapping_state.expert_token_sizes[expert_idx]
     else:
@@ -761,6 +788,45 @@ def _seek_expert_for_work_id(linear_work_id: Int32, mapping_state: Fc12TaskMappi
     return cursor
 
 
+def phase_raster_group_n(raster_group_n) -> Tuple[int, int]:
+    """(Linear1, Linear2) output-block band widths of ``raster_group_n``: one int for both phases or a pair."""
+    pair = tuple(raster_group_n) if isinstance(raster_group_n, (tuple, list)) else (raster_group_n, raster_group_n)
+    if len(pair) != 2 or any(isinstance(group_n, bool) or not isinstance(group_n, int) for group_n in pair):
+        raise ValueError(f"raster_group_n must be an int or a (linear1, linear2) pair of ints, got {raster_group_n!r}.")
+    return pair
+
+
+def _decode_raster_group(
+    local_work_id: Int32, token_block_count: Int32, output_block_count, band_width: int
+) -> Tuple[Int32, Int32]:
+    """(token block, output block) of one tile in the raster_group_n order inside one expert's grid of a phase.
+
+    Bands of ``band_width`` output blocks (the final band is narrower when it does not divide the block count); each
+    band sweeps every token block, visiting its output blocks per token block, so a band's weight slice stays L2
+    resident while the token side streams.  Odd bands sweep the token blocks backwards, so the token rows the
+    previous band ended on are reused from L2.  ``band_width`` 1 is the output-block-major order (one output block
+    per band, token blocks in order); a band covering every output block is the token-major order.
+    """
+    if band_width == 1:  # static (plain Python helper, traced inline)
+        output_block_idx = local_work_id // token_block_count
+        token_block_idx = local_work_id - output_block_idx * token_block_count
+        return token_block_idx, output_block_idx
+    band_tiles = token_block_count * Int32(band_width)
+    band_idx = local_work_id // band_tiles
+    tile_in_band = local_work_id - band_idx * band_tiles
+    band_first_block = band_idx * Int32(band_width)
+    if isinstance(output_block_count, int) and output_block_count % band_width == 0:
+        token_block_idx = tile_in_band // Int32(band_width)
+        output_block_idx = band_first_block + tile_in_band - token_block_idx * Int32(band_width)
+    else:
+        active_width = cutlass.min(Int32(band_width), Int32(output_block_count) - band_first_block)
+        token_block_idx = tile_in_band // active_width
+        output_block_idx = band_first_block + tile_in_band - token_block_idx * active_width
+    odd_band = band_idx & Int32(1)
+    token_block_idx = token_block_idx + odd_band * (token_block_count - Int32(1) - Int32(2) * token_block_idx)
+    return token_block_idx, output_block_idx
+
+
 @cute.jit
 def _decode_inside_expert(
     linear_work_id: Int32, cta_id_in_mapping_cluster: cute.Coord, mapping_state: Fc12TaskMappingState
@@ -768,15 +834,44 @@ def _decode_inside_expert(
     cursor = mapping_state.cursor_state
     cta_tile_m = mapping_state.mapping_cta_tile_shape_mnk[0]
     local_work_id = linear_work_id - cursor.current_expert_tile_start
+    real_expert_idx = cursor.current_expert_idx
+    if cutlass.const_expr(mapping_state.expert_split_factor > 1):
+        real_expert_idx = cursor.current_expert_idx // Int32(mapping_state.expert_split_factor)
 
     cluster_token_block_idx = Int32(0)
     cluster_output_block_idx = Int32(0)
+    # Tile order inside one expert's (token blocks x output blocks) grid of a phase: token-major (token block outer,
+    # the default) or the raster_group_n bands of output blocks (_decode_raster_group; band width 1 = output-block
+    # major).  Correctness does not depend on it -- every tile waits for its own inputs and all of a group's Linear1
+    # work IDs precede its Linear2 ones -- only stalls and L2 reuse do.
+    linear1_group_n = mapping_state.raster_group_n
+    linear2_group_n = mapping_state.raster_group_n
+    if cutlass.const_expr(isinstance(mapping_state.raster_group_n, tuple)):
+        linear1_group_n, linear2_group_n = mapping_state.raster_group_n
     if cursor.current_phase == Int32(BlockPhase.Linear1):
-        cluster_token_block_idx = local_work_id // mapping_state.num_fc1_intermediate_blocks
-        cluster_output_block_idx = local_work_id - cluster_token_block_idx * mapping_state.num_fc1_intermediate_blocks
+        if cutlass.const_expr(linear1_group_n > 0):
+            cluster_token_block_idx, cluster_output_block_idx = _decode_raster_group(
+                local_work_id,
+                cursor.current_token_block_count,
+                mapping_state.num_fc1_intermediate_blocks,
+                linear1_group_n,
+            )
+        else:
+            cluster_token_block_idx = local_work_id // mapping_state.num_fc1_intermediate_blocks
+            cluster_output_block_idx = (
+                local_work_id - cluster_token_block_idx * mapping_state.num_fc1_intermediate_blocks
+            )
     else:
-        cluster_token_block_idx = local_work_id // mapping_state.num_fc2_hidden_blocks
-        cluster_output_block_idx = local_work_id - cluster_token_block_idx * mapping_state.num_fc2_hidden_blocks
+        if cutlass.const_expr(linear2_group_n > 0):
+            cluster_token_block_idx, cluster_output_block_idx = _decode_raster_group(
+                local_work_id,
+                cursor.current_token_block_count,
+                mapping_state.num_fc2_hidden_blocks,
+                linear2_group_n,
+            )
+        else:
+            cluster_token_block_idx = local_work_id // mapping_state.num_fc2_hidden_blocks
+            cluster_output_block_idx = local_work_id - cluster_token_block_idx * mapping_state.num_fc2_hidden_blocks
 
     cta_token_block_idx = (
         cluster_token_block_idx * mapping_state.mapping_cluster_shape_mn[0] + cta_id_in_mapping_cluster[0]
@@ -806,7 +901,7 @@ def _decode_inside_expert(
     valid_tokens_in_cluster_tile = cutlass.min(remaining_cluster_tokens, Int32(cluster_tile_m))
     valid_tokens_in_cta_cluster_tile = (valid_tokens_in_cta_tile << Int32(16)) | valid_tokens_in_cluster_tile
     return NonSwapAbFc12WorkTileInfo(
-        expert_idx=cursor.current_expert_idx,
+        expert_idx=real_expert_idx,
         tile_m_idx=cta_token_block_idx,
         tile_n_idx=cta_output_block_idx,
         cumulative_data_physical_row=cursor.current_data_cumulative,
@@ -914,6 +1009,11 @@ class _PhaseFc12CursorState:
 
 class PhaseInterleavedFc12MappingState:
     """Runtime inputs and independent FC1/FC2 cursors for phase-local IDs."""
+
+    # The stream-extent count (resolve_phase_interleaved_stream_extent) reuses the task mapping's expert-sum helpers,
+    # which read these; the phase-interleaved mapping never splits experts.
+    expert_split_factor = 1
+    expert_split_chunk_tokens = 0
 
     def __init__(
         self,
