@@ -57,6 +57,8 @@ from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+# Leave room for SM107 direct attention and small-row mHC CTAs to share an SM.
+SM107_DECODE_SMEM_CARVEOUT = 58
 # A memory clobber, as in CUTLASS C++: no memory access moves across the asm.
 _PDL_ASM_CONSTRAINTS = "~{memory}"
 

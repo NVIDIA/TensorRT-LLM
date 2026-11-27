@@ -71,6 +71,7 @@ from .guided_decoder import CapturableGuidedDecoder
 from .llm_request import LlmRequest
 from .model_loader import ModelLoader, release_localized_moe_weights
 from .resource_manager import ResourceManager, ResourceManagerType
+from .runtime_hooks import runtime_hooks_of
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -591,6 +592,7 @@ class ModelEngine:
             guided_decoding_enabled=self.llm_args.guided_decoding_backend is not None,
             watermark_config=self.llm_args.watermark_config,
             is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
+            steady_decode_prepare=runtime_hooks_of(self.model).steady_decode_prepare,
             **extra_fields,
         )
 
@@ -661,6 +663,11 @@ class ModelEngine:
     def cuda_graph_padding_enabled(self) -> bool:
         """Return whether decode graph batches are padded to capture sizes."""
         return self._cuda_graph_padding_enabled
+
+    @property
+    def steady_mtp_reads_output_rows(self) -> bool:
+        """Whether the steady MTP prepare reads the previous step's output rows (``steady_decode_prepare``)."""
+        return isinstance(self._runner, DecoderRunner) and self._runner.steady_mtp_reads_output_rows
 
     @property
     def _dspark_confidence_enabled(self) -> bool:
