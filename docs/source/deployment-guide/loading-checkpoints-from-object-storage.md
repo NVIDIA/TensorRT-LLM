@@ -45,7 +45,7 @@ bucket. Include the model name and revision in the prefix so different versions
 do not overwrite each other.
 
 ```bash
-huggingface-cli download Qwen/Qwen3-8B --revision <revision> --local-dir ./Qwen3-8B-<revision>
+hf download Qwen/Qwen3-8B --revision <revision> --local-dir ./Qwen3-8B-<revision>
 
 # Amazon S3
 aws s3 sync ./Qwen3-8B-<revision> s3://<bucket>/checkpoints/Qwen3-8B/<revision>/
