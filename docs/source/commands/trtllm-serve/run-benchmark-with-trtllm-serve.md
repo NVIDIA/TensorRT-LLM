@@ -58,13 +58,18 @@ EOF
 trtllm-serve ${model_path} \
     --max_batch_size 1024 \
     --max_num_tokens 2048 \
-    --max_seq_len 1024 \
+    --max_seq_len 4096 \
     --kv_cache_free_gpu_memory_fraction 0.9 \
     --tp_size 1 \
     --ep_size 1 \
     --trust_remote_code \
     --config ${config_file}
 ```
+
+`--max_seq_len` bounds the combined input and output length. It must cover the
+1024-token input and 1024-token output configured below, plus any special tokens
+added during tokenization.
+
 > [!NOTE]
 > The trtllm-llmapi-launch is a script that launches the LLM-API code on
 > Slurm-like systems, and can support multi-node and multi-GPU setups.

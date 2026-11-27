@@ -166,15 +166,15 @@ def create_helix_gen_metadata(
 # ---------------------------------------------------------------------------
 
 
-def setup_kv_and_metadata(
+def setup_kv_cache(
     scenario,
     mapping: Mapping,
     *,
     cache_type,
     num_kv_heads: int,
     head_dim: int,
-):
-    """Create a :class:`KVCacheManagerV2` and context-phase attention metadata.
+) -> KVCacheManagerV2:
+    """Allocate a :class:`KVCacheManagerV2` and context-plus-generation requests.
 
     The caller supplies the KV-cache geometry that differs between MHA and MLA:
     *cache_type*, *num_kv_heads*, and *head_dim*.  Everything else is read from
@@ -222,6 +222,26 @@ def setup_kv_and_metadata(
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len
+    return kv_cache_manager
+
+
+def setup_kv_and_metadata(
+    scenario,
+    mapping: Mapping,
+    *,
+    cache_type,
+    num_kv_heads: int,
+    head_dim: int,
+):
+    """Create a KV cache and prepared context-phase attention metadata."""
+    kv_cache_manager = setup_kv_cache(
+        scenario,
+        mapping,
+        cache_type=cache_type,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+    ctx_len_per_gpu = scenario.ctx_len // mapping.world_size
     attn_metadata = get_attention_backend("TRTLLM").Metadata(
         seq_lens=torch.tensor([ctx_len_per_gpu] * scenario.batch, dtype=torch.int),
         request_ids=list(range(scenario.batch)),
