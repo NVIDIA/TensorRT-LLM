@@ -264,3 +264,54 @@ def target_logprobs(
             num_warps=1,
         )
     return out
+
+
+def publish_target_logprobs(
+    outputs: dict,
+    logits: torch.Tensor | None,
+    vocab_sharded: bool,
+    spec_metadata,
+) -> None:
+    """Publish the target logprob of every emitted token as ``outputs[OUTPUT_KEY]``.
+
+    Called by ``SpecWorkerBase.forward`` after the worker has accepted tokens, so it covers every worker and every
+    model through one launch. The scores read the dense target logits the worker verified. Nothing is published for a
+    layout this cannot read (vocabulary-sharded logits, ragged windows, tree rows); the sampler then rejects a
+    request that asks, and a batch without one is unaffected because the launch skips rows without a divisor. Every
+    condition here is static for a captured graph.
+
+    Args:
+        outputs: The worker outputs; ``new_tokens`` ``[B, width]`` and ``new_tokens_lens`` ``[B]`` are read.
+        logits: The target logits ``[rows, vocab]`` the worker was given, or None.
+        vocab_sharded: Whether ``logits`` are this rank's vocabulary columns.
+        spec_metadata: The step's speculative metadata, which owns the per-request divisors.
+    """
+    divisors = None if spec_metadata is None else spec_metadata.request_logprob_temperatures
+    if (
+        divisors is None
+        or vocab_sharded
+        or outputs.get("logits_vocab_shard")
+        or spec_metadata.sharded_target_logits
+        or spec_metadata.is_ragged_verify
+        or not isinstance(logits, torch.Tensor)
+        or logits.dim() != 2
+    ):
+        return
+    new_tokens = outputs["new_tokens"]
+    new_tokens_lens = outputs["new_tokens_lens"]
+    batch, width = new_tokens_lens.shape[0], new_tokens.shape[1]
+    # The layout is one row per context request and ``width`` rows per generation request, so the row count
+    # fixes the number of context requests. Reading it from the attention metadata is not safe: a worker may
+    # leave that field changed after its draft passes.
+    missing_rows = batch * width - logits.shape[0]
+    if batch > divisors.numel() or width < 2 or missing_rows < 0 or missing_rows % (width - 1):
+        return
+    num_contexts = missing_rows // (width - 1)
+    outputs[OUTPUT_KEY] = target_logprobs(
+        logits,
+        new_tokens,
+        new_tokens_lens,
+        divisors[:batch],
+        num_contexts=num_contexts,
+        width=width,
+    )

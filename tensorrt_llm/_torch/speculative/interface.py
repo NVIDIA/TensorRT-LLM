@@ -67,6 +67,7 @@ from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
                            sample_and_strict_accept)
 from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
+from .target_logprobs import publish_target_logprobs
 from .vocab_parallel import (VocabParallelHead, VocabShardedLogits,
                              is_vocab_sharded_lm_head, key_exchange_takes,
                              sharded_greedy_argmax, tp_pair_exchange,
@@ -2294,6 +2295,13 @@ class SpecWorkerBase(nn.Module, ABC):
             # The step returns the shard target_logits produced; the engine
             # gathers it for any logits post-processor.
             outputs['logits_vocab_shard'] = True
+        if isinstance(outputs, dict):
+            # ``logits`` is the fourth positional argument of every worker's _forward_impl.
+            logits = kwargs["logits"] if "logits" in kwargs else (
+                args[3] if len(args) > 3 else None)
+            publish_target_logprobs(outputs, logits,
+                                    bool(kwargs.get("vocab_sharded_logits")),
+                                    spec_metadata)
         return outputs
 
     @abstractmethod
