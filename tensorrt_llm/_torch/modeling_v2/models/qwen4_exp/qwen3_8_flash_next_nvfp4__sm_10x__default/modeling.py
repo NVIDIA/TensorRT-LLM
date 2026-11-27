@@ -997,18 +997,21 @@ _GROUPED_DECODE_MIN_REQUESTS = 32  # capacity: fixed: a dispatch threshold
 #: front ran caps 3-28 a rank, where this table runs split-K. Read once, when the core is built;
 #: set at a layout without attention DP it warns and does nothing.
 DP_GQA_MIN_REQUESTS_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"
-#: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_GQA_BITMAP=1` runs the trunk verify step's
-#: gated sparse GQA over an e4m3 pool on the bitmap-union grouped kernel
-#: (`qsa_paged_sparse_gqa_fp8_verify`: the NVFP4 verify kernel with an e4m3 operand path, a
-#: one-read loader, the union scan bounded by the highest selected token and its setup before the
-#: PDL wait, two-wave splits at 39-76 requests) instead of `qsa_sparse_gqa_grouped_cute` /
-#: split-K, from `_BITMAP_MIN_REQUESTS` requests of `p` rows (`DP_GQA_MIN_REQUESTS_ENV` when set),
-#: where the kernel takes the call (`_gqa_bitmap_serves`); every other call keeps the row table.
-#: This is the kernel the dep4 / dep8 AgentX front ran (grouped from 8 requests, from 2 at caps
-#: 3-7). Class S against the other two (another union, split plan and summation order; all
-#: within the decode op's band of the reference). The draft layer keeps the row table (its
-#: one-row passes: `DP_DRAFT_GQA_GROUPED1_ENV`). Read once, when the core is built; set at a
-#: layout without attention DP it warns and does nothing.
+#: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_GQA_BITMAP=1` runs the trunk verify step's gated
+#: sparse GQA over an e4m3 pool on the bitmap-union grouped kernel
+#: (`qsa_paged_sparse_gqa_fp8_verify`: the NVFP4 verify kernel with an e4m3 operand path, a one-read
+#: loader, the union scan bounded by the highest selected token and its setup before the PDL wait,
+#: two-wave splits at 39-76 requests) instead of `qsa_sparse_gqa_grouped_cute` / split-K, from
+#: `_BITMAP_MIN_REQUESTS` requests of `p` rows (`DP_GQA_MIN_REQUESTS_ENV` when set) to
+#: `_BITMAP_MAX_REQUESTS`, where the kernel takes the call (`_gqa_bitmap_serves`); every other call
+#: keeps the row table. This is the kernel the dep4 / dep8 AgentX front ran (grouped from 8
+#: requests, from 2 at caps 3-7). GB300 server A/B against the row table (device step at the cap):
+#: -0.082 / -0.071 / -0.038 / -0.047 ms at dep8 12 / 24 / 36 / 40 requests a rank, -0.044 at dep4
+#: 40; +0.112 at dep8 48 and +0.093 / +0.094 at dep4 48 / 52, hence the ceiling. Class S against the
+#: other two (another union, split plan and summation order; all within the decode op's band of the
+#: reference). The draft layer keeps the row table (its one-row passes:
+#: `DP_DRAFT_GQA_GROUPED1_ENV`). Read once, when the core is built; set at a layout without
+#: attention DP it warns and does nothing.
 DP_GQA_BITMAP_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_BITMAP"
 #: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_DRAFT_GQA_GROUPED1=1` runs the draft layer's
 #: gated sparse GQA of a pass that holds one row a request (the draft decode passes, and the
@@ -1079,6 +1082,9 @@ CTX_COLDIDX_ENV = "TRTLLM_QWEN4_EXP_CTX_COLDIDX"
 #: Requests from which `DP_GQA_BITMAP_ENV` takes a step when `DP_GQA_MIN_REQUESTS_ENV` is unset:
 #: the measured front's floor at caps 8-52.
 _BITMAP_MIN_REQUESTS = 8  # capacity: fixed: a dispatch threshold
+#: The most requests a rank `DP_GQA_BITMAP_ENV` takes a trunk verify step at: past it the row
+#: table's grouped kernel was faster (dep4 and dep8, 48 and 52 requests a rank).
+_BITMAP_MAX_REQUESTS = 40  # capacity: fixed: a dispatch threshold
 #: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=<n>` (n in
 #: `_TOPK_CLUSTER_MAX_ROWS` + 1..`_TOPK_CLUSTER_PAIR_MAX_ROWS`; unset is the op's own 37) lets a
 #: generation step's selection (`_selection`, not a context part) take the cluster top-k up to
@@ -7827,16 +7833,17 @@ def _gqa_bitmap_serves(
     floor, kv, q, block_table, selected, req_idx, tpb, gate, p: int, one_row: bool = False
 ) -> bool:
     """Whether `fp8_sparse_gqa_verify_grouped` takes this call: a trunk verify call under
-    `DP_GQA_BITMAP_ENV` (at least `floor` requests of `p` > 1 rows), or with `one_row` a draft
-    pass of one row a request under `DP_DRAFT_GQA_GROUPED1_ENV` (at least `floor` rows); over an
-    e4m3 pool, the layouts its entry asserts (q rows of unit head stride, 16-byte aligned;
-    row-contiguous block table, contiguous int32 selection, contiguous request indices,
+    `DP_GQA_BITMAP_ENV` (`floor` to `_BITMAP_MAX_REQUESTS` requests of `p` > 1 rows), or with
+    `one_row` a draft pass of one row a request under `DP_DRAFT_GQA_GROUPED1_ENV` (at least `floor`
+    rows); over an e4m3 pool, the layouts its entry asserts (q rows of unit head stride, 16-byte
+    aligned; row-contiguous block table, contiguous int32 selection, contiguous request indices,
     `[rows, heads * dim]` gate rows 16-byte aligned) and the kernel's own plan (`takes_grouped`:
     SM103, a shared-memory plan, row offsets the group table addresses). Host side, on shapes
     only."""
     return (
         (p > 1 or (one_row and p == 1))
         and q.shape[0] >= floor * p
+        and (one_row or q.shape[0] <= _BITMAP_MAX_REQUESTS * p)
         and q.dim() == 3
         and q.stride(2) == 1
         and q.stride(1) == q.shape[2]

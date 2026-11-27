@@ -533,6 +533,8 @@ def _bitmap_operands(rows, dtype=torch.float8_e4m3fn, gate_cols=24 * 256):
         (8, 2, True, True, ("bitmap", True, 4, 2)),  # 2 requests at a floor of 2 (caps 3-7)
         (28, 8, True, True, ("splitk", True, None)),  # 7 requests: below the floor
         (128, 32, True, True, ("bitmap", True, 4, 8)),  # a floor past the op's asks it for 8
+        (160, 8, True, True, ("bitmap", True, 4, 8)),  # 40 requests: the ceiling
+        (164, 8, True, True, ("grouped", True, 4)),  # 41 requests: the row table's grouped kernel
         (32, 8, False, True, ("splitk", True, None)),  # the draft layer keeps the row table
         (32, 8, True, False, ("splitk", True, None)),  # the kernel declines (plan, arch)
         (32, 0, True, True, ("splitk", True, None)),  # the switch off
@@ -540,14 +542,15 @@ def _bitmap_operands(rows, dtype=torch.float8_e4m3fn, gate_cols=24 * 256):
 )
 def test_sparse_gqa_bitmap_dispatch(monkeypatch, rows, floor, trunk, takes, expected):
     """`DP_GQA_BITMAP_ENV`: the trunk's verify step takes the bitmap-union kernel from its floor
-    of requests where the kernel's plan takes the call; below it, off the trunk and where it
-    declines, the row table decides as before (here: split-K)."""
+    of requests to `_BITMAP_MAX_REQUESTS` where the kernel's plan takes the call; below and above
+    it, off the trunk and where it declines, the row table decides as before (split-K, or the
+    grouped kernel from the core's 32 requests)."""
     calls, asked = _bitmap_case(monkeypatch, takes)
     core = SimpleNamespace(**{**vars(CORE), "dp_gqa_bitmap": floor, "dp_gqa_min_requests": 32})
     kv, q, bt, sel, req, gate = _bitmap_operands(rows)
     out = M._sparse_gqa_decode(core, kv, q, bt, sel, req, 32, gate, 4, trunk=trunk)
     assert out == expected[0] and calls == [expected]
-    if expected[0] == "bitmap" or (floor and trunk and rows >= floor * 4):
+    if expected[0] == "bitmap" or (floor and trunk and floor * 4 <= rows <= 160):
         assert asked == [min(floor, 8)]
 
 
