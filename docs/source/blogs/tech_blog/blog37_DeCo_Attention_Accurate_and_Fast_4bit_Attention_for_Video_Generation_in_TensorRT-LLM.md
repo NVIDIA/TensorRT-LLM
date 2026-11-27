@@ -85,7 +85,7 @@ This blog explains how DeCo-Attention works and why. The sections below cover wh
 
 ## Overview
 
-DeCo-Attention is a co-design of an algorithm and a kernel. The algorithm decomposes the rounding error of Q and K and adds the main part of that error back inside the same 4-bit matrix product, which takes neither a second product nor retraining nor calibration data. The CuTe DSL kernels shorten the softmax between the two matrix products, which lets the faster products shorten the kernel. Figure 3 shows the two halves of the design.
+DeCo-Attention is a co-design of an algorithm and a kernel, and each half solves one problem of 4-bit attention. The algorithm, principal residual compensation, makes the 4-bit QK product accurate. It decomposes the rounding error of Q and K and adds the main part of that error back inside the same 4-bit matrix product, without a second product, retraining, or calibration data. The kernel, written in CuTe DSL, turns the speed of the 4-bit product into faster attention. Once both matrix products are fast, the softmax between the two products limits the kernel, and three optimizations of the softmax remove this limit. Figure 3 shows the two halves of the design.
 
 <p align="center">
   <img src="../media/tech_blog37_overview.png" alt="Overview of DeCo-Attention: preparation per head and the attention kernel per tile" width="1000">
@@ -93,9 +93,10 @@ DeCo-Attention is a co-design of an algorithm and a kernel. The algorithm decomp
 
 <p align="center"><sub><em>Figure 3. The preparation in (a) runs once per head. The attention kernel in (b) runs per tile of queries and keys.</em></sub></p>
 
-The preparation rotates Q and K by a Hadamard matrix H and rounds both to NVFP4. The rounding residuals, projected on a basis B of a few principal directions estimated from 1/256 of the tokens, become extra channels next to the rounded ones, and V is smoothed by subtracting the block means. The kernel computes the scores S with the compensation in one NVFP4 MMA over the extended operands, forms the probabilities P with I-ExpCast without the special-function unit, and runs the PV MMA over the smoothed V and a column of ones that returns the row sum l with the output. The lazy rescale skips most rescales, and one high-precision MMA adds the block means of V back.
+- The preparation rotates Q and K by a Hadamard matrix H and rounds both to NVFP4. It then projects the rounding residuals on a basis B of a few principal directions, estimated from 1/256 of the tokens, and appends the projections as extra channels next to the rounded ones. V is smoothed by subtracting the block means.
+- The kernel computes the scores S together with the compensation in one NVFP4 MMA over the extended operands. I-ExpCast then forms the probabilities P without the special-function unit, and the PV MMA runs over the smoothed V and a column of ones, which returns the row sum l with the output. The lazy rescale skips most rescales, and one high-precision MMA adds the block means of V back.
 
-The hard layers named throughout this blog are the three layers of Wan2.2 where per-tensor FP8 attention is least accurate. On the hard layers, the compensation brings the error of an NVFP4 QK down to the level of an FP8 QK, and end to end DeCo-Attention reaches the generation quality of methods that keep QK in FP8.
+With both halves, DeCo-Attention is the fastest attention kernel of our comparison on GB300, VR200, and RTX PRO 6000, while its accuracy and its generation quality reach those of methods that keep QK in FP8.
 
 ## Background
 
@@ -123,7 +124,7 @@ TensorRT-LLM VisualGen already ships an NVFP4 QK, FP8 PV attention, and the next
 
 ## Error Analysis of 4-Bit Attention
 
-Which part of attention produces the error? We quantize one product at a time and measure the relative L2 error of the attention output against FP32 attention, on the hard layers and over all layers of Wan2.2 (Figure 5(a)). In the same format, rounding Q and K costs several times the accuracy of rounding P and V. On the hard layers, an NVFP4 QK alone gives an error of 30.1%, and an NVFP4 PV alone gives 7.1%. Therefore, the problem to solve is reducing the error of the QK product.
+Which part of attention produces the error? We quantize one product at a time and measure the relative L2 error of the attention output against FP32 attention, on the hard layers and over all layers of Wan2.2 (Figure 5(a)). The hard layers are the three layers of Wan2.2 where per-tensor FP8 attention is least accurate. In the same format, rounding Q and K costs several times the accuracy of rounding P and V. On the hard layers, an NVFP4 QK alone gives an error of 30.1%, and an NVFP4 PV alone gives 7.1%. Therefore, the problem to solve is reducing the error of the QK product.
 
 <p align="center">
   <img src="../media/tech_blog37_motivation.png" alt="Quantization error per product and format, and share of the energy of K held by r directions" width="560">
@@ -276,11 +277,11 @@ I-ExpCast, our improved ExpCast, does not use the MUFU instructions and still ro
 
 The idea is to form each probability in FP16 and leave the final rounding to a hardware conversion. FP16 has ten mantissa bits and represents every value of E4M3 and of E2M1 exactly. A conversion from FP16 therefore rounds to the nearest code of either format, subnormal codes included. What remains is to produce the FP16 value cheaply. Let *x* be the base-2 logarithm of a scaled probability, which is a linear function of the score. Read as an integer, the FP16 bit pattern of 2<sup>*x*</sup> is close to a linear function of *x*.
 
-$$\operatorname{bits}_{\mathrm{FP16}}\big(2^x\big) \approx 1024\,(x + 15)$$
+$$\mathrm{bits}_{\mathrm{FP16}}\big(2^x\big) \approx 1024\,(x + 15)$$
 
 I-ExpCast evaluates this linear function in the subnormal range of FP32, where the values are evenly spaced and the bit pattern of a value is the multiple of the spacing. One FMA therefore maps a score to the bit pattern and rounds the pattern to an integer in the same step. A saturating pack then narrows the pattern to the 16 bits of FP16, and the last step converts the FP16 value to E4M3 or E2M1.
 
-$$\hat p_j = \mathcal{Q}\Big(\operatorname{sat}_{16}\big(\operatorname{bits}_{\mathrm{FP32}}(a\,s_j + c)\big)\Big)$$
+$$\hat p_j = \mathcal{Q}\Big(\mathrm{sat}_{16}\big(\mathrm{bits}_{\mathrm{FP32}}(a\,s_j + c)\big)\Big)$$
 
 The same routine serves FP8 and FP4 probabilities, and Figure 13 compares the decoded probabilities with the exact ones. I-ExpCast matches the exact exponential with rounding over the whole range including the subnormal codes, where ExpCast drops to zero. Direct-P departs from the exact value over much of the range. With exact scores and only P rounded to FP4, the Direct-P codes give an error of 5.06% over all layers of Wan2.2 against 1.90% for I-ExpCast.
 
@@ -302,7 +303,7 @@ Inside the kernel, the way of forming P shows directly in the time (Figure 14). 
 
 The softmax needs the sum of each row of probabilities, and computing the sum next to the exponentials adds work where the kernel is already limited. Since the tensor cores have spare capacity, a column of ones appended to V lets the PV MMA return the row sum of P with the output, which moves the work to the tensor cores.
 
-Figure 15 compares this row sum with a sum on the ALU. An ALU sum of the same E4M3 values gives the same error and takes 7.2% longer, so the row sum in the PV MMA costs no accuracy. A sum of the probabilities before the rounding to E4M3 is also slower, and its error is slightly higher, because it no longer matches the rounded P that the PV product multiplies.
+Figure 15 compares this row sum with a sum on the ALU. An ALU sum of the same E4M3 values gives the same error and takes 7.2% longer, so the row sum in the PV MMA costs no accuracy. A sum of the probabilities before the rounding to E4M3 is also slower and slightly less accurate. The output is the PV product divided by the row sum, so when the row sum uses the unrounded P while the product uses the rounded P, the attention weights no longer sum to one and the output is biased.
 
 <p align="center">
   <img src="../media/tech_blog37_row_sum.png" alt="Row sum of P in the PV MMA and on the ALU" width="520">
@@ -342,7 +343,7 @@ The ablation gives three conclusions:
 - **The softmax bottleneck has to be removed to turn the 4-bit QK into real speedup.** With compensation only, the softmax bounds the kernel and hides the gain of the 4-bit QK, 79.0 ms against 82.1 ms for the same kernel with an FP8 QK. I-ExpCast, the row sum in the PV MMA, and the lazy rescale bring the kernel to 55.8 ms. The optimized kernel also does more work per cycle and draws more power, which lowers the SM clock under the power limit from 2017 to 1582 MHz and gives back part of the gain.
 - **The kernel optimizations must not cost accuracy.** I-ExpCast and the lazy rescale change the numerics of the softmax, yet the error stays between 2.92% and 2.95% through all three additions, because I-ExpCast rounds to the nearest code, subnormal codes included, and therefore combines with the lazy rescale. V smoothing, the last piece, costs 2.2 ms and lowers the error to 2.80%.
 
-DeCo-Attention addresses each of these points, the first with the compensation and the other two with the kernel optimizations. The complete kernel is both more accurate and faster than the NVFP4 QK, FP8 PV attention without compensation, and the MMAs nearly bound its time. The 4-bit QK matters for that bound. With an FP8 QK, the slower FP8 MMAs bound the kernel earlier, and the same four changes speed up the FP8-QK reference by 1.20x against 1.36x with the NVFP4 QK, or 1.67x at a fixed clock. The complete DeCo kernel is 1.17x faster than that reference and more accurate on the hard layers.
+This is why DeCo-Attention is a co-design, since neither half is enough alone. The compensation alone gives an accurate 4-bit QK that is hardly faster than an FP8 QK. The kernel optimizations alone gain less, because with an FP8 QK the slower FP8 MMAs bound the kernel earlier. The same four changes speed up the FP8-QK reference by 1.20x against 1.36x with the NVFP4 QK, or 1.67x at a fixed clock. Together, the two halves bring out both the accuracy and the speed of 4-bit attention. The complete kernel is 1.17x faster than the optimized FP8-QK reference and more accurate on the hard layers, and the MMAs nearly bound its time. Both halves are also general. The compensation needs no training, calibration, or model-specific code, and the softmax optimizations work for FP8 and FP4 probabilities alike, so both carry over to other models and attention kernels.
 
 ## Results
 
@@ -378,7 +379,7 @@ For the end-to-end quality we generate videos for the 100 prompts of MovieGen Be
 
 <p align="center"><sub><em>Figure 20. End-to-end quality on four video models against BF16 attention, as the mean over 100 prompts. QK/PV gives the bit widths of the two products, and DeCo-Attention is in bold. Blue cells mark the best PSNR, SSIM, and LPIPS within each group with a 4-bit QK. SageAttention2 and VC-Attention use the default INT8 QK on B200, and the rows with an FP8 QK run on GB300. The means marked † are reported by VC-Attention.</em></sub></p>
 
-With FP8 PV, DeCo-Attention reaches the quality of the FP8-QK methods. DeCo-Attention is more accurate than MXFP8 and than SageAttention2 with an FP8 QK on every model. Against VC-Attention with an FP8 QK, DeCo-Attention is more accurate on Wan2.2 and LongCat-Video and less on the other two models. Compared with the existing NVFP4 QK, FP8 PV attention, the compensation gains about 3 to 5 dB of PSNR on every model. With NVFP4 PV, DeCo-Attention has better PSNR and LPIPS than SageAttention3 and the 4-bit VC-Attention on every model, and the fully NVFP4 DeCo kernel also matches SageAttention2 with an FP8 QK on every model, with both products in 4 bits.
+With FP8 PV, DeCo-Attention reaches the quality of the FP8-QK methods. DeCo-Attention is more accurate than MXFP8 and than SageAttention2 with an FP8 QK on every model. Against VC-Attention with an FP8 QK, DeCo-Attention is more accurate on Wan2.2 and LongCat-Video and less on the other two models. Compared with the existing NVFP4 QK, FP8 PV attention, the compensation gains about 3 to 5 dB of PSNR on every model. DeCo-Attention also narrows the gap of a 4-bit QK to INT8-QK attention, from 5 to 6 dB of PSNR behind VC-Attention with an INT8 QK to 1 to 3 dB. The INT8-QK methods need the INT8 tensor cores of B200, whereas DeCo-Attention runs on the FP4 tensor cores of GB300, VR200, and RTX PRO 6000. With NVFP4 PV, DeCo-Attention has better PSNR and LPIPS than SageAttention3 and the 4-bit VC-Attention on every model, and the fully NVFP4 DeCo kernel also matches SageAttention2 with an FP8 QK on every model, with both products in 4 bits.
 
 ## Usage in TensorRT-LLM VisualGen
 
