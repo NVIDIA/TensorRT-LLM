@@ -165,6 +165,17 @@ if(NIXL_ROOT)
     add_bounce_reactor_test(bounceTransportTest bounceTransportTest.cpp)
     target_link_libraries(bounceTransportTest PRIVATE CUDA::cuda_driver)
 
+    add_tllm_gtest(
+      bounceWriteWindowTest
+      OWNER
+      executor
+      SOURCES
+      bounceWriteWindowTest.cpp
+      LINK_LIBRARIES
+      tllm::executor_bounce_reactor
+      LABELS
+      "unit;executor;bounce;host")
+
     # Boundary, failure-path, and concurrency tests.
     add_bounce_reactor_test(bounceTransportFailureTest
                             bounceTransportFailureTest.cpp)

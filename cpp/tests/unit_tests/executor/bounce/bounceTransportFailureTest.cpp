@@ -46,6 +46,7 @@ namespace
 // statuses it hands out.
 struct XferControls
 {
+    std::atomic<bool> useNixl{false};
     std::atomic<bool> failWrites{false};     // every posted write polls as FAILURE
     std::atomic<bool> allowTerminal{true};   // false -> posted writes stay IN_PROGRESS
     std::atomic<bool> releaseSucceeds{true}; // false -> release() fails (handle retained)
@@ -110,10 +111,15 @@ public:
     {
     }
 
-    [[nodiscard]] std::unique_ptr<kvc::TransferStatus> postXferRequest(kvc::TransferOp, kvc::TransferDescs const&,
-        kvc::TransferDescs const&, std::string const&, std::optional<kvc::SyncMessage> const&) override
+    [[nodiscard]] std::unique_ptr<kvc::TransferStatus> postXferRequest(kvc::TransferOp op,
+        kvc::TransferDescs const& local, kvc::TransferDescs const& remote, std::string const& peer,
+        std::optional<kvc::SyncMessage> const& notification) override
     {
         mCtl->postCount.fetch_add(1, std::memory_order_relaxed);
+        if (mCtl->useNixl.load(std::memory_order_acquire))
+        {
+            return kvc::NixlTransferAgent::postXferRequest(op, local, remote, peer, notification);
+        }
         return std::make_unique<FakeXferStatus>(mCtl);
     }
 
@@ -241,8 +247,7 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
     bounce_test::freeXferBufs(bufs);
 }
 
-// The posted write reports failure -> the request must FAIL (not hang, not falsely succeed).
-// The sender is a FakeXferAgent whose writes always poll as FAILURE.
+// A backend write failure settles the request. The same sender and receiver can service the next transfer.
 TEST(BounceTransportFailure, WriteFailureFailsRequest)
 {
     if (!bounce_test::hasCuda())
@@ -255,8 +260,7 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     auto B = bounce_test::makeNode("feB", c, 1024);
     if (!A || !B)
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    A->tx->addPeer("feB", B->ch->localEndpoint());
-    B->tx->addPeer("feA", A->ch->localEndpoint());
+    bounce_test::wirePair(*A, *B);
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
     auto fut = bounce_test::submitTransfer(*A, *B, bufs);
@@ -265,9 +269,17 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kWriteFailed);
     EXPECT_GE(ctl->postCount.load(std::memory_order_acquire), 1u);
 
+    ctl->useNixl.store(true, std::memory_order_release);
+    auto followup = bounce_test::makeXferBufs(8, 256, /*seed=*/2);
+    auto recovered = bounce_test::submitTransfer(*A, *B, followup);
+    ASSERT_EQ(recovered.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_EQ(recovered.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(followup));
+
     A->tx->shutdown();
     B->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
+    bounce_test::freeXferBufs(followup);
 }
 
 // A receiver that KNOWS a request cannot complete NACKs it, so the sender fails right away
@@ -725,20 +737,19 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
         GTEST_SKIP() << "no CUDA device";
     auto c = cfg(/*timeoutMs=*/0);
     capRegions(c, c.maxInflightChunksPerRequest);
-    b::ZmqControlChannel peer("shutdownReleasePeer");
     auto ctl = std::make_shared<XferControls>();
     ctl->allowTerminal.store(false, std::memory_order_release);
     ctl->releaseSucceeds.store(false, std::memory_order_release);
     auto sender = makeFakeNode("shutdownReleaseSender", c, ctl);
-    if (!sender)
+    auto receiver = bounce_test::makeNode("shutdownReleasePeer", c, 1024);
+    if (!sender || !receiver)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender->tx->addPeer("shutdownReleasePeer", peer.localEndpoint()));
-    ASSERT_TRUE(peer.addPeer("shutdownReleaseSender", sender->ch->localEndpoint()));
+    }
+    bounce_test::wirePair(*sender, *receiver);
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/5);
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "shutdownReleasePeer", bounce_test::testWindowKey());
-    b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/91};
-    peer.sendTo("shutdownReleaseSender", b::encodeGrant(/*requestId=*/1, {credit}));
+    auto fut = bounce_test::submitTransfer(*sender, *receiver, bufs);
 
     auto const postDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < postDeadline && ctl->postCount.load(std::memory_order_acquire) == 0)
@@ -757,6 +768,7 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
     // failAll attempts the failed release exactly twice (initial + bounded retry), never spins.
     EXPECT_EQ(ctl->releaseCount.load(std::memory_order_acquire), 2u);
+    receiver->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
 

@@ -96,46 +96,6 @@ void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t des
 }
 } // namespace
 
-TEST(BounceReceiveWindow, ScopeIsRetiredBeforeLocalMemoryCanBeReused)
-{
-    b::BounceWriteWindows windows;
-    auto const key = bounce_test::testWindowKey();
-    auto const id = b::bounceWindowId(key);
-    auto window = windows.add("writer", "local-test-endpoint", key, {{64, 8}, {72, 8}, {120, 8}});
-    EXPECT_EQ(windows.find(id, "writer"), window);
-    EXPECT_EQ(windows.find(id, "another-writer"), nullptr);
-    EXPECT_TRUE(window->contains(68, 12));
-    EXPECT_FALSE(window->contains(79, 2));
-
-    auto copy = window->acquire();
-    ASSERT_TRUE(copy.owns_lock());
-    std::promise<void> entered;
-    auto retired = std::async(std::launch::async,
-        [&]
-        {
-            entered.set_value();
-            windows.removeIntersecting(64, 16);
-        });
-    entered.get_future().wait();
-    EXPECT_EQ(retired.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
-    copy.unlock();
-    retired.get();
-    EXPECT_EQ(windows.find(id, "writer"), nullptr);
-    EXPECT_FALSE(window->acquire().owns_lock());
-}
-
-TEST(BounceReceiveWindow, SignedMessageUsesTheIssuedWindow)
-{
-    auto const key = bounce_test::testWindowKey();
-    std::string const message = "completed";
-    auto const envelope = b::signBounceFrame(message, key);
-    std::string id;
-    ASSERT_TRUE(b::readBounceWindowId(envelope, message.size(), id));
-    EXPECT_EQ(id, b::bounceWindowId(key));
-    EXPECT_TRUE(b::verifyBounceFrame(envelope, key));
-    EXPECT_FALSE(b::verifyBounceFrame(envelope, bounce_test::testWindowKey()));
-}
-
 TEST(BounceTransport, SmallTransferFitsInflightLimit)
 {
     // Four descriptors fit within the configured in-flight chunk limit.
