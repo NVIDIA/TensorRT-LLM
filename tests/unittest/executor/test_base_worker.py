@@ -17,7 +17,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
-from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.bindings.executor import FinishReason, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
@@ -908,6 +908,191 @@ def test_submit_cleans_up_failed_enqueue(
         result = BaseWorker.submit(worker, request)
         assert worker._results == {7: result, 8: peer_result}
         assert worker._client_id_to_request_id == {7: 70, 8: 80}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case", ["cancel_first", "cancel_during_prepare", "submitted", "malformed"])
+def test_context_token_worker_admission_and_late_cancel(case: str) -> None:
+    """Use the real submit/cancel boundaries, retaining an unrelated request."""
+    from tensorrt_llm.disaggregated_params import (DisaggregatedParams,
+                                                   DisaggScheduleStyle)
+    from tensorrt_llm.executor.context_cancellation import \
+        ContextCancellationReservations
+
+    engine = Mock(kv_connector_manager=None)
+    engine.supports_logical_context_cancellation.return_value = True
+    engine._can_enqueue_cancellation.return_value = True
+    engine.can_enqueue_requests.return_value = True
+    worker = MagicMock(rank=0,
+                       engine=engine,
+                       _results={8: "healthy"},
+                       _client_id_to_request_id={8: 80})
+    worker._context_cancellation_reservations = ContextCancellationReservations(
+    )
+    worker._check_context_cancellation_capability = MethodType(
+        BaseWorker._check_context_cancellation_capability, worker)
+    worker.supports_logical_context_cancellation = MethodType(
+        BaseWorker.supports_logical_context_cancellation, worker)
+    worker._handle_background_error = MethodType(lambda self: None, worker)
+    worker._get_logprob_params.return_value = None
+    worker._enqueue_request = Mock(
+        wraps=MethodType(BaseWorker._enqueue_request, worker))
+    worker.mapping = SimpleNamespace(cp_size=1)
+    worker.max_seq_len = 32
+    engine.enqueue_request.return_value = 17
+    token = BaseWorker.reserve_context_cancellation(
+        worker, 17, "a" * 32,
+        time.time_ns() // 1_000_000 + 60_000)
+    request = GenerationRequest(
+        prompt_token_ids=[10, 11],
+        sampling_params=SamplingParams(max_tokens=1, end_id=2),
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only",
+            disagg_request_id=17,
+            schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+            context_cancellation_token=token))
+    request.set_id(7)
+    if case == "malformed":
+        request.disaggregated_params.context_cancellation_token = "x.\u00e9"
+        with pytest.raises(RequestError,
+                           match="Invalid context cancellation token"):
+            BaseWorker.submit(worker, request)
+        worker._enqueue_request.assert_not_called()
+        engine.enqueue_request.assert_not_called()
+        assert worker._results == {8: "healthy"}
+        assert worker._client_id_to_request_id == {8: 80}
+    elif case == "cancel_first":
+        assert BaseWorker.cancel_context_cancellation(worker,
+                                                      token) == "not_submitted"
+        with pytest.raises(RequestError, match="admission is closed"):
+            BaseWorker.submit(worker, request)
+        worker._enqueue_request.assert_not_called()
+        engine.enqueue_request.assert_not_called()
+        assert worker._results == {8: "healthy"}
+        assert worker._client_id_to_request_id == {8: 80}
+    elif case == "cancel_during_prepare":
+        preparing, finish_prepare = Event(), Event()
+
+        sampling_config = request.sampling_params._get_sampling_config
+
+        def prepare() -> SamplingConfig:
+            """Hold request construction before the engine queue boundary."""
+            preparing.set()
+            assert finish_prepare.wait(5)
+            return sampling_config()
+
+        def cancel_while_preparing() -> str:
+            """An unrelated reservation and both cancellations can finish now."""
+            peer = BaseWorker.reserve_context_cancellation(
+                worker, 18, "b" * 32,
+                time.time_ns() // 1_000_000 + 60_000)
+            assert BaseWorker.cancel_context_cancellation(
+                worker, peer) == "not_submitted"
+            return BaseWorker.cancel_context_cancellation(worker, token)
+
+        with patch.object(
+                SamplingParams, "_get_sampling_config",
+                side_effect=prepare), ThreadPoolExecutor(max_workers=2) as pool:
+            submission = pool.submit(BaseWorker.submit, worker, request)
+            try:
+                assert preparing.wait(5)
+                assert pool.submit(cancel_while_preparing).result(
+                    timeout=5) == "not_submitted"
+            finally:
+                finish_prepare.set()
+            with pytest.raises(RequestError, match="admission is closed"):
+                submission.result(timeout=5)
+        with pytest.raises(RequestError, match="admission is closed"):
+            BaseWorker.submit(worker, request)
+        worker._enqueue_request.assert_called_once()
+        engine.enqueue_request.assert_not_called()
+        engine.cancel_context_request.assert_not_called()
+        assert worker._results == {8: "healthy"}
+        assert worker._client_id_to_request_id == {8: 80}
+    else:
+        BaseWorker.submit(worker, request)
+        engine.enqueue_request.assert_called_once()
+        envelope = engine.enqueue_request.call_args.args[0]
+        assert envelope.py_disaggregated_params.context_cancellation_token == token
+        # The completed HTTP result no longer owns routing; the exact token
+        # still reaches the executor's retained request via its normal queue.
+        BaseWorker._pop_result(worker, 7)
+        assert BaseWorker.cancel_context_cancellation(worker, token) == "queued"
+        engine.cancel_context_request.assert_called_once_with(token)
+        assert worker._results == {8: "healthy"}
+        assert worker._client_id_to_request_id == {8: 80}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("supported", [False, 1, None])
+def test_context_token_worker_rejects_unsupported_capability(
+        supported: object) -> None:
+    """A worker cannot reserve or cancel on an absent or non-boolean capability."""
+    engine = Mock()
+    engine.supports_logical_context_cancellation.return_value = supported
+    worker = Mock(rank=0, engine=engine)
+    worker._check_context_cancellation_capability = MethodType(
+        BaseWorker._check_context_cancellation_capability, worker)
+    worker.supports_logical_context_cancellation = MethodType(
+        BaseWorker.supports_logical_context_cancellation, worker)
+    with pytest.raises(ValueError, match="not supported"):
+        BaseWorker.reserve_context_cancellation(
+            worker, 17, "a" * 32,
+            time.time_ns() // 1_000_000 + 60_000)
+    with pytest.raises(ValueError, match="not supported"):
+        BaseWorker.cancel_context_cancellation(worker, "opaque")
+    worker._context_cancellation_reservations.reserve.assert_not_called()
+    worker._context_cancellation_reservations.cancel.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_context_token_worker_does_not_acknowledge_closed_cancellation_queue(
+) -> None:
+    """A consumed token cannot return a queued receipt after enqueue rejection."""
+    from tensorrt_llm.executor.context_cancellation import \
+        ContextCancellationReservations
+
+    engine = Mock()
+    engine.supports_logical_context_cancellation.return_value = True
+    engine.cancel_context_request.side_effect = RuntimeError(
+        "cancellation queue is closed")
+    worker = Mock(rank=0, engine=engine)
+    worker._check_context_cancellation_capability = MethodType(
+        BaseWorker._check_context_cancellation_capability, worker)
+    worker.supports_logical_context_cancellation = MethodType(
+        BaseWorker.supports_logical_context_cancellation, worker)
+    worker._context_cancellation_reservations = ContextCancellationReservations(
+    )
+    token = worker._context_cancellation_reservations.reserve(
+        17, "a" * 32,
+        time.time_ns() // 1_000_000 + 60_000)
+    with worker._context_cancellation_reservations.admission(
+            token, 17) as enqueue_guard:
+        with enqueue_guard:
+            engine.enqueue_request(17)
+    with pytest.raises(RuntimeError, match="queue is closed"):
+        BaseWorker.cancel_context_cancellation(worker, token)
+    engine.cancel_context_request.assert_called_once_with(token)
+
+
+@pytest.mark.cpu_only
+def test_context_token_worker_rejects_closed_admission_before_reserving(
+) -> None:
+    """A supported worker cannot issue a new token after request admission closes."""
+    engine = Mock()
+    engine.supports_logical_context_cancellation.return_value = True
+    engine.can_enqueue_requests.return_value = False
+    worker = Mock(rank=0, engine=engine)
+    worker._check_context_cancellation_capability = MethodType(
+        BaseWorker._check_context_cancellation_capability, worker)
+    worker.supports_logical_context_cancellation = MethodType(
+        BaseWorker.supports_logical_context_cancellation, worker)
+    with pytest.raises(RuntimeError, match="admission is closed"):
+        BaseWorker.reserve_context_cancellation(
+            worker, 17, "a" * 32,
+            time.time_ns() // 1_000_000 + 60_000)
+    worker._context_cancellation_reservations.reserve.assert_not_called()
 
 
 def _load_ray_executor(monkeypatch: pytest.MonkeyPatch) -> type:

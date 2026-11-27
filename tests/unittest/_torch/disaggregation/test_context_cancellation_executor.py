@@ -92,6 +92,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     engine._pending_response_terminations = []
     engine._response_channel = ResponseChannel()
     engine.gather_all_responses = False
+    engine.enable_iter_perf_stats = False
     engine.enable_attention_dp = False
     engine.kv_connector_manager = None
     engine.previous_batch = None

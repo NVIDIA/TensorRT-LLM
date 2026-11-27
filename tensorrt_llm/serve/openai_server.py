@@ -45,6 +45,8 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.executor.context_cancellation import \
+    ContextReservationCapacityError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
@@ -101,7 +103,10 @@ from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request,
+    CONTEXT_PROBE_HEADER, build_context_cancellation_headers,
+    context_cancellation_submission_payload,
+    request_requires_internal_disagg_auth, validate_context_cancellation_auth,
+    validate_context_probe, validate_internal_disagg_request,
     validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
@@ -117,10 +122,11 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionToolsParam, ChatMessage, CompletionRequest,
-    CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
-    ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
-    ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
+    CompletionResponse, CompletionResponseChoice, ContextCancellationRequest,
+    ContextCancellationReservationRequest, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse, ImageEditRequest,
+    ImageGenerationRequest, ImageGenerationResponse, ImageObject,
+    MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
     RerankDocument, RerankRequest, RerankResponse, RerankResult,
     RerankUsageInfo, RerankV2Request, RerankV2Response, RerankV2Result,
     ResponseFormat, ResponsesRequest, ResponsesResponse,
@@ -1141,6 +1147,111 @@ class OpenAIServer(_VideoRoutesMixin):
         headers = None if raw_request is None else raw_request.headers
         validate_internal_disagg_request(
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
+        cancellation_payload = context_cancellation_submission_payload(request)
+        if cancellation_payload is not None:
+            if not self._has_cache_transceiver_config():
+                raise ValueError(
+                    "Context cancellation requires cache_transceiver_config")
+            validate_context_cancellation_auth(self._internal_disagg_auth_key,
+                                               "submit", cancellation_payload,
+                                               headers)
+            if isinstance(request, CompletionRequest) and isinstance(
+                    request.prompt, list):
+                if not request.prompt or isinstance(request.prompt[0],
+                                                    (str, list)):
+                    raise ValueError(
+                        "A context cancellation reservation requires one prompt"
+                    )
+
+    async def reserve_context_cancellation(
+            self, request: ContextCancellationReservationRequest,
+            raw_request: Request) -> JSONResponse:
+        """Reserve an identity before a cancellable context request can be admitted.
+
+        Args:
+            request: Pairing identity to reserve on the shared worker.
+            raw_request: HTTP request carrying purpose-bound authentication.
+
+        Returns:
+            A worker-issued token; no model work or resources have been admitted.
+
+        Raises:
+            HTTPException: Authentication, capability, admission, or RPC failed.
+        """
+        try:
+            validate_context_cancellation_auth(self._internal_disagg_auth_key,
+                                               "reserve", request.model_dump(),
+                                               raw_request.headers)
+        except ValueError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+        reserve = getattr(getattr(self.generator, "_executor", None),
+                          "reserve_context_cancellation", None)
+        if not self._accepts_context_controls() or not callable(reserve):
+            raise HTTPException(status_code=409,
+                                detail="Context cancellation is unsupported")
+        try:
+            token = await asyncio.to_thread(reserve, request.disagg_request_id,
+                                            request.authorization_id,
+                                            request.authorization_expires_at_ms)
+        except ContextReservationCapacityError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except RPCError as error:
+            if isinstance(error.cause, ContextReservationCapacityError):
+                raise HTTPException(status_code=503,
+                                    detail=str(error.cause)) from error
+            if isinstance(error.cause, (ValueError, RuntimeError)):
+                raise HTTPException(status_code=409,
+                                    detail=str(error.cause)) from error
+            raise HTTPException(
+                status_code=503,
+                detail="Context cancellation worker is unavailable") from error
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return JSONResponse(content={"token": token})
+
+    async def cancel_context_cancellation(self,
+                                          request: ContextCancellationRequest,
+                                          raw_request: Request) -> JSONResponse:
+        """Queue cancellation; this response is not a physical retirement receipt.
+
+        Args:
+            request: Worker-issued context admission/cancellation token.
+            raw_request: HTTP request carrying purpose-bound authentication.
+
+        Returns:
+            HTTP 202 with not_submitted or queued, not a worker-handled outcome.
+
+        Raises:
+            HTTPException: Authentication failed or cancellation is unconfirmed.
+        """
+        try:
+            validate_context_cancellation_auth(self._internal_disagg_auth_key,
+                                               "cancel", request.model_dump(),
+                                               raw_request.headers)
+        except ValueError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+        cancel = getattr(getattr(self.generator, "_executor", None),
+                         "cancel_context_cancellation", None)
+        if not self._accepts_context_controls() or not callable(cancel):
+            raise HTTPException(status_code=409,
+                                detail="Context cancellation is unsupported")
+        try:
+            status = await asyncio.to_thread(cancel, request.token)
+        except RPCError as error:
+            if isinstance(error.cause, (ValueError, RuntimeError)):
+                raise HTTPException(status_code=409,
+                                    detail=str(error.cause)) from error
+            raise HTTPException(
+                status_code=503,
+                detail="Context cancellation delivery is unconfirmed"
+            ) from error
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if status not in ("not_submitted", "queued"):
+            raise HTTPException(
+                status_code=503,
+                detail="Context cancellation delivery is unconfirmed")
+        return JSONResponse(content={"status": status}, status_code=202)
 
     def _get_scheduling_params(
             self, request: Union[ChatCompletionRequest, CompletionRequest],
@@ -1151,6 +1262,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 getattr(self, "_internal_disagg_auth_key", None), request,
                 getattr(self, "server_role", None),
                 None if raw_request is None else raw_request.headers))
+
+    def _accepts_context_controls(self) -> bool:
+        """Whether this HTTP worker can accept authenticated CTX inputs."""
+        return (getattr(self, "server_role", None) in (None, ServerRole.CONTEXT)
+                and bool(getattr(self, "_internal_disagg_auth_key", None))
+                and self._has_cache_transceiver_config())
 
     def _has_cache_transceiver_config(self) -> bool:
         cache_transceiver_config = getattr(
@@ -1288,6 +1405,12 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
+        self.app.add_api_route("/internal/context-cancellation/reserve",
+                               self.reserve_context_cancellation,
+                               methods=["POST"])
+        self.app.add_api_route("/internal/context-cancellation/cancel",
+                               self.cancel_context_cancellation,
+                               methods=["POST"])
         resource_governor_queue = self.generator._executor.resource_governor_queue
         if resource_governor_queue is not None:
             from .resource_governor import ResourceGovernor
@@ -1380,7 +1503,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self._register_memory_report_route()
         self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
-                               self.get_server_info,
+                               self._get_server_info_http,
+                               name="get_server_info",
                                methods=["GET"])
         # The render and generate routes are a separate exposed surface: off
         # unless TRTLLM_ENABLE_RENDER_ENDPOINTS=1.
@@ -4179,11 +4303,41 @@ class OpenAIServer(_VideoRoutesMixin):
             return None
         return capacity.get("tokensPerBlock") or None
 
-    async def get_server_info(self) -> JSONResponse:
+    async def _get_server_info_http(self, raw_request: Request) -> JSONResponse:
+        """Serve ordinary metadata or answer the caller's authenticated challenge."""
+        return await self.get_server_info(raw_request)
+
+    async def get_server_info(self,
+                              raw_request: Optional[Request] = None
+                              ) -> JSONResponse:
+        challenge = None
+        if raw_request is not None and CONTEXT_PROBE_HEADER in raw_request.headers:
+            try:
+                challenge = validate_context_probe(
+                    self._internal_disagg_auth_key, raw_request.headers)
+            except ValueError as error:
+                raise HTTPException(status_code=403,
+                                    detail=str(error)) from error
         # Note: calling self.generator.disaggregated_params and startup_metrics below
         # may trigger an RPC sync call, blocking the server event loop. Since this server_info
         # is usually called only once before accepting requests, it's not a big concern.
         content = {"disaggregated_params": self.generator.disaggregated_params}
+        executor = getattr(self.generator, "_executor", None)
+        capability = getattr(executor, "supports_logical_context_cancellation",
+                             None)
+        content["supports_logical_context_cancellation"] = False
+        if (self._accepts_context_controls() and callable(capability)
+                and callable(
+                    getattr(executor, "reserve_context_cancellation", None))
+                and callable(
+                    getattr(executor, "cancel_context_cancellation", None))):
+            try:
+                content["supports_logical_context_cancellation"] = (
+                    await asyncio.to_thread(capability) is True)
+            except RPCError:
+                # Unavailable is retryable; only a completed probe can reject support.
+                content["supports_logical_context_cancellation"] = None
+                logger.warning("Context cancellation capability is unavailable")
         # A router or caller checks this before trusting prompt token ids that
         # another process rendered; it is computed once, then reused.
         render_fingerprint = getattr(self, "_render_fingerprint", None)
@@ -4228,7 +4382,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 content["tokens_per_block"] = live_tokens_per_block
         content["startup_metrics"] = getattr(self.generator, "startup_metrics",
                                              {})
-        return JSONResponse(content=content)
+        reply_headers = None
+        if challenge is not None:
+            reply_headers = build_context_cancellation_headers(
+                self._internal_disagg_auth_key, "probe-result", {
+                    "challenge": challenge,
+                    "supported":
+                    content["supports_logical_context_cancellation"]
+                })
+            reply_headers["Cache-Control"] = "no-store"
+        return JSONResponse(content=content, headers=reply_headers)
 
     async def openai_image_generation(self, request: ImageGenerationRequest,
                                       raw_request: Request) -> Response:

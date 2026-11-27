@@ -323,6 +323,13 @@ class DisaggregatedParams(OpenAIBaseModel):
     encoded_opaque_state: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
     disagg_request_id: Optional[int] = None
+    context_cancellation_token: Optional[str] = Field(
+        default=None,
+        repr=False,
+        min_length=1,
+        max_length=512,
+        description="Authenticated, single-use context cancellation reservation."
+    )
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
@@ -363,6 +370,18 @@ class DisaggregatedParams(OpenAIBaseModel):
                 "multimodal_positions and multimodal_lengths must have the same length"
             )
         return self
+
+
+class ContextCancellationReservationRequest(OpenAIBaseModel):
+    disagg_request_id: int = Field(gt=0, strict=True)
+    authorization_id: str = Field(min_length=32,
+                                  max_length=32,
+                                  pattern=r"^[0-9a-f]{32}$")
+    authorization_expires_at_ms: int = Field(ge=0, strict=True)
+
+
+class ContextCancellationRequest(OpenAIBaseModel):
+    token: str = Field(min_length=1, max_length=512, repr=False)
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -2361,6 +2380,8 @@ def to_llm_disaggregated_params(
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
         orig_elapsed_s=disaggregated_params.orig_elapsed_s,
+        context_cancellation_token=disaggregated_params.
+        context_cancellation_token,
     )
 
 

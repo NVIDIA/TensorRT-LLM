@@ -564,6 +564,7 @@ def _decode_key(raw_key: bytes) -> Optional[str]:
 
 # Returns the value of the record stored under a key, or None if it is not valid.
 _DecodeRecord = Callable[[str, bytes], Optional[str]]
+_AvailabilityCallback = Callable[[dict[str, str] | None], None]
 
 
 class Etcd3WatchEventQueue(WatchEventQueue):
@@ -590,6 +591,46 @@ class Etcd3WatchEventQueue(WatchEventQueue):
         self._loop = loop
         # Value of each key as last queued for the consumer.
         self._values: Dict[str, str] = {}
+        self._availability_callback: _AvailabilityCallback | None = None
+        self._available = False
+        # Known keys whose most recent PUT did not verify. Legacy event consumers
+        # ignore these PUTs, but their old values no longer qualify for a snapshot.
+        self._invalid_keys: set[str] = set()
+
+    @property
+    def observes_availability(self) -> bool:
+        return self._availability_callback is not None
+
+    def set_availability_callback(
+            self, callback: _AvailabilityCallback | None) -> None:
+        """Observe verified snapshots on this loop, independently of the event queue.
+
+        A new observer starts unavailable (None). A revision-bound read and watch
+        establish the first snapshot. Later snapshots include each batch of changes;
+        the observer receives None again as soon as its stream is known to be down.
+        """
+        self._availability_callback = callback
+        self._available = False
+        if callback is not None:
+            callback(None)
+            self.connection_lost()
+
+    def connection_lost(self) -> None:
+        """Invalidate an observed snapshot without waiting for the client's end callback."""
+        if self.observes_availability:
+            self._on_stream_end(self, self.stream)
+
+    def set_available(self, available: bool) -> None:
+        if self._availability_callback is not None and self._available != available:
+            self._available = available
+            self._availability_callback(self._snapshot() if available else None)
+
+    def _snapshot(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in self._values.items()
+            if key not in self._invalid_keys
+        }
 
     def cancel_event(self) -> None:
         """Cancel the current watch stream on the client that owns it."""
@@ -627,8 +668,6 @@ class Etcd3WatchEventQueue(WatchEventQueue):
             value = ""
             if event_type == WatchEventType.SET:
                 value = self._decode_record(key, event.value)
-                if value is None:
-                    continue
             events.append(
                 WatchEvent(storage_item=StorageItem(key=key, value=value),
                            event_type=event_type))
@@ -636,6 +675,9 @@ class Etcd3WatchEventQueue(WatchEventQueue):
 
     async def add_events(self, events: List[WatchEvent]) -> None:
         """Queue events that the caller read itself, such as the records present when watching starts."""
+        if self._availability_callback is not None:
+            raise RuntimeError(
+                "An observed watch reads its own initial records")
         self._queue(events)
 
     def resync(self, records: Dict[str, str]) -> None:
@@ -644,6 +686,7 @@ class Etcd3WatchEventQueue(WatchEventQueue):
         Removals come first: when a worker came back on the same address under a new key, a
         consumer that keys workers by address then removes the old record before adding the new.
         """
+        self._invalid_keys.clear()
         events = [
             WatchEvent(storage_item=StorageItem(key=key),
                        event_type=WatchEventType.DELETE)
@@ -667,12 +710,25 @@ class Etcd3WatchEventQueue(WatchEventQueue):
                              events: List[WatchEvent]) -> None:
         """Queue the events of watch stream ``stream`` unless a later stream replaced it."""
         if stream == self.stream:
-            self._queue(events)
+            self._queue(events, from_stream=True)
 
-    def _queue(self, events: List[WatchEvent]) -> None:
+    def _queue(self,
+               events: List[WatchEvent],
+               from_stream: bool = False) -> None:
         """Queue the events that change what the consumer has seen; runs on the event loop."""
+        changed = False
         for event in events:
             key, value = event.storage_item.key, event.storage_item.value
+            if from_stream and event.event_type == WatchEventType.SET and value is None:
+                if (self._availability_callback is not None
+                        and key in self._values
+                        and key not in self._invalid_keys):
+                    self._invalid_keys.add(key)
+                    changed = True
+                continue
+            if key in self._invalid_keys:
+                self._invalid_keys.remove(key)
+                changed = True
             if event.event_type == WatchEventType.SET:
                 if self._values.get(key) == value:
                     continue
@@ -682,6 +738,9 @@ class Etcd3WatchEventQueue(WatchEventQueue):
                 # valid signature, has nothing to remove.
                 continue
             self.events.put_nowait(event)
+            changed = True
+        if changed and self._available and self._availability_callback is not None:
+            self._availability_callback(self._snapshot())
 
 
 # Details of the INVALID_ARGUMENT errors with which etcd rejects a login token
@@ -846,6 +905,8 @@ class Etcd3ClusterStorage(ClusterStorage):
         """Close the current connection; the next storage call connects again."""
         client, self._client = self._client, None
         if client is not None:
+            for handle in self._watch_handles.values():
+                handle.connection_lost()
             client.close()
 
     def _encode_record(self, key: str, value: str) -> str:
@@ -883,9 +944,15 @@ class Etcd3ClusterStorage(ClusterStorage):
                 "and worker of the cluster uses the same record_auth_key")
         return record["value"]
 
-    def _read_prefix(self, key_prefix: str) -> Tuple[Dict[str, str], int]:
+    def _read_prefix(
+        self,
+        key_prefix: str,
+        client: Optional[etcd3.MultiEndpointEtcd3Client] = None
+    ) -> Tuple[Dict[str, str], int]:
         """The valid records under ``key_prefix`` and the etcd revision of the read."""
-        response = self.client.get_prefix_response(key_prefix)
+        if client is None:
+            client = self.client
+        response = client.get_prefix_response(key_prefix)
         records = {}
         for kv in response.kvs:
             key = _decode_key(kv.key)
@@ -967,6 +1034,7 @@ class Etcd3ClusterStorage(ClusterStorage):
         """
         handle.cancel_event()
         handle.stream += 1
+        handle.stream_ended = False
         client = self.client
         watch_id = await asyncio.to_thread(client.add_watch_prefix_callback,
                                            handle.key_prefix,
@@ -986,6 +1054,7 @@ class Etcd3ClusterStorage(ClusterStorage):
         if stream != handle.stream:
             return
         handle.stream_ended = True
+        handle.set_available(False)
         if self._watch_handles.get(handle.key_prefix) is not handle:
             return
         if handle.restart_task is None or handle.restart_task.done():
@@ -999,11 +1068,18 @@ class Etcd3ClusterStorage(ClusterStorage):
         """Queue what changed meanwhile, then watch on a new stream from there until one starts."""
         delay = _WATCH_RETRY_MIN_SEC
         while self._watch_handles.get(handle.key_prefix) is handle:
-            handle.stream_ended = False
+            client = None
             try:
                 await self.connect()
                 client = self.client
-                records, revision = self._read_prefix(handle.key_prefix)
+                if handle.observes_availability:
+                    records, revision = await asyncio.to_thread(
+                        self._read_prefix, handle.key_prefix, client)
+                    if (self.client is not client or self._watch_handles.get(
+                            handle.key_prefix) is not handle):
+                        continue
+                else:
+                    records, revision = self._read_prefix(handle.key_prefix)
                 # The new stream reports the changes made after the read, so
                 # the consumer gets them after the resync, in etcd's order.
                 handle.resync(records)
@@ -1014,15 +1090,22 @@ class Etcd3ClusterStorage(ClusterStorage):
                     return
                 # etcd does not report a watch that it did not start because
                 # it rejected the login token; a read with the same login does.
-                client.get(handle.key_prefix)
+                if handle.observes_availability:
+                    await asyncio.to_thread(client.get, handle.key_prefix)
+                else:
+                    client.get(handle.key_prefix)
             except (etcd3.Etcd3Exception, grpc.RpcError, OSError,
                     ValueError) as e:
                 handle.stream_ended = True
                 logger.warning(
                     f"Could not watch {handle.key_prefix!r} again, trying "
                     f"again in {delay} seconds: {_describe_error(e)}")
-                self.reconnect()
-            if not handle.stream_ended:
+                if self.client is client:
+                    self.reconnect()
+            if self._watch_handles.get(handle.key_prefix) is not handle:
+                return
+            if not handle.stream_ended and self.client is client:
+                handle.set_available(True)
                 logger.info(f"Watching {handle.key_prefix!r} again")
                 return
             await asyncio.sleep(delay)
@@ -1031,4 +1114,6 @@ class Etcd3ClusterStorage(ClusterStorage):
     async def unwatch(self, key_prefix: str) -> None:
         handle = self._watch_handles.pop(key_prefix)
         if handle:
+            handle.set_available(False)
+            handle.set_availability_callback(None)
             handle.cancel_event()

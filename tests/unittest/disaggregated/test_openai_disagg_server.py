@@ -434,8 +434,12 @@ async def test_first_chunk_wait_cancels_and_closes_upstream(cancel_task: bool) -
 
 
 @pytest.mark.asyncio
-async def test_client_disconnect_before_first_chunk_ends_request_quietly(streaming_server):
+@pytest.mark.parametrize("protected", [False, True])
+async def test_client_disconnect_before_first_chunk_ends_request_quietly(
+    streaming_server, protected
+):
     """An early disconnect returns a plain response instead of raising into the ASGI server."""
+    streaming_server._service.context_cancellation_enabled = protected
     started = asyncio.Event()
     closed = asyncio.Event()
     disconnected = asyncio.Event()
@@ -518,12 +522,16 @@ async def _failing_generation_stream():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["completion", "chat"])
-async def test_stream_failing_before_first_chunk_returns_http_error(kind, streaming_server):
+@pytest.mark.parametrize("protected", [False, True])
+async def test_stream_failing_before_first_chunk_returns_http_error(
+    kind, streaming_server, protected
+):
     """A generation server that fails its KV transfer yields no chunk; answer 500, not a cut 200."""
 
     async def entry_point(request, hooks):
         return _failing_generation_stream()
 
+    streaming_server._service.context_cancellation_enabled = protected
     request = _stream_request(kind)
     wrapper = streaming_server._wrap_entry_point(entry_point, type(request))
 
@@ -705,7 +713,8 @@ async def test_anthropic_stream_failing_before_first_chunk_ends_with_error_event
     """/v1/messages keeps its 200 and ends a stream that fails before its first chunk with an error."""
     server = streaming_server
     server._service = SimpleNamespace(
-        openai_chat_completion=AsyncMock(return_value=_failing_generation_stream())
+        context_cancellation_enabled=False,
+        openai_chat_completion=AsyncMock(return_value=_failing_generation_stream()),
     )
 
     response = await server.anthropic_messages(
@@ -719,8 +728,9 @@ async def test_anthropic_stream_failing_before_first_chunk_ends_with_error_event
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protected", [False, True])
 async def test_anthropic_stream_pings_while_the_first_chunk_is_pending(
-    monkeypatch, streaming_server
+    monkeypatch, streaming_server, protected
 ):
     """/v1/messages does not wait for the first chunk, so pings keep a slow stream alive."""
     monkeypatch.setattr(anthropic_adapter, "STREAM_PING_INTERVAL_S", 0.01)
@@ -733,7 +743,8 @@ async def test_anthropic_stream_pings_while_the_first_chunk_is_pending(
 
     server = streaming_server
     server._service = SimpleNamespace(
-        openai_chat_completion=AsyncMock(return_value=slow_generation_stream())
+        context_cancellation_enabled=protected,
+        openai_chat_completion=AsyncMock(return_value=slow_generation_stream()),
     )
 
     response = await asyncio.wait_for(
