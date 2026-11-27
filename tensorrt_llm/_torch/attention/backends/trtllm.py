@@ -1891,13 +1891,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @property
     def supports_steady_decode_step(self) -> bool:
-        """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
-        prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
-        mixed-precision KV, full generation page table or FMHA library step plan) and prepare() is this
-        class's."""
+        """Whether prepare_steady_decode_step may stand in for this metadata's prepare()."""
         return (type(self).prepare is TrtllmAttentionMetadata.prepare
-                and self.kv_cache_manager is not None
-                and not self.enable_flash_mla and not self.enable_helix
+                and self._steady_decode_config_supported())
+
+    def _steady_decode_config_supported(self) -> bool:
+        """Whether the common prepare() needs no host state beyond the KV lengths and
+        block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
+        mixed-precision KV, full generation page table or FMHA step plan)."""
+        return (self.kv_cache_manager is not None and not self.enable_flash_mla
+                and not self.enable_helix
                 and not self.enable_context_mla_with_cached_kv
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()
@@ -1917,14 +1920,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         batch_block_table_key(self.request_ids))
         self._steady_block_table_keys = tuple(keys)
 
-    def prepare_steady_decode_step(self, kv_lens: List[int]) -> None:
+    def prepare_steady_decode_step(
+            self,
+            kv_lens: List[int],
+            prompt_lens: Optional[List[int]] = None) -> None:
         """prepare() of a generation-only step that runs the batch of the previous prepare() one step later.
 
-        Requires supports_steady_decode_step and the same requests, prompt lengths, request types and beam width
-        as that prepare(); kv_lens_cuda[:num_seqs] already holds the new lengths on the device. Sets the host
-        state that follows from ``kv_lens`` (KV lengths without the extra speculative tokens) and copies the
-        block offsets of a KV cache manager only when its batch_block_table_key changed. Speculative decoding
-        copies the full table width (max_blocks None), as prepare() does.
+        Requires supports_steady_decode_step, the same request types and beam width as that prepare() and, without
+        ``prompt_lens``, its requests; kv_lens_cuda[:num_seqs] already holds the new lengths on the device. Sets
+        the host state that follows from ``kv_lens`` (KV lengths without the extra speculative tokens) and copies
+        the block offsets of a KV cache manager only when its batch_block_table_key changed. Speculative decoding
+        copies the full table width (max_blocks None), as prepare() does. With ``prompt_lens``, other requests
+        took the rows: prompt_lens_cuda[:num_seqs] already holds their prompt lengths too.
         """
         AttentionMetadata.prepare(self)
         self._invalidate_mla_scheduler_buffers()
@@ -1932,6 +1939,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             get_global_attrs().attention_metadata = weakref.ref(self)
         num_seqs = self.num_seqs
         assert len(kv_lens) == num_seqs and self.num_contexts == 0
+        if prompt_lens is not None:
+            self.prompt_lens_cpu[:num_seqs].copy_(
+                torch.as_tensor(prompt_lens, dtype=torch.int, device='cpu'))
+            h2d_cache.forget(self.prompt_lens_cuda)
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
         host_kv_lens = torch.tensor(kv_lens, dtype=torch.int)
         self.kv_lens[:num_seqs].copy_(host_kv_lens + num_extra_kv_tokens)

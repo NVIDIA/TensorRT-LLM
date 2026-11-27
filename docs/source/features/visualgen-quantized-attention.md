@@ -10,8 +10,10 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
   - [Configuration Surface](#configuration-surface)
 - [QK16PV8 Attention Kernels in the CUTEDSL Backend](#qk16pv8-attention-kernels-in-the-cutedsl-backend)
 - [SageAttention in the `TRTLLM` backend](#sageattention-in-the-trtllm-backend)
+- [VC-Attention in the `TRTLLM` backend](#vc-attention-in-the-trtllm-backend)
 - [FP8 and MXFP8 in the cuDNN Backend](#fp8-and-mxfp8-in-the-cudnn-backend)
 - [MXFP8 and NVFP4 in the `CUTEDSL` and `FlashInfer` backends](#mxfp8-and-nvfp4-in-the-cutedsl-and-flashinfer-backends)
+- [DeCo-Attention in the `CUTEDSL` backend](#deco-attention-in-the-cutedsl-backend)
 - [Interaction With Other Features](#interaction-with-other-features)
 
 ## Overview
@@ -38,6 +40,8 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 | `CUTEDSL` | `bf16` | `fp8` | `(0, 0, 0)` | QK16PV8 |
 | `CUTEDSL` | `mxfp8` | `fp8` | `(0, 0, 0)`, `(0, 0, 1)` | MXFP8 Q/K |
 | `CUTEDSL` | `nvfp4` | `fp8` | `(0, 0, 0)`, `(0, 0, 1)` | NVFP4 Q/K |
+| `CUTEDSL` | `nvfp4` | `fp8` | `(0, 0, 0)` | DeCo-Attention with FP8 PV, NVFP4 Q/K with compensation channels (`deco_attention: true`) |
+| `CUTEDSL` | `nvfp4` | `nvfp4` | `(0, 0, 0)` | DeCo-Attention with NVFP4 PV for SM120 (`deco_attention: true`) |
 | `FLASHINFER` | `mxfp8` | `fp8` | `(0, 0, 0)` | MXFP8 Q/K |
 | `FLASHINFER` | `nvfp4` | `fp8` | `(0, 0, 0)` | NVFP4 Q/K |
 | `FLASHINFER` | `nvfp4` | `nvfp4` | `(0, 0, 0)` | NVFP4 Attention |
@@ -57,6 +61,7 @@ Video quality is generally more sensitive to BMM1 accuracy than BMM2 accuracy, s
 - The `CUDNN` backend requires Q/K and V to use the same format. Use `fp8` for per-tensor scaling or `mxfp8` for block scaling.
 - For VC-Attention (`vc_attention: true`), `vc_repair_budget: 0.005` (0.5% of the tokens as repair rows) runs faster than the default tile means at unchanged quality; `0.005` to `0.02` is the useful range.
 - For `CUTEDSL` MXFP8 or NVFP4 recipes, `v_block_size: 1` uses a separate V scale per head and channel, while `v_block_size: 0` uses one tensor-wide V scale. Try the per-channel variant when the tensor-wide scale loses quality.
+- For DeCo-Attention (`deco_attention: true`), `v_dtype: fp8` keeps V at 8 bits; where `v_dtype: nvfp4` is available, it also runs BMM2 at 4 bits.
 
 After a recipe meets the quality target, benchmark its end-to-end throughput with the production workload.
 
@@ -73,8 +78,9 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | `smooth_v` | bool | `False` | SageAttention only. Subtract the per-channel V mean before quantizing V and add it back to the output. Applied where attention runs on the PrimTS kernels; see [SageAttention in the `TRTLLM` backend](#sageattention-in-the-trtllm-backend). |
 | `vc_attention` | bool | `false` | Run the recipe as VC-Attention on the `TRTLLM` backend. See [VC-Attention in the `TRTLLM` backend](#vc-attention-in-the-trtllm-backend). |
 | `vc_repair_budget` | float in `[0, 1)` | `0.0` | Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means. `0` restores the means. `vc_attention` only. |
+| `deco_attention` | bool | `false` | Run the recipe as DeCo-Attention on the `CUTEDSL` backend. See [DeCo-Attention in the `CUTEDSL` backend](#deco-attention-in-the-cutedsl-backend). |
 
-Routing (`tensorrt_llm/_torch/visual_gen/attention/backends/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
+Routing (`tensorrt_llm/_torch/visual_gen/attention/backends/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and for `CUTEDSL` the dense `CuTeDSLAttention` FMHA backend, or `DeCoAttention` when `deco_attention` is set.
 
 ## QK16PV8 Attention Kernels in the CUTEDSL Backend
 
@@ -333,8 +339,56 @@ attention_config:
     v_block_size: 0
 ```
 
+## DeCo-Attention in the `CUTEDSL` backend
+
+**What it does.** DeCo-Attention runs BMM1 on 4-bit Q/K and adds an estimate of the first-order quantization error of the scores back inside the same matrix product. Its preparation runs on the GPU before every attention call; it needs no calibration data and no change to the checkpoint.
+
+| Operand | Preparation |
+|---------|-------------|
+| Q, K | Rotated with a fixed sign-randomized Hadamard matrix and quantized to NVFP4. The 32 directions per head that hold most of the energy of Q and K, estimated on a sample of the tokens, give 2 × 32 compensation channels next to the 128 rotated ones, so BMM1 is one NVFP4 product over 192 channels. |
+| V | Smoothed: the means of V over blocks of keys are subtracted before quantization and added back weighted by the attention weights. `v_dtype: fp8` stores E4M3 with 128-key blocks, `v_dtype: nvfp4` stores NVFP4 with 16-key blocks; BMM2 runs in the format of V. |
+
+**Requirements and behavior.**
+
+- **GPUs.** SM100, SM103, SM107 and SM120; `v_dtype: nvfp4` on SM120 only. Other GPUs and backends reject the recipe when the model is built.
+- **Calls on the kernels.** Self-attention with head dimension 128, as many K/V heads as Q heads, BF16 inputs and at least 8192 rows. The backend runs every other call unquantized on `VANILLA`: cross-attention, a causal mask, another dtype, a shorter sequence such as the text of a token refiner, and every call of a layer with another head dimension or K/V head count. A model whose sequence has a fixed length and one modality needs no code for the recipe. A model whose sequence carries padding or packs several modalities passes the key padding mask and the token tags of the next two items, as MiniMax-H3 and HunyuanVideo 1.5 do. The recipe is validated on Wan2.2, HunyuanVideo 1.5 and MiniMax-H3; a model whose self-attention has fewer than 8192 tokens, such as FLUX or Qwen-Image at common image sizes, runs it on `VANILLA`. The backend logs the first call that it runs on `VANILLA` and why, once per reason.
+- **Padding.** A self-attention call marks its tokens with `key_padding_mask` (`[B, S]`, true for a token). Padded rows get no attention weight, whatever they hold, and return zeros. The tokens of every sample come first and its padding after them (`requires_trailing_padding`): the backend reads the mask as the count of tokens of every sample, on the kernels and on `VANILLA` alike, so a mask with padding between tokens is attended as if those tokens came first. Samples of a batch may hold different numbers of tokens. MiniMax-H3 rejects a packed sequence with padding between its tokens under this recipe.
+- **Joint sequences.** A model whose sequence packs text or audio tokens with the video tokens passes the modality of every position (`token_tags`). Half of the sampled tokens then come from the text and audio tokens, for every sample from its own tokens; without tags the sample is uniform.
+- **Fixed options.** The recipe sets every scaling granularity and smooths V itself with fixed parameters, so `q_block_size`, `k_block_size` and `v_block_size` stay `0`, and `smooth_k` and `smooth_v` are not options of it. The compensation rank is fixed at 32. A larger rank widens BMM1 and lowers the score error. `QuantAttentionConfig` does not offer a rank field yet. It does not compose with `vc_attention` or sparse attention (see [Interaction With Other Features](#interaction-with-other-features)).
+- **CUDA graphs.** The kernels are JIT-compiled on first use and keep no state between calls. A capture follows an eager forward of the same shape, which the CUDA graph runner's warm-up provides; a kernel variant or the inputs of a shape first met under capture raise an error. Every kernel compilation is logged with its key and its time. The token counts and the sampled tokens of a call are computed on the device, so a captured call follows the content of its mask and tags tensors on replay.
+
+**Configuration.**
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen import AttentionConfig, QuantAttentionConfig
+
+args = VisualGenArgs(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    attention_config=AttentionConfig(
+        backend="CUTEDSL",
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="nvfp4",
+            v_dtype="fp8",
+            deco_attention=True,
+        ),
+    ),
+)
+```
+
+```yaml
+attention_config:
+  backend: CUTEDSL
+  quant_attention_config:
+    qk_dtype: nvfp4
+    v_dtype: fp8
+    deco_attention: true
+```
+
+For NVFP4 PV, set `v_dtype` to `nvfp4`.
+
 ## Interaction With Other Features
 
 - **Linear-layer quantization** (`VisualGenArgs.quant_config`, e.g. FP8 block scales or NVFP4) is independent and can be combined with any attention recipe.
-- **Sparse attention.** On `CUTEDSL`, quantized attention and Video Sparse Attention (VSA) are mutually exclusive and rejected by the validator. On `TRTLLM`, Skip Softmax uses the same backend and the SageAttention unit tests exercise the two together. VC-Attention (`vc_attention: true`) is rejected together with any `sparse_attention_config`.
-- **Parallelism.** SageAttention is covered by a multi-GPU Ulysses test (`tests/unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py`). The CuTe DSL dense backend produces LSE, so it also composes with Attention2D / Ring context parallelism; the TRTLLM Sage path does not expose LSE through this wrapper.
+- **Sparse attention.** On `CUTEDSL`, quantized attention and Video Sparse Attention (VSA) are mutually exclusive and rejected by the validator. On `TRTLLM`, Skip Softmax uses the same backend and the SageAttention unit tests exercise the two together. VC-Attention (`vc_attention: true`) and DeCo-Attention (`deco_attention: true`) are rejected together with any `sparse_attention_config`.
+- **Parallelism.** SageAttention is covered by a multi-GPU Ulysses test (`tests/unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py`). The CuTe DSL dense backend produces LSE, so it also composes with Attention2D / Ring context parallelism; the TRTLLM Sage path does not expose LSE through this wrapper. DeCo-Attention does not produce LSE either: it composes with Ulysses, not with Attention2D / Ring.

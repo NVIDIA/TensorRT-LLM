@@ -131,9 +131,9 @@ def test_case_counts_use_scheduled_unsharded_pre_merge_universe(report_module, f
         _decision(), "pre_merge", str(REPO_ROOT), multi_gpu_scheduled=False
     )
 
-    # One 100-case single-GPU family narrowed to 20, plus a force-kept
-    # 10-case PerfSanity family. The two shards are one partitioned case set.
-    assert (cbts_cases, total_cases) == (30, 110)
+    # Count the narrowed 20-case family once across its two shards. PerfSanity
+    # contributes only to the baseline total because CBTS did not select it.
+    assert (cbts_cases, total_cases) == (20, 110)
 
 
 def test_case_counts_include_selected_multi_gpu_when_gate_is_open(report_module, fake_blocks):
@@ -141,7 +141,7 @@ def test_case_counts_include_selected_multi_gpu_when_gate_is_open(report_module,
         _decision(), "pre_merge", str(REPO_ROOT), multi_gpu_scheduled=True
     )
 
-    assert (cbts_cases, total_cases) == (35, 160)
+    assert (cbts_cases, total_cases) == (25, 160)
 
 
 def test_case_counts_include_coverage_multi_gpu_at_full_size(report_module, fake_blocks):
@@ -153,7 +153,7 @@ def test_case_counts_include_coverage_multi_gpu_at_full_size(report_module, fake
         decision, "pre_merge", str(REPO_ROOT), multi_gpu_scheduled=True
     )
 
-    assert (cbts_cases, total_cases) == (80, 160)
+    assert (cbts_cases, total_cases) == (70, 160)
 
 
 @pytest.mark.parametrize(
