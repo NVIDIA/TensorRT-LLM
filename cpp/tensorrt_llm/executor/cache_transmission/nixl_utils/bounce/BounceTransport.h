@@ -231,9 +231,6 @@ private:
         std::uint64_t offset{}; // receiver arena region offset freed once scattered
     };
 
-    /// The set of incoming regions currently scattering — the `busy` set passed to the scheduler's
-    /// reclaim calls so a region a worker is still reading is deferred, not re-granted.
-    std::unordered_set<std::uint64_t> scatteringRegions() const;
     /// Shared reclaim bookkeeping (cancel / peer loss / lease expiry): run `reclaim` with the
     /// currently-scattering regions as the busy set, send the resulting grants, and flag every
     /// deferred region orphaned in mScattering so drainScatterDone frees it on completion.
@@ -264,7 +261,7 @@ private:
     // from re-granting an incoming region a worker is still reading; the orphaned flag decides whether
     // drainScatterDone frees the region via freeOrphanRegion (flow already gone) or onScatterDone
     // (normal completion).
-    std::unordered_map<std::uint64_t, bool> mScattering;
+    ScatterReservations mScattering;
 
     std::chrono::steady_clock::time_point mNextSweep{}; // checkTimeouts() throttle (IO-thread-only)
 };
@@ -342,6 +339,8 @@ private:
         Sent,         // getXferStatus==Done -> DATA emitted; xfer released; awaiting ACK
     };
 
+    friend class BounceSenderStateTest;
+
     struct Posted
     {
         std::uint32_t chunkIdx{};
@@ -368,6 +367,26 @@ private:
 
     struct Request
     {
+        [[nodiscard]] bool acceptsCredit(std::uint64_t packedBytes, std::uint32_t creditBytes);
+        [[nodiscard]] bool canPost();
+        [[nodiscard]] BounceFailReason failureReason(BounceFailReason fallback) const;
+
+        template <class Release>
+        bool acknowledge(std::uint32_t chunk, std::uint64_t handle, Release release)
+        {
+            for (auto iter = posted.begin(); iter != posted.end(); ++iter)
+            {
+                if (iter->state == PostState::Sent && iter->chunkIdx == chunk && iter->remoteHandle == handle)
+                {
+                    release(*iter);
+                    posted.erase(iter);
+                    ++acked;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         std::string windowKey;
         std::string windowId;
         std::string peer;
@@ -462,7 +481,9 @@ private:
 
     // request table (IO thread + submit() from app threads)
     std::mutex mReqMu;
-    std::unordered_map<std::uint64_t, Request> mRequests;
+    using RequestTable = std::unordered_map<std::uint64_t, Request>;
+    static RequestTable::iterator findReply(RequestTable& requests, std::string const& peer, std::uint64_t rid);
+    RequestTable mRequests;
     std::atomic<std::uint64_t> mNextRid{1};
 
     std::vector<OrphanLocal> mOrphanLocal;

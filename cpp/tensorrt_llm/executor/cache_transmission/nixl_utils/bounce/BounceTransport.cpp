@@ -325,41 +325,15 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     {
         return;
     }
-    // A non-empty WANT has no retransmission path (submit() sends it exactly once per fresh rid),
-    // so one for an already-tracked flow is a replay or rid collision. Re-queueing would re-grant
-    // over the still-held regions — the sender never writes the extras, so they leak — and the
-    // lease refresh inside onWant would keep the flow forever off staleFlows(), defeating the
-    // reclaim path that exists for exactly this state. Drop it, mirroring the duplicate-DATA and
-    // stale-ACK handling. (Check-then-act is safe: all flow-state mutation happens on this IO
-    // thread; app threads only acquireLocal().) Checked BEFORE the chunk-size gate so a replay of
-    // a live request can never be NACKed.
-    if (mCtx.scheduler.knowsFlow(key))
+    auto grants = mCtx.scheduler.startFlow(key, chunkBytes, mCtx.cfg.maxChunkSizeBytes);
+    if (!grants)
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropped duplicate WANT from peer %s rid=%llu", mCtx.selfName.c_str(),
-            peer.c_str(), static_cast<unsigned long long>(h.requestId));
+        TLLM_LOG_WARNING("BounceTransport(%s): rejected WANT from peer %s rid=%llu: invalid chunk size",
+            mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId));
+        mCtx.channel->sendTo(peer, signBounceFrame(encodeNack(h.requestId, 0, 0), window->key(), window->id()));
         return;
     }
-    // Defensive range check against a buggy or mis-configured peer (defence in depth, not an
-    // adversary model — see the trust model in ZmqControlChannel.h). The handshake pins both sides to the same
-    // effective maxChunkSizeBytes (already clamped to usable arena capacity in the ctor), so a
-    // compliant sender never emits a chunk of 0 or above that cap. An ungrantable size must not
-    // reach the scheduler: BuddyAllocator::alloc() can never satisfy it, the flow would stay
-    // blocked forever, and once maybeActivateDrain() latches it as the drain flow every grant to
-    // every peer stops — with no reclaim path, because a pending-only flow holds no regions and
-    // the lease sweep skips it.
-    for (auto const bytes : chunkBytes)
-    {
-        if (bytes == 0 || bytes > mCtx.cfg.maxChunkSizeBytes)
-        {
-            TLLM_LOG_WARNING("BounceTransport(%s): rejected WANT from peer %s rid=%llu: chunk size %u outside (0, %zu]",
-                mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), bytes,
-                static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes));
-            // Request-level NACK: the sender fails now instead of waiting out requestTimeoutMs.
-            mCtx.channel->sendTo(peer, signBounceFrame(encodeNack(h.requestId, 0, 0), window->key(), window->id()));
-            return;
-        }
-    }
-    mCtx.sendGrants(mCtx.scheduler.onWant(key, chunkBytes));
+    mCtx.sendGrants(*grants);
 }
 
 void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, std::string const& blob,
@@ -375,13 +349,6 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
         return;
     }
     auto const key = makeKey(peer, window->id(), h.requestId);
-    // Drop a DATA whose region this flow no longer holds — it was cancelled/reclaimed (e.g. an empty
-    // WANT raced ahead of this DATA), and the region may have been re-granted to another flow.
-    // Scattering it would read a freed/re-owned region and corrupt that other flow's data.
-    if (!mCtx.scheduler.heldByFlow(key, h.regionHandle))
-    {
-        return;
-    }
     ScatterJob job;
     job.window = window;
     job.key = key;
@@ -389,22 +356,14 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
     job.rid = h.requestId;
     job.chunkIdx = h.chunkIdx;
     job.offset = h.regionHandle;
-    // Capture the granted region's byte size HERE (IO thread) — the scatter worker cannot query the
-    // IO-thread-only scheduler. Used to bound scatter reads to THIS flow's region (below).
-    job.regionBytes = mCtx.scheduler.regionBytes(h.regionHandle);
     job.entries = std::move(entries);
-    job.nvtxQueue = bounceRangeStart(
-        kNvtxScatterQueue, "scatterQueue rid=%llu chunk=%u", static_cast<unsigned long long>(h.requestId), h.chunkIdx);
-    // DATA is not retransmitted by this protocol. An occupied region therefore indicates stale or
-    // malformed input; drop it instead of adding replay state or risking two readers of one grant.
-    if (!mScattering.emplace(job.offset, false).second)
+    if (!mScattering.begin(mCtx.scheduler, key, job.offset))
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping duplicate DATA peer=%s rid=%llu chunk=%u region=%llu",
-            mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
-            static_cast<unsigned long long>(h.regionHandle));
-        bounceRangeEnd(job.nvtxQueue);
         return;
     }
+    job.regionBytes = mCtx.scheduler.regionBytes(job.offset);
+    job.nvtxQueue = bounceRangeStart(
+        kNvtxScatterQueue, "scatterQueue rid=%llu chunk=%u", static_cast<unsigned long long>(h.requestId), h.chunkIdx);
     {
         std::lock_guard<std::mutex> lk(mJobMu);
         mJobs.emplace_back(std::move(job));
@@ -412,27 +371,13 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
     mJobCv.notify_one();
 }
 
-std::unordered_set<std::uint64_t> BounceReceiver::scatteringRegions() const
-{
-    std::unordered_set<std::uint64_t> busy;
-    busy.reserve(mScattering.size());
-    for (auto const& [off, orphaned] : mScattering)
-    {
-        busy.insert(off);
-    }
-    return busy;
-}
-
 void BounceReceiver::reclaimAndFlagDeferred(
     std::function<std::vector<Grant>(std::unordered_set<std::uint64_t> const&, std::vector<std::uint64_t>&)> const&
         reclaim)
 {
     std::vector<std::uint64_t> deferred;
-    mCtx.sendGrants(reclaim(scatteringRegions(), deferred));
-    for (auto off : deferred)
-    {
-        mScattering[off] = true;
-    }
+    mCtx.sendGrants(reclaim(mScattering.offsets(), deferred));
+    mScattering.markOrphaned(deferred);
 }
 
 bool BounceReceiver::drainScatterDone()
@@ -453,13 +398,7 @@ bool BounceReceiver::drainScatterDone()
         // The ACK was already sent by the scatter worker itself (latency: it is on the sender's
         // ackWait critical path); only the region bookkeeping happens here, on the IO thread.
         // Worker finished reading this region. Was its flow reclaimed (peer gone / cancel) mid-scatter?
-        auto it = mScattering.find(d.offset);
-        bool const orphaned = (it != mScattering.end()) && it->second;
-        if (it != mScattering.end())
-        {
-            mScattering.erase(it);
-        }
-        if (orphaned)
+        if (mScattering.finish(d.offset))
         {
             // Flow was reclaimed while this scatter ran; the region was kept out of the arena so it
             // couldn't be re-granted under the worker. Now it's safe to free.
@@ -475,13 +414,8 @@ bool BounceReceiver::drainScatterDone()
 
 void BounceReceiver::forget(std::string const& peer)
 {
-    // Reclaim every flow this peer was granted ("peer\x1f rid").
-    // (1) Drop this peer's not-yet-started scatter jobs — no point scattering for a gone peer; their
-    //     incoming regions are quarantined (or freed) by the reclaim below. A queued job whose
-    //     flow was ALREADY reclaimed (cancel / lease expiry flagged it orphaned in mScattering) sits
-    //     in the scheduler's orphan set; collect those offsets here and free them in (4), AFTER the
-    //     peer's flows are dropped — freeOrphanRegion runs schedule(), which would otherwise grant the
-    //     freed region straight back to a flow of the very peer being forgotten.
+    // Queued jobs for this peer will never run. Keep their orphaned regions until the scheduler
+    // has removed the peer's pending flows, so only surviving peers can get those regions.
     std::vector<std::uint64_t> orphanedOffsets;
     {
         std::lock_guard<std::mutex> lk(mJobMu);
@@ -491,14 +425,9 @@ void BounceReceiver::forget(std::string const& peer)
             if (j.peer == peer)
             {
                 bounceRangeEnd(j.nvtxQueue); // job dropped, close its queue-wait span
-                auto it = mScattering.find(j.offset);
-                if (it != mScattering.end())
+                if (mScattering.finish(j.offset))
                 {
-                    if (it->second)
-                    {
-                        orphanedOffsets.push_back(j.offset);
-                    }
-                    mScattering.erase(it);
+                    orphanedOffsets.push_back(j.offset);
                 }
             }
             else
@@ -518,15 +447,9 @@ void BounceReceiver::forget(std::string const& peer)
     reclaimAndFlagDeferred(
         [&](auto const& busy, auto& deferred)
         {
-            return mCtx.scheduler.reclaimByPrefix(
-                peer + kSep, busy, deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)));
+            return mCtx.scheduler.reclaimByPrefix(peer + kSep, busy, deferred,
+                std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)), orphanedOffsets);
         });
-    // (4) Now that none of this peer's flows is in the ring, free the orphaned regions collected in
-    //     (1); the re-grants can only reach other peers.
-    for (auto const off : orphanedOffsets)
-    {
-        mCtx.sendGrants(mCtx.scheduler.freeOrphanRegion(off)); // mirrors drainScatterDone
-    }
 }
 
 void BounceReceiver::checkTimeouts()
@@ -612,8 +535,8 @@ void BounceReceiver::recoverScatterJob(
     {
         try
         {
-            mCtx.channel->sendTo(
-                job.peer, signBounceFrame(encodeNack(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
+            mCtx.channel->sendTo(job.peer,
+                signBounceFrame(encodeNack(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
         }
         catch (std::exception const& sendErr)
         {
@@ -712,32 +635,11 @@ void BounceReceiver::scatterWorkerLoop()
                 // maxChunkSizeBytes can carry more pieces than our pinned/scratch hold; reject rather than
                 // overflow (no launch -> NACK, the sender fails immediately; never a false ACK).
                 std::size_t const maxEntries = maxPlanEntries(ctx);
-                std::uint64_t rawPieces = 0;
-                for (std::uint32_t i = 0; i < n; ++i)
+                auto const pieces = countScatterPieces(job.entries, job.regionBytes, maxEntries);
+                inBounds = inBounds && pieces.has_value();
+                auto const rawPieces = pieces.value_or(0);
+                auto const destinationAllowed = [&](std::uint64_t address, std::uint64_t length)
                 {
-                    auto const& e = job.entries[i];
-                    // Run-level source bounds: every piece p reads region[bounceOffset + p*bounceStride
-                    // .. +pieceSize). count-1 and bounceStride are both u32 so the span product cannot
-                    // overflow u64. A count of 0 is malformed (a run always carries >= 1 piece).
-                    std::uint64_t const span = static_cast<std::uint64_t>(e.count - 1) * e.bounceStride + e.pieceSize;
-                    inBounds = inBounds && e.count >= 1 && e.bounceOffset <= job.regionBytes
-                        && span <= job.regionBytes - e.bounceOffset;
-                    rawPieces += std::max<std::uint32_t>(e.count, 1);
-                }
-                // Reject an oversized run list BEFORE the exact-count pass below: that pass iterates
-                // once per PIECE, so a hostile/corrupt DATA (per-run count near 2^32 passes the span
-                // check when bounceStride is 0) could otherwise pin this worker — and its region —
-                // for days. piecesFor() emits at least one entry per piece, so rawPieces > maxEntries
-                // implies the nTotal <= maxEntries check would reject the job anyway.
-                if (inBounds && rawPieces > maxEntries)
-                {
-                    TLLM_LOG_WARNING(
-                        "BounceTransport(%s): rejected scatter with %llu pieces (max %zu) rid=%llu chunk=%u",
-                        mCtx.selfName.c_str(), static_cast<unsigned long long>(rawPieces), maxEntries,
-                        static_cast<unsigned long long>(job.rid), job.chunkIdx);
-                    inBounds = false;
-                }
-                auto const destinationAllowed = [&](std::uint64_t address, std::uint64_t length) {
                     auto const it = regions.upper_bound(address);
                     if (it == regions.begin())
                     {
@@ -842,14 +744,15 @@ void BounceReceiver::scatterWorkerLoop()
                 BounceNvtxScope ackScope(
                     kNvtxAckSend, "ackSend rid=%llu chunk=%u", static_cast<unsigned long long>(job.rid), job.chunkIdx);
                 acked = true;
-                mCtx.channel->sendTo(
-                    job.peer, signBounceFrame(encodeAck(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
+                mCtx.channel->sendTo(job.peer,
+                    signBounceFrame(encodeAck(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
             }
             else
             {
                 nackSent = true;
-                mCtx.channel->sendTo(
-                    job.peer, signBounceFrame(encodeNack(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
+                mCtx.channel->sendTo(job.peer,
+                    signBounceFrame(
+                        encodeNack(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
             }
             {
                 std::lock_guard<std::mutex> lk(mDoneMu);
@@ -944,7 +847,8 @@ std::shared_future<BounceResult> BounceSender::submit(
     }
     // Ask the receiver to grant a region for each chunk of this request flow. The WANT carries our
     // own control endpoint so the receiver can addPeer us and send GRANT/ACK back (self-bootstrap).
-    mCtx.channel->sendTo(peer, signBounceFrame(encodeWant(rid, chunkBytes, mCtx.channel->localEndpoint()), windowKey, windowId));
+    mCtx.channel->sendTo(
+        peer, signBounceFrame(encodeWant(rid, chunkBytes, mCtx.channel->localEndpoint()), windowKey, windowId));
     if (mCtx.cfg.enableEagerGather)
     {
         // Overlap the WANT->GRANT control round-trip with the gather: launch this request's first
@@ -965,6 +869,43 @@ std::shared_future<BounceResult> BounceSender::submit(
     return fut;
 }
 
+BounceSender::RequestTable::iterator BounceSender::findReply(
+    RequestTable& requests, std::string const& peer, std::uint64_t rid)
+{
+    auto it = requests.find(rid);
+    if (it != requests.end() && it->second.peer != peer)
+    {
+        TLLM_LOG_WARNING("BounceTransport: dropped reply from peer %s for peer %s rid=%llu", peer.c_str(),
+            it->second.peer.c_str(), static_cast<unsigned long long>(rid));
+        return requests.end();
+    }
+    return it;
+}
+
+bool BounceSender::Request::acceptsCredit(std::uint64_t packedBytes, std::uint32_t creditBytes)
+{
+    if (packedBytes > creditBytes)
+    {
+        abandonReason = BounceFailReason::kProtocolError;
+    }
+    return canPost();
+}
+
+bool BounceSender::Request::canPost()
+{
+    if (abandonReason != BounceFailReason::kNone)
+    {
+        pendingCredits.clear();
+        return false;
+    }
+    return true;
+}
+
+BounceFailReason BounceSender::Request::failureReason(BounceFailReason fallback) const
+{
+    return abandonReason == BounceFailReason::kNone ? fallback : abandonReason;
+}
+
 void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob)
 {
     std::vector<BounceCreditEntry> credits;
@@ -973,20 +914,12 @@ void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, st
         return;
     }
     std::lock_guard<std::mutex> lk(mReqMu);
-    auto it = mRequests.find(h.requestId);
+    auto it = findReply(mRequests, peer, h.requestId);
     if (it == mRequests.end())
     {
-        return; // late grant for a finished/cancelled request
-    }
-    Request& req = it->second;
-    // A credit contains a peer-owned address. Never let an unrelated peer redirect this request's
-    // RDMA write, even if it guesses the request id.
-    if (peer != req.peer)
-    {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer GRANT peer=%s expected=%s rid=%llu",
-            mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId));
         return;
     }
+    Request& req = it->second;
     bounceRangeEnd(req.nvtxGrantWait);     // first GRANT ends the credit-wait span (no-op on later GRANTs)
     bounceRangeEnd(req.nvtxCreditStarved); // a GRANT ends the current starvation period (pump may reopen one)
     for (auto const& credit : credits)
@@ -1006,7 +939,7 @@ bool BounceSender::abandonOnCreditMispair(
     // and abandon the flow rather than corrupt the peer: pumpRequest stops touching an abandoned
     // request, so once its pre-abandon in-flight chunks drain, lastProgress freezes and
     // checkTimeouts fails it within one requestTimeoutMs.
-    if (packedBytes <= creditLen)
+    if (req.acceptsCredit(packedBytes, creditLen))
     {
         return false;
     }
@@ -1015,8 +948,6 @@ bool BounceSender::abandonOnCreditMispair(
         "mispair/reorder); abandoning flow",
         mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx, static_cast<std::size_t>(packedBytes),
         static_cast<unsigned int>(creditLen));
-    req.abandonReason = BounceFailReason::kProtocolError;
-    req.pendingCredits.clear();
     return true;
 }
 
@@ -1077,17 +1008,8 @@ void BounceSender::attachCredits(std::uint64_t rid, Request& req)
 
 void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
 {
-    if (req.abandonReason != BounceFailReason::kNone)
+    if (!req.canPost())
     {
-        // Abandoned (GRANT mispair / plan overflow): stop attaching credits and launching gathers.
-        // Chunks credited BEFORE the abandon still drain normally (drainGatherReady/onAck may refresh
-        // lastProgress a bounded number of times), but no new credit can ever attach, so checkTimeouts
-        // fails the request within one requestTimeoutMs of the last pre-abandon chunk's completion —
-        // instead of being revived indefinitely by later GRANTs on a flow already known dead.
-        // Drop credits a post-abandon GRANT parked (onGrant appends before calling here), keeping the
-        // abandon sites' "no parked credits" invariant; they are plain POD, and the receiver reclaims
-        // the regions behind them via the cancel that failRequest sends.
-        req.pendingCredits.clear();
         return;
     }
     attachCredits(rid, req);
@@ -1415,23 +1337,12 @@ bool BounceSender::pollSenderHandles()
 void BounceSender::onNack(std::string const& peer, BounceMsgHeader const& h)
 {
     std::lock_guard<std::mutex> lk(mReqMu);
-    auto it = mRequests.find(h.requestId);
+    auto it = findReply(mRequests, peer, h.requestId);
     if (it == mRequests.end())
     {
-        // Expected late arrival: the request already failed / was cancelled (e.g. a scatter NACK
-        // racing the timeout or a second chunk's NACK after the first one failed it).
-        TLLM_LOG_DEBUG("BounceTransport(%s): dropping NACK for unknown rid=%llu peer=%s chunk=%u",
-            mCtx.selfName.c_str(), static_cast<unsigned long long>(h.requestId), peer.c_str(), h.chunkIdx);
         return;
     }
     Request& req = it->second;
-    if (peer != req.peer)
-    {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer NACK peer=%s expected=%s rid=%llu chunk=%u",
-            mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId),
-            h.chunkIdx);
-        return;
-    }
     // Same terminal path as a failed RDMA write (pollSenderHandles): failRequest resolves the future,
     // recycles/defers the staging regions and sends the cancel that reclaims the receiver's regions.
     failRequest(h.requestId, req, BounceFailReason::kPeerNack);
@@ -1445,35 +1356,18 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
     BounceNvtxScope ackScope(
         kNvtxOnAck, "onAck rid=%llu chunk=%u", static_cast<unsigned long long>(h.requestId), h.chunkIdx);
     std::lock_guard<std::mutex> lk(mReqMu);
-    auto it = mRequests.find(h.requestId);
+    auto it = findReply(mRequests, peer, h.requestId);
     if (it == mRequests.end())
     {
         return;
     }
     Request& req = it->second;
-    if (peer != req.peer)
-    {
-        TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer ACK peer=%s expected=%s rid=%llu chunk=%u",
-            mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId),
-            h.chunkIdx);
-        return;
-    }
-    bool found = false;
-    for (auto pit = req.posted.begin(); pit != req.posted.end(); ++pit)
-    {
-        // Only a Sent chunk has finished reading its local staging region and may recycle it on ACK.
-        if (pit->chunkIdx == h.chunkIdx && pit->remoteHandle == h.regionHandle && pit->state == PostState::Sent)
-        {
-            bounceRangeEnd(pit->nvtxAckWait);
-            // Return the gather-staging region to the shared arena; re-schedule may hand the freed
-            // bytes to a waiting remote flow.
-            mCtx.sendGrants(mCtx.scheduler.releaseLocal(pit->localOffset));
-            req.posted.erase(pit);
-            found = true;
-            break;
-        }
-    }
-    if (!found)
+    if (!req.acknowledge(h.chunkIdx, h.regionHandle,
+            [&](Posted& post)
+            {
+                bounceRangeEnd(post.nvtxAckWait);
+                mCtx.sendGrants(mCtx.scheduler.releaseLocal(post.localOffset));
+            }))
     {
         TLLM_LOG_WARNING("BounceTransport(%s): dropping stale/invalid ACK peer=%s rid=%llu chunk=%u region=%llu",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
@@ -1482,7 +1376,6 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
         // could push acked past numChunks and resolve SUCCESS before all chunks actually landed.
         return;
     }
-    req.acked += 1;
     req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk was ACKed
     if (req.acked >= req.numChunks)
     {
@@ -1659,10 +1552,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
 {
     // An abandoned flow (GRANT mispair / plan overflow) reaches here through the timeout path;
     // report the specific abandon cause, not the generic timeout.
-    if (req.abandonReason != BounceFailReason::kNone)
-    {
-        reason = req.abandonReason;
-    }
+    reason = req.failureReason(reason);
     // The one log line every sender-side failure passes through (timeout, peer drop, write/gather
     // failure) — keep it WARNING and keep the progress context.
     TLLM_LOG_WARNING("BounceTransport(%s): request FAILED rid=%llu peer=%s reason=\"%s\" chunks acked=%u posted=%u/%u",

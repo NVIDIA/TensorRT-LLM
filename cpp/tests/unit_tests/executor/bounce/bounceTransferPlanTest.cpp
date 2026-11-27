@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
@@ -40,6 +41,18 @@ kvc::TransferDescs makeDescs(std::vector<std::tuple<std::uintptr_t, std::size_t,
     return kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(v)};
 }
 } // namespace
+
+TEST(BounceTransferPlan, ScatterPieceCountChecksScratchBeforeExpansion)
+{
+    b::BounceScatterRun run{};
+    run.count = 4;
+    run.pieceSize = 16;
+    EXPECT_EQ(b::countScatterPieces({run}, 16, 4), 4U);
+    EXPECT_FALSE(b::countScatterPieces({run}, 16, 3));
+    EXPECT_FALSE(b::countScatterPieces({run}, 15, 4));
+    run.count = std::numeric_limits<std::uint32_t>::max();
+    EXPECT_FALSE(b::countScatterPieces({run}, 16, 4));
+}
 
 TEST(BounceTransferPlan, EmptyYieldsNoChunks)
 {
