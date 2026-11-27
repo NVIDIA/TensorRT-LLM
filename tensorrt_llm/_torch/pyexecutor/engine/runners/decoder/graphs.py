@@ -40,7 +40,11 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -242,6 +246,9 @@ class DecoderCudaGraphs:
     # Whether TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1 may capture these graphs in one pass.
     supports_single_pass_capture: ClassVar[bool] = True
 
+    # The model's hooks, resolved at construction (all off until then).
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+
     def __init__(
         self,
         *,
@@ -270,6 +277,7 @@ class DecoderCudaGraphs:
         self._config = config
         self.mapping = mapping
         self.model = model
+        self.runtime_hooks = runtime_hooks_of(model)
         self.sparse_attention_config = sparse_attention_config
         self._metrics = metrics
         self._dummy_requests = dummy_requests
@@ -981,6 +989,18 @@ class DecoderCudaGraphs:
                         # Tactics tuned while warming the decode graphs agree across
                         # ranks before the capture pass reads them.
                         AutoTuner.get().post_tune_merge_tactics()
+                    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+                    if (
+                        runtime_hooks_of(self.model).persist_flashinfer_mxfp8_tactics
+                        and is_warmup_only
+                        and flashinfer_methods
+                        and cache_path is not None
+                    ):
+                        # The decode-graph pass tunes after the warmup's autotune() context saved the
+                        # cache: save again so these tactics persist across starts instead of being
+                        # re-profiled on every server start.
+                        autotuner = AutoTuner.get()
+                        autotuner.profiling_cache.save_cache(cache_path, autotuner.mapping.rank)
                     self._capture_additional_cuda_graphs(resource_manager)
                     if is_warmup_only and any(
                         method.tune_mxfp8_backends for method in flashinfer_methods
@@ -1064,6 +1084,19 @@ class DecoderCudaGraphs:
                 max_seq_len_list = [effective_max_seq_len]
         else:
             max_seq_len_list = [effective_max_seq_len]
+        long_family_tokens = self.cuda_graph_runner.long_family_min_total_tokens
+        if long_family_tokens is not None and effective_max_seq_len >= long_family_tokens:
+            # The long-context family (MsaRuntimePolicy.long_family_min_total_tokens): the longest warmup above
+            # captures it; one warmup at half the boundary captures the family below it (one long request plus
+            # minimal fillers, so its summed length stays under the boundary).
+            below = long_family_tokens // 2
+            short_len = min(max_seq_len_list) if len(max_seq_len_list) > 1 else 0
+            if short_len < below < effective_max_seq_len:
+                max_seq_len_list = [effective_max_seq_len, below] + max_seq_len_list[1:]
+        elif long_family_tokens is not None:
+            # A boundary above the per-rank max length leaves one family: the longest warmup serves
+            # every batch, so no summed-length batch may key an uncaptured long family.
+            self.cuda_graph_runner.long_family_min_total_tokens = None
 
         # Without variants (every decode but some FP4 MLA ones) the capture
         # leaves the graph runner's variant state alone.
@@ -1509,6 +1542,10 @@ class DecoderCudaGraphs:
             self.breakable_cuda_graph_runner.clear(
                 release_nccl_window_owners=release_nccl_window_owners
             )
+            # The model's per-graph state (RuntimeHooks.prefill_graphs_released) ends with the graphs.
+            released = self.runtime_hooks.prefill_graphs_released
+            if released is not None:
+                released(self.model)
 
     def _set_warmup_ragged_windows(self, batch, verify_bucket: int, draft_len: int) -> None:
         """Give a capture batch per-request windows summing to ``verify_bucket``.

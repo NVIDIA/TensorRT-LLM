@@ -183,6 +183,36 @@ if _UNRANKED:
     )
 
 
+def register_impl_ahead_of(impl_cls: MoEImplClass, *, ahead_of: MoEImplClass, family: str) -> None:
+    """Make a leaf defined outside this package selectable: register its identity, rank it
+    immediately ahead of ``ahead_of`` in ``IMPL_PRIORITY`` and add it to ``BACKEND_FAMILY[family]``.
+
+    For a model-specific variant of a stock leaf (Modeling V2 targets keep such leaves in their
+    family). The variant's ``can_implement`` declines whatever it cannot serve, so the stock leaf
+    behind it keeps every other layer. Idempotent; raises when ``ahead_of`` is not a ranked member
+    of ``family``.
+    """
+    global IMPL_PRIORITY
+    if impl_cls in IMPL_PRIORITY:
+        return
+    members = BACKEND_FAMILY.get(family)
+    if members is None or ahead_of not in members or ahead_of not in IMPL_PRIORITY:
+        raise ValueError(
+            f"{ahead_of.__name__} is not a ranked member of the {family!r} MoE backend family"
+        )
+    existing = MOE_IMPL_REGISTRY.lookup(impl_cls.descriptor.identity)
+    if existing is None:
+        MOE_IMPL_REGISTRY.register(impl_cls)
+    elif existing is not impl_cls:
+        raise ValueError(
+            f"duplicate MoEImplId {impl_cls.descriptor.identity.canonical()}: "
+            f"{existing.__name__} vs {impl_cls.__name__}"
+        )
+    index = IMPL_PRIORITY.index(ahead_of)
+    IMPL_PRIORITY = IMPL_PRIORITY[:index] + (impl_cls,) + IMPL_PRIORITY[index:]
+    BACKEND_FAMILY[family] = members | {impl_cls}
+
+
 def backend_family_of(impl_cls: MoEImplClass) -> Optional[str]:
     """The ``moe_backend`` literal whose family contains ``impl_cls``.
 

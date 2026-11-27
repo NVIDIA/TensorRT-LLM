@@ -23,6 +23,8 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+from ._worktile_scope import with_scalar_work_tile_info
+
 
 def _stable_value(value: object) -> object:
     if isinstance(value, enum.Enum):
@@ -133,6 +135,7 @@ def is_attention_kernel_cached(
     ).is_compiled
 
 
+@with_scalar_work_tile_info
 def build_and_load_attention_kernel(
     family: str,
     kind: str,

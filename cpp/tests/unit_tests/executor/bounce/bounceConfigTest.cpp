@@ -294,3 +294,31 @@ TEST(BounceConfig, ParamsWithoutRequestTimeoutLeaveLeaseAlone)
     EXPECT_EQ(cfgDirect.receiverFlowTimeoutMs, 123456);
     EXPECT_EQ(cfgDirect.quarantineMs, 654321);
 }
+
+TEST(BounceConfig, ScatterOrderingKnobsParseFromParams)
+{
+    std::unordered_map<std::string, std::string> const params{
+        {"scatter_on_order_stream", "off"}, {"copy_stream_priority", "LEAST"}, {"scatter_copy_engine", "off"}};
+    auto const cfg = b::BounceConfig::fromParams(params, b::BounceConfig{});
+    EXPECT_FALSE(cfg.scatterOnOrderStream);
+    EXPECT_FALSE(cfg.scatterCopyEngine);
+    EXPECT_EQ(cfg.copyStreamPriority, b::BounceConfig::StreamPriority::kLeast);
+
+    std::unordered_map<std::string, std::string> const params2{
+        {"copy_stream_priority", "default"}, {"scatter_on_order_stream", "on"}};
+    auto const cfg2 = b::BounceConfig::fromParams(params2, b::BounceConfig{});
+    EXPECT_EQ(cfg2.copyStreamPriority, b::BounceConfig::StreamPriority::kDefault);
+    EXPECT_TRUE(cfg2.scatterOnOrderStream);
+
+    // Garbage values keep the defaults.
+    std::unordered_map<std::string, std::string> const garbage{
+        {"scatter_on_order_stream", "maybe"}, {"copy_stream_priority", "highest"}, {"scatter_copy_engine", "perhaps"}};
+    auto const kept = b::BounceConfig::fromParams(garbage, b::BounceConfig{});
+    EXPECT_FALSE(kept.scatterOnOrderStream);
+    EXPECT_FALSE(kept.scatterCopyEngine);
+    EXPECT_TRUE(kept.scatterBlockingSync);
+
+    std::unordered_map<std::string, std::string> const blocking{{"scatter_blocking_sync", "0"}};
+    EXPECT_FALSE(b::BounceConfig::fromParams(blocking, b::BounceConfig{}).scatterBlockingSync);
+    EXPECT_EQ(kept.copyStreamPriority, b::BounceConfig::StreamPriority::kGreatest);
+}

@@ -246,6 +246,7 @@ class DecoderRunner(ScheduledModelRunner):
                 early_copy=self.runtime_hooks.pack_early_copy,
                 step_epoch=self.runtime_hooks.pack_step_epoch,
                 prologue_op=self.runtime_hooks.pack_prologue_op,
+                cpp_scatter=self.runtime_hooks.pack_cpp_scatter,
             )
             if self.runtime_hooks.pack_step_inputs
             else None
@@ -586,6 +587,7 @@ class DecoderRunner(ScheduledModelRunner):
             dist=self._dist,
             sparse_attention_config=self._sparse_attention_config,
             short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
+            long_family_min_total_tokens=self.runtime_hooks.msa.long_family_min_total_tokens,
             private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
             prioritize_decode_graphs=self.runtime_hooks.prioritize_decode_graphs,
             stage_decode_inputs=self.runtime_hooks.stage_decode_inputs,

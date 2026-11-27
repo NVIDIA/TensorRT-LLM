@@ -557,11 +557,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
         They would otherwise hold their /select open until a seat frees or their KV transfer
         deadline passes. Idempotent.
         """
+        # Every router: a pooled one's seat waiters, and a conversation router's late-bind
+        # waiters (the base router has none).
         for router in (self._ctx_router, self._gen_router):
-            if router.pooled:
-                failed = await router.fail_waiters("the disaggregated coordinator is stopping")
-                if failed:
-                    logger.info(f"Failed {failed} requests waiting for a seat at shutdown")
+            failed = await router.fail_waiters("the disaggregated coordinator is stopping")
+            if failed:
+                logger.info(f"Failed {failed} requests waiting for a seat at shutdown")
 
     async def stop(self) -> None:
         await self.fail_seat_waiters()
@@ -788,6 +789,12 @@ class CoordinatorClient(DisaggCoordinator):
         # Routers that expose get_next_server_by_key delegate placement to the
         # coordinator. Round-robin remains local. Pass the RAW url so the
         # delegating router picks the UDS connector when applicable.
+        if getattr(local_router, "_late_bind", False):
+            raise ValueError(
+                f"{role} router: ConversationRouter late_bind is not supported with "
+                "a multi-worker fleet or disagg coordinator; unset late_bind or use "
+                "num_workers=1"
+            )
         if hasattr(local_router, "get_next_server_by_key"):
             return CoordinatorDelegatingRouter(
                 self._remote_url_raw, local_router, role, self._request_timeout_s

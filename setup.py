@@ -175,6 +175,7 @@ else:
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
         'libs/libth_modeling_v2_*.so',
+        'libs/msa_fmha_sm100/**/*.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
@@ -224,6 +225,11 @@ MSA_VLLM_PACKAGES = {
     ['*.py', 'csrc/**/*', 'LICENSE', 'NOTICE', 'README.md'],
 }
 
+# The tactic pins the MiniMax-M3.1-Flash targets load before warmup tuning (m31_pins).
+package_data += [
+    '_torch/modeling_v2/models/minimax_m3/m31_tuning/**/*.json',
+]
+
 
 def download_precompiled(workspace: str, version: str) -> str:
     import glob
@@ -251,13 +257,16 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
     Precompiled wheels own native bits. Source owns configuration/telemetry schemas, the
-    OpenEngine contract and the kernel sources compiled at run time. Skip those wheel files so
-    Python-only edits layer over old wheels and tracked bindings from the current checkout
-    remain authoritative.
+    MiniMax-M3.1 tactic pins, the OpenEngine contract and the kernel sources compiled at run
+    time. Skip those wheel files so Python-only edits layer over old wheels and tracked
+    bindings from the current checkout remain authoritative.
     """
     filename = filename.replace("\\", "/")
     if filename.startswith(
         ("tensorrt_llm/schemas/", "tensorrt_llm/usage/schemas/")):
+        return filename.endswith(".json")
+    if filename.startswith(
+            "tensorrt_llm/_torch/modeling_v2/models/minimax_m3/m31_tuning/"):
         return filename.endswith(".json")
     return filename.startswith((
         "tensorrt_llm/grpc/openengine/_generated/",

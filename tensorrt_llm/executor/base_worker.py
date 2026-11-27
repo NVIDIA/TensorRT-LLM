@@ -1320,6 +1320,15 @@ class BaseWorker(GenerationExecutor):
 
         return startup_metrics
 
+    def async_stats_rpc_opted_in(self) -> bool:
+        """Whether the served model opts into the awaited stats RPC (``RuntimeHooks.async_stats_rpc``)."""
+        model = getattr(getattr(self.engine, "model_engine", None), "model",
+                        None)
+        if model is None:
+            return False
+        from .._torch.pyexecutor.runtime_hooks import runtime_hooks_of
+        return runtime_hooks_of(model).async_stats_rpc is True
+
     def get_engine_config(self) -> dict:
         """Return resolved model and KV-cache dtype metadata from the runtime."""
         model_engine = getattr(self.engine, "model_engine", None)

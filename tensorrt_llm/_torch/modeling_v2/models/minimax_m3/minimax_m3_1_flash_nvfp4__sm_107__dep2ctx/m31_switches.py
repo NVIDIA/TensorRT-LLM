@@ -25,7 +25,11 @@ _UNSET = frozenset(("", "0", "false", "off", "no"))
 
 #: The target's items: id -> what ``TRTLLM_M31_DISABLE_<id>=1`` restores.
 SWITCHES: Dict[str, str] = {
+    # Read by the MegaMoE local backend with its own rule (ops/moe/megamoe_local/local_plan.py).
+    "CTX_MOE_T16K": "the generic default tactic for the MegaMoE launch at the 16384-row bucket",
     "CTX_MOE_TAIL": "the MegaMoE launch's own top-k reduce and the separate shared-expert add",
+    "MEGAMOE_GATHER_FILL": "the MegaMoE gather index's padding ids as allocated",
+    "MEGAMOE_FASTLAUNCH": "every eager MegaMoE launch through the op (no recorded-launch replay)",
     "DEP2CTX_A1_FUSED_IN_BCG": "the stock QKV projection under a breakable prefill graph capture",
     "DEP2CTX_A1_IN_BCG": "the stock QKV projection and producer under a breakable prefill graph capture",
     "DEP2CTX_BCG_LARGE": "the prefill graph capture capped at the base bucket",

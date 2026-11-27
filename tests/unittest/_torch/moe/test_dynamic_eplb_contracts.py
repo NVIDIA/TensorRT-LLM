@@ -2422,8 +2422,9 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     namespace = {
         "ExpertStatistic": ExpertStatistic,
         "get_calibrator": lambda: SimpleNamespace(
-            maybe_collect_or_replay_slots=maybe_collect_or_replay_slots
+            mode="collect", maybe_collect_or_replay_slots=maybe_collect_or_replay_slots
         ),
+        "CalibratorMode": SimpleNamespace(REPLAY="replay"),
         "get_active_route_capture": lambda: None,
         "torch": SimpleNamespace(int32="int32", float32="float32"),
         "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
@@ -2435,7 +2436,11 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     _extract_function(source, "_num_rows", namespace)
     _extract_class(source, "MoEScheduler", {"_try_fused_route_quant"}, namespace)
     scheduler_cls = _extract_class(
-        source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace, bases=("MoEScheduler",)
+        source,
+        "FusedCommMoEScheduler",
+        {"_forward_chunk", "_may_fuse_route_quant"},
+        namespace,
+        bases=("MoEScheduler",),
     )
 
     plan = SimpleNamespace(reserved_sms=4)
@@ -2480,6 +2485,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         _load_balancer_route=route,
         _load_balancer_start_set_cpu_stage=lambda is_last_call: trace.append("start_set_cpu"),
         _load_balancer_done_set_cpu_stage=lambda is_last_call: trace.append("done_set_cpu"),
+        _using_load_balancer=lambda: layer is not None,
         _using_dynamic_load_balancer=lambda: False,
         _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_count_warmup=lambda *args: None,

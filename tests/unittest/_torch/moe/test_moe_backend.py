@@ -489,6 +489,7 @@ def _dummy_allreduce_moe(
                 torch.ones((logits.shape[0], 1), dtype=torch.float32),
             ),
         ),
+        _using_load_balancer=lambda: False,
         _using_dynamic_load_balancer=lambda: False,
         _load_balancer_uses_replica_plan=lambda: False,
         _warmup_placement_route_counters=lambda offset: None,

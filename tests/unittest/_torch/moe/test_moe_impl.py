@@ -3336,7 +3336,10 @@ def test_a_malformed_segment_is_rejected_before_lookup(text):
 
 def test_a_mistyped_token_is_answered_with_near_misses():
     """The vocabulary grows one entry per leaf, so listing all of it would not scale."""
-    with pytest.raises(ValueError, match=r"Closest known values: \['mega_moe'\]"):
+    # A model family may register a variant leaf (mega_moe_local) when its module is imported.
+    with pytest.raises(
+        ValueError, match=r"Closest known values: \['mega_moe'(, 'mega_moe_local')?\]"
+    ):
         MOE_IMPL_REGISTRY.parse_query("mega_moo")
 
 

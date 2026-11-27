@@ -508,6 +508,28 @@ def torch_comm():
     return _torch_comm
 
 
+_ENV_SWITCH_ON = ("1", "true", "on", "yes")
+_ENV_SWITCH_OFF = ("0", "false", "off", "no")
+
+
+def env_switch(name: str) -> Optional[bool]:
+    """An on/off environment variable: None when unset or empty, else True or False.
+
+    Accepts 1 / true / on / yes and 0 / false / off / no in any case, and raises
+    ValueError naming the variable for any other value.
+    """
+    word = os.environ.get(name, "").strip().lower()
+    if not word:
+        return None
+    if word in _ENV_SWITCH_ON:
+        return True
+    if word in _ENV_SWITCH_OFF:
+        return False
+    raise ValueError(
+        f"{name}={os.environ[name]!r}: expected 1 / true / on / yes (set) or "
+        "0 / false / off / no / empty (unset)")
+
+
 def mpi_disabled() -> bool:
     """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
     return os.environ.get("TLLM_DISABLE_MPI") == "1"

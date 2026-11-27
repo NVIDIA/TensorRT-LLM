@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <nanobind/nanobind.h>
@@ -297,6 +298,47 @@ static auto withTokens(nb::handle tokens, Fn&& fn)
     }
     auto [vec, knownNoDigest] = castTokenIterable(tokens);
     return fn(kv::toSpan(vec), knownNoDigest);
+}
+
+// GIL fast path for short, frequent calls (probe_reuse, KvCache.resize, get_storage_statistics), on a
+// manager a model opted in (KvCacheManager::setGilFastPath; off by default). Releasing the GIL around
+// such a call costs a GIL handoff whenever another Python thread is runnable: the caller then
+// waits up to the interpreter switch interval to run again, far longer than the call itself. So
+// when the manager's API lock is free right now, take it without waiting and run the call with
+// the GIL held; the core's own lock acquisitions nest inside. When the lock is busy, release the
+// GIL and block as usual. The GIL is never held while waiting for the API lock, so the deadlock
+// rule in kv_cache_manager_v2/AGENTS.md (a lock holder may need the GIL) still holds.
+// TRTLLM_KVCM2_DISABLE_GIL_FASTPATH=1 always releases first.
+//
+// A probe hashes and walks its prompt block by block, so its cost grows with the prompt. Up to
+// kGilFastPathMaxProbeTokens it stays well under one switch interval (a few hundred microseconds);
+// a longer probe releases the GIL and takes the shared lock, so other threads keep running and may
+// probe concurrently.
+constexpr size_t kGilFastPathMaxProbeTokens = size_t{1} << 18;
+
+static bool gilFastPathEnabled()
+{
+    static bool const enabled = []
+    {
+        char const* env = std::getenv("TRTLLM_KVCM2_DISABLE_GIL_FASTPATH");
+        return env == nullptr || std::strcmp(env, "1") != 0;
+    }();
+    return enabled;
+}
+
+template <class Fn>
+static auto callWithGilFastPath(kv::KvCacheManager const& manager, Fn&& fn)
+{
+    if (manager.gilFastPath() && gilFastPathEnabled())
+    {
+        auto const fast = manager.tryLockExclusive();
+        if (fast.acquired())
+        {
+            return fn();
+        }
+    }
+    nb::gil_scoped_release release;
+    return fn();
 }
 
 static kv::TypedVec<kv::PoolIndex, size_t> typedPoolSizeList(std::vector<size_t> const& slotSizeList)
@@ -2188,9 +2230,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "per step, because fetch_sparse_pages resolves one selection per request while an "
             "attention kernel indexes its selection per query token. Prefill and speculative "
             "decoding give a request several and are out of scope; this is the guard.")
-        .def("resize", &kv::KvCache::resize, nb::arg("capacity") = std::nullopt,
-            nb::arg("history_length") = std::nullopt, nb::kw_only(), nb::arg("complete_optional_recovery") = false,
-            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "resize",
+            [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength,
+                bool completeOptionalRecovery) -> bool
+            {
+                // Only a resize that needs no new block stays on the GIL fast path: a new block may evict
+                // pages to a lower (or remote) tier, and a history change (or an optional recovery) may
+                // allocate, which must not run with the GIL held.
+                int const tpb = self.tokensPerBlock();
+                bool const noNewBlock
+                    = !capacity.has_value() || (*capacity + tpb - 1) / tpb <= (self.capacity() + tpb - 1) / tpb;
+                if (noNewBlock && !historyLength.has_value() && !completeOptionalRecovery)
+                {
+                    return callWithGilFastPath(
+                        self.manager(), [&] { return self.resize(capacity, historyLength, completeOptionalRecovery); });
+                }
+                nb::gil_scoped_release release;
+                return self.resize(capacity, historyLength, completeOptionalRecovery);
+            },
+            nb::arg("capacity") = std::nullopt, nb::arg("history_length") = std::nullopt, nb::kw_only(),
+            nb::arg("complete_optional_recovery") = false)
         .def(
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
@@ -3674,14 +3734,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 if (inputTokens.is_none())
                 {
-                    nb::gil_scoped_release release;
-                    return self->probeReuse(std::move(reuseScope), kv::TokenSpan{}, /*knownNoDigest=*/true);
+                    return callWithGilFastPath(*self,
+                        [&]
+                        { return self->probeReuse(std::move(reuseScope), kv::TokenSpan{}, /*knownNoDigest=*/true); });
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
                     {
-                        nb::gil_scoped_release release;
-                        return self->probeReuse(std::move(reuseScope), view, knownNoDigest);
+                        if (static_cast<size_t>(view.size()) > kGilFastPathMaxProbeTokens)
+                        {
+                            nb::gil_scoped_release release;
+                            return self->probeReuse(std::move(reuseScope), view, knownNoDigest);
+                        }
+                        return callWithGilFastPath(
+                            *self, [&] { return self->probeReuse(std::move(reuseScope), view, knownNoDigest); });
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
@@ -3794,9 +3860,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             &kv::KvCacheManager::getAndResetIterationSuspendResumeStats, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_storage_statistics",
-            [](kv::KvCacheManager const& self, int cacheLevel)
-            { return self.getStorageStatistics(kv::CacheLevel{cacheLevel}).raw(); },
-            nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>())
+            [](kv::KvCacheManager const& self, int cacheLevel) {
+                return callWithGilFastPath(
+                    self, [&] { return self.getStorageStatistics(kv::CacheLevel{cacheLevel}).raw(); });
+            },
+            nb::arg("cache_level") = kv::kHotLevel.value())
+        .def("set_gil_fast_path", &kv::KvCacheManager::setGilFastPath, nb::arg("enabled"),
+            "Run short calls with the GIL held when the API lock is free (off by default).")
+        .def_prop_ro("gil_fast_path", &kv::KvCacheManager::gilFastPath)
         .def("get_and_reset_iteration_disk_prefetch_blocks",
             &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def(

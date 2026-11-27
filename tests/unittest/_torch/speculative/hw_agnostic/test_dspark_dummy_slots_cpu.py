@@ -72,3 +72,21 @@ def test_all_padding_families_preserve_real_slot_ownership(monkeypatch, physical
     DSparkSpecMetadata.prepare(meta)
     assert worker._req_to_slot == {}
     assert sorted(worker._free_slots) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "shift_label, block_size, identity",
+    [(True, 4, True), (False, 4, False), (True, 5, False)],
+)
+def test_draft_slots_are_identity_matches_the_slot_ids(shift_label, block_size, identity):
+    """The lean-glue identity shortcut holds exactly when the slot gather is arange."""
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker, dflash_draft_slot_ids
+
+    k = 4
+    draft_model = SimpleNamespace(shift_label=shift_label)
+    worker = dspark.DSparkWorker.__new__(dspark.DSparkWorker)
+    assert worker._draft_slots_are_identity(draft_model, block_size, k) is identity
+    slots = dflash_draft_slot_ids(3, block_size, k, shift_label, device="cpu")
+    assert torch.equal(slots, torch.arange(3 * block_size)) is identity
+    plain = DFlashWorker.__new__(DFlashWorker)
+    assert plain._draft_slots_are_identity(draft_model, block_size, k) is False

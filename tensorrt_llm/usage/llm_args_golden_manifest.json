@@ -801,6 +801,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "kv_cache_config.enable_disagg_completion_reservation"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "kv_cache_config.enable_kv_pool_rebalance"
     },
     {
@@ -1071,6 +1076,11 @@
       "capture_policy": "allowlist|none",
       "kind": "categorical",
       "path": "kv_connector_config.connector"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_connector_config.context_only"
     },
     {
       "capture_policy": "float",
@@ -1877,7 +1887,8 @@
     {
       "allowed_values": [
         "bf16",
-        "fp8"
+        "fp8",
+        "nvfp4"
       ],
       "capture_policy": "literal",
       "kind": "categorical",

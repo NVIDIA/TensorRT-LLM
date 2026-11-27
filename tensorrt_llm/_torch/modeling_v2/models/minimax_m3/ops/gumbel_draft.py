@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Family GUMBEL_DRAFT (moved from the DEP target, which installs it as DEP_GUMBEL_DRAFT; the TP targets as
-TP_GUMBEL_DRAFT): the DSpark ancestral draft block (``DSparkWorker._sample_block_ancestrally``) drawn by
+TP_GUMBEL_DRAFT): the DSpark ancestral draft block (``DSparkWorker._sample_block_draft_tokens``) drawn by
 ``minimax_m3/ops/markov_sampling.sample_markov_block`` (Gumbel-max, one fused draw per position; the CUDA C++ ops
 of NATIVE_MARKOV_SAMPLING, bit for bit the Triton sampler they replaced), through the ancestral block override
 (``speculative/dspark.set_ancestral_block_override``).

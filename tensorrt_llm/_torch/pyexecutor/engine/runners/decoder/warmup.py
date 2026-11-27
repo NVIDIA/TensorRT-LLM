@@ -291,6 +291,9 @@ class DecoderWarmup:
     shapes, pre-populates the memory pool and captures the CUDA graphs.
     """
 
+    # Whether this warmup already preloaded the model's tactic pins (RuntimeHooks.install_tactic_pins).
+    _tactic_pins_installed = False
+
     def __init__(
         self,
         *,
@@ -351,10 +354,18 @@ class DecoderWarmup:
         )
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
+        # A model's sparse attention warmup scope (RuntimeHooks.sparse_attention.warmup_scope) closes after the timed
+        # warmup: what it runs on exit is not one of the warmup timer's phases.
+        sparse_classes = runtime_hooks_of(self.model).sparse_attention
+        if sparse_classes is not None and sparse_classes.warmup_scope is not None:
+            scope = sparse_classes.warmup_scope(self)
+        else:
+            scope = contextlib.nullcontext()
         try:
-            # Retain a partial summary when a phase raises.
-            with self._warmup_timer:
-                return self._warmup_scheduled(resource_manager, kv_cache_manager)
+            with scope:
+                # Retain a partial summary when a phase raises.
+                with self._warmup_timer:
+                    return self._warmup_scheduled(resource_manager, kv_cache_manager)
         finally:
             # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage
             # their rows in buffers of its own: free the ones the warmup forwards left on this thread.
@@ -1549,6 +1560,12 @@ class DecoderWarmup:
                     AutoTuner.get().clean_pp_flag()
             return ran_forward
 
+        # The model's tuned-tactic pins (RuntimeHooks.install_tactic_pins), preloaded once per warmup object before
+        # its first tuning pass: shapes they cover are served instead of profiled.
+        install_tactic_pins = runtime_hooks_of(self.model).install_tactic_pins
+        if install_tactic_pins is not None and not self._tactic_pins_installed:
+            self._tactic_pins_installed = True
+            install_tactic_pins(self.mapping.rank)
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         ran_native_forward = run_autotuner_pass(
             autotune(cache_path=cache_path), synchronize_trtllm_cache=True
@@ -1565,6 +1582,15 @@ class DecoderWarmup:
             # serving different tactics for one shape: keep the fastest everywhere.
             # Collective; before the native MXFP8 cache below registers the tactics.
             AutoTuner.get().post_tune_merge_tactics()
+        if (
+            runtime_hooks_of(self.model).persist_flashinfer_mxfp8_tactics
+            and ran_flashinfer_forward
+            and cache_path is not None
+        ):
+            # The FlashInfer MXFP8 pass tunes after the native pass's autotune() context saved the cache:
+            # save again so its tactics persist across starts instead of being re-profiled every start.
+            autotuner = AutoTuner.get()
+            autotuner.profiling_cache.save_cache(cache_path, autotuner.mapping.rank)
 
         if enable_flashinfer_mxfp8_autotuner:
             if ran_flashinfer_forward:
@@ -1989,6 +2015,11 @@ class DecoderWarmup:
         self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
     ) -> None:
         """Compile the MSA indexer's KV-split proxy variants, which no warmup forward plans."""
+        sparse_classes = runtime_hooks_of(self.model).sparse_attention
+        if sparse_classes is not None and sparse_classes.indexer_prewarm is not None:
+            # The model's own sparse attention classes prewarm their own kernels.
+            sparse_classes.indexer_prewarm(self, kv_cache_manager)
+            return
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
             MiniMaxM3KVCacheManagerV2,
         )

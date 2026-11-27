@@ -723,9 +723,13 @@ def _make_admission_executor(model, requests):
         _validate_request_budget=Mock(),
         _validate_embedding_bias=Mock(),
         _handle_errors=Mock(),
+        _postlaunch_items=[],
+        is_shutdown=False,
+        control_requests=[],
         _num_embeddings=1234,
     )
     executor._validate_request = types.MethodType(PyExecutor._validate_request, executor)
+    executor._respond_if_invalid = types.MethodType(PyExecutor._respond_if_invalid, executor)
     return executor
 
 
@@ -963,9 +967,11 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(
         ),
         kv_cache_transceiver=None,
         disagg=types.SimpleNamespace(
+            commit_deferred_gen_receives=lambda: None,
             completed_gen_receives=lambda batch: batch.generation_requests,
-            try_finish_gen_receive=lambda req: True,
+            try_finish_gen_receive=lambda req, defer_commit=False: True,
         ),
+        _defer_gen_reuse_commit=False,
         _setup_sampler_step=Mock(),
         _update_sampler_state_for_disagg_gen_request=Mock(return_value=accepted),
         _maybe_prepend_logprobs_and_logits=Mock(),
@@ -1002,7 +1008,7 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward(
         # A failed sampler setup terminates the request before generation.
         terminated.is_disagg_generation_transmission_complete = False
 
-    def finish_gen_receive(req):
+    def finish_gen_receive(req, defer_commit=False):
         events.append(("finish", req.py_request_id))
         return False
 
@@ -1021,9 +1027,11 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward(
             }
         ),
         disagg=types.SimpleNamespace(
+            commit_deferred_gen_receives=lambda: None,
             completed_gen_receives=lambda batch: batch.generation_requests,
             try_finish_gen_receive=finish_gen_receive,
         ),
+        _defer_gen_reuse_commit=False,
         _setup_sampler_step=setup_sampler_step,
     )
 
@@ -3823,6 +3831,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
         track_unique_tokens=False,
+        _postlaunch_build=False,
         _is_kv_manager_v2=False,
         _num_embeddings=1234,
     )
@@ -3830,6 +3839,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     stub._cancel_queued_context_requests = types.MethodType(
         PyExecutor._cancel_queued_context_requests, stub
     )
+    stub._stage_postlaunch_items = types.MethodType(PyExecutor._stage_postlaunch_items, stub)
     stub._fetch_and_enqueue_requests = lambda waiting_queue, live, **kw: seen.update(live=live)
 
     def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
@@ -3916,6 +3926,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
         track_unique_tokens=False,
+        _postlaunch_build=False,
         _is_kv_manager_v2=False,
         _num_embeddings=123,
     )
@@ -3923,6 +3934,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         "_get_request_admission_capacity",
         "_pop_from_waiting_queue",
         "_cancel_queued_context_requests",
+        "_stage_postlaunch_items",
     ):
         setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
     live = []

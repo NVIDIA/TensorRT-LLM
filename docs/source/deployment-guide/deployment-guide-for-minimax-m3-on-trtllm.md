@@ -115,7 +115,11 @@ The checkpoint ships MXFP8 base layers with NVFP4 routed experts in the compress
 
 ### MSA kernels
 
-These targets use their own copy of the MSA kernels, which compiles at run time on first use (it needs `nvcc` and the CUTLASS headers packaged with TensorRT LLM, or `CUTLASS_ROOT`).
+These targets use their own copy of the MSA kernels, which compiles at run time on first use (it needs `nvcc` and the CUTLASS headers packaged with TensorRT LLM, or `CUTLASS_ROOT`). A wheel built with `python3 scripts/build_wheel.py --msa_aot` also compiles the kernel variants these targets call ahead of time and loads them before compiling anything at run time.
+
+### NVFP4 index keys
+
+Besides `indexer_kv_dtype: fp8`, these targets accept `indexer_kv_dtype: nvfp4`, which stores the index keys as packed NVFP4 pages (E2M1 values with E4M3 16-element scales, 72 bytes per token instead of 128) and scores them with E4M3 index queries. It requires `implementation: msa` and `fuse_qkv_index_projection: true`, and it is not bitwise identical to `fp8`: it can change which blocks are selected. `TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK=1` falls back to `fp8`.
 
 ### Speculative decoding with the DSpark drafter
 

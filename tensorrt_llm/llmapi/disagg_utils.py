@@ -494,6 +494,12 @@ def extract_disagg_cfg(
         # context servers report their own value in /server_info.
         gen_router_config.args["kv_transfer_timeout_ms"] = (
             _ctx_kv_transfer_timeout_ms(context_servers))
+    elif (str(gen_router_config.type).lower() == "conversation"
+          and gen_router_config.args.get("late_bind")
+          and "kv_transfer_timeout_ms" not in gen_router_config.args):
+        # A late-bind waiter fails once the context servers may have dropped its KV.
+        gen_router_config.args["kv_transfer_timeout_ms"] = (
+            _ctx_kv_transfer_timeout_ms(context_servers))
     if disagg_cluster:
         disagg_cluster_config = extract_disagg_cluster_config(disagg_cluster)
     else:
@@ -534,6 +540,10 @@ def extract_disagg_cfg(
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.num_workers = num_workers
     config.disagg_coordinator_url = disagg_coordinator_url
+    for role, router_config in (("context", ctx_router_config),
+                                ("generation", gen_router_config)):
+        reject_conversation_late_bind(router_config, role, num_workers,
+                                      disagg_coordinator_url)
     config.server_keep_alive_timeout = validate_config_non_negative_int(
         server_keep_alive_timeout, "server_keep_alive_timeout")
     config.internal_request_auth_key = internal_request_auth_key
@@ -662,6 +672,26 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
                                instance_num_ranks=instance_num_ranks,
                                other_args=kwargs))
     return cfgs
+
+
+def reject_conversation_late_bind(
+        router_config: Optional[RouterConfig], role: str, num_workers: int,
+        disagg_coordinator_url: Optional[str]) -> None:
+    """Refuse a conversation router with ``late_bind`` in a fleet placed by a coordinator.
+
+    The coordinator places by key without the request, so a turn cannot wait
+    for a free server; every request of that role would fail.
+    """
+    if (router_config is None
+            or str(router_config.type).lower() != "conversation"
+            or not router_config.args.get("late_bind")):
+        return
+    if num_workers > 1 or disagg_coordinator_url is not None:
+        raise ValueError(
+            f"{role} router: ConversationRouter late_bind is not supported with "
+            f"a multi-worker fleet or disagg coordinator (num_workers="
+            f"{num_workers}, disagg_coordinator_url={disagg_coordinator_url}); "
+            "unset late_bind or use num_workers=1")
 
 
 def extract_router_config(server_cfg: dict) -> RouterConfig:

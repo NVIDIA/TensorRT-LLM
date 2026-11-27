@@ -143,6 +143,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as _sampler_flashinfer
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.speculative import interface as _spec_interface
@@ -159,7 +160,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .. import cute_aot, m31_capture_fork, runtime_hooks_compat
+from .. import cute_aot, m31_capture_fork, m31_pins
 from ..kernels import m3_spec_tail
 from ..msa import engine as _msa_engine
 from ..ops import gqamix_sparse_decode as _gqamix_kernel
@@ -172,6 +173,7 @@ from ..ops.attention.m31_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_
 from ..ops.attention.m31_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
 from ..ops.attention.m31_qkv_insert import m3_qkv_insert
 from ..ops.comm.m31_allreduce import m3_allreduce
+from ..ops.dspark import dflash_merge as _dflash_merge
 from ..ops.embedding.m31_embedding import m3_embedding
 from ..ops.gemm.m3_fp32_linear import m3_fp32_linear
 from ..ops.gemm.m31_bf16_linear import m3_bf16_linear
@@ -6488,20 +6490,9 @@ def _build_speculation(shell, model_config: ModelConfig):
 # --------------------------------------------------------------------------------------------------------------------
 
 
-# TRTLLM_M31_DISABLE_HOSTTAIL=1 turns off six host-side items together (HOST_D2H_SIDE, SMALL_H2D, BATCH_CHANGED_ONLY,
-# SKIP_ACCEPTED_UPLOAD, PHILOX_PACK, KV_LENS_ONCE below).
+# TRTLLM_M31_DISABLE_HOSTTAIL=1 turns off four host-side items together (HOST_D2H_SIDE, SMALL_H2D, PHILOX_PACK,
+# KV_LENS_ONCE below).
 _HOSTTAIL_OFF = m31_disabled("HOSTTAIL")
-# SKIP_ACCEPTED_UPLOAD (RuntimeHooks.skip_accepted_draft_upload): the step's per-request accepted-draft
-# counts are no longer uploaded and spec_metadata.num_accepted_draft_tokens is None. Nothing on this target reads that
-# tensor (modeling.py, dspark.py, dspark_markov_worker.py, drafter_mxfp8.py, kernels/, ops/; the in-tree DFlash / DSpark
-# workers and the Eagle3 path: tests/unittest/_torch/executor/test_skip_accepted_draft_upload.py scans for readers).
-# Kill switch: TRTLLM_M31_DISABLE_SKIP_ACCEPTED_UPLOAD=1 (the stock per-step upload, packed under spec_small_h2d).
-STEP_SKIP_ACCEPTED_UPLOAD = not (_HOSTTAIL_OFF or m31_disabled("SKIP_ACCEPTED_UPLOAD"))
-# BATCH_CHANGED_ONLY (RuntimeHooks.spec_batch_map_changed_only): the standalone DSpark (DFlash)
-# drafter's batch_indices and batch-to-slot map are uploaded only when they change (both constant in steady decode);
-# the buffers hold the same values as with the stock every-step copies. Kill switch:
-# TRTLLM_M31_DISABLE_BATCH_CHANGED_ONLY=1 (both copied every step).
-STEP_BATCH_CHANGED_ONLY = not (_HOSTTAIL_OFF or m31_disabled("BATCH_CHANGED_ONLY"))
 # The rest of the step loop's host-side items, each default on with its own kill switch; every one is exact (the same
 # values reach the device, only the copies' stream, size, grouping or timing change):
 # * HOST_D2H_SIDE (RuntimeHooks.sampler_d2h_side_stream): the spec sampler's store copies to the host on a side
@@ -6587,7 +6578,7 @@ TP8_LONG_FAMILY_MIN_TOKENS = 540000 if m31_enabled("TP8_SHORT_FAMILY") else None
 _SHORT_FAMILY_LOGGED: list = []
 
 
-def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.RuntimeHooks:
+def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
     """The step-loop hooks this target opts into.
 
     * ``pack_step_inputs``: a decode step's small input copies go out as one upload and one scatter at the graph
@@ -6616,6 +6607,9 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
       noise otherwise splits them, and the slowest rank sets every step).
     * ``persist_flashinfer_mxfp8_tactics``: with TLLM_AUTOTUNER_CACHE_PATH set, the FlashInfer MXFP8 tactics tuned in
       warmup and the decode-graph pass are saved with the cache, so a restart reuses them instead of re-profiling.
+    * ``install_tactic_pins``: before the warmup tuning pass each rank loads its bundled name-keyed tactic pins
+      (``m31_pins``, topology ``tp8``), so the shapes they cover are served instead of tuned; without a bundle file
+      nothing is loaded. Kill switch: ``TRTLLM_M31_DISABLE_BUNDLED_PINS=1``.
     * ``disagg_draft_kv``: in disaggregated serving the drafter's prompt context window travels with the target's KV,
       so a generation worker's drafter does not start from an empty window.
     * ``skip_greedy_rng_upload``: all-greedy speculative batches never read the Philox seeds.
@@ -6626,19 +6620,13 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
     * ``iteration_timing_one_event``: the iteration log times the device step with one event per boundary on a side
       stream (the reported step times are the same).
     * ``spec_tail_bookkeep`` (``TAILBK``): the sampler tail's no-op bookkeeping launches dropped, bitwise.
-    * Kill switches (the ``STEP_*`` constants above; ``HOSTTAIL`` turns off the first six together):
+    * Kill switches (the ``STEP_*`` constants above; ``HOSTTAIL`` turns off the first four together):
       ``sampler_d2h_side_stream`` HOST_D2H_SIDE, ``spec_small_h2d`` SMALL_H2D, ``pack_spec_rng_uploads`` PHILOX_PACK,
-      ``kv_lens_update_once`` KV_LENS_ONCE, ``skip_accepted_draft_upload`` SKIP_ACCEPTED_UPLOAD,
-      ``spec_batch_map_changed_only`` BATCH_CHANGED_ONLY, ``pack_parallel_scatter`` PACK_PSCATTER, ``pack_in_graph``
+      ``kv_lens_update_once`` KV_LENS_ONCE, ``pack_parallel_scatter`` PACK_PSCATTER, ``pack_in_graph``
       PACK_IN_GRAPH (with ``pack_step_epoch``), ``pack_early_copy`` PACK_EARLY_COPY (with ``pack_prologue_op``),
       ``pack_cpp_scatter`` PACK_CPP_SCATTER, ``h2d_changed_span`` H2D_CHANGED_SPAN.
-    * ``skip_accepted_draft_upload`` / ``spec_batch_map_changed_only`` (kill switches ``SKIP_ACCEPTED_UPLOAD`` /
-      ``BATCH_CHANGED_ONLY``, ``STEP_SKIP_ACCEPTED_UPLOAD`` / ``STEP_BATCH_CHANGED_ONLY``): no per-step upload of the
-      accepted-draft counts (no reader here), and the drafter's batch_indices / batch-to-slot map uploaded only on
-      change.
     * MSA: identity selections for short sequences (and short/long graph families), the one-launch KV-length update,
-      unchanged block-table copies skipped, pool views built once, block-id tables copied from the page-index views
-      (the stock builder makes a Python list of the whole padded row).
+      unchanged block-table copies skipped, pool views built once.
     """
     logger.info(f"[M3.1] SLOT_IDS_CHANGED {'on' if SLOT_IDS_CHANGED else 'off'}")
     if not _SHORT_FAMILY_LOGGED:
@@ -6652,47 +6640,59 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
                 else "off: one decode graph family"
             )
         )
-    # Built for this engine: a requested hook it does not have is classified and dropped (runtime_hooks_compat).
-    return runtime_hooks_compat.build(
-        dict(
-            sparse_attention=_msa_engine.sparse_attention_classes(),
-            fp8_saturating_casts=True,
-            ctx_batch_wait_skip=True,
-            gpu_timestamps=True,
-            msa_kv_cache_fixes=True,
-            draft_pool_fixes=True,
-            first_content_emit_iters=FIRST_CONTENT_EMIT_ITERS,
-            mxfp8_pinned_tactics=True,
-            late_compile_detect=True,
-            pack_step_inputs=True,
-            pack_parallel_scatter=STEP_PACK_PSCATTER,
-            pack_in_graph=STEP_PACK_IN_GRAPH,
-            pack_early_copy=STEP_PACK_EARLY_COPY,
-            pack_step_epoch=True,
-            pack_prologue_op=m3_step_prologue,
-            pack_cpp_scatter=STEP_PACK_CPP_SCATTER,
-            skip_unchanged_h2d=True,
-            kv_lens_update_once=STEP_KV_LENS_ONCE,
-            spec_offsets_op=m3_spec_offsets,
-            h2d_changed_span=STEP_H2D_CHANGED_SPAN,
-            loop_on_execution_stream=True,
-            merge_tuned_tactics_across_ranks=True,
-            persist_flashinfer_mxfp8_tactics=True,
-            disagg_draft_kv=True,
-            skip_greedy_rng_upload=True,
-            pack_spec_rng_uploads=STEP_PHILOX_PACK,
-            spec_small_h2d=STEP_SMALL_H2D,
-            skip_accepted_draft_upload=STEP_SKIP_ACCEPTED_UPLOAD,
-            spec_batch_map_changed_only=STEP_BATCH_CHANGED_ONLY,
-            spec_slot_ids_changed_only=SLOT_IDS_CHANGED,
-            spec_step_fold=spec_fold,
-            sampler_d2h_side_stream=STEP_HOST_D2H_SIDE,
-            skip_unchanged_draft_block_offsets=STEP_BLOCKOFF_GUARD,
-            patch_unchanged_draft_block_offsets=STEP_BLOCKOFF_PATCH,
-            spec_tail_bookkeep=TAILBK,
-            iteration_timing_one_event=True,
-        ),
-        msa=dict(
+    return RuntimeHooks(
+        sparse_attention=_msa_engine.sparse_attention_classes(),
+        ctx_batch_wait_skip=True,
+        postlaunch_admission=True,
+        gpu_timestamps=True,
+        # Engine features this target turns on (each off by default in the engine).
+        dspark_ancestral_override=True,
+        ctx_srpt_aging=True,
+        ctx_oop_retry_gate=True,
+        response_guard=True,
+        kv_cache_gil_fast_path=True,
+        async_stats_rpc=True,
+        moe_flashinfer_fp4_quantize=True,
+        draft_pool_fixes=True,
+        draft_kv_reserve_guard=True,
+        context_onehot_index_fill=True,
+        dflash_host_ctx_alloc=True,
+        # Generation worker: one request's KV prefetched while the batch decodes, and each admitted request's
+        # decode headroom reserved (no tier below GPU).
+        disagg_gen_prefetch_requests=1,
+        disagg_gen_completion_reservation=True,
+        bounce_scatter_on_order_stream=True,
+        first_content_emit_iters=FIRST_CONTENT_EMIT_ITERS,
+        mxfp8_pinned_tactics=True,
+        late_compile_detect=True,
+        pack_step_inputs=True,
+        pack_parallel_scatter=STEP_PACK_PSCATTER,
+        pack_in_graph=STEP_PACK_IN_GRAPH,
+        pack_early_copy=STEP_PACK_EARLY_COPY,
+        pack_step_epoch=True,
+        pack_prologue_op=m3_step_prologue,
+        pack_cpp_scatter=STEP_PACK_CPP_SCATTER,
+        skip_unchanged_h2d=True,
+        kv_lens_update_once=STEP_KV_LENS_ONCE,
+        spec_offsets_op=m3_spec_offsets,
+        h2d_changed_span=STEP_H2D_CHANGED_SPAN,
+        loop_on_execution_stream=True,
+        merge_tuned_tactics_across_ranks=True,
+        persist_flashinfer_mxfp8_tactics=True,
+        # Bundled name-keyed tactic pins (m31_pins); kill: TRTLLM_M31_DISABLE_BUNDLED_PINS=1.
+        install_tactic_pins=lambda rank: m31_pins.install("tp8", rank),
+        disagg_draft_kv=True,
+        skip_greedy_rng_upload=True,
+        pack_spec_rng_uploads=STEP_PHILOX_PACK,
+        spec_small_h2d=STEP_SMALL_H2D,
+        spec_slot_ids_changed_only=SLOT_IDS_CHANGED,
+        spec_step_fold=spec_fold,
+        sampler_d2h_side_stream=STEP_HOST_D2H_SIDE,
+        skip_unchanged_draft_block_offsets=STEP_BLOCKOFF_GUARD,
+        patch_unchanged_draft_block_offsets=STEP_BLOCKOFF_PATCH,
+        spec_tail_bookkeep=TAILBK,
+        iteration_timing_one_event=True,
+        msa=MsaRuntimePolicy(
             short_sequence_identity=True,
             long_family_min_total_tokens=TP8_LONG_FAMILY_MIN_TOKENS,
             kv_update=_msa_kv_update_kernel.msa_kv_update,
@@ -6701,10 +6701,7 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
             else None,
             skip_unchanged_block_offsets=True,
             reuse_pool_views=True,
-            block_ids_from_views=True,
-            forward_staging=True,
         ),
-        target=__name__,
     )
 
 
@@ -6856,6 +6853,10 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8(
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
 
+    #: The hooks ``__init__`` builds always set ``draft_pool_fixes``; routing reads it here, before construction
+    #: (``routing._m31_draft_pool_guard``).
+    draft_pool_fixes = True
+
     # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
     # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
     # moe_config.tactic names, so it declares no moe_impls_honored.
@@ -6909,6 +6910,8 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8(
             elif DSFOLD:
                 self._spec_fold = M3DSparkStepFold()
         self.runtime_hooks = _runtime_hooks(self._spec_fold)
+        # The drafter's non-causal block merge as one CUDA launch (kill: TRTLLM_M31_DISABLE_NATIVE_DFLASH_MERGE=1).
+        self._dflash_merge = _dflash_merge.install()
         _log_tailbk(self.spec_worker)
         _install_topp_det()
         _install_softmax_mc()

@@ -221,6 +221,12 @@ dimension may differ, except that an NVFP4 target KV cache requires an
 identical draft layout unless both caches are K-only (MLA). Both servers must
 use the same layout.
 
+A model can also ship its drafter's context window from a separate draft KV
+cache manager (an opt-in the model declares). That transfer needs an unpaired
+draft pool: a worker whose separate draft pool is paired with the target's block
+reuse (`enable_joint_kv_cache_reuse`) logs a warning and serves the target-only
+transfer. `TRTLLM_DISABLE_DISAGG_DRAFT_KV=1` turns the window transfer off.
+
 Hybrid recurrent/attention targets whose cache manager opts in (Kimi K3) also
 hold a standalone DSpark drafter's layers, after their own. In every case the
 drafter decides whether it shares: it declares whether its block attention reads

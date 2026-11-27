@@ -17,11 +17,11 @@
 
 # minimax_m3 native code; see the modeling_v2 README.
 #
-# m3/: the family's copies of the MiniMax-M3 multicast all-reduce + RMSNorm,
-# low-M MXFP8 GEMM, MSA KV-length update and SM107 TP2 / TP8 sparse decode
-# kernels, with their fixes. m31/: kernels the MiniMax-M3.1-Flash targets share.
-# msa_vllm_topk/: the MSA top-k selection headers. Each target keeps its own
-# code in <target>/csrc/.
+# m3/: the MiniMax-M3 multicast all-reduce + RMSNorm, low-M MXFP8 GEMM, MSA
+# KV-length update and SM107 TP2 / TP8 sparse decode kernels the MiniMax-M3 and
+# MiniMax-M3.1-Flash targets share. m31/: kernels the MiniMax-M3.1-Flash targets
+# share. msa_vllm_topk/: the MSA top-k selection headers. Each target keeps its
+# own code in <target>/csrc/.
 add_modeling_v2_family(minimax_m3)
 
 # 100f runs on SM100 / SM103 / SM107; 107a adds exact SM107 code when the build
@@ -76,8 +76,8 @@ add_modeling_v2_target(
 add_modeling_v2_target(minimax_m3 minimax_m3_1_flash_nvfp4__sm_107__tp2ctx
                        ARCHS 100f 107a)
 
-# The MiniMax-M3 targets call the shared fixed copies in m3/ (family_ops()), so
-# a build that selects only them still builds the family library.
+# The MiniMax-M3 targets call the shared kernels in m3/ (family_ops()), so a
+# build that selects only them still builds the family library.
 add_modeling_v2_target(
   minimax_m3 minimax_m3_nvfp4__sm_103__tp4
   ARCHS 100f

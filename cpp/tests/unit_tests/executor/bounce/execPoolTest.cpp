@@ -108,3 +108,52 @@ TEST(ExecPool, StreamScratchAreUsable)
     EXPECT_EQ(in, out);
     pool.release(c);
 }
+
+TEST(ExecPool, CopyStreamPriorityClass)
+{
+    if (!hasCuda())
+        GTEST_SKIP();
+    int least = 0;
+    int greatest = 0;
+    ASSERT_EQ(cudaDeviceGetStreamPriorityRange(&least, &greatest), cudaSuccess);
+
+    struct Case
+    {
+        b::BounceConfig::StreamPriority cls;
+        int want;
+    };
+
+    for (auto const& c : {Case{b::BounceConfig::StreamPriority::kGreatest, greatest},
+             Case{b::BounceConfig::StreamPriority::kLeast, least}, Case{b::BounceConfig::StreamPriority::kDefault, 0}})
+    {
+        b::ExecPool pool(2, 64, 0, /*useZeroCopyArguments=*/true, c.cls);
+        EXPECT_EQ(pool.streamPriority(), c.want);
+        auto* ctx = pool.tryAcquire();
+        ASSERT_NE(ctx, nullptr);
+        int got = 12345;
+        ASSERT_EQ(cudaStreamGetPriority(ctx->stream, &got), cudaSuccess);
+        EXPECT_EQ(got, c.want);
+        pool.release(ctx);
+    }
+    if (least == 0)
+    {
+        // On current parts "least" is the default priority: both pools report the same one.
+        b::ExecPool leastPool(1, 64, 0, /*useZeroCopyArguments=*/true, b::BounceConfig::StreamPriority::kLeast);
+        b::ExecPool defaultPool(1, 64, 0, /*useZeroCopyArguments=*/true, b::BounceConfig::StreamPriority::kDefault);
+        EXPECT_EQ(leastPool.streamPriority(), defaultPool.streamPriority());
+    }
+}
+
+TEST(ExecPool, BlockingSyncEventsRecordAndSynchronize)
+{
+    if (!hasCuda())
+        GTEST_SKIP();
+    b::ExecPool pool(1, 64, 0, /*useZeroCopyArguments=*/true, b::BounceConfig::StreamPriority::kDefault,
+        /*blockingSyncEvents=*/true);
+    auto* ctx = pool.tryAcquire();
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(cudaEventRecord(ctx->event, ctx->stream), cudaSuccess);
+    ASSERT_EQ(cudaEventSynchronize(ctx->event), cudaSuccess);
+    EXPECT_EQ(cudaEventQuery(ctx->event), cudaSuccess);
+    pool.release(ctx);
+}

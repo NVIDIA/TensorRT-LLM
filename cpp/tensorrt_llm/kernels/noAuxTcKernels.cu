@@ -25,6 +25,7 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cstdlib>
+#include <type_traits>
 
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
@@ -89,13 +90,79 @@ static __device__ __forceinline__ uint64_t warpArgMaxRound(
     return winner;
 }
 
+// The routed scaling factor as a float when it is a float with at most 20 significant bits (the low 4 mantissa bits
+// zero) between 2^-20 and 2^20. Decided from the bits of the double, so no FP64 instruction runs.
+static __device__ __forceinline__ bool scalingFactorAsShortFloat(double factor, float& factorFloat)
+{
+    uint64_t const bits = static_cast<uint64_t>(__double_as_longlong(factor));
+    int const exponent = static_cast<int>((bits >> 52) & 0x7FFU) - 1023;
+    uint64_t const mantissa = bits & ((uint64_t{1} << 52) - 1);
+    factorFloat
+        = __uint_as_float((static_cast<uint32_t>(exponent + 127) << 23) | static_cast<uint32_t>(mantissa >> 29));
+    bool const shortMantissa = (mantissa & ((uint64_t{1} << 33) - 1)) == 0;
+    bool const inRange = exponent >= -20 && (exponent < 20 || (exponent == 20 && mantissa == 0));
+    return (bits >> 63) == 0 && shortMantissa && inRange;
+}
+
+// The routing weight static_cast<float>(s * c / (S + 1e-20)) evaluated in double, with s the expert's sigmoid score,
+// S the sum of the selected scores and c the routed scaling factor.
+static __device__ __noinline__ float noAuxTcRoutingWeightFp64(float s, float S, double c)
+{
+    return static_cast<float>(s * c / (S + 1e-20));
+}
+
+// noAuxTcRoutingWeightFp64 without FP64 instructions on the common path: on Rubin an FP64 instruction drops the SM
+// clock of its GPC to about 1 GHz, recovering over tens of microseconds, which slows the kernels that follow. When c
+// is a float with at most 20 significant bits, S >= 2^-13 and s * c >= 2^-60, the double expression is the float
+// rounding of the exact quotient s * c / S: s * c is exact in double, S + 1e-20 rounds to S, and a quotient of these
+// operands that is not itself a float rounding boundary lies at least 2^-49 relative from one, farther than rounding to
+// double can move it. The quotient comes from an exact two-float product, a correctly rounded division and its exact
+// remainder (no intermediate is subnormal); it is returned when it lies more than 2^-20 ulp inside its rounding
+// interval and is not a power of two. Otherwise the FP64 expression runs, out of line.
+static __device__ __forceinline__ float noAuxTcRoutingWeight(float s, float S, double c)
+{
+    float cFloat;
+    if (scalingFactorAsShortFloat(c, cFloat) && S >= 0x1p-13f)
+    {
+        float const pHi = __fmul_rn(s, cFloat);
+        if (pHi >= 0x1p-60f)
+        {
+            float const pLo = __fmaf_rn(s, cFloat, -pHi);
+            float const q = __fdiv_rn(pHi, S);
+            float const r = __fmaf_rn(-q, S, pHi);
+            float const e = __fdiv_rn(__fadd_rn(r, pLo), S);
+            float const y = __fadd_rn(q, e);
+            uint32_t const bits = __float_as_uint(y);
+            if ((bits & 0x7FFFFFU) != 0 && (bits & 0x7F800000U) != 0x7F800000U)
+            {
+                float const ulp = __uint_as_float(bits & 0x7F800000U) * 0x1p-23f;
+                float const g = __fsub_rn(e, __fsub_rn(y, q));
+                if (fabsf(g) < 0.5F * ulp - 0x1p-20f * ulp)
+                {
+                    return y;
+                }
+            }
+        }
+    }
+    return noAuxTcRoutingWeightFp64(s, S, c);
+}
+
+// Whether invokeNoAuxTc picks the noAuxTcRoutingWeight kernels for float weights;
+// TRTLLM_DISABLE_NOAUX_TC_FP32_WEIGHT=1 keeps the FP64 expression.
+static bool noAuxTcFp32WeightEnabled()
+{
+    static bool const enabled = !getBoolEnv("TRTLLM_DISABLE_NOAUX_TC_FP32_WEIGHT");
+    return enabled;
+}
+
 // SmallBatch selects the ungrouped implementation: true = two-level parallel top-k (all warps, redux.sync)
 // that minimizes per-CTA latency for decode batches; false = the original single-warp iterated
 // reduceTopK, which issues fewer instructions and wins once thousands of CTAs saturate the GPU
 // (prefill). Both produce bit-identical results; invokeNoAuxTc picks by token count.
+// Fp32Weight forms the routing weights with noAuxTcRoutingWeight (the same weights bit for bit; OutputT float only).
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
     int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups,
-    bool SmallBatch = true>
+    bool SmallBatch = true, bool Fp32Weight = false>
 __device__ __forceinline__ void deepseek_v3_topk_block(InputT* scores, OutputT* topkValues, IdxT* topkIndices,
     BiasT* routingBias, int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
     int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor, int64_t tokenIdx)
@@ -177,11 +244,23 @@ __device__ __forceinline__ void deepseek_v3_topk_block(InputT* scores, OutputT* 
             int32_t expertIdx = laneIdx < topk ? topExperts[laneIdx] : MaxNumExperts - 1;
             float scoreNorm = laneIdx < topk ? smemScoreSigmoid[expertIdx] : 0.F;
             auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
-            auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
-            if (laneIdx < topk)
+            if constexpr (Fp32Weight)
             {
-                topkValues[laneIdx] = static_cast<OutputT>(finalScore);
-                topkIndices[laneIdx] = expertIdx;
+                // Only the lanes that store a weight form one: a zero score would take the FP64 path.
+                if (laneIdx < topk)
+                {
+                    topkValues[laneIdx] = noAuxTcRoutingWeight(scoreNorm, redNorm, routedScalingFactor);
+                    topkIndices[laneIdx] = expertIdx;
+                }
+            }
+            else
+            {
+                auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
+                if (laneIdx < topk)
+                {
+                    topkValues[laneIdx] = static_cast<OutputT>(finalScore);
+                    topkIndices[laneIdx] = expertIdx;
+                }
             }
         }
     }
@@ -221,11 +300,23 @@ __device__ __forceinline__ void deepseek_v3_topk_block(InputT* scores, OutputT* 
             int32_t expertIdx = laneIdx < topk ? topExperts[laneIdx] : MaxNumExperts - 1;
             float scoreNorm = laneIdx < topk ? smemScoreSigmoid[expertIdx] : 0.F;
             auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
-            auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
-            if (laneIdx < topk)
+            if constexpr (Fp32Weight)
             {
-                topkValues[laneIdx] = static_cast<OutputT>(finalScore);
-                topkIndices[laneIdx] = expertIdx;
+                // Only the lanes that store a weight form one: a zero score would take the FP64 path.
+                if (laneIdx < topk)
+                {
+                    topkValues[laneIdx] = noAuxTcRoutingWeight(scoreNorm, redNorm, routedScalingFactor);
+                    topkIndices[laneIdx] = expertIdx;
+                }
+            }
+            else
+            {
+                auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
+                if (laneIdx < topk)
+                {
+                    topkValues[laneIdx] = static_cast<OutputT>(finalScore);
+                    topkIndices[laneIdx] = expertIdx;
+                }
             }
         }
     }
@@ -345,11 +436,23 @@ __device__ __forceinline__ void deepseek_v3_topk_block(InputT* scores, OutputT* 
                 scoreNorm = smemScoreSigmoid[expertIdx];
             }
             auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
-            auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
-            if (laneIdx < topk)
+            if constexpr (Fp32Weight)
             {
-                topkValues[laneIdx] = static_cast<OutputT>(finalScore);
-                topkIndices[laneIdx] = expertIdx;
+                // Only the lanes that store a weight form one: a zero score would take the FP64 path.
+                if (laneIdx < topk)
+                {
+                    topkValues[laneIdx] = noAuxTcRoutingWeight(scoreNorm, redNorm, routedScalingFactor);
+                    topkIndices[laneIdx] = expertIdx;
+                }
+            }
+            else
+            {
+                auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
+                if (laneIdx < topk)
+                {
+                    topkValues[laneIdx] = static_cast<OutputT>(finalScore);
+                    topkIndices[laneIdx] = expertIdx;
+                }
             }
         }
     }
@@ -378,6 +481,54 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
+}
+
+// deepseek_v3_topk_kernel with the routing weights formed by noAuxTcRoutingWeight: the same outputs, without FP64
+// instructions on the common path.
+template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
+    int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups,
+    bool SmallBatch = true>
+__global__ void deepseek_v3_topk_fp32_weight_kernel(InputT* scores, OutputT* topkValues, IdxT* topkIndices,
+    BiasT* routingBias, int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
+    int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor)
+{
+    static_assert(std::is_same_v<OutputT, float>, "the FP32 routing weight reproduces float weights only");
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+    if constexpr (UseGroups)
+    {
+        if (threadIdx.x / WARP_SIZE >= numGroup)
+        {
+            return;
+        }
+    }
+    deepseek_v3_topk_block<InputT, BiasT, OutputT, IdxT, MaxNumExperts, UseGroups, MaxNumTopExperts, MaxNumTopGroups,
+        SmallBatch, true>(scores, topkValues, topkIndices, routingBias, numTokens, numGroup, topkGroup, topk,
+        numExperts, numExpertsPerGroup, routedScalingFactor, blockIdx.x);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// The top-k kernel of one configuration; with fp32Weight and float weights, the variant whose routing weights avoid
+// FP64 instructions.
+template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
+    int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups,
+    bool SmallBatch = true>
+auto selectTopkKernel(bool fp32Weight)
+{
+    auto kernel = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, MaxNumExperts, UseGroups, MaxNumTopExperts,
+        MaxNumTopGroups, SmallBatch>;
+    if constexpr (std::is_same_v<OutputT, float>)
+    {
+        if (fp32Weight)
+        {
+            kernel = &deepseek_v3_topk_fp32_weight_kernel<InputT, BiasT, OutputT, IdxT, MaxNumExperts, UseGroups,
+                MaxNumTopExperts, MaxNumTopGroups, SmallBatch>;
+        }
+    }
+    return kernel;
 }
 
 // K3 decode specialization: CTAs [0, M) route 896 experts to top-16, while
@@ -469,20 +620,21 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
             return;
         }
 
+        bool const fp32Weight = noAuxTcFp32WeightEnabled();
         cudaLaunchConfig_t config;
-        auto* kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
+        auto* kernel_instance = selectTopkKernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>(fp32Weight);
         int num_threads = NumDeepseekExperts;
 
         if (is_multi_group)
         {
             if (experts_per_group * topk_group <= DefaultMaxNumTopGroups * WARP_SIZE)
             {
-                kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
+                kernel_instance = selectTopkKernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>(fp32Weight);
             }
             else
             {
-                kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true,
-                    DefaultMaxNumTopExperts, LargeMaxNumTopGroups>;
+                kernel_instance = selectTopkKernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true,
+                    DefaultMaxNumTopExperts, LargeMaxNumTopGroups>(fp32Weight);
             }
             num_threads = NumDeepseekExperts;
         }
@@ -502,34 +654,34 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
             bool const smallBatch = num_tokens <= smallBatchMaxTokens;
             if (num_experts <= 128)
             {
-                kernel_instance = smallBatch ? &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 128, false,
-                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>
-                                             : &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 128, false,
-                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>;
+                kernel_instance = smallBatch ? selectTopkKernel<InputT, BiasT, OutputT, IdxT, 128, false,
+                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>(fp32Weight)
+                                             : selectTopkKernel<InputT, BiasT, OutputT, IdxT, 128, false,
+                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>(fp32Weight);
                 num_threads = 128;
             }
             else if (num_experts <= 256)
             {
-                kernel_instance = smallBatch ? &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 256, false,
-                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>
-                                             : &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 256, false,
-                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>;
+                kernel_instance = smallBatch ? selectTopkKernel<InputT, BiasT, OutputT, IdxT, 256, false,
+                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>(fp32Weight)
+                                             : selectTopkKernel<InputT, BiasT, OutputT, IdxT, 256, false,
+                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>(fp32Weight);
                 num_threads = 256;
             }
             else if (num_experts <= 512)
             {
-                kernel_instance = smallBatch ? &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 512, false,
-                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>
-                                             : &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 512, false,
-                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>;
+                kernel_instance = smallBatch ? selectTopkKernel<InputT, BiasT, OutputT, IdxT, 512, false,
+                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>(fp32Weight)
+                                             : selectTopkKernel<InputT, BiasT, OutputT, IdxT, 512, false,
+                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>(fp32Weight);
                 num_threads = 256;
             }
             else
             {
-                kernel_instance = smallBatch ? &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 1024, false,
-                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>
-                                             : &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 1024, false,
-                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>;
+                kernel_instance = smallBatch ? selectTopkKernel<InputT, BiasT, OutputT, IdxT, 1024, false,
+                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>(fp32Weight)
+                                             : selectTopkKernel<InputT, BiasT, OutputT, IdxT, 1024, false,
+                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>(fp32Weight);
                 num_threads = 256;
             }
         }

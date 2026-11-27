@@ -48,6 +48,8 @@ from tensorrt_llm._torch.modules.linear import (
     flashinfer_mxfp8_autotune,
     flashinfer_mxfp8_decode_graph_capture,
     get_quant_method,
+    mxfp8_cute_dsl_dispatch,
+    mxfp8_native_dispatch,
     mxfp8_quantize_activation,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
@@ -354,6 +356,106 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
         assert projection.mxfp8_linear_quantized(module, act, scales) is native_output
 
 
+def _auto_linear_module():
+    return SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
+        dtype=torch.bfloat16,
+        mxfp8_allowed_backends=None,
+    )
+
+
+def test_mxfp8_native_dispatch_keeps_captured_auto_linears_on_the_native_op(monkeypatch):
+    """Inside the native scope a captured auto linear runs the native GEMM; a forced FlashInfer backend stays."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    mm_mxfp8 = Mock(return_value=flashinfer_output)
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock()),
+    )
+    _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch, mm_mxfp8)
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: False)
+    tuned_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    tuned = Mock(return_value=tuned_output)
+    monkeypatch.setattr(linear_module, "mxfp8_quantize_gemm_autotuned", tuned)
+    module = _auto_linear_module()
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+
+    method = MXFP8LinearMethod()
+    assert method.enable_flashinfer_auto()
+    method.tune_mxfp8_backends = True
+    method.mark_flashinfer_autotuned()
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method.apply(module, activation, bias=None) is tuned_output
+        with mxfp8_native_dispatch():
+            assert method.apply(module, activation, bias=None) is native_output
+    tuned.assert_called_once()
+    native_gemm.assert_called_once()
+    method.tune_mxfp8_backends = False
+    with flashinfer_mxfp8_decode_graph_capture(), mxfp8_native_dispatch():
+        assert method.apply(module, activation, bias=None) is native_output
+    mm_mxfp8.assert_not_called()
+
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "flashinfer")
+    forced = MXFP8LinearMethod()
+    with mxfp8_native_dispatch():
+        assert forced.apply(module, activation, bias=None) is flashinfer_output
+    mm_mxfp8.assert_called_once()
+
+
+@pytest.mark.parametrize("cute_dsl_available", [True, False])
+def test_mxfp8_cute_dsl_dispatch_runs_the_cute_dsl_gemm_on_the_native_quantization(
+    monkeypatch, cute_dsl_available
+):
+    """Inside the CuTe DSL scope an auto linear runs FlashInfer's CuTe DSL GEMM, or the native one without it."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    mm_mxfp8 = Mock()
+    monkeypatch.setitem(
+        sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock())
+    )
+    quantized, activation_scale, quantize, native_gemm, native_output, _, _ = _mock_mxfp8_ops(
+        monkeypatch, mm_mxfp8
+    )
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: False)
+    monkeypatch.setattr(linear_module, "IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE", cute_dsl_available)
+    cute_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    runner = Mock()
+    runner.return_value.forward.return_value = cute_output
+    runner.CUTE_DSL = 0
+    monkeypatch.setattr(linear_module, "FlashInferMXFP8GemmRunner", runner)
+    tuned = Mock()
+    monkeypatch.setattr(linear_module, "mxfp8_quantize_gemm_autotuned", tuned)
+    module = _auto_linear_module()
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+
+    method = MXFP8LinearMethod()
+    assert method.enable_flashinfer_auto()
+    method.tune_mxfp8_backends = True
+    method.mark_flashinfer_autotuned()
+    with flashinfer_mxfp8_decode_graph_capture(), mxfp8_cute_dsl_dispatch():
+        output = method.apply(module, activation, bias=None)
+    tuned.assert_not_called()
+    mm_mxfp8.assert_not_called()
+    if cute_dsl_available:
+        assert output is cute_output
+        assert runner.return_value.forward.call_args.kwargs["tactic"] == runner.CUTE_DSL
+        native_gemm.assert_not_called()
+        # Two rows stay under the CuTe DSL quantize threshold: the native quantization feeds it.
+        assert quantize.call_args.args[0] is activation
+        runner.assert_called_once_with(module.dtype)
+        inputs = runner.return_value.forward.call_args.args[0]
+        expected = [quantized, activation_scale, module.weight, module.weight_scale]
+        assert len(inputs) == 4 and all(a is b for a, b in zip(inputs, expected))
+    else:
+        assert output is native_output
+        runner.assert_not_called()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["auto", "flashinfer"])
 def test_mxfp8_compile_skips_context_dispatch(
@@ -370,6 +472,7 @@ def test_mxfp8_compile_skips_context_dispatch(
     for name in (
         "_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE",
         "_FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE",
+        "_MXFP8_NATIVE_DISPATCH_ACTIVE",
     ):
         monkeypatch.setattr(
             linear_module, name, SimpleNamespace(get=Mock(side_effect=AssertionError))

@@ -502,6 +502,14 @@ class CpuContractTests(unittest.TestCase):
             profile.get_opt_shapes()[0][0]
         )
         self.tuner._primed_cached_tactics = set()
+        # No name-keyed bundle is loaded, so the lookup is the plain cache search.
+        self.tuner._search_cache_resolving_bundles = (
+            lambda op, runners, shapes, config, apply_map, x, profile, **kwargs: (
+                self.tuner.profiling_cache.search_cache(
+                    op, runners, shapes, config, apply_map_to_tuning_buckets=apply_map
+                )
+            )
+        )
         self.tuner.is_tuning_mode = True
         r.tuning_config.inputs_pre_hook = None
         with patch.dict(os.environ, {"TLLM_AUTOTUNER_PRIME_CACHED_TACTICS": "1"}):

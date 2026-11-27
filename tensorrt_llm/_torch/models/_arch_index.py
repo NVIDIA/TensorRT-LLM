@@ -172,6 +172,7 @@ MODEL_CLASS_TO_MODULE = {
     "LlavaNextModel": "modeling_llava_next",
     "MBartForConditionalGeneration": "modeling_bart",
     "MiniCPMV4_6Model": "modeling_minicpmv4_6",
+    "MiniMaxDSparkBackbone": "modeling_dspark",
     "MiniMaxM2ForCausalLM": "modeling_minimaxm2",
     "MiniMaxM3ForCausalLM": "modeling_minimaxm3",
     "MiniMaxM3VLForConditionalGeneration": "modeling_minimaxm3",

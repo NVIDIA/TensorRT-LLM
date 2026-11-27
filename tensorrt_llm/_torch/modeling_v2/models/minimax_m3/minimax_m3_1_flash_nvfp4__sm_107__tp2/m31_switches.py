@@ -32,11 +32,11 @@ ITEMS: Dict[str, str] = {
     "AGG_SP": "the ordinary prefill layer boundaries (same as TP2AGG_SP)",
     "AGG_SP_PREMOE": "the gathered residual before the pre-MoE boundary (sequence parallel after the MoE only)",
     "AGG_TSEL": "the built-in prefill tile selector",
-    "BATCH_CHANGED_ONLY": "the every-step copies of the drafter's batch indices and batch-to-slot map",
     "BLOCKOFF_GUARD": "the drafter KV cache manager's block-table copy on every step",
     "BLOCKOFF_PATCH": "the full-width block-table copy on steps that change one page index per row",
     "CTXNORMQ": "the fused all-reduce + norm and the consumers' own quantize at large prefill layer boundaries",
     "DECODE_LAYER_WIDE_ROWS": "the 8-row decode step bound (every wider step runs the generic layers)",
+    "DENSE16A": "the dense gate_up's own MXFP8 quantize at 9..16 decode rows (not the attention boundary's copy)",
     "DRAFTER_BLOCK_TABLE_REFRESH_FUSED": "the drafter's unfused block-table refresh",
     "DRAFTER_BLOCK_TABLE_REFRESH_GRID": (
         "the serial block-table refresh kernel (instead of the row x column-chunk grid)"
@@ -78,8 +78,7 @@ ITEMS: Dict[str, str] = {
     "GQAMIX": "the in-tree block-sparse decode for the generation rows of mixed steps",
     "H2D_CHANGED_SPAN": "the whole packed 2-D upload (instead of each row's changed column span)",
     "HOSTTAIL": (
-        "the stock host step loop: turns off HOST_D2H_SIDE, SMALL_H2D, BATCH_CHANGED_ONLY, SKIP_ACCEPTED_UPLOAD, "
-        "PHILOX_PACK and KV_LENS_ONCE together"
+        "the stock host step loop: turns off HOST_D2H_SIDE, SMALL_H2D, PHILOX_PACK and KV_LENS_ONCE together"
     ),
     "HOST_CAPTURE_TAIL": (
         "the in-line capture copies and the in-tree tail bookkeeping (FRONT_CAPFORK and TAIL_BOOKKEEP together)"
@@ -133,7 +132,6 @@ ITEMS: Dict[str, str] = {
     "S9BVR": "AllReduce(AUTO) for the drafter's row-parallel all-reduces at every row count",
     "SHARED_SWIGLU_MXFP8": "the bf16 SwiGLU + quantize for the shared expert's down projection",
     "SHARED_SWIGLU_MXFP8_NATIVE": "the Triton producer of the shared expert's MXFP8 SwiGLU",
-    "SKIP_ACCEPTED_UPLOAD": "the stock per-step upload of the accepted-draft counts",
     "SM107_DRAFT_FMHA_SM100F": "the drafter attention on thop.attention's in-tree runner",
     "SMALL_DECODE_MOE_ENGINE": "the original TP2 MoE engine at every row count",
     "SMALL_H2D": "the stock per-step uploads",

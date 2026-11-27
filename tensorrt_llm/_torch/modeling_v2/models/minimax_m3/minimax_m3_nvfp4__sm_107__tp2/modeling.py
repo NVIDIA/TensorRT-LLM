@@ -6104,7 +6104,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
             f"this target is built for sm_{_SM[0]}{_SM[1]}, the device is sm_"
             f"{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
-        # The fused all-reduces and the long-context sparse decode (LC2) run the family library's fixed copies: an
+        # The fused all-reduces and the long-context sparse decode (LC2) run the family library's kernels: an
         # installation without the library refuses here (NoTarget), and modeling_v2='auto' keeps the built-in model.
         family_ops()
         # Under modeling_v2='require' a covered decode shape that cannot take its fast path raises.

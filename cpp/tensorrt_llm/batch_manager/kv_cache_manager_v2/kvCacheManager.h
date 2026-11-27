@@ -574,6 +574,25 @@ public:
         return mApiMutex.lockShared();
     }
 
+    //! Exclusive lock if it is free now, without waiting (see ReentrantSharedMutex::TryExclusiveGuard).
+    //! For bindings that keep the GIL across a short call when nothing contends for the lock.
+    [[nodiscard]] ReentrantSharedMutex::TryExclusiveGuard tryLockExclusive() const
+    {
+        return mApiMutex.tryLockExclusive();
+    }
+
+    //! Whether bindings may run short calls with the GIL held when the API lock is free (off by
+    //! default; a model opts its managers in).
+    [[nodiscard]] bool gilFastPath() const
+    {
+        return mGilFastPath.load(std::memory_order_relaxed);
+    }
+
+    void setGilFastPath(bool enabled)
+    {
+        mGilFastPath.store(enabled, std::memory_order_relaxed);
+    }
+
     // White-box introspection (incl. test-only auto-tuner state mutation) reaches
     // private members directly rather than widening the public API.
     friend class KvCacheIntrospection;
@@ -671,6 +690,7 @@ private:
 
     //! Guards all mutable state reachable from this manager. See the scope note above.
     mutable ReentrantSharedMutex mApiMutex;
+    std::atomic<bool> mGilFastPath{false};
 
     //! One layer's run within its life cycle's sparse buffer list, as the sparse entry
     //! points name it: they take a layer's buffers and address them as a range.

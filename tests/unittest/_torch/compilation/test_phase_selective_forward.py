@@ -274,6 +274,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     for method in (
         "_prewarm_engram_kernels",
         "_prewarm_csa2_sparse_indexer",
+        "_prewarm_minimax_m3_msa_indexer",
         "_prewarm_cute_dsl_indexer_q",
         "_prewarm_model_decode_kernels",
         "_ensure_dsa_attn_metadata_for_warmup",

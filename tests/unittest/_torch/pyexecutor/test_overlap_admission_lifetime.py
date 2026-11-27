@@ -57,6 +57,7 @@ def _admission_executor(
         track_unique_tokens=False,
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
+        _postlaunch_build=False,
         _num_embeddings=123,
     )
     executor._fetch_and_enqueue_requests = (
@@ -66,6 +67,7 @@ def _admission_executor(
         "_get_request_admission_capacity",
         "_pop_from_waiting_queue",
         "_cancel_queued_context_requests",
+        "_stage_postlaunch_items",
     ):
         setattr(executor, name, MethodType(getattr(PyExecutor, name), executor))
     return executor

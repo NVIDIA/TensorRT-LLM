@@ -138,3 +138,31 @@ def test_a_taken_lc2_call_reads_the_masked_lengths(monkeypatch):
         q, None, None, None, None, seq_lens, sm_scale=1.0, output=out, decode_query_len=8
     )
     assert calls[0][9].tolist() == [0, 300]
+
+
+@pytest.mark.parametrize("reason", [None, "512 rows, past 448"])
+def test_a_declined_lc2_call_runs_the_stock_decode(monkeypatch, reason):
+    """A call LC2 cannot take (too many rows, another query length) falls back instead of raising."""
+    lc2_calls, stock_calls = [], []
+    monkeypatch.setattr(lc2_decode, "lc2_op", lambda: lambda *args: lc2_calls.append(args))
+    monkeypatch.setattr(lc2_decode, "decline_reason", lambda *args: reason)
+    monkeypatch.setattr(
+        lc2_decode, "_stock_decode", lambda *args, **kwargs: stock_calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(lc2_decode, "DEP_OWNT", False)
+    monkeypatch.setattr(lc2_decode, "_PAD_ROWS", None)
+    monkeypatch.setattr(lc2_decode._mx, "buffers", lambda *args: None)
+    q = torch.zeros((ROWS, 64, 128), dtype=torch.float8_e4m3fn)
+    out = torch.zeros((ROWS, 64, 128), dtype=torch.bfloat16)
+    seq_lens = torch.tensor([300], dtype=torch.int32)
+    lc2_decode.dep_lc2_decode(
+        q, None, None, None, None, seq_lens, sm_scale=1.0, output=out, decode_query_len=1
+    )
+    if reason is None:
+        assert len(lc2_calls) == 1 and stock_calls == []
+    else:
+        assert lc2_calls == [] and len(stock_calls) == 1
+        args, kwargs = stock_calls[0]
+        assert args[5] is seq_lens  # the real lengths
+        assert kwargs["output"] is out and kwargs["decode_query_len"] == 1
+        assert lc2_decode._mx.SLOT.pending is None  # no MXFP8 hand-off published

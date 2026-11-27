@@ -791,6 +791,17 @@ def _reapply_current_thread_affinity_to_all_threads() -> tuple[int, int]:
     return _set_affinity_all_threads(cpus)
 
 
+def worker_affinity_managed() -> bool:
+    """Whether TensorRT-LLM manages its worker threads' CPU affinity.
+
+    False when ``TLLM_NUMA_AWARE_WORKER_AFFINITY`` is set to anything but 1 (the
+    user configures affinity, e.g. with numactl or a container cpuset). Every
+    affinity change of a worker -- ``configure_cpu_affinity`` and the executor
+    thread pinning a model opts into -- follows this one decision.
+    """
+    return os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None, "1")
+
+
 def configure_cpu_affinity(device_id: int) -> None:
     """Probe and configure the CPU affinity of the calling process based on NUMA topology.
 

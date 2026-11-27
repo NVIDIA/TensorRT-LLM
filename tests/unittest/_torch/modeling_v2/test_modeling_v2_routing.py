@@ -1893,7 +1893,8 @@ def _m31_route(monkeypatch):
 
     for directory, name in _M31_TARGETS.values():
         stub = types.ModuleType(f"{_M3_TARGETS}.{directory}.modeling")
-        setattr(stub, name, type(name, (), {"__module__": stub.__name__}))
+        hooks = types.SimpleNamespace(draft_pool_fixes=True)
+        setattr(stub, name, type(name, (), {"__module__": stub.__name__, "runtime_hooks": hooks}))
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
     monkeypatch.setattr(routing, "_quant_algo", lambda _config: QuantAlgo.MXFP8)
     monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
@@ -2036,56 +2037,76 @@ def test_minimax_m3_1_route_declines_another_speculative_mode(_m31_route):
         _m31_route.route(_m31_model_config("tp2", _NGRAM), _m3_llm_args("auto", "nvfp4"), (10, 7))
 
 
-def test_minimax_m3_1_route_declines_a_windowed_draft_pool_that_needs_a_resize(
-    _m31_route, tmp_path
+@pytest.mark.parametrize("topology", sorted(_M31_TARGETS))
+@pytest.mark.parametrize("role", ["context", "generation", None])
+def test_minimax_m3_1_route_takes_the_disaggregated_windowed_drafter_deployment(
+    _m31_route, monkeypatch, tmp_path, topology, role
 ):
-    """A windowed drafter with chunked prefill and no host KV cache needs the separate draft pool's history-first
-    resize, which this engine does not have; a host KV cache, or no chunked prefill, keeps the target."""
-    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
-
-    spec_config = _m31_dspark(tmp_path, sliding_window=4096)
-    config = _m31_model_config("tp2", spec_config)
-    chunked = _llm_args(
-        "auto", kv_cache_config=dict(dtype="nvfp4"), enable_chunked_prefill=True, max_seq_len=65536
-    )
-    with pytest.raises(NoTarget, match="history-first resize"):
-        _m31_route.route(config, chunked, (10, 7))
-    with_host_cache = _llm_args(
-        "auto",
-        kv_cache_config=dict(dtype="nvfp4", host_cache_size=1 << 30),
-        enable_chunked_prefill=True,
-        max_seq_len=65536,
-    )
-    assert _m31_route.route(config, with_host_cache, (10, 7)).__name__ == _M31_TARGETS["tp2"][1]
-    unchunked = _llm_args("auto", kv_cache_config=dict(dtype="nvfp4"), max_seq_len=65536)
-    assert _m31_route.route(config, unchunked, (10, 7)).__name__ == _M31_TARGETS["tp2"][1]
-
-
-@pytest.mark.parametrize("topology", ["tp2", "dep"])
-def test_minimax_m3_1_route_declines_a_windowed_drafter_on_a_generation_worker(
-    _m31_route, monkeypatch, tmp_path, topology
-):
-    """A disaggregated generation worker does not receive the drafter's windowed KV from the context worker on this
-    engine; the context worker itself is unaffected."""
-    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
-
+    """The disaggregated deployment with the windowed DSpark drafter (a 4096-token window, chunked prefill, no host
+    KV cache, a KV cache transceiver) lands on every target: each one runs the drafter's separate draft pool and
+    ships or receives its context window."""
     spec_config = _m31_dspark(tmp_path, sliding_window=4096)
     config = _m31_model_config(topology, spec_config)
-    args = _llm_args("auto", kv_cache_config=dict(dtype="nvfp4"), max_seq_len=65536)
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
-    with pytest.raises(NoTarget, match="disaggregated generation worker"):
-        _m31_route.route(config, args, (10, 7))
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    args = _llm_args(
+        "require",
+        kv_cache_config=dict(dtype="nvfp4", host_cache_size=0),
+        enable_chunked_prefill=True,
+        max_seq_len=1048576,
+        cache_transceiver_config=dict(backend="NIXL"),
+    )
+    if role is not None:
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
     assert _m31_route.route(config, args, (10, 7)).__name__ == _M31_TARGETS[topology][1]
 
 
-def test_minimax_m3_1_route_declines_when_the_kv_pool_is_not_zeroed(_m31_route, monkeypatch):
-    """The targets rely on the engine's zero-initialized MSA KV pool when the engine has no hook for it."""
-    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import runtime_hooks_compat
+def test_minimax_m3_1_route_declines_the_windowed_drafter_without_draft_pool_fixes(
+    _m31_route, tmp_path
+):
+    """A target whose hooks lack the draft pool fixes (e.g. a kill switch) fails at startup, not mid-run."""
+    import sys
+    import types
 
-    if runtime_hooks_compat.has_hook("msa_kv_cache_fixes"):
-        pytest.skip("this engine carries the MSA KV cache fixes as a hook")
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    directory, name = _M31_TARGETS["dep"]
+    target = getattr(sys.modules[f"{_M3_TARGETS}.{directory}.modeling"], name)
+    target.runtime_hooks = types.SimpleNamespace(draft_pool_fixes=False)
+    spec_config = _m31_dspark(tmp_path, sliding_window=4096)
+    args = _llm_args(
+        "require",
+        kv_cache_config=dict(dtype="nvfp4", host_cache_size=0),
+        enable_chunked_prefill=True,
+        max_seq_len=1048576,
+    )
+    with pytest.raises(NoTarget, match="draft_pool_fixes"):
+        _m31_route.route(_m31_model_config("dep", spec_config), args, (10, 7))
+
+
+@pytest.mark.parametrize("topology", ["tp2", "tp4", "tp8"])
+def test_minimax_m3_1_route_reads_class_level_draft_pool_fixes(_m31_route, tmp_path, topology):
+    """A target that builds its hooks per instance (no class-level runtime_hooks) declares
+    draft_pool_fixes on the class, and the windowed drafter routes to it."""
+    import sys
+
+    directory, name = _M31_TARGETS[topology]
+    target = getattr(sys.modules[f"{_M3_TARGETS}.{directory}.modeling"], name)
+    del target.runtime_hooks
+    target.draft_pool_fixes = True
+    spec_config = _m31_dspark(tmp_path, sliding_window=4096)
+    args = _llm_args(
+        "require",
+        kv_cache_config=dict(dtype="nvfp4", host_cache_size=0),
+        enable_chunked_prefill=True,
+        max_seq_len=1048576,
+    )
+    route = _m31_route.route(_m31_model_config(topology, spec_config), args, (10, 7))
+    assert route.__name__ == name
+
+
+def test_minimax_m3_1_route_declines_when_the_kv_pool_is_not_zeroed(_m31_route, monkeypatch):
+    """The targets read unwritten page tails of the MSA KV pool, which the engine zero-initializes by default."""
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
     monkeypatch.setenv("TRTLLM_M3_KV_POOL_ZERO_INIT", "0")
     with pytest.raises(NoTarget, match="must be zero-initialized"):
         _m31_route.route(_m31_model_config("tp2"), _m3_llm_args("auto", "nvfp4"), (10, 7))

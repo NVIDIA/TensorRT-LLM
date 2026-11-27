@@ -41,6 +41,10 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledMod
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    override_sparse_attention_class,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.utils import set_torch_compiling
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.registry import InputProcessor, create_input_processor
@@ -509,7 +513,13 @@ def resolve_attention_backend(
         if sparse_attention_config is not None
         else None
     )
-    return get_attention_backend(llm_args.attn_backend, sparse_params=sparse_params)
+    backend = get_attention_backend(llm_args.attn_backend, sparse_params=sparse_params)
+    # A model may build its attention layers from a subclass of the registry's sparse backend; the step metadata must
+    # then be that subclass's (RuntimeHooks.sparse_attention).
+    sparse_classes = runtime_hooks_of(model).sparse_attention
+    if sparse_params is not None and sparse_classes is not None:
+        backend = override_sparse_attention_class(backend, sparse_classes.backend, "backend")
+    return backend
 
 
 @dataclass(frozen=True)

@@ -40,7 +40,8 @@ from tensorrt_llm._startup_errors import (StartupErrorInfo,
 from tensorrt_llm.logger import logger
 
 from .._torch.pyexecutor.llm_request import release_undelivered_response
-from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from .._utils import (customized_gc_thresholds, env_switch, mpi_rank,
+                      nvtx_range_debug)
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient,
@@ -69,6 +70,41 @@ __all__ = [
     "GenerationExecutorProxy",
     "GenerationExecutorFrontendProxy",
 ]
+
+# A model that opts in (RuntimeHooks.async_stats_rpc) has aget_stats await the
+# stats RPC, so an asyncio caller of LLM.get_stats_async (a serving frontend
+# that polls iteration stats on the loop that also sends responses) does not
+# stall while the RPC waits up to `timeout` for a stats record. At most one
+# stats RPC is in flight, so records keep the worker's drain order. Other
+# models keep the blocking RPC; TRTLLM_DISABLE_ASYNC_STATS_RPC=1 restores it
+# for an opted-in model too.
+_ASYNC_STATS_RPC = not env_switch("TRTLLM_DISABLE_ASYNC_STATS_RPC")
+
+
+def _async_stats_rpc(executor) -> bool:
+    """Whether ``executor``'s ``aget_stats`` awaits the stats RPC.
+
+    Asks the worker once whether its model opted in; a worker that cannot
+    answer keeps the blocking RPC.
+    """
+    if not _ASYNC_STATS_RPC:
+        return False
+    opted_in = getattr(executor, "_async_stats_rpc_opted_in", None)
+    if opted_in is None:
+        try:
+            opted_in = executor.rpc_client.async_stats_rpc_opted_in().remote(
+                timeout=30.0) is True
+        except Exception as e:
+            logger.debug(f"Async stats RPC opt-in query failed: {e}")
+            opted_in = False
+        executor._async_stats_rpc_opted_in = opted_in
+    return opted_in
+
+
+def _stats_rpc_timeout(timeout: Optional[float]) -> Optional[float]:
+    """The RPC deadline of a stats fetch that waits up to ``timeout`` on the worker."""
+    return None if timeout is None else timeout + 1.0
+
 
 # Methods that are explicitly implemented for multi-rank MPI/IPC executor
 # deployments and may be called via collective_rpc even when world_size > 1.
@@ -1605,11 +1641,28 @@ class GenerationExecutorProxy(GenerationExecutor):
             from .executor import empty_async_iterable
             return empty_async_iterable()
 
+        self._iter_stats_result.set_timeout(timeout)
+        if _async_stats_rpc(self):
+            # The result awaits the RPC when it is read (IterationResult.
+            # add_pending_records), so the caller's event loop keeps running.
+            # At most one RPC is in flight: the worker serves concurrent RPCs
+            # concurrently, so a second one could drain records out of order.
+            # Records it would drain stay in the worker for the next call.
+            if self._iter_stats_result.has_inflight_records():
+                return self._iter_stats_result
+            try:
+                self._iter_stats_result.add_pending_records(
+                    self.rpc_client.fetch_stats_wait_async(
+                        timeout=timeout).remote_future(
+                            timeout=_stats_rpc_timeout(timeout)))
+            except Exception as e:
+                logger.debug(f"Error fetching stats via RPC: {e}")
+            return self._iter_stats_result
+
         # Fetch stats via RPC and populate the result
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote(
-                    timeout=None if timeout is None else timeout + 1.0)
+                timeout=timeout).remote(timeout=_stats_rpc_timeout(timeout))
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             stats = []
@@ -1617,7 +1670,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         for stat in stats:
             self._iter_stats_result.queue.put(stat)
 
-        self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result
 
     def get_kv_events(self, timeout: float) -> List[dict]:

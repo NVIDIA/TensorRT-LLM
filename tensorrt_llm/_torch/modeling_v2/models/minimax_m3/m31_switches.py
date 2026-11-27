@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kill switches of the default-on items in the MiniMax-M3.1-Flash family modules (``ops/``, ``kernels/``, ``msa/``).
+"""Kill switches of the default-on items in the MiniMax-M3.1-Flash family modules (``ops/``, ``kernels/``, ``msa/``,
+``m31_pins``).
 
 Family modules may not import a target, so the items they own read this registry instead of a target's
 ``m31_switches.py``. The parser and the values are the targets': every item is on by default and
@@ -22,6 +23,7 @@ _UNSET = frozenset(("", "0", "false", "off", "no"))
 
 #: The family's items: id -> what ``TRTLLM_M31_DISABLE_<id>=1`` restores.
 SWITCHES: Dict[str, str] = {
+    "BUNDLED_PINS": "m31_pins: no bundled tactic pins (the warmup tunes every shape)",
     "DEP_IDXK_NATIVE_LAYOUT": "msa/kernels/nvfp4_index_k: the reader's row-contiguous index-K page layout",
     "DRAFT_PROB1": "kernels/m3ll/prob1/draft_prob1: the in-tree DSpark draft (no fused probabilistic draft op)",
     "DSPARK_CTX_STORE_CPP": "ops/dspark/dspark_ctx_store: the stock drafter context store",

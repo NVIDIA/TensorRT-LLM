@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -60,7 +62,12 @@ public:
     /// `maxDescsPerChunk` plan entries. Throws on CUDA allocation failure.
     /// @param useZeroCopyArguments Map hostPinned into the device address space so a kernel can read
     /// plan arrays directly.
-    ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments = false);
+    /// @param priority Priority class of the copy streams (BounceConfig::copyStreamPriority).
+    /// @param blockingSyncEvents Create the contexts' events with cudaEventBlockingSync, so a host
+    /// waiting on one yields instead of spinning (BounceConfig::scatterBlockingSync).
+    ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments = false,
+        BounceConfig::StreamPriority priority = BounceConfig::StreamPriority::kGreatest,
+        bool blockingSyncEvents = false);
     ~ExecPool();
 
     ExecPool(ExecPool const&) = delete;
@@ -80,12 +87,19 @@ public:
 
     [[nodiscard]] std::size_t freeCount();
 
+    /// The CUDA priority value the copy streams were created with.
+    [[nodiscard]] int streamPriority() const noexcept
+    {
+        return mStreamPriority;
+    }
+
 private:
     /// Free every allocated context resource (never throws; used by the destructor and the
     /// constructor's failure path).
     void destroyContexts();
 
     int mDeviceId{0};
+    int mStreamPriority{0};
     std::vector<ExecCtx> mCtxs;
     std::mutex mMu;
     std::deque<std::uint32_t> mFree;

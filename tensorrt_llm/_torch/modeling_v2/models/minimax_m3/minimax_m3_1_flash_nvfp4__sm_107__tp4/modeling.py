@@ -147,6 +147,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as _sampler_flashinfer
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.speculative import interface as _spec_interface
@@ -163,7 +164,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .. import cute_aot, m31_capture_fork, runtime_hooks_compat
+from .. import cute_aot, m31_capture_fork
 from ..kernels import m3_fold_tail, m3_nnt_fold, m3_spec_tail
 from ..kernels import m3_index_score as _index_score_kernel
 from ..kernels import msa_kv_update as _msa_kv_update_kernel
@@ -186,6 +187,7 @@ from ..ops.attention.m31_qkv_insert import m3_qkv_insert
 from ..ops.comm.m3_mc_allreduce_norm import m3_mc_allreduce_norm
 from ..ops.comm.m3_mc_finalize_allreduce_norm import m3_mc_finalize_allreduce_norm
 from ..ops.comm.m31_allreduce import m3_allreduce
+from ..ops.dspark import dflash_merge as _dflash_merge
 from ..ops.embedding.m31_embedding import m3_embedding
 from ..ops.gemm.m3_draft_lowm import ROWS as DRAFT_LOWM_TACTIC_ROWS
 from ..ops.gemm.m3_draft_lowm import m3_draft_lowm
@@ -342,8 +344,9 @@ class DecodePlan:
 # tiny: every step up to 8 tokens (c1..c8 without speculation, the c1 verify, every draft pass); small: the c2
 # verify; verify: the c4 / c8 verifies. Each is one multicast all-reduce bucket (kernels/m3_mc_allreduce.BUCKETS).
 # SM 10.7 TP4: one bucket. MC_AR_TP4 puts every decode boundary on the multicast all-reduce + residual + RMSNorm
-# (trtllm::minimax_m3_sm107_tp4_mc_allreduce_norm, its row kernel: bitwise to the stock TP4 oneshot all-reduce fusion
-# on the residual and the normed rows) with the MXFP8 copy for the next QKV; False = the built-in all-reduce.
+# (mv2_minimax_m3::minimax_m3_sm107_tp4_mc_allreduce_norm, its row kernel: bitwise to the stock TP4 oneshot
+# all-reduce fusion on the residual and the normed rows) with the MXFP8 copy for the next QKV; False = the built-in
+# all-reduce.
 MC_AR_TP4 = True
 # Up to this many rows the decode all-reduces (not the MoE finalize) take the 8-CTA cluster kernel instead of the row
 # kernel: the same stock oneshot order (opts bit 32: per-column sum of squares, warp butterflies, 6-warp groups, 4 group
@@ -636,8 +639,8 @@ QKV_FRONT_SPLIT = 8  # capacity: fixed: the split bitwise to m3_mx_gemv's (8, 8)
 # across the TP group, else m3_moe. Kill switches, read at import: TRTLLM_M31_DISABLE_TP4_WHOLECHAIN=1 (the whole TP4
 # whole-chain port) or TRTLLM_M31_DISABLE_TP4_MOE_ENGINE=1 (m3_moe), TRTLLM_M31_DISABLE_TP4WC_EARLY_TRIG=1 (the
 # teardown release). B2LAG (FC2 six groups behind FC1 on the 8-deep fc1_done ring, two FC2 B buffers; scheduling only)
-# is default ON since the mcAllreduceNormTp4 parity fix (the producer-tail release no longer
-# races the call-parity flip); TRTLLM_M31_DISABLE_TP4WC_B2LAG=1 restores lag 2, one FC2 B buffer.
+# is default ON (the producer-tail release does not race the call-parity flip);
+# TRTLLM_M31_DISABLE_TP4WC_B2LAG=1 restores lag 2, one FC2 B buffer.
 TP4_MOE_ENGINE = not (m31_disabled("TP4_WHOLECHAIN") or m31_disabled("TP4_MOE_ENGINE"))
 TP4_MOE_ENGINE_PATH = "m31_tp4_moe_engine"
 TP4_MOE_ENGINE_ROWS = frozenset({8})  # capacity: fixed: the served c1 K7 decode rows
@@ -1281,17 +1284,6 @@ STEP_PACK_SPEC_RNG_UPLOADS = True
 # The spec step's small uploads: the accepted-draft counts ride the step-input pack, and the sampler's slot ids stay in
 # a device buffer re-uploaded only when they change (a pageable upload every step otherwise).
 STEP_SPEC_SMALL_H2D = True
-# SKIP_ACCEPTED_UPLOAD (RuntimeHooks.skip_accepted_draft_upload): the step's per-request accepted-draft
-# counts are no longer uploaded and spec_metadata.num_accepted_draft_tokens is None. Nothing on this target reads that
-# tensor (modeling.py, dspark.py, dspark_markov_worker.py, drafter_mxfp8.py, kernels/, ops/; the in-tree DFlash / DSpark
-# workers and the Eagle3 path: tests/unittest/_torch/executor/test_skip_accepted_draft_upload.py scans for readers).
-# Kill switch: TRTLLM_M31_DISABLE_SKIP_ACCEPTED_UPLOAD=1 (the stock per-step upload, packed under spec_small_h2d).
-STEP_SKIP_ACCEPTED_UPLOAD = not m31_disabled("SKIP_ACCEPTED_UPLOAD")
-# BATCH_CHANGED_ONLY (RuntimeHooks.spec_batch_map_changed_only): the standalone DSpark (DFlash)
-# drafter's batch_indices and batch-to-slot map are uploaded only when they change (both constant in steady decode);
-# the buffers hold the same values as with the stock every-step copies. Kill switch:
-# TRTLLM_M31_DISABLE_BATCH_CHANGED_ONLY=1 (both copied every step).
-STEP_BATCH_CHANGED_ONLY = not m31_disabled("BATCH_CHANGED_ONLY")
 # BLOCKOFF_GUARD (RuntimeHooks.skip_unchanged_draft_block_offsets; ported from the sm_107 tp2 / tp8 targets): the
 # standalone DSpark drafter's separate KV cache manager skips its per-step block-table copy (one 128-thread launch
 # between the step graphs, full max_seq_len width: 17.3 us of the TP4 b1 step gap, which the next decode graph waits on)
@@ -1331,9 +1323,6 @@ MERGE_MXFP8_HANDOFF = True
 MSA_KV_UPDATE = True
 MSA_SKIP_UNCHANGED_BLOCK_OFFSETS = True
 MSA_REUSE_POOL_VIEWS = True
-# Step-input preparation fills the MSA block-id table by slice-copying each request's page-index view (MSA
-# RuntimeHooks.block_ids_from_views) instead of building a Python list of the whole padded row; the table is the same.
-MSA_BLOCK_IDS_FROM_VIEWS = True
 
 FAST_PATHS: Tuple[RowRange, ...] = (
     EMBED_FIRSTNORM,
@@ -2723,7 +2712,7 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
         quant_config = model_config.get_quant_config()
         self.attn: List[MiniMaxM3MsaSparseAttention] = []
         for i in range(self.num_layers):
-            backend = create_attention(
+            backend = _msa_engine.create_msa_attention(
                 model_config.attn_backend,
                 i,
                 self.heads,
@@ -7021,7 +7010,7 @@ def _log_tailbk(worker) -> None:
     logger.info(f"[M3 host] tail bookkeeping: {items}")
 
 
-def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.RuntimeHooks:
+def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
     """The step-loop hooks this target opts into (each behind its constant above).
 
     * ``pack_step_inputs``: a decode step's small input copies go out as one upload and one scatter at the graph
@@ -7044,61 +7033,66 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
     * ``sampler_d2h_side_stream`` / ``iteration_timing_one_event``: the sampler's store copies and the iteration timing
       leave the main stream.
     * ``spec_tail_bookkeep`` (``TAILBK``): the sampler tail's no-op bookkeeping launches dropped, bitwise.
-    * ``skip_accepted_draft_upload`` / ``spec_batch_map_changed_only`` (kill switches ``SKIP_ACCEPTED_UPLOAD`` /
-      ``BATCH_CHANGED_ONLY``, ``STEP_SKIP_ACCEPTED_UPLOAD`` / ``STEP_BATCH_CHANGED_ONLY``): no per-step upload of the
-      accepted-draft counts (no reader here), and the drafter's batch_indices / batch-to-slot map uploaded only on
-      change.
     * ``skip_unchanged_draft_block_offsets`` / ``patch_unchanged_draft_block_offsets`` (kill switches
       ``BLOCKOFF_GUARD`` / ``BLOCKOFF_PATCH``): the separate draft KV cache's block-table copy skipped when unchanged,
       patched with one row copy when a few page indices changed.
     * MSA: identity selections for short sequences (and short/long graph families), the one-launch KV-length update,
-      unchanged block-table copies skipped, pool views built once, block-id tables copied from the page-index views.
+      unchanged block-table copies skipped, pool views built once.
     """
-    # Built for this engine: a requested hook it does not have is classified and dropped (runtime_hooks_compat).
-    return runtime_hooks_compat.build(
-        dict(
-            fp8_saturating_casts=True,
-            msa_kv_cache_fixes=True,
-            draft_pool_fixes=True,
-            first_content_emit_iters=FIRST_CONTENT_EMIT_ITERS,
-            mxfp8_pinned_tactics=True,
-            late_compile_detect=True,
-            pack_step_inputs=STEP_PACK_INPUTS,
-            pack_parallel_scatter=STEP_PACK_PARALLEL_SCATTER,
-            pack_in_graph=STEP_PACK_IN_GRAPH,
-            pack_early_copy=STEP_PACK_EARLY_COPY,
-            pack_step_epoch=STEP_PACK_EPOCH,
-            pack_prologue_op=m3_step_prologue if STEP_PACK_CPP_PROLOGUE else None,
-            pack_cpp_scatter=STEP_PACK_CPP_SCATTER,
-            skip_unchanged_h2d=STEP_SKIP_UNCHANGED_H2D,
-            h2d_changed_span=STEP_H2D_CHANGED_SPAN,
-            kv_lens_update_once=STEP_KV_LENS_UPDATE_ONCE,
-            spec_offsets_op=m3_spec_offsets if STEP_SPEC_OFFSETS_ONE_LAUNCH else None,
-            loop_on_execution_stream=STEP_LOOP_ON_EXECUTION_STREAM,
-            merge_tuned_tactics_across_ranks=STEP_MERGE_TUNED_TACTICS,
-            persist_flashinfer_mxfp8_tactics=True,
-            disagg_draft_kv=True,
-            skip_greedy_rng_upload=STEP_SKIP_GREEDY_RNG_UPLOAD,
-            pack_spec_rng_uploads=STEP_PACK_SPEC_RNG_UPLOADS,
-            spec_small_h2d=STEP_SPEC_SMALL_H2D,
-            skip_accepted_draft_upload=STEP_SKIP_ACCEPTED_UPLOAD,
-            spec_batch_map_changed_only=STEP_BATCH_CHANGED_ONLY,
-            skip_unchanged_draft_block_offsets=STEP_BLOCKOFF_GUARD,
-            patch_unchanged_draft_block_offsets=STEP_BLOCKOFF_PATCH,
-            spec_step_fold=spec_fold,
-            sampler_d2h_side_stream=STEP_SAMPLER_D2H_SIDE_STREAM,
-            spec_tail_bookkeep=TAILBK,
-            iteration_timing_one_event=STEP_ONE_TIMING_EVENT,
-        ),
-        msa=dict(
+    return RuntimeHooks(
+        sparse_attention=_msa_engine.sparse_attention_classes(),
+        gpu_timestamps=True,
+        # Engine features this target turns on (each off by default in the engine).
+        dspark_ancestral_override=True,
+        ctx_srpt_aging=True,
+        ctx_oop_retry_gate=True,
+        response_guard=True,
+        kv_cache_gil_fast_path=True,
+        async_stats_rpc=True,
+        moe_flashinfer_fp4_quantize=True,
+        draft_pool_fixes=True,
+        draft_kv_reserve_guard=True,
+        context_onehot_index_fill=True,
+        dflash_host_ctx_alloc=True,
+        # Generation worker: one request's KV prefetched while the batch decodes, and each admitted request's
+        # decode headroom reserved (no tier below GPU).
+        disagg_gen_prefetch_requests=1,
+        disagg_gen_completion_reservation=True,
+        postlaunch_admission=True,
+        bounce_scatter_on_order_stream=True,
+        first_content_emit_iters=FIRST_CONTENT_EMIT_ITERS,
+        mxfp8_pinned_tactics=True,
+        late_compile_detect=True,
+        pack_step_inputs=STEP_PACK_INPUTS,
+        pack_parallel_scatter=STEP_PACK_PARALLEL_SCATTER,
+        pack_in_graph=STEP_PACK_IN_GRAPH,
+        pack_early_copy=STEP_PACK_EARLY_COPY,
+        pack_step_epoch=STEP_PACK_EPOCH,
+        pack_prologue_op=m3_step_prologue if STEP_PACK_CPP_PROLOGUE else None,
+        pack_cpp_scatter=STEP_PACK_CPP_SCATTER,
+        skip_unchanged_h2d=STEP_SKIP_UNCHANGED_H2D,
+        h2d_changed_span=STEP_H2D_CHANGED_SPAN,
+        kv_lens_update_once=STEP_KV_LENS_UPDATE_ONCE,
+        spec_offsets_op=m3_spec_offsets if STEP_SPEC_OFFSETS_ONE_LAUNCH else None,
+        loop_on_execution_stream=STEP_LOOP_ON_EXECUTION_STREAM,
+        merge_tuned_tactics_across_ranks=STEP_MERGE_TUNED_TACTICS,
+        persist_flashinfer_mxfp8_tactics=True,
+        disagg_draft_kv=True,
+        skip_greedy_rng_upload=STEP_SKIP_GREEDY_RNG_UPLOAD,
+        pack_spec_rng_uploads=STEP_PACK_SPEC_RNG_UPLOADS,
+        spec_small_h2d=STEP_SPEC_SMALL_H2D,
+        skip_unchanged_draft_block_offsets=STEP_BLOCKOFF_GUARD,
+        patch_unchanged_draft_block_offsets=STEP_BLOCKOFF_PATCH,
+        spec_step_fold=spec_fold,
+        sampler_d2h_side_stream=STEP_SAMPLER_D2H_SIDE_STREAM,
+        spec_tail_bookkeep=TAILBK,
+        iteration_timing_one_event=STEP_ONE_TIMING_EVENT,
+        msa=MsaRuntimePolicy(
             short_sequence_identity=MSA_SHORT_SEQUENCE_IDENTITY,
             kv_update=_msa_kv_update_kernel.msa_kv_update if MSA_KV_UPDATE else None,
             skip_unchanged_block_offsets=MSA_SKIP_UNCHANGED_BLOCK_OFFSETS,
             reuse_pool_views=MSA_REUSE_POOL_VIEWS,
-            block_ids_from_views=MSA_BLOCK_IDS_FROM_VIEWS,
-            forward_staging=True,
         ),
-        target=__name__,
     )
 
 
@@ -7251,6 +7245,10 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4(
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
 
+    #: The hooks ``__init__`` builds always set ``draft_pool_fixes``; routing reads it here, before construction
+    #: (``routing._m31_draft_pool_guard``).
+    draft_pool_fixes = True
+
     # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
     # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
     # moe_config.tactic names, so it declares no moe_impls_honored.
@@ -7321,6 +7319,8 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4(
                     bind(spec_fold)
         self._spec_fold = spec_fold
         self.runtime_hooks = _runtime_hooks(spec_fold)
+        # The drafter's non-causal block merge as one CUDA launch (kill: TRTLLM_M31_DISABLE_NATIVE_DFLASH_MERGE=1).
+        self._dflash_merge = _dflash_merge.install()
         _log_tailbk(self.spec_worker)
         _install_topp_det()
         _install_rej_mc()

@@ -2693,3 +2693,32 @@ class TestGraphCaptureConcurrencyWarning:
         # follows runs the check.
         check = self._build(mocker, tmp_path, draft=True, estimating=True)
         check.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_standalone_draft_mirror_window_counts_the_slot_trail(monkeypatch, enable_block_reuse):
+    """The funded window matches the manager's retention: reuse backoff, then the slot trail."""
+    import tensorrt_llm._torch.pyexecutor._util as util_mod
+    import tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 as kvcm
+
+    creator = object.__new__(KvCacheCreator)
+    creator._max_seq_len = 65536
+    creator._speculative_config = object()
+    windows = [4096, 2048]
+    creator._get_draft_max_attention_window = lambda max_seq_len, config: list(windows)
+    monkeypatch.setattr(util_mod, "draft_prompt_lookahead", lambda config: 7)
+    monkeypatch.setattr(
+        kvcm, "_draft_slot_trail_tokens", lambda config, *, is_draft, tokens_per_block: 64
+    )
+    config = SimpleNamespace(enable_block_reuse=enable_block_reuse)
+    expected = max(
+        kvcm._extend_swa_windows_for_reuse(
+            kvcm._extend_swa_windows_for_reuse(windows, 7 if enable_block_reuse else 0, 65536),
+            64,
+            65536,
+        )
+    )
+    assert creator._standalone_draft_mirror_window(config, 64) == expected
+    # A window the trail pushes to max_seq_len is a full-context layer.
+    creator._max_seq_len = 4096 + 64 + (7 if enable_block_reuse else 0)
+    assert creator._standalone_draft_mirror_window(config, 64) is None

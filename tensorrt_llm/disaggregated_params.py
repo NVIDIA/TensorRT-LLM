@@ -53,6 +53,9 @@ class DisaggregatedParams:
          context worker. The generation worker replays the suffix starting here.
         orig_elapsed_s (float): Seconds since the request arrived at the disagg orchestrator,
          measured when the generation request was dispatched. Used for GEN admission ordering.
+        draft_ctx_state (List[int]): Context-first only: the standalone drafter's context-window
+         decision ``[ctx_len, ctx_base, ok]`` for the generation request (not ``opaque_state``,
+         which carries the C++ DataTransceiverState).
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
         multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
@@ -76,6 +79,7 @@ class DisaggregatedParams:
     schedule_style: Optional[DisaggScheduleStyle] = None
     ctx_usage: Optional[Dict[str, Any]] = None
     remote_tail_start: Optional[int] = None
+    draft_ctx_state: Optional[List[int]] = None
     multimodal_positions: Optional[List[int]] = None
     multimodal_lengths: Optional[List[int]] = None
     orig_elapsed_s: Optional[float] = None
