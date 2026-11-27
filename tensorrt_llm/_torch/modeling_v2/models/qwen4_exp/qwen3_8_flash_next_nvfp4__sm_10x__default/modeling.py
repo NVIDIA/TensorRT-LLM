@@ -70,6 +70,11 @@ rows (`_sparse_gqa_nvfp4_context`); and the opt-in FP8 / NVFP4 copies of the den
 projections and heads (`_ONE_RANK_SWITCHES`: `_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP4_ENV`,
 `_TARGET_HEAD_NVFP4_ENV`, `_MTP_HEAD_NVFP4_ENV`, `_MTP_MOE_NVFP4_ENV`, `_MTP_DENSE_FP8_ENV`).
 
+**tep4.** A rank of attention TP4 with 128-expert windows takes some of those forms at its shard
+for a captured generation-only step (`tep_fast`, `TEP_FAST_DECODE_ENV`, on by default): the
+decode hyper-connection sites' rows pairs (`hc_decode_pairs`), the CuTe split-K sparse GQA over
+its e4m3 KV head, and the MoE route front over its own rows.
+
 **QSA sparse attention.** The index plane is maintained on every step so a request can
 cross `dense_seq_len_threshold` later without rebuilding its prefix; above it the sparse
 core (index scores, block top-k and expansion, sparse GQA) replaces the dense op, and the
@@ -266,6 +271,12 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_g
     qsa_sparse_gqa_rowtile as one_rank_sparse_gqa_rowtile,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    HEAD_DIM as _SPLITK_HEAD_DIM,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    TILE as _SPLITK_TILE,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
     qsa_sparse_gqa_splitk_cute,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
@@ -398,6 +409,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_mo
     fp4_block_scale_moe_renorm_permuted,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (
+    DECODE_TACTICS as _MOE_DECODE_TACTICS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (
     ROUTING_RENORMALIZE,
     fp4_block_scale_moe_renorm_routed,
 )
@@ -498,7 +512,11 @@ from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
-from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    is_gdn_replay_enabled,
+    last_positive_power_of_2,
+)
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -1031,6 +1049,59 @@ _ROUTE_FRONT_WINDOW = 128  # capacity: fixed: the certified window, not a buffer
 #: runner does not list for the shape falls back to `_ROUTE_FRONT_TACTICS_BASE`'s.
 _ROUTE_FRONT_TACTICS = ((96, (8, 53)), (192, (16, 32)), (704, (32, 32)), (1025, (64, 4)))
 _ROUTE_FRONT_TACTICS_BASE = ((256, (8, 53)), (512, (16, 32)), (1025, (32, 20)))
+#: Switch, on by default: a tep4 rank (attention TP over four ranks without attention DP, the
+#: routed experts as 128-expert windows) runs a captured generation-only step on the forms the
+#: one-rank target runs, at its shard:
+#: - every trunk hyper-connection site of up to `_HC_DECODE_ROWS_MAX` rows on the one-rank GEMV
+#:   or tcgen05 rows pair (`hc_decode_pairs`). The sites are replicated work on the all-reduced
+#:   rows, so the four ranks still compute the same bits; `hc_out` is bitwise, the mixer output
+#:   the pair's rounding of the same sums (1-2 bf16 ulp from the three-launch site's).
+#: - the gated sparse GQA of the rank's 6 q heads on its one e4m3 KV head, up to
+#:   `_TEP_SPLITK_MAX_ROWS` rows, on `qsa_sparse_gqa_splitk_cute` (the gate in its merge) in
+#:   place of the per-row Triton kernel and the gate launch: exactly widened K/V, q and P in f16,
+#:   fp32 accumulation, so the output moves by an ulp on some elements.
+#: - each trunk MoE block on the route front (`_RouteFront`) up to `_TEP_ROUTE_FRONT_MAX_ROWS`
+#:   rows, the runner entered pre-routed over the window on the site's NVFP4 codes. Routing and
+#:   codes are bitwise (build-checked); the runner runs `DECODE_TACTICS`' tactic where the stock
+#:   window call runs the AutoTuner's, so the block is bitwise today's as far as the trtllm-gen
+#:   tactics agree (measured bitwise one another on the whole layer, not on the window).
+#: The first two are same-precision reorders: a draft or target token can move at a near-tie.
+#: `0` keeps today's forms. Read once, when the target is built; set to 1 at another layout it
+#: warns and does nothing.
+TEP_FAST_DECODE_ENV = "TRTLLM_QWEN4_EXP_TEP_FAST_DECODE"
+#: The group the fast forms are written and measured for: tep4 (6 q heads on 1 KV head a rank).
+_TEP_RANKS = 4  # capacity: fixed: the certified layout
+#: Rows per (q heads, KV heads, pool dtype) up to which a tep4 rank sends a gated decode GQA to
+#: `qsa_sparse_gqa_splitk_cute` beyond the op's own table (`serves`, which the FP8 target routes
+#: by): 1-4 requests of four verify rows over the e4m3 pool.
+_TEP_SPLITK_MAX_ROWS = {(6, 1, torch.float8_e4m3fn): 16}
+#: Rows up to which a tep4 rank's trunk MoE takes the route front (1-4 requests of four rows).
+#: Its tactic is `DECODE_TACTICS`' pin for the row count's bucket: measured on the whole
+#: 512-expert layer (one rank), where the tactics compared were bitwise one another. A stock tep4
+#: window call is not pinned (`fp4_block_scale_moe_renorm_routed` pins the whole layer only) and
+#: runs the AutoTuner's tactic; the build check compares at the pinned tactic.
+_TEP_ROUTE_FRONT_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold
+
+
+def _tep_fast_decode(core) -> bool:
+    """`TEP_FAST_DECODE_ENV` at this core's layout: whether it is a tep4 rank with the switch on
+    (default). Set to 1 at another layout: one warning, False."""
+    on = _switch(TEP_FAST_DECODE_ENV, default=True)
+    tep4 = (
+        not core.one_rank
+        and core.dp_size == 1
+        and core.attn_tp_size == _TEP_RANKS
+        and core.mapping.world_size == _TEP_RANKS
+        and core.local_experts * _TEP_RANKS == core.num_experts
+    )
+    if on and not tep4 and os.environ.get(TEP_FAST_DECODE_ENV, "").strip():
+        logger.warning(
+            f"{TEP_FAST_DECODE_ENV} is set but ignored: it serves a tep4 rank (attention TP "
+            f"{_TEP_RANKS} without attention DP, {_TEP_RANKS} expert windows); this rank has world "
+            f"size {core.mapping.world_size}, attention TP {core.attn_tp_size}, attention DP "
+            f"{core.dp_size}, {core.local_experts} of {core.num_experts} experts"
+        )
+    return on and tep4
 
 
 def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: int) -> bool:
@@ -1421,6 +1492,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # The draft layer's FP8 experts: this rank's window over the whole TP group.
         self.mtp_local_experts = d.mtp_local_experts
         self.mtp_expert_offset = d.mtp_expert_offset
+        # A tep4 rank's decode forms (`TEP_FAST_DECODE_ENV`), settled with the layout.
+        self.tep_fast = _tep_fast_decode(self)
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -1589,6 +1662,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # At one rank the hyper-connection sites' fast forms by row count (the decode GEMV and
         # tcgen05 rows pairs, the prefill rstd sites); the other layouts do not take them.
         self.hc_fast_sites = one_rank
+        # The decode sites' rows pairs alone: at one rank, and at a tep4 rank under
+        # `TEP_FAST_DECODE_ENV` (replicated sites over the all-reduced rows).
+        self.hc_decode_pairs = one_rank or self.tep_fast
         self.decode_in_mm = (
             _one_rank_projection
             if one_rank
@@ -3262,22 +3338,41 @@ def _route_front_tactic(runner, core, rows: int) -> tuple | None:
     return None
 
 
-def _route_front_run(core, st: _RouteFront, x, L: _LayerWeights, layer: int, logits):
-    """The route front and the pre-routed runner over gathered rows `x` (a built row count) and
-    their router logits: `(out, xq, xsf, ids, wts)`. The runner runs this rank's window numbered
-    from 0, finalized."""
+def _tep_route_front_tactic(runner, core, rows: int) -> tuple | None:
+    """A tep4 rank's pinned tactic for `rows` rows: `DECODE_TACTICS`' pin for the row count's
+    bucket (measured on the whole layer, where `fp4_block_scale_moe_renorm_routed` runs it; its
+    window calls take the AutoTuner's) where the runner lists it for the window, else None."""
+    tactic = _MOE_DECODE_TACTICS.get(last_positive_power_of_2(rows))
+    valid = [
+        list(t)
+        for t in runner.get_valid_configs(
+            core.topk, core.hidden, core.expert_inter, core.local_experts, rows
+        )
+    ]
+    return tactic if tactic is not None and list(tactic) in valid else None
+
+
+def _route_front_run(
+    core, st: _RouteFront, x, L: _LayerWeights, layer: int, logits, fp4=None, finalize=True
+):
+    """The route front and the pre-routed runner over rows `x` (a built row count) and their
+    router logits: `(out, xq, xsf, ids, wts)`. The runner runs this rank's window numbered from
+    0 on `fp4` (the MoE site's NVFP4 codes, the same bits as the front's) or the front's own
+    codes; `out` is its finalized output, or with `finalize` False its FC2 rows in the tables'
+    permuted order (the slot -> row table is `st.views[rows][layer][0]`, the weights `wts`)."""
     rows = x.shape[0]
     tactic = st.tactics[rows]
     tile = int(tactic[0])
     xq, xsf, ids, wts = moe_route_front(
         logits, x, L.moe_gscale, st.flats[rows][layer], tile, core.expert_offset, core.local_experts
     )
+    xq_in, xsf_in = (xq, xsf) if fp4 is None else fp4
     out = st.runner.run_moe_prerouted(
         None,
         None,
-        xq,
+        xq_in,
         # The runner reads the linear block scales flat.
-        torch.reshape(xsf, [-1]).view(torch.float8_e4m3fn),
+        torch.reshape(xsf_in, [-1]).view(torch.float8_e4m3fn),
         L.fc1_w,
         L.fc1_s,
         None,
@@ -3299,7 +3394,7 @@ def _route_front_run(core, st: _RouteFront, x, L: _LayerWeights, layer: int, log
         core.local_experts,
         None,
         ROUTING_RENORMALIZE,
-        True,
+        finalize,
         list(tactic),
         wts,
         ids,
@@ -3373,20 +3468,22 @@ def _route_front_check(core, st: _RouteFront, L: _LayerWeights, layer: int, rows
 
 
 def _route_front_build(core, layers, device) -> _RouteFront | None:
-    """`DP_ROUTE_FRONT_ENV`, read once at build (`post_load_weights`, `layers` the decode
-    target's): None where it is off or cannot take effect (not an attention-DP rank on the
-    trtllm-gen trunk MoE over CUDA weights, another routing geometry, no CUDA-graph batch size
-    in the row range) or where the op is not certified (`moe_route_front.ARCHS`, SM103, and its
-    128-expert window, dep4; the tactic table was measured there). For every gathered row count
-    a graph batch size gives it compiles the
+    """`DP_ROUTE_FRONT_ENV` at an attention-DP rank, `TEP_FAST_DECODE_ENV` at a tep4 rank
+    (`core.tep_fast`), read once at build (`post_load_weights`, `layers` the decode target's):
+    None where it is off or cannot take effect (another layout, not the trtllm-gen trunk MoE over
+    CUDA weights, another routing geometry, no CUDA-graph batch size in the row range) or where
+    the op is not certified (`moe_route_front.ARCHS`, SM103, and its 128-expert window: dep4's
+    gathered rows, `_ROUTE_FRONT_TACTICS`; tep4's own rows up to `_TEP_ROUTE_FRONT_MAX_ROWS`,
+    `_tep_route_front_tactic`). For every row count a graph batch size gives it compiles the
     route front at the pinned tactic's tile, makes each layer's table buffer (pre-filled with
     valid row indices: the kernel writes only the live entries), and checks every layer once at
     a row count that rotates over the built ones (`_route_front_check`). A failed check leaves
     the whole switch off, with one warning."""
-    if not _switch(DP_ROUTE_FRONT_ENV, default=True):
+    dp = core.dp_size > 1
+    if dp and not _switch(DP_ROUTE_FRONT_ENV, default=True):
         return None
     if not (
-        core.dp_size > 1
+        (dp or core.tep_fast)
         and not core.one_rank
         and core.trunk_moe_backend == "TRTLLM"
         and device.type == "cuda"
@@ -3395,21 +3492,20 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
         and torch.cuda.get_device_capability(device) == archs.SM_103
     ):
         return None
+    # Under attention DP the group's gathered rows, at a tep4 rank its own.
     per_batch = core.dp_size * core.max_verify_rows
-    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
-    rows_list = sorted(
-        {
-            per_batch * int(b)
-            for b in sizes
-            if _ROUTE_FRONT_MIN_ROWS <= per_batch * int(b) <= _ROUTE_FRONT_MAX_ROWS
-        }
+    lo, hi = (
+        (_ROUTE_FRONT_MIN_ROWS, _ROUTE_FRONT_MAX_ROWS) if dp else (1, _TEP_ROUTE_FRONT_MAX_ROWS)
     )
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    rows_list = sorted({per_batch * int(b) for b in sizes if lo <= per_batch * int(b) <= hi})
     if not rows_list:
         return None
+    pin = _route_front_tactic if dp else _tep_route_front_tactic
     st = _RouteFront(_moe_runner())
     with torch.cuda.device(device):
         for rows in rows_list:
-            tactic = _route_front_tactic(st.runner, core, rows)
+            tactic = pin(st.runner, core, rows)
             if tactic is None or not _route_front_compile(
                 rows, core.hidden, core.hidden, core.local_experts, int(tactic[0])
             ):
@@ -3431,28 +3527,29 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
             bad = _route_front_check(core, st, layers[i], i, rows, gen)
             if bad:
                 logger.warning(
-                    f"{DP_ROUTE_FRONT_ENV}: layer {i} at {rows} gathered rows differs from the "
-                    f"runner's own routing ({bad}); every MoE block keeps it"
+                    f"{DP_ROUTE_FRONT_ENV if dp else TEP_FAST_DECODE_ENV}: layer {i} at {rows} "
+                    f"rows differs from the runner's own routing ({bad}); every MoE block keeps it"
                 )
                 return None
         torch.cuda.synchronize(device)
     if not built:
         return None
     logger.info(
-        f"MoE route front: rank {core.dp_rank} of {core.dp_size}, gathered rows {built}, "
-        f"tactics {[st.tactics[r] for r in built]}"
+        f"MoE route front: rank {core.mapping.tp_rank} of {core.mapping.tp_size}, "
+        f"{'gathered ' if dp else ''}rows {built}, tactics {[st.tactics[r] for r in built]}"
     )
     return st
 
 
-def _route_front_experts(core, st: _RouteFront, x, L: _LayerWeights) -> torch.Tensor | None:
+def _route_front_experts(core, st: _RouteFront, x, L: _LayerWeights, fp4=None):
     """`_routed_experts` of a captured generation-only step over the route front, or None where
-    no route front was built for the row count (the caller's path)."""
+    no route front was built for the row count (the caller's path). `fp4` is the MoE site's
+    NVFP4 activation at a tep4 rank (the runner reads it), None under attention DP."""
     rows = x.shape[0]
     layer = st.layers.get(L.fc1_w.data_ptr())
     if rows not in st.tactics or layer is None or x.stride(1) != 1 or x.stride(0) != core.hidden:
         return None
-    return _route_front_run(core, st, x, L, layer, _decode_router(x, L.router))[0]
+    return _route_front_run(core, st, x, L, layer, _decode_router(x, L.router), fp4)[0]
 
 
 def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) -> torch.Tensor:
@@ -3481,11 +3578,13 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
     route_front = getattr(core, "_route_front", None)
     if (
         route_front is not None
-        and fp4 is None
+        # Under attention DP the gathered rows come unquantized; a tep4 rank's come with the
+        # site's codes.
+        and (fp4 is None) == (core.dp_size > 1)
         and router_mm is _decode_router
         and torch.cuda.is_current_stream_capturing()
     ):
-        routed = _route_front_experts(core, route_front, x, L)
+        routed = _route_front_experts(core, route_front, x, L, fp4)
         if routed is not None:
             return routed
     if core.trunk_moe_backend == "CUTEDSL":
@@ -4315,9 +4414,9 @@ def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p
     """The gated sparse GQA `bf16(attn) * sigmoid(gate)` (`[rows, heads_q, head_dim]`) of a
     generation step's rows over a bf16 or e4m3 pool on the family's CuTe decode kernels: the
     request-grouped one from `_GROUPED_DECODE_MIN_REQUESTS` requests of `p` rows, else the
-    per-row split-K one up to its rows. None where neither serves the call (an NVFP4 pool, a
-    head geometry or row count they were not measured at): the caller then runs `_sparse_gqa`
-    and the gate apart."""
+    per-row split-K one up to its rows (`_splitk_serves`). None where neither serves the call (an
+    NVFP4 pool, a head geometry or row count they were not measured at): the caller then runs
+    `_sparse_gqa` and the gate apart."""
     if kv.k_scale is not None:
         return None
     if (
@@ -4328,11 +4427,29 @@ def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p
         return qsa_sparse_gqa_grouped_cute(
             q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, p, gate
         )
-    if qsa_sparse_gqa_splitk_cute.serves(q, kv.k, selected):
+    if _splitk_serves(core, q, kv.k, selected):
         return qsa_sparse_gqa_splitk_cute(
             q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, gate
         )
     return None
+
+
+def _splitk_serves(core, q, k_cache, selected) -> bool:
+    """Whether `qsa_sparse_gqa_splitk_cute` takes this decode call: where the op's own table
+    serves it (`serves`, the FP8 target's routing), and at a tep4 rank under
+    `TEP_FAST_DECODE_ENV` also the geometries of `_TEP_SPLITK_MAX_ROWS` up to their rows."""
+    if qsa_sparse_gqa_splitk_cute.serves(q, k_cache, selected):
+        return True
+    if not core.tep_fast or q.dim() != 3 or k_cache.dim() != 4:
+        return False
+    rows, heads_q, head_dim = q.shape
+    cap = _TEP_SPLITK_MAX_ROWS.get((heads_q, k_cache.shape[1], k_cache.dtype), 0)
+    return (
+        0 < rows <= cap
+        and q.dtype == torch.bfloat16
+        and head_dim == k_cache.shape[3] == _SPLITK_HEAD_DIM
+        and selected.shape[1] > _SPLITK_TILE
+    )
 
 
 def _copy_positions(position_ids: torch.Tensor) -> torch.Tensor:
@@ -6321,10 +6438,12 @@ class DecodeTarget:
     def _hc_site(self, hc, block_out, inject, norm, first, up, with_inject, normed=None, moe=None):
         """One hyper-connection site: the previous block's injection (none at the stack's first
         site and after the PLE add), this site's grouped norm and its mixer. Returns `(hc, mixed,
-        inject)`. At one rank (`hc_fast_sites`) the row count, a per-capture constant, picks the
-        form: one row runs the CuTe GEMV pair, up to `_HC_DECODE_ROWS_MAX` rows the tcgen05 rows
-        pair, larger batches `qwen4_exp_hc_inject_norm` and `_hc_mixer`, which every batch takes
-        at the other layouts. `normed`, when given, is this site's grouped
+        inject)`. At one rank, and at a tep4 rank (`hc_decode_pairs`), the row count, a
+        per-capture constant, picks the form: one row runs the CuTe GEMV pair, up to
+        `_HC_DECODE_ROWS_MAX` rows the tcgen05 rows pair, larger batches
+        `qwen4_exp_hc_inject_norm` and `_hc_mixer`, which every batch takes at the other layouts.
+        A tep4 rank's site never gets the top-k pair (its MoE does not fold), so the first kernel
+        forms only `routed + sigmoid(gate) * shared`. `normed`, when given, is this site's grouped
         norm of `hc` already computed (the PLE tail's, no injection pending), which only the
         inject-norm route reads (the first kernels of the other two compute it themselves).
 
@@ -6335,7 +6454,7 @@ class DecodeTarget:
         core = self.core
         gate_logits, shared, topk_w, topk_rows = moe if moe is not None else (None,) * 4
         n_cols = core.hc_lowrank + (core.hc_count if with_inject else 0)
-        fast = core.hc_fast_sites
+        fast = core.hc_decode_pairs
         if fast and _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX:
             hc, low, inject, rstd = qwen4_exp_hc_decode_rows_first(
                 hc,
@@ -6707,7 +6826,7 @@ class DecodeTarget:
             )
             return hc, mixed, inject, None
         n_cols = core.hc_lowrank + core.hc_count
-        fast = core.hc_fast_sites
+        fast = core.hc_decode_pairs
         if fast and _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX:
             hc, low, inject, rstd = qwen4_exp_hc_decode_rows_first(
                 hc, block_out, inject, L.mhc_norm, L.mhc_first, core.hc_count, n_cols, core.eps

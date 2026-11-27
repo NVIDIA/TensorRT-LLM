@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Where the decode MoE takes the route front (`DP_ROUTE_FRONT_ENV`).
+"""Where the decode MoE takes the route front (`DP_ROUTE_FRONT_ENV`, and at a tep4 rank
+`TEP_FAST_DECODE_ENV`).
 
 * The tactic a gathered row count pins: `_ROUTE_FRONT_TACTICS`' where the runner lists it for
-  the window, else the base table's, else none (that row count keeps the runner's routing).
-* `_routed_experts` takes the route front only on a captured step's gathered rows with the
-  decode router and no mixer-side activation, and only at a row count the build compiled.
-* The build is off with the switch at 0, away from attention DP, on host weights, and away
-  from the certified window (128 experts, dep4) and GPU (SM103).
+  the window, else the base table's, else none (that row count keeps the runner's routing). A
+  tep4 rank pins the runner's own bucket tactic (`DECODE_TACTICS`).
+* `_routed_experts` takes the route front only on a captured step with the decode router, at a
+  row count the build compiled: under attention DP on the gathered rows without a mixer-side
+  activation, at a tep4 rank on its own rows with the site's activation, which the runner reads.
+* The build is off with the switch at 0, away from attention DP and tep4, on host weights, and
+  away from the certified window (128 experts, dep4 / tep4) and GPU (SM103).
 
 The ops are recorders; no kernel runs.
 """
@@ -51,12 +54,15 @@ def test_pinned_tactic(rows, valid, expected):
     assert M._route_front_tactic(_Runner(valid), CORE, rows) == expected
 
 
-def _engage(monkeypatch, capturing: bool, built_rows=(48,)):
+def _engage(monkeypatch, capturing: bool, built_rows=(48,), dp_size=4):
     calls = []
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    monkeypatch.setattr(
-        M, "_route_front_run", lambda core, st, x, L, layer, logits: (calls.append("front"), 0)
-    )
+
+    def front(core, st, x, L, layer, logits, fp4=None):
+        calls.append("front" if fp4 is None else "front+site")
+        return (0,)
+
+    monkeypatch.setattr(M, "_route_front_run", front)
     monkeypatch.setattr(M, "_decode_router", lambda x, router: "logits")
 
     def runner(logits, *args):
@@ -75,6 +81,7 @@ def _engage(monkeypatch, capturing: bool, built_rows=(48,)):
         _route_front=st,
         trunk_moe_backend="TRTLLM",
         one_rank=False,
+        dp_size=dp_size,
         hidden=8,
         num_experts=512,
         topk=10,
@@ -107,9 +114,41 @@ def test_routed_experts_takes_the_route_front(monkeypatch, capturing, router, fp
     assert calls == expected
 
 
+@pytest.mark.parametrize(
+    "capturing, fp4, rows, expected",
+    [
+        (True, "mixer", 16, ["front+site"]),  # the runner reads the site's codes
+        (True, None, 16, ["runner"]),  # tep4 rows always come with the site's codes
+        (False, "mixer", 16, ["runner"]),  # an eager step
+        (True, "mixer", 12, ["runner"]),  # a row count the build did not compile
+    ],
+)
+def test_routed_experts_takes_the_route_front_at_tep4(monkeypatch, capturing, fp4, rows, expected):
+    core, L, calls = _engage(monkeypatch, capturing, built_rows=(4, 16), dp_size=1)
+    x = torch.zeros(rows, 8, dtype=torch.bfloat16)
+    act = None if fp4 is None else (torch.zeros(rows, 4), torch.zeros(rows))
+    M._routed_experts(core, x, L, act, M._decode_router)
+    assert calls == expected
+
+
+@pytest.mark.parametrize(
+    "rows, valid, expected",
+    [
+        (4, [(8, 44), (8, 0)], (8, 44)),  # bucket 4
+        (8, [(8, 0)], (8, 0)),  # bucket 8
+        (12, [(8, 0)], (8, 0)),  # bucket 8
+        (16, [(8, 44)], (8, 44)),  # bucket 16
+        (16, [(8, 0)], None),  # the bucket's pin is not listed for the window
+    ],
+)
+def test_tep4_pinned_tactic_is_the_runners_bucket(rows, valid, expected):
+    assert M._tep_route_front_tactic(_Runner(valid), CORE, rows) == expected
+
+
 def test_build_is_off_with_the_switch(monkeypatch):
     monkeypatch.setenv(M.DP_ROUTE_FRONT_ENV, "0")
-    assert M._route_front_build(SimpleNamespace(), [], torch.device("cuda")) is None
+    core = SimpleNamespace(dp_size=4)
+    assert M._route_front_build(core, [], torch.device("cuda")) is None
 
 
 @pytest.mark.parametrize(
@@ -120,6 +159,7 @@ def test_build_declines_away_from_attention_dp(monkeypatch, dp_size, backend, de
     monkeypatch.delenv(M.DP_ROUTE_FRONT_ENV, raising=False)
     core = SimpleNamespace(
         dp_size=dp_size,
+        tep_fast=False,
         one_rank=False,
         trunk_moe_backend=backend,
         num_experts=512,
@@ -130,18 +170,19 @@ def test_build_declines_away_from_attention_dp(monkeypatch, dp_size, backend, de
 
 
 @pytest.mark.parametrize(
-    "local_experts, capability",
-    [(64, (10, 3)), (256, (10, 3)), (128, (10, 7))],
-    ids=["dep8_window", "dep2_window", "sm_107"],
+    "dp_size, local_experts, capability",
+    [(4, 64, (10, 3)), (4, 256, (10, 3)), (4, 128, (10, 7)), (1, 128, (10, 7))],
+    ids=["dep8_window", "dep2_window", "sm_107", "tep4_sm_107"],
 )
 def test_build_declines_away_from_the_certified_window_and_arch(
-    monkeypatch, local_experts, capability
+    monkeypatch, dp_size, local_experts, capability
 ):
-    """The tactic table and the op's cells cover the dep4 window on SM103 only."""
+    """The tactic tables and the op's cells cover the dep4 / tep4 window on SM103 only."""
     monkeypatch.delenv(M.DP_ROUTE_FRONT_ENV, raising=False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
     core = SimpleNamespace(
-        dp_size=4,
+        dp_size=dp_size,
+        tep_fast=dp_size == 1,
         one_rank=False,
         trunk_moe_backend="TRTLLM",
         num_experts=512,

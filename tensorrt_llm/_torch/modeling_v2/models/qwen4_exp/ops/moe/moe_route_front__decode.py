@@ -143,13 +143,15 @@ class MoeRouteFront(OpWrapper):
         _cell(256, 384, 32, "dep4 MTP-3: 16 a rank (256 rows, the lean form's last), window 3"),
         _cell(512, 256, 32, "dep4 MTP-3: 32 a rank (512 rows, clusters of 16), window 2"),
         _cell(1024, 0, 64, "dep4 MTP-3: 64 a rank (1024 rows, the launch's last), tile 64"),
+        _cell(4, 384, 8, "tep4 MTP-3: 1 request (4 rows, the rank's own), window 3, tile 8"),
+        _cell(16, 128, 8, "tep4 MTP-3: 4 requests (16 rows, the rank's own), window 1, tile 8"),
     )
 
     note = """
     Source: `kernels/blackwell/moe_route_front` (CuTe DSL clusters; lean to 256 rows), compiled
     per shape by `compile_front` outside capture. Certified for 128-expert windows of the
-    512-expert / top-10 layer at hidden 2560 on GB300 (dep4), tiles 8 to 64. Not certified: a
-    64-expert (dep8) window, other routing geometries.
+    512-expert / top-10 layer at hidden 2560 on GB300 (dep4's gathered rows, tep4's own 4-16
+    rows), tiles 8 to 64. Not certified: a 64-expert (dep8) window, other routing geometries.
     """
 
     def __call__(

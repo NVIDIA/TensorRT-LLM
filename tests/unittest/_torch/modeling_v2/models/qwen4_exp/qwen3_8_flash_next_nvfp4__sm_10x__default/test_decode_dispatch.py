@@ -6,8 +6,9 @@
   `_INDEX_GROUP_MIN_ROWS - 1` rows, request groups of `p` rows from there, the CuTe group kernel
   from `_INDEX_SCORES_CUTE_MIN_GROUPS` groups where it serves them.
 * **Sparse GQA** (`_sparse_gqa_decode`): the request-grouped CuTe kernel from
-  `_GROUPED_DECODE_MIN_REQUESTS` requests, the per-row split-K one where it serves the call,
-  None (the caller's `_sparse_gqa`) otherwise and over an NVFP4 pool.
+  `_GROUPED_DECODE_MIN_REQUESTS` requests, the per-row split-K one where it serves the call
+  (and at a tep4 rank under `TEP_FAST_DECODE_ENV` its e4m3 shard up to 16 rows), None (the
+  caller's `_sparse_gqa`) otherwise and over an NVFP4 pool.
 * **Selection** (`_selection`): the cluster launch, then the one-CTA launch, then the two
   launches apart; a prefill step's context parts ask the one-CTA op for its context launch.
 
@@ -25,7 +26,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 
 pytestmark = pytest.mark.cpu_only
 
-CORE = SimpleNamespace(compress_ratio=4, softmax_scale=0.0625, token_topk=2048, block_topk=512)
+CORE = SimpleNamespace(
+    compress_ratio=4, softmax_scale=0.0625, token_topk=2048, block_topk=512, tep_fast=False
+)
 
 
 def _scores_calls(monkeypatch, cute_serves: bool):
@@ -129,6 +132,33 @@ def test_sparse_gqa_nvfp4_pool_keeps_its_kernels(monkeypatch):
         is None
     )
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "tep_fast, rows, dtype, selected, expected",
+    [
+        (True, 4, torch.float8_e4m3fn, 2051, "splitk"),  # one request of four rows
+        (True, 16, torch.float8_e4m3fn, 2051, "splitk"),  # four requests
+        (True, 20, torch.float8_e4m3fn, 2051, None),  # past the shard's rows
+        (True, 16, torch.bfloat16, 2051, None),  # the op's own table decides a bf16 pool
+        (True, 16, torch.float8_e4m3fn, 64, None),  # a selection of one tile
+        (False, 4, torch.float8_e4m3fn, 2051, None),  # not a tep4 rank, or the switch off
+    ],
+)
+def test_sparse_gqa_tep4_shard_on_splitk(monkeypatch, tep_fast, rows, dtype, selected, expected):
+    """A tep4 rank's 6 q heads on its one e4m3 KV head take the split-K kernel up to 16 rows,
+    which the op's own table (the FP8 target's routing) leaves out."""
+    calls = _gqa(monkeypatch, False, False)
+    core = SimpleNamespace(**{**vars(CORE), "tep_fast": tep_fast})
+    k = torch.zeros(8, 1, 32, 256, dtype=dtype)
+    kv = SimpleNamespace(k=k, v=k, k_scale=None)
+    q = torch.zeros(rows, 6, 256, dtype=torch.bfloat16)
+    sel = torch.zeros(rows, selected, dtype=torch.int32)
+    out = M._sparse_gqa_decode(core, kv, q, None, sel, None, 32, torch.zeros(rows, 1), 4)
+    if expected is None:
+        assert out is None and calls == []
+    else:
+        assert out == expected and calls == [("splitk", True, None)]
 
 
 @pytest.mark.parametrize(
