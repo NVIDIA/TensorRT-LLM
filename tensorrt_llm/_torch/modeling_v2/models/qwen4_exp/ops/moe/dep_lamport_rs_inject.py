@@ -59,7 +59,7 @@ Slots, by the workspace's protocol (`DepRoundTrip.steps`):
 * host index (`LamportSteps`): the slot is `(state[1] + launch_index) mod 3`, with no acquire load,
   atomic or release store. The `C / SPP` CTAs of a row all read the row's vectors, so no single
   reader can re-arm them: CTA 0 records the slot's vector count with a plain store, and the re-arm
-  pass of the launch two later on the workspace (which every launch of the workspace runs) clears
+  pass of the next launch on the workspace (which every launch of the workspace runs) clears
   them, as the device-counter form does. The workspace's other host-index launches clean their own
   vectors and record 0. Every receive issues its first probe of every peer before it waits on any.
 
@@ -286,7 +286,7 @@ def _rs_inject_kernel(
         cute.arch.sync_threads()
     signal_i64 = cutlass.Int64(signal_i32)
     ping_slot = signal_i64 % _PING_PONG
-    clear_slot = (signal_i64 + cutlass.Int64(1)) % _PING_PONG
+    clear_slot = (signal_i64 + cutlass.Int64(_rt._CLEAR_AHEAD)) % _PING_PONG
     ping_base = cutlass.Int64(ping_slot) * cutlass.Int64(WORLD_SIZE) * workspace_numel_i64
     clear_base = cutlass.Int64(clear_slot) * cutlass.Int64(WORLD_SIZE) * workspace_numel_i64
 
@@ -295,12 +295,10 @@ def _rs_inject_kernel(
     for lane in cutlass.range_constexpr(_VEC):
         neg_zero_vec[lane] = neg_zero_bits.bitcast(cutlass.BFloat16)
 
-    # Re-arm the slot the launch after next uses, for as many vectors as its last user's peers
-    # wrote into it. A peer writes that slot only once it has finished this launch, which needs
-    # every vector this rank publishes to it; so the thread that publishes vector `v` to a peer
-    # clears that peer's vector `v` first (CTA 0 of the row publishes to every peer, or with `fin`
-    # the CTA the peer ordinal maps to). Indices past this launch's own rows have no such order,
-    # as in the reduce-scatter kernel.
+    # Re-arm the previous launch's slot (`_rt._CLEAR_AHEAD`, the round trip's protocol: every launch
+    # of the workspace must re-arm the same slot), for as many vectors as its peers wrote into it:
+    # every peer finished writing it before this rank's previous launch completed, and none writes
+    # it again before this rank's next launch has published.
     clear_count_ptr = (
         signal_state.iterator
         + cutlass.Int64(_rt._SIGNAL_SLOT_COUNTS_INDEX)
@@ -499,8 +497,8 @@ def _rs_inject_kernel(
         )
 
     if cutlass.const_expr(STEP):
-        # The vectors the peers wrote into this slot, for the re-arm pass of the launch two later
-        # (a completed grid by then): a plain store by CTA 0.
+        # The vectors the peers wrote into this slot, for the re-arm pass of the next launch (a
+        # completed grid by then): a plain store by CTA 0.
         if bidx + tidx == 0:
             slot_count_ptr = (
                 signal_state.iterator

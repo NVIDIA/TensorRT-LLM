@@ -235,7 +235,7 @@ def _pack_kernel(
         cute.arch.load(state_signal_ptr, Int32, sem="relaxed", scope="gpu") + launch_index
     )
     ping_slot = signal_i64 % _PING_PONG
-    clear_slot = (signal_i64 + Int64(1)) % _PING_PONG
+    clear_slot = (signal_i64 + Int64(_rt._CLEAR_AHEAD)) % _PING_PONG
     ping_base = Int64(ping_slot) * Int64(WORLD_SIZE) * ws
     clear_base = Int64(clear_slot) * Int64(WORLD_SIZE) * ws
     nz_vec = cutlass.Array(cutlass.Int32, 4, alignment=_ALIGN)
@@ -311,7 +311,8 @@ def _pack_kernel(
     q1 = _shfl(s16, g + Int32(2)) | (_shfl(s16, g + Int32(3)) << Int32(16))
     q2 = _shfl(s16, g + Int32(4)) | (_shfl(s16, g + Int32(5)) << Int32(16))
     q3 = _shfl(s16, g + Int32(6)) | (_shfl(s16, g + Int32(7)) << Int32(16))
-    # Re-arm the slot the launch after next uses, as the host-index gather does.
+    # Re-arm the previous launch's slot (`_rt._CLEAR_AHEAD`), as the host-index gather does: every
+    # launch of the workspace must re-arm the same slot.
     clear_count_ptr = (
         signal_state.iterator + Int64(_rt._SIGNAL_SLOT_COUNTS_INDEX) + Int64(clear_slot)
     ).llvm_ptr
