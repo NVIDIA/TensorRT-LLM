@@ -413,3 +413,23 @@ def test_a_launch_the_group_plan_does_not_fit_takes_the_two_passes(monkeypatch, 
     args = _build(_with([(5000, 37)], slots=8), seed=31)
     _compare(op(**args), op.reference(**args))
     assert tuple(name for name, _ in launches) == _TWO_PASSES
+
+
+def test_group_plan_checks_an_int64_request_index_before_narrowing(monkeypatch) -> None:
+    """An int64 request index past the table (here 2^32 above a mapped slot, which narrows to
+    that slot) names no request: the group plan sends its rows to the lone pass as the two
+    passes do, instead of planning them over the slot the narrowed index aliases."""
+    spec = _with([(9000, 60), (40000, 40)], slots=8, request_dtype=torch.int64)
+    args = _build(spec, seed=4242)
+    group_rows = rows_per_group(spec["q_heads"] // spec["kv_heads"])
+    req = args["request_indices"].clone()
+    req[:group_rows] += 2**32
+    args = {**args, "request_indices": req}
+    new = _plan(args, monkeypatch, group_plan=True)
+    old = _plan(args, monkeypatch, group_plan=False)
+    assert new and old, "a plan stage did not run"
+    _assert_same_plan(new, old)
+    lone = old["lone"][: int(old["lone_count"][0])].tolist()
+    assert set(range(group_rows)) <= set(lone), "the foreign rows left the lone list"
+    got, want = op(**args), _two_pass_out(args, monkeypatch)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16)), "attn_out"

@@ -461,7 +461,13 @@ class _GroupPlanKernel:
             rq_s[tidx] = Int32(0)
             cols_s[tidx] = Int32(0)
             if first + tidx < rows:
-                rq_s[tidx] = Int32(mReq[first + tidx])
+                # Range-checked at the index's own width before it narrows (an int64 2^32
+                # would read as request 0): -1 keeps an out-of-range row out of the
+                # one-request test, as the two passes' plan keeps it.
+                rq = Int64(mReq[first + tidx])
+                rq_s[tidx] = Int32(-1)
+                if rq >= Int64(0) and rq < Int64(num_requests):
+                    rq_s[tidx] = Int32(rq)
                 cols_s[tidx] = self.columns_read(Int32(mQp[first + tidx]))
         self.stage(sel, sel_stride, cutlass.min(first, last_row), tidx, sel_s, Int32(0))
         cute.arch.sync_threads()
