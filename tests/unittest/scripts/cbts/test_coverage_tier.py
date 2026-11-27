@@ -73,7 +73,7 @@ def test_single_node_multi_gpu_selection(monkeypatch: pytest.MonkeyPatch, tmp_pa
     )
     assert result is not None
     assert result.dropped == {names[0], names[3], names[4]}
-    assert {names[1], names[2], names[5], names[6]} <= result.affected_stages
+    assert result.affected_stages == {names[1], names[2], names[5], names[6]}
     assert ("5", 0) not in result.removed  # Multi-node stays at baseline.
     assert ("6", 0) not in result.removed  # Missing family stays at baseline.
     assert result.removed[("1", 0)] == result.removed[("2", 0)] == {safe}
