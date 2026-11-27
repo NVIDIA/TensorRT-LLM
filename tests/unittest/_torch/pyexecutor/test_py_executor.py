@@ -2940,6 +2940,7 @@ def _partial_prefill_rank(dist, tp_size, *, write_in_flight):
     coordinator._context_cancellation_drains = set()
     coordinator._pending_ctx_transfer_failures = set()
     coordinator._timed_out_ctx_cancelled_ids = set()
+    coordinator._released_ctx_send_ids = set()
     coordinator._check_transfer_errors = Mock()
 
     executor = object.__new__(PyExecutor)
