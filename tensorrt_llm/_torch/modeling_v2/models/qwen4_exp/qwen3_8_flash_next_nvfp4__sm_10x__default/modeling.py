@@ -35,7 +35,8 @@ The forward is cut per rank; what the layout settles is settled once, at constru
   same way. Under attention DP each rank holds its own rows: they are padded to the group's
   largest row count, gathered (`comm/allgather`), routed and run through the window, and
   reduce-scattered back (`comm/reducescatter`), each row's window partials summed once
-  (`_expert_sum_op`). The router and the bf16 shared expert are replicated and run on this
+  (`_expert_sum_op`); at dep4 `DP_MOE_COMM_ENV=lamport` runs the pair as one Lamport launch each
+  (`ops/moe/dep_lamport_round_trip`). The router and the bf16 shared expert are replicated and run on this
   rank's rows, so the block output `routed + sigmoid(gate) * shared` is formed by the next
   hyper-connection site on the reduced routed rows.
 * **Hyper-connections, PLE, the embedding** run replicated on every rank's rows;
@@ -384,6 +385,12 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gat
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (
     cute_dsl_nvfp4_grouped_gemm,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
+    build as dep_lamport_build,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
+    dep_lamport_round_trip,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_permuted import (
     fp4_block_scale_moe_renorm_permuted,
 )
@@ -505,6 +512,24 @@ _MODULE_ONLY_STRATEGIES = frozenset({int(AllReduceStrategy.MNNVL), int(AllReduce
 #: Overrides the stock model's attention-DP MoE round trip; `check_deployment` declines any value
 #: but `ALLGATHER`, the round trip this target runs.
 MOE_COMM_METHOD_ENV = "TRTLLM_FORCE_COMM_METHOD"
+#: The transport of the attention-DP MoE round trip's two collectives: `nccl` (the default) or
+#: `lamport`, one Lamport launch each over symmetric memory (`ops/moe/dep_lamport_round_trip`)
+#: for every round trip of up to `dep_lamport_round_trip.MAX_ROWS` rows a rank (more keep
+#: NCCL): the same rows in the same rank order and NCCL's ring sum order, a -0.0 lane traveling
+#: as +0.0. A CTA polls for its peers' CTAs, so a launch needs all of its CTAs resident at once;
+#: certified on a dep4 worker on SM103 (one NVLink domain) only, which `check_deployment` and
+#: the build hold it to. Read once, when the target is built.
+DP_MOE_COMM_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_COMM"
+_DP_MOE_COMMS = ("nccl", "lamport")
+
+
+def _dp_moe_comm() -> str:
+    """`DP_MOE_COMM_ENV`, lower-cased, `nccl` when unset; ValueError on another value."""
+    comm = os.environ.get(DP_MOE_COMM_ENV, "nccl").strip().lower() or "nccl"
+    if comm not in _DP_MOE_COMMS:
+        raise ValueError(f"{DP_MOE_COMM_ENV}={comm!r}: one of {', '.join(_DP_MOE_COMMS)}")
+    return comm
+
 
 # Recurrent-state cache dtypes the target serves, checked at bind: at one rank the checkpoint's
 # fp32 too.
@@ -1640,15 +1665,54 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # Under MPI the plain symbols; with MPI disabled the `_pg` ones over the TP process
         # group, as `allreduce_group_args` routes them.
         process_group = self.mapping.tp_group_pg.boxed() if mpi_disabled() else None
+        lamport = self._dp_lamport(group) if _dp_moe_comm() == "lamport" else None
 
         def round_trip(run, x: torch.Tensor, pad_rows: int) -> torch.Tensor:
             rows = x.shape[0]
             padded = x if not pad_rows else nn.functional.pad(x, [0, 0, 0, pad_rows])
+            if lamport is not None and lamport.takes(padded.shape[0], padded):
+                # Every rank takes the same branch: the padded row count and the dtype are the
+                # group's. The window's output is bf16 at the hidden width on every rank.
+                partial = run(dep_lamport_round_trip(padded, lamport, False))
+                mine = dep_lamport_round_trip(partial, lamport, True)
+                return mine if not pad_rows else mine[:rows]
             gathered = allgather(padded, None, group, process_group)
             mine = reducescatter(run(gathered), None, group, process_group)
             return mine if not pad_rows else mine[:rows]
 
         return round_trip
+
+    def _dp_lamport(self, group):
+        """The Lamport round trip of `DP_MOE_COMM_ENV=lamport` (`ops/moe/dep_lamport_round_trip`),
+        built once over the 4-rank torch group: a collective, every rank of the group builds it
+        at construction. ValueError away from a dep4 worker on SM103."""
+        import torch.distributed as dist
+
+        from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
+
+        if (
+            self.mapping.world_size != 4
+            or self.dp_size != 4
+            or list(group) != list(range(4))
+            or torch.cuda.get_device_capability() != archs.SM_103
+        ):
+            raise ValueError(
+                f"{DP_MOE_COMM_ENV}=lamport: the Lamport round trip is certified on a dep4 "
+                f"worker on SM103 (this rank: world size {self.mapping.world_size}, attention DP "
+                f"size {self.dp_size}, device sm_{''.join(map(str, torch.cuda.get_device_capability()))})"
+            )
+        # MPI workers have no torch process group: the collective bootstrap the stock MoE uses.
+        ensure_cutedsl_torch_distributed(4)
+        if not dist.is_initialized() or dist.get_world_size() != 4:
+            raise RuntimeError(f"{DP_MOE_COMM_ENV}=lamport found no 4-rank torch group")
+        if dist.get_rank() != self.dp_rank:
+            raise RuntimeError(
+                f"{DP_MOE_COMM_ENV}=lamport: the torch WORLD rank order differs from the DP rank "
+                "order"
+            )
+        built = dep_lamport_build(self.hidden, int(self.max_num_tokens), self.dp_rank, 4)
+        logger.info(f"MoE Lamport round trip: dep4, up to {built.max_rows} rows a rank")
+        return built
 
     def _dp_pad_rows(self, md, num_tokens: int) -> int:
         """Rows this rank pads its MoE input with before the attention-DP round trip: up to
@@ -7721,6 +7785,11 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             raise NoTarget(
                 f"{MOE_COMM_METHOD_ENV}={comm_method} at {layout}: the target runs the "
                 "attention-DP MoE round trip as ALLGATHER (the default)"
+            )
+        if _dp_moe_comm() == "lamport" and layout != "dep4":
+            raise NoTarget(
+                f"{DP_MOE_COMM_ENV}=lamport at {layout}: the Lamport round trip is certified on "
+                "a dep4 worker only"
             )
         if getattr(llm_args.multimodal_config, "vision_gpu_normalize", False):
             raise NoTarget(
