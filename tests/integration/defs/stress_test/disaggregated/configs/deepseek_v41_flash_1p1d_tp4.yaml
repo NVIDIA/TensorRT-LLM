@@ -75,7 +75,7 @@ env:
   TLLM_KV_CACHE_MANAGER_V2_THP: "0"
 
 stress:
-  request_count: 35000
+  request_count: 50000
   concurrency: 512
   input_len_mean: 8192
   input_len_std: 0
