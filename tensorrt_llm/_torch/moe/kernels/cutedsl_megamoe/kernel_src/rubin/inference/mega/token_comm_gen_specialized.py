@@ -45,6 +45,17 @@ Activation scale factors exist twice:
                          SF bytes + call tag each), so no fence or flag gates them
   fc1_sf_ready[expert]   the canonical atom-major pool the MMA reads, counted in
                          refine items so one expert opens without the others
+
+Adaptive route
+--------------
+Built with ``adaptive_route_experts`` > 0, the caller's plane holds expert ids and the
+sending rank maps each to a slot through the layer's route table
+(``communication/nvlink_domain/adaptive_route.py``). Both outbound transfers depend on
+the slot: the exchange CTAs put slots and per-slot counts on the wire, the pushers pick
+their peers by the slot's owner. Each CTA copies the table's leading entries to shared
+memory once and maps from there. The exchange CTA that talks to rank 0 also counts the
+picks of the forward's live rows; the other W - 1 walk the same plane and count nothing.
+Everything behind the wire sees slots only.
 """
 
 import dataclasses
@@ -61,6 +72,7 @@ from cutlass.cutlass_dsl import Int32, Int64, T
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc
+from .....communication.nvlink_domain.adaptive_route import AdaptiveRouteMixin
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
 from .....helpers.device_workspace import DeviceWorkspace
@@ -219,9 +231,13 @@ class GenphaseTokenCommArgs:
     topk_scores: Optional[cute.Tensor]  # (max_tokens_per_rank, topk), Float32
     activation: cute.Tensor  # (max_tokens_per_rank, hidden), padded row stride
     activation_sf: cute.Tensor  # (max_tokens_per_rank, hidden / sf_vec_size), padded row stride
+    # iff adaptive_route_experts > 0: the device addresses of the layer's packed route table row, its statistics row
+    # (float32 per expert), forward count (int64), recording flag (int32) and live-row word (int32), then the forward's
+    # token rows and whether this is the forward's first call (Int32 each); communication/nvlink_domain/adaptive_route.py
+    adaptive_route: Optional[tuple] = None
 
 
-class GenphaseTokenComm(KernelComponent):
+class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
     """One-round-trip token dispatch for generation-phase MegaMoE.
 
     Owns a standalone kernel launch. ``griddepcontrol_launch_dependents`` fires at
@@ -309,6 +325,8 @@ class GenphaseTokenComm(KernelComponent):
     sort_prefix_region: ClassVar[str] = "genphase.token_comm.smem.sort_prefix"
     sort_warp_totals_region: ClassVar[str] = "genphase.token_comm.smem.sort_warp_totals"
     exchange_histogram_region: ClassVar[str] = "genphase.token_comm.smem.exchange_histogram"
+    exchange_route_table_region: ClassVar[str] = "genphase.token_comm.smem.exchange_route_table"
+    pusher_route_table_region: ClassVar[str] = "genphase.token_comm.smem.pusher_route_table"
     # Route words carry (local expert << 16 | offset in the source segment); this
     # marker, above any packed word, is a route the destination does not own.
     route_word_invalid: ClassVar[int] = 0x7FFFFFFF
@@ -382,11 +400,15 @@ class GenphaseTokenComm(KernelComponent):
             "refine_output_stages": int,
             "smem_limit_bytes": OptionalRequirement(int),
             "sf_plain_transport": OptionalRequirement(bool),
+            # > 0: the caller's ids are this many experts' ids, mapped to slots (and counted) on the sending rank by
+            # the adaptive route (communication/nvlink_domain/adaptive_route.py). 0 (the default) reads them as slot ids.
+            "adaptive_route_experts": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
 
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
         self.world_size = problem_desc["world_size"]
         # Reads (never registers) the kernel tail's epoch and done-signal regions.
         self._tail = GenphaseTail(world_size=self.world_size)
@@ -463,6 +485,8 @@ class GenphaseTokenComm(KernelComponent):
             raise NotImplementedError("Genphase token comm supports at most 16384 global experts.")
         if self.topk > self.expert_count:
             raise ValueError(f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}.")
+        if not 0 <= self.adaptive_route_experts <= self.expert_count:
+            raise ValueError("An adaptive route maps at most as many experts as there are slots.")
         if self.max_tokens_per_rank > 1024:
             raise ValueError(
                 f"Genphase token comm requires max_tokens_per_rank <= 1024, got {self.max_tokens_per_rank}."
@@ -1070,6 +1094,12 @@ class GenphaseTokenComm(KernelComponent):
                 exchange.register_tensor(
                     region_name, cutlass.Int32, (self.local_expert_bucket_count,), byte_alignment=16
                 )
+        if self.adaptive_route_experts > 0:
+            # The route table's leading entries (AdaptiveRouteMixin._adaptive_table_load): every exchange CTA maps
+            # the whole plane, so a pick reads them here instead of chaining dependent global loads.
+            exchange.register_tensor(
+                self.exchange_route_table_region, cutlass.Int32, (self.adaptive_table_entries,), byte_alignment=16
+            )
 
         sort = overlay.add_lifetime("sort")
         sort.register_tensor(
@@ -1113,6 +1143,10 @@ class GenphaseTokenComm(KernelComponent):
                 (warp_count, self.pusher_pipeline_depth, row_elements),
                 stride=(self.pusher_pipeline_depth * row_elements, row_elements, 1),
                 byte_alignment=16,
+            )
+        if self.adaptive_route_experts > 0:
+            pusher.register_tensor(
+                self.pusher_route_table_region, cutlass.Int32, (self.adaptive_table_entries,), byte_alignment=16
             )
 
         refine = overlay.add_lifetime("refine")
@@ -1321,6 +1355,12 @@ class GenphaseTokenComm(KernelComponent):
                 if cutlass.const_expr(plane.stride[0] != row_elements):
                     raise ValueError(f"{plane_name} needs the padded row stride {row_elements}, got {plane.stride[0]}.")
 
+        if cutlass.const_expr((args.adaptive_route is not None) != (self.adaptive_route_experts > 0)):
+            raise ValueError("adaptive_route is passed iff the component is built with adaptive_route_experts")
+        adaptive_route = args.adaptive_route
+        if cutlass.const_expr(adaptive_route is None):
+            adaptive_route = (None,) * 7
+
         self._kernel(
             args.topk_indices,
             args.topk_scores,
@@ -1331,6 +1371,7 @@ class GenphaseTokenComm(KernelComponent):
             shared_workspace,
             peer_rank_ptr_mapper_host.make_device_object(),
             device_workspace,
+            *adaptive_route,
         ).launch(
             grid=[self.launch_cluster_width, 1, self.launch_cluster_count],
             cluster=(self.launch_cluster_width, 1, 1),
@@ -1351,6 +1392,13 @@ class GenphaseTokenComm(KernelComponent):
         shared_workspace: cute.Pointer,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         device_workspace: DeviceWorkspace,
+        adaptive_tables: Optional[Int64],
+        adaptive_stats: Optional[Int64],
+        adaptive_forwards: Optional[Int64],
+        adaptive_stats_enabled: Optional[Int64],
+        adaptive_live_word: Optional[Int64],
+        adaptive_stats_tokens: Optional[Int32],
+        adaptive_stats_first: Optional[Int32],
     ) -> None:
         """Dispatch CTA roles.
 
@@ -1408,6 +1456,18 @@ class GenphaseTokenComm(KernelComponent):
         cute.arch.sync_threads()
         cute.arch.griddepcontrol_launch_dependents()
 
+        adaptive = None
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            adaptive = (
+                adaptive_tables,
+                adaptive_stats,
+                adaptive_forwards,
+                adaptive_stats_enabled,
+                adaptive_live_word,
+                adaptive_stats_tokens,
+                adaptive_stats_first,
+            )
+
         if linear_cta_idx < Int32(self.world_size):
             # Dual identity: this CTA sends to peer `linear_cta_idx` and then
             # counting-sorts what that same peer sent back.
@@ -1420,6 +1480,7 @@ class GenphaseTokenComm(KernelComponent):
                 smem_base,
                 linear_cta_idx,
                 thread_idx,
+                adaptive,
             )
             self._run_sort(device_workspace, local_rank, smem_base, linear_cta_idx, thread_idx)
             self._leave(device_workspace, thread_idx)
@@ -1437,6 +1498,7 @@ class GenphaseTokenComm(KernelComponent):
                 smem_base,
                 linear_cta_idx - Int32(self.pusher_cta_begin),
                 thread_idx,
+                adaptive,
             )
 
         self._run_refine(device_workspace, smem_base, thread_idx)
@@ -1475,6 +1537,7 @@ class GenphaseTokenComm(KernelComponent):
         smem_base: cute.Pointer,
         destination_rank: Int32,
         thread_idx: Int32,
+        adaptive: Optional[tuple] = None,
     ) -> None:
         """Send this rank's whole top-k plane to one peer.
 
@@ -1483,6 +1546,11 @@ class GenphaseTokenComm(KernelComponent):
         (``max_tokens_per_rank * topk`` indices) and every peer needs all of it,
         so each of the W exchange CTAs stages the same source plane and unicasts
         it once. There is no cross-rank multicast to amortize that with.
+
+        With the adaptive route (``adaptive``, the seven operands) the plane holds expert ids. The destination
+        and the per-expert counts are fixed here, on the sender, so this is where each id becomes its slot; every
+        exchange CTA maps the whole plane, and the one that talks to rank 0 also counts the picks, so a pick is
+        counted once.
         """
         iket.range_push("exchange")
         load_mbarrier = self._smem_workspace.ptr(self.exchange_mbarrier_region, smem_base)
@@ -1513,6 +1581,15 @@ class GenphaseTokenComm(KernelComponent):
                 if cutlass.const_expr(bulk_scores):
                     score_stage = self._smem_workspace.tensor(self.exchange_score_stage_region, smem_base)
                     tma_load_1d(score_stage.iterator, topk_scores.iterator, load_mbarrier, Int32(score_plane_bytes))
+        route_table = None
+        counted_rows = None
+        if cutlass.const_expr(adaptive is not None):
+            # Issued behind the plane's bulk copy and ahead of the wait for it, so the two overlap.
+            route_table = self._stage_route_table(adaptive, self.exchange_route_table_region, smem_base, thread_idx)
+            counted_rows = self._adaptive_counted_rows(adaptive, destination_rank, thread_idx)
+            if destination_rank != Int32(0):
+                counted_rows = Int32(0)
+        if cutlass.const_expr(staged_bytes > 0):
             cute.arch.mbarrier_wait(load_mbarrier, 0)
         if cutlass.const_expr(self.exchange_stages_topk_indices and not bulk_indices):
             self._stage_plane_plain(
@@ -1529,7 +1606,7 @@ class GenphaseTokenComm(KernelComponent):
 
         if cutlass.const_expr(self.exchange_stages_topk_indices):
             index_stage = self._smem_workspace.tensor(self.exchange_topk_stage_region, smem_base)
-            self._canonicalize_wire_indices(index_stage, thread_idx)
+            self._canonicalize_wire_indices(index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table)
             # Every thread rewrote its own share of the staged plane; the single thread
             # that copies the plane out reads all of it.
             cute.arch.sync_threads()
@@ -1561,9 +1638,14 @@ class GenphaseTokenComm(KernelComponent):
                 else:
                     # The same Int32 wire form `_canonicalize_wire_indices` stages.
                     raw_index = raw_indices[route]
-                    wire_indices[0] = Int32(self.invalid_expert_marker)
-                    if not self._is_unowned_expert(raw_index):
-                        wire_indices[0] = Int32(raw_index)
+                    if cutlass.const_expr(adaptive is not None):
+                        wire_indices[0] = self._routed_slot(
+                            raw_index, route // Int32(self.topk), local_rank, adaptive, route_table, counted_rows
+                        )
+                    else:
+                        wire_indices[0] = Int32(self.invalid_expert_marker)
+                        if not self._is_unowned_expert(raw_index):
+                            wire_indices[0] = Int32(raw_index)
                     local_expert = wire_indices[0] - destination_expert_begin
                 if cutlass.Uint32(local_expert) < cutlass.Uint32(self.experts_per_rank):
                     offset = Int32(
@@ -1685,8 +1767,59 @@ class GenphaseTokenComm(KernelComponent):
                 stage[route] = source[route]
 
     @cute.jit
-    def _canonicalize_wire_indices(self, index_stage: cute.Tensor, thread_idx: Int32) -> None:
-        """Rewrite the staged plane into the Int32 wire form."""
+    def _stage_route_table(
+        self, adaptive: tuple, region_name: str, smem_base: cute.Pointer, thread_idx: Int32
+    ) -> cute.Tensor:
+        """Copy the adaptive route table's leading entries to shared memory: the CTA's threads split the loads,
+        and every pick that follows reads the copy (AdaptiveRouteMixin._adaptive_slot's ``staged``)."""
+        staged = self._smem_workspace.tensor(region_name, smem_base)
+        entries = self._adaptive_table_load(adaptive[0], thread_idx, self.threads_per_cta)
+        self._adaptive_table_store(entries, staged, thread_idx, self.threads_per_cta)
+        cute.arch.sync_threads()
+        return staged
+
+    @cute.jit
+    def _routed_slot(
+        self,
+        raw_index,
+        token: Int32,
+        local_rank: Int32,
+        adaptive: tuple,
+        route_table: cute.Tensor,
+        counted_rows: Optional[Int32] = None,
+    ) -> Int32:
+        """The slot the adaptive route gives one caller-supplied expert id in token row ``token``, or
+        ``invalid_expert_marker`` for an id outside the routed experts or a malformed table entry.
+
+        The exchange and the pushers both call this with the same row and rank, so they agree on the pick's
+        destination. ``counted_rows`` (the exchange only) also counts the pick into the statistics row when its
+        row is below it.
+        """
+        slot = Int32(self.invalid_expert_marker)
+        if cutlass.const_expr(self.topk_index_dtype is cutlass.Int32):
+            in_range = cutlass.Uint32(raw_index) < cutlass.Uint32(self.adaptive_route_experts)
+        else:
+            in_range = cutlass.Uint64(raw_index) < cutlass.Uint64(self.adaptive_route_experts)
+        if in_range:
+            if cutlass.const_expr(counted_rows is not None):
+                slot = self._adaptive_pick(adaptive, counted_rows, Int32(raw_index), token, local_rank, route_table)
+            else:
+                slot = self._adaptive_slot(adaptive[0], Int32(raw_index), token, local_rank, route_table)
+            if cutlass.Uint32(slot) >= cutlass.Uint32(self.expert_count):
+                slot = Int32(self.invalid_expert_marker)
+        return slot
+
+    @cute.jit
+    def _canonicalize_wire_indices(
+        self,
+        index_stage: cute.Tensor,
+        thread_idx: Int32,
+        local_rank: Optional[Int32] = None,
+        adaptive: Optional[tuple] = None,
+        counted_rows: Optional[Int32] = None,
+        route_table: Optional[cute.Tensor] = None,
+    ) -> None:
+        """Rewrite the staged plane into the Int32 wire form (slot ids; ``adaptive``: mapped from expert ids)."""
         wire_indices = self._wire_index_view(index_stage)
         narrow_rounds = ceil_div(self.routes_per_rank, self.threads_per_cta)
         narrowed = cute.make_rmem_tensor((narrow_rounds,), cutlass.Int32)
@@ -1696,7 +1829,11 @@ class GenphaseTokenComm(KernelComponent):
             narrowed[narrow_round] = Int32(self.invalid_expert_marker)
             if route < Int32(self.routes_per_rank):
                 raw_index = index_stage[route]
-                if not self._is_unowned_expert(raw_index):
+                if cutlass.const_expr(adaptive is not None):
+                    narrowed[narrow_round] = self._routed_slot(
+                        raw_index, route // Int32(self.topk), local_rank, adaptive, route_table, counted_rows
+                    )
+                elif not self._is_unowned_expert(raw_index):
                     narrowed[narrow_round] = Int32(raw_index)
 
         cute.arch.sync_threads()
@@ -1715,7 +1852,14 @@ class GenphaseTokenComm(KernelComponent):
 
     @cute.jit
     def _classify_tokens(
-        self, topk_indices: cute.Tensor, global_warp_idx: Int32, lane_idx: Int32, role_warp_count: int
+        self,
+        topk_indices: cute.Tensor,
+        global_warp_idx: Int32,
+        lane_idx: Int32,
+        role_warp_count: int,
+        local_rank: Optional[Int32] = None,
+        adaptive: Optional[tuple] = None,
+        route_table: Optional[cute.Tensor] = None,
     ) -> cute.Tensor:
         """One bit per (token, peer): does this warp owe that peer this token?
 
@@ -1756,7 +1900,13 @@ class GenphaseTokenComm(KernelComponent):
 
                 if lane_owns_slot:
                     raw_index = topk_indices[token, slot]
-                    if not self._is_unowned_expert(raw_index):
+                    if cutlass.const_expr(adaptive is not None):
+                        # The exchange's mapping of the same pick (no counting here), so both name one destination.
+                        raw_index = self._routed_slot(raw_index, token, local_rank, adaptive, route_table)
+                        owned = raw_index != Int32(self.invalid_expert_marker)
+                    else:
+                        owned = not self._is_unowned_expert(raw_index)
+                    if owned:
                         lane_rank = cutlass.Uint32(raw_index) // cutlass.Uint32(self.experts_per_rank)
                         if cutlass.const_expr(mask_words == 1):
                             masks[token_round, 0] = masks[token_round, 0] | (cutlass.Uint32(1) << lane_rank)
@@ -1784,6 +1934,7 @@ class GenphaseTokenComm(KernelComponent):
         smem_base: cute.Pointer,
         pusher_idx: Int32,
         thread_idx: Int32,
+        adaptive: Optional[tuple] = None,
     ) -> None:
         """Push this rank's tokens to every peer that routed to them.
 
@@ -1818,7 +1969,12 @@ class GenphaseTokenComm(KernelComponent):
                 sf_row_bytes = self.plain_activation_sf_row_elements * int(self.activation_sf_dtype.width) // 8
                 self._preload_first_row(activation_sf, sf_stage, mbarriers, stage_state, sf_row_bytes, global_warp_idx, warp_idx)
             iket.range_push("pusher.classify")
-            destination_masks = self._classify_tokens(topk_indices, global_warp_idx, lane_idx, role_warp_count)
+            route_table = None
+            if cutlass.const_expr(adaptive is not None):
+                route_table = self._stage_route_table(adaptive, self.pusher_route_table_region, smem_base, thread_idx)
+            destination_masks = self._classify_tokens(
+                topk_indices, global_warp_idx, lane_idx, role_warp_count, local_rank, adaptive, route_table
+            )
             iket.range_pop()
             iket.range_push("pusher.sf")
             if cutlass.const_expr(self.sf_plain_transport):
@@ -1872,7 +2028,12 @@ class GenphaseTokenComm(KernelComponent):
             data_row_bytes = self.plain_activation_row_elements * int(self.activation_dtype.width) // 8
             self._preload_first_row(activation, data_stage, mbarriers, stage_state, data_row_bytes, data_warp_idx, warp_idx)
             iket.range_push("pusher.classify")
-            destination_masks = self._classify_tokens(topk_indices, data_warp_idx, lane_idx, role_warp_count)
+            route_table = None
+            if cutlass.const_expr(adaptive is not None):
+                route_table = self._stage_route_table(adaptive, self.pusher_route_table_region, smem_base, thread_idx)
+            destination_masks = self._classify_tokens(
+                topk_indices, data_warp_idx, lane_idx, role_warp_count, local_rank, adaptive, route_table
+            )
             iket.range_pop()
             iket.range_push("pusher.data")
             stage_state = self._push_one_plane(

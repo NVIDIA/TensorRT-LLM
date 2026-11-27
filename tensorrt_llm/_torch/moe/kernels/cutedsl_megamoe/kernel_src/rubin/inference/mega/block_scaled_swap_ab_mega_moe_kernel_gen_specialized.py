@@ -216,6 +216,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             "sf_plain_transport": OptionalRequirement(bool),
             "helper_expert_count": OptionalRequirement(int),
             "total_helper_slots": OptionalRequirement(int),
+            # > 0: the token comm maps this many experts' ids to slots on the sending rank and counts them (adaptive
+            # load balancer; communication/nvlink_domain/adaptive_route.py). 0 (the default) builds the kernel without it.
+            "adaptive_route_experts": OptionalRequirement(int),
             # None = off; cluster_shape_mn is not declared here: it is checked by value below.
             "die_aware": OptionalRequirement(Optional[str]),
             # TensorRT-LLM local patch, removed once the pinned CuTe DSL provides
@@ -228,13 +231,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
-        # The gen-phase token comm reads the ids as slot ids; the key is refused, not declared, so a framework that
-        # probes impl_desc_require() for the route does not take this kernel for one that maps expert ids.
-        if impl_desc.get("adaptive_route_experts"):
-            raise NotImplementedError("The adaptive route is implemented in token_comm.py's router only.")
         problem_desc, impl_desc = resolve_dlb_expert_counts(
             problem_desc, impl_desc, world_size=problem_desc["world_size"]
         )
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
+        if self.adaptive_route_experts and impl_desc.get("helper_expert_count", 0):
+            # The helper READY gate holds FC1 until the helper slots' weights are published; the route's tables name
+            # slots on their own schedule and the gate does not cover them.
+            raise NotImplementedError("The adaptive route is not implemented together with DLB helper slots.")
         schedule_policy = impl_desc["schedule_policy"]
         if len(schedule_policy) != 2 or schedule_policy[0] != "decode":
             raise ValueError(
@@ -469,7 +473,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 self.topk,
                 self.combine_format,
                 ll_encoded=True,
-                num_experts=self.expert_count,
+                # The reduce reads the caller's ids: with the adaptive route those are expert ids, of which the
+                # token comm routes [0, adaptive_route_experts) only, so the rest are dropped on both sides.
+                num_experts=self.adaptive_route_experts or self.expert_count,
                 shared_term=self.reduce_shared_output,
                 outlive_producer=self.shared_expert,
             )
@@ -753,6 +759,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 else ""
             )
             + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
+            # Off keeps the name: its seven trailing adaptive-route operands are None and the token comm compiles no
+            # route.
+            + (f"_aroute{self.adaptive_route_experts}_v1" if self.adaptive_route_experts else "")
         )
 
     @cute.jit
@@ -852,6 +861,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
             )
         fake_arguments.update(self._shared_fake_arguments(fake_tensor, tokens))
+        if self.adaptive_route_experts:
+            fake_arguments.update(
+                {f"adaptive_route_{name}": Int64(0) for name in ("tables", "stats", "forwards", "stats_enabled", "live_word")},
+                adaptive_route_stats_tokens=Int32(0),
+                adaptive_route_stats_first=Int32(1),
+            )
 
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
         if out_path is None:
@@ -902,9 +917,37 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         shared_fc2_weight: Optional[cute.Tensor] = None,  # (1, shared_intermediate_downproj, shared_output)
         shared_fc2_weight_sf: Optional[cute.Tensor] = None,  # (1, packed)
         shared_output: Optional[cute.Tensor] = None,  # (max_tokens_per_rank, shared_output) BF16, local
+        # Adaptive route (iff adaptive_route_experts > 0; GenphaseTokenCommArgs.adaptive_route): device addresses of the
+        # layer's packed route table row, statistics row, forward count, statistics-enabled flag and live-row word,
+        # then the forward's token rows to count and whether this is its first call. The route itself always runs
+        # in a kernel built with adaptive_route_experts > 0; the stats_* operands and the live-row word only
+        # control the statistics.
+        adaptive_route_tables: Optional[Int64] = None,
+        adaptive_route_stats: Optional[Int64] = None,
+        adaptive_route_forwards: Optional[Int64] = None,
+        adaptive_route_stats_enabled: Optional[Int64] = None,
+        adaptive_route_live_word: Optional[Int64] = None,
+        adaptive_route_stats_tokens: Optional[Int32] = None,
+        adaptive_route_stats_first: Optional[Int32] = None,
     ) -> None:
         """Launch generation-phase dispatch, fused FC12, and the optional top-k reduce."""
         check_reduce_operand_alignment(output_activation=output_activation, shared_output=shared_output)
+        # The seven adaptive-route operands come exactly with a kernel built with the route, as the READY pair does:
+        # without it the token comm would drop them unread, with it a missing one would reach it as None.
+        adaptive_route_mismatch: cutlass.Constexpr = any(
+            (operand is None) == (self.adaptive_route_experts > 0)
+            for operand in (
+                adaptive_route_tables,
+                adaptive_route_stats,
+                adaptive_route_forwards,
+                adaptive_route_stats_enabled,
+                adaptive_route_live_word,
+                adaptive_route_stats_tokens,
+                adaptive_route_stats_first,
+            )
+        )
+        if cutlass.const_expr(adaptive_route_mismatch):
+            raise ValueError("The seven adaptive_route_* operands are passed iff adaptive_route_experts > 0.")
 
         helper_ready_bundle = (hot_expert_weight_ready_flags, hot_expert_weight_ready_generation)
         if cutlass.const_expr(
@@ -967,6 +1010,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 topk_scores=router_topk_scores,
                 activation=activation,
                 activation_sf=activation_sf,
+                adaptive_route=(
+                    (
+                        adaptive_route_tables,
+                        adaptive_route_stats,
+                        adaptive_route_forwards,
+                        adaptive_route_stats_enabled,
+                        adaptive_route_live_word,
+                        adaptive_route_stats_tokens,
+                        adaptive_route_stats_first,
+                    )
+                    if self.adaptive_route_experts > 0
+                    else None
+                ),
             ),
             local_rank,
             local_workspace,
