@@ -1,15 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""TP4 all-reduce of a bf16 `[rows, hidden]` partial: one-shot Lamport over symmetric memory."""
+"""TP4 all-reduce of a bf16 `[rows, hidden]` partial: one-shot Lamport over symmetric memory;
+and `allreduce`, the same at any row count, in slices of the workspace's budget."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from .._build import Count
 from ._lamport import LamportWorkspace, check_rows, tail
 
 
@@ -72,3 +75,44 @@ class CuteDslAllreduce(OpWrapper):
 
 
 cute_dsl_allreduce = CuteDslAllreduce()
+
+
+@dataclass(frozen=True)
+class CommHandle:
+    """What the target's collectives take: the group's one workspace (`build_workspace`'s,
+    sized for the token budget) and the route counter."""
+
+    workspace: LamportWorkspace
+    count: Count
+
+
+def build(workspace: LamportWorkspace, count: Count) -> CommHandle:
+    """The collectives' handle over the group's workspace."""
+    return CommHandle(workspace, count)
+
+
+def check_budget(partial: torch.Tensor, workspace: LamportWorkspace) -> None:
+    """The all-reduce kernels take the row count from their input, so a call above the token
+    budget the peer buffers were sized for would write past every peer's buffer."""
+    assert partial.shape[0] <= workspace.max_rows, (
+        f"{partial.shape[0]} rows exceed the collective's budget of {workspace.max_rows}"
+    )
+
+
+class Allreduce(OpWrapper):
+    """`cute_dsl_allreduce` at any row count: a step above the workspace's token budget
+    reduces in slices of it. A new tensor."""
+
+    def __call__(self, partial: torch.Tensor, handle: CommHandle) -> torch.Tensor:
+        n = handle.workspace.max_rows
+        if partial.shape[0] > n:
+            return torch.cat([allreduce(p, handle) for p in partial.split(n)])
+        check_budget(partial, handle.workspace)
+        return cute_dsl_allreduce(partial, torch.empty_like(partial), handle.workspace)
+
+    def reference(self, partials: Sequence[torch.Tensor], handle: CommHandle) -> torch.Tensor:
+        """`cute_dsl_allreduce`'s reference: the group's partials in rank order."""
+        return cute_dsl_allreduce.reference(partials, None, handle.workspace)
+
+
+allreduce = Allreduce()

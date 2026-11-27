@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Ungrouped sigmoid top-8 expert routing at any token count, one CuTe DSL launch."""
+"""Ungrouped sigmoid top-8 expert routing at any token count, one CuTe DSL launch; and
+`sigmoid_topk`, that launch with `noaux_tc_op` as its fallback."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -11,6 +13,8 @@ import torch
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.common import moe_sigmoid_topk_swiglu_rows as _kernel
+from .._build import Count, build_or_reason
+from .noaux_tc_op import noaux_tc_op
 
 EXPERTS = _kernel.EXPERTS
 TOP_K = _kernel.TOP_K
@@ -137,3 +141,63 @@ class CuteDslMoeSigmoidTopk(OpWrapper):
 
 
 cute_dsl_moe_sigmoid_topk = CuteDslMoeSigmoidTopk()
+
+
+@dataclass(frozen=True)
+class SigmoidTopkHandle:
+    """What `sigmoid_topk` launches: the compiled kernel (None: not built, `missing` says
+    why) and the route counter (`topk_rows`)."""
+
+    compiled: Callable | None
+    count: Count
+    missing: str = ""
+
+
+def build(count: Count, enabled: bool = True) -> SigmoidTopkHandle:
+    """Compile the kernel into `sigmoid_topk`'s handle; one that fails keeps `noaux_tc_op`.
+    `enabled=False` builds nothing."""
+    if not enabled:
+        return SigmoidTopkHandle(None, count, "not built")
+    compiled, missing = build_or_reason("sigmoid top-k", compile)
+    return SigmoidTopkHandle(compiled, count, missing)
+
+
+class SigmoidTopk(OpWrapper):
+    """`(topk_w, topk_ids)` for a chunk the fused MoE front end does not take:
+    `cute_dsl_moe_sigmoid_topk` where the handle's kernel built and takes the routing, else
+    `noaux_tc_op`. Counted as `topk_rows`."""
+
+    def __call__(
+        self,
+        router_logits: torch.Tensor,
+        bias: torch.Tensor,
+        n_group: int,
+        topk_group: int,
+        topk: int,
+        routed_scaling_factor: float,
+        handle: SigmoidTopkHandle,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        args = (router_logits, bias, n_group, topk_group, topk)
+        hit = handle.compiled is not None and takes(*args)
+        handle.count("topk_rows", hit)
+        if hit:
+            return cute_dsl_moe_sigmoid_topk(*args, routed_scaling_factor, handle.compiled)
+        return noaux_tc_op(*args, routed_scaling_factor)
+
+    def reference(
+        self,
+        router_logits: torch.Tensor,
+        bias: torch.Tensor,
+        n_group: int,
+        topk_group: int,
+        topk: int,
+        routed_scaling_factor: float,
+        handle: SigmoidTopkHandle,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`cute_dsl_moe_sigmoid_topk`'s reference (one group). `handle` is ignored."""
+        return cute_dsl_moe_sigmoid_topk.reference(
+            router_logits, bias, n_group, topk_group, topk, routed_scaling_factor, None
+        )
+
+
+sigmoid_topk = SigmoidTopk()

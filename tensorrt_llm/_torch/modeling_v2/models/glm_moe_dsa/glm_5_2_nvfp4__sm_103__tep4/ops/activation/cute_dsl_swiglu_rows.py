@@ -1,16 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""`silu(gate) * up` over `[gate | up]` bf16 rows at any row count and width, one CuTe DSL launch."""
+"""`silu(gate) * up` over `[gate | up]` bf16 rows at any row count and width, one CuTe DSL launch;
+and `swiglu_rows`, that launch with FlashInfer's `silu_and_mul` as its fallback."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
+    flashinfer_silu_and_mul,
+)
 
 from ...kernels.common import moe_sigmoid_topk_swiglu_rows as _kernel
+from .._build import Count, build_or_reason
 
 
 def compile() -> Callable:  # noqa: A001 -- the kernel module's own name for this step
@@ -69,3 +75,42 @@ class CuteDslSwigluRows(OpWrapper):
 
 
 cute_dsl_swiglu_rows = CuteDslSwigluRows()
+
+
+@dataclass(frozen=True)
+class SwigluRowsHandle:
+    """What `swiglu_rows` launches: the compiled kernel (None: not built, `missing` says why)
+    and the route counter (`swiglu_rows`)."""
+
+    compiled: Callable | None
+    count: Count
+    missing: str = ""
+
+
+def build(count: Count, enabled: bool = True) -> SwigluRowsHandle:
+    """Compile the kernel into `swiglu_rows`'s handle; one that fails keeps FlashInfer's.
+    `enabled=False` builds nothing."""
+    if not enabled:
+        return SwigluRowsHandle(None, count, "not built")
+    compiled, missing = build_or_reason("SwiGLU rows", compile)
+    return SwigluRowsHandle(compiled, count, missing)
+
+
+class SwigluRows(OpWrapper):
+    """`silu(gate) * up` over `[gate | up]` rows: `cute_dsl_swiglu_rows` where the handle's
+    kernel built and takes `src`, else `flashinfer_silu_and_mul`. Counted as
+    `swiglu_rows`."""
+
+    def __call__(self, src: torch.Tensor, handle: SwigluRowsHandle) -> torch.Tensor:
+        hit = handle.compiled is not None and takes(src)
+        handle.count("swiglu_rows", hit)
+        if hit:
+            return cute_dsl_swiglu_rows(src, handle.compiled)
+        return flashinfer_silu_and_mul(src)
+
+    def reference(self, src: torch.Tensor, handle: SwigluRowsHandle) -> torch.Tensor:
+        """`cute_dsl_swiglu_rows`'s reference. `handle` is ignored."""
+        return cute_dsl_swiglu_rows.reference(src, None)
+
+
+swiglu_rows = SwigluRows()

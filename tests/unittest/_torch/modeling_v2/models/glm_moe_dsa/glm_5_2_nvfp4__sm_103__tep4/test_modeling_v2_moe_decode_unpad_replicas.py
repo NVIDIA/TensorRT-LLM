@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test: the unpadded trunk decode MoE (`_moe_dec_unpadded`) with decode expert replicas,
+"""GPU test: the unpadded trunk decode MoE (`routed_moe.dec_unpadded`) with decode expert
+replicas,
 all four EP ranks simulated on one GPU.
 
 Unpadded, a decode width that is not a power of two runs on the replica top-k's maps (hot
@@ -14,6 +15,7 @@ one rank.
 """
 
 import zlib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -25,9 +27,6 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E402, E501
     fp4_quantize,
 )
-from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    modeling as _modeling,
-)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.moe import (  # noqa: E402, E501
     moe_fc1_kblock as _fc1_kblock,
 )
@@ -36,6 +35,9 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
     cute_dsl_hidden_add as _add_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    projection as _proj,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_nvfp4_experts as _experts_op,
@@ -47,6 +49,9 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     cute_dsl_moe_routing as _routing_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    cute_dsl_moe_sigmoid_topk as _sigmoid_topk_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_topk_routing as _topk_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
@@ -55,14 +60,21 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_zero as _zero_op,
 )
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    routed_moe as _moe,
+)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.quantization import (  # noqa: E402, E501
     cute_dsl_moe_quantize_nvfp4 as _quant_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.step import (  # noqa: E402, E501
+    PREFILL,
 )
 
 __extra_import_path__ = ["../../.."]
 from _validating import assert_within_ulp  # noqa: E402 — needs the path declared above
 
 HIDDEN, INTER, EXPERTS, LOCAL = 6144, 2048, 256, 64
+DECODE_MAX_ROWS = _proj.DECODE_MAX_ROWS
 TOP_K = _routing_op.TOP_K
 NREP = 8
 #: MTP5 at 2 / 3 requests, and an odd count in the 64-row bucket; all on the replica top-k.
@@ -151,7 +163,7 @@ def _rank_weights(gw, router, bias, off: int, hot: list[int]) -> SimpleNamespace
 
 
 def _slot(dev) -> SimpleNamespace:
-    rows = _modeling._MOE_MAX_T
+    rows = _moe.MAX_ROWS
     counts, barrier = _routing_op.allocate_workspace(dev)
     f32 = {"dtype": torch.float32, "device": dev}
     return SimpleNamespace(
@@ -162,72 +174,84 @@ def _slot(dev) -> SimpleNamespace:
         maps=_routing_op.allocate_maps(rows, dev),
         counts=counts,
         barrier=barrier,
-        router_out=torch.zeros((_modeling._DECODE_MAX_ROWS, EXPERTS), **f32),
-        router_partials=torch.zeros(
-            (_modeling._DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32
-        ),
-        router_x=torch.zeros(
-            (_modeling._DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev
-        ),
+        router_out=torch.zeros((DECODE_MAX_ROWS, EXPERTS), **f32),
+        router_partials=torch.zeros((DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32),
+        router_x=torch.zeros((DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev),
         topk_out={w: _topk_rep_op.allocate_outputs(w, NREP, dev) for w in ROWS},
         c=_experts_op.allocate_decode_c(rows, INTER, dev),
         sfc=_experts_op.allocate_sfc(rows, INTER, dev),
     )
 
 
+class _Counts:
+    """The route counter the handles report to (`count(route, hit)`), as the core's."""
+
+    def __init__(self) -> None:
+        self.hits: dict = {}
+        self.misses: dict = {}
+
+    def __call__(self, route: str, hit: bool) -> None:
+        counts = self.hits if hit else self.misses
+        counts[route] = counts.get(route, 0) + 1
+
+
 def state() -> SimpleNamespace:
+    """The routed ops' handle over the decode MoE kernels with decode expert replicas, as
+    `build_kernels` builds them at ROWS (the replica top-k, its early-release handles at the
+    step widths); each rank's expert offset is set per call (`replace`)."""
     if "state" in _STATE:
         return _STATE["state"]
     dev = torch.cuda.current_device()
-    core = _modeling.GlmMoeDsaTep4ModelingV2.__new__(_modeling.GlmMoeDsaTep4ModelingV2)
-    torch.nn.Module.__init__(core)
-    core.route_hits, core.route_misses = {}, {}
-    core.expert_offset = 0
-    core.routed_scale = ROUTED_SCALE
-    core.max_draft_len = 5
-    core.num_layers = NUM_LAYERS
-    core.fc1_kblk, core.fc2_kblk = FC1_KBLK, FC2_KBLK
-    core._moe_acc_padded = True
-    core._moe_dec_unpad = True
-    core._moe_dec_unpad_signal = True
-    core._moe_topk_signaled = False
-    core.dec_replicas = NREP
-    core._rows = SimpleNamespace(
-        norm=None, add=_add_op.compile(), gather=None, topk=None, swiglu=None,
-        copy=_copy_op.compile(), argmax=None,
-    )  # fmt: skip
-    core._side_stream = torch.cuda.Stream(device=dev)
-    core._moe_slot = 0
-    core._moe_slots = [_slot(dev) for _ in range(2)]
-    rows = _modeling._MOE_MAX_T
-    core._moe_xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
-    core._moe_xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
-    core._moe_rep_maps = None
-    core._ctx_hot_ids = {}
-    core._pf = None
-    core._dec_hot_none = torch.full((NREP,), -1, dtype=torch.int32, device=dev)
-    s0 = core._moe_slots[0]
+    counts = _Counts()
+    copy = _copy_op.build(counts)
+    rows = _moe.MAX_ROWS
+    k = SimpleNamespace()
+    k.slots = [_slot(dev) for _ in range(2)]
+    k.xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
+    k.xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
+    s0 = k.slots[0]
     splits = {w: _router_op.decode_splits(w) for w in ROWS}
-    core._moe_k = SimpleNamespace(
-        routing=_routing_op.build(sorted({_pow2(r) for r in ROWS}), dev),
-        experts=_experts_op.build_decode(
-            c=s0.c, sfc=s0.sfc, maps=s0.maps, xq=core._moe_xq, xsf=core._moe_xsf, out=s0.out,
-            hidden=HIDDEN, inter=INTER, experts=LOCAL + NREP, max_rows=rows,
-            fc1_kblk=FC1_KBLK, fc2_kblk=FC2_KBLK, dyn_slots=NUM_LAYERS + 1,
-        ),  # fmt: skip
-        topk={w: _topk_op.build_decode(w, splits[w], dev, signal_gg1=False) for w in ROWS},
-        topk_rep={
-            w: _topk_rep_op.build_decode(w, splits[w], NREP, dev, signal_gg1=False) for w in ROWS
-        },
-        topk_sig={
-            w: _topk_rep_op.build_decode(w, splits[w], NREP, dev, signal_gg1=True)
-            for w in SIG_ROWS
-        },
-        router={w: _router_op.build(w, dev) for w in ROWS},
-        quant={w: _quant_op.build_decode(w, dev) for w in ROWS},
-        zero={w: _zero_op.build_decode(w, dev) for w in sorted({_pow2(r) for r in ROWS})},
-        pair=None, pair_rep=None, topk_pre=None, topk_pre_rep=None, quant_pre=None,
-        zero_pre=None, merge=None,
+    k.routing = _routing_op.build(sorted({_pow2(r) for r in ROWS}), dev)
+    k.experts = _experts_op.build_decode(
+        c=s0.c, sfc=s0.sfc, maps=s0.maps, xq=k.xq, xsf=k.xsf, out=s0.out,
+        hidden=HIDDEN, inter=INTER, experts=LOCAL + NREP, max_rows=rows,
+        fc1_kblk=FC1_KBLK, fc2_kblk=FC2_KBLK, dyn_slots=NUM_LAYERS + 1,
+    )  # fmt: skip
+    k.pair = k.pair_rep = k.topk_pre = k.topk_pre_rep = k.router_pre = None
+    k.quant_pre = k.zero_pre = k.merge = k.pf = k.router_wide = None
+    k.ctx_hot_ids, k.topk_wide, k.topk_wide_rep = {}, {}, {}
+    k.topk = {w: _topk_op.build_decode(w, splits[w], dev, signal_gg1=False) for w in ROWS}
+    k.topk_rep = {
+        w: _topk_rep_op.build_decode(w, splits[w], NREP, dev, signal_gg1=False) for w in ROWS
+    }
+    k.topk_sig = {
+        w: _topk_rep_op.build_decode(w, splits[w], NREP, dev, signal_gg1=True) for w in SIG_ROWS
+    }
+    # The layer's hot ids are set per test (`k.dec_hot_ids`).
+    k.dec_hot_ids = {}
+    k.dec_hot_none = torch.full((NREP,), -1, dtype=torch.int32, device=dev)
+    k.router = {w: _router_op.build(w, dev) for w in ROWS}
+    k.quant = {w: _quant_op.build_decode(w, dev) for w in ROWS}
+    k.zero = {w: _zero_op.build_decode(w, dev) for w in sorted({_pow2(r) for r in ROWS})}
+    h = _moe.build(
+        k,
+        expert_offset=0,
+        routed_scale=ROUTED_SCALE,
+        n_group=1,
+        topk_group=1,
+        topk=TOP_K,
+        num_layers=NUM_LAYERS,
+        wide_cells=True,
+        dec_unpad=True,
+        acc_padded=True,
+        router_proj=_proj.build(
+            "router", cells={}, mtp_cells={}, prefill=None, mxf8=None, dec8=None, dec8w=None,
+            wide_bucket=False, copy=copy, count=counts,
+        ),
+        route=_sigmoid_topk_op.build(counts, False),
+        copy=copy,
+        add=_add_op.build(counts),
+        count=counts,
     )  # fmt: skip
     g = torch.Generator(device="cuda").manual_seed(_seed("rep router"))
     router = (torch.randn(EXPERTS, HIDDEN, generator=g, device="cuda") * HIDDEN**-0.5).to(
@@ -236,7 +260,15 @@ def state() -> SimpleNamespace:
     bias = torch.randn(EXPERTS, generator=g, device="cuda") * 0.2
     for e in FORCED:
         bias[e] = 4.0
-    st = SimpleNamespace(core=core, gw=_global_experts(), router=router.contiguous(), bias=bias)
+    st = SimpleNamespace(
+        h=h,
+        counts=counts,
+        parity=_moe.SlotParity(),
+        side=torch.cuda.Stream(device=dev),
+        gw=_global_experts(),
+        router=router.contiguous(),
+        bias=bias,
+    )
     _STATE["state"] = st
     return st
 
@@ -250,41 +282,44 @@ def _hot_ids(st, x) -> list[int]:
     return [int(e) for e in counts.argsort(descending=True)[:NREP]]
 
 
-def _rank_step(core, x, partial, m, rows: int):
-    """`_mlp_and_close`'s MoE half on one rank (as test_modeling_v2_moe_decode_unpad.py)."""
-    _quant_op.cute_dsl_moe_quantize_nvfp4(
-        x, m.g1, core._moe_xq[:rows], core._moe_xsf[:rows], core._moe_k.quant[rows]
-    )
-    acc = core._moe_begin_layer(rows)
-    slot = core._moe_slot
+def _rank_step(st, h, x, partial, m, rows: int):
+    """A decode Target's trunk MoE layer on one rank (as test_modeling_v2_moe_decode_unpad.py)."""
+    k = h.k
+    _quant_op.cute_dsl_moe_quantize_nvfp4(x, m.g1, k.xq[:rows], k.xsf[:rows], k.quant[rows])
+    pf = _moe.moe_l2_prefetch(LAYER, m, rows, False, h)
+    slot, acc = _moe.moe_open(rows, False, h, st.parity)
+    assert slot is not None and acc is not None, "a decode width always accumulates here"
     main = torch.cuda.current_stream()
-    side = core._side_stream
+    side = st.side
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        core._copy_into(acc, partial)
-    out = core._routed(x, m, rows, True, side, True, True, LAYER)
+        _copy_op.row_copy(acc, partial, h.copy)
+    quantized = _moe.moe_quantize_first(x, m, True, h)
+    logits, in_slot = _moe.moe_router(PREFILL, x, m, slot, False, h)
+    routing = _moe.moe_topk(logits, in_slot, m, slot, LAYER, False, h)
+    routed = _moe.moe_experts(x, routing, m, quantized, slot, acc, side, pf, LAYER, False, h)
+    out = _moe.moe_combine(routed, None, acc, rows, main, side, h)
     torch.cuda.synchronize()
-    s = core._moe_slots[slot]
+    s = k.slots[slot]
     padded = _pow2(rows)
-    if core._moe_dec_unpad or padded == rows:
+    if h.dec_unpad or padded == rows:
         t = s.topk_out[rows]
         w, maps, n = t["topk_weights"].view(rows, TOP_K), t, rows
     else:
         w, maps, n = s.w[:padded], s.maps, padded
-    snap = {k: maps[k].clone() for k in _routing_op.MAP_KEYS}
+    snap = {key: maps[key].clone() for key in _routing_op.MAP_KEYS}
     return out.clone(), w[:n].clone(), snap, n
 
 
-def _reference(core, x, partial, m, rows, w, maps, n):
-    _quant_op.cute_dsl_moe_quantize_nvfp4(
-        x, m.g1, core._moe_xq[:rows], core._moe_xsf[:rows], core._moe_k.quant[rows]
-    )
-    xq, xsf = core._moe_xq[:rows].clone(), core._moe_xsf[:rows].clone()
+def _reference(h, x, partial, m, rows, w, maps, n):
+    k = h.k
+    _quant_op.cute_dsl_moe_quantize_nvfp4(x, m.g1, k.xq[:rows], k.xsf[:rows], k.quant[rows])
+    xq, xsf = k.xq[:rows].clone(), k.xsf[:rows].clone()
     maps = dict(maps)
     maps["expanded_idx_to_permuted_idx"] = maps["expanded_idx_to_permuted_idx"][: rows * TOP_K]
     return _experts_op.cute_dsl_moe_nvfp4_experts.reference(
         xq, xsf, maps, w[:rows].contiguous(), m.fc1_w, m.fc1_s, m.fc2_w, m.fc2_s, m.norm_const,
-        m.alpha1, m.alpha2, partial.clone(), None, None, None, core._moe_k.experts,
+        m.alpha1, m.alpha2, partial.clone(), None, None, None, k.experts,
     )[:rows]  # fmt: skip
 
 
@@ -301,29 +336,27 @@ def _mapped(maps, n_exp: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("rows", ROWS)
-def test_four_rank_sum_replicas_unpadded_vs_padded(rows: int, monkeypatch) -> None:
+def test_four_rank_sum_replicas_unpadded_vs_padded(rows: int) -> None:
     st = state()
-    core = st.core
     g = torch.Generator(device="cuda").manual_seed(_seed(f"rep x {rows}"))
     x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
     partial = (torch.randn(rows, HIDDEN, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
     hot = _hot_ids(st, x)
     hot_t = torch.tensor(hot, dtype=torch.int32, device="cuda")
-    core._dec_hot_ids = {LAYER: hot_t}
+    st.h.k.dec_hot_ids = {LAYER: hot_t}
     sums, refs, rep_tiles = {}, {}, 0
     for unpad in (True, False):
-        monkeypatch.setattr(core, "_moe_dec_unpad", unpad)
         total = torch.zeros(rows, HIDDEN, dtype=torch.float32, device="cuda")
         ref = torch.zeros_like(total)
         cover = torch.zeros(rows * TOP_K, dtype=torch.int32, device="cuda")
         for r, off in enumerate(OFFSETS):
-            core.expert_offset = off
+            h = replace(st.h, expert_offset=off, dec_unpad=unpad)
             m = _rank_weights(st.gw, st.router, st.bias, off, hot)
             p = partial if r == 0 else torch.zeros_like(partial)
-            out, w, maps, n = _rank_step(core, x, p, m, rows)
+            out, w, maps, n = _rank_step(st, h, x, p, m, rows)
             assert bool(torch.isfinite(out).all())
             total += out.float()
-            ref += _reference(core, x, p, m, rows, w, maps, n).float()
+            ref += _reference(h, x, p, m, rows, w, maps, n).float()
             cover += _mapped(maps, rows * TOP_K)
             if unpad:
                 tiles = int(maps["num_non_exiting_tiles"][0])

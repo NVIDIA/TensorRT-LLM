@@ -10,11 +10,15 @@ accepted row), and draft steps 1.. copy it instead of scoring and selecting. Wha
 * the flag resolves as the engine's attention module resolves the MTP layer's sparse params;
 * the stash is the engine's own rows (`Indexer._mtp_last_accepted_rows` plus the context last
   rows), with and without accepted counts, decode and mixed steps;
-* the target's MTP layer, over a whole draft loop on a fake core: with the flag on, step 0 runs
-  the indexer and stashes, steps 1.. run no q side / scorer / top-k, still project and append
-  their keys, and attend over the stashed rows; with it off, every step runs the indexer as
-  before (the same calls, in the same order); the two give the same outputs when the indexer
-  would select step 0's rows again, and a dense (skipped) step is untouched either way.
+* the target's MTP layer (`DecodeTarget.mtp_forward`), over a whole draft loop on a fake core
+  whose indexer ops record (`indexer_pre_proj`, `indexer_q_side`, `indexer_write_k`,
+  `indexer_decode_logits`, `indexer_decode_topk`; the real `mtp_share_store` /
+  `mtp_share_load` around them): with the flag on, step 0 runs the indexer and stashes, steps
+  1.. run no q side / scorer / top-k, still project and append their keys, and attend over
+  the stashed rows; with it off, every step runs the indexer as before (the same calls, in
+  the same order); the two give the same outputs when the indexer would select step 0's rows
+  again, and a dense (skipped) step is untouched either way. The MTP layer's decode step
+  never asks for the q_b | wq_b fold (a wide decode step's cell).
 
 Dispatch and index arithmetic only: no kernel runs.
 """
@@ -29,7 +33,14 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer  # noqa: E402
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    decode as D,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as M,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.mtp_index_share import (  # noqa: E402, E501
+    mtp_share_load,
+    mtp_share_store,
 )
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig  # noqa: E402
 
@@ -108,14 +119,16 @@ def test_stash_is_the_engine_rows(ctx_lens, seqs, gen_p, accepted) -> None:
         else torch.tensor(accepted, dtype=torch.int32, device=dev),
         shared_topk_indices=torch.full((64, TOPK), -7, dtype=torch.int32, device=dev),
     )
-    M._mtp_share_store(md, topk, ctx, tc, seqs, gen_p)
+    mtp_share_store(md, topk, ctx, tc, seqs, gen_p)
     want = _engine_stash(md, topk, ctx, tc, seqs, gen_p)
     n = ctx + seqs
     assert torch.equal(md.shared_topk_indices[:n], want)
     assert bool((md.shared_topk_indices[n:] == -7).all())
     # A later step's selection is the stash's first `n` rows.
     out = torch.empty((n, TOPK), dtype=torch.int32, device=dev)
-    M._mtp_share_load(md, out, n)
+    count = {}
+    mtp_share_load(md, out, n, lambda name, hit: count.__setitem__(name, hit))
+    assert count == {"mtp_ix_share": True}
     assert torch.equal(out, want)
 
 
@@ -124,60 +137,155 @@ def test_stash_is_the_engine_rows(ctx_lens, seqs, gen_p, accepted) -> None:
 
 class _Loop:
     """A fake core and a draft loop's metadata. `fresh(step)` is the selection the indexer
-    would make at `step` (one row per query row); `calls` records the indexer front."""
+    would make at `step` (one row per query row); `calls` records the indexer front, `slots`
+    the selection each step's attention reads (the MTP layer's pool-row conversion)."""
 
     def __init__(self, share: bool, max_draft_len: int, seqs: int, fresh, skip_gen=False):
         self.calls: list[tuple] = []
         self.slots: list[torch.Tensor] = []
         self.fresh = fresh
         self.step = 0
+        self.topk_buf = None
+        attn = SimpleNamespace(
+            **dict.fromkeys(("norm1", "norm2", "o", "qkva", "qkva8", "ix_fold_w", "q_norm")),
+            **dict.fromkeys(("kv_norm", "qb", "qb_dec8", "k_b", "k_b_nk", "v_b_t", "v_b_nk")),
+        )
+        ix = SimpleNamespace(**dict.fromkeys(("fused", "fused_bf16", "qb", "kn_w", "kn_b")))
         core = SimpleNamespace(
             num_layers=NUM_LAYERS,
             max_draft_len=max_draft_len,
+            dec_cell_up=False,
             mtp_index_share=share,
             _mtp_share_stash=share and max_draft_len > 1,
-            _attn={NUM_LAYERS: "attn"},
-            _idx={NUM_LAYERS: "ix"},
+            _mtp_out_normed=max_draft_len > 1,
+            _attn={NUM_LAYERS: attn},
+            _idx={NUM_LAYERS: ix},
+            _mlp={NUM_LAYERS: (None, None)},
+            _shared_gu_il={NUM_LAYERS: None},
+            _side_stream=torch.cuda.Stream(),
+            _mtp={"head_norm": None},
+            heads=1,
+            v_dim=1,
+            kv_lora=1,
+            eps=1e-5,
+            # The handles the MTP layer passes to its ops (recorded as identities in `run`).
+            w={"embed": None},
+            _embedding=None,
+            _mtp_eh_h=None,
+            _rows=SimpleNamespace(norm=None, add=None, add_norm=None),
+            _proj_h=SimpleNamespace(o_proj=None, ix_qb=None),
+            _comm=None,
+            _shared_h=None,
+            _mtp_moe_h=None,
+            _mtp_moe=None,
+            _mtp_parity=SimpleNamespace(take=lambda: 0),
+            _ix_state=None,
             route_hits={},
             route_misses={},
+            idx_topk=TOPK,
+            _attn_h=SimpleNamespace(
+                **dict.fromkeys(("qkva_fold", "norm", "q_b_fold", "fmha", "k_b", "rope", "v_b"))
+            ),
         )
         core._count = lambda name, hit: core.route_hits.__setitem__(
             name, core.route_hits.get(name, 0) + 1
         )
-        core._qkva_ix_fold = lambda x, i, rows: None
-        core._qb_ixqb_runner = lambda i, rows: self.calls.append(("qb_ixqb", rows)) or None
-        core._qkv = lambda x, a, q_b=True, qkva=None: ("q", "q_a", "latent", None)
-
-        def project(x, q_a, pos, ix, rows, need_q, kw=None, ixq=None, kc=None):
-            self.calls.append(("project", rows, need_q))
-            k_pre = ("k", rows)
-            return ("q_fp8", "w", k_pre) if need_q else (None, None, k_pre)
-
-        core._indexer_project = project
-        core._indexer_write_k = lambda md, k_pool, k_pre, rows: self.calls.append(("write_k", rows))
-
-        def decode(md, k_pool, q_fp8, weights, topk_buf, ctx, seqs_, gen_p, memo=None):
-            self.calls.append(("select", seqs_, gen_p))
-            topk_buf.copy_(self.fresh(self.step, seqs_, gen_p))
-
-        core._indexer_decode = decode
-        core._dec8_takes = lambda *a: False
-        core._dec8w_takes = lambda *a: False
-        core._attn_gen = lambda *a: None
+        # The indexer ops' handle: only its counter is read (`mtp_share_load`).
+        core._ix_h = SimpleNamespace(pre_proj=None, count=core._count)
         self.core = core
         self.target = M.DecodeTarget(core)
+        # The Target's handoff table (`on_load`): the MTP layer's q_a norm and V-B write no
+        # operand here.
+        self.target._qb_pre = {NUM_LAYERS: False}
+        self.target._vb_pre = {NUM_LAYERS: False}
         self.md = SimpleNamespace(
             in_mtp_draft_loop=True,
             indexer_skip_topk=False,
             mtp_num_accepted=None,
             shared_topk_indices=torch.full((64, TOPK), -7, dtype=torch.int32),
-            kv_cache_manager=SimpleNamespace(get_indexer_k_cache_buffers=lambda i: "k_pool"),
+            kv_cache_manager=SimpleNamespace(
+                get_indexer_k_cache_buffers=lambda i: "k_pool", layer_offsets={NUM_LAYERS: 0}
+            ),
+            host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32),
+            tokens_per_block=64,
+            block_table=None,
+            req_idx_per_token=torch.zeros(64, dtype=torch.int32),
+            skip_indexer_for_gen_reqs=skip_gen,
+            num_seqs=seqs,
         )
         self.seqs = seqs
         self.skip_gen = skip_gen
 
     def run(self, accepted: list[int]) -> None:
-        """The engine's loop: step 0 at `max_draft_len + 1` rows per request, then 1 row."""
+        """The engine's loop: step 0 at `max_draft_len + 1` rows per request, then 1 row, each
+        a call of the MTP layer's decode forward."""
+        with pytest.MonkeyPatch.context() as mp:
+            # The MTP layer's front, o_proj, collectives, shared expert, routed experts and
+            # adds: identities.
+            for name in ("embed", "hidden_rmsnorm", "hidden_add", "allreduce"):
+                mp.setattr(D, name, lambda x, *a, **k: x)
+            mp.setattr(D, "hidden_add_rmsnorm", lambda res, red, *a, **k: red)
+            mp.setattr(D, "mtp_eh_norm", lambda ph, e, h, *a: h)
+            mp.setattr(D, "mtp_eh_proj", lambda ph, eh, *a: eh)
+            mp.setattr(D, "projection", lambda ph, x, *a, **k: x)
+            mp.setattr(D, "allreduce_add_rmsnorm", lambda x, *a, **k: (x, None))
+            mp.setattr(D, "shared_gate_up_swiglu", lambda ph, o, *a, **k: (o, False))
+            mp.setattr(D, "shared_down", lambda ph, act, *a, **k: act)
+            mp.setattr(D, "mtp_moe_open", lambda *a: False)
+            mp.setattr(D, "moe_quantize_first", lambda *a: False)
+            mp.setattr(D, "moe_router", lambda ph, o, *a: (None, False))
+            mp.setattr(D, "moe_topk", lambda *a: None)
+            mp.setattr(D, "moe_experts", lambda o, *a: o)
+            # The indexer front records; the share stash / load are the target's own.
+            mp.setattr(D, "indexer_topk_buf", lambda *a: self.topk_buf)
+
+            def pre_proj(ph, x, fused, fused_bf16, kw, h):
+                self.calls.append(("project", int(x.shape[0])))
+                return ("k", int(x.shape[0])), "wq"
+
+            def q_side(ph, q_a, ixq, *a):
+                self.calls.append(("q_side", int(self.topk_buf.shape[0])))
+                return "q_fp8", "w", a[3]
+
+            def write_k(md, k_pool, kb, *a):
+                self.calls.append(("write_k", kb[1]))
+
+            def logits(md, k_pool, q_fp8, weights, ctx, gen_p, memo, h):
+                self.calls.append(("score", int(self.topk_buf.shape[0]) // gen_p, gen_p))
+                return "logits"
+
+            def topk(md, logits, topk_buf, ctx, gen_p, h):
+                seqs_ = int(topk_buf.shape[0]) // gen_p
+                self.calls.append(("select", seqs_, gen_p))
+                topk_buf.copy_(self.fresh(self.step, seqs_, gen_p))
+
+            mp.setattr(D, "indexer_pre_proj", pre_proj)
+            mp.setattr(D, "indexer_q_side", q_side)
+            mp.setattr(D, "indexer_write_k", write_k)
+            mp.setattr(D, "indexer_decode_logits", logits)
+            mp.setattr(D, "indexer_decode_topk", topk)
+            # The attention: a decode step never asks for the q_b | wq_b fold (a wide decode
+            # step's cell); the pool-row conversion records the selection it reads.
+            mp.setattr(D, "qkva_ix_fold", lambda ph, x, *a: (x, None))
+            mp.setattr(D, "qkv_a_rmsnorm", lambda qkva, *a: ("q_a", "latent", None, False))
+
+            def q_b_ix_wq_b(ph, q_a, w, w_fold, *a):
+                assert w_fold is None, "a decode step asked for the q_b | wq_b fold"
+                return "q", None
+
+            def convert(req_idx, block_table, buf, *a):
+                self.slots.append(buf.clone())
+                return buf
+
+            mp.setattr(D, "q_b_ix_wq_b", q_b_ix_wq_b)
+            mp.setattr(D, "convert_req_index_to_global", convert)
+            mp.setattr(D, "k_b_q_base", lambda *a: None)
+            mp.setattr(D, "mla_rope", lambda *a: (None, None, None, None))
+            mp.setattr(D, "sparse_mla_decode", lambda *a: None)
+            mp.setattr(D, "v_b", lambda *a: False)
+            self._run(accepted)
+
+    def _run(self, accepted: list[int]) -> None:
         md, d = self.md, self.core.max_draft_len
         md.mtp_num_accepted = torch.tensor(accepted, dtype=torch.int32)
         for step in range(d):
@@ -185,19 +293,16 @@ class _Loop:
             md.indexer_skip_topk = step > 0
             gen_p = d + 1 if step == 0 else 1
             rows = self.seqs * gen_p
-            topk_buf = (
+            # The engine's dense index on a skipped phase (`Indexer.topk_buf`).
+            self.topk_buf = (
                 torch.full((rows, TOPK), -3, dtype=torch.int32)
                 if self.skip_gen
                 else torch.empty((rows, TOPK), dtype=torch.int32)
             )
-
-            def slots_of(buf, fresh):
-                self.slots.append(buf.clone())
-                return buf, "global", None
-
-            self.target._layer_attention(
-                md, "x", "pos", "out", NUM_LAYERS, 0, slots_of, topk_buf, rows, gen_p,
-                self.skip_gen, False,
+            hidden = torch.zeros((rows, 1), dtype=torch.bfloat16)
+            self.target.mtp_forward(
+                None, None, torch.zeros(rows, dtype=torch.int32), hidden, md,
+                position_ids=torch.zeros(rows, dtype=torch.int32),
             )  # fmt: skip
         md.in_mtp_draft_loop = False
 
@@ -224,8 +329,8 @@ def test_off_path_runs_the_indexer_every_step(max_draft_len, seqs) -> None:
     for step in range(max_draft_len):
         gen_p = max_draft_len + 1 if step == 0 else 1
         rows = seqs * gen_p
-        want += [("qb_ixqb", rows), ("project", rows, True), ("write_k", rows),
-                 ("select", seqs, gen_p)]  # fmt: skip
+        want += [("project", rows), ("q_side", rows), ("write_k", rows),
+                 ("score", seqs, gen_p), ("select", seqs, gen_p)]  # fmt: skip
         assert torch.equal(loop.slots[step], _fresh_by_step(step, seqs, gen_p))
     assert loop.calls == want
     assert bool((loop.md.shared_topk_indices == -7).all())
@@ -240,10 +345,10 @@ def test_on_path_reuses_draft_step_0(max_draft_len, seqs) -> None:
     p0 = max_draft_len + 1
     step0 = _fresh_by_step(0, seqs, p0)
     last = torch.stack([step0[s * p0 + accepted[s] - 1] for s in range(seqs)])
-    want = [("qb_ixqb", seqs * p0), ("project", seqs * p0, True), ("write_k", seqs * p0),
-            ("select", seqs, p0)]  # fmt: skip
-    # Later steps: keys only (no q_b | wq_b fusion, no q side, scorer or top-k).
-    want += [("project", seqs, False), ("write_k", seqs)] * (max_draft_len - 1)
+    want = [("project", seqs * p0), ("q_side", seqs * p0), ("write_k", seqs * p0),
+            ("score", seqs, p0), ("select", seqs, p0)]  # fmt: skip
+    # Later steps: keys only (no q side, scorer or top-k).
+    want += [("project", seqs), ("write_k", seqs)] * (max_draft_len - 1)
     assert loop.calls == want
     assert torch.equal(loop.slots[0], step0)
     for step in range(1, max_draft_len):
