@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -223,7 +224,49 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     bounce_test::freeXferBufs(followup);
 }
 
-TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
+namespace
+{
+// The reactor dispatches one received message before its next recv. Pause at that boundary
+// after the first DATA, so the test can seal an already queued scatter before cancel is handled.
+class PauseAfterData : public b::ZmqControlChannel
+{
+public:
+    PauseAfterData(std::string const& name, std::promise<void> reached, std::future<void> resume)
+        : b::ZmqControlChannel(name)
+        , mReached(std::move(reached))
+        , mResume(std::move(resume))
+    {
+    }
+
+    bool recv(std::string& peer, std::string& blob, int timeoutMs) override
+    {
+        if (mPauseNext)
+        {
+            mPauseNext = false;
+            mReached.set_value();
+            EXPECT_EQ(mResume.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        }
+        auto const received = b::ZmqControlChannel::recv(peer, blob, timeoutMs);
+        if (received && mArmed)
+        {
+            b::BounceMsgHeader header{};
+            if (b::decodeHeader(blob, header) && header.msgType == static_cast<std::uint16_t>(b::BounceMsgType::kDATA))
+            {
+                mPauseNext = true;
+                mArmed = false;
+            }
+        }
+        return received;
+    }
+
+private:
+    std::promise<void> mReached;
+    std::future<void> mResume;
+    bool mArmed{true};
+    bool mPauseNext{false};
+};
+
+void checkFailedWriteDrain(bool sealBeforeCancel)
 {
     if (!bounce_test::hasCuda())
     {
@@ -231,7 +274,15 @@ TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
     }
     auto c = cfg(/*timeoutMs=*/1500);
     auto sender = bounce_test::makeNode("drainA", c, 1024);
-    auto receiver = bounce_test::makeNode("drainB", c, 1024);
+    std::promise<void> reached;
+    auto queued = reached.get_future();
+    std::promise<void> resume;
+    std::unique_ptr<b::ZmqControlChannel> channel;
+    if (sealBeforeCancel)
+    {
+        channel = std::make_unique<PauseAfterData>("drainB", std::move(reached), resume.get_future());
+    }
+    auto receiver = bounce_test::makeNode("drainB", c, 1024, nullptr, std::move(channel));
     if (!sender || !receiver)
     {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
@@ -240,13 +291,30 @@ TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
     ASSERT_TRUE(sender->tx->registerPeerHandshake(receiver->name, receiver->tx->localHandshakeBlob()));
     ASSERT_TRUE(receiver->tx->registerPeerHandshake(sender->name, sender->tx->localHandshakeBlob()));
 
+    auto const key = bounce_test::testWindowKey();
+    auto const id = b::bounceWindowId(key);
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/7);
+    std::vector<unsigned char> const untouched(bufs.total, 0xA5);
+    if (sealBeforeCancel)
+    {
+        ASSERT_EQ(cudaMemcpy(bufs.dst, untouched.data(), bufs.total, cudaMemcpyHostToDevice), cudaSuccess);
+    }
     std::vector<b::ExecCtx*> held;
     while (auto* ctx = receiver->exec->tryAcquire())
     {
         held.push_back(ctx);
     }
-    auto result = bounce_test::submitTransfer(*sender, *receiver, bufs);
+    EXPECT_EQ(held.size(), receiver->exec->size());
+    auto result = bounce_test::submitTransfer(*sender, *receiver, bufs, key);
+    if (sealBeforeCancel)
+    {
+        EXPECT_EQ(queued.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        receiver->tx->receiveWindows().seal(id);
+        auto window = receiver->tx->receiveWindows().find(id, sender->name);
+        EXPECT_TRUE(window && !window->acquire().owns_lock());
+        EXPECT_EQ(result.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+        resume.set_value();
+    }
     std::shared_future<bool> drain;
     if (result.wait_for(std::chrono::seconds(10)) == std::future_status::ready)
     {
@@ -275,12 +343,38 @@ TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
         if (ready == std::future_status::ready)
         {
             EXPECT_TRUE(drain.get());
-            EXPECT_TRUE(bounce_test::verifyXferBufs(bufs));
+            if (!sealBeforeCancel)
+            {
+                EXPECT_TRUE(bounce_test::verifyXferBufs(bufs));
+            }
         }
+    }
+    if (sealBeforeCancel)
+    {
+        auto next = bounce_test::makeXferBufs(8, 256, /*seed=*/8);
+        auto followup = bounce_test::submitTransfer(*sender, *receiver, next);
+        ASSERT_EQ(followup.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+        EXPECT_EQ(followup.get().state, kvc::TransferState::kSUCCESS);
+        EXPECT_TRUE(bounce_test::verifyXferBufs(next));
+        std::vector<unsigned char> actual(bufs.total);
+        EXPECT_EQ(cudaMemcpy(actual.data(), bufs.dst, actual.size(), cudaMemcpyDeviceToHost), cudaSuccess);
+        EXPECT_EQ(actual, untouched);
+        bounce_test::freeXferBufs(next);
     }
     sender->tx->shutdown();
     receiver->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
+}
+} // namespace
+
+TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
+{
+    checkFailedWriteDrain(false);
+}
+
+TEST(BounceTransportFailure, SealedWindowAllowsTheOriginalWriterToDrain)
+{
+    checkFailedWriteDrain(true);
 }
 
 class BounceCapacityFailure : public ::testing::TestWithParam<bool>

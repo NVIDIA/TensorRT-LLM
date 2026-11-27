@@ -180,9 +180,9 @@ inline std::string testWindowKey()
     return key;
 }
 
-inline std::shared_future<b::BounceResult> submitTransfer(Node& source, Node& destination, XferBufs& buffers)
+inline std::shared_future<b::BounceResult> submitTransfer(
+    Node& source, Node& destination, XferBufs& buffers, std::string const& key = testWindowKey())
 {
-    auto key = testWindowKey();
     kvc::MemoryDescs region{
         kvc::MemoryType::kVRAM, {kvc::MemoryDesc{buffers.dst, static_cast<std::size_t>(buffers.total), 0}}};
     destination.agent->registerMemory(region);
@@ -210,7 +210,8 @@ inline std::shared_future<b::BounceResult> submitTransfer(Node& source, Node& de
 // control the scheduler/arena sizing. `makeAgent` lets failure tests substitute a fault-injecting
 // NixlTransferAgent subclass.
 inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig const& cfg, std::size_t maxDescs,
-    std::function<std::unique_ptr<kvc::NixlTransferAgent>(kvc::BaseAgentConfig const&)> const& makeAgent = nullptr)
+    std::function<std::unique_ptr<kvc::NixlTransferAgent>(kvc::BaseAgentConfig const&)> const& makeAgent = nullptr,
+    std::unique_ptr<b::ZmqControlChannel> channel = nullptr)
 {
     auto n = std::make_unique<Node>();
     n->name = name;
@@ -229,7 +230,7 @@ inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig c
     {
         return nullptr;
     }
-    n->ch = std::make_unique<b::ZmqControlChannel>(name);
+    n->ch = channel ? std::move(channel) : std::make_unique<b::ZmqControlChannel>(name);
     n->tx
         = std::make_unique<b::BounceTransport>(n->name, cfg, 0, n->ch.get(), *n->agent, n->arena.get(), n->exec.get());
     return n;
