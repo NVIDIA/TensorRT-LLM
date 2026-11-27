@@ -564,8 +564,11 @@ with the native `AttentionOp` input requirements.
 ##### 3.2.2.1 Selection order (`TLLM_FMHA_LIBS`)
 
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
-it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
-defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
+it may add host overhead, except for MLA generation on SM107. On SM100 and
+SM103, MLA generation is opt-in too: its decode kernels compile at startup for
+each new configuration, which takes minutes on a cold cache. Use
+`TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
+`TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
 block-sparse PrimTS remains enabled by default because a dense fallback cannot
 preserve its routing semantics. The PrimTS sparse MLA library
 (`prims_ts_sparse_mla`) is also enabled by default: it serves only DeepSeek-V4

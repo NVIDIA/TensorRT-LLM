@@ -149,6 +149,7 @@ l0_b200:
   - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
   - unittest/_torch/kv_cache_compression
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
+  - unittest/disaggregated/test_nixl_vmm_preflight.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
   # Locality domains via mock localization: per-domain KV pools on one GPU.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_locality_domains
@@ -429,10 +430,9 @@ l0_b200:
   - unittest/_torch/modeling/test_musespark_open_moe_finalize.py
   - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
   - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
-  - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
+  # The single-GPU layer-wise benchmark cases in one entry, so they share one inner pytest
+  # session and its nsys capability check instead of paying for both per case.
+  - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1] unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1] unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1] unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests -k "not RemoteInPlaceOfDisk"
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
@@ -485,6 +485,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
+  - unittest/_torch/visual_gen/test_attention_deco.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_attention.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_kernels.py

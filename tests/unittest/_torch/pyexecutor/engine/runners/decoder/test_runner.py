@@ -360,7 +360,11 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
         )
         prepared_inputs = engine._inputs.prepare_inputs.return_value.kwargs
         runner.replay.assert_called_once_with(
-            key, prepared_inputs, position_id_offsets=None, static_inputs_staged=0
+            key,
+            prepared_inputs,
+            position_id_offsets=None,
+            static_inputs_staged=0,
+            pre_replay_staged=False,
         )
 
     def test_zero_runtime_draft_speculation_graph_miss_is_semantic_eager(self) -> None:
