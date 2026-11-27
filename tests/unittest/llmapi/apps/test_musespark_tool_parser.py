@@ -692,12 +692,10 @@ def _stream_through_reasoning_parser(tool_parser, tools, text, chunk=4):
     rp = MuseSparkReasoningParser()
     results = []
     for pos in range(0, len(text), chunk):
-        content = rp.parse_delta(text[pos : pos + chunk]).content
-        if content:
-            results.append(tool_parser.parse_streaming_increment(content, tools))
-    content = rp.finish().content
-    if content:
+        content = rp.parse_delta(text[pos : pos + chunk]).content or ""
         results.append(tool_parser.parse_streaming_increment(content, tools))
+    content = rp.finish().content or ""
+    results.append(tool_parser.parse_streaming_increment(content, tools))
     results.append(tool_parser.finish(tools))
     normal = "".join(r.normal_text for r in results)
     return normal, [c.name for r in results for c in r.calls if c.name]
@@ -721,7 +719,41 @@ _WHITESPACE_RUN_STREAMS = {
         lambda run: f"Checking.{run}",
         ["get_weather"],
     ),
+    "commentary_before_reasoning": (
+        lambda run: f" to=commentary{MS_M}set to=x{run}{MS_EOM}"
+        f"{MS_S}assistant to=self{MS_M}{'a' * len(run)}{MS_EOM}"
+        f"{MS_S}assistant to=user{MS_M}done.{MS_EOT}",
+        lambda run: f"set to=x{run}done.",
+        [],
+    ),
 }
+
+
+@pytest.mark.parametrize(
+    ("deltas", "expected"),
+    [
+        (["t\n", "\n", "x"], ["", "t", "\n\nx", ""]),
+        ([" to\n", " ", "x"], ["", " to", "\n x", ""]),
+        ([" to=\n", " ", "x"], ["", " to=", "\n x", ""]),
+    ],
+    ids=["single_char_newline", "to_newline", "to_eq_newline"],
+)
+def test_musespark_single_newline_prefix_releases_on_next_whitespace_delta(
+    musespark_sample_tools, deltas, expected
+):
+    r"""A held buffer ending in a single newline after non-whitespace must not bypass scanning.
+
+    `$` in `_HEADER_PREFIX_RE` matches before a final `\n`, so `t\n` is held while
+    `t\n\n` releases `t` immediately on the second whitespace delta rather than
+    waiting for the next non-whitespace delta or `finish()`.
+    """
+    parser = MuseSparkToolParser()
+    emissions = [
+        parser.parse_streaming_increment(delta, musespark_sample_tools).normal_text
+        for delta in deltas
+    ]
+    emissions.append(parser.finish(musespark_sample_tools).normal_text)
+    assert emissions == expected
 
 
 @pytest.mark.parametrize("run_char", [" ", "\n"], ids=["spaces", "newlines"])

@@ -372,6 +372,8 @@ class MuseSparkToolParser(BaseToolParser):
 
     # ------------------------------------------------------------- streaming
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        if not new_text:
+            return StreamingParseResult()
         if self._holds_whitespace_run and new_text.isspace():
             # Outside tool and reasoning blocks, a held buffer that ends in
             # whitespace is all whitespace, ` to=NAME` and whitespace, or a
