@@ -7803,6 +7803,13 @@
           "default": null,
           "description": "The context chunking policy to use"
         },
+        "context_demote_probe": {
+          "default": false,
+          "description": "With long-prefill demotion on (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0, chunked prefill, KV cache manager V2): a context request that has no router estimate of its uncached prefill, as on a worker without the attention-DP conversation router, is measured by the scheduler's reuse probe, once while it waits, and demoted when more than the threshold is uncached. Off: such a request is never demoted. Changes the context order only.",
+          "status": "prototype",
+          "title": "Context Demote Probe",
+          "type": "boolean"
+        },
         "context_scheduling_policy": {
           "$ref": "#/$defs/ContextSchedulingPolicy",
           "default": "fcfs",

@@ -6261,6 +6261,116 @@ class TestLongContextDemotion:
             assert ids(out.recompute_paused_requests) == [long_id]
 
 
+class TestLongContextDemotionProbe:
+    """scheduler_config.context_demote_probe: a request without a router
+    estimate is measured by the scheduler's reuse probe, once while it waits,
+    instead of never being demoted."""
+
+    def _make(self, probe=True, reused=None, prepared_remaining=None, **demote):
+        """`reused`: probe result per request id. `prepared_remaining`: the exact
+        remainder prepare_context leaves per request id (its claimed reuse)."""
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_block_reuse=True)
+        reused = reused or {}
+        prepared_remaining = prepared_remaining or {}
+
+        def prepare(req, reuse_limit=None):
+            if req.py_request_id in prepared_remaining:
+                req.context_remaining_length = prepared_remaining[req.py_request_id]
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.probe_context_reuse.side_effect = lambda req: reused.get(req.py_request_id)
+        demote.setdefault("context_demote_uncached_tokens", 1024)
+        demote.setdefault("context_demote_max_iters", 0)
+        with patch.dict("os.environ", {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "0"}):
+            sched = make_scheduler(
+                mgr,
+                max_num_tokens=1024,
+                ctx_chunk_config=(None, 64),
+                context_demote_probe=probe,
+                **demote,
+            )
+        return sched, mgr
+
+    def _req(self, request_id, remaining, kv_start=0):
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, is_first_context_chunk=kv_start == 0
+        )
+        req.context_current_position = kv_start
+        req.py_uncached_prefill_tokens = None  # no conversation router
+        return req
+
+    def _probes_of(self, mgr, request_id):
+        return [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list].count(
+            request_id
+        )
+
+    def test_off_by_default_and_without_demotion(self):
+        for kwargs in ({"probe": False}, {"context_demote_uncached_tokens": 0}):
+            sched, mgr = self._make(reused={1: 9_800}, **kwargs)
+            long_req, forked = self._req(0, 10_000), self._req(1, 10_000)
+            out = sched.schedule_request([long_req, forked], set())
+            assert ids(out.context_requests) == [0]
+            mgr.probe_context_reuse.assert_not_called()
+            assert not sched._ctx_demote_probe
+
+    def test_probe_demotes_a_request_without_an_estimate(self):
+        """Neither request has an estimate; the probe finds 9800 of the second's
+        10000 tokens cached, so the first one goes behind it."""
+        sched, mgr = self._make(reused={0: 0, 1: 9_800}, prepared_remaining={1: 200})
+        long_req, forked = self._req(0, 10_000), self._req(1, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert forked.context_chunk_size == 200
+        assert long_req.context_chunk_size == 768  # leftover 824, rounded to the chunk unit
+        # The probe sets no router estimate.
+        assert long_req.py_uncached_prefill_tokens is None
+
+    def test_one_probe_per_waiting_request_bounded_by_max_iters(self):
+        """Behind short requests that fill the budget, a long request without an
+        estimate is demoted context_demote_max_iters iterations, then let
+        through, and is probed once in all."""
+        sched, mgr = self._make(reused={0: 0}, context_demote_max_iters=2)
+        long_req = self._req(0, 10_000)
+        for iteration in range(1, 4):
+            short = self._req(100 + iteration, 1024)  # at the threshold: short
+            out = sched.schedule_request([long_req, short], set())
+            assert ids(out.context_requests) == ([0] if iteration == 3 else [100 + iteration])
+        assert long_req.context_chunk_size == 1024
+        assert self._probes_of(mgr, 0) == 1
+        assert 0 in sched._ctx_demote_released
+        # A request that leaves the active list leaves no probe behind.
+        sched.schedule_request([], set())
+        assert sched._ctx_demote_probes == {}
+
+    def test_started_prefill_is_judged_by_its_exact_remainder(self):
+        sched, mgr = self._make()
+        tail, short = self._req(0, 512, kv_start=9_600), self._req(1, 256)
+        out = sched.schedule_request([tail, short], set())
+        assert ids(out.context_requests) == [0, 1]
+        still_long = self._req(2, 5_000, kv_start=5_000)
+        out = sched.schedule_request([still_long, short], set())
+        assert ids(out.context_requests) == [1, 2]
+        assert self._probes_of(mgr, 0) == self._probes_of(mgr, 2) == 0
+
+    def test_waiting_request_is_probed_again(self):
+        """A request waiting for a prefix another request prefills is probed
+        again once it stops waiting: its first probe predates that prefix."""
+        reused = {1: 0}
+        sched, mgr = self._make(reused=reused, prepared_remaining={1: 200})
+        waits = {1: None}
+        sched._prefix_wait_planner = Mock()
+        sched._prefix_wait_planner.plan.side_effect = lambda reqs: dict(waits)
+        waiting = self._req(1, 10_000)
+        assert ids(sched.schedule_request([waiting], set()).context_requests) == []
+        reused[1] = 9_800
+        waits.clear()
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == [1]
+        assert waiting.context_chunk_size == 200
+        assert self._probes_of(mgr, 1) == 2
+
+
 # ===========================================================================
 # Shortest-uncached-first context order and its starvation limit
 # ===========================================================================

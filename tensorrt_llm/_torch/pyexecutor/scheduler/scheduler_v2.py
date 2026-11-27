@@ -223,6 +223,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         context_demote_uncached_tokens: Optional[int] = None,
         context_demote_max_iters: Optional[int] = None,
         exact_context_demotion: bool = False,
+        context_demote_probe: bool = False,
     ) -> None:
         """``recover_lost_kv_per_rank`` False is for ranks that schedule in lock step (TP without attention DP, CP,
         PP): a failed remote cache level then raises RemoteMemError out of ``schedule_request`` instead of re-matching,
@@ -381,6 +382,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # ordered as short whose first prepare shows a long remainder goes
         # behind the rest of the iteration.
         self._ctx_demote_exact = self._ctx_demote_uncached_tokens > 0 and exact_context_demotion
+        # Probe (scheduler_config.context_demote_probe): a request without an
+        # estimate (a worker without the conversation router) is measured by the
+        # scheduler's own reuse probe instead of never being demoted. A waiting
+        # request is probed once, and again only after a prefix wait; the
+        # result is kept, by request id, until it leaves the active list. A
+        # started prefill is judged by its exact remainder.
+        self._ctx_demote_probe = self._ctx_demote_uncached_tokens > 0 and context_demote_probe
+        self._ctx_demote_probes: dict[int, int] = {}
         # First-chunk requests ordered as short on the estimate alone this iteration.
         self._ctx_unverified_short: set[int] = set()
         if self._ctx_demote_uncached_tokens:
@@ -388,11 +397,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"KVCacheV2Scheduler: demoting context requests with more than "
                 f"{self._ctx_demote_uncached_tokens} uncached tokens left "
                 f"(max iterations demoted: {self._ctx_demote_max_iters or 'unbounded'}, "
-                f"exact: {self._ctx_demote_exact})"
+                f"exact: {self._ctx_demote_exact}, probe: {self._ctx_demote_probe})"
             )
         elif demote_uncached:
             logger.warning(
                 "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS needs chunked prefill; context demotion is off"
+            )
+        if context_demote_probe and not self._ctx_demote_probe:
+            logger.warning(
+                "scheduler_config.context_demote_probe is ignored: it needs long-prefill demotion "
+                "(TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0 and chunked prefill)"
             )
 
         # Shortest-uncached-first: context requests with the fewest uncached prompt
@@ -1065,6 +1079,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             for req in pending_ctx + starved_ctx:
                 if req.py_request_id in prefix_waits:
                     req.py_uncached_prefill_probed = False
+        if self._ctx_demote_probe and prefix_waits:
+            for rid in prefix_waits:
+                self._ctx_demote_probes.pop(rid, None)
         # Starved requests are scheduled after the others, but their first shares
         # and request slots are held back while the others fill the budget.
         starved_shares = self._starved_ctx_shares(starved_ctx, budget)
@@ -1251,6 +1268,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._ctx_demote_released.intersection_update(
                 req.py_request_id for req in active_requests
             )
+            if self._ctx_demote_probes:
+                live = {req.py_request_id for req in active_requests}
+                for rid in [rid for rid in self._ctx_demote_probes if rid not in live]:
+                    del self._ctx_demote_probes[rid]
 
         # Phase and frozen-membership deferrals are not KV capacity stalls.
         self._detect_deadlock(
@@ -1281,15 +1302,23 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _is_long_context(self, req: LlmRequest) -> bool:
         """Whether the router's uncached-prefill estimate exceeds the threshold
         and, once mid-prefill, more than the threshold is actually left. A
-        request without an estimate is never long. No radix probe here unless
-        exact demotion is on (then at most one per request): it would walk the
-        whole prompt for every request on every iteration."""
+        request without an estimate is never long unless the demotion probe is
+        on. No radix probe here unless exact demotion or the probe is on (then
+        at most one per request while it waits): it would walk the whole prompt
+        for every request on every iteration."""
         if req.state_value == self._encoder_init_state_value:
             return False
         estimate = req.py_uncached_prefill_tokens
-        if estimate is None:
-            return False
         threshold = self._ctx_demote_uncached_tokens
+        if estimate is None:
+            if not self._ctx_demote_probe:
+                return False
+            if self._started_context(req):
+                return req.context_remaining_length > threshold
+            rid = req.py_request_id
+            if rid not in self._ctx_demote_probes:
+                self._ctx_demote_probes[rid] = self._uncached_tokens(req)
+            return self._ctx_demote_probes[rid] > threshold
         if self._ctx_demote_exact:
             if req.context_current_position > 0 or self._holds_context_cache(req):
                 return req.context_remaining_length > threshold
@@ -1359,6 +1388,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req
                 for req in keep
                 if req.py_uncached_prefill_tokens is None
+                and req.py_request_id not in self._ctx_demote_probes
                 and arrival[req.py_request_id] > first
                 and not self._started_context(req)
             ]

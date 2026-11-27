@@ -5805,6 +5805,11 @@ def create_py_executor_resources(
         logger.warning(
             "scheduler_config.max_gen_init_admissions_per_pass is ignored: it "
             "needs the KV cache manager V2 scheduler")
+    if (not isinstance(kv_cache_manager, KVCacheManagerV2)
+            and scheduler_config is not None
+            and scheduler_config.context_demote_probe):
+        logger.warning("scheduler_config.context_demote_probe is ignored: it "
+                       "needs the KV cache manager V2 scheduler")
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -5845,6 +5850,8 @@ def create_py_executor_resources(
                 if scheduler_config is not None else None),
             exact_context_demotion=runtime_hooks_of(
                 model_engine.model).exact_context_demotion,
+            context_demote_probe=(scheduler_config.context_demote_probe
+                                  if scheduler_config is not None else False),
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

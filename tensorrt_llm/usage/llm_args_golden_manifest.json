@@ -1715,6 +1715,11 @@
       "path": "scheduler_config.context_chunking_policy"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.context_demote_probe"
+    },
+    {
       "allowed_values": [
         "fcfs",
         "shortest_uncached_first"

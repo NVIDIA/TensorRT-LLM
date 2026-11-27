@@ -5725,6 +5725,18 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "disables it."),
         status="prototype")
 
+    context_demote_probe: bool = Field(
+        default=False,
+        description=(
+            "With long-prefill demotion on (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS "
+            "> 0, chunked prefill, KV cache manager V2): a context request "
+            "that has no router estimate of its uncached prefill, as on a "
+            "worker without the attention-DP conversation router, is measured "
+            "by the scheduler's reuse probe, once while it waits, and demoted "
+            "when more than the threshold is uncached. Off: such a request is "
+            "never demoted. Changes the context order only."),
+        status="prototype")
+
     @model_validator(mode="after")
     def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
         if (self.waiting_queue_max_wait_s is not None
