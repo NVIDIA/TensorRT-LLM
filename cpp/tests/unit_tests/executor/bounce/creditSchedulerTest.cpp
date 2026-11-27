@@ -669,12 +669,14 @@ TEST(CreditScheduler, ForgetReleasesQueuedOrphansOnlyToSurvivingFlows)
     EXPECT_TRUE(scheduler.onWant("other/pending", want(2)).empty());
 
     ASSERT_TRUE(scatters.finish(queued));
-    deferred.clear();
-    auto released
-        = scheduler.reclaimByPrefix("gone/", scatters.offsets(), deferred, std::chrono::seconds(30), {queued});
-    ASSERT_EQ(released.size(), 1U);
-    EXPECT_EQ(released.front().flow, "other/pending");
-    EXPECT_EQ(released.front().offset, queued);
+    std::vector<std::vector<b::Grant>> batches;
+    scatters.forgetPeer(scheduler, "gone/", std::chrono::seconds(30), {queued},
+        [&](auto grants) { batches.push_back(std::move(grants)); });
+    ASSERT_EQ(batches.size(), 2U);
+    EXPECT_TRUE(batches[0].empty());
+    ASSERT_EQ(batches[1].size(), 1U);
+    EXPECT_EQ(batches[1].front().flow, "other/pending");
+    EXPECT_EQ(batches[1].front().offset, queued);
     EXPECT_EQ(scheduler.heldCount("gone/pending"), 0U);
     EXPECT_EQ(freeRegions(scheduler), 0U);
     ASSERT_TRUE(scatters.finish(running));

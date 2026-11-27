@@ -437,19 +437,8 @@ void BounceReceiver::forget(std::string const& peer)
         }
         mJobs.swap(keep);
     }
-    // (2) Regions of this peer still scattering are reads already RUNNING in a worker — they must not
-    //     be re-granted until the worker finishes. reclaimByPrefix defers those; we flag them orphaned
-    //     in mScattering so drainScatterDone frees them via freeOrphanRegion on completion.
-    // (3) Every OTHER held region may STILL be RDMA-written by the peer: forget() is
-    //     receiver-initiated (invalidateRemoteAgent), so — unlike an explicit cancel — no
-    //     sender-side drain guarantees those writes ended, and a one-sided write cannot be aborted.
-    //     quarantineFor > 0 keeps them out of the arena until checkTimeouts()'s reapQuarantine.
-    reclaimAndFlagDeferred(
-        [&](auto const& busy, auto& deferred)
-        {
-            return mCtx.scheduler.reclaimByPrefix(peer + kSep, busy, deferred,
-                std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)), orphanedOffsets);
-        });
+    mScattering.forgetPeer(mCtx.scheduler, peer + kSep, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)),
+        orphanedOffsets, [&](auto const& grants) { mCtx.sendGrants(grants); });
 }
 
 void BounceReceiver::checkTimeouts()

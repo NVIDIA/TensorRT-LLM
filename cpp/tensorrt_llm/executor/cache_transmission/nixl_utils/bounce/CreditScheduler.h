@@ -108,8 +108,7 @@ public:
     /// reapQuarantine() frees it once the deadline passes) instead of freed immediately.
     [[nodiscard]] std::vector<Grant> reclaimByPrefix(std::string const& prefix,
         std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut,
-        std::chrono::milliseconds quarantineFor = std::chrono::milliseconds{0},
-        std::vector<std::uint64_t> const& queuedOrphans = {});
+        std::chrono::milliseconds quarantineFor = std::chrono::milliseconds{0});
 
     /// Free a region deferred by reclaimByPrefix (its in-flight scatter has finished) + re-schedule.
     [[nodiscard]] std::vector<Grant> freeOrphanRegion(std::uint64_t offset);
@@ -219,7 +218,6 @@ private:
         std::chrono::steady_clock::time_point lastProgress;
     };
 
-    void releaseOrphan(std::uint64_t offset);
     std::vector<Grant> schedule(); // grant while the arena has room and eligible flows exist
     std::vector<Grant> updateWant(std::string const& flow, std::vector<std::uint32_t> const& chunkBytes);
     // Book one issued grant (shared by schedule()'s drain branch and round-robin sweep): pop the
@@ -298,6 +296,21 @@ public:
     [[nodiscard]] bool begin(CreditScheduler const& scheduler, std::string const& flow, std::uint64_t offset);
     [[nodiscard]] std::unordered_set<std::uint64_t> offsets() const;
     void markOrphaned(std::vector<std::uint64_t> const& deferred);
+
+    /// Remove the peer's pending flows before releasing its queued orphans. Running jobs retain their regions.
+    template <class SendGrants>
+    void forgetPeer(CreditScheduler& scheduler, std::string const& prefix, std::chrono::milliseconds quarantine,
+        std::vector<std::uint64_t> const& queuedOrphans, SendGrants send)
+    {
+        std::vector<std::uint64_t> deferred;
+        send(scheduler.reclaimByPrefix(prefix, offsets(), deferred, quarantine));
+        markOrphaned(deferred);
+        for (auto offset : queuedOrphans)
+        {
+            send(scheduler.freeOrphanRegion(offset));
+        }
+    }
+
     /// Drop the job and report whether its flow has already been reclaimed.
     [[nodiscard]] bool finish(std::uint64_t offset);
 

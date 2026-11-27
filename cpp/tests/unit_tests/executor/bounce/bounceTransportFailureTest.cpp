@@ -154,9 +154,9 @@ void capRegions(b::BounceConfig& c, std::uint32_t regionCap)
 
 // makeNode with a FakeXferAgent wired to `ctl`.
 std::unique_ptr<bounce_test::Node> makeFakeNode(
-    std::string const& name, b::BounceConfig const& c, std::shared_ptr<XferControls> ctl)
+    std::string const& name, b::BounceConfig const& c, std::shared_ptr<XferControls> ctl, std::size_t maxDescs = 1024)
 {
-    return bounce_test::makeNode(name, c, 1024,
+    return bounce_test::makeNode(name, c, maxDescs,
         [&ctl](kvc::BaseAgentConfig const& agentConfig) { return std::make_unique<FakeXferAgent>(agentConfig, ctl); });
 }
 
@@ -236,7 +236,9 @@ TEST_P(BounceCapacityFailure, ResolvesAndReleasesTheRegionForTheNextRequest)
     bool const senderLimited = GetParam();
     auto config = cfg(senderLimited ? 1000 : 20000);
     capRegions(config, 1);
-    auto sender = bounce_test::makeNode("capacitySender", config, senderLimited ? 1 : 8);
+    auto controls = std::make_shared<XferControls>();
+    controls->useNixl.store(true, std::memory_order_release);
+    auto sender = makeFakeNode("capacitySender", config, controls, senderLimited ? 1 : 8);
     auto receiver = bounce_test::makeNode("capacityReceiver", config, senderLimited ? 8 : 1);
     if (!sender || !receiver)
     {
@@ -253,6 +255,7 @@ TEST_P(BounceCapacityFailure, ResolvesAndReleasesTheRegionForTheNextRequest)
     EXPECT_EQ(refused.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(
         refused.get().reason, senderLimited ? b::BounceFailReason::kProtocolError : b::BounceFailReason::kPeerNack);
+    EXPECT_EQ(controls->postCount.load(), senderLimited ? 0U : 1U);
     if (!senderLimited)
     {
         EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(config.requestTimeoutMs / 2));

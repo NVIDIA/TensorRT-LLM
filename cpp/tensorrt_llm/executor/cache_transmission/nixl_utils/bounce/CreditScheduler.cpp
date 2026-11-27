@@ -375,7 +375,7 @@ void CreditScheduler::dropFlow(std::string const& flow, std::unordered_set<std::
 
 std::vector<Grant> CreditScheduler::reclaimByPrefix(std::string const& prefix,
     std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut,
-    std::chrono::milliseconds quarantineFor, std::vector<std::uint64_t> const& queuedOrphans)
+    std::chrono::milliseconds quarantineFor)
 {
     // Guard the degenerate empty prefix: compare(0,0,"")==0 for EVERY key, so it would reclaim all
     // flows of all peers. Callers always pass a real "peer<sep>" prefix; refuse empty defensively.
@@ -395,10 +395,6 @@ std::vector<Grant> CreditScheduler::reclaimByPrefix(std::string const& prefix,
     for (auto const& key : victims)
     {
         dropFlow(key, busy, deferredOut, quarantineFor);
-    }
-    for (auto offset : queuedOrphans)
-    {
-        releaseOrphan(offset);
     }
     return schedule();
 }
@@ -469,18 +465,16 @@ bool CreditScheduler::heldByFlow(std::string const& flow, std::uint64_t offset) 
     return it != mFlows.end() && it->second.held.count(offset) > 0;
 }
 
-void CreditScheduler::releaseOrphan(std::uint64_t offset)
+std::vector<Grant> CreditScheduler::freeOrphanRegion(std::uint64_t offset)
 {
+    std::lock_guard<std::mutex> lk(mMu);
+    // Only free a region we actually deferred as an orphan. Guards against a stray/duplicate call
+    // freeing an offset that may since have been re-allocated to a live flow (defense in depth; the
+    // transport already gates on its own mScattering orphaned-flag map).
     if (mOrphans.erase(offset) > 0)
     {
         mArena.free(offset);
     }
-}
-
-std::vector<Grant> CreditScheduler::freeOrphanRegion(std::uint64_t offset)
-{
-    std::lock_guard<std::mutex> lk(mMu);
-    releaseOrphan(offset);
     return schedule();
 }
 
