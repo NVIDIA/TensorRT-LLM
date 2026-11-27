@@ -19,6 +19,8 @@ _PREFILL_GROUP_SIZE = 4
 # composition of a chunk does not create a plan (the wrapper requires
 # routes <= rows, so chunks shorter than the bucket plan per row count).
 _PREFILL_ROUTE_BUCKET = 256
+# Retain recent host layouts across chunks and layers.
+_PREFILL_ROUTE_CACHE_SIZE = 256
 # The wrapper re-prepares its launch, with a host readback of the route
 # offsets, whenever the q/out shape changes. Full chunks share one shape;
 # tail chunks are padded to this many rows so each padded shape keeps its
@@ -38,7 +40,6 @@ _KV_BLOCK_SIZE = 4
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_KV_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-_FP8_MAX = 448.0
 # Positional arguments the vendored metadata plan passes to run_fixed. A
 # flashinfer wheel whose metadata csrc is older or newer than the vendored
 # tree fails the TVM-FFI arity check at the first run instead of launching.
@@ -240,17 +241,22 @@ class _PrimsTSSparseCore:
     def __init__(self) -> None:
         self._plans: dict[tuple, _Plan] = {}
         self._workspace: torch.Tensor | None = None
-        # Graphs captured before a growth keep the old buffer's address.
+        # Graphs captured before a growth keep the old buffer's address and
+        # read device tensors their plans own besides it, such as the query
+        # offsets of a decode plan, so a growth retires both.
         self._retired_workspaces: list[torch.Tensor] = []
+        self._retired_plans: list[_Plan] = []
         self._qo_indptr: dict[tuple, torch.Tensor] = {}
         self._qo_indptr_key: tuple | None = None
         self._qo_indptr_buffer_key: tuple | None = None
+        self._host_route_offsets: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
         self._lock = threading.Lock()
 
     def _workspace_for(self, nbytes: int, device: torch.device) -> torch.Tensor:
         ws = self._workspace
         if ws is None or ws.device != device or ws.numel() < nbytes:
             # Plans bind typed views into the workspace; growth invalidates them.
+            self._retired_plans.extend(self._plans.values())
             self._plans.clear()
             if ws is not None:
                 self._retired_workspaces.append(ws)
@@ -273,14 +279,21 @@ class _PrimsTSSparseCore:
         layout = (device.index, rows, request_boundaries)
         if layout == self._qo_indptr_key:
             return self._qo_indptr[self._qo_indptr_buffer_key]
-        host = make_qo_indptr(
-            torch.tensor(request_boundaries, dtype=torch.int32),
-            rows,
-            group_size=_PREFILL_GROUP_SIZE,
-            device="cpu",
-        )
-        routes = min(rows, -(-(host.numel() - 1) // _PREFILL_ROUTE_BUCKET) * _PREFILL_ROUTE_BUCKET)
-        host = torch.cat([host, host[-1:].expand(routes + 1 - host.numel())])
+        host_key = (rows, request_boundaries)
+        host = self._host_route_offsets.get(host_key)
+        if host is None:
+            host = make_qo_indptr(
+                torch.tensor(request_boundaries, dtype=torch.int32, device="cpu"),
+                rows,
+                group_size=_PREFILL_GROUP_SIZE,
+                device="cpu",
+            )
+            route_count = host.numel() - 1
+            routes = min(rows, -(-route_count // _PREFILL_ROUTE_BUCKET) * _PREFILL_ROUTE_BUCKET)
+            host = torch.cat([host, host[-1:].expand(routes - route_count)])
+            if len(self._host_route_offsets) == _PREFILL_ROUTE_CACHE_SIZE:
+                del self._host_route_offsets[next(iter(self._host_route_offsets))]
+            self._host_route_offsets[host_key] = host
         buffer_key = (device.index, host.numel())
         buffer = self._qo_indptr.get(buffer_key)
         if buffer is None:
@@ -323,7 +336,9 @@ class _PrimsTSSparseCore:
             # E4M3 range, and a per-call scale would need a host readback that
             # CUDA-graph capture forbids. This differs numerically from the
             # Triton path, which upcasts K/V.
-            q = q.clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+            from .kernels import triton_qsa_clamp_cast_fp8
+
+            q = triton_qsa_clamp_cast_fp8(q)
 
         q = q.contiguous()
         if is_decode:

@@ -18,6 +18,7 @@ _INTEGER_DTYPES = (torch.int32, torch.int64)
 _LOG2_E = tl.constexpr(1.4426950408889634)
 # Triton ranges are power-of-two sized; four lanes carry three position axes.
 _POSITION_AXIS_TILE = tl.constexpr(4)
+_FP8_E4M3_MAX = 448.0
 
 
 def _require_same_cuda_device(name: str, *tensors: torch.Tensor) -> None:
@@ -32,6 +33,49 @@ def _qsa_pdl_enabled(rows: int) -> bool:
     # PDL helps the two- and four-row speculative target graphs. Larger IFB
     # batches already expose enough split-K parallelism to hide the merge.
     return rows <= 4 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
+
+
+@triton.jit(do_not_specialize=["num_rows"])
+def _qsa_clamp_cast_fp8_kernel(
+    src,
+    dst,
+    num_rows,
+    src_row_stride: tl.constexpr,
+    width: tl.constexpr,
+    fp8_max: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)[:, None]
+    cols = tl.program_id(1) * BLOCK_COLS + tl.arange(0, BLOCK_COLS)[None, :]
+    valid = (rows < num_rows) & (cols < width)
+    offsets = rows.to(tl.int64) * src_row_stride + cols
+    values = tl.load(src + offsets, mask=valid, other=0).to(tl.float32)
+    values = tl.clamp(values, -fp8_max, fp8_max, propagate_nan=tl.PropagateNan.ALL)
+    tl.store(dst + rows.to(tl.int64) * width + cols, values.to(tl.float8e4nv), mask=valid)
+
+
+def triton_qsa_clamp_cast_fp8(q: torch.Tensor) -> torch.Tensor:
+    """Clamp `q[rows, heads, head_dim]` and return contiguous FP8 E4M3."""
+    if (
+        q.ndim != 3
+        or not q.is_cuda
+        or q.dtype not in (torch.bfloat16, torch.float16)
+        or q.stride(2) != 1
+        or q.stride(1) != q.shape[2]
+        or q.numel() == 0
+    ):
+        return q.clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn).contiguous()
+
+    rows, heads, head_dim = q.shape
+    width = heads * head_dim
+    out = torch.empty(q.shape, dtype=torch.float8_e4m3fn, device=q.device)
+    block_rows, block_cols = 8, 1024
+    grid = (triton.cdiv(rows, block_rows), triton.cdiv(width, block_cols))
+    _qsa_clamp_cast_fp8_kernel[grid](
+        q, out, rows, q.stride(0), width, _FP8_E4M3_MAX, block_rows, block_cols, num_warps=8
+    )
+    return out
 
 
 @triton.jit(do_not_specialize=["num_rows"])

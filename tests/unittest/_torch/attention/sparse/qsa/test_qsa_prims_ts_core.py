@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import itertools
 from types import SimpleNamespace
 from unittest import mock
@@ -9,6 +10,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import triton_qsa_clamp_cast_fp8
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import qsa_sparse_gqa_reference
 from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparseParams
 from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
@@ -251,7 +253,9 @@ def test_prefill_rows_share_plans_within_bucket() -> None:
     torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
 
 
-def test_route_offsets_follow_layout_changes_without_replanning() -> None:
+def test_route_offsets_follow_layout_changes_without_replanning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _requires_prims_ts()
     import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
 
@@ -262,6 +266,12 @@ def test_route_offsets_follow_layout_changes_without_replanning() -> None:
     layouts = ([36, 92], [64, 64], [36, 92])
     cases = [_make_case(lens, seed=40 + i) for i, lens in enumerate(layouts)]
     k_cache, v_cache, block_table = cases[0][1], cases[0][2], cases[0][3]
+    monkeypatch.setattr(prims_ts_core, "_CORE", prims_ts_core._PrimsTSSparseCore())
+    wrapper_cls, workspace_size, make_qo_indptr = prims_ts_core._prims_ts_api()
+    route_builder = mock.Mock(wraps=make_qo_indptr)
+    monkeypatch.setattr(
+        prims_ts_core, "_prims_ts_api", lambda: (wrapper_cls, workspace_size, route_builder)
+    )
 
     def run(case, lens):
         q, _, _, _, block_ids, request_indices, positions, _, _ = case
@@ -284,6 +294,7 @@ def test_route_offsets_follow_layout_changes_without_replanning() -> None:
         ).clone()
         for case in cases
     ]
+    assert route_builder.call_count == 2
     prepares = 0
     original = fi_metadata._prepare_q_token_kv_block_sparse_attention
 
@@ -303,8 +314,43 @@ def test_route_offsets_follow_layout_changes_without_replanning() -> None:
         fi_metadata._prepare_q_token_kv_block_sparse_attention = original
     torch.cuda.synchronize()
     assert prepares == 1
+    assert route_builder.call_count == 3
     for out, ref in zip(outputs, expected):
         assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_clamp_cast_fp8_matches_torch_for_packed_queries(dtype: torch.dtype) -> None:
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8 requires SM89 or newer")
+
+    qkv = torch.empty((9, 8, 256), dtype=dtype, device="cuda")
+    q = qkv[:, :6]
+    q.normal_(std=300)
+    q[0, 0, :12] = torch.tensor(
+        [
+            float("nan"),
+            float("inf"),
+            -float("inf"),
+            -512,
+            -448,
+            -0.0,
+            0,
+            2**-10,
+            2**-9,
+            1.0625,
+            448,
+            512,
+        ],
+        dtype=dtype,
+        device=q.device,
+    )
+    for query in (q, q.transpose(1, 2)):
+        expected = query.clamp(-448, 448).to(torch.float8_e4m3fn).contiguous()
+        actual = triton_qsa_clamp_cast_fp8(query)
+        assert actual.is_contiguous()
+        torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 def test_repeat_runs_skip_wrapper_validation() -> None:
@@ -535,6 +581,51 @@ def test_decode_graph_capture_replay(kv_dtype) -> None:
     )
     torch.cuda.synchronize()
     assert torch.equal(out, eager)
+
+
+def test_decode_graph_replay_survives_prefill_workspace_growth() -> None:
+    """A prefill that grows the shared workspace keeps captured decode plans alive.
+
+    Replay reads device tensors the decode plan owns besides its workspace,
+    such as its query offsets; were the plan dropped, later allocations would
+    reuse that storage under the graph.
+    """
+    _requires_prims_ts()
+    kwargs = dict(page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5)
+    small_prefill = _make_case([64, 64], seed=3)
+    large_prefill = _make_case([1024, 1021], seed=4)
+    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, _, _ = _make_case(
+        [4] * 8, seed=5
+    )
+    core = prims_ts_core._PrimsTSSparseCore()
+    with mock.patch.object(prims_ts_core, "_CORE", core):
+        _sparse_gqa(*small_prefill[:7], is_decode=False, **kwargs)
+        out = torch.empty_like(q)
+        _sparse_gqa(
+            q, k_cache, v_cache, block_table, block_ids, request_indices, positions,
+            out=out, is_decode=True, **kwargs,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        expected = out.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _sparse_gqa(
+                q, k_cache, v_cache, block_table, block_ids, request_indices, positions,
+                out=out, is_decode=True, **kwargs,
+            )  # fmt: skip
+        workspace = core._workspace
+        _sparse_gqa(*large_prefill[:7], is_decode=False, **kwargs)
+        assert core._workspace is not workspace, "the large prefill must grow the workspace"
+        gc.collect()
+        # Small allocations that would take over any storage the decode plan released.
+        filler = [
+            torch.full((64,), -(2**30), dtype=torch.int32, device=q.device) for _ in range(4096)
+        ]
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        del filler
+    assert torch.equal(out, expected)
 
 
 def test_decode_rows_get_exact_plans() -> None:
