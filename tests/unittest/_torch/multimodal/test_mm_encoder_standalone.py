@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 import numpy as np
 import pytest
@@ -30,12 +30,14 @@ from test_common.moe_tactics import fp8_block_scales_moe_config
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
+from tensorrt_llm._torch.models.modeling_qwen3vl import \
+    Qwen3VLInputProcessorBase
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import TextPrompt, default_multimodal_input_loader
 from tensorrt_llm.inputs.multimodal import apply_mm_hashes
 from tensorrt_llm.inputs.multimodal_data import VideoData
-from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
-                                 KvCacheConfig)
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CompletionOutput,
+                                 DisaggregatedParams, KvCacheConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
 test_data_root = Path(
@@ -1005,6 +1007,266 @@ def test_video_encoder_handoff_preserves_timestamps(llms_and_encoder,
                                 disaggregated_params=handoff).result()
     assert output.prompt_token_ids == reference.prompt_token_ids
     assert output.outputs[0].token_ids == reference.outputs[0].token_ids
+
+
+def _synthetic_videos(frame_counts: tuple[int, ...]) -> list[VideoData]:
+    """Red-then-blue clips sampled from a 240-frame, 24 fps source."""
+    videos = []
+    for count in frame_counts:
+        indices = np.linspace(0, 239, count).astype(int).tolist()
+        frames = []
+        for index in indices:
+            frame = np.zeros((224, 224, 3), dtype=np.uint8)
+            frame[:, :, 0 if index < 120 else 2] = 255
+            frames.append(frame)
+        videos.append(
+            VideoData(frames=frames,
+                      metadata={
+                          "fps": 24.0,
+                          "total_num_frames": 240,
+                          "duration": 10.0,
+                          "frames_indices": indices,
+                      }))
+    return videos
+
+
+def _video_inputs(llm: LLM, videos: list[VideoData]) -> dict:
+    """Chat prompt with one placeholder per video, plus the raw videos."""
+    # Older Qwen2.5-VL checkpoints ship a text-only tokenizer chat template;
+    # the processor loads the multimodal one from chat_template.json.
+    prompt = llm.input_processor.processor.apply_chat_template(
+        [{
+            "role":
+            "user",
+            "content": [
+                *({
+                    "type": "video"
+                } for _ in videos),
+                {
+                    "type": "text",
+                    "text": "Describe the events and their times in seconds."
+                },
+            ]
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return {
+        "prompt": prompt,
+        "multi_modal_data": {
+            "video": videos
+        },
+        "mm_processor_kwargs": {
+            "do_sample_frames": False
+        }
+    }
+
+
+def _external_video_inputs(llm: LLM, encoder: MultimodalEncoder,
+                           inputs: dict) -> dict:
+    """The same request with the encoder's video embeddings and metadata."""
+    videos = inputs["multi_modal_data"]["video"]
+    handles = encoder.generate_async(copy.deepcopy(
+        inputs)).result().disaggregated_params.multimodal_embedding_handles
+    embeddings = [
+        SharedTensorContainer.from_dict(handle).get_local_view().clone()
+        for handle in handles
+    ]
+    video_grid_thw, second_per_grid_ts = _raw_video_grids(llm, inputs)
+    assert len(embeddings) == len(videos) == video_grid_thw.shape[0]
+    is_qwen3 = isinstance(llm.input_processor, Qwen3VLInputProcessorBase)
+    items = []
+    for index, (video, embedding) in enumerate(zip(videos, embeddings)):
+        item = {
+            "mm_embeddings": embedding,
+            "video_grid_thw": video_grid_thw[index].tolist(),
+        }
+        if is_qwen3:
+            item["fps"] = video.metadata["fps"]
+            item["frames_indices"] = video.metadata["frames_indices"]
+        elif second_per_grid_ts is not None:
+            item["second_per_grid_ts"] = float(second_per_grid_ts[index])
+        items.append(item)
+    return {
+        "prompt": inputs["prompt"],
+        "multi_modal_embeddings": {
+            "video": items
+        }
+    }
+
+
+def _raw_video_grids(llm: LLM, inputs: dict) -> tuple[torch.Tensor, object]:
+    """Video grids and seconds per grid the raw-media path feeds MRoPE."""
+    processor = llm.input_processor
+    captured = {}
+    get_mrope_config = processor.get_mrope_config
+
+    def capture(input_ids: torch.Tensor,
+                image_grid_thw: Optional[torch.Tensor],
+                video_grid_thw: Optional[torch.Tensor],
+                attention_mask: Optional[torch.Tensor],
+                second_per_grid_ts: Optional[torch.Tensor] = None) -> dict:
+        captured.update(video_grid_thw=video_grid_thw,
+                        second_per_grid_ts=second_per_grid_ts)
+        return get_mrope_config(input_ids, image_grid_thw, video_grid_thw,
+                                attention_mask, second_per_grid_ts)
+
+    processor.get_mrope_config = capture
+    try:
+        processor(copy.deepcopy(inputs), SamplingParams())
+    finally:
+        del processor.get_mrope_config
+    return captured["video_grid_thw"], captured["second_per_grid_ts"]
+
+
+@pytest.mark.parametrize("model_dir", [
+    pytest.param(_QWEN_3_VL_DIR, id="qwen3_vl"),
+    pytest.param(_QWEN_2_5_VL_3B_DIR, id="qwen2_5_vl"),
+],
+                         indirect=True)
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.parametrize("frame_counts", [(8, ), (8, 12)])
+@pytest.mark.threadleak(enabled=False)
+def test_external_video_embeddings_match_raw_video(
+        llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
+        frame_counts: tuple[int, ...]) -> None:
+    """Precomputed video embeddings + metadata reproduce the raw-video request."""
+    (llm, _), encoder = llms_and_encoder
+    videos = _synthetic_videos(frame_counts)
+    inputs = _video_inputs(llm, videos)
+    sampling = SamplingParams(temperature=0, top_k=1, max_tokens=48)
+    reference = llm.generate_async(copy.deepcopy(inputs),
+                                   sampling_params=sampling).result()
+
+    output = llm.generate_async(_external_video_inputs(llm, encoder, inputs),
+                                sampling_params=sampling).result()
+    assert output.prompt_token_ids == reference.prompt_token_ids
+    assert output.outputs[0].token_ids == reference.outputs[0].token_ids
+
+
+def _greedy_tokens_before_first_tie(output: CompletionOutput,
+                                    min_margin: float = 0.25) -> list[int]:
+    """Greedy tokens generated before the first top-2 logprob near-tie."""
+    tokens = []
+    for token, candidates in zip(output.token_ids, output.logprobs):
+        best, runner_up = sorted((c.logprob for c in candidates.values()),
+                                 reverse=True)[:2]
+        if best - runner_up < min_margin:
+            break
+        tokens.append(token)
+    return tokens
+
+
+@pytest.fixture(scope="module")
+def chunked_reuse_llm(model_dir: Path) -> Generator[LLM, None, None]:
+    """Chunked prefill with small chunks and KV block reuse enabled."""
+    with LLM(
+            model=model_dir,
+            backend="pytorch",
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                          free_gpu_memory_fraction=0.2),
+            trust_remote_code=True,
+            max_batch_size=1,
+            enable_chunked_prefill=True,
+            max_num_tokens=64,
+            **_get_fake_checkpoint_kwargs(model_dir),
+    ) as llm:
+        yield llm
+
+
+@pytest.fixture(scope="module")
+def no_overlap_llm(model_dir: Path) -> Generator[LLM, None, None]:
+    """Block reuse on and the overlap scheduler off."""
+    with LLM(
+            model=model_dir,
+            backend="pytorch",
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                          free_gpu_memory_fraction=0.2),
+            trust_remote_code=True,
+            disable_overlap_scheduler=True,
+            **_get_fake_checkpoint_kwargs(model_dir),
+    ) as llm:
+        yield llm
+
+
+@pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
+                         indirect=True)
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_external_video_embeddings_without_overlap_scheduler(
+        llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
+        no_overlap_llm: LLM) -> None:
+    """Attached video matches raw video and replays from cache without overlap."""
+    (llm, _), encoder = llms_and_encoder
+    inputs = _video_inputs(llm, _synthetic_videos((8, 12)))
+    external = _external_video_inputs(llm, encoder, inputs)
+    sampling = SamplingParams(temperature=0, top_k=1, max_tokens=32, logprobs=2)
+
+    reference = no_overlap_llm.generate_async(
+        copy.deepcopy(inputs), sampling_params=sampling).result()
+    first = no_overlap_llm.generate_async(copy.deepcopy(external),
+                                          sampling_params=sampling).result()
+    replay = no_overlap_llm.generate_async(copy.deepcopy(external),
+                                           sampling_params=sampling).result()
+
+    assert first.prompt_token_ids == reference.prompt_token_ids
+    untied = _greedy_tokens_before_first_tie(reference.outputs[0])
+    assert len(untied) >= 4
+    assert first.outputs[0].token_ids[:len(untied)] == untied
+    # The replay reuses KV past the text before the video.
+    assert replay.cached_tokens > reference.prompt_token_ids.index(
+        no_overlap_llm.input_processor.config.video_token_id)
+    assert replay.outputs[0].token_ids[:len(untied)] == untied
+
+
+@pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
+                         indirect=True)
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_external_video_embeddings_chunked_prefill_and_reuse(
+        llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
+        chunked_reuse_llm: LLM) -> None:
+    """Chunked prefill and KV reuse key attached video by content.
+
+    Small chunks split frame groups; a replay reuses the cached prompt; a
+    different embedding with the identical prompt text reuses nothing past
+    the text before the video.
+    """
+    (llm, _), encoder = llms_and_encoder
+    videos = _synthetic_videos((8, ))
+    inputs = _video_inputs(llm, videos)
+    external = _external_video_inputs(llm, encoder, inputs)
+    sampling = SamplingParams(temperature=0, top_k=1, max_tokens=32, logprobs=2)
+
+    reference = chunked_reuse_llm.generate_async(
+        copy.deepcopy(inputs), sampling_params=sampling).result()
+    # 64-token chunks over a ~250-token prompt end inside frame groups.
+    assert len(reference.prompt_token_ids) > 2 * 64
+    first = chunked_reuse_llm.generate_async(copy.deepcopy(external),
+                                             sampling_params=sampling).result()
+    second = chunked_reuse_llm.generate_async(
+        copy.deepcopy(external), sampling_params=sampling).result()
+
+    assert first.prompt_token_ids == reference.prompt_token_ids
+    # The answer's timestamps include exact bf16 ties between digits, which
+    # either input may break differently; greedy tokens match up to the first.
+    untied = _greedy_tokens_before_first_tie(reference.outputs[0])
+    assert len(untied) >= 4
+    assert first.outputs[0].token_ids[:len(untied)] == untied
+    # KV before the first embedding slot does not depend on the video.
+    text_prefix = reference.prompt_token_ids.index(
+        llm.input_processor.config.video_token_id)
+    # The replay reuses KV past the text before the video.
+    assert second.cached_tokens > text_prefix
+    assert second.outputs[0].token_ids[:len(untied)] == untied
+    item = external["multi_modal_embeddings"]["video"][0]
+    changed_content = copy.deepcopy(external)
+    changed_content["multi_modal_embeddings"]["video"][0]["mm_embeddings"] = (
+        item["mm_embeddings"] * 1.01)
+    result = chunked_reuse_llm.generate_async(
+        changed_content, sampling_params=sampling).result()
+    assert result.prompt_token_ids == reference.prompt_token_ids
+    assert result.cached_tokens <= text_prefix
 
 
 @pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],

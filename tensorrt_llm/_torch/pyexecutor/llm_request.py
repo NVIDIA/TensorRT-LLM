@@ -1202,6 +1202,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             chunk_size=self.py_logits_chunk_size,
             additional_outputs=additional_outputs)
         self.child_requests = []
+        # Largest mRoPE delta as a host int, set at admission.
+        self.py_mrope_delta: Optional[int] = None
 
         self._validation_error = _validation_error
 

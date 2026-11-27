@@ -3,6 +3,7 @@
 
 import copy
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -964,7 +965,12 @@ def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
     }[model]
     config = SimpleNamespace(
         torch_dtype=torch.float32,
-        text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=100, dtype=torch.float32),
+        text_config=SimpleNamespace(
+            hidden_size=hidden_size,
+            vocab_size=100,
+            max_position_embeddings=128000,
+            dtype=torch.float32,
+        ),
         vision_config=vision_config,
         image_token_id=12,
         video_token_id=14,
@@ -973,6 +979,7 @@ def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
     )
     tokenizer = MagicMock()
     tokenizer.return_value.input_ids = [torch.tensor(prompt_ids)]
+    tokenizer.convert_tokens_to_ids = {"<|image_pad|>": 12, "<|video_pad|>": 14}.get
     with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor") as auto_processor:
         auto_processor.from_pretrained.return_value = MagicMock(mm_special_token_ids=None)
         processor = processor_cls("unused", config, tokenizer, trust_remote_code=True)
@@ -1133,10 +1140,17 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
     """Embeddings + image_grid_thw give the same ids and mRoPE as raw images."""
     from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
-    # One <vision_start> <image> <vision_end> per image.
-    processor, width = _make_qwen_vl_embedding_processor(
-        model, [7] + [11, 12, 13] * len(sizes) + [8]
-    )
+    processor, width = _make_qwen_vl_embedding_processor(model, [])
+    special_ids = {"<|vision_start|>": 11, "<|image_pad|>": 12, "<|vision_end|>": 13}
+
+    def tokenize(text: str, return_tensors: Optional[str] = None) -> SimpleNamespace:
+        # "Describe" -> 7, special tokens by id, "this image." -> 8.
+        pieces = re.findall(r"<\|[a-z_]+\|>|[^<]+", text)
+        ids = [special_ids.get(piece, 7 if piece == "Describe" else 8) for piece in pieces]
+        return SimpleNamespace(input_ids=torch.tensor([ids]))
+
+    processor.tokenizer.side_effect = tokenize
+    prompt = "Describe" + "<|vision_start|><|image_pad|><|vision_end|>" * len(sizes) + "this image."
     # The image processor settings of the Qwen2.5-VL and Qwen3-VL checkpoints.
     image_processor = Qwen2VLImageProcessor(
         patch_size=14 if model == "qwen2.5" else 16,
@@ -1166,7 +1180,7 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
 
     processor._preprocess = hf_processor_outputs
     ref_ids, ref = processor.call_with_text_prompt(
-        {"prompt": "Describe this image.", "multi_modal_data": {"image": images}},
+        {"prompt": prompt, "multi_modal_data": {"image": images}},
         SamplingParams(),
     )
 
@@ -1176,7 +1190,7 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
             for image_rows, grid in zip(rows, image_grids)
         ]
         return processor.attach_multimodal_embeddings(
-            {"prompt": "Describe this image."}, {"image": items}, SamplingParams()
+            {"prompt": prompt}, {"image": items}, SamplingParams()
         )
 
     ids, extra = attach(grids)
@@ -1204,24 +1218,32 @@ def test_qwen_vl_embeddings_without_image_grid_raise(model, as_dict):
     image = torch.zeros(6, width)
     if as_dict:
         image = {"mm_embeddings": image}
-    with pytest.raises(ValueError, match="has no image_grid_thw"):
+    with pytest.raises(ValueError, match="requires 'image_grid_thw'"):
         processor.attach_multimodal_embeddings(
-            {"prompt": "p"}, {"image": [image]}, SamplingParams()
+            {"prompt": "<|vision_start|><|image_pad|><|vision_end|>"},
+            {"image": [image]},
+            SamplingParams(),
         )
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "grid",
+    "grid, match",
     # The last two pass a row check alone: an image has t == 1, and
     # [1, 4.9, 6.9] truncated to integers is [1, 4, 6].
-    [[1, 6, 6], [1, 3, 8], [4, 6], [2, 2, 6], [1, 4.9, 6.9]],
+    [
+        ([1, 6, 6], "has 6 rows but its grid"),
+        ([1, 3, 8], "multiples of the spatial merge size"),
+        ([4, 6], "must have 3 entries"),
+        ([2, 2, 6], "t == 1"),
+        ([1, 4.9, 6.9], "must hold integers"),
+    ],
 )
-def test_qwen_vl_embeddings_with_wrong_image_grid_raise(grid):
+def test_qwen_vl_embeddings_with_wrong_image_grid_raise(grid: list, match: str) -> None:
     processor, width = _make_qwen_vl_embedding_processor("qwen3", [7, 12, 8])
-    with pytest.raises(ValueError, match="does not match image embedding 0"):
+    with pytest.raises(ValueError, match=match):
         processor.attach_multimodal_embeddings(
-            {"prompt": "p"},
+            {"prompt": "<|vision_start|><|image_pad|><|vision_end|>"},
             {"image": [{"mm_embeddings": torch.zeros(6, width), "image_grid_thw": grid}]},
             SamplingParams(),
         )
