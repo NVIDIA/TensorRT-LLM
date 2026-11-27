@@ -629,7 +629,7 @@ class PeerRegistrar:
         entries = pool_view.buffer_entries
         if len(entries) == 0:
             return 1
-        counts = Counter(int(e["local_layer_id"]) for e in entries)
+        counts = Counter(entries["local_layer_id"].tolist())
         distinct = set(counts.values())
         if len(distinct) != 1:
             raise ValueError(
