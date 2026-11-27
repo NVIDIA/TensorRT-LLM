@@ -23,7 +23,7 @@ worker_config:
   tensor_parallel_size: 4
   pipeline_parallel_size: 1
   moe_expert_parallel_size: 4
-  enable_attention_dp: false
+  enable_attention_dp: true
   attn_backend: TRTLLM
   moe_config:
     tactic: cutlass
