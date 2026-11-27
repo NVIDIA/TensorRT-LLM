@@ -10,7 +10,6 @@ hardware:
 
 # All timeouts are in seconds.
 timeouts:
-  test: 28800
   worker_startup: 7200
   frontend_startup: 300
   stress: 12600

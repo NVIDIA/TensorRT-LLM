@@ -54,6 +54,7 @@ __extra_import_path__ = [
 pytestmark = [skip_pre_blackwell, pytest.mark.threadleak(enabled=False)]
 
 CTX_PORT, GEN_PORT, FRONTEND_PORT, CONTROL_PORT = 8001, 8002, 8000, 8003
+TEST_TIMEOUT = 12600
 
 
 @dataclass(frozen=True)
@@ -99,15 +100,14 @@ class _StressConfig:
         return cls(**data)
 
 
-def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
-    if "stress_config" not in metafunc.fixturenames:
-        return
-    name = metafunc.function.__name__.removeprefix("test_")
-    config = _StressConfig.from_yaml(Path(__file__).parent / "configs" / f"{name}.yaml")
-    metafunc.parametrize(
-        "stress_config",
-        [pytest.param(config, id="yaml", marks=pytest.mark.timeout(config.timeouts["test"]))],
-    )
+def _load_stress_config(test_name: str) -> _StressConfig:
+    name = test_name.removeprefix("test_")
+    return _StressConfig.from_yaml(Path(__file__).parent / "configs" / f"{name}.yaml")
+
+
+@pytest.fixture
+def stress_config(request: pytest.FixtureRequest) -> _StressConfig:
+    return _load_stress_config(request.function.__name__)
 
 
 def _worker_config(config: _StressConfig, generation: bool) -> dict[str, object]:
@@ -330,6 +330,7 @@ def _run_stress_test(cluster: _Cluster) -> None:
     wait_for_signal(cluster.connection, b"P", timeouts["peer_completion"], cluster.check_local)
 
 
+@pytest.mark.timeout(TEST_TIMEOUT)
 def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
     """Gate cross-node KV-transfer stability under 8k/1k load and post-stress accuracy."""
     _run_stress_test(disagg_cluster)

@@ -9,7 +9,7 @@ defaults:
 
 tests:
   # Sustained cross-node KV transfer, followed by V4.1 GSM8K and DSpark acceptance checks.
-  - case: stress_test/disaggregated/test_multinode.py::test_deepseek_v41_flash_1p1d_tp4[yaml] TIMEOUT (480)
+  - case: stress_test/disaggregated/test_multinode.py::test_deepseek_v41_flash_1p1d_tp4
     launch:
       mode: per_node
       tasks_per_node: 1
