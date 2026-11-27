@@ -235,3 +235,71 @@ def test_draft_gate_view_through_the_dispatch():
     )
     flat = torch.as_strided(gate, (rows, _HQ, _D), (2 * _HQ * _D, _D, 1))
     assert not torch.equal(out, op.reference(**dict(args, output_gate=flat)))
+
+
+# ---- `TEP_TPSUM_LAMPORT_ENV`: the plain Lamport TP sum (CPU) ----
+
+
+@pytest.mark.cpu_only
+def test_tpsum_lamport_off_by_default(monkeypatch):
+    monkeypatch.delenv(M.TEP_TPSUM_LAMPORT_ENV, raising=False)
+    assert M._tep_tpsum_build(SimpleNamespace(tep_fast=True, one_rank=False), "cuda") is None
+
+
+@pytest.mark.cpu_only
+def test_tpsum_lamport_at_another_layout_warns(monkeypatch):
+    warned = []
+    monkeypatch.setenv(M.TEP_TPSUM_LAMPORT_ENV, "1")
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    core = SimpleNamespace(tep_fast=False, one_rank=False)
+    assert M._tep_tpsum_build(core, "cuda") is None
+    assert len(warned) == 1 and M.TEP_TPSUM_LAMPORT_ENV in warned[0]
+
+
+@pytest.mark.cpu_only
+def test_tpsum_lamport_op_routes_and_rotates_slots():
+    calls = []
+
+    class _Op:
+        takes = staticmethod(lambda x: x.dtype == torch.bfloat16 and x.shape[0] <= 32)
+
+        def __call__(self, x, slot):
+            calls.append(("lamport", slot))
+            return x
+
+    def stock(x):
+        calls.append(("stock", None))
+        return x
+
+    f = M._TepTpSumOp(_Op(), stock)
+    for rows in (4, 16, 33, 20, 1):
+        f(torch.zeros(rows, 2, dtype=torch.bfloat16))
+    f(torch.zeros(4, 2, dtype=torch.int32))
+    assert calls == [
+        ("lamport", 0),
+        ("lamport", 1),
+        ("stock", None),
+        ("lamport", 2),
+        ("lamport", 0),
+        ("stock", None),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_tpsum_lamport_bind_survives_a_rebuilt_stock_sum():
+    """`post_load_weights` rebuilds `tp_sum` / `expert_sum` at every pass: the built launch is
+    bound again over the new stock sum, and binding twice wraps once."""
+    rebuilt = []
+
+    def stock(x):
+        return x
+
+    core = SimpleNamespace(tp_sum=stock, _expert_sum_op=lambda: rebuilt.append(1) or "window")
+    M._tep_tpsum_bind(core, object())
+    assert isinstance(core.tp_sum, M._TepTpSumOp) and core.tp_sum.stock is stock
+    assert core.expert_sum == "window"
+    M._tep_tpsum_bind(core, object())
+    assert core.tp_sum.stock is stock and len(rebuilt) == 1
+    core.tp_sum = stock  # the next pass's stock sum
+    M._tep_tpsum_bind(core, object())
+    assert isinstance(core.tp_sum, M._TepTpSumOp) and len(rebuilt) == 2

@@ -529,6 +529,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.tep_finalize_allre
     build as tep_finar_build,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.tep_finalize_allreduce import (
+    build_tp_sum as tep_tp_sum_build,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.tep_finalize_allreduce import (
     tep_finalize_allreduce,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.flashinfer_gemma_rmsnorm import (
@@ -2135,6 +2138,7 @@ def _decode_forms(core) -> str:
             "proj split-k": getattr(core, "tep_proj", False),
             "attn inplace": getattr(core, "tep_attn_inplace", False),
             "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
+            "tp sum lamport": getattr(core, "_tep_tpsum", None) is not None,
         }
     return f"{head}: " + ", ".join(f"{k} {v}" for k, v in forms.items())
 
@@ -2780,6 +2784,12 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # Collective; once a load (the post-load walk reaches this hook again).
         if self._tep_finar is None and device.type == "cuda":
             self._tep_finar = _tep_finar_build(self, device)
+        # Collective where set; once a load. The walk above rebuilds `tp_sum` / `expert_sum` at
+        # every pass, so a later pass binds the built launch again.
+        if getattr(self, "_tep_tpsum", None) is None and device.type == "cuda":
+            self._tep_tpsum = _tep_tpsum_build(self, device)
+        elif getattr(self, "_tep_tpsum", None) is not None:
+            _tep_tpsum_bind(self, self._tep_tpsum)
         if device.type == "cuda" and not one_rank:
             logger.info(_decode_forms(self))
 
@@ -5325,6 +5335,108 @@ def _tep_finar_rows(core, device) -> tuple:
     return tuple(
         r for r in range(1, _TEP_FINAR.MAX_ROWS + 1) if int(total[r - 1]) == _TEP_FINAR.WORLD
     )
+
+
+#: Off by default (opt-in, bitwise). At a tep4 rank (`TEP_FAST_DECODE_ENV`) inside one NVLink
+#: domain, every attention-TP sum (`core.tp_sum`: the trunk attention / GDN output projections,
+#: the draft's, a MoE block's window sum where the fused finalize all-reduce does not serve it)
+#: of a bf16 `[1..32, 2560]` partial runs on the fused finalize all-reduce's transport without
+#: the finalize (`tep_finalize_allreduce.build_tp_sum`: one CuTe DSL launch, publish to the three
+#: peers' symmetric slots, read theirs, fp32 sum in rank order, one rounding; its dependents
+#: released right after its PDL wait) instead of the stock one-shot Lamport all-reduce. The sum is
+#: the stock op's bit for bit except a lane whose four partials are all -0.0 (+0.0 here, the
+#: transport's not-ready marker, as in the finalize launch), checked at build on every row count
+#: it serves (a failure on any rank raises on every rank). Why (a 4-rank trace, 1 request): after
+#: the last rank's producer ends, the stock launch needs 4.45 us (p50) and the finalize launch,
+#: its finalize included, 2.30. Other sums (wider, other dtypes, more rows) keep the stock op. The
+#: three slots rotate by call order. Read once, when the target is built; set at another layout
+#: it warns and does nothing.
+TEP_TPSUM_LAMPORT_ENV = "TRTLLM_QWEN4_EXP_TEP_TPSUM_LAMPORT"
+#: Row counts the build check compares against the stock sum.
+_TEP_TPSUM_CHECK_ROWS = (1, 4, 16, 20, 32)  # capacity: fixed: build-check coverage
+
+
+class _TepTpSumOp:
+    """`TEP_TPSUM_LAMPORT_ENV`'s `core.tp_sum`: the plain Lamport launch where it takes the
+    operand, else the stock sum; the slot is the call count mod 3 (host, baked into a capture)."""
+
+    def __init__(self, op, stock):
+        self.op, self.stock, self.calls = op, stock, 0
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.op.takes(x):
+            return self.stock(x)
+        slot = self.calls % _TEP_FINAR.SLOTS
+        self.calls += 1
+        return self.op(x, slot)
+
+
+def _tep_tpsum_bind(core, op) -> None:
+    """`core.tp_sum` on the plain launch `op` (over the stock sum the core holds now), and the
+    window sum rebuilt from it; a no-op when it is bound already."""
+    if isinstance(core.tp_sum, _TepTpSumOp):
+        return
+    core.tp_sum = _TepTpSumOp(op, core.tp_sum)
+    core.expert_sum = core._expert_sum_op()
+
+
+def _tep_tpsum_build(core, device):
+    """`TEP_TPSUM_LAMPORT_ENV` at build: None where it is off or cannot apply (one warning, on
+    every rank alike); else the plain launch over the 4-rank torch group, checked bit for bit
+    against the stock sum at `_TEP_TPSUM_CHECK_ROWS` on every rank, and `core.tp_sum` /
+    `core.expert_sum` rebound to it."""
+    if not _switch(TEP_TPSUM_LAMPORT_ENV):
+        return None
+    why = None
+    if not core.tep_fast or core.one_rank:
+        why = f"it needs a tep4 rank with {TEP_FAST_DECODE_ENV} on"
+    elif core.mapping.is_multi_node():
+        why = "the TP group spans nodes"
+    elif core.hidden != _TEP_FINAR.HIDDEN:
+        why = f"hidden {core.hidden}"
+    if why is not None:
+        logger.warning(f"{TEP_TPSUM_LAMPORT_ENV} is set but ignored: {why}")
+        return None
+    import torch.distributed as dist
+
+    from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
+
+    rank = core.mapping.tp_rank
+    ensure_cutedsl_torch_distributed(_TEP_FINAR.WORLD)
+    if not dist.is_initialized() or dist.get_world_size() != _TEP_FINAR.WORLD:
+        raise RuntimeError(f"{TEP_TPSUM_LAMPORT_ENV} found no {_TEP_FINAR.WORLD}-rank torch group")
+    if dist.get_rank() != rank:
+        raise RuntimeError(f"{TEP_TPSUM_LAMPORT_ENV}: the torch WORLD rank order differs from TP's")
+    stock = core.tp_sum
+    with torch.cuda.device(device):
+        op = tep_tp_sum_build(rank, get_env_enable_pdl(), early=True)
+        gen = torch.Generator(device=device).manual_seed(4242 + rank)
+        diffs = []
+        for i, rows in enumerate(_TEP_TPSUM_CHECK_ROWS):
+            x = torch.randn(rows, core.hidden, generator=gen, device=device).to(torch.bfloat16)
+            # -0.0 lanes on this rank only: where every rank's partial of a lane is -0.0 the
+            # stock sum keeps -0.0 and the launch +0.0 (its not-ready marker), as the finalize
+            # launch's sum does.
+            x[:, rank::37] = -0.0
+            got = op(x, i % _TEP_FINAR.SLOTS)
+            want = stock(x)
+            diffs.append(int((got.view(torch.int16) != want.view(torch.int16)).sum()))
+        ok = torch.tensor([int(not any(diffs))], dtype=torch.int32, device=device)
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+    if not int(ok.item()):
+        raise RuntimeError(
+            f"{TEP_TPSUM_LAMPORT_ENV}: the plain Lamport sum differs from the stock sum on a rank "
+            f"(this rank, rows {list(_TEP_TPSUM_CHECK_ROWS)}: lanes that differ {diffs}); unset "
+            "the switch"
+        )
+    _tep_tpsum_bind(core, op)
+    logger.info(
+        f"TP sum on the plain Lamport launch ({TEP_TPSUM_LAMPORT_ENV}=1): rank {rank} of "
+        f"{_TEP_FINAR.WORLD}, 1..{_TEP_FINAR.TP_SUM_MAX_ROWS} rows of {core.hidden}, "
+        f"{op.workspace_bytes / (1 << 20):.2f} MiB, lanes that differ from the stock sum at the "
+        f"build check {diffs}"
+    )
+    return op
 
 
 def _tep_finar_build(core, device) -> "_TepFinar | None":

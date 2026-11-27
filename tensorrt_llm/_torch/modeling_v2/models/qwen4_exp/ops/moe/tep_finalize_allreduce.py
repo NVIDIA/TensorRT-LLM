@@ -350,6 +350,13 @@ def _local_partial(
     return [_sanitize(_pack_bf16x2(acc[2 * j], acc[2 * j + 1])) for j in range(4)]
 
 
+def _plain_partial(k, x, x_row_bytes, row, col):
+    """The plain form's local vector (4 words = 8 bf16 lanes) of (row, col..col+7): this rank's
+    bf16 partial as it is, -0.0 lanes as +0.0 (the transport's not-ready marker)."""
+    w = _ld_v4(x + Int64(row) * x_row_bytes + Int64(col) * Int64(2))
+    return [_sanitize(w[j]) for j in range(4)]
+
+
 def _offset(k, slot, src_rank: int, row, col):
     return (
         (Int64(slot) * Int64(k.world) + Int64(src_rank)) * Int64(k.max_rows * k.hidden * 2)
@@ -390,13 +397,26 @@ class _Kernel:
     """Compile-time shape of one launch: the rank, the columns a CTA, PDL and its release
     point, and whether a gated fp32 shared addend joins the local sum."""
 
-    def __init__(self, rank: int, chunk: int, use_pdl: bool, early: bool, has_shared: bool):
+    def __init__(
+        self,
+        rank: int,
+        chunk: int,
+        use_pdl: bool,
+        early: bool,
+        has_shared: bool,
+        plain: bool = False,
+        max_rows: int = MAX_ROWS,
+    ):
         assert HIDDEN % chunk == 0 and chunk % 8 == 0
+        assert not (plain and has_shared), "the plain sum takes no shared addend"
         self.rank = int(rank)
         self.world = WORLD
         self.hidden = HIDDEN
         self.top_k = TOP_K
-        self.max_rows = MAX_ROWS
+        # Rows a slot holds (the workspace layout); `plain`: `fc2` is the rank's bf16 partial
+        # `[rows, HIDDEN]` at row pitch `fc2_row_bytes`, summed as it is (no finalize).
+        self.max_rows = int(max_rows)
+        self.plain = bool(plain)
         self.chunk = int(chunk)
         self.threads = self.chunk // 8
         self.use_pdl = bool(use_pdl)
@@ -477,9 +497,22 @@ class _Kernel:
             cute.arch.griddepcontrol_launch_dependents()
         col = (cta * Int32(self.threads) + tidx) * Int32(8)
         bufs = [b0, b1, b2, b3]
-        local = _local_partial(
-            self, fc2, fc2_row_bytes, fc2_rows, wts, perm, shared, gate, gate_row_bytes, row, col
-        )
+        if cutlass.const_expr(self.plain):
+            local = _plain_partial(self, fc2, fc2_row_bytes, row, col)
+        else:
+            local = _local_partial(
+                self,
+                fc2,
+                fc2_row_bytes,
+                fc2_rows,
+                wts,
+                perm,
+                shared,
+                gate,
+                gate_row_bytes,
+                row,
+                col,
+            )
         _publish(self, local, bufs, slot, row, col)
         if cutlass.const_expr(self.use_pdl and not self.early):
             cute.arch.griddepcontrol_launch_dependents()
@@ -489,14 +522,30 @@ class _Kernel:
 _COMPILED: dict = {}
 
 
-def _compile(rank: int, chunk: int, use_pdl: bool, early: bool, has_shared: bool = False):
+def _compile(
+    rank: int,
+    chunk: int,
+    use_pdl: bool,
+    early: bool,
+    has_shared: bool = False,
+    plain: bool = False,
+    max_rows: int = MAX_ROWS,
+):
     """The compiled launch of one shape, once a process."""
-    key = (int(rank), int(chunk), bool(use_pdl), bool(use_pdl) and bool(early), bool(has_shared))
+    key = (
+        int(rank),
+        int(chunk),
+        bool(use_pdl),
+        bool(use_pdl) and bool(early),
+        bool(has_shared),
+        bool(plain),
+        int(max_rows),
+    )
     fn = _COMPILED.get(key)
     if fn is None:
         from cutlass.cute import runtime as cute_runtime
 
-        kern = _Kernel(rank, chunk, use_pdl, early, has_shared)
+        kern = _Kernel(rank, chunk, use_pdl, early, has_shared, plain, max_rows)
         z64, z32 = Int64(0), Int32(0)
         state_fake = cute_runtime.make_fake_compact_tensor(
             Int32, (4,), stride_order=(0,), assumed_align=16
@@ -658,6 +707,112 @@ def build(
         empty_fc2=empty_fc2,
         fn_shared=fn_shared,
     )
+
+
+#: Rows the plain sum serves (`build_tp_sum`): 1..8 requests of four verify rows.
+TP_SUM_MAX_ROWS = 32
+#: Columns a CTA of the plain sum: 5 CTAs of 64 threads a row, as the finalize launch.
+TP_SUM_CHUNK = CHUNK
+
+
+@dataclass
+class TepTpSum:
+    """`build_tp_sum`'s workspace: this rank's `[3, 4, 32 * 2560]` bf16 symmetric slots (its own,
+    not the finalize launch's), the peers' slot base addresses in rank order, the plain launch."""
+
+    rank: int
+    use_pdl: bool
+    early: bool
+    buffer: torch.Tensor
+    peer_buffers: list
+    peers: tuple
+    state: torch.Tensor
+    fn: object
+
+    @property
+    def workspace_bytes(self) -> int:
+        return self.buffer.numel() * self.buffer.element_size()
+
+    @staticmethod
+    def takes(x: torch.Tensor) -> bool:
+        """Whether the plain launch takes `x` (host values every rank of the group shares)."""
+        return (
+            x.dtype == torch.bfloat16
+            and x.dim() == 2
+            and 1 <= x.shape[0] <= TP_SUM_MAX_ROWS
+            and x.shape[1] == HIDDEN
+            and x.stride(1) == 1
+            and (x.stride(0) * 2) % 16 == 0
+            and x.data_ptr() % 16 == 0
+        )
+
+    def __call__(self, x: torch.Tensor, slot: int) -> torch.Tensor:
+        if not (self.takes(x) and 0 <= slot < SLOTS):
+            raise RuntimeError(
+                f"tep tp_sum: operand outside the compiled layout: {x.dtype} {tuple(x.shape)} "
+                f"strides {tuple(x.stride())}, slot {slot}"
+            )
+        rows = x.shape[0]
+        out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=x.device)
+        self.fn(
+            x.data_ptr(),
+            x.stride(0) * 2,
+            rows,
+            0,
+            0,
+            0,
+            0,
+            0,
+            out.data_ptr(),
+            self.peers[0],
+            self.peers[1],
+            self.peers[2],
+            self.peers[3],
+            int(slot),
+            self.state,
+            int(rows),
+        )
+        return out
+
+
+def build_tp_sum(rank: int, use_pdl: bool, early: bool = False) -> TepTpSum:
+    """The plain TP sum (`TepTpSum`) over the 4-rank torch process group (WORLD, the TP group of
+    one NVLink domain): the finalize launch's transport and arithmetic -- every rank publishes
+    its bf16 partial to the three peers' slot, reads theirs, sums the four in fp32 in rank order
+    and rounds once -- without the finalize. Its own three slots of `TP_SUM_MAX_ROWS` rows.
+    Collective: every rank calls it with the same arguments."""
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as symm_mem
+
+    assert dist.is_initialized() and dist.get_world_size() == WORLD and dist.get_rank() == rank
+    dev = torch.device("cuda", torch.cuda.current_device())
+    shape = (SLOTS, WORLD, TP_SUM_MAX_ROWS * HIDDEN)
+    buffer = symm_mem.empty(shape, dtype=torch.bfloat16, device=dev)
+    buffer.view(torch.int16).fill_(_NEG_ZERO_BF16_I16)
+    group = dist.group.WORLD
+    handle = symm_mem.rendezvous(buffer, group=getattr(group, "group_name", group))
+    peer_buffers = [handle.get_buffer(p, buffer.shape, buffer.dtype) for p in range(WORLD)]
+    peers = tuple(int(b.data_ptr()) for b in peer_buffers)
+    assert all(p % 16 == 0 for p in peers), peers
+    state = torch.zeros(4, dtype=torch.int32, device=dev)
+    fn = _compile(rank, TP_SUM_CHUNK, use_pdl, early, plain=True, max_rows=TP_SUM_MAX_ROWS)
+    torch.cuda.synchronize(dev)
+    ok = torch.ones(1, dtype=torch.int32, device=dev)
+    dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+    torch.cuda.synchronize(dev)
+    return TepTpSum(
+        rank, bool(use_pdl), bool(use_pdl) and bool(early), buffer, peer_buffers, peers, state, fn
+    )
+
+
+def tp_sum_reference(partials_in_rank_order) -> torch.Tensor:
+    """The plain sum every rank gets: each rank's bf16 partial (-0.0 as +0.0) summed in fp32 in
+    rank order, rounded once."""
+    acc = None
+    for p in partials_in_rank_order:
+        v = torch.where(p.view(torch.int16) == _NEG_ZERO_BF16_I16, torch.zeros_like(p), p).float()
+        acc = v if acc is None else acc + v
+    return acc.to(torch.bfloat16)
 
 
 def _finalize(fc2, wts, perm, shared=None, gate=None) -> torch.Tensor:
