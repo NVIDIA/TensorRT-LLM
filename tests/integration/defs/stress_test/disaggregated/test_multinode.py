@@ -1,17 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Two-node DeepSeek-V4.1-Flash NVFP4 stress with a post-load GSM8K gate.
+"""YAML-configured two-node disaggregated stress tests.
+
+Each test loads ``configs/<test function name without test_>.yaml``.
 
 Run the same selected case on both nodes, with LLM_MODELS_ROOT set::
 
     srun --kill-on-bad-exit=1 --nodes=2 --ntasks-per-node=1 \
-        python -m pytest stress_test/test_disaggregated_multinode_stress.py \
+        python -m pytest stress_test/disaggregated/test_multinode.py \
         --output-dir=/path/to/results -sv
 
-Each node needs four Blackwell-or-newer GPUs with at least 140000 MiB each.
-Node 0 owns the TP4 context worker, frontend and client; node 1 owns the TP4
-generation worker with DSpark. The nodes need HTTP and NIXL/UCX connectivity.
+Hardware requirements and worker settings come from each case's YAML.
+Node 0 owns the context worker, frontend and client; node 1 owns the generation
+worker. The nodes need HTTP and NIXL/UCX connectivity.
 """
 
 import os
@@ -20,11 +22,13 @@ import time
 from collections import deque
 from collections.abc import Iterator
 from contextlib import ExitStack
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+import yaml
 from multinode_utils import check_peer, peer_connection, slurm_topology, wait_for_signal
 
 if TYPE_CHECKING:
@@ -36,64 +40,83 @@ __extra_import_path__ = [
     "~/tests/integration/defs/disaggregated",
 ]
 
-pytestmark = [pytest.mark.threadleak(enabled=False), pytest.mark.timeout(28800)]
+pytestmark = pytest.mark.threadleak(enabled=False)
 
-MODEL = "DeepSeek-V4.1-Flash-NVFP4"
 CTX_PORT, GEN_PORT, FRONTEND_PORT, CONTROL_PORT = 8001, 8002, 8000, 8003
-STARTUP_TIMEOUT = 7200
-FRONTEND_TIMEOUT = 300
-STRESS_TIMEOUT = 12600
-ACCURACY_TIMEOUT = 7200
-REQUEST_COUNT = 10000
-CONCURRENCY = 512
 
 
-def _worker_config(generation: bool) -> dict[str, object]:
-    from deepseek_v41_serving import model_kwargs
+@dataclass(frozen=True)
+class _Workload:
+    request_count: int
+    concurrency: int
+    input_len_mean: int
+    input_len_std: int
+    output_len_mean: int
+    output_len_std: int
+    extra_args: list[str]
+    max_error_rate: float
 
-    config = model_kwargs()
-    config.update(
-        max_batch_size=64,
-        max_num_tokens=8192,
-        max_seq_len=10240,
-        enable_iter_perf_stats=True,
-        print_iter_log=True,
-        cache_transceiver_config={"backend": "NIXL", "transceiver_runtime": "PYTHON"},
-        kv_cache_config={
-            "dtype": "fp8_ds_mla",
-            "tokens_per_block": 128,
-            "max_tokens": 262144,
-            "free_gpu_memory_fraction": 0.5,
-            "host_cache_size": 2 * (1 << 30),
-            "enable_block_reuse": False,
-            "enable_swa_scratch_reuse": False,
-        },
-        cuda_graph_config={"enable_padding": True, "batch_sizes": [1, 2, 4, 8, 16, 32, 64]},
+    def __post_init__(self) -> None:
+        if self.request_count <= 0 or self.concurrency <= 0:
+            raise ValueError("Stress request_count and concurrency must be positive")
+        if not 0 <= self.max_error_rate <= 1:
+            raise ValueError("Stress max_error_rate must be between 0 and 1")
+
+
+@dataclass(frozen=True)
+class _StressConfig:
+    model: str
+    hardware: dict[str, int]
+    timeouts: dict[str, int]
+    worker_config: dict[str, object]
+    context_config: dict[str, object]
+    generation_config: dict[str, object]
+    env: dict[str, str]
+    unset_env_prefixes: list[str]
+    stress: _Workload
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> "_StressConfig":
+        with path.open() as stream:
+            data = yaml.safe_load(stream)
+        if not isinstance(data, dict):
+            raise ValueError(f"Stress config must be a YAML mapping: {path}")
+        data["stress"] = _Workload(**data["stress"])
+        return cls(**data)
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    if "stress_config" not in metafunc.fixturenames:
+        return
+    name = metafunc.function.__name__.removeprefix("test_")
+    config = _StressConfig.from_yaml(Path(__file__).parent / "configs" / f"{name}.yaml")
+    metafunc.parametrize(
+        "stress_config",
+        [pytest.param(config, id="yaml", marks=pytest.mark.timeout(config.timeouts["test"]))],
     )
-    if generation:
-        config["speculative_config"] = {"decoding_type": "DSpark", "max_draft_len": 5}
-    else:
-        config.update(cuda_graph_config=None, disable_overlap_scheduler=True)
-    return config
 
 
-def _worker_env() -> dict[str, str]:
-    from defs.deepseek_v41_serving import baseline_env
+def _worker_config(config: _StressConfig, generation: bool) -> dict[str, object]:
+    overrides = config.generation_config if generation else config.context_config
+    return deepcopy({**config.worker_config, **overrides})
+
+
+def _worker_env(config: _StressConfig) -> dict[str, str]:
     from test_common.cluster_env import apply_ucx_env
 
     env = {
         key: value
-        for key, value in baseline_env(dict(os.environ)).items()
+        for key, value in os.environ.items()
+        if not key.startswith(tuple(config.unset_env_prefixes))
+    }
+    apply_ucx_env(env)
+    env = {
+        key: value
+        for key, value in env.items()
         if not key.startswith(("SLURM_", "OMPI_", "PMI_", "PMIX_"))
         and key not in {"MASTER_ADDR", "MASTER_PORT"}
     }
-    apply_ucx_env(env, cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""))
-    env.update(
-        OMPI_ALLOW_RUN_AS_ROOT="1",
-        OMPI_ALLOW_RUN_AS_ROOT_CONFIRM="1",
-        TRTLLM_NIXL_KVCACHE_BACKEND="UCX",
-        TLLM_KV_CACHE_MANAGER_V2_THP="0",
-    )
+    env.update(config.env)
     return env
 
 
@@ -113,6 +136,7 @@ class _Cluster:
     frontend: "RemoteDisaggOpenAIServer | None"
     model_path: str
     artifacts: Path
+    config: _StressConfig
 
     def check_local(self) -> None:
         for server in (self.worker, self.frontend):
@@ -137,7 +161,9 @@ class _Cluster:
 
 
 @pytest.fixture
-def disagg_cluster(request: pytest.FixtureRequest, output_dir: str) -> Iterator[_Cluster]:
+def disagg_cluster(
+    request: pytest.FixtureRequest, output_dir: str, stress_config: _StressConfig
+) -> Iterator[_Cluster]:
     from defs.common import resolve_llm_model_path
     from defs.conftest import get_device_count, get_device_memory, get_sm_version
     from openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
@@ -146,9 +172,15 @@ def disagg_cluster(request: pytest.FixtureRequest, output_dir: str) -> Iterator[
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
     rank, hosts = slurm_topology(os.environ)
-    if get_sm_version() < 100 or get_device_count() < 4 or get_device_memory() < 140000:
-        pytest.skip("Requires four Blackwell-or-newer GPUs with 140000 MiB each on each node")
-    model_path = resolve_llm_model_path(MODEL)
+    hardware = stress_config.hardware
+    timeouts = stress_config.timeouts
+    if (
+        get_sm_version() < hardware["min_sm"]
+        or get_device_count() < hardware["gpus_per_node"]
+        or get_device_memory() < hardware["min_gpu_memory_mib"]
+    ):
+        pytest.skip(f"Each node must satisfy the stress config hardware requirements: {hardware}")
+    model_path = resolve_llm_model_path(stress_config.model)
     artifacts = Path(output_dir) / "disagg-logs" / request.node.name / f"node-{rank}"
     artifacts.mkdir(parents=True, exist_ok=True)
     with peer_connection(rank, hosts[0], CONTROL_PORT, request.node.nodeid) as connection:
@@ -161,37 +193,39 @@ def disagg_cluster(request: pytest.FixtureRequest, output_dir: str) -> Iterator[
                     port=GEN_PORT if rank else CTX_PORT,
                     role=ServerRole.GENERATION if rank else ServerRole.CONTEXT,
                     rank=0,
-                    env=_worker_env(),
-                    extra_config=_worker_config(generation=bool(rank)),
+                    env=_worker_env(stress_config),
+                    extra_config=_worker_config(stress_config, generation=bool(rank)),
                     log_path=str(artifacts / "worker.log"),
                     wait=False,
                 )
             )
-            cluster = _Cluster(rank, hosts, connection, worker, None, model_path, artifacts)
+            cluster = _Cluster(
+                rank, hosts, connection, worker, None, model_path, artifacts, stress_config
+            )
             assert worker.log_path is not None
             wait_for_endpoint_ready(
                 f"http://127.0.0.1:{worker.port}/health",
-                timeout=STARTUP_TIMEOUT,
+                timeout=timeouts["worker_startup"],
                 server_proc=worker.proc,
                 check_files=[worker.log_path],
             )
             if rank == 0:
-                wait_for_signal(connection, b"R", STARTUP_TIMEOUT, cluster.check_local)
+                wait_for_signal(connection, b"R", timeouts["worker_startup"], cluster.check_local)
                 cluster.frontend = stack.enter_context(
                     RemoteDisaggOpenAIServer(
                         ctx_servers=[f"{hosts[0]}:{CTX_PORT}"],
                         gen_servers=[f"{hosts[1]}:{GEN_PORT}"],
                         port=FRONTEND_PORT,
-                        env=_worker_env(),
+                        env=_worker_env(stress_config),
                         log_path=str(artifacts / "frontend.log"),
                         wait_ready=False,
-                        server_start_timeout=FRONTEND_TIMEOUT,
+                        server_start_timeout=timeouts["frontend_startup"],
                     )
                 )
                 assert cluster.frontend.log_path is not None
                 wait_for_endpoint_ready(
                     f"http://127.0.0.1:{FRONTEND_PORT}/health",
-                    timeout=FRONTEND_TIMEOUT,
+                    timeout=timeouts["frontend_startup"],
                     server_proc=cluster.frontend.proc,
                     additional_server_procs=[(worker.proc, "Context worker")],
                     check_files=[cluster.frontend.log_path, worker.log_path],
@@ -204,11 +238,13 @@ def disagg_cluster(request: pytest.FixtureRequest, output_dir: str) -> Iterator[
 def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
     """Gate cross-node KV-transfer stability under 8k/1k load and post-stress accuracy."""
     cluster = disagg_cluster
+    timeouts = cluster.config.timeouts
+    workload = cluster.config.stress
     if cluster.rank == 1:
         wait_for_signal(
             cluster.connection,
             b"D",
-            STARTUP_TIMEOUT + STRESS_TIMEOUT + ACCURACY_TIMEOUT,
+            timeouts["worker_startup"] + timeouts["stress"] + timeouts["accuracy"],
             cluster.check_local,
         )
         cluster.check_local()
@@ -228,40 +264,41 @@ def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
     from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
 
     server = ServerConfig(host=cluster.hosts[0], port=FRONTEND_PORT)
-    assert warmup_inference(server.url, cluster.model_path, timeout=600)
+    assert warmup_inference(server.url, cluster.model_path, timeout=timeouts["warmup"])
     artifacts = cluster.artifacts / "aiperf"
     cmd = create_aiperf_command(
         cluster.model_path,
         cluster.model_path,
-        REQUEST_COUNT,
-        CONCURRENCY,
+        workload.request_count,
+        workload.concurrency,
         server.url,
-        input_len_mean=8192,
-        input_len_std=0,
-        output_len_mean=1024,
-        output_len_std=0,
+        input_len_mean=workload.input_len_mean,
+        input_len_std=workload.input_len_std,
+        output_len_mean=workload.output_len_mean,
+        output_len_std=workload.output_len_std,
         artifact_dir=str(artifacts),
     )
-    cmd.extend(
-        [
-            "--tokenizer-trust-remote-code",
-            "--extra-inputs",
-            "ignore_eos:true",
-            "--request-cancellation-rate",
-            "10",
-            "--request-cancellation-delay",
-            "0.5",
-        ]
+    cmd.extend(workload.extra_args)
+    assert run_aiperf_process(
+        cmd, time.time(), timeouts["stress"], server, health_check=cluster.check
     )
-    assert run_aiperf_process(cmd, time.time(), STRESS_TIMEOUT, server, health_check=cluster.check)
-    enforce_aiperf_error_rate(str(artifacts), max_error_rate=0.01, expected_records=REQUEST_COUNT)
+    enforce_aiperf_error_rate(
+        str(artifacts),
+        max_error_rate=workload.max_error_rate,
+        expected_records=workload.request_count,
+    )
     cluster.check()
     tokenizer = DeepseekV41Tokenizer.from_pretrained(
         cluster.model_path, trust_remote_code=True, local_files_only=True
     )
     evaluate_gsm8k_server(server.url, cluster.model_path, tokenizer, cluster.artifacts / "gsm8k")
-    assert warmup_inference(server.url, cluster.model_path, timeout=30, num_warmup_requests=1)
+    assert warmup_inference(
+        server.url,
+        cluster.model_path,
+        timeout=timeouts["post_stress_warmup"],
+        num_warmup_requests=1,
+    )
     cluster.check()
     cluster.check_logs()
     cluster.connection.sendall(b"D")
-    wait_for_signal(cluster.connection, b"P", 300, cluster.check_local)
+    wait_for_signal(cluster.connection, b"P", timeouts["peer_completion"], cluster.check_local)
