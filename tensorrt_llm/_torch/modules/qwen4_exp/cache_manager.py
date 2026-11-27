@@ -205,6 +205,8 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
     # A model that implements the in-forward snapshot split opts in per instance
     # (inforward_snapshot_min_main).
     _supports_inforward_snapshot = False
+    # The longest tail the model's split runs (inforward_snapshot_max_tail); 0: no limit.
+    _inforward_max_tail_request = 0
     # Whether the model's GDN layers verify drafts with the fused kernels, which
     # commit in-layer at every batch size.
     gdn_fused_verify = False
