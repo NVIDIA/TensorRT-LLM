@@ -206,6 +206,35 @@ class DeepseekV41Attention(CSA2Attention):
         """``row_split`` (decoder-pass graphs) keeps the row-wise projections in the graph;
         ``live_rows`` (encoder-pass graphs) runs the whole module on the live rows, followed by
         ``after_live_rows`` in the same eager break."""
+        # O-B's TP reduction takes the caller's parameters, e.g. an early PDL trigger.
+        self.o_b_all_reduce_params = all_reduce_params
+        try:
+            return self._forward(
+                position_ids,
+                hidden_states,
+                attn_metadata,
+                all_reduce_params,
+                hidden_states_mxfp8,
+                row_split,
+                live_rows,
+                after_live_rows,
+                **kwargs,
+            )
+        finally:
+            self.o_b_all_reduce_params = None
+
+    def _forward(
+        self,
+        position_ids,
+        hidden_states,
+        attn_metadata,
+        all_reduce_params,
+        hidden_states_mxfp8,
+        row_split: PassRows | None,
+        live_rows: PassRows | None,
+        after_live_rows: Callable[[], None] | None,
+        **kwargs,
+    ):
         if kwargs.get("lora_params") is not None:
             raise NotImplementedError("DeepSeek-V4.1 CSA2 does not implement attention LoRA")
         # TP reduction is owned by the row-parallel output projection; ``enable_allreduce=False``
@@ -245,6 +274,8 @@ class DeepseekV41Attention(CSA2Attention):
         """Keep a graph's padded shape while CSA2 attends only the live query rows, in an eager
         break: those of ``live_rows``, else the step's own. Padding rows come out zero."""
         output = torch.empty_like(hidden_states)
+        # Graph replays run this eager break outside forward: keep the caller's O-B parameters.
+        params = self.o_b_all_reduce_params
 
         def forward_live_rows(states, positions, destination):
             if live_rows is None:
@@ -254,9 +285,13 @@ class DeepseekV41Attention(CSA2Attention):
             if rows > states.shape[0]:
                 raise ValueError("CSA2 query rows exceed the padded graph input")
             if rows:
-                super(DeepseekV41Attention, self).forward(
-                    states[:rows], positions[:rows], metadata, out=destination[:rows]
-                )
+                previous, self.o_b_all_reduce_params = self.o_b_all_reduce_params, params
+                try:
+                    super(DeepseekV41Attention, self).forward(
+                        states[:rows], positions[:rows], metadata, out=destination[:rows]
+                    )
+                finally:
+                    self.o_b_all_reduce_params = previous
             if rows < destination.shape[0]:
                 destination[rows:].zero_()
             if after is not None:
@@ -1219,6 +1254,17 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             self._mhc_lamport_resolved = True
         return self._mhc_lamport
 
+    def _ob_weights(self) -> tuple:
+        """The MXFP8 o_b projection's weight and swizzled scales, as the attention's GEMM reads them."""
+        linear = self.self_attn.o_b_proj
+        if linear.weight.dtype != torch.float8_e4m3fn:
+            return ()
+        return tuple(
+            t
+            for t in (linear.weight, linear.weight_scale)
+            if t.is_contiguous() and t.data_ptr() % 16 == 0 and t.nbytes % 16 == 0
+        )
+
     def _moe_supports_unfinalized(self) -> bool:
         """Whether the routed experts can hand back their rows before the top-k combine."""
         experts = self.mlp.experts
@@ -1363,6 +1409,10 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 events=self._mhc_attn_events,
                 allreduce=entry_allreduce,
                 mxfp8=mxfp8,
+                # The split FFN boundary reads these coefficients after its dependency wait.
+                coefficients_release_after_wait=ffn_split,
+                # The attention's o_b projection then reads its weights from L2.
+                l2_prefetch=self._ob_weights() if entry_allreduce is not None else (),
             )
             residual, attn_pre, post_mix, comb_mix, layer_input, attn_coeff_event = boundary[:6]
             if mxfp8:
@@ -1405,11 +1455,12 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             hidden_states=layer_input,
             attn_metadata=attn_metadata,
             hidden_states_mxfp8=layer_input_mxfp8,
-            # The split boundary's critical half prefetches its residual before its PDL wait,
-            # so the all-reduce may let it launch at its start.
+            # The split FFN boundary loads its constant inputs, and after a split entry also
+            # its residual, before its PDL wait, so the all-reduce may release it once its own
+            # wait returns.
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce and lamport is None,
-                trigger_completion_at_end=not split,
+                trigger_completion_at_end=not ffn_split,
             ),
             **kwargs,
         )

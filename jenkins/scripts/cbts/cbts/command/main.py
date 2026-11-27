@@ -134,8 +134,7 @@ class SelectionResult:
     # Aggregated `any(rule.sanity_relevant)` across fired rules. Default
     # True is safe; Groovy Layer 2 keeps PackageSanityCheck only when True.
     sanity_required: bool = True
-    # Aggregated `any(rule.perfsanity_relevant)`. Groovy Layer 2 keeps
-    # *-PerfSanity-* stages only when True.
+    # Legacy perf-relevance signal kept in decision JSON for diagnostics.
     perfsanity_required: bool = True
     # set by coverage tier; Groovy re-adds multiGpuJobs under MULTI_GPU_FILE_CHANGED gate
     enable_multi_gpu: bool = False

@@ -54,14 +54,15 @@ Caller obligations:
       GPU pages. The pages a fetch grows are outside the V2 scheduler's reach: it neither
       evicts, pauses nor preempts a parked request. Its deadlock check counts no pass while any
       request is in a disaggregated transfer state, as one parked in the transfer-in-progress
-      state is, and otherwise raises "V2 scheduler deadlock" after 1000 passes in a row that
-      schedule and reclaim nothing while a context or generation request waits, so without that
-      room a request that cannot be admitted, resume or grow can end in that deadlock. A share
-      of each pool group for the parked fetches alone does not ensure it, with or without a
-      cache tier below the GPU. The manager's ``get_page_indices_by_layer_group`` lists a
-      request's pages per layer group, one beam's (under beam search each further beam also
-      locks a page of its own for every block not wholly inside the prompt), and the runtime's
-      ``impl.pool_group_descs`` give each pool group's number of GPU pages and its layer groups.
+      state is, and otherwise fails the newest waiting request, preferring one that holds pages,
+      after 1000 passes in a row that schedule and reclaim nothing while a context or generation
+      request waits, so without that room a request that cannot be admitted, resume or grow can
+      be failed with a KV cache admission error. A share of each pool group for the parked
+      fetches alone does not ensure it, with or without a cache tier below the GPU. The
+      manager's ``get_page_indices_by_layer_group`` lists a request's pages per layer group, one
+      beam's (under beam search each further beam also locks a page of its own for every block
+      not wholly inside the prompt), and the runtime's ``impl.pool_group_descs`` give each pool
+      group's number of GPU pages and its layer groups.
     - Under attention data parallelism without a cache transceiver, the caller keeps a rank from
       parking all its active requests, or accepts the stall: the executor counts parked requests
       as schedulable, so a rank whose active requests are all parked, at its cap of active

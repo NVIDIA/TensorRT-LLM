@@ -171,7 +171,7 @@ def test_mpi_pool_environment_forwards_unified_cache_variables(
     monkeypatch.setenv(_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV, "1")
     monkeypatch.setenv("UNRELATED_CACHE_DIR", "/not-forwarded")
     monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor, raising=False)
-    session = SimpleNamespace(mpi_pool=None, n_workers=1, _env_overrides={})
+    session = SimpleNamespace(mpi_pool=None, n_workers=1, _env_overrides={}, _mpi_info=None)
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 
@@ -214,7 +214,7 @@ def test_mpi_pool_flashinfer_isolation_respects_unified_cache_configuration(
         monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path / "explicit-flashinfer"))
     monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor, raising=False)
     _bootstrap._setup_unified_cache()
-    session = SimpleNamespace(mpi_pool=None, n_workers=2, _env_overrides={})
+    session = SimpleNamespace(mpi_pool=None, n_workers=2, _env_overrides={}, _mpi_info=None)
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 
