@@ -251,6 +251,35 @@ def test_architecture_check_skipped_without_config():
     startup_checks.check_architecture_registered(_arch_args(), None)
 
 
+@pytest.mark.parametrize("modeling_v2", ["auto", "require"])
+def test_modeling_v2_routed_architecture_passes(monkeypatch, modeling_v2):
+    # An architecture only a Modeling V2 route implements has no model-zoo class.
+    from tensorrt_llm._torch.modeling_v2._router_index import registered_routes
+
+    monkeypatch.setitem(registered_routes(), "FooBarForCausalLM", lambda *args: None)
+    args = _arch_args()
+    args.modeling_v2 = modeling_v2
+    startup_checks.check_architecture_registered(
+        args, SimpleNamespace(architectures=["FooBarForCausalLM"])
+    )
+
+
+def test_modeling_v2_routed_architecture_with_modeling_v2_off_is_unsupported(monkeypatch):
+    from tensorrt_llm._torch.modeling_v2._router_index import registered_routes
+
+    monkeypatch.setitem(registered_routes(), "FooBarForCausalLM", lambda *args: None)
+    args = _arch_args()
+    args.modeling_v2 = "off"
+    with pytest.raises(ValueError, match="only a Modeling V2 implementation") as e:
+        startup_checks.check_architecture_registered(
+            args, SimpleNamespace(architectures=["FooBarForCausalLM"])
+        )
+
+    info = classify_startup_error(e.value)
+    assert info.category == "unsupported"
+    assert "modeling_v2" in info.hint
+
+
 def test_externally_declared_architecture_passes(monkeypatch):
     # A declared external provider resolves on lookup even before its module is imported.
     from tensorrt_llm._torch.models import modeling_utils
