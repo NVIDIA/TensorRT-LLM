@@ -2133,3 +2133,66 @@ def test_bounce_slot_selection_preserves_holes_and_page_intersections(kind, heli
         assert selected.tolist() == [slot for slot, _ in expected]
         assert ordinals.tolist() == [ordinal for _, ordinal in expected]
         assert largest == max(selected, default=-1)
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+@pytest.mark.parametrize("slot_dtype", [np.int32, np.int64])
+def test_single_view_bounce_registration_matches_each_writers_descriptors(mapper_kind, slot_dtype):
+    from tensorrt_llm._torch.disaggregation.native.extent import Chunk, TokenRange
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        _BounceReceiveSlice,
+        _BounceWriterProjection,
+    )
+
+    local = make_rankinfo(
+        instance_name="gen",
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8], mapper_kind),
+    )
+    # The middle hole and unused ordinal at either end remain outside the grant.
+    slots = np.array([7, 6, -1, 4, 1], dtype=slot_dtype)
+    extent = Chunk([slots], [CacheKind.PAGED], TokenRange(2, 8), is_last=True)
+    receive_slice = _BounceReceiveSlice(extent, local)
+    extractor = KVRegionExtractorV1(local.page_table)
+    for rank in range(4):
+        writer = make_rankinfo(
+            instance_name="ctx",
+            instance_rank=rank,
+            tp_size=4,
+            tp_rank=rank,
+            kv_heads_per_rank=2,
+            tokens_per_block=2,
+            dims_per_head=2,
+            page_table=_make_per_view_page_table([2], mapper_kind),
+        )
+        registrar = PeerRegistrar(writer, KVRegionExtractorV1(writer.page_table))
+        registrar.register(local.instance_name, local.instance_rank, local)
+        plan = _BounceWriterProjection(registrar, local, extractor, "writer-endpoint")
+        agent = SimpleNamespace(register_bounce_window_slots=Mock(), register_bounce_window=Mock())
+        key = bytes([rank]) * 16
+        plan.register_window(agent, f"ctx{rank}", key, receive_slice)
+        peer, endpoint, token, ids, base, stride, payload, count, offsets, sizes = (
+            agent.register_bounce_window_slots.call_args.args
+        )
+        assert (peer, endpoint, token) == (f"ctx{rank}", "writer-endpoint", key)
+        assert ids.tolist() == [6, -1, 4]
+        assert all(a.dtype == np.int64 and a.flags.c_contiguous for a in (ids, offsets, sizes))
+        assert max(ids) < count and max(offsets + sizes) <= payload <= stride
+        actual = sorted(
+            (int(base + i * stride + offset), int(size))
+            for i in ids
+            if i >= 0
+            for offset, size in zip(offsets, sizes, strict=True)
+        )
+        expected = sorted((d.addr, d.len) for d in plan.destinations(receive_slice).descs)
+        assert actual == expected
+        agent.register_bounce_window.assert_not_called()
+
+        # The original registration API accepts exactly the same spans.
+        old_agent = SimpleNamespace(register_bounce_window=Mock())
+        plan.register_window(old_agent, f"ctx{rank}", key, receive_slice)
+        old_descs = old_agent.register_bounce_window.call_args.args[-1].descs
+        assert sorted((d.addr, d.len) for d in old_descs) == expected

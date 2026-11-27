@@ -3207,15 +3207,18 @@ class _BounceReceiveSlice:
     def __init__(self, chunk: Chunk, local: RankInfo):
         self.chunk = chunk
         self.local = local
+        self._spans: dict[tuple[int, bool], tuple[np.ndarray, int, int, int]] = {}
         self._groups: dict[tuple[int, bool], tuple[np.ndarray, np.ndarray, int]] = {}
 
-    def slots_for(self, group: int, helix_stride: bool) -> tuple[np.ndarray, np.ndarray, int]:
+    def span(self, group: int, helix_stride: bool) -> tuple[np.ndarray, int, int, int]:
         key = (group, helix_stride)
-        if key in self._groups:
-            return self._groups[key]
-        slots = self.chunk.block_ids_per_layer_groups[group]
+        if key in self._spans:
+            return self._spans[key]
         page_table = self.local.page_table
         assert page_table is not None
+        if len(self.chunk.block_ids_per_layer_groups) != len(page_table.layer_groups):
+            raise ValueError("Receive slice does not match the local layer groups")
+        slots = self.chunk.block_ids_per_layer_groups[group]
         first = 0
         stride = 1
         offset = 0
@@ -3228,7 +3231,17 @@ class _BounceReceiveSlice:
                 first = (first - offset + stride - 1) // stride
                 stop = (stop - offset + stride - 1) // stride
             first = max(0, first)
-            slots = slots[first : max(0, stop)]
+            if first or stop < slots.size:
+                slots = slots[first : max(0, stop)]
+        result = slots, first, stride, offset
+        self._spans[key] = result
+        return result
+
+    def slots_for(self, group: int, helix_stride: bool) -> tuple[np.ndarray, np.ndarray, int]:
+        key = (group, helix_stride)
+        if key in self._groups:
+            return self._groups[key]
+        slots, first, stride, offset = self.span(group, helix_stride)
         ordinals = np.flatnonzero(slots >= 0)
         selected = slots if len(ordinals) == len(slots) else slots[ordinals]
         selected = selected.astype(np.int64, copy=False)
@@ -3256,6 +3269,7 @@ class _BounceWriterProjection:
         self.destination = destination
         self.templates = {}
         self.rings = {}
+        self._single_view = None
         src = writer.self_extractor
         writer_info = writer.self_rank_info
         targets = writer.get_peer_overlap(local, local.dp_rank)
@@ -3297,6 +3311,50 @@ class _BounceWriterProjection:
                     if part.dst.memory.ptrs.size
                 ],
             )
+
+        if len(self.templates) == 1 and not self.rings:
+            view_key, (pool, pieces) = next(iter(self.templates.items()))
+            if pieces:
+                offsets = np.ascontiguousarray(
+                    np.concatenate([part for part, _ in pieces]), dtype=np.int64
+                )
+                lengths = np.concatenate(
+                    [np.full(part.size, width, dtype=np.int64) for part, width in pieces]
+                )
+                if (
+                    np.any(offsets < 0)
+                    or np.any(lengths <= 0)
+                    or np.any(lengths > pool.slot_bytes)
+                    or np.any(offsets > pool.slot_bytes - lengths)
+                ):
+                    raise ValueError("Writer view exceeds the local slot payload")
+                offsets.flags.writeable = lengths.flags.writeable = False
+                self._single_view = (view_key, pool, offsets, lengths)
+
+    def register_window(
+        self, agent, peer: str, key: bytes, receive_slice: _BounceReceiveSlice
+    ) -> None:
+        register_slots = getattr(agent, "register_bounce_window_slots", None)
+        if self._single_view is not None and register_slots is not None:
+            view_key, pool, offsets, lengths = self._single_view
+            if view_key not in receive_slice.chunk.excluded_pool_views:
+                helix_stride = self.local.cp_size > 1 and self.writer.self_rank_info.cp_size == 1
+                slots, _, _, _ = receive_slice.span(view_key[0], helix_stride)
+                if slots.dtype in (np.int64, np.int32):
+                    register_slots(
+                        peer,
+                        self.endpoint,
+                        key,
+                        np.ascontiguousarray(slots, dtype=np.int64),
+                        pool.base_address,
+                        pool.slot_stride_bytes,
+                        pool.slot_bytes,
+                        pool.num_slots,
+                        offsets,
+                        lengths,
+                    )
+                    return
+        agent.register_bounce_window(peer, self.endpoint, key, self.destinations(receive_slice))
 
     def destinations(self, receive_slice: _BounceReceiveSlice) -> MemoryDescs:
         chunk = receive_slice.chunk
@@ -3649,13 +3707,9 @@ class Receiver(ReceiverBase):
                         projection = projections.get(rank)
                         if projection is None:
                             continue  # This writer did not advertise the bounce transport.
-                        destinations = projection.destinations(receive_slice)
                         key = secrets.token_bytes(16)
-                        self._agent.register_bounce_window(
-                            peer_infos.instance_name + str(rank),
-                            projection.endpoint,
-                            key,
-                            destinations,
+                        projection.register_window(
+                            self._agent, peer_infos.instance_name + str(rank), key, receive_slice
                         )
                         task._bounce_windows[rank] = (self._agent, key)
                         published_window_keys[rank] = key
