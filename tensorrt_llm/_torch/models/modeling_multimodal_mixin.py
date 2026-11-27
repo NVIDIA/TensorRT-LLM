@@ -17,6 +17,7 @@
 import contextlib
 import copy
 import itertools
+import sys
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -215,18 +216,45 @@ def _build_batched_input(fields: list[dict[str, tuple[int | None, Any]]]) -> dic
     return inputs
 
 
+def _encoder_batch_slices(
+    sizes: Iterable[tuple[int, int]], max_tokens: int, max_items: int
+) -> Iterator[slice]:
+    start = end = tokens = items = 0
+    for index, (cost, count) in enumerate(sizes):
+        if index > start and (tokens + cost > max_tokens or items + count > max_items):
+            yield slice(start, index)
+            start = index
+            tokens = items = 0
+        tokens += cost
+        items += count
+        end = index + 1
+    if end > start:
+        yield slice(start, end)
+
+
+def _encoder_payload_size(param: MultimodalParams, modalities: tuple[str, ...]) -> tuple[int, int]:
+    metadata = param.item_metadata
+    assert metadata is not None  # Group members have already supplied an output layout.
+    indices = [i for i, (m, _) in enumerate(metadata.item_refs) if m in modalities]
+    costs = metadata.encoder_token_lengths
+    return (sum(costs[i] for i in indices) if costs is not None else 0, len(indices))
+
+
 def _encode_modality(
     group: EncoderGroup,
     modality: str,
     params: list[MultimodalParams],
-    layouts: Sequence[tuple[Sequence[tuple[str, int]], Sequence[int]]],
+    max_tokens: int,
+    max_items: int,
 ) -> torch.Tensor:
     """Batch compatible payloads and return their embeddings in request and local item order."""
     fields = []
     output_lengths = []
+    request_indices = []
     owner = getattr(group.encoder_fn, "__self__", None)
     derive_partitions = getattr(owner, "get_multimodal_item_partitions", None)
-    for param, (refs, lengths) in zip(params, layouts, strict=True):
+    for request_index, param in enumerate(params):
+        refs, lengths = param.get_item_layout()
         data = param.multimodal_data.get(modality)
         if data is None:
             continue
@@ -234,7 +262,8 @@ def _encode_modality(
         if not item_lengths:
             continue
         metadata = param.item_metadata
-        partitions = metadata.input_partitions.get(modality) if metadata is not None else None
+        assert metadata is not None
+        partitions = metadata.input_partitions.get(modality)
         if derive_partitions is not None and data.keys() - (partitions or {}).keys():
             defaults = derive_partitions(param, modality)
             if defaults is not None:
@@ -250,6 +279,7 @@ def _encode_modality(
             for axis, value in payload.values()
         ):
             for index, length in sorted(item_lengths):
+                request_indices.append(request_index)
                 fields.append(
                     {
                         key: (axis, partitions[key].select(value, [index]))
@@ -258,6 +288,7 @@ def _encode_modality(
                 )
                 output_lengths.append(length)
         else:
+            request_indices.append(request_index)
             fields.append(payload)
             output_lengths.append(sum(length for _, length in item_lengths))
 
@@ -273,8 +304,19 @@ def _encode_modality(
         else:
             batches.append([index])
 
-    pieces = {}
+    bounded_batches = []
     for batch in batches:
+        # A heterogeneous request can contribute several fields of the same shape.
+        # Apply capacity at request boundaries within this compatible batch.
+        members = []
+        sizes = []
+        for i, indices in itertools.groupby(batch, key=request_indices.__getitem__):
+            members.append(list(indices))
+            sizes.append(_encoder_payload_size(params[i], (modality,)))
+        for span in _encoder_batch_slices(sizes, max_tokens, max_items):
+            bounded_batches.append(list(itertools.chain.from_iterable(members[span])))
+    pieces = {}
+    for batch in bounded_batches:
         out = group.encoder_fn(**_build_batched_input([fields[i] for i in batch]))
         lengths = [output_lengths[i] for i in batch]
         expected = sum(lengths)
@@ -282,7 +324,7 @@ def _encode_modality(
             raise MultimodalEncoderContractError(
                 f"MM encoder returned {out.shape[0]} embeddings, item metadata expects {expected}"
             )
-        if len(batches) == 1:
+        if len(bounded_batches) == 1:
             return out
         pieces.update(zip(batch, out.split(lengths), strict=True))
     return torch.cat([pieces[i] for i in range(len(output_lengths))])
@@ -395,6 +437,7 @@ def _reorder_embeds_by_manifest(
 def encode_multimodal_by_groups(
     mm_encoder_groups: Sequence["EncoderGroup"],
     multimodal_params: Sequence[MultimodalParams],
+    model: object | None = None,
 ) -> torch.Tensor:
     """Run each group's encoder over its batched items and reorder into
     per-request prompt order.
@@ -407,6 +450,12 @@ def encode_multimodal_by_groups(
     mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering
     contract lives in one place.
     """
+    config = getattr(model, "model_config", None)
+    attrs = getattr(config, "extra_attrs", {})
+    max_tokens = attrs.get(
+        "encoder_max_num_tokens", getattr(config, "max_num_tokens", None) or sys.maxsize
+    )
+    max_items = attrs.get("encoder_batch_size", sys.maxsize)
     per_modality_embeds: Dict[str, torch.Tensor] = {}
     per_modality_lengths: Dict[str, List[int]] = {}
     item_layouts = [mp.get_item_layout() for mp in multimodal_params]
@@ -429,15 +478,26 @@ def encode_multimodal_by_groups(
             for modality in group.modalities:
                 if lengths[modality]:
                     per_modality_embeds[modality] = _encode_modality(
-                        group, modality, group_params, group_layouts
+                        group, modality, group_params, max_tokens, max_items
                     )
             continue
-        out = group.encoder_fn(**group.build_batched_input(group_params))
-        cursor = 0
-        for m in group.modalities:
-            total = sum(lengths[m])
-            per_modality_embeds[m] = out[cursor : cursor + total]
-            cursor += total
+        sizes = (_encoder_payload_size(param, group.modalities) for param in group_params)
+        pieces = {m: [] for m in group.modalities}
+        for span in _encoder_batch_slices(sizes, max_tokens, max_items):
+            batch = group_params[span]
+            out = group.encoder_fn(**group.build_batched_input(batch))
+            batch_lengths = (
+                lengths
+                if len(batch) == len(group_params)
+                else _lengths_by_modality(group_layouts[span], group.modalities)
+            )
+            cursor = 0
+            for m in group.modalities:
+                total = sum(batch_lengths[m])
+                pieces[m].append(out[cursor : cursor + total])
+                cursor += total
+        for m, outputs in pieces.items():
+            per_modality_embeds[m] = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
 
 
@@ -645,7 +705,7 @@ class MultimodalModelMixin:
         groups = self.mm_encoder_groups
         if not groups:
             raise NotImplementedError
-        return encode_multimodal_by_groups(groups, multimodal_params)
+        return encode_multimodal_by_groups(groups, multimodal_params, self)
 
     def validate_multimodal_request_data(self, mm_data: dict) -> None:
         """Admission-time validation of one request's multimodal payload.

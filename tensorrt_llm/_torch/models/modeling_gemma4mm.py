@@ -1039,7 +1039,8 @@ def _gemma4_encode_view(param: MultimodalParams, modality: str) -> MultimodalPar
             payload["image_position_ids"] = positions
 
     partition = MultimodalItemPartition.batched()
-    if modality == "video" and (metadata := param.item_metadata) is not None:
+    metadata = param.item_metadata
+    if modality == "video" and metadata is not None:
         recorded = metadata.input_partitions.get("video", {}).get("pixel_values")
         if recorded is not None:
             partition = recorded
@@ -1048,6 +1049,7 @@ def _gemma4_encode_view(param: MultimodalParams, modality: str) -> MultimodalPar
     refs, lengths = param.get_item_layout()
     layout = MultimodalItemMetadata(
         refs,
+        encoder_token_lengths=metadata.encoder_token_lengths if metadata is not None else None,
         output_embedding_lengths=lengths,
         input_partitions={modality: {name: partition for name in payload}},
     )
@@ -1245,7 +1247,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         for payload, name, key in fields:
             if payload[name].dtype != dtypes[key]:
                 payload[name] = payload[name].to(dtypes[key])
-        return encode_multimodal_by_groups(tuple(groups.values()), views)
+        return encode_multimodal_by_groups(tuple(groups.values()), views, self)
 
     @staticmethod
     def get_sub_model_config(

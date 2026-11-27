@@ -463,7 +463,9 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
         encoder_batch_size=num_images,
     )
 
-    params = profiler._create_dummy_encoder_inputs()
+    profile = profiler._create_dummy_encoder_inputs()
+    assert profile is not None
+    params, _, _ = profile
 
     def encode(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         assert grid_thw.shape == (num_images, 3)

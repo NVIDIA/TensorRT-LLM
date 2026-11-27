@@ -471,7 +471,7 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
         return _qwen_vision_groups(self.encode_batched, _qwen3vl_build_batched_input)
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params, self)]
 
 
 class Cosmos3EdgeAttention(Attention):

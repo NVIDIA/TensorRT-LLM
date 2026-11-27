@@ -471,6 +471,36 @@ def test_prepared_gemma4_audio_groups_preserve_width_and_mask():
     ]
 
 
+@pytest.mark.cpu_only
+def test_prepared_gemma4_inline_audio_encoder_capacity():
+    processor = _make_item_input_processor(audio_seq_length=750)
+    model = Gemma4ForConditionalGeneration.__new__(Gemma4ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_config = SimpleNamespace(
+        extra_attrs={"encoder_max_num_tokens": 750, "encoder_batch_size": 8}
+    )
+    model.model_dtype = torch.bfloat16
+    model.embed_audio = torch.nn.Identity()
+    model.embed_audio.embedding_projection = torch.nn.Linear(1, 1)
+    model.audio_tower = mock.Mock(
+        side_effect=lambda features: SimpleNamespace(last_hidden_state=features[:, ::4])
+    )
+    clips = torch.arange(8 * 3000, dtype=torch.float32).reshape(8, 3000, 1)
+
+    def request(clip):
+        param = _with_item_metadata({"audio": {"audio_features": clip}}, processor)
+        param.multimodal_runtime = MultimodalRuntimeData(0, 750, torch.arange(1, 751))
+        return param
+
+    expected = torch.cat(
+        [model._get_or_encode_multimodal_embeddings([request(clip)]) for clip in clips.split(1)]
+    )
+    model.audio_tower.reset_mock()
+    actual = model._get_or_encode_multimodal_embeddings([request(clip) for clip in clips.split(1)])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert [call.args[0][:, ::4].numel() for call in model.audio_tower.call_args_list] == [750] * 8
+
+
 def test_unified_audio_projects_compatible_clips_once():
     model = Gemma4UnifiedForConditionalGeneration.__new__(Gemma4UnifiedForConditionalGeneration)
     torch.nn.Module.__init__(model)

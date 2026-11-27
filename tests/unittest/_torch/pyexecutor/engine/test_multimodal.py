@@ -376,6 +376,7 @@ def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
     llm_args = SimpleNamespace(
         max_num_tokens=max_num_tokens,
         encoder_max_num_tokens=encoder_max_num_tokens,
+        encoder_max_batch_size=None,
         get_runtime_sizes=lambda: (1, max_num_tokens, 128, 1),
         multimodal_config=None,
         cuda_graph_config=None,
@@ -388,6 +389,7 @@ def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
         assert built.max_num_tokens == 128
 
     assert setup_metadata.call_args.args[2] == tower_budget
+    assert setup_metadata.call_args.kwargs["encoder_batch_size"] == 1
     assert setup_graphs.call_args.kwargs["max_num_tokens"] == tower_budget
 
 

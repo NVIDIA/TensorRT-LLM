@@ -232,14 +232,16 @@ def test_executor_factory_enables_chunk_item_scheduling_only_for_v2(
         mapping=mapping,
         mm_encoder_item_scheduling_enabled=True,
         mm_encoder_cache=TensorLRUCache(8),
-        encoder_batch_size=1,
+        encoder_batch_size=2,
         encoder_max_num_tokens=8,
         bytes_per_mm_encoder_embedding=4,
         get_mm_encoder_item_cache_keys=_item_cache_keys,
         model=SimpleNamespace(
             encoder_cache_active=False,
             model_config=SimpleNamespace(
-                pretrained_config=SimpleNamespace(), is_encoder_decoder=False
+                pretrained_config=SimpleNamespace(),
+                is_encoder_decoder=False,
+                extra_attrs={"encoder_batch_size": 2, "encoder_max_num_tokens": 4},
             ),
         ),
     )
@@ -486,13 +488,14 @@ def test_multimodal_scheduler_respects_encoder_batch_size():
     assert output.context_requests == []
 
 
-def test_multimodal_scheduler_withholds_request_on_budget_overflow():
+@pytest.mark.parametrize(("costs", "selected"), [([6, 4, 1], [0, 1]), ([12, 1], [0])])
+def test_multimodal_scheduler_withholds_request_on_budget_overflow(costs, selected):
     scheduler = _scheduler(max_batch_size=3, max_num_tokens=10)
-    request = make_mm_request(1, [6, 4, 1])
+    request = make_mm_request(1, costs)
 
     output = scheduler.schedule_request([request], set())
 
-    assert output.scheduled_mm_encoder_items == {1: [0, 1]}
+    assert output.scheduled_mm_encoder_items == {1: selected}
     assert output.context_requests == []
 
 

@@ -1654,7 +1654,8 @@ class Qwen2VisionModelBase(nn.Module):
             multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         return [
             encode_multimodal_by_groups(
-                _qwen_vision_groups(self._encode_batched), multimodal_params)
+                _qwen_vision_groups(self._encode_batched), multimodal_params,
+                self)
         ]
 
 

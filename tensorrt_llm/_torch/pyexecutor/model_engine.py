@@ -396,6 +396,7 @@ class ModelEngine:
             mm_item_scheduler.attention_metadata_capacity
             if mm_item_scheduler is not None
             else None,
+            encoder_batch_size=self.encoder_batch_size,
         )
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
         self._init_model_capacity()

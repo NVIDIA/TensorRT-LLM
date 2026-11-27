@@ -323,7 +323,7 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
 
         def get_mm_max_tokens_per_item(self, max_num_encoder_tokens=None):
             del max_num_encoder_tokens
-            return {"image": 4096}
+            return {"image": 4096, "video": 10001}
 
         def get_dummy_mm_data(
             self,
@@ -343,10 +343,12 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
         def __init__(self):
             self.forwarded_item_counts = []
             self.last_output = None
+            self.last_inputs = None
 
         def encode_multimodal_inputs(self, multimodal_params):
             assert scope.__enter__.called
             assert not scope.__exit__.called
+            self.last_inputs = multimodal_params
             count = multimodal_params[0].multimodal_data["image"]["item_count"]
             self.forwarded_item_counts.append(count)
             self.last_output = torch.arange(count * 4).reshape(count, 4)
@@ -354,13 +356,15 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
 
     input_processor = _InputProcessor()
     model = _Model()
-    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
+    model.model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(vocab_size=128), extra_attrs={}
+    )
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(
         model=model,
         input_processor=input_processor,
         encoder_batch_size=4,
-        encoder_max_num_tokens=8192,
+        encoder_max_num_tokens=10000,
     )
     creator._llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
     creator._profiling_stage_data = {"enable_mm_reqs": True}
@@ -375,21 +379,21 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert input_processor.calls == []
     assert all(getattr(request, "py_multimodal_data", None) is None for request in requests)
 
-    creator._dummy_encoder_inputs = creator._create_dummy_encoder_inputs()
-    encoder_inputs = creator._dummy_encoder_inputs
-    assert input_processor.calls == [(8192, {"image": 2}, torch.float16)]
-
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
     with patch(
         "tensorrt_llm._torch.pyexecutor._util.discard_nccl_window_tensor_outputs",
         return_value=scope,
     ) as make_scope:
         retained_output = creator._encode_dummy_inputs()
-    make_scope.assert_called_once_with(encoder_inputs)
+    make_scope.assert_called_once_with(model.last_inputs)
+    assert input_processor.calls == [(10000, {"image": 2}, torch.float16)]
+    assert model.model_config.extra_attrs == {
+        "encoder_max_num_tokens": 8192,
+        "encoder_batch_size": 4,
+    }
     scope.__exit__.assert_called_once_with(None, None, None)
     assert model.forwarded_item_counts == [2]
     assert retained_output.data_ptr() != model.last_output.data_ptr()
-    assert creator._dummy_encoder_inputs == []
 
 
 def _make_creator(
@@ -592,7 +596,7 @@ def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
     )
 
     assert model.model_config.multimodal_config.encoder_cache_max_bytes == 0
-    assert creator._create_dummy_encoder_inputs() == []
+    assert creator._create_dummy_encoder_inputs() is None
     assert creator._get_multimodal_encoder_memory_reserve() == 0
 
 

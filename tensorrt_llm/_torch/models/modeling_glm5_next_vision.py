@@ -725,7 +725,7 @@ class Glm5NextVisionModelBase(nn.Module):
         )
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params, self)]
 
 
 def _flatten_video_grid_thw(video_grid_thw: torch.Tensor) -> torch.Tensor:

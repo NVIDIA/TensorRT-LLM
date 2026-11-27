@@ -1148,6 +1148,7 @@ class NemotronHMultimodalEncoder(NemotronHVisionEncoder):
                     EncoderGroup(("video",), partial(_encoder_fn, modality="video"), pack),
                 ),
                 multimodal_params,
+                self,
             )
         ]
 

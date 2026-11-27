@@ -305,6 +305,36 @@ def test_wrapper_encodes_image_spans_and_tracks_active_positions(
         assert wrapper.llm.forward.call_args.kwargs["context_requests"] is requests
 
 
+def test_wrapper_bounds_four_images_by_profiled_capacity() -> None:
+    wrapper = _wrapper()
+    wrapper.model_config = SimpleNamespace(max_batch_size=1, max_num_tokens=8192, extra_attrs={})
+    wrapper.vision = Mock(side_effect=lambda pixels, height, width: pixels[:, ::9, :2])
+    wrapper.aligner = Mock(side_effect=lambda features, height, width: features)
+    wrapper.image_start = wrapper.image_end = wrapper.image_newline = torch.zeros(2)
+    processor = DeepseekV41InputProcessor.__new__(DeepseekV41InputProcessor)
+    processor._vision_enabled = True
+    processor._downsample_ratio = 3
+    processor._max_image_tokens = 1024
+    setup_mm_encoder_attn_metadata(wrapper, processor, 32768, None)
+
+    # At patch size 14 a 1260 x 1260 image has 90 x 90 patches.
+    pixels = [torch.full((1,), float(i)).expand(8100, 3, 14, 14) for i in range(4)]
+
+    def encode(images):
+        image = {
+            "pixel_values": images,
+            "image_grid_hw": [(90, 90)] * len(images),
+            "llm_grid_hw": [(30, 30)] * len(images),
+            "num_tokens": [932] * len(images),
+        }
+        return wrapper.encode_multimodal_inputs([SimpleNamespace(multimodal_data={"image": image})])
+
+    expected = torch.cat([encode([image]) for image in pixels])
+    wrapper.vision.reset_mock()
+    torch.testing.assert_close(encode(pixels), expected, rtol=0, atol=0)
+    assert [call.args[0].shape[:2] for call in wrapper.vision.call_args_list] == [(1, 8100)] * 4
+
+
 def test_wrapper_request_lifecycle_preserves_image_history() -> None:
     wrapper = _wrapper()
     provider = Mock(config=SimpleNamespace(max_ngram_size=4))

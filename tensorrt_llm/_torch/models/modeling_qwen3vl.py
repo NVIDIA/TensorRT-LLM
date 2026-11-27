@@ -1553,7 +1553,7 @@ class Qwen3VisionModelBase(nn.Module):
         modality-batched ViT the aggregated path uses and applies the
         per-request `item_metadata.item_refs` reorder before returning.
         """
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params, self)]
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):

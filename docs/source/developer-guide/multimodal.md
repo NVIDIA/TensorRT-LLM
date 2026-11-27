@@ -98,6 +98,14 @@ non-item dimensions, dtypes, devices, or shared values require separate calls.
 A tower that needs a different layout can keep its custom builder. The runtime
 restores the embeddings to each request's prompt order.
 
+The item scheduler and grouped encoders use the token capacity of the startup
+encoder batch and the configured encoder item limit. For example, if the
+largest dummy image costs 12,100 patches and the budget is 16,384, only one
+such image fits. Runtime batches then have a 12,100-patch limit. When startup
+skips encoder profiling, the configured token budget applies. Grouped encoders
+apply both limits between request payloads. A payload that exceeds either
+limit runs alone. Without `encoder_token_lengths`, only its item count is known.
+
 ## Processor Hooks
 
 Processors implement
