@@ -8,9 +8,11 @@
 - [Image generation evaluation](#image-generation-evaluation)
   - [Qwen Image Bench](#qwen-image-bench)
 - [Video generation evaluation](#video-generation-evaluation)
+  - [Generate references and targets](#generate-references-and-targets)
   - [LPIPS](#lpips)
+  - [Latent RMSE](#latent-rmse)
 
-`image_generation_eval` and `video_generation_eval` use two separate configurations:
+`image_generation_eval` and `video_generation_eval` use separate generator and evaluator configurations:
 
 * `--config generator.yaml` configures the VisualGen generator and its
   `generation_params` (for example, seed, resolution, frame count, and inference steps).
@@ -97,10 +99,128 @@ quote dimension names containing spaces on the command line.
 
 ## Video generation evaluation
 
+### Generate references and targets
+
+LPIPS and RMSE compare a target against a reference. To generate both in one
+command, supply the following inputs:
+
+| Input | CLI option | Purpose |
+| --- | --- | --- |
+| Target model | `--model` | Checkpoint used for target generation; placed before the subcommand. |
+| Target generation YAML | `--config` | Target runtime settings and `generation_params`. |
+| Reference generation YAML | `--reference-config` | Baseline runtime settings and `generation_params`; optional `model` overrides the target checkpoint. |
+| Evaluation YAML | `--evaluator-options` | Optional metric settings; omit to use defaults. |
+| Prompt list | `--prompts` | The same ordered prompts are used for both generations. |
+| Report directory | `--output-dir` | Destination for JSON reports. |
+
+Choose the metric with `--evaluator lpips` or `--evaluator rmse`. With these
+inputs, the toolkit handles reference generation, target generation, artifact
+pairing, scoring, aggregation, and report writing. No separate baseline-generation
+script or manually populated reference directory is needed. Both models run in
+the current TRTLLM installation; the reference YAML does not select a different
+TRTLLM version. Generation settings are independent, so the target config does
+not inherit settings from the reference config.
+
+For either LPIPS or RMSE, pass `--reference-config baseline.yaml` to generate the
+baseline as part of evaluation. This YAML uses the same VisualGen arguments and
+`generation_params` structure as the target `--config`, with an optional `model`
+field (defaults to the root `--model`). Specify the same prompts, seed, dimensions,
+frame count, and scheduler settings in both configurations for a controlled
+comparison; only change the model settings you intend to evaluate. Each side's
+actual generation parameters are recorded in `results.json`.
+
+For example, create `baseline.yaml` with your BF16 generation settings, and
+`target.yaml` with identical generation parameters plus dynamic FP8 quantization:
+
+```yaml
+# baseline.yaml (model is optional)
+model: /path/to/MiniMax-H3
+generation_params:
+  seed: 42
+  height: 256
+  width: 256
+  num_frames: 124
+  frame_rate: 24
+  num_inference_steps: 4
+```
+
+Copy those generation parameters into `target.yaml` and add:
+
+```yaml
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+```
+
+For LPIPS, an optional evaluation config can select the scoring backbone and
+device (these values are also the defaults):
+
+```yaml
+# lpips.yaml
+net: alex
+device: cpu
+```
+
+```bash
+trtllm-eval --model /path/to/MiniMax-H3 video_generation_eval \
+  --config target.yaml \
+  --reference-config baseline.yaml \
+  --evaluator lpips \
+  --evaluator-options lpips.yaml \
+  --prompts prompts.json \
+  --output-dir results/lpips \
+  --media-dir comparisons
+```
+
+For RMSE, there are currently no additional scoring options in this mode.
+Omit `--evaluator-options`, or pass an `rmse.yaml` containing an empty mapping:
+
+```yaml
+# rmse.yaml
+{}
+```
+
+```bash
+trtllm-eval --model /path/to/MiniMax-H3 video_generation_eval \
+  --config target.yaml \
+  --reference-config baseline.yaml \
+  --evaluator rmse \
+  --evaluator-options rmse.yaml \
+  --prompts prompts.json \
+  --output-dir results/rmse \
+  --media-dir comparisons
+```
+
+Keep `--config` after `video_generation_eval`: it is a subcommand option.
+Each invocation scores one metric; run the respective command for LPIPS or RMSE.
+
+LPIPS compares decoded video frames; it does not score audio. RMSE automatically requests
+latent outputs for both passes. The command generates one reference and one target
+per prompt: it finishes the reference pass and closes that model before loading
+the target, so both models do not need to fit in GPU memory simultaneously.
+
+`--media-dir comparisons` retains both sets of artifacts in a unique
+`comparisons/trtllm-eval-*/reference/` and `target/` directory, using prompt-order
+filenames (`0000.mp4` for LPIPS, `0000.safetensors` for RMSE). Omitting
+`--media-dir` uses temporary storage that is removed after evaluation, including
+on failure. Reports remain in `--output-dir`; `artifacts_retained` indicates
+whether the artifact paths in the report are still available. Explicitly retained
+artifacts are kept on failure as well, for inspection.
+
+`--evaluator-options` is optional with `--reference-config`; use it for LPIPS
+`net`/`device` overrides. Do not combine reference generation with `reference_dir`
+or `generated_dir` in that YAML. Existing-directory evaluation is unchanged and
+still uses `reference_dir` as described below. `--media-dir` applies only to
+reference-generation mode.
+
 ### LPIPS
 
-Select LPIPS with `video_generation_eval --evaluator lpips`. An
-`--evaluator-options` YAML file is required:
+Select LPIPS with `video_generation_eval --evaluator lpips`. To generate the
+reference automatically, use [Generate references and targets](#generate-references-and-targets)
+above; the evaluator YAML is optional in that mode.
+
+To use existing baseline videos instead, omit `--reference-config` and supply
+an `--evaluator-options` YAML file:
 
 ```yaml
 reference_dir: baselines
@@ -111,7 +231,7 @@ device: cpu               # Optional; default: cpu.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `reference_dir` | Required | Existing directory containing the baseline MP4 videos. |
+| `reference_dir` | Required without `--reference-config` | Existing directory containing the baseline MP4 videos; omit when generating references. |
 | `generated_dir` | Omitted | Existing directory containing videos to score. When supplied, generation is skipped. The root CLI still requires `--model`, but does not load it in this mode. |
 | `net` | `alex` | LPIPS backbone: `alex`, `vgg`, or `squeeze`. Keep the backbone consistent when comparing scores across runs. |
 | `device` | `cpu` | PyTorch device used for scoring, such as `cpu`, `cuda`, or `cuda:0`. |
@@ -151,7 +271,7 @@ trtllm-eval --model /path/to/video-model video_generation_eval \
   --output-dir results
 ```
 
-New videos are saved as `results/generated_videos/0000.mp4`, etc. A supplied
+Without `--reference-config`, new videos are saved as `results/generated_videos/0000.mp4`, etc. A supplied
 `generated_dir` is an input directory, not a destination for new generation.
 Both modes write `results.json` and `results.jsonl` under `--output-dir`.
 Completed scores are flushed to `results.jsonl` after each video, so they survive
@@ -165,3 +285,95 @@ lower is better. Reference and generated videos must have equal frame rates,
 frame counts, and dimensions. Empty videos and non-finite scores are rejected;
 frames are not resized, trimmed, or temporally aligned. The reported aggregate is
 the mean of the per-video scores; the command does not apply a quality threshold.
+
+### Latent RMSE
+
+`--evaluator rmse` measures numerical drift in **final denoising latents**, before
+VAE decoding. It reports `video_latent_rmse` and, when present, `audio_latent_rmse`
+separately: `sqrt(mean((candidate - reference)**2))`. Arithmetic uses CPU float64;
+the summary is the arithmetic mean of per-prompt RMSE values, not a pooled RMSE.
+Lower is closer to the reference, but this is not a perceptual quality score.
+
+The generator must support `extra_params.output_type: latent` (including MiniMax
+H3). The evaluator selects this option automatically during generation. Latent
+files use prompt order (`0000.safetensors`, `0001.safetensors`, ...), with named
+`video_latent` and optional `audio_latent` tensors. Decoded videos and tensors
+saved from normal decoded outputs are not valid latent baselines. Both sides
+must contain the same modalities and exact shapes; no resizing or truncation is
+performed. Empty tensors and nonfinite values are rejected.
+
+To generate both H3 BF16 reference latents and dynamic FP8 target latents
+automatically, use the RMSE command in
+[Generate references and targets](#generate-references-and-targets). There is no
+need to save baseline tensors separately.
+
+Alternatively, to reuse existing BF16 baseline latents, omit
+`--reference-config` and configure their directory:
+
+```yaml
+# rmse.yaml
+reference_dir: /path/to/bf16_latents
+# Optional: score already generated latent files instead of generating them.
+# generated_dir: /path/to/fp8_latents
+```
+
+```yaml
+# fp8.yaml
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+generation_params:
+  seed: 42
+  height: 768
+  width: 1344
+  num_frames: 124
+  frame_rate: 24
+  num_inference_steps: 50
+```
+
+To generate and score:
+
+```bash
+trtllm-eval --model /path/to/MiniMax-H3 video_generation_eval \
+  --evaluator rmse --config fp8.yaml --evaluator-options rmse.yaml \
+  --prompts prompts.json --output-dir results/fp8
+```
+
+New tensors are saved in `results/fp8/generated_latents/`, with per-prompt scores
+and generation parameters in the JSON reports. To score existing tensors, set
+`generated_dir` in `rmse.yaml` and omit `--config`; the root command still requires
+`--model`, although it does not load that model in existing-file mode.
+
+For this existing-reference workflow, generate the BF16 reference once using the same checkpoint and generation
+settings, without `quant_config`. For example, save the matching settings above
+as `bf16.yaml` and use the evaluation helpers:
+
+```python
+from pathlib import Path
+
+from tensorrt_llm.evaluate.visual_gen.config import load_prompt_records
+from tensorrt_llm.evaluate.visual_gen.generators import build_visual_generator
+from tensorrt_llm.evaluate.visual_gen.rmse import save_latents
+
+_, prompts = load_prompt_records("prompts.json", None)
+reference_dir = Path("bf16_latents")
+reference_dir.mkdir(parents=True, exist_ok=True)
+generator, params = build_visual_generator("/path/to/MiniMax-H3", "bf16.yaml")
+try:
+    params.extra_params = {**(params.extra_params or {}), "output_type": "latent"}
+    for index, prompt in enumerate(prompts):
+        output = generator.generate([prompt], params)[0]
+        if output.error:
+            raise RuntimeError(output.error)
+        save_latents(output, reference_dir / f"{index:04d}.safetensors")
+finally:
+    generator.close()
+```
+
+Use the same prompt order, seed, dimensions, frame count, scheduler settings,
+conditioning, model revision, and runtime settings on both sides, changing only
+the intended quantization setting. File pairing validates shapes and modalities;
+it cannot prove that independently supplied baselines used matching settings.
+H3 latent output excludes fixed conditioning rows and retains the final scheduler
+outputs for video and audio. It does not compare intermediate denoising steps or
+teacher-forced trajectories.

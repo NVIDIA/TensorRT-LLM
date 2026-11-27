@@ -1369,7 +1369,8 @@ def test_infer_supports_a_last_frame_without_a_first_frame(
     assert captured["keyframe_anchors"] == ("last",)
 
 
-def test_infer_unwraps_the_executor_single_prompt_list() -> None:
+@pytest.mark.parametrize("output_type", ["pt", "latent"])
+def test_infer_unwraps_the_executor_single_prompt_list(output_type: str) -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
     captured: dict[str, object] = {}
 
@@ -1385,7 +1386,7 @@ def test_infer_unwraps_the_executor_single_prompt_list() -> None:
             negative_prompt=None,
             num_images_per_prompt=1,
             image_reference=None,
-            extra_params=None,
+            extra_params={"output_type": output_type},
             seed=0,
             height=128,
             width=128,
@@ -1397,6 +1398,7 @@ def test_infer_unwraps_the_executor_single_prompt_list() -> None:
 
     assert pipeline.infer(request) == "output"
     assert captured["prompt"] == "one public API prompt"
+    assert captured["output_type"] == output_type
 
 
 def test_prepare_request_derives_default_canvas_from_last_only_keyframe(
@@ -1664,7 +1666,7 @@ def test_h3_workflow_reference_slots(workflow: str) -> None:
         assert "reference_order" in pipeline.extra_param_specs
     else:
         assert set(slots) == {"image_reference"}
-        assert not pipeline.extra_param_specs
+        assert set(pipeline.extra_param_specs) == {"output_type"}
 
 
 @pytest.mark.parametrize(
@@ -2192,3 +2194,43 @@ def test_pipeline_accepts_masked_ulysses_backends(
     config = _ulysses_pipeline_config(2)
     config.attention.backend = backend
     MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("output_type", ["latent", "invalid"])
+def test_h3_final_latent_output_skips_decoders(monkeypatch, output_type):
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    final = {}
+    denoise = pipeline.denoise
+
+    def capture(**kwargs):
+        video, streams = denoise(**kwargs)
+        final["video"] = video.clone()
+        final["audio"] = streams["audio"].clone()
+        return video, streams
+
+    def fail_decode(*args, **kwargs):
+        raise AssertionError("Latent output must not decode either modality")
+
+    monkeypatch.setattr(pipeline, "denoise", capture)
+    monkeypatch.setattr(pipeline, "decode_latents", fail_decode)
+    kwargs = dict(
+        prompt="a synthetic prompt",
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=2,
+        output_type=output_type,
+    )
+    if output_type == "invalid":
+        with pytest.raises(ValueError, match="output_type"):
+            pipeline.forward(**kwargs)
+        assert not final
+    else:
+        output = pipeline.forward(**kwargs)
+        torch.testing.assert_close(output.video, final["video"], rtol=0, atol=0)
+        torch.testing.assert_close(output.audio, final["audio"], rtol=0, atol=0)
+        assert output.video.shape[0] == output.audio.shape[0] == 1
+        assert output.frame_rate is None
+        assert output.audio_sample_rate is None

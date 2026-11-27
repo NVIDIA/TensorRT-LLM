@@ -683,3 +683,330 @@ def test_script_lpips_failure_precedes_generator_initialization(tmp_path, monkey
     )
     with pytest.raises(ImportError, match="missing LPIPS"):
         module._evaluate(args)
+
+
+def test_latent_rmse_modalities_and_precision(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+
+    from tensorrt_llm.evaluate.visual_gen.rmse import score_latent_files
+
+    reference, candidate = tmp_path / "ref.safetensors", tmp_path / "test.safetensors"
+    save_file(
+        {"video_latent": torch.zeros(2, dtype=torch.bfloat16), "audio_latent": torch.ones(3)},
+        str(reference),
+    )
+    save_file(
+        {
+            "video_latent": torch.tensor([3.0, 4.0], dtype=torch.bfloat16),
+            "audio_latent": torch.full((3,), 3.0),
+        },
+        str(candidate),
+    )
+    assert score_latent_files(candidate, reference) == pytest.approx(
+        {"video_latent_rmse": (12.5**0.5), "audio_latent_rmse": 2.0}
+    )
+    assert set(score_latent_files(reference, reference).values()) == {0.0}
+
+
+@pytest.mark.parametrize(
+    "bad, message",
+    [
+        ({"video_latent": [float("nan"), 0.0]}, "NaN"),
+        ({"video_latent": []}, "non-empty"),
+        ({"video_latent": [1.0]}, "shape mismatch"),
+        ({"video": [1.0, 2.0]}, "expected video_latent"),
+        ({"video_latent": [1.0, 2.0], "audio_latent": [1.0]}, "modalities differ"),
+    ],
+)
+def test_latent_rmse_rejects_invalid_pairs(tmp_path, bad, message):
+    import torch
+    from safetensors.torch import save_file
+
+    from tensorrt_llm.evaluate.visual_gen.rmse import score_latent_files
+
+    reference, candidate = tmp_path / "ref.safetensors", tmp_path / "test.safetensors"
+    save_file({"video_latent": torch.zeros(2)}, str(reference))
+    save_file({key: torch.tensor(value) for key, value in bad.items()}, str(candidate))
+    with pytest.raises(ValueError, match=message):
+        score_latent_files(candidate, reference)
+
+
+def test_cli_generates_latents_for_rmse(tmp_path, monkeypatch):
+    import torch
+    from safetensors.torch import save_file
+
+    from tensorrt_llm.visual_gen import VisualGenParams
+
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    save_file(
+        {"video_latent": torch.zeros(2), "audio_latent": torch.ones(2)},
+        str(baseline / "0000.safetensors"),
+    )
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("A fox")
+    options = tmp_path / "rmse.yaml"
+    options.write_text("reference_dir: baseline\n")
+    params = VisualGenParams()
+    closed = []
+
+    def generate(**kwargs):
+        assert kwargs["params"].extra_params["output_type"] == "latent"
+        assert kwargs["params"].seed == 42
+        return [SimpleNamespace(error=None, video=torch.ones(2), audio=torch.full((2,), 3.0))]
+
+    generator = SimpleNamespace(generate=generate, close=lambda: closed.append(True))
+    monkeypatch.setattr(cli, "build_visual_generator", lambda *args: (generator, params))
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--evaluator",
+            "rmse",
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ],
+        obj={"model": "MiniMax-H3"},
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads((tmp_path / "output/results.json").read_text())
+    assert payload["aggregate_scores"] == {"video_latent_rmse": 1.0, "audio_latent_rmse": 2.0}
+    assert payload["results"][0]["latent_path"] == "generated_latents/0000.safetensors"
+    assert closed == [True]
+    options.write_text("reference_dir: baseline\ngenerated_dir: output/generated_latents\n")
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--evaluator",
+            "rmse",
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(tmp_path / "offline"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (
+        json.loads((tmp_path / "offline/results.json").read_text())["aggregate_scores"]
+        == payload["aggregate_scores"]
+    )
+
+
+@pytest.mark.parametrize("evaluator", ["lpips", "rmse"])
+@pytest.mark.parametrize("retain", [False, True])
+def test_reference_generation_two_passes(tmp_path, monkeypatch, evaluator, retain):
+    from pathlib import Path
+
+    import torch
+
+    from tensorrt_llm.visual_gen import VisualGenParams
+
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("A fox\nA beach\n")
+    reference = tmp_path / "reference.yaml"
+    reference.write_text("model: baseline-model\ngeneration_params:\n  seed: 42\n")
+    events = []
+
+    def build(model, config):
+        if model == "target-model":
+            assert events[-1] == ("close", "baseline-model")
+        events.append(("build", model))
+        value = 0.0 if model == "baseline-model" else 1.0
+
+        def generate(inputs, params):
+            assert params.seed == 42
+            if evaluator == "rmse":
+                assert params.extra_params["output_type"] == "latent"
+            events.append(("generate", model, inputs[0]))
+            return [
+                SimpleNamespace(
+                    error=None,
+                    video=torch.full((2, 3), value),
+                    audio=torch.full((2, 2), value),
+                    save=lambda path: path.write_bytes(b"media"),
+                )
+            ]
+
+        return SimpleNamespace(
+            generate=generate, close=lambda: events.append(("close", model))
+        ), VisualGenParams()
+
+    monkeypatch.setattr(cli, "build_visual_generator", build)
+    if evaluator == "lpips":
+        monkeypatch.setattr(
+            evaluators,
+            "LPIPSVideoEvaluator",
+            lambda refs, net, device: SimpleNamespace(
+                evaluate=lambda *args: {"lpips": 0.25}, close=lambda: None
+            ),
+        )
+    args = [
+        "--reference-config",
+        str(reference),
+        "--prompts",
+        str(prompts),
+        "--evaluator",
+        evaluator,
+        "--output-dir",
+        str(tmp_path / "reports"),
+    ]
+    if retain:
+        args += ["--media-dir", str(tmp_path / "media")]
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command, args, obj={"model": "target-model"}
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads((tmp_path / "reports/results.json").read_text())
+    assert payload["reference_model"] == "baseline-model"
+    assert payload["reference_generation_params"]["seed"] == 42
+    assert payload["artifacts_retained"] == retain
+    assert Path(payload["artifacts_dir"]).exists() == retain
+    assert len([event for event in events if event[0] == "generate"]) == 4
+    assert events[-1] == ("close", "target-model")
+    if evaluator == "rmse":
+        assert payload["aggregate_scores"] == {"video_latent_rmse": 1.0, "audio_latent_rmse": 1.0}
+    for row in payload["results"]:
+        assert Path(row["reference_path"]).exists() == retain
+        assert Path(row["latent_path" if evaluator == "rmse" else "video_path"]).exists() == retain
+
+
+@pytest.mark.parametrize("failure", ["reference", "target", "score"])
+def test_reference_generation_cleans_up_on_failure(tmp_path, monkeypatch, failure):
+    from pathlib import Path
+
+    from tensorrt_llm.visual_gen import VisualGenParams
+
+    reference = tmp_path / "reference.yaml"
+    reference.write_text("{}")
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("A fox")
+    closed, artifacts = [], []
+    builds = []
+
+    def build(model, config):
+        phase = "reference" if not builds else "target"
+        builds.append(phase)
+
+        def generate(**kwargs):
+            if failure == phase:
+                raise RuntimeError("generation failed")
+
+            def save(path):
+                artifacts.append(path.parent.parent)
+                path.write_bytes(b"media")
+
+            return [SimpleNamespace(error=None, video=True, save=save)]
+
+        return SimpleNamespace(
+            generate=generate, close=lambda: closed.append(phase)
+        ), VisualGenParams()
+
+    def metric(*args, **kwargs):
+        def evaluate(*args):
+            raise ValueError("scoring failed")
+
+        return SimpleNamespace(evaluate=evaluate, close=lambda: closed.append("metric"))
+
+    monkeypatch.setattr(cli, "build_visual_generator", build)
+    monkeypatch.setattr(cli, "build_video_evaluator", metric)
+    # Capture the actual temporary root even if generation fails before saving.
+    original = cli.TemporaryDirectory
+
+    def temporary(**kwargs):
+        directory = original(dir=tmp_path, **kwargs)
+        artifacts.append(Path(directory.name))
+        return directory
+
+    monkeypatch.setattr(cli, "TemporaryDirectory", temporary)
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--reference-config",
+            str(reference),
+            "--prompts",
+            str(prompts),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+        obj={"model": "model"},
+    )
+    assert result.exit_code != 0
+    assert "prompt index 0" in result.output.lower()
+    assert "reference" in closed
+    if failure != "reference":
+        assert closed == ["reference", "target", "metric"]
+    assert artifacts and not any(path.exists() for path in artifacts)
+
+
+@pytest.mark.parametrize("key", ["reference_dir", "generated_dir"])
+def test_reference_generation_rejects_conflicting_directories(tmp_path, monkeypatch, key):
+    reference = tmp_path / "reference.yaml"
+    reference.write_text("{}")
+    options = tmp_path / "options.yaml"
+    options.write_text(f"{key}: /unused\n")
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("A fox")
+    monkeypatch.setattr(
+        cli, "build_visual_generator", lambda *args: pytest.fail("must validate first")
+    )
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--reference-config",
+            str(reference),
+            "--evaluator-options",
+            str(options),
+            "--prompts",
+            str(prompts),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+        obj={"model": "model"},
+    )
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+
+
+@pytest.mark.parametrize(
+    "evaluator,options",
+    [
+        ("lpips", "net: invalid"),
+        ("lpips", "device: ''"),
+        ("rmse", "net: alex"),
+        ("rmse", "unknown: true"),
+    ],
+)
+def test_reference_options_validated_before_generation(tmp_path, monkeypatch, evaluator, options):
+    reference = tmp_path / "reference.yaml"
+    reference.write_text("{}")
+    metric_options = tmp_path / "options.yaml"
+    metric_options.write_text(options)
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("A fox")
+    monkeypatch.setattr(
+        cli, "build_visual_generator", lambda *args: pytest.fail("must validate first")
+    )
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--reference-config",
+            str(reference),
+            "--evaluator",
+            evaluator,
+            "--evaluator-options",
+            str(metric_options),
+            "--prompts",
+            str(prompts),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+        obj={"model": "model"},
+    )
+    assert result.exit_code == 2
+    assert "Invalid value" in result.output
