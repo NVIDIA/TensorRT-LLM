@@ -24,6 +24,7 @@ from transformers import AutoConfig, AutoModel
 
 from ..._utils import prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
+from .modeling_multimodal_mixin import MultimodalEncoderContractError
 from .modeling_multimodal_utils import multiscale_forward
 
 if TYPE_CHECKING:
@@ -43,6 +44,14 @@ if TYPE_CHECKING:
 # Runtime-scheduled Qwen and Mistral/Pixtral encoders override
 # ``get_encoder_attention_metadata_capacity`` and do not consume this fallback.
 _ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
+
+
+def validate_encoder_segment_count(num_segments: int,
+                                   attn_metadata: AttentionMetadata) -> None:
+    if num_segments > attn_metadata.max_num_requests:
+        raise MultimodalEncoderContractError(
+            f"Encoder attention requires {num_segments} segments, "
+            f"but metadata has {attn_metadata.max_num_requests} slots")
 
 
 def prepare_encoder_attn_metadata(seq_lens: list[int],
@@ -81,6 +90,7 @@ def prepare_encoder_attn_metadata(seq_lens: list[int],
             "Increase encoder_max_num_tokens or reduce the input max_pixels.")
 
     num_segments = len(seq_lens)
+    validate_encoder_segment_count(num_segments, attn_metadata)
     seq_lens_torch = torch.tensor(seq_lens,
                                   dtype=torch.int,
                                   pin_memory=prefer_pinned())

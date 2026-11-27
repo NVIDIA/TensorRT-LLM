@@ -2,8 +2,9 @@
 import copy
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
+from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -77,7 +78,7 @@ from .modeling_multimodal_utils import (
 )
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
-from .modeling_radio import RADIOVisionModel, calc_seq_lens
+from .modeling_radio import RADIOVisionModel, calc_seq_len, calc_seq_lens, radio_prefix_token_counts
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 if TYPE_CHECKING:
@@ -1172,6 +1173,37 @@ class NemotronHMultimodalInputProcessor(
         mm_item_order: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[MultimodalItemMetadata]:
         metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        image = multimodal_data.get("image")
+        if metadata is not None and image and all(m == "image" for m, _ in metadata.item_refs):
+            prefix = self._image_prefix_tokens
+            pixels = image.get("pixel_values")
+            if prefix is None:
+                return metadata
+            if (sizes := image.get("image_sizes")) is not None:
+                if len(sizes) == len(metadata.item_refs):
+                    costs = calc_seq_lens(sizes, self.patch_size)
+                    return replace(
+                        metadata,
+                        encoder_token_lengths=[costs[i] + prefix for _, i in metadata.item_refs],
+                    )
+            elif isinstance(pixels, torch.Tensor) and pixels.ndim == 4:
+                size = (pixels.shape[-2], pixels.shape[-1])
+                tile_cost = calc_seq_len(size, self.patch_size) + prefix
+                if len(metadata.item_refs) == 1:
+                    return replace(metadata, encoder_token_lengths=[len(pixels) * tile_cost])
+                # Fixed tiles each produce the same number of projected tokens.
+                lengths = metadata.output_embedding_lengths
+                tokens = calc_seq_len(size, self.spatial_merge_size)
+                if (
+                    lengths is not None
+                    and tokens > 0
+                    and sum(lengths) == len(pixels) * tokens
+                    and all(length > 0 and length % tokens == 0 for length in lengths)
+                ):
+                    return replace(
+                        metadata,
+                        encoder_token_lengths=[length // tokens * tile_cost for length in lengths],
+                    )
         audio = multimodal_data.get("audio")
         # EVS merge also carries full prompt IDs for image/audio requests.
         # Selecting individual items would require rebuilding that prompt stream.
@@ -1275,6 +1307,11 @@ class NemotronHMultimodalInputProcessor(
         # Detect dynamic resolution from config.
         self.dynamic_tiler = None
         vision_args = getattr(getattr(config, "vision_config", None), "args", None)
+        self._image_prefix_tokens = (
+            sum(radio_prefix_token_counts(SimpleNamespace(**vision_args)))
+            if isinstance(vision_args, dict) and "cls_token_per_teacher" in vision_args
+            else None
+        )
         if isinstance(vision_args, dict) and "min_num_patches" in vision_args:
             pixel_shuffle_version = config.ps_version
             if pixel_shuffle_version != "v2":

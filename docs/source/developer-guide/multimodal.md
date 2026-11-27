@@ -103,22 +103,22 @@ encoder batch and the configured encoder item limit. For example, if the
 largest dummy image costs 12,100 patches and the budget is 16,384, only one
 such image fits. Runtime batches then have a 12,100-patch limit. When startup
 skips encoder profiling, the configured token budget applies. Grouped encoders
-apply both limits between request payloads. A payload that exceeds either
-limit or has unknown encoder cost runs alone. When the default builder has no
-input partitions for a modality, it sends the whole payload to the encoder
-and uses the declared output lengths to recover each item's embeddings.
+apply both limits between request payloads. Custom builders split oversized
+multi-item requests at item boundaries when the model can select individual
+items. An indivisible payload that exceeds a limit or has unknown encoder cost
+runs alone.
 
 ## Processor Hooks
 
 Processors implement
 `get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)` and
 return `MultimodalItemMetadata`. Generic preparation supplies prompt order and
-known output lengths. Model processors add encoder costs and input partitions.
-For prepared media the worker runs the same hook after restoring the tensors.
-It matches inferred values to caller-supplied items by modality and local index,
-preserves the caller's order, and rejects conflicting values.
-In E+PD deployments, hand-built prepared media inputs must supply
-`item_metadata.output_embedding_lengths` so the encoder frontend can export the prefill layout.
+known output lengths. Model processors can add encoder costs and input partitions.
+Media that still need encoding must come from `LLM.preprocess()`.
+
+You can submit each result once, directly or after serialization and
+restoration while the producing process is alive, and build token-only
+inputs by hand.
 
 Unknown costs or row counts remain `None`. Common metadata does not enable item
 scheduling: models can supply order and output rows with
@@ -183,11 +183,10 @@ To opt in, the model sets `supports_mm_encoder_item_scheduling = True`, supports
 item selection, and either declares encoder groups or overrides
 `encode_multimodal_inputs`. The engine also checks `disable_mm_encoder`, the
 scheduling policy, and supported combinations in `mm_item_scheduling_enabled()` and
-`validate_mm_encoder_scheduling_compatibility()`. If individual items cannot
-be selected or costed, the scheduler reserves space for the complete output
-and schedules the payload as one item. Admission requires a known physical
-encoder cost and enough capacity for one call. Prefill consumes the embeddings
-in the caller's item order and releases the reservation after its last use.
+`validate_mm_encoder_scheduling_compatibility()`. Under item scheduling, missing
+costs or output lengths fail admission; they do not silently switch one request to
+full-request encoding. Keep the capability disabled until the model can supply
+the complete scheduling contract.
 
 ### Selecting Unusual Payloads
 
@@ -216,9 +215,8 @@ index `1`.
 Returning `None` from `get_multimodal_item_partitions` uses the existing
 packed/stacked compatibility selector. New models should declare partitions or
 override selection explicitly; the compatibility selector cannot describe an
-arbitrary model layout. The default selector supports item scheduling when
-every populated field has a partition and at least one field has an item
-axis. An incomplete or shared-only declaration schedules the payload whole.
+arbitrary model layout. An empty partition dict means every field is shared,
+so it is appropriate only when selecting an item requires no payload changes.
 
 ### Item Boundaries and Model Hooks
 

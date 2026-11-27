@@ -52,7 +52,6 @@ from .scheduler.waiting_queue import create_waiting_queue
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
-    from tensorrt_llm.inputs.registry import InputProcessor
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
     from tensorrt_llm.mapping import Mapping
 
@@ -204,7 +203,6 @@ class ScheduledEncoderExecutor:
         max_batch_size: int,
         max_num_tokens: int,
         max_seq_len: int,
-        input_processor: InputProcessor | None = None,
     ) -> None:
         """Assemble the executor around a built runner and warm the runner up on every rank.
 
@@ -221,12 +219,10 @@ class ScheduledEncoderExecutor:
             max_batch_size: The most sequences one forward takes.
             max_num_tokens: The most prompt tokens one forward takes.
             max_seq_len: The longest prompt a request may have.
-            input_processor: The multimodal encoder's processor for completing request metadata.
         """
         self._runner = runner
         self._completion = completion
         self._model_loader = model_loader
-        self.input_processor = input_processor
         self.dist = dist
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
@@ -347,7 +343,6 @@ class ScheduledEncoderExecutor:
                 max_batch_size=built.max_batch_size,
                 max_num_tokens=built.max_num_tokens,
                 max_seq_len=built.max_seq_len,
-                input_processor=built.input_processor,
             )
 
     @property
@@ -505,7 +500,7 @@ class ScheduledEncoderExecutor:
             self._profiler.cleanup()
             self._model_loader.cleanup()
             self._runner.release_graphs()
-            del self._runner, self._model_loader, self.input_processor
+            del self._runner, self._model_loader
             release_gc()
         finally:
             self._release_memory_monitor()

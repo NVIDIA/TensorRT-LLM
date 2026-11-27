@@ -186,9 +186,6 @@ class MultimodalItemMetadata:
     output_embedding_lengths: Sequence[int] | None = None
     input_partitions: dict[str, dict[str, MultimodalItemPartition]] = field(
         default_factory=dict)
-    # Physical tokens and attention sequences in the complete payload, even
-    # when its per-item boundaries are unknown. Selected views omit this.
-    _encoder_payload_size: tuple[int, int] | None = None
 
     def __init__(
         self,
@@ -197,8 +194,6 @@ class MultimodalItemMetadata:
         output_embedding_lengths: Sequence[int] | None = None,
         input_partitions: dict[str, dict[str, MultimodalItemPartition]]
         | None = None,
-        *,
-        _encoder_payload_size: tuple[int, int] | None = None,
     ) -> None:
         """Normalize lists while initializing each frozen field once."""
         # Frozen dataclasses require object.__setattr__ during construction.
@@ -211,18 +206,9 @@ class MultimodalItemMetadata:
             is None else tuple(output_embedding_lengths))
         object.__setattr__(self, "input_partitions",
                            {} if input_partitions is None else input_partitions)
-        object.__setattr__(self, "_encoder_payload_size", _encoder_payload_size)
 
     def validate(self) -> None:
         """Validate producer data once before dispatch or executor admission."""
-        if self._encoder_payload_size is not None:
-            tokens, sequences = self._encoder_payload_size
-            if tokens <= 0 or sequences <= 0:
-                raise ValueError("Encoder payload size must be positive")
-            if (self.encoder_token_lengths is not None
-                    and sum(self.encoder_token_lengths) != tokens):
-                raise ValueError(
-                    "Item costs do not match the encoder payload size")
         if not isinstance(self.item_refs, tuple):
             raise TypeError("Multimodal item references must be a sequence")
         indices_by_modality: dict[str, list[int]] = {}
@@ -439,28 +425,19 @@ class MultimodalEncoderRequestState:
     cannot be built, so this request uses request-local cache keys instead.
     """
 
-    _whole_payload_lengths: tuple[int, int] | None = None
-    """Encoder tokens and output embeddings when the entire payload is one scheduled item."""
-
     @property
     def embedding_lengths(self) -> Sequence[int]:
-        if self._whole_payload_lengths is not None:
-            return (self._whole_payload_lengths[1], )
         return cast(Sequence[int], self.item_metadata.output_embedding_lengths)
 
     @property
     def encoder_token_lengths(self) -> Sequence[int]:
-        if self._whole_payload_lengths is not None:
-            return (self._whole_payload_lengths[0], )
         return cast(Sequence[int], self.item_metadata.encoder_token_lengths)
 
     def __post_init__(self) -> None:
         if not self.item_cache_keys:
             self.item_cache_keys = [None] * len(self.item_ready)
-        slot_count = (len(self.item_metadata.item_refs)
-                      if self._whole_payload_lengths is None else 1)
-        if not (slot_count == len(self.item_ready) == len(
-                self.item_cache_keys)):
+        if not (len(self.item_metadata.item_refs) == len(self.item_ready) ==
+                len(self.item_cache_keys)):
             raise ValueError(
                 "MM encoder state must have exactly one cache key per item slot"
             )
@@ -1111,8 +1088,7 @@ class MultimodalParams:
             )
         return metadata.item_refs, metadata.output_embedding_lengths
 
-    @staticmethod
-    def _is_shared_tensor_dict(obj: Any) -> bool:
+    def _is_shared_tensor_dict(self, obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
 
         Args:

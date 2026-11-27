@@ -522,7 +522,6 @@ class EncoderBuild:
     max_batch_size: int
     max_num_tokens: int
     max_seq_len: int
-    input_processor: InputProcessor | None = None
 
 
 @dataclass(frozen=True)
@@ -720,5 +719,4 @@ def build_mm_encoder_runner(
             max_batch_size=loaded.max_batch_size,
             max_num_tokens=loaded.max_num_tokens,
             max_seq_len=loaded.max_seq_len,
-            input_processor=input_processor,
         )

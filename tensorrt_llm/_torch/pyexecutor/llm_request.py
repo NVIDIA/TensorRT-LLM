@@ -77,7 +77,6 @@ def make_mm_encoder_transient_cache_key(request_id: int,
 
 
 if TYPE_CHECKING:
-    from ..models.modeling_multimodal_mixin import MultimodalModelMixin
     from ..speculative.interface import OneModelSamplingParams
     from ..tensor_lru_cache import TensorLRUCache
 
@@ -1694,8 +1693,6 @@ def initialize_multimodal_encoder_request(
         request: LlmRequest,
         max_num_tokens: int,
         *,
-        model: Optional["MultimodalModelMixin"] = None,
-        attention_metadata_capacity: Optional[dict[str, int]] = None,
         max_output_bytes: Optional[int] = None,
         bytes_per_encoder_embedding: int = 0,
         context_chunk_unit_size: Optional[int] = None) -> None:
@@ -1715,20 +1712,25 @@ def initialize_multimodal_encoder_request(
     has_full_embedding = (isinstance(mm_data, dict)
                           and mm_data.get("multimodal_embedding") is not None)
     needs_item_encoding = has_raw_payload and not has_full_embedding
-    metadata = (get_multimodal_item_metadata(mm_data)
-                if needs_item_encoding else None)
-    if needs_item_encoding and metadata is None:
+    token_lengths = (get_multimodal_encoder_token_lengths(request)
+                     if needs_item_encoding else None)
+    if needs_item_encoding and token_lengths is None:
         raise ValueError(
             "Raw multimodal payload requires multimodal_encoder_item_metadata "
             "when item-level encoder scheduling is enabled")
+    if needs_item_encoding and not token_lengths:
+        raise ValueError(
+            "Raw multimodal payload must declare at least one encoder item "
+            "when item-level encoder scheduling is enabled")
+    if token_lengths is not None:
+        largest = max(token_lengths, default=0)
+        if largest > max_num_tokens:
+            raise ValueError(
+                f"Multimodal item requires {largest} encoder tokens, exceeding "
+                f"the effective startup maximum {max_num_tokens}")
 
     request.py_mm_encoder_state = None
-    if metadata is not None:
-        token_lengths = get_multimodal_encoder_token_lengths(request)
-        if not metadata.item_refs:
-            raise ValueError(
-                "Raw multimodal payload must declare at least one encoder item "
-                "when item-level encoder scheduling is enabled")
+    if token_lengths is not None:
         embedding_lengths = get_multimodal_embedding_lengths(request)
         if embedding_lengths is None:
             raise ValueError("Multimodal item scheduling requires "
@@ -1743,46 +1745,10 @@ def initialize_multimodal_encoder_request(
                     f"Multimodal items declare {sum(embedding_lengths)} "
                     "embedding rows but the prompt has "
                     f"{num_embedding_slots} embedding slots")
-        assert request.py_multimodal_params is not None
-        can_schedule_items = token_lengths is not None and (
-            model is None or model._can_select_multimodal_items(
-                request.py_multimodal_params,
-                {m
-                 for m, _ in metadata.item_refs}))
-        whole_payload_lengths = None
-        if not can_schedule_items:
-            payload_size = metadata._encoder_payload_size
-            if payload_size is not None:
-                cost = payload_size[0]
-            elif token_lengths is not None:
-                cost = sum(token_lengths)
-            else:
-                raise ValueError("Cannot determine the physical encoder token "
-                                 "cost of this whole multimodal payload")
-            slots = (attention_metadata_capacity or {}).get("attention")
-            if payload_size is not None and slots is not None and payload_size[
-                    1] > slots:
-                raise ValueError(
-                    f"Whole multimodal payload requires {payload_size[1]} attention "
-                    f"sequence slots, exceeding the encoder capacity of {slots}"
-                )
-            attrs = getattr(getattr(model, "model_config", None), "extra_attrs",
-                            {})
-            max_num_tokens = min(
-                max_num_tokens,
-                attrs.get("encoder_max_num_tokens", max_num_tokens))
-            whole_payload_lengths = (cost, sum(embedding_lengths))
-            token_lengths = (cost, )
-        assert token_lengths is not None
-        largest = max(token_lengths)
-        if largest > max_num_tokens:
-            raise ValueError(
-                f"Multimodal item requires {largest} encoder tokens, exceeding "
-                f"the effective startup maximum {max_num_tokens}")
         if (max_output_bytes is not None and bytes_per_encoder_embedding > 0):
             resident_bytes = get_mm_max_resident_embeddings(
-                request, embedding_lengths, context_chunk_unit_size
-                if can_schedule_items else None) * bytes_per_encoder_embedding
+                request, embedding_lengths,
+                context_chunk_unit_size) * bytes_per_encoder_embedding
             if resident_bytes > max_output_bytes:
                 raise ValueError(
                     format_multimodal_encoder_output_budget_error(
@@ -1790,14 +1756,12 @@ def initialize_multimodal_encoder_request(
                         max_output_bytes,
                         max_num_tokens,
                         request_id=request.py_request_id,
-                        whole_request_output_resident=(
-                            can_schedule_items
-                            and context_chunk_unit_size is None),
+                        whole_request_output_resident=(context_chunk_unit_size
+                                                       is None),
                     ))
         request.py_mm_encoder_state = MultimodalEncoderRequestState(
-            item_metadata=metadata,
-            item_ready=[False] * len(token_lengths),
-            _whole_payload_lengths=whole_payload_lengths)
+            item_metadata=get_multimodal_item_metadata(mm_data),
+            item_ready=[False] * len(embedding_lengths))
 
 
 def get_mm_context_chunk_start(request: LlmRequest) -> int:

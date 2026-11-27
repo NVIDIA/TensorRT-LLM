@@ -15,6 +15,7 @@ from _torch.pyexecutor.multimodal_utils import (
 )
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
@@ -45,11 +46,11 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderProgress,
     MultimodalItemMetadata,
-    MultimodalItemPartition,
     MultimodalParams,
     strip_mm_encoder_inputs,
 )
@@ -103,12 +104,8 @@ def test_text_requests_do_not_allocate_multimodal_params():
     assert request.py_multimodal_params is None
 
 
-def test_raw_encoder_input_requires_a_known_physical_cost():
-    metadata = MultimodalItemMetadata(
-        [("image", 0)],
-        output_embedding_lengths=[1],
-        input_partitions={"image": {"pixel_values": MultimodalItemPartition.batched()}},
-    )
+def test_generic_metadata_does_not_enable_item_scheduling():
+    metadata = MultimodalItemMetadata([("image", 0)], output_embedding_lengths=[1])
     request = make_llm_request(
         1,
         {
@@ -117,9 +114,9 @@ def test_raw_encoder_input_requires_a_known_physical_cost():
         },
     )
     assert request.py_mm_encoder_state is None
-    with pytest.raises(ValueError, match="cost"):
-        initialize_multimodal_encoder_request(request, 32, model=MultimodalModelMixin())
-    assert request.py_mm_encoder_state is None
+    assert get_multimodal_encoder_token_lengths(request) is None
+    with pytest.raises(ValueError, match="when item-level encoder scheduling is enabled"):
+        initialize_multimodal_encoder_request(request, 32)
     request.py_multimodal_data["multimodal_embedding"] = torch.zeros(1, 2)
     initialize_multimodal_encoder_request(request, 32)
     assert request.py_multimodal_params.encoder_state is None
@@ -402,32 +399,26 @@ def test_scheduler_defers_items_beyond_output_byte_budget():
 
 
 def test_referenced_outputs_block_new_admissions_until_explicit_release():
-    scheduler = _scheduler(max_batch_size=8, max_num_tokens=32, cache_capacity=12)
-    holder, newcomer = [
-        make_mm_request(i, [3, 6], embedding_lengths=[1, 2], interleaved=True) for i in (1, 2)
-    ]
-    for request in (holder, newcomer):
-        initialize_multimodal_encoder_request(request, 32, model=MultimodalModelMixin())
-        assert tuple(request.py_mm_encoder_state.encoder_token_lengths) == (9,)
+    scheduler = _scheduler(max_batch_size=8, max_num_tokens=1 << 20, cache_capacity=4)
+    holder = make_mm_request(1, [3])
+    newcomer = make_mm_request(2, [3])
 
-    first_output = scheduler.schedule_request([holder, newcomer], set())
+    first_output = scheduler.schedule_request([holder], set())
     assert first_output.scheduled_mm_encoder_items == {1: [0]}
-    assert first_output.context_requests == [holder]
-    assert scheduler.encoder_cache.stats().reserved_bytes == 12
     holder_cache_key = holder.py_mm_encoder_state.item_cache_keys[0]
     assert holder_cache_key is not None
-    scheduler.encoder_cache.commit(holder_cache_key, torch.ones(3, dtype=torch.float32))
+    scheduler.encoder_cache.commit(holder_cache_key, torch.ones(1, dtype=torch.float32))
     holder.py_mm_encoder_state.mark_cache_key_ready(holder_cache_key)
 
-    holder.context_current_position = 2  # The first image has reached prefill.
-    release_consumed_mm_items(holder, scheduler.encoder_cache)
     output = scheduler.schedule_request([holder, newcomer], set())
     assert output.scheduled_mm_encoder_items is None
 
-    holder.context_current_position = holder.prompt_len
-    release_consumed_mm_items(holder, scheduler.encoder_cache)
+    drained = holder.py_mm_encoder_state.pop_all_cache_keys()
+    assert drained == [holder_cache_key]
+    scheduler.encoder_cache.release(holder_cache_key)
     assert scheduler.encoder_cache.get(holder_cache_key, record_stats=False) is None
-    output = scheduler.schedule_request([newcomer], set())
+    holder.py_mm_encoder_state = None
+    output = scheduler.schedule_request([holder, newcomer], set())
     assert output.scheduled_mm_encoder_items == {2: [0]}
 
 
@@ -521,13 +512,12 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
     assert output.context_requests == [request]
 
 
-@pytest.mark.parametrize("costs", [[9], [3, 6]], ids=["one-item", "unpartitioned"])
-def test_request_rejects_item_above_effective_startup_maximum(costs):
-    request = make_mm_request(1, costs)
-    model = MultimodalModelMixin() if len(costs) > 1 else None
+def test_request_rejects_item_above_effective_startup_maximum():
+    request = make_mm_request(1, [9])
+    request.py_multimodal_data["image"] = {"pixel_values": torch.empty(1)}
 
     with pytest.raises(ValueError, match="exceeding the effective startup maximum 8"):
-        initialize_multimodal_encoder_request(request, max_num_tokens=8, model=model)
+        initialize_multimodal_encoder_request(request, max_num_tokens=8)
 
 
 def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
@@ -839,6 +829,73 @@ def test_forward_multimodal_encoder_step_contains_model_contract_error():
     assert len(handled) == 1
     assert "must be a MultimodalItemMetadata" in handled[0][0]
     assert handled[0][1] == {"requests": [failed], "charge_budget": False}
+
+
+@pytest.mark.parametrize(
+    "metadata_path,frame_counts", [("gemma", [33]), ("gemma", [16, 17]), ("shared", [33])]
+)
+def test_encoder_segment_overflow_only_fails_producers(metadata_path, frame_counts):
+    from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionModel
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import prepare_encoder_attn_metadata
+
+    slots = SimpleNamespace(max_num_requests=32, prepare=Mock())
+    tower = SimpleNamespace(attn_metadata=slots)
+
+    def encode(pixel_values, image_seq_lens, **kwargs):
+        assert pixel_values.shape[:2] == (33, 9)
+        if metadata_path == "gemma":
+            return Gemma4VisionModel._prepare_attn_metadata(tower, torch.tensor(image_seq_lens))
+        return prepare_encoder_attn_metadata(image_seq_lens, slots, max_seq_len=9)
+
+    scheduler = _scheduler(max_batch_size=2, max_num_tokens=20_160)
+    model = MultimodalModelMixin()
+    model.mm_encoder_groups = [EncoderGroup(("video",), encode)]
+    model.multimodal_data_device_paths = []
+    model._multimodal_encoder_cache = scheduler.encoder_cache
+    vision = SimpleNamespace(patch_size=1, pooling_kernel_size=3, max_soft_tokens=1)
+    processor = object.__new__(Gemma4InputProcessor)
+    processor._config = SimpleNamespace(vision_config=vision)
+    producers = []
+    for request_id, count in enumerate(frame_counts, start=1):
+        video = processor._dummy_vision_data(vision, count, dtype=torch.float32)
+        video["num_frames"] = [count]
+        data = {"video": video}
+        metadata = processor.get_mm_item_metadata([], data)
+        assert metadata.encoder_token_lengths == (9 * count,)
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+        request = make_llm_request(request_id, data, prompt_len=count)
+        initialize_multimodal_encoder_request(request, max_num_tokens=20_160)
+        producers.append(request)
+    text = make_llm_request(3)
+    requests = [*producers, text]
+    selection = scheduler.schedule_request(requests, set())
+    batch = ScheduledRequests()
+    batch.reset_context_requests(selection.context_requests)
+    batch.scheduled_mm_encoder_items = selection.scheduled_mm_encoder_items
+    executor = make_partial_executor(
+        active_requests=requests,
+        model_engine=SimpleNamespace(
+            forward_multimodal_encoder_items=bare_mm_item_scheduler(model).forward_items
+        ),
+        disable_overlap_scheduler=True,
+        _handle_errors=Mock(),
+    )
+
+    executor._forward_multimodal_encoder_step(batch)
+
+    executor._handle_errors.assert_called_once_with(
+        "Encoder attention requires 33 segments, but metadata has 32 slots",
+        requests=producers,
+        charge_budget=False,
+    )
+    slots.prepare.assert_not_called()
+    assert batch.context_requests == [text]
+    executor._update_request_states_tp(batch)
+    assert text.context_remaining_length == 0
+    text.add_new_token(7, 0)
+    text.finish_by(FinishReason.LENGTH, 0)
+    assert text.create_response().result.is_final
 
 
 def test_forward_multimodal_encoder_step_contains_stale_schedule():

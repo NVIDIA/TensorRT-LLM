@@ -37,7 +37,6 @@ from __future__ import annotations
 import os
 import unittest
 from copy import deepcopy
-from dataclasses import replace
 from itertools import accumulate
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,9 +46,7 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
-from _torch.pyexecutor.multimodal_utils import bare_mm_item_scheduler, make_llm_request
 from PIL import Image
-from test_modeling_multimodal import submit_prepared
 
 # Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
 pytest.importorskip(
@@ -73,6 +70,7 @@ from tensorrt_llm._torch.models.modeling_gemma4_unified import (  # noqa: E402
     Gemma4UnifiedImageProcessor,
     Gemma4UnifiedInputProcessor,
     Gemma4UnifiedProcessorShim,
+    Gemma4UnifiedVideoProcessor,
 )
 from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionModel  # noqa: E402
 from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
@@ -88,14 +86,10 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
     get_multimodal_embeddings,
     vision_normalization_from_processor,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    initialize_multimodal_encoder_request,  # noqa: E402
-)
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
     MultimodalItemMetadata,
-    MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -249,23 +243,28 @@ def _make_keyed_image_param(
     )
 
 
-def _make_keyed_video_param(videos: list[list[int]]) -> MultimodalParams:
+def _make_keyed_video_param(
+    videos: list[list[int]], processor: Gemma4InputProcessor
+) -> MultimodalParams:
     embedding_lengths = [2 * len(frames) for frames in videos]
     pixels = torch.tensor([value for frames in videos for value in frames], dtype=torch.float32)
+    data = {
+        "video": {
+            "pixel_values": pixels.reshape(-1, 1, 1).expand(-1, 18, 1),
+            "image_position_ids": torch.zeros(len(pixels), 18, 2, dtype=torch.long),
+            "image_seq_lens": [18] * len(pixels),
+            "num_frames": [len(frames) for frames in videos],
+        },
+        "mm_processor_kwargs_hash": "kwargs-a",
+    }
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = processor.get_mm_item_metadata([], data)
     return MultimodalParams(
         multimodal_input=MultimodalInput(
             multimodal_hashes=[[frames[0]] * 8 for frames in videos],
             multimodal_positions=list(accumulate(embedding_lengths[:-1], initial=0)),
             multimodal_lengths=embedding_lengths,
         ),
-        multimodal_data={
-            "video": {"pixel_values": pixels.reshape(-1, 1, 1).expand(-1, 18, 1)},
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [("video", i) for i in range(len(embedding_lengths))],
-                output_embedding_lengths=embedding_lengths,
-            ),
-            "mm_processor_kwargs_hash": "kwargs-a",
-        },
+        multimodal_data=data,
         multimodal_runtime=MultimodalRuntimeData(
             embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
             past_seen_token_num=0,
@@ -378,98 +377,45 @@ def _encode_normalization_buckets(buckets, modality="image"):
     return Gemma4MultimodalModelBase.encode_multimodal_inputs(model, params)
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "processor_class,side", [(Gemma4ImageProcessor, 32), (Gemma4UnifiedImageProcessor, 96)]
-)
-def test_prepared_gemma4_implicit_positions_match_processor(processor_class, side):
-    processor = processor_class(max_soft_tokens=70, do_resize=False)
-    image = processor(images=[Image.new("RGB", (side, side))], return_tensors="pt")
-    # Keep the four real patches, excluding the processor's padding.
-    pixels = image["pixel_values"][:, :4]
-    positions = image["image_position_ids"][:, :4]
-
-    def embed(pixel_values, image_position_ids, **_):
-        x, y = image_position_ids.unbind(-1)
-        return (pixel_values[..., 0] + x + 10 * y).reshape(-1, 1)
-
-    model = SimpleNamespace(_get_image_features=embed)
-    param = MultimodalParams(
-        multimodal_data=_single_item_data("image", {"pixel_values": pixels}, 4)
+def _processed_video_data(video_processor):
+    processor = _make_normalization_processor(None)
+    processor._processor = SimpleNamespace(video_processor=video_processor)
+    frames = [Image.new("RGB", (96, 48))] * 2
+    _, output = processor.call_with_text_prompt(
+        {"prompt": "<|video|>", "multi_modal_data": {"video": [frames]}}, None
     )
-    implicit = Gemma4MultimodalModelBase.encode_multimodal_inputs(model, [param])
-    torch.testing.assert_close(implicit, embed(pixels, positions), rtol=0, atol=0)
+    return output["multimodal_data"]
 
 
 @pytest.mark.cpu_only
-def test_prepared_gemma4_accepts_single_video_without_frame_counts():
-    model = _Gemma4FrameEncoder()
-    param = submit_prepared(_make_keyed_video_param([[1, 2, 3]]), _make_item_input_processor())
-    model.validate_multimodal_request_data(param.multimodal_data)
-    embeddings = model._get_or_encode_multimodal_embeddings([param])
-    assert embeddings.flatten().tolist() == [1, 1, 2, 2, 3, 3]
+def test_gemma4_video_requires_frame_counts():
+    data = _processed_video_data(Gemma4VideoProcessor(max_soft_tokens=70, do_resize=False))
+    model = Gemma4ForConditionalGeneration.__new__(Gemma4ForConditionalGeneration)
+    model.validate_multimodal_request_data(data)
+    assert data["video"].pop("num_frames") == [2]
+    with pytest.raises(ValueError, match="num_frames"):
+        model.validate_multimodal_request_data(data)
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "frames,declared_field",
-    [
-        (3, None),
-        (32, None),
-        (33, None),
-        (3, "vision_normalization"),
-        (33, "vision_normalization"),
-        (3, "image_seq_lens"),
-    ],
-)
-def test_prepared_gemma4_atomic_videos_respect_attention_capacity(
-    frames, declared_field, monkeypatch
-):
-    processor = _make_item_input_processor()
-    model = _Gemma4FrameEncoder()
-    videos = [[1], list(range(2, frames + 1))]
-    param = _make_keyed_video_param(videos)
-    if declared_field is not None:
-        if declared_field == "vision_normalization":
-            param.multimodal_data["video"][declared_field] = None
-            partition = MultimodalItemPartition.shared()
-        else:
-            param.multimodal_data["video"][declared_field] = [18] * frames
-            partition = MultimodalItemPartition.packed((1, frames - 1))
-        param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = replace(
-            param.item_metadata,
-            encoder_token_lengths=(18, 18 * (frames - 1)),
-            input_partitions={"video": {declared_field: partition}},
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_unified_vision_requires_position_ids(modality):
+    if modality == "image":
+        processor = _make_normalization_processor(
+            Gemma4UnifiedImageProcessor(max_soft_tokens=70, do_resize=False)
         )
-    param = submit_prepared(param, processor)
-    request = make_llm_request(1, param.multimodal_data)
-    budget = 20160
-    capacity = processor.get_mm_encoder_attention_metadata_capacity(budget)
-    if frames > 32:
-        with pytest.raises(ValueError, match="33.*32"):
-            initialize_multimodal_encoder_request(
-                request, budget, model=model, attention_metadata_capacity=capacity
-            )
-        assert model.frames_per_call == []
-        return
-    initialize_multimodal_encoder_request(
-        request, budget, model=model, attention_metadata_capacity=capacity
-    )
-    state = request.py_mm_encoder_state
-    assert tuple(state.encoder_token_lengths) == (frames * 18,)
-    assert tuple(state.embedding_lengths) == (frames * 2,)
-    scheduler = bare_mm_item_scheduler(model)
-    scheduler.bytes_per_embedding = 4
-    key = (request.request_id, 0)
-    assert scheduler.encoder_cache.acquire(key, frames * 2 * 4, retain_after_release=False)
-    state.set_item_cache_key(0, key, ready=False)
-    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
-    scheduler.forward_items([request], {request.request_id: [0]})
-    embeddings = scheduler.build_multimodal_data_for_llm(request)["multimodal_embedding"]
-    outputs = embeddings.split(param.item_metadata.output_embedding_lengths)
-    for actual, video in zip(outputs, videos, strict=True):
-        assert actual.flatten().tolist() == torch.tensor(video).repeat_interleave(2).tolist()
-    assert model.frames_per_call == [frames]
+        _, output = processor.call_with_text_prompt(
+            {"prompt": "<|image|>", "multi_modal_data": {"image": [Image.new("RGB", (96, 48))]}},
+            None,
+        )
+        data = output["multimodal_data"]
+    else:
+        data = _processed_video_data(Gemma4UnifiedVideoProcessor(do_resize=False))
+    model = Gemma4UnifiedForConditionalGeneration.__new__(Gemma4UnifiedForConditionalGeneration)
+    model.validate_multimodal_request_data(data)
+    del data[modality]["image_position_ids"]
+    with pytest.raises(ValueError, match="image_position_ids"):
+        model.validate_multimodal_request_data(data)
 
 
 @pytest.mark.cpu_only
@@ -519,47 +465,16 @@ def test_prepared_gemma4_inline_audio_encoder_capacity():
 
     def request(clip):
         param = _with_item_metadata({"audio": {"audio_features": clip}}, processor)
-        param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = replace(
-            param.item_metadata, encoder_token_lengths=None
-        )
         param.multimodal_runtime = MultimodalRuntimeData(0, 750, torch.arange(1, 751))
-        return submit_prepared(param, processor)
+        return param
 
     expected = torch.cat(
         [model._get_or_encode_multimodal_embeddings([request(clip)]) for clip in clips.split(1)]
     )
     model.audio_tower.reset_mock()
-    prepared = [request(clip) for clip in clips.split(1)]
-    actual = model._get_or_encode_multimodal_embeddings(prepared)
+    actual = model._get_or_encode_multimodal_embeddings([request(clip) for clip in clips.split(1)])
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert max(call.args[0][:, ::4].numel() for call in model.audio_tower.call_args_list) <= 750
-    assert all(param.item_metadata.encoder_token_lengths == (750,) for param in prepared)
-
-
-@pytest.mark.cpu_only
-def test_prepared_unified_audio_fills_output_length_from_mask():
-    processor = Gemma4UnifiedInputProcessor.__new__(Gemma4UnifiedInputProcessor)
-    features = torch.arange(6.0).reshape(1, 3, 2)
-    mask = torch.tensor([[True, False, True]])
-    refs = [("audio", 0)]
-    model = SimpleNamespace(
-        embed_audio=True,
-        _get_audio_features=lambda audio_features, audio_features_mask: audio_features[
-            audio_features_mask
-        ],
-    )
-    for record in (
-        None,
-        MultimodalItemMetadata(refs),
-        MultimodalItemMetadata(refs, output_embedding_lengths=[2]),
-    ):
-        data = {"audio": {"audio_features": features, "audio_features_mask": mask}}
-        if record is not None:
-            data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = record
-        param = submit_prepared(MultimodalParams(multimodal_data=data), processor, [1, 1])
-        assert param.item_metadata.output_embedding_lengths == (2,)
-        output = Gemma4MultimodalModelBase.encode_multimodal_inputs(model, [param])
-        torch.testing.assert_close(output, features[mask], rtol=0, atol=0)
 
 
 def test_unified_audio_batch_matches_single_masked_clips():
@@ -807,8 +722,6 @@ def test_gemma4_vision_gpu_normalize_real_image(processor_class, device):
 def test_gemma4_vision_gpu_normalize_video_uint8(device, producer_dtype):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required for device normalization exactness")
-    from tensorrt_llm._torch.models.modeling_gemma4_unified import Gemma4UnifiedVideoProcessor
-
     values = torch.arange(3 * 48 * 96, dtype=torch.int64).reshape(3, 48, 96).remainder(256).byte()
     for video_class in (Gemma4VideoProcessor, Gemma4UnifiedVideoProcessor):
         video_processor = video_class(
@@ -1762,7 +1675,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
 
     @pytest.mark.cpu_only
     def test_encoder_cache_reuses_full_video_hits_and_reencodes_partial_hits(self):
-        """Three flattened frames describe two videos, even without per-video frame counts."""
+        """Reuse complete video hits and encode the entire request on partial hits."""
         model = _Gemma4FrameEncoder()
         processor = _make_item_input_processor()
         for videos, expected in (
@@ -1770,7 +1683,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             ([[1], [4, 5]], [1, 1, 4, 4, 5, 5]),  # first video cached
             ([[1], [4, 5]], [1, 1, 4, 4, 5, 5]),  # both cached
         ):
-            param = submit_prepared(_make_keyed_video_param(videos), processor)
+            param = _make_keyed_video_param(videos, processor)
             embeddings = model._get_or_encode_multimodal_embeddings([param])
             self.assertEqual(embeddings.flatten().tolist(), expected)
         self.assertEqual(model.frames_per_call, [3, 3])

@@ -15,7 +15,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.utils._pytree import tree_map
 
 from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
@@ -520,8 +519,6 @@ class MultimodalItemScheduler:
             )
         )
         if state is not None:
-            if state._whole_payload_lengths is not None and keys is not None:
-                keys = [tuple(keys)]
             state.stable_item_cache_keys = keys
         return keys
 
@@ -541,7 +538,7 @@ class MultimodalItemScheduler:
         if encoder_cache is None:
             raise RuntimeError("MM item scheduling requires a model-owned encoder cache")
         request_by_id = {request.request_id: request for request in requests}
-        encoder_inputs = []
+        encoder_items = []
         output_targets: list[tuple[int, Hashable, int]] = []
         scheduled_cache_keys: set[Hashable] = set()
 
@@ -574,23 +571,6 @@ class MultimodalItemScheduler:
                 multimodal_data=request.py_multimodal_params.multimodal_data
             )
             embedding_lengths = state.embedding_lengths
-            if state._whole_payload_lengths is not None:
-                # Device placement can replace nested fields. Keep the request's host payload.
-                multimodal_param.multimodal_data = tree_map(
-                    lambda v: v, multimodal_param.multimodal_data
-                )
-                encoder_inputs.append((multimodal_param, embedding_lengths, None))
-            else:
-                try:
-                    encoder_inputs.extend(
-                        self.model.prepare_multimodal_encoder_inputs(
-                            [(multimodal_param, i) for i in item_indices]
-                        )
-                    )
-                except MultimodalEncoderContractError as error:
-                    raise MultimodalEncoderRequestError(
-                        str(error), request_ids={request_id}
-                    ) from error
             for item_idx in item_indices:
                 cache_key = state.item_cache_keys[item_idx]
                 if cache_key is None:
@@ -599,12 +579,19 @@ class MultimodalItemScheduler:
                         request_ids={request_id},
                     )
                 scheduled_cache_keys.add(cache_key)
+                encoder_items.append((multimodal_param, item_idx))
                 output_targets.append((item_idx, cache_key, embedding_lengths[item_idx]))
 
         # A batch-level error cannot be traced to one output, so fail only the
         # scheduled producers. Requests that only share a scheduled entry keep
         # their references, and the next scheduling pass picks a new producer.
         producer_request_ids = scheduled_items.keys()
+        try:
+            encoder_inputs = self.model.prepare_multimodal_encoder_inputs(encoder_items)
+        except MultimodalEncoderContractError as error:
+            raise MultimodalEncoderRequestError(
+                str(error), request_ids=producer_request_ids
+            ) from error
         for encoder_input, _, _ in encoder_inputs:
             encoder_input.to_device(
                 "multimodal_data",

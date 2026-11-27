@@ -4,7 +4,7 @@
 
 from types import SimpleNamespace
 from typing import get_args
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -25,31 +25,11 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
-    BaseMultimodalInputProcessor,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
 )
-from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
 
 pytestmark = pytest.mark.cpu_only
-
-
-def test_disaggregated_encoder_rejects_prepared_media_without_output_lengths():
-    encoder = Mock()
-    encoder._encode_only = False
-    encoder._executor.is_shutdown.return_value = False
-    encoder.args.mm_encoder_only = True
-    encoder.input_processor = Mock(spec=BaseMultimodalInputProcessor)
-    params = MultimodalParams(
-        multimodal_data={
-            "audio": {"input_features": torch.ones(1, 2)},
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata([("audio", 0)]),
-        }
-    )
-
-    with pytest.raises(ValueError, match=r"output_embedding_lengths.*LLM\.preprocess\(\)"):
-        BaseLLM.generate_async(encoder, PreprocessedInputs([1, 2], params))
-    encoder._executor.generate_async.assert_not_called()
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1])

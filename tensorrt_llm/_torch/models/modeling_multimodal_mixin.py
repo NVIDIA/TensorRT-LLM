@@ -244,6 +244,56 @@ def _encoder_payload_size(
     return (sum(costs[i] for i in indices) if costs is not None else None, len(indices))
 
 
+def _custom_encoder_batches(
+    params: list[MultimodalParams],
+    modalities: tuple[str, ...],
+    model: object | None,
+    max_tokens: int,
+    max_items: int,
+) -> Iterator[list[MultimodalParams]]:
+    # Standalone towers use the same partition-based selector as the item scheduler.
+    selector = model if isinstance(model, MultimodalModelMixin) else MultimodalModelMixin()
+    members = []
+    sizes = []
+    for param in params:
+        cost, count = _encoder_payload_size(param, modalities)
+        if count > 1 and cost is not None and (count > max_items or cost > max_tokens):
+            metadata = param.item_metadata
+            assert metadata is not None and metadata.encoder_token_lengths is not None
+            refs = metadata.item_refs
+            indices = [i for i, (m, _) in enumerate(refs) if m in modalities]
+            if all(metadata.input_partitions.get(refs[i][0]) for i in indices):
+                # Later assembly expects each modality in its original payload order.
+                indices.sort(key=lambda i: (modalities.index(refs[i][0]), refs[i][1]))
+                for i in indices:
+                    members.append((param, i))
+                    sizes.append((metadata.encoder_token_lengths[i], 1))
+                continue
+        members.append((param, None))
+        sizes.append((cost, count))
+
+    for span in _encoder_batch_slices(sizes, max_tokens, max_items):
+        if span.start == 0 and span.stop == len(members):
+            yield params
+            continue
+        batch = []
+        for intact, run in itertools.groupby(members[span], key=lambda item: item[1] is None):
+            if intact:
+                batch.extend(param for param, _ in run)
+            else:
+                batch.extend(
+                    view for view, _, _ in selector.prepare_multimodal_encoder_inputs(list(run))
+                )
+        yield batch
+
+
+def _validate_encoder_output_length(out: torch.Tensor, expected: int) -> None:
+    if out.shape[0] != expected:
+        raise MultimodalEncoderContractError(
+            f"MM encoder returned {out.shape[0]} embeddings, item metadata expects {expected}"
+        )
+
+
 def _encode_modality(
     group: EncoderGroup,
     modality: str,
@@ -253,7 +303,6 @@ def _encode_modality(
 ) -> torch.Tensor:
     """Batch compatible payloads and return their embeddings in request and local item order."""
     fields = []
-    whole_payloads = set()
     output_lengths = []
     request_indices = []
     owner = getattr(group.encoder_fn, "__self__", None)
@@ -274,9 +323,9 @@ def _encode_modality(
             if defaults is not None:
                 partitions = {**defaults, **(partitions or {})}
         if partitions is None:
-            # Output lengths still delimit the embeddings of this intact payload.
-            whole_payloads.add(len(fields))
-            partitions = dict.fromkeys(data, MultimodalItemPartition.shared())
+            raise MultimodalEncoderContractError(
+                f"The {modality} payload declares no input partitions"
+            )
         payload = _encoder_fields(data, partitions, len(item_lengths))
         # A single request may carry a list of items with different shapes.
         if any(
@@ -298,11 +347,7 @@ def _encode_modality(
             output_lengths.append(sum(length for _, length in item_lengths))
 
     batches: list[list[int]] = []
-    bounded_batches = []
     for index, candidate in enumerate(fields):
-        if index in whole_payloads:
-            bounded_batches.append([index])
-            continue
         for batch in batches:
             first = fields[batch[0]]
             if first.keys() == candidate.keys() and all(
@@ -313,6 +358,7 @@ def _encode_modality(
         else:
             batches.append([index])
 
+    bounded_batches = []
     for batch in batches:
         # A heterogeneous request can contribute several fields of the same shape.
         # Apply capacity at request boundaries within this compatible batch.
@@ -327,11 +373,7 @@ def _encode_modality(
     for batch in bounded_batches:
         out = group.encoder_fn(**_build_batched_input([fields[i] for i in batch]))
         lengths = [output_lengths[i] for i in batch]
-        expected = sum(lengths)
-        if out.shape[0] != expected:
-            raise MultimodalEncoderContractError(
-                f"MM encoder returned {out.shape[0]} embeddings, item metadata expects {expected}"
-            )
+        _validate_encoder_output_length(out, sum(lengths))
         if len(bounded_batches) == 1:
             return out
         pieces.update(zip(batch, out.split(lengths), strict=True))
@@ -489,21 +531,24 @@ def encode_multimodal_by_groups(
                         group, modality, group_params, max_tokens, max_items
                     )
             continue
-        sizes = (_encoder_payload_size(param, group.modalities) for param in group_params)
         pieces = {m: [] for m in group.modalities}
-        for span in _encoder_batch_slices(sizes, max_tokens, max_items):
-            batch = group_params[span]
+        for batch in _custom_encoder_batches(
+            group_params, group.modalities, model, max_tokens, max_items
+        ):
             out = group.encoder_fn(**group.build_batched_input(batch))
             batch_lengths = (
                 lengths
-                if len(batch) == len(group_params)
-                else _lengths_by_modality(group_layouts[span], group.modalities)
+                if batch is group_params
+                else _lengths_by_modality(
+                    [param.get_item_layout() for param in batch], group.modalities
+                )
             )
             cursor = 0
             for m in group.modalities:
                 total = sum(batch_lengths[m])
                 pieces[m].append(out[cursor : cursor + total])
                 cursor += total
+            _validate_encoder_output_length(out, cursor)
         for m, outputs in pieces.items():
             per_modality_embeds[m] = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
@@ -833,7 +878,7 @@ class MultimodalModelMixin:
 
     def forward_multimodal_encoder_items(
         self,
-        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str | None]],
+        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
     ) -> list[torch.Tensor]:
         """Forward prepared MM encoder inputs in scheduler item order.
 
@@ -866,8 +911,7 @@ class MultimodalModelMixin:
             group_lengths.clear()
 
         for multimodal_param, embedding_lengths, modality in encoder_inputs:
-            # An intact payload can consume every attention sequence slot in one call.
-            if modality is None or (
+            if (
                 group_modality is not None
                 and modality != group_modality
                 and not any(
@@ -881,8 +925,6 @@ class MultimodalModelMixin:
             group_modality = modality
             group_params.append(multimodal_param)
             group_lengths.extend(embedding_lengths)
-            if modality is None:
-                flush_group()
         flush_group()
         return outputs
 
@@ -1138,26 +1180,6 @@ class MultimodalModelMixin:
         metadata = param.item_metadata
         return metadata.input_partitions.get(modality) if metadata is not None else None
 
-    def _can_select_multimodal_items(self, param: MultimodalParams, modalities: set[str]) -> bool:
-        """A model-specific selector can describe layouts that have no field partitions."""
-        if (
-            type(self).build_multimodal_encoder_input
-            is not MultimodalModelMixin.build_multimodal_encoder_input
-        ):
-            return True
-        for modality in modalities:
-            partitions = self.get_multimodal_item_partitions(param, modality)
-            fields = {
-                name
-                for name, value in param.multimodal_data.get(modality, {}).items()
-                if value is not None
-            }
-            if not partitions or not fields.issubset(partitions):
-                return False
-            if all(partitions[name].is_shared for name in fields):
-                return False
-        return True
-
     def build_multimodal_encoder_input(
         self,
         param: MultimodalParams,
@@ -1408,7 +1430,7 @@ class MultimodalModelMixin:
                     # request event and records the attached tensor on the consuming stream before
                     # gathering it.
                     continue
-                partition = self._partition_full_request_encoder_cache(param, encoder_cache)
+                partition = self.partition_encoder_cache(param, encoder_cache)
                 if partition is None or partition.is_full_miss:
                     cache_misses.append(param)
                     continue
@@ -1669,22 +1691,6 @@ class MultimodalModelMixin:
         return EncoderCachePartition(
             hits=hits, miss_indices=miss_indices, keys=keys, looked_up=looked_up
         )
-
-    def _partition_full_request_encoder_cache(
-        self, param: MultimodalParams, encoder_cache: TensorLRUCache
-    ) -> Optional[EncoderCachePartition]:
-        partition = self.partition_encoder_cache(param, encoder_cache)
-        if partition is not None and partition.hits and partition.miss_indices:
-            # A default builder can only select its cache misses with known partitions.
-            metadata = param.item_metadata
-            assert metadata is not None
-            misses = {metadata.item_refs[i][0] for i in partition.miss_indices}
-            for group in self.mm_encoder_groups:
-                if group.build_batched_input is None and not self._can_select_multimodal_items(
-                    param, misses.intersection(group.modalities)
-                ):
-                    return None
-        return partition
 
     @staticmethod
     def _apply_metadata_slice(
@@ -2007,7 +2013,7 @@ def _dispatch_cross_iter_prefetch(
                 cache_misses = params_list
             else:
                 for param in params_list:
-                    partition = model._partition_full_request_encoder_cache(param, encoder_cache)
+                    partition = model.partition_encoder_cache(param, encoder_cache)
                     if partition is None or partition.is_full_miss:
                         cache_misses.append(param)
                     elif partition.is_full_hit:

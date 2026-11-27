@@ -49,6 +49,22 @@ def calc_seq_lens(sizes: List[Tuple[int, int]], patch_size: int) -> List[int]:
     return [calc_seq_len(size, patch_size) for size in sizes]
 
 
+def _register_token_count(num_tokens, num_registers, register_multiple):
+    if num_registers or not register_multiple:
+        return num_registers or 0
+    return register_multiple - num_tokens % register_multiple
+
+
+def radio_prefix_token_counts(args) -> tuple[int, int]:
+    """Return the CLS and register token counts prepended to RADIO image patches."""
+    cls_tokens = (len({t['name']
+                       for t in args.teachers})
+                  if args.cls_token_per_teacher else 1)
+    return cls_tokens, _register_token_count(
+        cls_tokens, getattr(args, 'cpe_num_registers', None),
+        getattr(args, 'register_multiple', None))
+
+
 class VITTIMMConfig(NamedTuple):
     embed_dim: int
     depth: int
@@ -87,11 +103,9 @@ class ClsToken(nn.Module):
         self.num_registers = 0
         self.num_tokens = num_tokens
         if enabled:
-            if num_registers:
-                self.num_registers = num_registers
-            elif register_multiple:
-                self.num_registers = register_multiple - (num_tokens %
-                                                          register_multiple)
+            self.num_registers = _register_token_count(num_tokens,
+                                                       num_registers,
+                                                       register_multiple)
             scale = ndim**-0.5
             self.token = nn.Parameter(
                 torch.randn(num_tokens + self.num_registers, ndim) * scale)
@@ -698,7 +712,6 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         self.head = nn.Linear(
             self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        uq_teachers = set(t['name'] for t in special_args.teachers)
         patch_size = patch_size
         embed_dim = self.embed_dim
         input_dims = img_size
@@ -707,10 +720,7 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         max_img_size = int(
             round(special_args.cpe_max_size / patch_size) * patch_size)
         pos_dropout = 0.1
-        num_cls_tokens = len(
-            uq_teachers) if special_args.cls_token_per_teacher else 1
-        register_multiple = getattr(special_args, 'register_multiple', None)
-        num_registers = getattr(special_args, 'cpe_num_registers', None)
+        num_cls_tokens, num_registers = radio_prefix_token_counts(special_args)
 
         # Temporal compression config (for video).
         self.temporal_patch_size = getattr(self.config,
@@ -727,7 +737,6 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
             max_input_dims=max_img_size,
             pos_dropout=pos_dropout,
             num_cls_tokens=num_cls_tokens,
-            register_multiple=register_multiple,
             num_registers=num_registers,
             temporal_patch_size=self.temporal_patch_size,
             separate_video_embedder=separate_video_embedder,

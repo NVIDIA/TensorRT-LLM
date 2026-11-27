@@ -41,8 +41,6 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
-from ..inputs.multimodal_data import MEDIA_MODALITIES
-from ..inputs.registry import _set_mm_item_metadata
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -66,10 +64,6 @@ from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
-    from .._torch.pyexecutor.model_engine import ModelEngine
-    from .._torch.pyexecutor.py_executor import PyExecutor
-    from .._torch.pyexecutor.scheduled_encoder_executor import \
-        ScheduledEncoderExecutor
     from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
@@ -98,12 +92,6 @@ def _init_hf_modules():
 
 
 _init_hf_modules()
-
-
-def _model_engine_or_executor(
-    executor: "PyExecutor | ScheduledEncoderExecutor",
-) -> "ModelEngine | ScheduledEncoderExecutor":
-    return getattr(executor, "model_engine", executor)
 
 
 class BaseWorker(GenerationExecutor):
@@ -595,15 +583,6 @@ class BaseWorker(GenerationExecutor):
             if request.multimodal_params is not None:
                 # Resolve worker-handoff handles before constructing the input envelope.
                 request.multimodal_params.to_tensor("multimodal_data")
-                data = request.multimodal_params.multimodal_data
-                if (data and data.get("multimodal_embedding") is None
-                        and any(modality in data
-                                for modality in MEDIA_MODALITIES)):
-                    processor = _model_engine_or_executor(
-                        self.engine).input_processor
-                    if processor is not None:
-                        _set_mm_item_metadata(processor,
-                                              request.prompt_token_ids, data)
             processors = request.sampling_params.logits_processor
             executor_request = ExecutorRequest(
                 executor_request,
@@ -1322,7 +1301,8 @@ class BaseWorker(GenerationExecutor):
                 startup_metrics[model_engine_stage] = dict(model_engine_metrics)
         startup_metrics["py_executor"] = executor_metrics
 
-        loader_owner = _model_engine_or_executor(self.engine)
+        # An executor without a model engine holds its loader itself.
+        loader_owner = getattr(self.engine, "model_engine", self.engine)
         model_loader = getattr(loader_owner, "model_loader", None)
         if model_loader is not None:
             startup_metrics["model_loader"] = {

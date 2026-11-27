@@ -3,7 +3,7 @@
 
 import copy
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -14,7 +14,7 @@ import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from PIL import Image
-from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal, submit_prepared
+from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
 from transformers import PretrainedConfig, Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
@@ -45,10 +45,12 @@ from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attent
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
     MultimodalItemMetadata,
     MultimodalParams,
     MultimodalRuntimeData,
 )
+from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -1317,6 +1319,60 @@ def _assert_rows_hold_item_grids(embedding, lengths, expected):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "fields,hashed,error",
+    [
+        pytest.param(
+            {MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata([("image", 0)])},
+            False,
+            r"output_embedding_lengths.*LLM\.preprocess",
+            id="refs-without-lengths",
+        ),
+        pytest.param({}, True, r"item_refs.*LLM\.preprocess", id="hash-without-record"),
+        pytest.param({}, False, None, id="unhashed-without-record"),
+        pytest.param({"multimodal_embedding": [torch.zeros(1, 1)]}, True, None, id="embedding"),
+        pytest.param(
+            {
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 1)], output_embedding_lengths=[1]
+                )
+            },
+            False,
+            "must cover each local item once",
+            id="invalid-record",
+        ),
+        pytest.param(None, False, None, id="token-only"),
+    ],
+)
+def test_prepared_media_requires_processor_item_metadata(fields, hashed, error):
+    params = None
+    if fields is not None:
+        params = MultimodalParams(
+            multimodal_input=MultimodalInput([[0] * 8], [0], [1]) if hashed else None,
+            multimodal_data={"image": {"pixel_values": torch.ones(1, 1)}, **fields},
+        )
+    prepared = PreprocessedInputs([11], params)
+    llm = object.__new__(BaseLLM)
+    llm.shutdown = MagicMock()
+    llm._encode_only = False
+    llm._executor = MagicMock()
+    llm._executor.is_shutdown.return_value = False
+    llm._prepare_sampling_params = MagicMock(return_value=SamplingParams(max_tokens=1))
+    llm._check_arguments = MagicMock()
+    llm._tokenizer = llm._post_processor_hook = None
+    llm.args = SimpleNamespace(mm_encoder_only=False, return_perf_metrics=False)
+
+    if error:
+        with pytest.raises(ValueError, match=error):
+            llm.generate_async(prepared)
+        llm._executor.generate_async.assert_not_called()
+    else:
+        llm.generate_async(prepared)
+        llm._executor.generate_async.assert_called_once()
+        assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is params
+
+
+@pytest.mark.cpu_only
 @_QWEN_VL_ENCODERS
 def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
     """Each item gets its grid, in prompt order, with its embedding rows.
@@ -1338,24 +1394,32 @@ def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
         (
             Qwen2_5_VLModel,
             modeling_qwen2vl.Qwen2VisionModelBase,
-            [{"image_grid_thw": [1, 64, 64]}, {"video_grid_thw": [2, 32, 64]}],
+            [
+                [{"image_grid_thw": [1, 32, 64]}],
+                [{"video_grid_thw": [2, 32, 64]}, {"image_grid_thw": [1, 64, 32]}],
+            ],
             [4096, 4096],
+        ),
+        (
+            Qwen2_5_VLModel,
+            modeling_qwen2vl.Qwen2VisionModelBase,
+            [[{"image_grid_thw": [1, 96, 64]}]],
+            [6144],
         ),
         (
             Qwen3VLModel,
             Qwen3VisionModelBase,
             [
-                {"image_grid_thw": [1, 8, 12]},
-                {"video_grid_thw": [2, 8, 8]},
-                {"image_grid_thw": [1, 4, 6]},
+                [{"image_grid_thw": [1, 8, 12]}],
+                [{"video_grid_thw": [2, 8, 8]}, {"image_grid_thw": [1, 4, 6]}],
             ],
             [248],
         ),
     ],
-    ids=["qwen2.5-split", "qwen3-one-call"],
+    ids=["qwen2.5-split", "qwen2.5-oversized-item", "qwen3-one-call"],
 )
 def test_qwen_vl_inline_encoder_capacity(model_cls, encoder_cls, grids, expected_calls):
-    cases = [_qwen_vl_item_grid_case(encoder_cls, [grid]) for grid in grids]
+    cases = [_qwen_vl_item_grid_case(encoder_cls, request) for request in grids]
     encoder = cases[0][3]
     vit = encoder.visual
     calls = []
@@ -1388,7 +1452,8 @@ def test_qwen_vl_inline_encoder_capacity(model_cls, encoder_cls, grids, expected
 
     def prefill(requests):
         params = []
-        for data, (length,), *_ in requests:
+        for data, lengths, *_ in requests:
+            length = sum(lengths)
             params.append(
                 MultimodalParams(
                     multimodal_data=data.copy(),
@@ -1404,58 +1469,12 @@ def test_qwen_vl_inline_encoder_capacity(model_cls, encoder_cls, grids, expected
             multimodal_params=params,
         )
 
-    expected = torch.cat([prefill([case]) for case in cases])
-    calls.clear()
-    torch.testing.assert_close(prefill(cases), expected, rtol=0, atol=0)
+    _assert_rows_hold_item_grids(
+        prefill(cases),
+        [length for _, lengths, *_ in cases for length in lengths],
+        [grid for request in grids for grid in request],
+    )
     assert calls == expected_calls
-
-
-@pytest.mark.cpu_only
-def test_prepared_qwen_vl_keeps_caller_image_order_at_prefill():
-    grids = [{"image_grid_thw": [1, 2, 2]}] * 2
-    data, lengths, _, encoder, _ = _qwen_vl_item_grid_case(Qwen3VisionModelBase, grids)
-    data["image"]["pixel_values"][:4].fill_(11)
-    data["image"]["pixel_values"][4:].fill_(22)
-    refs = [("image", 1), ("image", 0)]
-    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
-        refs, output_embedding_lengths=lengths
-    )
-    prompt = [11, 12, 13] * 2
-    processor, _ = _make_qwen_vl_embedding_processor("qwen3", prompt)
-    param = MultimodalParams(multimodal_data=data)
-    param.to_handle("multimodal_data")
-    param = submit_prepared(param, processor, prompt)
-    assert param.item_metadata.item_refs == tuple(refs)
-    assert param.item_metadata.encoder_token_lengths == (4, 4)
-    _, prefill = modeling_multimodal_utils.fuse_input_embeds(
-        torch.nn.Embedding(15, 3),
-        torch.tensor(prompt),
-        encoder.forward([param]),
-        mm_token_ids=torch.tensor([12]),
-    )
-    assert prefill[[1, 4]].tolist() == [[22.0] * 3, [11.0] * 3]
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "field", ["encoder_token_lengths", "output_embedding_lengths", "input_partitions"]
-)
-def test_prepared_qwen_vl_rejects_contradictory_metadata(field):
-    from tensorrt_llm.executor.utils import RequestError
-    from tensorrt_llm.inputs.multimodal import MultimodalItemPartition
-
-    prompt = [11, 12, 13]
-    processor, _ = _make_qwen_vl_embedding_processor("qwen3", prompt)
-    data, *_ = _qwen_vl_item_grid_case(Qwen3VisionModelBase, [{"image_grid_thw": [1, 2, 2]}])
-    wrong = (
-        {"image": {"pixel_values": MultimodalItemPartition.batched()}}
-        if field == "input_partitions"
-        else [5]
-    )
-    key = MULTIMODAL_ENCODER_ITEM_METADATA_KEY
-    data[key] = replace(data[key], **{field: wrong})
-    with pytest.raises(RequestError, match=field):
-        submit_prepared(MultimodalParams(multimodal_data=data), processor, prompt)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

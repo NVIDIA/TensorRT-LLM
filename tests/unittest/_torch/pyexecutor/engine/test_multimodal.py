@@ -20,6 +20,7 @@ from _torch.pyexecutor.multimodal_utils import (
 import tensorrt_llm
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
     MultimodalEncoderContractError,
     MultimodalModelMixin,
     _build_request_multimodal_input,
@@ -589,6 +590,42 @@ def test_item_encoder_classifies_output_count_contract_error() -> None:
 
     with pytest.raises(MultimodalEncoderRequestError, match="one output per item"):
         mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+
+
+def test_custom_builder_validates_output_before_cache_publication() -> None:
+    def build(params):
+        return {"pixels": torch.cat([mp.multimodal_data["image"]["pixel_values"] for mp in params])}
+
+    tower = Mock(side_effect=lambda pixels: pixels[[0, 0, 1]])
+    model = MultimodalModelMixin()
+    model.mm_encoder_groups = [EncoderGroup(("image",), tower, build)]
+    model.multimodal_data_device_paths = []
+    model.model_config = SimpleNamespace(torch_dtype=torch.float32)
+    scheduler = bare_mm_item_scheduler(model)
+    scheduler.bytes_per_embedding = 4
+    requests = [make_mm_request(i, [1]) for i in (1, 2)]
+    for request in requests:
+        image = request.py_multimodal_data["image"]
+        image["pixel_values"].fill_(request.request_id)
+        image["image_sizes"] = [[1, 1]]
+        _bind_items(scheduler, request, row_bytes=4)
+    selected = {r.request_id: [0] for r in requests}
+
+    with pytest.raises(
+        MultimodalEncoderRequestError, match="returned 3 embeddings.*expects 2"
+    ) as error:
+        scheduler.forward_items(requests, selected)
+
+    assert isinstance(error.value.__cause__, MultimodalEncoderContractError)
+    assert error.value.request_ids == {1, 2}
+    assert scheduler.encoder_cache.current_bytes == 0
+    assert all(not is_multimodal_encoder_ready(r) for r in requests)
+    tower.side_effect = lambda pixels: pixels
+    scheduler.forward_items(requests, selected)
+    assert tower.call_count == 2
+    for request in requests:
+        key = request.py_mm_encoder_state.item_cache_keys[0]
+        assert scheduler.encoder_cache.get(key).item() == request.request_id
 
 
 def test_item_encoder_drains_replayed_host_functions_first() -> None:
