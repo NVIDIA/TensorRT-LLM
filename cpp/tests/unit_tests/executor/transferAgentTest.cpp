@@ -447,7 +447,8 @@ TEST_P(TransferAgentTest, SyncMessage)
     xferAgent1->invalidateRemoteAgent(agent0);
 }
 
-// Status must survive destruction of its owning agent.
+// A status whose transfer completed successfully must remain safe to query and destroy
+// after its owning agent is destroyed.
 TEST_P(TransferAgentTest, StatusOutlivesAgent)
 {
     std::string const agent0{"agent0"}, agent1{"agent1"};
@@ -484,11 +485,16 @@ TEST_P(TransferAgentTest, StatusOutlivesAgent)
 
     if (backend == "mooncake")
     {
+        // The successful wait() above freed the batch and cached success in mBatchFreed, so
+        // these queries do not touch the destroyed engine. An unfinished Mooncake status
+        // must not be queried after its agent is destroyed.
         EXPECT_TRUE(status->isCompleted());
         EXPECT_EQ(status->wait(0), TransferState::kSUCCESS);
     }
     else
     {
+        // The NIXL status's weak_ptr<nixlAgent> expires on reset, so queries report
+        // failure and its destructor skips releaseXferReq.
         EXPECT_FALSE(status->isCompleted());
         EXPECT_EQ(status->wait(0), TransferState::kFAILURE);
     }
