@@ -977,6 +977,9 @@ async def test_context_cancellation_releases_conditional_generation_reservation(
     service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
     service._ctx_client = AsyncMock()
     service._gen_client = AsyncMock()
+    renewal_task = object()
+    service._gen_client.start_reservation_renewal = mock.Mock(return_value=renewal_task)
+    service._gen_client.stop_reservation_renewal = AsyncMock()
     router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
     router.get_next_server = AsyncMock(
         return_value=("gen:9001", {"match_length": 0, "num_tokens": 96})
@@ -1001,6 +1004,7 @@ async def test_context_cancellation_releases_conditional_generation_reservation(
             await pending
 
     router.get_next_server.assert_awaited_once_with(request, req_id=101)
+    service._gen_client.stop_reservation_renewal.assert_awaited_once_with(101, renewal_task)
     router.finish_request.assert_awaited_once_with(request, success=False, req_id=101)
     service._gen_client.send_request.assert_not_awaited()
 

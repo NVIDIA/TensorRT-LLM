@@ -537,9 +537,10 @@ def test_decode_graph_capture_replay(kv_dtype) -> None:
     assert torch.equal(out, eager)
 
 
-def test_decode_rows_get_exact_plans() -> None:
+def test_decode_rows_get_exact_plans(monkeypatch: pytest.MonkeyPatch) -> None:
     _requires_prims_ts()
-    from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import _CORE
+    core = prims_ts_core._PrimsTSSparseCore()
+    monkeypatch.setattr(prims_ts_core, "_CORE", core)
 
     kwargs = dict(
         page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=True
@@ -547,7 +548,12 @@ def test_decode_rows_get_exact_plans() -> None:
     q, k_cache, v_cache, block_table, block_ids, request_indices, positions, selected, metadata = (
         _make_case([1] * 5, seed=7)
     )
-    _sparse_gqa(
+    # Run the larger decode first: workspace growth clears the active plan cache.
+    out = _sparse_gqa(
+        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+    )
+    assert len(core._plans) == 1
+    out_three_rows = _sparse_gqa(
         q[:3],
         k_cache,
         v_cache,
@@ -557,11 +563,7 @@ def test_decode_rows_get_exact_plans() -> None:
         positions[:3],
         **kwargs,
     )
-    plans = len(_CORE._plans)
-    out = _sparse_gqa(
-        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
-    )
-    assert len(_CORE._plans) == plans + 1
+    assert len(core._plans) == 2
     assert out.shape[0] == 5
     expected = qsa_sparse_gqa_reference(
         q=q,
@@ -574,6 +576,7 @@ def test_decode_rows_get_exact_plans() -> None:
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out_three_rows, expected[:3], atol=2e-2, rtol=2e-2)
 
 
 def test_decode_rows_derive_requests_from_seq_lens() -> None:

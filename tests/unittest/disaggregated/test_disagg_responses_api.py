@@ -845,7 +845,11 @@ def _responses_server(
         service._gen_router = AsyncMock(spec=Router)
         service._gen_router.get_next_server.return_value = ("gen:8002", {})
         service._ctx_client = SimpleNamespace(send_request=workers.send_context_request)
-        service._gen_client = SimpleNamespace(send_request=workers.send_generation_request)
+        service._gen_client = SimpleNamespace(
+            send_request=workers.send_generation_request,
+            start_reservation_renewal=lambda *args, **kwargs: None,
+            stop_reservation_renewal=AsyncMock(return_value=None),
+        )
 
         server = env.build_disagg_server(DisaggConfig())
         server._config = config
