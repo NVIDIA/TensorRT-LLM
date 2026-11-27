@@ -2789,12 +2789,13 @@ class KVCacheManagerV2(BaseResourceManager):
         self._helix_cp_size = mapping.cp_size if self._has_cp_helix else 1
         self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
         if self._has_cp_helix:
-            if kv_cache_config.enable_block_reuse:
+            if kv_cache_config.enable_block_reuse and is_disagg:
                 raise ValueError(
                     "KVCacheManagerV2 does not support block reuse with "
-                    "helix context parallelism: a ledger block's bytes span "
-                    "all CP ranks, so publishing it requires a group-wide "
-                    "protocol. Set kv_cache_config.enable_block_reuse=False."
+                    "disaggregated helix context parallelism: each rank "
+                    "holds only its slice of the prompt, so ranks cannot "
+                    "agree on prefix hashes. "
+                    "Set kv_cache_config.enable_block_reuse=False."
                 )
             # K-only draft latents shard by page over CP like the target's.
             if is_draft or any(
@@ -2908,6 +2909,13 @@ class KVCacheManagerV2(BaseResourceManager):
             self._supports_partial_reuse,
             type(self).__name__,
         )
+        if kv_cache_config.enable_block_reuse and self.enable_partial_reuse and self._has_cp_helix:
+            if "enable_partial_reuse" in getattr(kv_cache_config, "model_fields_set", ()):
+                logger.warning(
+                    "Helix context parallelism reuses whole ledger blocks only; "
+                    "forcing enable_partial_reuse=False."
+                )
+            self.enable_partial_reuse = False
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
             _get_generation_kv_capacity(
@@ -11020,9 +11028,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _generation_history_length(self, req: LlmRequest) -> int | None:
         """Return the history length a generation update records, or None to keep it."""
-        # Reuse (history's consumer) is disabled under helix, and under
-        # disaggregated helix max_beam_num_tokens mixes rank-local and global
-        # counts.
+        # Under helix, reuse advances history itself through commit(), and
+        # under disaggregated helix max_beam_num_tokens mixes rank-local and
+        # global counts.
         if self.kv_compression_manages_history or self._has_cp_helix:
             return None
         return req.max_beam_num_tokens - 1

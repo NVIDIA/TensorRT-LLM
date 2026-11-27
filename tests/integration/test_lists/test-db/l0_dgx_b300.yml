@@ -32,6 +32,11 @@ l0_dgx_b300:
   - unittest/_torch/modeling/test_modeling_llama_min_latency.py
   - unittest/_torch/modeling/test_modeling_gpt_oss.py
   - unittest/_torch/multi_gpu_modeling/test_deepseek.py
+  # Aggregated Helix TP1 x CP2 GSM8K with BF16 KV and block reuse: a small KV
+  # pool with no host tier that forces recompute-pause, and the same pool with
+  # a host offload tier that suspends and resumes.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_agg_helix_cp2[reuse_preempt]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_agg_helix_cp2[reuse_host_offload]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
