@@ -3612,9 +3612,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("refresh_retention", &kv::KvCacheManager::refreshRetention, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch_reuse",
-            // By shared_ptr, like create_kv_cache: the transient KvCache takes
-            // manager.shared_from_this(), which throws bad_weak_ptr when no live
-            // KvCache owns the manager yet (the first prefetch of a fresh manager).
+            // By shared_ptr: the transient KvCache calls shared_from_this() on the manager.
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens, int target)
             {
                 auto reuseScope = castReuseScope(std::move(reuseScopeObj));

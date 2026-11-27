@@ -6204,6 +6204,22 @@ class TestRetention(TestKVCacheManagerV2):
         self.manager.refresh_retention()
         self.assertEqual(self._cache(tokens[:4]).get_page_priorities(0), [80])
 
+    def test_prefetch_without_a_live_kv_cache(self) -> None:
+        """prefetch_reuse works while no KV cache owns the manager.
+
+        Its transient KV cache calls shared_from_this() on the manager, which threw bad_weak_ptr
+        on a fresh manager and once every KV cache was gone while the binding took it by reference.
+        """
+        self._prepare_retention()
+        tokens = list(range(12))
+        # Nothing is cached yet, so there is nothing to move.
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
+        self._cache(tokens)
+        self._close_caches()
+        gc.collect()
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
+        self.assertEqual(self.manager.probe_reuse(input_tokens=tokens), len(tokens))
+
     def test_prefetch_rejects_invalid_cache_levels(self) -> None:
         self._prepare_retention()
         for level in (-1, 1):
