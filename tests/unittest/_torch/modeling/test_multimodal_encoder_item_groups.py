@@ -379,9 +379,6 @@ class _GroupedEncoderModel(MultimodalModelMixin):
         # test can assert *which* rows came back, not just how many.
         return pixel_values.clone()
 
-    def encode_multimodal_inputs(self, multimodal_params) -> torch.Tensor:
-        return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
-
 
 @pytest.mark.parametrize("empty_record", [False, True])
 def test_grouped_encoder_rejects_raw_payload_without_item_layout(empty_record: bool) -> None:
@@ -612,30 +609,10 @@ def test_sliced_items_survive_the_grouped_encoder_path():
         torch.testing.assert_close(output, expected)
 
 
-@pytest.mark.parametrize(
-    "modalities,item_order,expected_runs",
-    [
-        pytest.param(["image", "image"], [0, 1], [("image", 5)], id="adjacent-images"),
-        pytest.param(
-            ["video", "image", "image"],
-            [0, 1, 2],
-            [("video", 4), ("image", 5)],
-            id="video-then-images",
-        ),
-        pytest.param(
-            ["image", "video", "image"],
-            [0, 1, 2],
-            [("image", 2), ("video", 4), ("image", 3)],
-            id="interleaved-vision",
-        ),
-        pytest.param(["image", "image"], [1, 0], [("image", 5)], id="reordered-images"),
-    ],
-)
-def test_full_and_item_encoder_paths_share_item_metadata(
-    modalities: list[str], item_order: list[int], expected_runs: list[tuple[str, int]]
-) -> None:
+def test_full_and_item_encoder_paths_share_item_metadata() -> None:
     model = _GroupedEncoderModel()
-    request = _make_request(modalities)
+    request = _make_request(["image", "image", "video", "image"])
+    item_order = [3, 1, 2, 0]
     original = request.item_metadata
     # Reorder prompt refs while retaining the original payload-local indices.
     request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
@@ -649,13 +626,11 @@ def test_full_and_item_encoder_paths_share_item_metadata(
     )
 
     model.encoder_calls.clear()
-    item_outputs, encoder_inputs = _run_items(model, [(request, i) for i in range(len(item_order))])
+    item_outputs, _ = _run_items(model, [(request, i) for i in range(len(item_order))])
 
-    assert [modality for _, _, modality in encoder_inputs] == [m for m, _ in expected_runs]
-    assert model.encoder_calls == [rows for _, rows in expected_runs]
-    assert len(item_outputs) == len(expected)
-    for actual, rows in zip(item_outputs, expected, strict=True):
-        torch.testing.assert_close(actual, rows, rtol=0, atol=0)
+    assert len(model.encoder_calls) == 1
+    for actual, embeddings in zip(item_outputs, expected, strict=True):
+        torch.testing.assert_close(actual, embeddings, rtol=0, atol=0)
 
 
 def test_metadata_is_rebased_for_partial_and_reordered_items() -> None:

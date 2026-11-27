@@ -1100,15 +1100,42 @@ class TestChunkedPrefillCaching:
         )
         assert torch.equal(result2[0], result[0])
 
-    def test_multi_request_batch_caching(self):
-        """Two image requests in one batch: both cached after a single batched call."""
+    @pytest.mark.parametrize("layout", ["fixed", "dynamic", "unknown"])
+    def test_multi_request_batch_caching(self, layout):
+        """Only images with known attention-token counts share the first encoder call."""
         model = self._make_mock_model()
         emb_a = torch.randn(5, self.HIDDEN)
         emb_b = torch.randn(3, self.HIDDEN)
-        model.vision_encoder.return_value = ([emb_a, emb_b], [None, None])
-
+        processor = object.__new__(NemotronHMultimodalInputProcessor)
+        processor.patch_size = 2
+        processor.spatial_merge_size = 4
+        processor._image_prefix_tokens = 4
         param_a = self._make_param_with_runtime("image", 5)
         param_b = self._make_param_with_runtime("image", 3)
+        for param, lengths in ((param_a, (2, 3)), (param_b, (3,))):
+            image = param.multimodal_data["image"]
+            param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+                [("image", i) for i in range(len(lengths))], output_embedding_lengths=lengths
+            )
+            expected_costs = None
+            if layout == "fixed":
+                image["pixel_values"] = torch.zeros(sum(lengths), 3, 4, 4)
+                expected_costs = tuple(length * 8 for length in lengths)
+            elif layout == "dynamic":
+                sizes = [(4, length * 4) for length in lengths]
+                image.update(
+                    pixel_values=[torch.zeros(3, h, w) for h, w in sizes], image_sizes=sizes
+                )
+                expected_costs = tuple(length * 4 + 4 for length in lengths)
+            metadata = processor.get_mm_item_metadata([], param.multimodal_data)
+            assert metadata.encoder_token_lengths == expected_costs
+            param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+        expected_calls = 2 if layout == "unknown" else 1
+        model.vision_encoder.side_effect = (
+            [([emb_a], [None]), ([emb_b], [None])]
+            if layout == "unknown"
+            else [([emb_a, emb_b], None)]
+        )
         encoder_fn = self._make_encoder_fn(model)
 
         result = get_multimodal_embeddings(
@@ -1116,10 +1143,12 @@ class TestChunkedPrefillCaching:
             multimodal_params=[param_a, param_b],
         )
         assert len(result) == 1
-        assert result[0].shape == (8, self.HIDDEN)
-        assert model.vision_encoder.call_count == 1, (
-            "image params should be encoded in a single batched vision_encoder call"
-        )
+        assert torch.equal(result[0], torch.cat([emb_a, emb_b]))
+        assert model._vision_view.call_args_list == [
+            mock.call(param_a, "image"),
+            mock.call(param_b, "image"),
+        ]
+        assert model.vision_encoder.call_count == expected_calls
         assert "multimodal_embedding" in param_a.multimodal_data
         assert "multimodal_embedding" in param_b.multimodal_data
 
@@ -1127,7 +1156,7 @@ class TestChunkedPrefillCaching:
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
         )
-        assert model.vision_encoder.call_count == 1, (
+        assert model.vision_encoder.call_count == expected_calls, (
             "`vision_encoder` was called again on the second chunk. Caching is broken."
         )
         assert torch.equal(result2[0], result[0])

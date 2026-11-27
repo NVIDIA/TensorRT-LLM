@@ -15,6 +15,7 @@ from _torch.pyexecutor.multimodal_utils import (
 )
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
@@ -45,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderProgress,
@@ -232,14 +234,16 @@ def test_executor_factory_enables_chunk_item_scheduling_only_for_v2(
         mapping=mapping,
         mm_encoder_item_scheduling_enabled=True,
         mm_encoder_cache=TensorLRUCache(8),
-        encoder_batch_size=1,
+        encoder_batch_size=2,
         encoder_max_num_tokens=8,
         bytes_per_mm_encoder_embedding=4,
         get_mm_encoder_item_cache_keys=_item_cache_keys,
         model=SimpleNamespace(
             encoder_cache_active=False,
             model_config=SimpleNamespace(
-                pretrained_config=SimpleNamespace(), is_encoder_decoder=False
+                pretrained_config=SimpleNamespace(),
+                is_encoder_decoder=False,
+                extra_attrs={"encoder_batch_size": 2, "encoder_max_num_tokens": 4},
             ),
         ),
     )
@@ -486,13 +490,14 @@ def test_multimodal_scheduler_respects_encoder_batch_size():
     assert output.context_requests == []
 
 
-def test_multimodal_scheduler_withholds_request_on_budget_overflow():
+@pytest.mark.parametrize(("costs", "selected"), [([6, 4, 1], [0, 1]), ([12, 1], [0])])
+def test_multimodal_scheduler_withholds_request_on_budget_overflow(costs, selected):
     scheduler = _scheduler(max_batch_size=3, max_num_tokens=10)
-    request = make_mm_request(1, [6, 4, 1])
+    request = make_mm_request(1, costs)
 
     output = scheduler.schedule_request([request], set())
 
-    assert output.scheduled_mm_encoder_items == {1: [0, 1]}
+    assert output.scheduled_mm_encoder_items == {1: selected}
     assert output.context_requests == []
 
 
@@ -824,6 +829,73 @@ def test_forward_multimodal_encoder_step_contains_model_contract_error():
     assert len(handled) == 1
     assert "must be a MultimodalItemMetadata" in handled[0][0]
     assert handled[0][1] == {"requests": [failed], "charge_budget": False}
+
+
+@pytest.mark.parametrize(
+    "metadata_path,frame_counts", [("gemma", [33]), ("gemma", [16, 17]), ("shared", [33])]
+)
+def test_encoder_segment_overflow_only_fails_producers(metadata_path, frame_counts):
+    from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionModel
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import prepare_encoder_attn_metadata
+
+    slots = SimpleNamespace(max_num_requests=32, prepare=Mock())
+    tower = SimpleNamespace(attn_metadata=slots)
+
+    def encode(pixel_values, image_seq_lens, **kwargs):
+        assert pixel_values.shape[:2] == (33, 9)
+        if metadata_path == "gemma":
+            return Gemma4VisionModel._prepare_attn_metadata(tower, torch.tensor(image_seq_lens))
+        return prepare_encoder_attn_metadata(image_seq_lens, slots, max_seq_len=9)
+
+    scheduler = _scheduler(max_batch_size=2, max_num_tokens=20_160)
+    model = MultimodalModelMixin()
+    model.mm_encoder_groups = [EncoderGroup(("video",), encode)]
+    model.multimodal_data_device_paths = []
+    model._multimodal_encoder_cache = scheduler.encoder_cache
+    vision = SimpleNamespace(patch_size=1, pooling_kernel_size=3, max_soft_tokens=1)
+    processor = object.__new__(Gemma4InputProcessor)
+    processor._config = SimpleNamespace(vision_config=vision)
+    producers = []
+    for request_id, count in enumerate(frame_counts, start=1):
+        video = processor._dummy_vision_data(vision, count, dtype=torch.float32)
+        video["num_frames"] = [count]
+        data = {"video": video}
+        metadata = processor.get_mm_item_metadata([], data)
+        assert metadata.encoder_token_lengths == (9 * count,)
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+        request = make_llm_request(request_id, data, prompt_len=count)
+        initialize_multimodal_encoder_request(request, max_num_tokens=20_160)
+        producers.append(request)
+    text = make_llm_request(3)
+    requests = [*producers, text]
+    selection = scheduler.schedule_request(requests, set())
+    batch = ScheduledRequests()
+    batch.reset_context_requests(selection.context_requests)
+    batch.scheduled_mm_encoder_items = selection.scheduled_mm_encoder_items
+    executor = make_partial_executor(
+        active_requests=requests,
+        model_engine=SimpleNamespace(
+            forward_multimodal_encoder_items=bare_mm_item_scheduler(model).forward_items
+        ),
+        disable_overlap_scheduler=True,
+        _handle_errors=Mock(),
+    )
+
+    executor._forward_multimodal_encoder_step(batch)
+
+    executor._handle_errors.assert_called_once_with(
+        "Encoder attention requires 33 segments, but metadata has 32 slots",
+        requests=producers,
+        charge_budget=False,
+    )
+    slots.prepare.assert_not_called()
+    assert batch.context_requests == [text]
+    executor._update_request_states_tp(batch)
+    assert text.context_remaining_length == 0
+    text.add_new_token(7, 0)
+    text.finish_by(FinishReason.LENGTH, 0)
+    assert text.create_response().result.is_final
 
 
 def test_forward_multimodal_encoder_step_contains_stale_schedule():

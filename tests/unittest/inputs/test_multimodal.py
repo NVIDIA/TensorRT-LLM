@@ -304,7 +304,7 @@ def test_item_metadata_selection_keeps_partitions_in_payload_order(indices) -> N
         input_partitions={
             "image": {"pixels": MultimodalItemPartition(item_lengths=(2, 3))},
             "audio": {
-                "features": MultimodalItemPartition(1, (1, 4)),
+                "features": MultimodalItemPartition.packed([1, 4], axis=1),
                 "shared": MultimodalItemPartition(item_axis=None),
             },
         },
@@ -698,7 +698,10 @@ def test_mixed_hashing_uses_processor_metadata_without_frontend_order() -> None:
 
 
 @pytest.mark.parametrize("hashing_enabled", [False, True])
-def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool) -> None:
+@pytest.mark.parametrize("hook_returns_metadata", [False, True])
+def test_mm_item_metadata_rejects_conflicting_prompt_order(
+    hashing_enabled: bool, hook_returns_metadata: bool
+) -> None:
     class Processor(_KwargsHashFakeProcessor):
         multimodal_hashing_supported = hashing_enabled
 
@@ -718,8 +721,10 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
 
         def get_mm_item_metadata(
             self, prompt_token_ids: list[int], multimodal_data: dict, mm_item_order=None
-        ) -> MultimodalItemMetadata:
-            return MultimodalItemMetadata([("video", 0), ("image", 0)], [4, 4], [2, 2])
+        ) -> MultimodalItemMetadata | None:
+            if hook_returns_metadata:
+                return MultimodalItemMetadata([("video", 0), ("image", 0)], [4, 4], [2, 2])
+            return None
 
     processor = Processor()
     inputs = {
@@ -731,9 +736,14 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
         "mm_item_order": [{"modality": "image", "index": 0}, {"modality": "video", "index": 0}],
     }
 
+    wrapped = create_input_processor_with_hash(processor)
     with pytest.raises(ValueError, match="item references do not match the prompt item order"):
-        create_input_processor_with_hash(processor)(inputs, None)
-
+        wrapped(inputs, None)
+    inputs["mm_item_order"].reverse()
+    _, extra = wrapped(inputs, None)
+    metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.item_refs == (("video", 0), ("image", 0))
+    assert metadata.output_embedding_lengths == (2, 2)
     assert processor.multimodal_hashing_supported is hashing_enabled
 
 

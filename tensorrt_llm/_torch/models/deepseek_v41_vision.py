@@ -63,7 +63,7 @@ class _DeepseekV41PatchEmbed(nn.Module):
         self.proj = nn.Linear(3 * config.patch_size**2, config.hidden_size)
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
-        return self.proj(patches.flatten(1))
+        return self.proj(patches)
 
 
 class _DeepseekV41VisionAttention(nn.Module):
@@ -75,19 +75,19 @@ class _DeepseekV41VisionAttention(nn.Module):
         self.wo = nn.Linear(config.hidden_size, config.hidden_size)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        num_patches = x.shape[0]
+        batch_size, num_patches, hidden_size = x.shape
         query, key, value = (
-            part.reshape(num_patches, self.num_heads, self.head_dim)
+            part.reshape(batch_size, num_patches, self.num_heads, self.head_dim)
             for part in self.wqkv(x).chunk(3, dim=-1)
         )
         query = _apply_vision_rotary(query, cos, sin)
         key = _apply_vision_rotary(key, cos, sin)
         attended = F.scaled_dot_product_attention(
-            query.transpose(0, 1).unsqueeze(0),
-            key.transpose(0, 1).unsqueeze(0),
-            value.transpose(0, 1).unsqueeze(0),
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
         )
-        return self.wo(attended.squeeze(0).transpose(0, 1).reshape(num_patches, -1))
+        return self.wo(attended.transpose(1, 2).reshape(batch_size, num_patches, hidden_size))
 
 
 class _DeepseekV41VisionMLP(nn.Module):
@@ -139,21 +139,27 @@ class DeepseekV41VisionModel(nn.Module):
         self.norm = _DeepseekV41VisionRMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
-        """Encode one row-major patch grid into ``[n_h * n_w, hidden_size]``.
+        """Encode row-major patch grids, keeping attention within each image.
 
         Args:
             patches: Floating-point patches shaped ``[n_h * n_w, 3, P, P]``
-                or ``[n_h * n_w, 3 * P * P]``, in the projection's dtype/device.
+                or flattened to ``[n_h * n_w, 3 * P * P]``. A batch has shape
+                ``[B, n_h * n_w, 3 * P * P]``.
             n_h: Number of patch rows.
             n_w: Number of patch columns.
         """
-        if n_h <= 0 or n_w <= 0 or patches.ndim < 2 or patches.shape[0] != n_h * n_w:
+        grid_shape = (n_h * n_w, self.patch_embed.proj.in_features)
+        batched = patches.ndim == 3 and patches.shape[1:] == grid_shape
+        if not batched and patches.ndim >= 2:
+            patches = patches.flatten(1).unsqueeze(0)
+        if n_h <= 0 or n_w <= 0 or patches.shape[1:] != grid_shape:
             raise ValueError("Vision patches must match a positive n_h by n_w grid")
         hidden_states = self.patch_embed(patches)
         cos, sin = _get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta, patches.device)
         for block in self.blocks:
             hidden_states = block(hidden_states, cos, sin)
-        return self.norm(hidden_states)
+        features = self.norm(hidden_states)
+        return features if batched else features.squeeze(0)
 
 
 class DeepseekV41Aligner(nn.Module):
@@ -173,15 +179,20 @@ class DeepseekV41Aligner(nn.Module):
         self.w2 = nn.Linear(text_hidden_size, text_hidden_size)
 
     def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
-        """Project ``[n_h * n_w, hidden_size]`` image features to text width.
+        """Project image features with an optional leading batch dimension to text width.
 
         Right/bottom zero padding produces
         ``ceil(n_h / ratio) * ceil(n_w / ratio)`` output rows.
         """
-        if n_h <= 0 or n_w <= 0 or x.ndim != 2 or x.shape[0] != n_h * n_w:
+        batched = x.ndim == 3
+        if not batched:
+            x = x.unsqueeze(0)
+        if n_h <= 0 or n_w <= 0 or x.ndim != 3 or x.shape[1] != n_h * n_w:
             raise ValueError("Aligner features must match a positive n_h by n_w grid")
         ratio = self.downsample_ratio
-        grid = x.reshape(n_h, n_w, -1).permute(2, 0, 1)
+        grid = x.reshape(x.shape[0], n_h, n_w, -1).permute(0, 3, 1, 2)
         grid = F.pad(grid, (0, -n_w % ratio, 0, -n_h % ratio))
-        neighborhoods = F.unfold(grid.unsqueeze(0), ratio, stride=ratio).squeeze(0).transpose(0, 1)
-        return self.w2(F.gelu(self.w1(neighborhoods)))
+        neighborhoods = F.unfold(grid, ratio, stride=ratio).transpose(1, 2)
+        flat = neighborhoods.flatten(0, 1)
+        aligned = self.w2(F.gelu(self.w1(flat))).unflatten(0, neighborhoods.shape[:2])
+        return aligned if batched else aligned.squeeze(0)

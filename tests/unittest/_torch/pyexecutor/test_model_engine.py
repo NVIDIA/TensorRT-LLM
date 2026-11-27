@@ -1432,6 +1432,7 @@ def test_layerwise_nvtx_flag_controls_real_forward_markers(
     engine.enable_in_graph_sampling = False
     engine.max_beam_width = 1
     engine.batch_size = 4
+    engine.encoder_batch_size = engine.batch_size
     engine.is_spec_decode = False
     engine.input_processor = None
     engine.encoder_max_num_tokens = 16

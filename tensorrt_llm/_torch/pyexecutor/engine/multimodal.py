@@ -9,6 +9,7 @@ byte budget before each decode step. This is a capability facet, orthogonal to
 the runner family axis -- it has no warmup or graph-capture phase.
 """
 
+import sys
 from collections.abc import Hashable, Mapping
 from typing import Any
 
@@ -195,11 +196,21 @@ def setup_mm_encoder_cuda_graphs(
         module.enable_blocks_cuda_graph(max_num_tokens=max_num_tokens)
 
 
+def _set_mm_encoder_capacity(model: nn.Module, max_num_tokens: int, batch_size: int) -> None:
+    # A local encoder may own a separate model config from its wrapper.
+    for owner in (model, getattr(model, "mm_encoder", None)):
+        attrs = getattr(getattr(owner, "model_config", None), "extra_attrs", None)
+        if attrs is not None:
+            attrs.update(encoder_max_num_tokens=max_num_tokens, encoder_batch_size=batch_size)
+
+
 def setup_mm_encoder_attn_metadata(
     model: nn.Module,
     input_processor: InputProcessor,
     encoder_max_num_tokens: int,
     attention_metadata_capacity: dict[str, int] | None,
+    *,
+    encoder_batch_size: int | None = None,
 ) -> None:
     """Construct AttentionMetadata for any multimodal encoders inside the loaded model,
     using the engine's encoder token budget (``encoder_max_num_tokens``, falling back to
@@ -215,6 +226,12 @@ def setup_mm_encoder_attn_metadata(
     function rather than a ``MultimodalItemScheduler`` method: the scheduler is ``None``
     whenever item scheduling is off.
     """
+    config = getattr(model, "model_config", None)
+    if isinstance(model, MultimodalModelMixin) or getattr(config, "mm_encoder_only", False):
+        # Use the configured limits until a startup dummy has actually run.
+        if encoder_batch_size is None:
+            encoder_batch_size = getattr(config, "max_batch_size", None) or sys.maxsize
+        _set_mm_encoder_capacity(model, encoder_max_num_tokens, encoder_batch_size)
     encoders = [module for module in model.modules() if isinstance(module, MultimodalEncoderMixin)]
     if not encoders:
         return

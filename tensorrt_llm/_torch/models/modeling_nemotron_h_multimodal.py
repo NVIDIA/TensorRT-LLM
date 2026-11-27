@@ -2,8 +2,9 @@
 import copy
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
+from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -77,7 +78,7 @@ from .modeling_multimodal_utils import (
 )
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
-from .modeling_radio import RADIOVisionModel, calc_seq_lens
+from .modeling_radio import RADIOVisionModel, calc_seq_len, calc_seq_lens, radio_prefix_token_counts
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 if TYPE_CHECKING:
@@ -1148,6 +1149,7 @@ class NemotronHMultimodalEncoder(NemotronHVisionEncoder):
                     EncoderGroup(("video",), partial(_encoder_fn, modality="video"), pack),
                 ),
                 multimodal_params,
+                self,
             )
         ]
 
@@ -1171,6 +1173,37 @@ class NemotronHMultimodalInputProcessor(
         mm_item_order: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[MultimodalItemMetadata]:
         metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        image = multimodal_data.get("image")
+        if metadata is not None and image and all(m == "image" for m, _ in metadata.item_refs):
+            prefix = self._image_prefix_tokens
+            pixels = image.get("pixel_values")
+            if prefix is None:
+                return metadata
+            if (sizes := image.get("image_sizes")) is not None:
+                if len(sizes) == len(metadata.item_refs):
+                    costs = calc_seq_lens(sizes, self.patch_size)
+                    return replace(
+                        metadata,
+                        encoder_token_lengths=[costs[i] + prefix for _, i in metadata.item_refs],
+                    )
+            elif isinstance(pixels, torch.Tensor) and pixels.ndim == 4:
+                size = (pixels.shape[-2], pixels.shape[-1])
+                tile_cost = calc_seq_len(size, self.patch_size) + prefix
+                if len(metadata.item_refs) == 1:
+                    return replace(metadata, encoder_token_lengths=[len(pixels) * tile_cost])
+                # Fixed tiles each produce the same number of projected tokens.
+                lengths = metadata.output_embedding_lengths
+                tokens = calc_seq_len(size, self.spatial_merge_size)
+                if (
+                    lengths is not None
+                    and tokens > 0
+                    and sum(lengths) == len(pixels) * tokens
+                    and all(length > 0 and length % tokens == 0 for length in lengths)
+                ):
+                    return replace(
+                        metadata,
+                        encoder_token_lengths=[length // tokens * tile_cost for length in lengths],
+                    )
         audio = multimodal_data.get("audio")
         # EVS merge also carries full prompt IDs for image/audio requests.
         # Selecting individual items would require rebuilding that prompt stream.
@@ -1182,15 +1215,15 @@ class NemotronHMultimodalInputProcessor(
                 return metadata
             clip_counts = clip_counts.cpu()
             audio["audio_num_clips"] = clip_counts
-            clips = tuple(clip_counts.tolist())
+            clips = clip_counts.tolist()
             item_count = sum(m == "audio" for m, _ in metadata.item_refs)
             if len(clips) == item_count:
-                packed = MultimodalItemPartition(item_lengths=clips)
+                packed = MultimodalItemPartition.packed(clips)
                 metadata.input_partitions["audio"] = {
                     "input_audio_features": packed,
                     "feature_attention_mask": packed,
                     "audio_output_lengths": packed,
-                    "audio_num_clips": MultimodalItemPartition(),
+                    "audio_num_clips": MultimodalItemPartition.batched(),
                 }
         return metadata
 
@@ -1274,6 +1307,11 @@ class NemotronHMultimodalInputProcessor(
         # Detect dynamic resolution from config.
         self.dynamic_tiler = None
         vision_args = getattr(getattr(config, "vision_config", None), "args", None)
+        self._image_prefix_tokens = (
+            sum(radio_prefix_token_counts(SimpleNamespace(**vision_args)))
+            if isinstance(vision_args, dict) and "cls_token_per_teacher" in vision_args
+            else None
+        )
         if isinstance(vision_args, dict) and "min_num_patches" in vision_args:
             pixel_shuffle_version = config.ps_version
             if pixel_shuffle_version != "v2":
@@ -3508,15 +3546,6 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
             EncoderGroup(("audio",), self._encode_audio_group, pack),
         )
 
-    def encode_multimodal_inputs(
-        self, multimodal_params: List[MultimodalParams], **_: Any
-    ) -> torch.Tensor:
-        # Raw encoder hook per the `MultimodalModelMixin` contract. Cache
-        # bookkeeping belongs to callers (`_get_or_encode_multimodal_embeddings`,
-        # `_dispatch_cross_iter_prefetch`), not here — wrapping in
-        # `get_multimodal_embeddings` would double-cache.
-        return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
-
     @torch.inference_mode()
     def forward(
         self,
@@ -3552,7 +3581,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
             if raw_ctx_params:
                 self._check_encoders_exist(raw_ctx_params)
                 mm_embedding = get_multimodal_embeddings(
-                    encoder_forward_fn=partial(encode_multimodal_by_groups, self.mm_encoder_groups),
+                    encoder_forward_fn=self.encode_multimodal_inputs,
                     multimodal_params=ctx_params,
                 )
             # E/P prefill: encoder already ran; use attached embeddings.

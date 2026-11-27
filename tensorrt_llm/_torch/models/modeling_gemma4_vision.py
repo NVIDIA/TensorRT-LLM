@@ -54,7 +54,7 @@ from ..attention.backends.interface import AttentionMetadata, PredefinedAttentio
 from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
-from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_encoder import MultimodalEncoderMixin, validate_encoder_segment_count
 from .modeling_utils import _load_weights_impl
 
 
@@ -745,6 +745,7 @@ class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
 
     def _prepare_attn_metadata(self, seq_lens_cpu: torch.Tensor):
         batch_size = int(seq_lens_cpu.numel())
+        validate_encoder_segment_count(batch_size, self.attn_metadata)
         prompt_lens = seq_lens_cpu.tolist()
         self.attn_metadata.num_contexts = batch_size
         self.attn_metadata.request_ids = list(range(1, batch_size + 1))

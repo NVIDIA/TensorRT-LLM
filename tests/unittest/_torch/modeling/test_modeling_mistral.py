@@ -30,7 +30,7 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -769,7 +769,7 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
 @pytest.mark.parametrize(
     "sizes, encoder_lengths, embedding_lengths",
     [
-        ([[28, 56]], [8], [2]),
+        ([[42, 56]], [12], [2]),
         ([[28, 56], [28, 56]], [8, 8], [2, 2]),
         ([[28, 56], [56, 84]], [8, 24], [2, 6]),
     ],
@@ -879,36 +879,21 @@ def test_dummy_get_dummy_mm_data_respects_requested_item_count():
     assert image["pixel_values"].shape[0] == 3
 
 
+@pytest.mark.cpu_only
 def test_dummy_mm_data_satisfies_the_encoder_input_contract():
-    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
-
-    Nothing rebuilds these tensors through the input processor any more, so the
-    processor now restates the encoder's input layout on its own. A drift
-    between the two would surface only as a crash during startup memory
-    estimation. Drive the encoder's real batching step instead of restating its
-    expectations here, so a change on either side fails this test.
-    """
-    proc = _make_dummy_processor()
-    budget = 8192
-    tokens_per_image = proc.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)["image"]
-    num_images = min(8, budget // tokens_per_image)
-    image = proc.get_dummy_mm_data(
-        max_num_encoder_tokens=budget,
-        mm_counts={"image": num_images},
-        dtype=torch.float16,
-    )["image"]
-
-    # `_vision_forward` collects one entry per request and converts the sizes to
-    # tensors before batching; mirror that, then run the real batching step.
-    batched_pixel_values, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
-        pixel_values=[image["pixel_values"]],
-        image_sizes=[torch.tensor(image["image_sizes"])],
+    """Startup passes the processor's dummy and its item metadata directly to the encoder."""
+    proc = _make_dummy_processor(image_size=56)
+    data = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=32, mm_counts={"image": 2}, dtype=torch.float16
     )
+    param = MultimodalParams(multimodal_data=data)
+    encoder = _MistralCpuEncoder(patch_size=14, merge_size=2)
 
-    num_images = image["pixel_values"].shape[0]
-    assert batched_pixel_values.shape[0] == num_images
-    assert batched_sizes.shape == (num_images, 2)
-    assert batched_pixel_values.dtype == torch.float16
+    embeddings = encoder.encode_multimodal_inputs([param])
+
+    per_image = embeddings.split(param.item_metadata.output_embedding_lengths)
+    assert [image.shape for image in per_image] == [(4, 3), (4, 3)]
+    assert embeddings.dtype == torch.float16
 
 
 # ---------------------------------------------------------------------------
@@ -984,3 +969,39 @@ def test_text_only_native_checkpoint_reports_no_encoder_geometry() -> None:
     # The memory profiler treats `NotImplementedError` as "skip MM profiling".
     with pytest.raises(NotImplementedError):
         proc.get_dummy_mm_data(max_num_encoder_tokens=8192, mm_counts={"image": 1})
+
+
+class _MistralCpuEncoder(modeling_mistral.Mistral3VLM):
+    def __init__(self, patch_size=1, merge_size=1):
+        torch.nn.Module.__init__(self)
+        self.patch_size = patch_size
+        self._vision_tower = self._tower
+        self._multi_modal_projector = lambda features, sizes: features[:: merge_size**2]
+
+    def _tower(self, pixel_values, image_sizes):
+        return torch.cat(
+            [
+                image[:, : height : self.patch_size, : width : self.patch_size].flatten(1).T
+                for image, (height, width) in zip(pixel_values, image_sizes, strict=True)
+            ]
+        ).unsqueeze(0)
+
+
+@pytest.mark.cpu_only
+def test_mistral_encoder_batches_mixed_sizes_across_requests():
+    processor = _make_dummy_processor(patch_size=1, spatial_merge_size=1, image_size=4)
+    pixels = torch.arange(24, dtype=torch.float32).reshape(2, 1, 4, 3)
+    small = torch.arange(6, dtype=torch.float32).reshape(1, 1, 2, 3) + 100
+    params = []
+    for batch, sizes in ((pixels, [[2, 3], [4, 2]]), (small, torch.tensor([[2, 3]]))):
+        data = {"image": {"pixel_values": batch, "image_sizes": sizes}}
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = processor.get_mm_item_metadata([], data)
+        params.append(MultimodalParams(multimodal_data=data))
+
+    encoder = _MistralCpuEncoder()
+    selected = encoder.build_multimodal_encoder_input(params[0], [0], "image")
+    torch.testing.assert_close(selected.multimodal_data["image"]["pixel_values"], pixels[:1, :, :2])
+    expected = torch.cat(
+        (pixels[0, :, :2].flatten(), pixels[1, :, :, :2].flatten(), small.flatten())
+    )
+    torch.testing.assert_close(encoder.encode_multimodal_inputs(params).flatten(), expected)

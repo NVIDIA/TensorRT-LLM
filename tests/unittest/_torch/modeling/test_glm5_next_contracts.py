@@ -463,7 +463,9 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
         encoder_batch_size=num_images,
     )
 
-    params = profiler._create_dummy_encoder_inputs()
+    profile = profiler._create_dummy_encoder_inputs()
+    assert profile is not None
+    params, _, _ = profile
 
     def encode(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         assert grid_thw.shape == (num_images, 3)
@@ -480,6 +482,53 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
     assert metadata.item_refs == tuple(("image", i) for i in range(num_images))
     assert metadata.encoder_token_lengths == (16,) * num_images
     assert metadata.output_embedding_lengths == (4,) * num_images
+
+
+@pytest.mark.cpu_only
+def test_mixed_vision_batch_matches_single_items():
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalParams,
+    )
+
+    max_patches = 64
+
+    def encode_patches(pixel_values, grid_thw):
+        assert len(pixel_values) <= max_patches
+        widths = grid_thw[:, 2].repeat_interleave(grid_thw.prod(1) // 4)
+        return pixel_values[::4] + widths[:, None]
+
+    model = Glm5NextVisionModelBase.__new__(Glm5NextVisionModelBase)
+    torch.nn.Module.__init__(model)
+    model.model_config = SimpleNamespace(extra_attrs={"encoder_max_num_tokens": max_patches})
+    model.encode_batched = encode_patches
+    params = []
+    for modality, grid, key in (
+        ("video", [2, 4, 6], "pixel_values_videos"),
+        ("image", [1, 4, 4], "pixel_values"),
+        ("image", [1, 2, 6], "pixel_values"),
+    ):
+        patches = grid[0] * grid[1] * grid[2]
+        params.append(
+            MultimodalParams(
+                multimodal_data={
+                    modality: {
+                        key: torch.arange(patches).reshape(-1, 1),
+                        f"{modality}_grid_thw": torch.tensor([grid]),
+                    },
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [(modality, 0)],
+                        encoder_token_lengths=[patches],
+                        output_embedding_lengths=[patches // 4],
+                    ),
+                }
+            )
+        )
+
+    expected = torch.cat([model([item])[0] for item in params])
+    (actual,) = model(params)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _materialize_meta(module: torch.nn.Module) -> None:

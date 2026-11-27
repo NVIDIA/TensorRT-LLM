@@ -20,6 +20,7 @@ from _torch.pyexecutor.multimodal_utils import (
 import tensorrt_llm
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
     MultimodalEncoderContractError,
     MultimodalModelMixin,
     _build_request_multimodal_input,
@@ -345,8 +346,8 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
 
 
 @pytest.mark.parametrize(
-    ("encoder_max_num_tokens", "max_num_tokens", "tower_budget"),
-    [(None, 4096, 4096), (1024, 4096, 1024), (None, None, 128)],
+    ("encoder_max_num_tokens", "max_num_tokens", "tower_budget", "encoder_batch_size"),
+    [(None, 4096, 4096, None), (1024, 4096, 1024, 2), (None, None, 128, None)],
     ids=["configured", "encoder_budget", "resolved"],
 )
 def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
@@ -354,11 +355,13 @@ def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
     encoder_max_num_tokens: int | None,
     max_num_tokens: int | None,
     tower_budget: int,
+    encoder_batch_size: int | None,
 ) -> None:
     """A merged item fits a prompt shorter than its patches, so the clamped budget is too small."""
     from tensorrt_llm._torch.pyexecutor.engine import model_setup
 
-    model = SimpleNamespace(model_config=SimpleNamespace())
+    model = torch.nn.Module()
+    model.model_config = SimpleNamespace(mm_encoder_only=True, extra_attrs={})
     loader = Mock()
     loader.load.return_value = (model, None)
     for name in ("init_process_setup", "configure_autotuner_nvmmh", "prepare_loaded_model"):
@@ -370,12 +373,12 @@ def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
         model_setup, "compile_model", Mock(return_value=SimpleNamespace(model=model))
     )
     monkeypatch.setattr(model_setup.MultimodalEncoderRunner, "create", Mock())
-    setup_metadata, setup_graphs = Mock(), Mock()
-    monkeypatch.setattr(model_setup, "setup_mm_encoder_attn_metadata", setup_metadata)
+    setup_graphs = Mock()
     monkeypatch.setattr(model_setup, "setup_mm_encoder_cuda_graphs", setup_graphs)
     llm_args = SimpleNamespace(
         max_num_tokens=max_num_tokens,
         encoder_max_num_tokens=encoder_max_num_tokens,
+        encoder_max_batch_size=encoder_batch_size,
         get_runtime_sizes=lambda: (1, max_num_tokens, 128, 1),
         multimodal_config=None,
         cuda_graph_config=None,
@@ -387,7 +390,8 @@ def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
     ) as built:
         assert built.max_num_tokens == 128
 
-    assert setup_metadata.call_args.args[2] == tower_budget
+    assert built.model_config.extra_attrs["encoder_max_num_tokens"] == tower_budget
+    assert built.model_config.extra_attrs["encoder_batch_size"] == (encoder_batch_size or 1)
     assert setup_graphs.call_args.kwargs["max_num_tokens"] == tower_budget
 
 
@@ -586,6 +590,42 @@ def test_item_encoder_classifies_output_count_contract_error() -> None:
 
     with pytest.raises(MultimodalEncoderRequestError, match="one output per item"):
         mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+
+
+def test_custom_builder_validates_output_before_cache_publication() -> None:
+    def build(params):
+        return {"pixels": torch.cat([mp.multimodal_data["image"]["pixel_values"] for mp in params])}
+
+    tower = Mock(side_effect=lambda pixels: pixels[[0, 0, 1]])
+    model = MultimodalModelMixin()
+    model.mm_encoder_groups = [EncoderGroup(("image",), tower, build)]
+    model.multimodal_data_device_paths = []
+    model.model_config = SimpleNamespace(torch_dtype=torch.float32)
+    scheduler = bare_mm_item_scheduler(model)
+    scheduler.bytes_per_embedding = 4
+    requests = [make_mm_request(i, [1]) for i in (1, 2)]
+    for request in requests:
+        image = request.py_multimodal_data["image"]
+        image["pixel_values"].fill_(request.request_id)
+        image["image_sizes"] = [[1, 1]]
+        _bind_items(scheduler, request, row_bytes=4)
+    selected = {r.request_id: [0] for r in requests}
+
+    with pytest.raises(
+        MultimodalEncoderRequestError, match="returned 3 embeddings.*expects 2"
+    ) as error:
+        scheduler.forward_items(requests, selected)
+
+    assert isinstance(error.value.__cause__, MultimodalEncoderContractError)
+    assert error.value.request_ids == {1, 2}
+    assert scheduler.encoder_cache.current_bytes == 0
+    assert all(not is_multimodal_encoder_ready(r) for r in requests)
+    tower.side_effect = lambda pixels: pixels
+    scheduler.forward_items(requests, selected)
+    assert tower.call_count == 2
+    for request in requests:
+        key = request.py_mm_encoder_state.item_cache_keys[0]
+        assert scheduler.encoder_cache.get(key).item() == request.request_id
 
 
 def test_item_encoder_drains_replayed_host_functions_first() -> None:

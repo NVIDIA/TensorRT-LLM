@@ -691,7 +691,13 @@ def build_mm_encoder_runner(
             if budget is not None
         )
         input_processor = create_engine_input_processor(model_path, llm_args)
-        setup_mm_encoder_attn_metadata(loaded.model, input_processor, encoder_max_num_tokens, None)
+        setup_mm_encoder_attn_metadata(
+            loaded.model,
+            input_processor,
+            encoder_max_num_tokens,
+            None,
+            encoder_batch_size=llm_args.encoder_max_batch_size or loaded.max_batch_size,
+        )
         compiled = compile_model(
             loaded.model,
             llm_args=llm_args,

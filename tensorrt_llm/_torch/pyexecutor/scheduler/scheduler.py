@@ -740,7 +740,7 @@ class _MultimodalEncoderStep:
     ) -> bool:
         """Select one bound item for encoding if it fits the remaining budget."""
         cost = state.encoder_token_lengths[item_idx]
-        if self.batch_slots == 0 or cost > self.tokens:
+        if self.batch_slots == 0 or (self.selected and cost > self.tokens):
             return False
         self.batch_slots -= 1
         self.tokens -= cost

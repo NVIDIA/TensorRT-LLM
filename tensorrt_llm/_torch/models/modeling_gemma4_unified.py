@@ -229,8 +229,35 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
         metadata = BaseMultimodalInputProcessor.get_mm_item_metadata(
             self, prompt_token_ids, multimodal_data, mm_item_order
         )
-        if metadata is not None:
-            metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
+        if metadata is None:
+            # Unhashed inputs still need lengths for the encoder-free projections.
+            lengths = {}
+            for modality in ("image", "video"):
+                data = multimodal_data.get(modality, {})
+                pixels = data.get("pixel_values")
+                if pixels is not None and pixels.ndim == 3:
+                    # Each merged patch projects directly to a text embedding.
+                    _, lengths[modality] = self._vision_item_lengths(data, pooling_area=1)
+            if (audio := multimodal_data.get("audio")) is not None:
+                mask = audio.get("audio_features_mask")
+                features = audio["audio_features"]
+                clips = len(features) if features.ndim == 3 else 1
+                lengths["audio"] = (
+                    [features.shape[-2]] * clips
+                    if mask is None
+                    else mask.reshape(clips, -1).bool().sum(dim=-1).tolist()
+                )
+            if not lengths:
+                return None
+            refs = (
+                [(entry["modality"], entry["index"]) for entry in mm_item_order]
+                if mm_item_order
+                else [(m, i) for m, counts in lengths.items() for i in range(len(counts))]
+            )
+            metadata = MultimodalItemMetadata(
+                refs, output_embedding_lengths=[lengths[m][i] for m, i in refs]
+            )
+        metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
         return metadata
 
 
@@ -348,6 +375,18 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
         # Surface the text (LLM) config and its normalized KV-cache geometry.
         self.post_config()
         self.is_loaded = True
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        if mm_data.get("multimodal_embedding") is not None:
+            return
+        super().validate_multimodal_request_data(mm_data)
+        for modality in ("image", "video"):
+            data = mm_data.get(modality)
+            if data is not None and data.get("image_position_ids") is None:
+                raise ValueError(
+                    f"Gemma4 Unified {modality} inputs require image_position_ids "
+                    "from LLM.preprocess()."
+                )
 
     # --- Encoder-free feature extractors (override the tower-based parents) ---
 

@@ -26,6 +26,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv41_multimodal import (
     DeepseekV41ForConditionalGeneration,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import PreparedLlmInputs
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_attn_metadata
 from tensorrt_llm.inputs import create_input_processor_with_hash
 from tensorrt_llm.inputs.shared_prompt_store import SharedPromptStore
 
@@ -198,6 +199,9 @@ def test_complete_vision_and_aligner_match_reference(
         actual = aligner(model(patches, 4, 5), 4, 5)
         expected = _reference_encoder(model, aligner, vision_config, patches, 4, 5)
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(model(patches.flatten(2), 4, 5), model(patches, 4, 5))
+    patch = patches[:1].flatten(1)
+    torch.testing.assert_close(model(patch.unsqueeze(0), 1, 1), model(patch, 1, 1).unsqueeze(0))
     model.bfloat16()
     assert model.patch_embed.proj.weight.dtype == torch.bfloat16
     for name, parameter in model.named_parameters():
@@ -217,27 +221,39 @@ def test_wrapper_encodes_image_spans_and_tracks_active_positions(
     wrapper.image_end = nn.Parameter(torch.tensor([-3.0, -4.0]))
     wrapper.image_newline = nn.Parameter(torch.tensor([-5.0, -6.0]))
     pixels = torch.randn(20, 3, 2, 2)
-    params = [
-        SimpleNamespace(
-            multimodal_data={
-                "image": {
-                    "pixel_values": [pixels],
-                    "image_grid_hw": [(4, 5)],
-                    "llm_grid_hw": [(2, 2)],
-                    "num_tokens": [8],
+
+    params = []
+    expected = []
+    for image, height, width in [(pixels, 4, 5), (-pixels, 5, 4), (pixels * 2, 4, 5)]:
+        params.append(
+            SimpleNamespace(
+                multimodal_data={
+                    "image": {
+                        "pixel_values": [image],
+                        "image_grid_hw": [(height, width)],
+                        "llm_grid_hw": [(2, 2)],
+                        "num_tokens": [8],
+                    }
                 }
-            }
+            )
         )
-    ]
+        features = _reference_encoder(
+            wrapper.vision, wrapper.aligner, vision_config, image, height, width
+        )
+        expected.extend(
+            (
+                wrapper.image_start[None],
+                features[:2],
+                wrapper.image_newline[None],
+                features[2:],
+                wrapper.image_newline[None],
+                wrapper.image_end[None],
+            )
+        )
+
     output = wrapper.encode_multimodal_inputs(params)
-    features = wrapper.aligner(wrapper.vision(pixels, 4, 5), 4, 5)
-    torch.testing.assert_close(output[[1, 2, 4, 5]], features)
-    torch.testing.assert_close(
-        output[[0, 3, 6, 7]],
-        torch.stack(
-            (wrapper.image_start, wrapper.image_newline, wrapper.image_newline, wrapper.image_end)
-        ),
-    )
+    torch.testing.assert_close(output, torch.cat(expected), rtol=2e-5, atol=2e-6)
+
     ids = torch.tensor([_IMAGE_ID] * 10)
     kwargs = wrapper.get_language_model_extra_forward_kwargs(
         raw_input_ids=ids,
@@ -264,6 +280,40 @@ def test_wrapper_encodes_image_spans_and_tracks_active_positions(
             **({"context_requests": requests} if requests is not None else {}),
         )
         assert wrapper.llm.forward.call_args.kwargs["context_requests"] is requests
+
+
+@pytest.mark.parametrize(
+    "item_limit,patch_budget,max_patches",
+    [(1, 32768, 8100), (4, 16200, 16200)],
+    ids=["item-limit", "patch-budget"],
+)
+def test_wrapper_bounds_image_batches(item_limit, patch_budget, max_patches) -> None:
+    wrapper = _wrapper()
+    wrapper.model_config = SimpleNamespace(
+        max_batch_size=item_limit, max_num_tokens=8192, extra_attrs={}
+    )
+    wrapper.vision = Mock(side_effect=lambda pixels, height, width: pixels[:, ::9, :2])
+    wrapper.aligner = Mock(side_effect=lambda features, height, width: features)
+    wrapper.image_start = wrapper.image_end = wrapper.image_newline = torch.zeros(2)
+    setup_mm_encoder_attn_metadata(wrapper, object(), patch_budget, None)
+
+    # At patch size 14 a 1260 x 1260 image has 90 x 90 patches.
+    pixels = [torch.full((1,), float(i)).expand(8100, 3, 14, 14) for i in range(4)]
+
+    def encode(images):
+        image = {
+            "pixel_values": images,
+            "image_grid_hw": [(90, 90)] * len(images),
+            "llm_grid_hw": [(30, 30)] * len(images),
+            "num_tokens": [932] * len(images),
+        }
+        return wrapper.encode_multimodal_inputs([SimpleNamespace(multimodal_data={"image": image})])
+
+    expected = torch.cat([encode([image]) for image in pixels])
+    wrapper.vision.reset_mock()
+    torch.testing.assert_close(encode(pixels), expected, rtol=0, atol=0)
+    batch_patches = [math.prod(call.args[0].shape[:2]) for call in wrapper.vision.call_args_list]
+    assert max(batch_patches) == max_patches
 
 
 def test_wrapper_request_lifecycle_preserves_image_history() -> None:

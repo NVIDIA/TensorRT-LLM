@@ -78,7 +78,8 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
-from .engine.multimodal import is_multimodal, use_mrope
+from .engine.multimodal import (_set_mm_encoder_capacity, is_multimodal,
+                                use_mrope)
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
                                            KVCacheManagerV2, Role,
@@ -1226,6 +1227,27 @@ def _fit_draft_pool_ratio(
         draft_kv_config.pool_ratio = [1.0]
 
 
+def _mm_encoder_profile_capacity(
+        max_tokens_per_item: dict[str, int], max_num_tokens: int,
+        batch_size: int) -> tuple[int, int, dict[str, int]]:
+    """Return the token and item caps plus the dummy counts that realize the token cap."""
+    for modality, cost in max_tokens_per_item.items():
+        if not modality:
+            raise ValueError("Multimodal modality name cannot be empty")
+        if cost <= 0:
+            raise ValueError(
+                f"Multimodal encoder token counts must be positive; got {cost} for {modality}"
+            )
+    largest, modality = max(((cost, modality)
+                             for modality, cost in max_tokens_per_item.items()
+                             if cost <= max_num_tokens),
+                            default=(0, ""))
+    if not largest:
+        return max_num_tokens, batch_size, {}
+    count = min(batch_size, max_num_tokens // largest)
+    return count * largest, batch_size, {modality: count}
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -1294,7 +1316,6 @@ class KvCacheCreator:
         self._mla_chunked_profile_length: int | None = None
         # Prompt length of the fresh-prefill dummies the profiling forward runs.
         self._profiled_prompt_len = 0
-        self._dummy_encoder_inputs: List[MultimodalParams] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
         self._cache_transceiver_config = llm_args.cache_transceiver_config
@@ -1864,99 +1885,82 @@ class KvCacheCreator:
             requests = requests * self._mapping.tp_size
         return requests
 
-    def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
-        """Build one processed MM encoder batch at its scheduling limits."""
+    def _create_dummy_encoder_inputs(
+            self) -> tuple[list[MultimodalParams], int, int] | None:
+        """Build one processed MM encoder batch and return its token and item limits."""
         if not isinstance(self._model_engine.model, MultimodalModelMixin):
-            return []
+            return None
         if isinstance(
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
-            return []
+            return None
         if self._llm_args.disable_mm_encoder:
-            return []
+            return None
         # MM E/P disaggregation may remove an otherwise exposed encoder.
         if (hasattr(self._model_engine.model, "mm_encoder")
                 and self._model_engine.model.mm_encoder is None):
-            return []
+            return None
 
         input_processor = self._model_engine.input_processor
         encoder_max_num_tokens = self._model_engine.encoder_max_num_tokens
         if encoder_max_num_tokens is None or encoder_max_num_tokens <= 0:
-            return []
+            return None
 
         try:
             max_tokens_per_item = input_processor.get_mm_max_tokens_per_item(
                 max_num_encoder_tokens=encoder_max_num_tokens)
-            for modality, num_tokens in max_tokens_per_item.items():
-                if not modality:
-                    raise ValueError("Multimodal modality name cannot be empty")
-                if num_tokens <= 0:
-                    raise ValueError(
-                        "Multimodal encoder token counts must be positive; "
-                        f"got {num_tokens} for {modality}")
-            max_tokens_per_item = {
-                modality: num_tokens
-                for modality, num_tokens in max_tokens_per_item.items()
-                if num_tokens <= encoder_max_num_tokens
-            }
-            if not max_tokens_per_item:
-                return []
-
-            modality, num_tokens_per_item = max(
-                max_tokens_per_item.items(),
-                key=lambda item: (item[1], item[0]),
-            )
-            num_items = min(
-                self._model_engine.encoder_batch_size,
-                encoder_max_num_tokens // num_tokens_per_item,
-            )
+            token_cap, item_cap, counts = _mm_encoder_profile_capacity(
+                max_tokens_per_item, encoder_max_num_tokens,
+                self._model_engine.encoder_batch_size)
+            if not counts:
+                return None
             mm_data = input_processor.get_dummy_mm_data(
                 max_num_encoder_tokens=encoder_max_num_tokens,
-                mm_counts={modality: num_items},
+                mm_counts=counts,
                 dtype=self._model_engine.model.dtype,
             )
         except NotImplementedError:
             logger.info("Multimodal memory profiling skipped: "
                         f"{type(input_processor).__name__} does not implement "
                         "get_dummy_mm_data().")
-            return []
+            return None
         if not mm_data:
-            return []
+            return None
         if not isinstance(mm_data, dict):
             raise ValueError(
                 "get_dummy_mm_data() must return a multimodal_data "
                 "dictionary")
-        return [MultimodalParams(multimodal_data=mm_data)]
+        return [MultimodalParams(multimodal_data=mm_data)], token_cap, item_cap
 
     def _encode_dummy_inputs(self) -> Optional[torch.Tensor]:
         """Run the full-budget MM encoder and retain equivalent store output."""
-        if not self._dummy_encoder_inputs:
+        profile = self._create_dummy_encoder_inputs()
+        if profile is None:
             return None
+        encoder_inputs, token_cap, item_cap = profile
 
-        encoder_inputs = self._dummy_encoder_inputs
-        try:
-            with torch.inference_mode():
-                for encoder_input in encoder_inputs:
-                    encoder_input.to_device(
-                        "multimodal_data",
-                        "cuda",
-                        pin_memory=prefer_pinned(),
-                        target_keywords=getattr(
-                            self._model_engine.model,
-                            "multimodal_data_device_paths",
-                            None,
-                        ),
-                    )
-                # The clone is retained only for memory accounting; no tensor
-                # data is consumed after this profiling forward returns.
-                with discard_nccl_window_tensor_outputs(encoder_inputs):
-                    output = self._model_engine.model.encode_multimodal_inputs(
-                        encoder_inputs)
-                    # The runtime store owns detached copies rather than views
-                    # of an encoder batch. Reproduce that allocation boundary.
-                    return output.detach().clone()
-        finally:
-            self._dummy_encoder_inputs = []
+        with torch.inference_mode():
+            for encoder_input in encoder_inputs:
+                encoder_input.to_device(
+                    "multimodal_data",
+                    "cuda",
+                    pin_memory=prefer_pinned(),
+                    target_keywords=getattr(
+                        self._model_engine.model,
+                        "multimodal_data_device_paths",
+                        None,
+                    ),
+                )
+            # The clone is retained only for memory accounting; no tensor
+            # data is consumed after this profiling forward returns.
+            with discard_nccl_window_tensor_outputs(encoder_inputs):
+                _set_mm_encoder_capacity(self._model_engine.model, token_cap,
+                                         item_cap)
+                output = self._model_engine.model.encode_multimodal_inputs(
+                    encoder_inputs)
+                # The runtime store owns detached copies rather than views
+                # of an encoder batch. Reproduce that allocation boundary.
+                return output.detach().clone()
 
     def _get_multimodal_encoder_memory_reserve(self,
                                                profiled_output_bytes: int = 0
@@ -2031,7 +2035,6 @@ class KvCacheCreator:
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
                 max(1, self._net_max_seq_len - 1))
-            self._dummy_encoder_inputs = self._create_dummy_encoder_inputs()
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
@@ -5915,10 +5918,11 @@ def create_py_executor_resources(
         if encoder_cache is None:
             raise RuntimeError(
                 "MM encoder item scheduling requires its unified output cache")
+        encoder_caps = model_engine.model.model_config.extra_attrs
         scheduler = scheduler_cls(
             scheduler,
-            max_batch_size=model_engine.encoder_batch_size,
-            max_num_tokens=model_engine.encoder_max_num_tokens,
+            max_batch_size=encoder_caps["encoder_batch_size"],
+            max_num_tokens=encoder_caps["encoder_max_num_tokens"],
             encoder_cache=encoder_cache,
             get_item_cache_keys=model_engine.get_mm_encoder_item_cache_keys,
             bytes_per_encoder_embedding=(

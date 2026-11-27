@@ -40,13 +40,17 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
     MultimodalItemMetadata,
     MultimodalParams,
+    MultimodalRuntimeData,
 )
+from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -529,6 +533,20 @@ def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
 
     assert result is metadata
     assert calls == [(seq_lens, metadata, fixed_max_seq_len)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen2_5_vision_mixed_batch_attention_segments() -> None:
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    model = modeling_qwen2vl.Qwen2_5_VisionModel.__new__(modeling_qwen2vl.Qwen2_5_VisionModel)
+    torch.nn.Module.__init__(model)
+    model.metadata_cls = TrtllmAttentionMetadata
+    metadata = model.metadata_cls(max_num_requests=1, max_num_tokens=4, kv_cache_manager=None)
+    # The image and the video each fit on their own. Their combined call has two segments.
+    metadata = model.prepare_attn_metadata([4, 4], metadata, max_seq_len=4)
+    assert metadata.host_request_types_runtime.tolist() == [0, 0]
+    assert metadata.prompt_lens_cpu_runtime.tolist() == [4, 4]
 
 
 @pytest.mark.cpu_only
@@ -1245,21 +1263,23 @@ _QWEN_VL_ENCODERS = pytest.mark.parametrize(
 )
 
 
-def _qwen_vl_item_grid_case(encoder_cls):
+def _qwen_vl_item_grid_case(encoder_cls, expected=None):
     """Return one request's processed data, a stub encoder and the expected grids.
 
     The input processor records each item's grid in prompt order (the runner
     returns it as handle metadata), and the encoder returns rows in the same order.
     """
     # A landscape and a portrait image, so a swapped h and w shows.
-    expected = [{"image_grid_thw": [1, 4, 6]}, {"image_grid_thw": [1, 6, 4]}]
-    prompt = [11, 12, 13, 11, 12, 13]
-    model = "qwen2.5"
-    if encoder_cls is not modeling_qwen2vl.Qwen2VisionModelBase:
-        # Qwen3-VL encodes images and videos in one call. The video comes first in the prompt.
-        expected.insert(0, {"video_grid_thw": [2, 4, 4]})
-        prompt = [11, 14, 13] + prompt
-        model = "qwen3"
+    if expected is None:
+        expected = [
+            {"video_grid_thw": [2, 4, 4]},
+            {"image_grid_thw": [1, 4, 6]},
+            {"image_grid_thw": [1, 6, 4]},
+        ]
+    prompt = [
+        token for item in expected for token in (11, 12 if "image_grid_thw" in item else 14, 13)
+    ]
+    model = "qwen2.5" if encoder_cls is modeling_qwen2vl.Qwen2VisionModelBase else "qwen3"
     data = {}
     for modality, pixel_key in (("image", "pixel_values"), ("video", "pixel_values_videos")):
         grid_key = f"{modality}_grid_thw"
@@ -1299,6 +1319,60 @@ def _assert_rows_hold_item_grids(embedding, lengths, expected):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "fields,hashed,error",
+    [
+        pytest.param(
+            {MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata([("image", 0)])},
+            False,
+            r"output_embedding_lengths.*LLM\.preprocess",
+            id="refs-without-lengths",
+        ),
+        pytest.param({}, True, r"item_refs.*LLM\.preprocess", id="hash-without-record"),
+        pytest.param({}, False, None, id="unhashed-without-record"),
+        pytest.param({"multimodal_embedding": [torch.zeros(1, 1)]}, True, None, id="embedding"),
+        pytest.param(
+            {
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 1)], output_embedding_lengths=[1]
+                )
+            },
+            False,
+            "must cover each local item once",
+            id="invalid-record",
+        ),
+        pytest.param(None, False, None, id="token-only"),
+    ],
+)
+def test_prepared_media_requires_processor_item_metadata(fields, hashed, error):
+    params = None
+    if fields is not None:
+        params = MultimodalParams(
+            multimodal_input=MultimodalInput([[0] * 8], [0], [1]) if hashed else None,
+            multimodal_data={"image": {"pixel_values": torch.ones(1, 1)}, **fields},
+        )
+    prepared = PreprocessedInputs([11], params)
+    llm = object.__new__(BaseLLM)
+    llm.shutdown = MagicMock()
+    llm._encode_only = False
+    llm._executor = MagicMock()
+    llm._executor.is_shutdown.return_value = False
+    llm._prepare_sampling_params = MagicMock(return_value=SamplingParams(max_tokens=1))
+    llm._check_arguments = MagicMock()
+    llm._tokenizer = llm._post_processor_hook = None
+    llm.args = SimpleNamespace(mm_encoder_only=False, return_perf_metrics=False)
+
+    if error:
+        with pytest.raises(ValueError, match=error):
+            llm.generate_async(prepared)
+        llm._executor.generate_async.assert_not_called()
+    else:
+        llm.generate_async(prepared)
+        llm._executor.generate_async.assert_called_once()
+        assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is params
+
+
+@pytest.mark.cpu_only
 @_QWEN_VL_ENCODERS
 def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
     """Each item gets its grid, in prompt order, with its embedding rows.
@@ -1311,6 +1385,96 @@ def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
     _assert_rows_hold_item_grids(
         torch.cat(encoder.forward([MultimodalParams(multimodal_data=data)])), lengths, expected
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "model_cls,encoder_cls,grids,expected_calls",
+    [
+        (
+            Qwen2_5_VLModel,
+            modeling_qwen2vl.Qwen2VisionModelBase,
+            [
+                [{"image_grid_thw": [1, 32, 64]}],
+                [{"video_grid_thw": [2, 32, 64]}, {"image_grid_thw": [1, 64, 32]}],
+            ],
+            [4096, 4096],
+        ),
+        (
+            Qwen2_5_VLModel,
+            modeling_qwen2vl.Qwen2VisionModelBase,
+            [[{"image_grid_thw": [1, 96, 64]}]],
+            [6144],
+        ),
+        (
+            Qwen3VLModel,
+            Qwen3VisionModelBase,
+            [
+                [{"image_grid_thw": [1, 8, 12]}],
+                [{"video_grid_thw": [2, 8, 8]}, {"image_grid_thw": [1, 4, 6]}],
+            ],
+            [248],
+        ),
+    ],
+    ids=["qwen2.5-split", "qwen2.5-oversized-item", "qwen3-one-call"],
+)
+def test_qwen_vl_inline_encoder_capacity(model_cls, encoder_cls, grids, expected_calls):
+    cases = [_qwen_vl_item_grid_case(encoder_cls, request) for request in grids]
+    encoder = cases[0][3]
+    vit = encoder.visual
+    calls = []
+
+    def record(pixel_values, grid_thw):
+        calls.append(pixel_values.shape[0])
+        return vit(pixel_values, grid_thw)
+
+    encoder.visual = encoder.encode_batched = record
+    model = model_cls.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.mm_encoder = encoder
+    model.model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(disable_fuse_rope=True),
+        multimodal_config=MultimodalConfig(encoder_scheduling_policy="DISABLED"),
+        max_batch_size=8,
+        extra_attrs={},
+    )
+    encoder.model_config = copy.deepcopy(model.model_config)
+    setup_mm_encoder_attn_metadata(model, object(), 4096, None)
+    if model_cls is Qwen3VLModel:
+        model.mm_encoder_groups = encoder.mm_encoder_groups
+        model.use_deepstack = False
+        model.deepstack_num_level = 0
+    model._mm_token_ids = torch.tensor([0])
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=torch.nn.Embedding(1, 3)),
+        forward=lambda inputs_embeds, **_: inputs_embeds,
+    )
+
+    def prefill(requests):
+        params = []
+        for data, lengths, *_ in requests:
+            length = sum(lengths)
+            params.append(
+                MultimodalParams(
+                    multimodal_data=data.copy(),
+                    multimodal_runtime=MultimodalRuntimeData(
+                        0, length, torch.arange(1, length + 1)
+                    ),
+                )
+            )
+        num_tokens = sum(param.multimodal_runtime.total_embeds_in_request for param in params)
+        return model.forward(
+            attn_metadata=SimpleNamespace(num_contexts=len(params), num_generations=0),
+            input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+            multimodal_params=params,
+        )
+
+    _assert_rows_hold_item_grids(
+        prefill(cases),
+        [length for _, lengths, *_ in cases for length in lengths],
+        [grid for request in grids for grid in request],
+    )
+    assert calls == expected_calls
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -80,22 +80,45 @@ accepts lists. Encoder state references this record without copying its lengths.
 Producers fill input partitions before admission and validate contracts at
 producer/admission boundaries, avoiding repeated validation per forward.
 
-Partitions describe how to select processed fields: shared fields have no item
-axis, batched fields have an item axis, and packed fields also provide host-side
-per-item lengths. Contiguous tensor selections can share storage; reordered
-selections may copy. Treat shared input storage as read-only. Model hooks and
-`EncoderGroup` still own compatible batching, padding, masks, encoder arguments,
-and output fusion.
+Use `MultimodalItemPartition.batched(axis)` when each index selects one item.
+Use `MultimodalItemPartition.packed(item_lengths, axis)` for concatenated items
+with host-side lengths. Both default to axis zero. Use
+`MultimodalItemPartition.shared()` for a value that passes through unsliced
+and must match across payloads to batch. Contiguous tensor selections can
+share storage. Reordered selections may copy. Treat shared input storage as
+read-only.
+
+The default `MultimodalModelMixin.encode_multimodal_inputs` runs the model's
+`mm_encoder_groups`.
+An `EncoderGroup` with `build_batched_input=None` passes the declared fields
+to the tower as keyword arguments. Each call batches compatible items of one
+modality across requests. It concatenates tensors along the declared item axis
+on their existing device and passes a single tensor through directly. Different
+non-item dimensions, dtypes, devices, or shared values require separate calls.
+A tower that needs a different layout can keep its custom builder. The runtime
+restores the embeddings to each request's prompt order.
+
+The item scheduler and grouped encoders use the token capacity of the startup
+encoder batch and the configured encoder item limit. For example, if the
+largest dummy image costs 12,100 patches and the budget is 16,384, only one
+such image fits. Runtime batches then have a 12,100-patch limit. When startup
+skips encoder profiling, the configured token budget applies. Grouped encoders
+apply both limits between request payloads. Custom builders split oversized
+multi-item requests at item boundaries when the model can select individual
+items. An indivisible payload that exceeds a limit or has unknown encoder cost
+runs alone.
 
 ## Processor Hooks
 
 Processors implement
 `get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)` and
 return `MultimodalItemMetadata`. Generic preparation supplies prompt order and
-known output rows; model processors add encoder costs and input partitions.
-Partial model records retain known prompt rows. Conflicting order or rows fail
-at input preparation. Gemma4 and Nemotron add partitions; Qwen and Mistral also
-provide physical encoder costs.
+known output lengths. Model processors can add encoder costs and input partitions.
+Media that still need encoding must come from `LLM.preprocess()`.
+
+You can submit each result once, directly or after serialization and
+restoration while the producing process is alive, and build token-only
+inputs by hand.
 
 Unknown costs or row counts remain `None`. Common metadata does not enable item
 scheduling: models can supply order and output rows with
@@ -156,12 +179,12 @@ If output row counts are unknown too, the model must resolve them before using
 grouped assembly or item caching. A model-specific full-request encoder can
 compute those counts from its result. Metadata alone never enables scheduling.
 
-To opt in, the model sets `supports_mm_encoder_item_scheduling = True` and
-implements `encode_multimodal_inputs` and item selection. The engine also
-checks `disable_mm_encoder`, the scheduling policy, and supported combinations
-in `mm_item_scheduling_enabled()` and
+To opt in, the model sets `supports_mm_encoder_item_scheduling = True`, supports
+item selection, and either declares encoder groups or overrides
+`encode_multimodal_inputs`. The engine also checks `disable_mm_encoder`, the
+scheduling policy, and supported combinations in `mm_item_scheduling_enabled()` and
 `validate_mm_encoder_scheduling_compatibility()`. Under item scheduling, missing
-costs or output rows fail admission; they do not silently switch one request to
+costs or output lengths fail admission; they do not silently switch one request to
 full-request encoding. Keep the capability disabled until the model can supply
 the complete scheduling contract.
 
@@ -173,9 +196,9 @@ For example, two audio items with two and one clips use:
 ```python
 input_partitions = {
     "audio": {
-        "input_audio_features": MultimodalItemPartition(item_lengths=(2, 1)),
-        "feature_attention_mask": MultimodalItemPartition(item_lengths=(2, 1)),
-        "audio_num_clips": MultimodalItemPartition(),
+        "input_audio_features": MultimodalItemPartition.packed((2, 1)),
+        "feature_attention_mask": MultimodalItemPartition.packed((2, 1)),
+        "audio_num_clips": MultimodalItemPartition.batched(),
     },
 }
 ```

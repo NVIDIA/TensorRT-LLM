@@ -33,6 +33,7 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
@@ -352,9 +353,11 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
 
 @dataclass
 class PreprocessedInputs:
-    """Light structure for holding preprocessed inputs.
+    """Media that still need encoding must come from `LLM.preprocess()`.
 
-    Can be passed to `generate_async` to skip preprocessing.
+    You can submit each result once, directly or after serialization and
+    restoration while the producing process is alive, and build token-only
+    inputs by hand.
     """
 
     prompt_token_ids: List[int]
@@ -712,6 +715,25 @@ class BaseLLM:
         raise ValueError(
             "decoder_start_token_id is required for encoder-decoder models.")
 
+    @staticmethod
+    def _validate_prepared_media(params: MultimodalParams) -> None:
+        data = params.multimodal_data or {}
+        if data.get("multimodal_embedding") is not None or not any(
+                data.get(key) is not None
+                for key in (*MEDIA_MODALITIES, "input_image_embeds",
+                            "input_audio_embeds")):
+            return
+        metadata = params.item_metadata
+        if metadata is None and params.multimodal_input is None:
+            return
+        if (metadata is None or not metadata.item_refs
+                or not metadata.output_embedding_lengths):
+            raise ValueError(
+                "Prepared media inputs require item_metadata.item_refs and "
+                "item_metadata.output_embedding_lengths. Pass the result of "
+                "LLM.preprocess().")
+        metadata.validate()
+
     def generate(
         self,
         inputs: Union[PromptInputs, Sequence[PromptInputs]],
@@ -889,6 +911,8 @@ class BaseLLM:
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
             multimodal_params = inputs.multimodal_params
+            if multimodal_params is not None:
+                self._validate_prepared_media(multimodal_params)
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
                 preprocessed_encoder_input_token_ids = self._normalize_token_ids(
