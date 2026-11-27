@@ -1545,7 +1545,21 @@ def collect_status(item: pytest.Item):
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    ret = yield
+    prefix = item.config.getoption("--test-prefix")
+    output_dir = item.config.getoption("--output-dir")
+    defs_root = Path(__file__).parent
+    if prefix and output_dir and item.path.is_relative_to(defs_root):
+        local_id = item.nodeid.removeprefix(f"{prefix}/")
+        # Use the collected file to normalize node IDs across pytest rootdirs.
+        _, separator, suffix = local_id.partition("::")
+        nodeid = str(item.path.relative_to(defs_root)) + separator + suffix
+        directory = str(Path(output_dir).resolve() / "llm-constructor-records")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("TRTLLM_CI_CONSTRUCTOR_CONTEXT",
+                         json.dumps([directory, prefix, nodeid]))
+            ret = yield
+    else:
+        ret = yield
     collect_status(item)
     return ret
 
