@@ -118,6 +118,7 @@ def _verify_generation(
             (descriptor.arena_row_counts[data_index], row_bytes),
         )
     )
+    consumer_pool = manager.get_sparse_compress_buffers(layer)[0]
     for query in range(metadata.num_tokens):
         request_position = int(request_positions[query])
         assert 0 <= request_position < active_count, (
@@ -167,6 +168,7 @@ def _verify_generation(
             host_view,
             host_pages,
             arena,
+            consumer_pool=consumer_pool,
             token_position=int(token_positions[query]),
         )
 

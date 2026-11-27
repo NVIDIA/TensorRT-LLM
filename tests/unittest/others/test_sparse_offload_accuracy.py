@@ -4,7 +4,9 @@
 
 import copy
 import runpy
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -154,6 +156,8 @@ def test_forced_gate_allows_only_post_stop_tokens() -> None:
         ({"id": "other"}, "ordinary sample ID differs"),
         ({"prompt_sha256": "other"}, "ordinary tokenized prompt differs"),
         ({"finish_reason": "stop"}, "finish reasons differ"),
+        ({"answer": "C"}, "extracted answers differ"),
+        ({"correct": False}, "answer correctness differs"),
     ],
 )
 def test_forced_gate_preserves_prefix_and_metadata(change: dict, message: str) -> None:
@@ -284,8 +288,26 @@ def test_history_verifier_rejects_injected_wrong_slots() -> None:
     slots = torch.tensor([2, 0], dtype=torch.int64)
     original_host, original_arena, original_units = host_view.clone(), arena.clone(), units.clone()
     verifier = SparseHistoryVerifier()
-    verifier.check_tensors(0, units, slots, host_view, host_pages, arena, token_position=8)
-    verifier.check_tensors(0, units, slots.roll(1), host_view, host_pages, arena, token_position=9)
+    verifier.check_tensors(
+        0,
+        units,
+        slots,
+        host_view,
+        host_pages,
+        arena,
+        consumer_pool=arena[:, None, :],
+        token_position=8,
+    )
+    verifier.check_tensors(
+        0,
+        units,
+        slots.roll(1),
+        host_view,
+        host_pages,
+        arena,
+        consumer_pool=arena[:, None, :],
+        token_position=9,
+    )
     assert verifier.mismatched_rows == 2
     assert verifier.metrics()["first_mismatch"] == {"layer": 0, "unit": 0, "slot": 0, "position": 9}
     with pytest.raises(AssertionError, match="rank 0, request 1: Offload history row mismatch"):
@@ -310,18 +332,151 @@ def test_history_verifier_counts_eviction_and_refetch_per_layer() -> None:
     assert verifier.metrics() == {
         "checked_rows": 8,
         "mismatched_rows": 0,
+        "aliased_rows": 0,
+        "pool_mismatches": 0,
         "evictions": 2,
         "refetches": 1,
         "checked_positions": {"0": [8, 9, 10], "1": [8]},
         "first_mismatch": None,
+        "first_alias": None,
+        "first_pool_mismatch": None,
     }
 
 
-def test_history_verifier_rejects_shared_physical_slot() -> None:
-    with pytest.raises(AssertionError, match="share an attention slot"):
-        SparseHistoryVerifier().check(
-            0, [10, 11], [0, 0], b"aa", b"aa", row_bytes=1, token_position=8
+@pytest.mark.parametrize("expected", [b"ab", b"aa"])
+def test_history_verifier_defers_shared_physical_slot(expected: bytes) -> None:
+    verifier = SparseHistoryVerifier()
+    verifier.check(
+        0,
+        [0, 1],
+        [0, 0],
+        expected,
+        expected[:1] * 2,
+        row_bytes=1,
+        token_position=8,
+    )
+    metrics = verifier.metrics()
+    assert metrics["checked_rows"] == 2
+    assert metrics["aliased_rows"] == 1
+    assert metrics["mismatched_rows"] == int(expected[0] != expected[1])
+    assert metrics["first_alias"] == {
+        "layer": 0,
+        "unit": 1,
+        "previous_unit": 0,
+        "slot": 0,
+        "position": 8,
+    }
+    with pytest.raises(AssertionError, match="rank 0, request 1: Different history units share"):
+        assert_history_integrity(
+            [_integrity_event(metrics)],
+            prompt_lengths=[8],
+            completion_lengths=[2],
+            world_size=1,
+            require_eviction=False,
         )
+
+
+@pytest.mark.parametrize("binding", ["same", "different_storage", "wrong_stride"])
+def test_history_observer_checks_consumer_pool_binding(
+    binding: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper_dir = Path(__file__).resolve().parents[2] / "integration/defs/accuracy"
+    monkeypatch.syspath_prepend(str(helper_dir))
+    integrity_helpers = runpy.run_path(str(helper_dir / "sparse_offload_integrity.py"))
+
+    arena = torch.tensor([[11, 12], [21, 22]], dtype=torch.uint8)
+    host_view = arena.clone().view(1, 2, 2)
+    consumer_pool = arena[:, None, :]
+    if binding == "different_storage":
+        consumer_pool = consumer_pool.flip(0)
+    elif binding == "wrong_stride":
+        consumer_pool = arena.as_strided((2, 1, 2), (1, 2, 1))
+    views = {host_view.data_ptr(): host_view, arena.data_ptr(): arena}
+    utils = ModuleType("tensorrt_llm._utils")
+    monkeypatch.setattr(utils, "TensorWrapper", lambda pointer, *args: pointer, raising=False)
+    monkeypatch.setattr(utils, "convert_to_torch_tensor", views.__getitem__, raising=False)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._utils", utils)
+    descriptor = SimpleNamespace(
+        data_buffer_index=0,
+        buffer_ids=[1],
+        unit_tokens=4,
+        arena_base_addresses=[arena.data_ptr()],
+        arena_row_counts=[2],
+    )
+    host = SimpleNamespace(
+        size=4,
+        stride=4,
+        base=host_view.data_ptr(),
+        layer_group_id=0,
+        buffers=[SimpleNamespace(id=1, expansion=1)],
+    )
+    cache = SimpleNamespace(history_length=8, get_aggregated_page_indices=lambda group: [0])
+    manager = SimpleNamespace(
+        tokens_per_block=8,
+        _sparse_batch_members={1: SimpleNamespace(row=0, cache=cache)},
+        impl=SimpleNamespace(get_aggregated_pages=lambda buffers: [host]),
+        get_sparse_compress_buffers=lambda layer: (consumer_pool, None),
+    )
+    metadata = SimpleNamespace(
+        sparse_offload_state=SimpleNamespace(
+            layers={0: descriptor},
+            prepared=True,
+            batch=object(),
+            batch_rows=torch.tensor([0]),
+            active_request_count=torch.tensor([1]),
+        ),
+        kv_cache_manager=manager,
+        request_ids=[1],
+        num_contexts=0,
+        num_tokens=1,
+        max_compressed_indices={4: 2},
+        req_idx_per_token=torch.tensor([0]),
+        token_positions_cuda=torch.tensor([8]),
+        compressed_kv_lens_cuda={4: torch.tensor([2])},
+    )
+    attention = SimpleNamespace(
+        layer_idx=0,
+        compress_ratio=4,
+        _uses_nvfp4_compress=False,
+        head_dim=2,
+        sparse_attention_config=SimpleNamespace(window_size=2),
+    )
+    forward_args = SimpleNamespace(
+        sparse_runtime_params=SimpleNamespace(aux_kv_cache_pool_ptr=arena.data_ptr()),
+        sparse_backend_args=SimpleNamespace(topk_indices=torch.tensor([[0, 1]])),
+    )
+    try:
+        integrity_helpers["_verify_generation"](
+            attention, metadata, forward_args, torch.tensor([[0, 1, 0, 1]])
+        )
+    finally:
+        metrics = integrity_helpers["finish_request"](manager, 1, cache)
+    assert metrics["checked_rows"] == 2
+    assert metrics["mismatched_rows"] == 0
+    if binding == "same":
+        assert metrics.get("pool_mismatches", 0) == 0
+        assert_history_integrity(
+            [_integrity_event(metrics)],
+            prompt_lengths=[8],
+            completion_lengths=[2],
+            world_size=1,
+            require_eviction=False,
+        )
+    else:
+        with pytest.raises(
+            AssertionError, match="rank 0, request 1: Attention consumer pool differs"
+        ):
+            assert_history_integrity(
+                [_integrity_event(metrics)],
+                prompt_lengths=[8],
+                completion_lengths=[2],
+                world_size=1,
+                require_eviction=False,
+            )
+        assert metrics["pool_mismatches"] == 1
+        assert metrics["first_pool_mismatch"]["layer"] == 0
+        assert metrics["first_pool_mismatch"]["position"] == 8
 
 
 def _integrity_event(metrics: dict | None) -> dict:
@@ -360,7 +515,12 @@ def test_history_gate_requires_checked_evicted_and_refetched_data(
     metrics: dict | None, message: str
 ) -> None:
     if metrics is not None:
-        metrics = {**metrics, "checked_positions": {"0": [8]}}
+        metrics = {
+            **metrics,
+            "aliased_rows": 0,
+            "pool_mismatches": 0,
+            "checked_positions": {"0": [8]},
+        }
     with pytest.raises(AssertionError, match=message):
         assert_history_integrity(
             [_integrity_event(metrics)],
@@ -378,6 +538,8 @@ def test_history_gate_does_not_require_eviction_from_short_completions() -> None
                 {
                     "checked_rows": 1,
                     "mismatched_rows": 0,
+                    "aliased_rows": 0,
+                    "pool_mismatches": 0,
                     "evictions": 0,
                     "refetches": 0,
                     "checked_positions": {"0": [8]},

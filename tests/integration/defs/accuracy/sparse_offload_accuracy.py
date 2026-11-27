@@ -90,7 +90,8 @@ def assert_forced_token_parity(
     Forced answer/correct fields describe the entire stress continuation, not the
     ordinary answer. Exact prefix tokens protect that answer; suffix-derived
     metadata cannot be used to reject an otherwise permitted suffix difference.
-    Without an ordinary stop, full token and metadata equality remains required.
+    Identical forced tokens still require identical metadata. Without an ordinary
+    stop, full token and metadata equality remains required.
     """
     assert_token_parity(ordinary_reference, ordinary_candidate, label=f"{label} ordinary")
     left, right = reference["token_ids"], candidate["token_ids"]
@@ -129,6 +130,8 @@ def assert_forced_token_parity(
     assert reference["finish_reason"] == candidate["finish_reason"], (
         f"{label}: finish reasons differ"
     )
+    if first_diff is None:
+        assert_token_parity(reference, candidate, label=label)
     return first_diff
 
 
@@ -138,12 +141,16 @@ class SparseHistoryVerifier:
     def __init__(self) -> None:
         self.checked_rows = 0
         self.mismatched_rows = 0
+        self.aliased_rows = 0
+        self.pool_mismatches = 0
         self.evictions = 0
         self.refetches = 0
         self._slots: dict[int, dict[int, int]] = {}
         self._evicted: dict[int, set[int]] = {}
         self._checked_positions: dict[str, list[int]] = {}
         self._first_mismatch: dict[str, int] | None = None
+        self._first_alias: dict[str, int] | None = None
+        self._first_pool_mismatch: dict | None = None
 
     def check_tensors(
         self,
@@ -154,6 +161,7 @@ class SparseHistoryVerifier:
         host_pages: list[int],
         arena: torch.Tensor,
         *,
+        consumer_pool: torch.Tensor,
         token_position: int,
     ) -> None:
         """Compare actual host and attention rows selected by the supplied indices.
@@ -165,6 +173,8 @@ class SparseHistoryVerifier:
             host_view: uint8 tensor [physical_page, unit, byte] viewing host pages.
             host_pages: Logical-to-physical page mapping for this request.
             arena: uint8 tensor [physical_slot, byte] viewing the attention pool.
+            consumer_pool: Cached tensor [physical_slot, 1, byte] returned to the
+                PrimTS consumer; its storage and row layout must match arena.
             token_position: Absolute decode position that selected these rows.
         """
         import torch
@@ -173,6 +183,28 @@ class SparseHistoryVerifier:
         assert bool(((slots >= 0) & (slots < arena.shape[0])).all()), (
             f"layer {layer}, position {token_position}: slots outside arena of {arena.shape[0]} rows"
         )
+        if (
+            consumer_pool.device != arena.device
+            or consumer_pool.data_ptr() != arena.data_ptr()
+            or consumer_pool.element_size() != 1
+            or tuple(consumer_pool.shape) != (arena.shape[0], 1, arena.shape[1])
+            or consumer_pool.stride(0) != arena.shape[1]
+            or consumer_pool.stride(2) != 1
+        ):
+            self.pool_mismatches += 1
+            if self._first_pool_mismatch is None:
+                self._first_pool_mismatch = {
+                    "layer": layer,
+                    "position": token_position,
+                    "expected_pointer": arena.data_ptr(),
+                    "consumer_pointer": consumer_pool.data_ptr(),
+                    "expected_shape": [arena.shape[0], 1, arena.shape[1]],
+                    "consumer_shape": list(consumer_pool.shape),
+                    "consumer_stride": list(consumer_pool.stride()),
+                    "consumer_element_size": consumer_pool.element_size(),
+                    "expected_device": str(arena.device),
+                    "consumer_device": str(consumer_pool.device),
+                }
         logical_pages = units // units_per_page
         assert bool(((logical_pages >= 0) & (logical_pages < len(host_pages))).all()), (
             f"layer {layer}, position {token_position}: units outside {len(host_pages)} host pages"
@@ -220,17 +252,28 @@ class SparseHistoryVerifier:
             row_bytes: Number of bytes in one selected row.
             token_position: Absolute decode position of this comparison.
 
-        Byte mismatches are retained in metrics and rejected by the parent gate
-        after completion, so one failing TP rank does not strand its peers.
+        Byte mismatches and in-bounds slot aliases are retained in metrics and
+        rejected by the parent after completion, so one rank does not strand peers.
         """
         assert units and len(units) == len(slots), "Missing selected history rows"
         assert len(expected) == len(actual) == len(units) * row_bytes, (
             f"layer {layer}, position {token_position}: expected/actual byte counts "
             f"{len(expected)}/{len(actual)} do not match {len(units)} rows of {row_bytes} bytes"
         )
-        assert len(set(zip(slots, units, strict=True))) == len(set(slots)), (
-            "Different history units share an attention slot"
-        )
+        selected_slots = {}
+        for slot, unit in zip(slots, units, strict=True):
+            previous_unit = selected_slots.get(slot)
+            if previous_unit is not None and previous_unit != unit:
+                self.aliased_rows += 1
+                if self._first_alias is None:
+                    self._first_alias = {
+                        "layer": layer,
+                        "unit": unit,
+                        "previous_unit": previous_unit,
+                        "slot": slot,
+                        "position": token_position,
+                    }
+            selected_slots[slot] = unit
         self.checked_rows += len(units)
         if expected != actual:
             different = [
@@ -267,10 +310,14 @@ class SparseHistoryVerifier:
         return {
             "checked_rows": self.checked_rows,
             "mismatched_rows": self.mismatched_rows,
+            "aliased_rows": self.aliased_rows,
+            "pool_mismatches": self.pool_mismatches,
             "evictions": self.evictions,
             "refetches": self.refetches,
             "checked_positions": self._checked_positions,
             "first_mismatch": self._first_mismatch,
+            "first_alias": self._first_alias,
+            "first_pool_mismatch": self._first_pool_mismatch,
         }
 
 
@@ -304,6 +351,15 @@ def assert_history_integrity(
             metrics = event.get("integrity")
             assert metrics is not None and metrics["checked_rows"] > 0, (
                 f"{label}: native attention history integrity check did not run"
+            )
+            assert metrics["pool_mismatches"] == 0, (
+                f"{label}: Attention consumer pool differs: "
+                f"first={metrics.get('first_pool_mismatch')}, "
+                f"pool_mismatches={metrics['pool_mismatches']}"
+            )
+            assert metrics["aliased_rows"] == 0, (
+                f"{label}: Different history units share an attention slot: "
+                f"first={metrics.get('first_alias')}, aliased_rows={metrics['aliased_rows']}"
             )
             assert metrics["mismatched_rows"] == 0, (
                 f"{label}: Offload history row mismatch: "
