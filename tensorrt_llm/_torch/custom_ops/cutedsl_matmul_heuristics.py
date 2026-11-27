@@ -11,8 +11,8 @@ cluster shape, split-K, rasterization order, swizzle) is taken as returned;
 runners only sweep knobs nvMMH does not model.
 
 Each runner describes what its kernel can execute through a validity check, so
-nvMMH ranks implementable configurations only. Both the 0.1.0.x wheels (the
-``nvidia-matmul-heuristics`` requirement) and newer libheuristics builds are
+nvMMH ranks implementable configurations only. Both the 0.2.0.x wheels (the
+``nvidia-matmul-heuristics`` requirement) and older 0.1.0.x wheels are
 supported. If the library is missing or a query fails, :func:`query` returns
 an empty list and the runner falls back to its full tactic space.
 """
