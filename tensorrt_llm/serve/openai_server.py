@@ -102,7 +102,7 @@ from tensorrt_llm.serve.cluster_storage import (create_cluster_storage_client,
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request,
+    request_requires_internal_disagg_auth, validate_protected_disagg_request,
     validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
@@ -1164,7 +1164,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     "Protected disaggregated request fields on a network "
                     "listener require internal_request_auth_key")
         headers = None if raw_request is None else raw_request.headers
-        validate_internal_disagg_request(key, request, headers)
+        validate_protected_disagg_request(key, request, headers)
 
     def _get_scheduling_params(
             self, request: Union[ChatCompletionRequest, CompletionRequest],
