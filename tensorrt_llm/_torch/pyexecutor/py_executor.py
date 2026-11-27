@@ -10260,8 +10260,11 @@ class PyExecutor:
 
     def _cancel_queued_context_requests(self,
                                         waiting_queue: WaitingQueue) -> None:
-        """Finish cancelled CTX work before admission or rank placement.
+        """Finish cancelled queued work before admission or rank placement.
 
+        Every request type gets one terminal CANCELLED response here; the
+        later waiting-queue removal in _handle_canceled_requests would
+        otherwise drop it silently and leave the client waiting forever.
         The executor loop serializes removal with activation. Entries already
         activated remain on the existing active-request cancellation path.
         No model, KV, or transfer resources have been acquired for these raw
@@ -10275,8 +10278,7 @@ class PyExecutor:
         cancelled_ids = set(self.canceled_req_ids)
         cancelled_items = [
             item for item in waiting_queue
-            if item.id in cancelled_ids and item.request is not None and
-            item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY
+            if item.id in cancelled_ids and item.request is not None
         ]
         if not cancelled_items:
             return
@@ -10311,7 +10313,11 @@ class PyExecutor:
                 exclude_input_from_output,
                 client_id=raw.client_id
                 if raw.client_id is not None else item.id,
-                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+                # A response vehicle only: GEN_ONLY would start in
+                # DISAGG_GENERATION_INIT, so build it as CTX+GEN instead.
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
+                if raw.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY
+                else LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
                 return_perf_metrics=raw.output_config.return_perf_metrics,
             )
             for child_id in item.child_req_ids or ():
