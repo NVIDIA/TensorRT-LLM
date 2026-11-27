@@ -3126,6 +3126,15 @@ def test_KvCacheConfig_page_staging(tmp_path):
     with pytest.raises(ValidationError,
                        match="page_staging_depth requires disk_cache_size"):
         KvCacheConfig(page_staging_depth=4)
+    # Several stretches in flight with busy-stream skipping ran a context server out of GPU memory.
+    with pytest.raises(
+            ValidationError,
+            match=
+            "page_staging_depth > 1 cannot be combined with copy_stream_busy_skip > 0"
+    ):
+        KvCacheConfig(**disk, page_staging_depth=4, copy_stream_busy_skip=64)
+    KvCacheConfig(**disk, page_staging_depth=1, copy_stream_busy_skip=64)
+    KvCacheConfig(**disk, page_staging_depth=4, copy_stream_busy_skip=0)
 
     config = _kvcm2_manager_config()
     assert (config.page_staging_mib, config.page_staging_depth) == (64, 1)

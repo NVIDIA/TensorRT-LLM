@@ -6101,7 +6101,7 @@
         },
         "copy_stream_busy_skip": {
           "default": 0,
-          "description": "Pooled CUDA streams that a KV cache block copy skips while they still have work pending (0: it takes the next pooled stream, busy or not). A stream goes back to the pool once its work is submitted, so without skipping, a restore can wait behind an unrelated copy still pending on the stream it is handed, such as a disk write waiting for the disk I/O pool. Skipped streams go back to the pool, which grows until enough streams are idle. Process-wide: the first KV cache manager that sets a nonzero value sets it for the life of the process. Only used by KV cache manager v2.",
+          "description": "Pooled CUDA streams that a KV cache block copy skips while they still have work pending (0: it takes the next pooled stream, busy or not). A stream goes back to the pool once its work is submitted, so without skipping, a restore can wait behind an unrelated copy still pending on the stream it is handed, such as a disk write waiting for the disk I/O pool. Skipped streams go back to the pool, which grows until enough streams are idle. Process-wide: the first KV cache manager that sets a nonzero value sets it for the life of the process. Only used by KV cache manager v2. Refused together with `page_staging_depth` above 1: that pair ran a context server out of GPU memory after about 30 minutes.",
           "maximum": 4096,
           "minimum": 0,
           "status": "prototype",
@@ -6496,7 +6496,7 @@
         },
         "page_staging_depth": {
           "default": 1,
-          "description": "Stretches of the page staging buffer (`page_staging_mib`) that one move of KV cache blocks between GPU and the disk cache keeps in flight. 1 copies one stretch after another, each as large as the buffer allows. N > 1 cuts the move into stretches of at most 1/N of the buffer, issued round-robin on N CUDA streams, so up to N of its disk reads or writes run at once and other moves still find room in the buffer. Requires a disk cache. Per KV cache manager. Only used by KV cache manager v2.",
+          "description": "Stretches of the page staging buffer (`page_staging_mib`) that one move of KV cache blocks between GPU and the disk cache keeps in flight. 1 copies one stretch after another, each as large as the buffer allows. N > 1 cuts the move into stretches of at most 1/N of the buffer, issued round-robin on N CUDA streams, so up to N of its disk reads or writes run at once and other moves still find room in the buffer. Requires a disk cache. Per KV cache manager. Only used by KV cache manager v2. Refused together with `copy_stream_busy_skip` above 0: that pair ran a context server out of GPU memory after about 30 minutes.",
           "exclusiveMinimum": 0,
           "maximum": 16,
           "status": "prototype",

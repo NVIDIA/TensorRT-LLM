@@ -510,7 +510,10 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   wait for the move's stream first; the move's stream waits for all of them
   before returning (also on unwinding), so the caller's finish event still covers
   the whole move. Their disk reads and writes overlap on the async disk I/O pool.
-  Remote moves keep their own loop.
+  Remote moves keep their own loop. `KvCacheConfig` refuses a depth above 1
+  together with `copy_stream_busy_skip` above 0 (the pair ran a context server out
+  of GPU memory after about 30 minutes); a `KVCacheManagerConfig` built directly
+  is not checked.
 
 ### Remote cache levels
 

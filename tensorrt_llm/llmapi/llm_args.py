@@ -6664,7 +6664,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "without skipping, a restore can wait behind an unrelated copy still pending on the stream it is handed, "
         "such as a disk write waiting for the disk I/O pool. Skipped streams go back to the pool, which grows "
         "until enough streams are idle. Process-wide: the first KV cache manager that sets a nonzero value sets "
-        "it for the life of the process. Only used by KV cache manager v2.")
+        "it for the life of the process. Only used by KV cache manager v2. Refused together with "
+        "`page_staging_depth` above 1: that pair ran a context server out of GPU memory after about 30 "
+        "minutes.")
     page_staging_mib: PositiveInt = Field(
         default=64,
         le=65536,
@@ -6684,8 +6686,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "and the disk cache keeps in flight. 1 copies one stretch after another, each as large as the buffer "
         "allows. N > 1 cuts the move into stretches of at most 1/N of the buffer, issued round-robin on N CUDA "
         "streams, so up to N of its disk reads or writes run at once and other moves still find room in the "
-        "buffer. Requires a disk cache. Per KV cache manager. Only used by KV cache manager v2."
-    )
+        "buffer. Requires a disk cache. Per KV cache manager. Only used by KV cache manager v2. Refused "
+        "together with `copy_stream_busy_skip` above 0: that pair ran a context server out of GPU memory "
+        "after about 30 minutes.")
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
@@ -7293,6 +7296,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.copy_stream_busy_skip > 0 and self.use_kv_cache_manager_v2 is False:
             raise ValueError(
                 "kv_cache_config.copy_stream_busy_skip requires use_kv_cache_manager_v2"
+            )
+        if self.page_staging_depth > 1 and self.copy_stream_busy_skip > 0:
+            raise ValueError(
+                "kv_cache_config.page_staging_depth > 1 cannot be combined with copy_stream_busy_skip > 0: "
+                "together they ran a context server out of GPU memory after about 30 minutes"
             )
         if self.page_staging_mib != 64 and self.use_kv_cache_manager_v2 is False:
             raise ValueError(
