@@ -287,8 +287,10 @@ l0_b300:
   # recurrent state (gsm8k and the pass keys); seven drafts over 3k-12k-token pass keys on
   # NVFP4 KV and a bf16 state (the verify step's eight rows per request); and the breakable
   # prefill CUDA graph replayed against eager greedy continuations at the bucket edges and
-  # with context and generation rows in one batch. Its disaggregated engines run in
+  # with context and generation rows in one batch; and a second turn restored from an
+  # in-forward Mamba snapshot against a cold prefill. Its disaggregated engines run in
   # l0_gb300_multi_gpus.
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_mtp3_cutedsl_fp8_kv_bf16_state
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_mtp7_long_context_passkey
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_breakable_prefill_matches_eager
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_inforward_snapshot_turn2_restore
