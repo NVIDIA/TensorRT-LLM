@@ -565,15 +565,30 @@ def qsa_rowtile_sparse_gqa(
     softmax_scale: float,
     query_positions: torch.Tensor,
     compress_ratio: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Bitmap pass, plan pass, lone-row pass, row-tile pass (`qsa_rowtile_attention_cute`);
-    returns `[rows, Hq, D]` contiguous."""
+    returns `[rows, Hq, D]` contiguous: `out` when given (q's dtype and device, contiguous,
+    16-byte aligned), written in place, else a fresh tensor."""
     _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_indices,
                   tokens_per_block, softmax_scale, query_positions, compress_ratio)  # fmt: skip
     rows, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     group_size = num_q_heads // num_kv_heads
-    output = torch.empty((rows, num_q_heads, head_dim), dtype=q.dtype, device=q.device)
+    if out is None:
+        output = torch.empty((rows, num_q_heads, head_dim), dtype=q.dtype, device=q.device)
+    elif (
+        out.shape != (rows, num_q_heads, head_dim)
+        or out.dtype != q.dtype
+        or out.device != q.device
+        or not out.is_contiguous()
+        or out.data_ptr() % 16
+    ):
+        raise ValueError(
+            "QSA row-tile `out` must be a contiguous, 16-byte-aligned [rows, Hq, D] of q's dtype"
+        )
+    else:
+        output = out
     if rows == 0:
         return output
     table_width = block_table.shape[1]
@@ -809,6 +824,7 @@ class QsaSparseGqaRowtile(OpWrapper):
         softmax_scale: float,
         query_positions: torch.Tensor,
         compress_ratio: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return qsa_rowtile_sparse_gqa(
             q=q,
@@ -821,6 +837,7 @@ class QsaSparseGqaRowtile(OpWrapper):
             softmax_scale=softmax_scale,
             query_positions=query_positions,
             compress_ratio=compress_ratio,
+            out=out,
         )
 
     def reference(
@@ -836,11 +853,13 @@ class QsaSparseGqaRowtile(OpWrapper):
         softmax_scale: float,
         query_positions: torch.Tensor,
         compress_ratio: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The reference `qsa_paged_sparse_gqa` certifies against: fp32 sparse
         GQA over every resident selected token, rounded once. The prefill pair
         is ignored, as there: on a prefix-packed selection the bound reads
-        exactly the valid entries."""
+        exactly the valid entries. `out` only names where the call writes; the
+        reference returns a fresh tensor."""
         return _per_row_entry.reference(
             q=q,
             k_cache=k_cache,

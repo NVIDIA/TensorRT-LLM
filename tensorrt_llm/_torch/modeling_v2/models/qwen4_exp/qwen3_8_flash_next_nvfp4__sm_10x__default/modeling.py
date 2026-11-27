@@ -3619,14 +3619,15 @@ def _fp8_context_groups(core, md, tpb: int, fp8_pages: int) -> list | None:
 
 
 def _sparse_gqa_rowtile(
-    core, kv, q, block_table, selected, request_indices, tpb, query_positions, fp8_pages
+    core, kv, q, block_table, selected, request_indices, tpb, query_positions, fp8_pages, out=None
 ):
     """The row-tile pass over a context launch, or None where it does not serve it. A bf16
     pool is read in place. Over an fp8 pool, request slot `s`'s first `ceil((p_s + 1) / tpb)`
     pages (`p_s` the highest position the launch's rows hold there) are widened, exactly, into
     a bf16 scratch pool addressed through a table of `block_table`'s shape; `fp8_pages` is
     their host count (`_fp8_context_pages`), read back from the device when not given. A
-    scratch past `_FP8_ROWTILE_MAX_SCRATCH` bytes declines (None)."""
+    scratch past `_FP8_ROWTILE_MAX_SCRATCH` bytes declines (None). `out` (`[rows, Hq, D]`,
+    contiguous) is where the pass writes, or None for a fresh tensor."""
     k_cache, v_cache, table = kv.k, kv.v, block_table
     if kv.k.dtype == torch.float8_e4m3fn:
         # Each slot's highest position among the launch's rows, -1 for a slot it does not
@@ -3668,6 +3669,7 @@ def _sparse_gqa_rowtile(
         softmax_scale=core.softmax_scale,
         query_positions=query_positions,
         compress_ratio=core.compress_ratio,
+        out=out,
     )
 
 
@@ -3683,17 +3685,20 @@ def _sparse_gqa(
     fp8_pages=None,
     output_gate=None,
     rows_per_request=1,
+    rowtile_out=None,
 ):
     """Sparse GQA over the layer's paged pool. `query_positions` is a context row's bound on
     its scan (the prefill pair with `compress_ratio`), or None for decode rows. A context
     launch of `_ROWTILE_MIN_ROWS` rows or more over a bf16 or fp8 pool takes the row-tile
-    pass (`fp8_pages`: see `_sparse_gqa_rowtile`). Over an NVFP4 pool context rows take the
+    pass (`fp8_pages`: see `_sparse_gqa_rowtile`), which writes `rowtile_out` (`[rows, Hq,
+    D]`, contiguous) when given and returns it. Over an NVFP4 pool context rows take the
     prefill kernel and decode rows the split-K decode kernel."""
     if kv.k_scale is None:
         if query_positions is not None and q.shape[0] >= _ROWTILE_MIN_ROWS:
             out = _sparse_gqa_rowtile(
-                core, kv, q, block_table, selected, request_indices, tpb, query_positions, fp8_pages
-            )
+                core, kv, q, block_table, selected, request_indices, tpb, query_positions,
+                fp8_pages, rowtile_out,
+            )  # fmt: skip
             if out is not None:
                 return out
         return qsa_paged_sparse_gqa(
@@ -4087,10 +4092,20 @@ class PrefillTarget:
         _, k_dst, v_dst = _attn_in_heads(core, proj)
         if self._kv_probe is not None and not self._kv_probe.observe(i, k_dst, v_dst):
             self._kv_probe = None
-        # The packed `[q | k | v]` as one compact copy: the dense op reads it flat, and the
-        # sparse GQA reads its query heads from it.
-        qkv = proj_qkv[:num_tokens]
-        qkv.copy_(proj[:, : core.qkv_width])
+        # The packed `[q | k | v]`. The dense op reads it flat, as one compact copy. A sparse
+        # context-only step over an unscaled pool reads its query heads through the fused
+        # projection's rows instead: the row-tile pass and the per-row kernel take q's strides.
+        if (
+            sparse
+            and not step.stage
+            and step.attn["num_ctx_tokens"] == num_tokens
+            and core._bound.pools.kv[i].k_scale is None
+            and proj.stride(0) % 8 == 0
+        ):
+            qkv = proj[:, : core.qkv_width]
+        else:
+            qkv = proj_qkv[:num_tokens]
+            qkv.copy_(proj[:, : core.qkv_width])
         if step.stage:
             core.spec_rollback.stage_index(core._bound.pools.position_cache)
         _index_plane(core, proj, i, L, (req_idx, logical, block_table, tokens_per_block, coords))
@@ -4158,6 +4173,12 @@ class PrefillTarget:
             else:
                 parts = [(lo, hi, context_rows, step.fp8_pages) for lo, hi, context_rows in parts]
             for lo, hi, context_rows, pages in parts:
+                # A context launch's row-tile pass writes its rows of `attn_out` itself.
+                direct = None
+                if context_rows and attn_out.is_contiguous():
+                    direct = attn_out[lo:hi].view(hi - lo, core.heads_q, core.head_dim)
+                    if direct.data_ptr() % 16:
+                        direct = None
                 out = _sparse_gqa(
                     core,
                     kv,
@@ -4168,8 +4189,10 @@ class PrefillTarget:
                     tokens_per_block,
                     logical[lo:hi] if context_rows else None,
                     pages,
+                    rowtile_out=direct,
                 )
-                attn_out[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
+                if direct is None or out.data_ptr() != direct.data_ptr():
+                    attn_out[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
         else:
             thop_attention(
                 q=qkv,
