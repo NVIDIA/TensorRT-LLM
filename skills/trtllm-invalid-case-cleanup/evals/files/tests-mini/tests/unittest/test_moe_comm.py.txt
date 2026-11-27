@@ -1,0 +1,19 @@
+# tests/unittest/_torch/moe/test_moe_comm.py (trimmed)
+import pytest
+from utils.util import assert_accuracy, parametrize_with_ids
+
+
+@pytest.mark.skip_less_device(4)
+@parametrize_with_ids("parallelism", ["tp4", "ep4"])
+@parametrize_with_ids("low_precision_combine", [False, True])
+def test_nvfp4_low_precision_combine(parallelism, low_precision_combine):
+    """NVFP4 MoE accuracy on 4 GPUs, with and without low_precision_combine."""
+    moe_tp, moe_ep = (4, 1) if parallelism == "tp4" else (1, 4)
+    llm = LLM(
+        MODEL,
+        tensor_parallel_size=4,
+        moe_tensor_parallel_size=moe_tp,
+        moe_expert_parallel_size=moe_ep,
+        moe_config=MoeConfig(low_precision_combine=low_precision_combine),
+    )
+    assert_accuracy(llm, "gsm8k", threshold=GSM8K_THRESHOLD)

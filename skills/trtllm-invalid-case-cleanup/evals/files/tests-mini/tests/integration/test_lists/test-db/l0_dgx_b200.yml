@@ -1,0 +1,19 @@
+version: 0.0.1
+l0_dgx_b200:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - unittest/_torch/moe/test_moe_comm.py::test_nvfp4_low_precision_combine[parallelism=tp4-low_precision_combine=False]
+  - unittest/_torch/moe/test_moe_comm.py::test_nvfp4_low_precision_combine[parallelism=tp4-low_precision_combine=True]
+  - unittest/_torch/moe/test_moe_comm.py::test_nvfp4_low_precision_combine[parallelism=ep4-low_precision_combine=False]
+  - unittest/_torch/moe/test_moe_comm.py::test_nvfp4_low_precision_combine[parallelism=ep4-low_precision_combine=True]

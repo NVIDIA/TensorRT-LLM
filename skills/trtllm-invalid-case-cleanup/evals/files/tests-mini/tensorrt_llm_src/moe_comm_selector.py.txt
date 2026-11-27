@@ -1,0 +1,14 @@
+# tensorrt_llm/_torch/modules/fused_moe/comm_selector.py (trimmed)
+# Chooses the MoE communication strategy from the parallel layout.
+
+
+def select_comm_strategy(moe_tp_size, moe_ep_size, low_precision_combine=False):
+    if moe_tp_size != 1:
+        # Mixed TP+EP cannot use the one-sided NVLink combine. Use the generic
+        # path; it has no low-precision combine, so the flag is dropped here.
+        return CommStrategy("AllGatherReduceScatter",
+                            low_precision_combine=False)
+    if moe_ep_size > 1:
+        return CommStrategy("NVLinkOneSided",
+                            low_precision_combine=low_precision_combine)
+    return CommStrategy("None", low_precision_combine=False)
