@@ -36,6 +36,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4 import vision
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import prepare_multimodal_indices
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 
@@ -139,13 +140,19 @@ def _grid_positions(grids, device) -> torch.Tensor:
 def _tower_attention(x, wq, wk, wv, wo, grids) -> torch.Tensor:
     """The tower's own attention call, on the operand the table builds."""
     qkv = torch.cat((wq, wk, wv), dim=0)
-    block = modeling._VisionBlock(
-        attn_norm=None, qkv=qkv.t(), wo=wo.t(), ffn_norm=None, w13=None, w2=None
+    unused_weights = x.new_empty(0)
+    block = vision._VisionBlock(
+        attn_norm=unused_weights,
+        qkv=qkv.t(),
+        wo=wo.t(),
+        ffn_norm=unused_weights,
+        w13=unused_weights,
+        w2=unused_weights,
     )
     seg = [h * w for h, w in grids]
     workspace = torch.empty(0, dtype=torch.int8, device=x.device)
-    step = modeling._vision_step(seg, x.device, workspace)
-    out = modeling._vision_attention(
+    step = vision._vision_step(seg, x.device, workspace)
+    out = vision._vision_attention(
         x, block, _grid_positions(grids, x.device), step, HEADS, HEAD_DIM, THETA
     )
     torch.cuda.synchronize()
