@@ -464,7 +464,7 @@ void initBindings(nb::module_& m)
         {
             TLLM_CHECK_WITH_INFO(requests.size() == tokens.size(), "Expected the same number of requests and tokens.");
 
-            for (int i = 0; i < requests.size(); ++i)
+            for (size_t i = 0; i < requests.size(); ++i)
             {
                 requests[i]->addNewToken(tokens[i], beam_idx);
             }

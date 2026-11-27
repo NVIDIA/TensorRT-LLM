@@ -179,7 +179,7 @@ bool FmhaDispatcher::isSupported()
         // Create TllmGenFmhaRunnerParams based on MHARunnerFixedParams. Only fill necessary
         // attributes for kernel selection.
         TllmGenFmhaRunnerParams tllmRunnerParams;
-        memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        memset(static_cast<void*>(&tllmRunnerParams), 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = qkvLayout;
         // A size of 1 becomes the (0, 0) inclusive sliding-window probe after converting size to reach.
         int32_t const probeSlidingWindowSize
@@ -289,7 +289,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         }
 
         TllmGenFmhaRunnerParams tllmRunnerParams;
-        memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        memset(static_cast<void*>(&tllmRunnerParams), 0, sizeof(tllmRunnerParams));
 
         // Parameters to select kernels.
         tllmRunnerParams.mQkvLayout = qkvLayout;

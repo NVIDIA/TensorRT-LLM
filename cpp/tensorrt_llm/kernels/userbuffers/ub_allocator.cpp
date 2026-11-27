@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ void UserBufferAllocator::deallocate(void* addr) {}
 
 UBBuffer UserBufferAllocator::get(int idx)
 {
-    TLLM_CHECK(isInitialized() && idx < mBuffers.size() && !mBuffers[idx].invalid());
+    TLLM_CHECK(isInitialized() && static_cast<size_t>(idx) < mBuffers.size() && !mBuffers[idx].invalid());
     return mBuffers[idx];
 }
 

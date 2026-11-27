@@ -35,12 +35,8 @@ namespace kernels
 {
 
 DecoderXQARunner::DecoderXQARunner(
-    XQADataType const dataType, int numHeads, int numKVHeads, int headSize, bool multiBlockMode)
+    XQADataType const dataType, int /*numHeads*/, int /*numKVHeads*/, int /*headSize*/, bool /*multiBlockMode*/)
     : mDataType(dataType)
-    , mNumHeads(numHeads)
-    , mNumKVHeads(numKVHeads)
-    , mHeadSize(headSize)
-    , mMultiBlockMode(multiBlockMode)
     , mMultiProcessorCount(tensorrt_llm::common::getMultiProcessorCount())
     , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
     , mResource(DecoderXQARunner::getResourceGlobal())
@@ -188,7 +184,8 @@ jit::CubinObjKey DecoderXQARunner::getCubinObjKeyFromXQAParams(XQAParams const& 
 
 void DecoderXQARunner::prepareForActualXQAParams(XQAParams const& xqaParams)
 {
-    jit::CubinObjKey currentKey = getCubinObjKeyFromXQAParams(xqaParams);
+    // Not used directly; kept for the parameter validation it performs (numQHeads % numKVHeads).
+    [[maybe_unused]] jit::CubinObjKey currentKey = getCubinObjKeyFromXQAParams(xqaParams);
 
     jit::CompileEngine compileEngine(mSM, xqaParams);
 
@@ -316,7 +313,7 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
 
             // The preprocessing kernel that applies RoPE and updates kv cache.
             QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
-            memset(&preprocessingParams, 0, sizeof(preprocessingParams));
+            memset(static_cast<void*>(&preprocessingParams), 0, sizeof(preprocessingParams));
             // Set parameters.
             preprocessingParams.qkv_input = static_cast<T*>(const_cast<void*>(xqaParams.qkv));
             preprocessingParams.q_output = static_cast<T*>(xqaQInputPtr);

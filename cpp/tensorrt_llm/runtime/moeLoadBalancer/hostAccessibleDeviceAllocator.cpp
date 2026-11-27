@@ -170,6 +170,15 @@ void NumaHugePagePoolAllocator::shutdown()
 namespace
 {
 
+//! Build a cudaMemLocation by member assignment, which works whether or not the CUDA headers wrap `id` in a union.
+cudaMemLocation makeMemLocation(cudaMemLocationType type, int id)
+{
+    cudaMemLocation location{};
+    location.type = type;
+    location.id = id;
+    return location;
+}
+
 //! Whether the host can access device-resident managed memory directly, without page faults or migration.
 //! This holds on hardware-coherent platforms such as Grace-based GB200/GB300, including when GPU memory is not
 //! exposed as a NUMA node (CDMM mode).
@@ -414,12 +423,12 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
             "HostAccessibleDeviceAllocator is not supported on the current system.");
         TLLM_CUDA_CHECK(cudaMallocManaged(&devPtr, memorySize));
         TLLM_CUDA_CHECK(cudaMemAdvise(devPtr, memorySize, cudaMemAdviseSetPreferredLocation,
-            cudaMemLocation{cudaMemLocationTypeDevice, {currentDevId}}));
+            makeMemLocation(cudaMemLocationTypeDevice, currentDevId)));
         if (mHostDirectManagedAccess)
         {
             // Keep the device-resident pages mapped for the host, so host accesses neither fault nor migrate them.
             TLLM_CUDA_CHECK(cudaMemAdvise(
-                devPtr, memorySize, cudaMemAdviseSetAccessedBy, cudaMemLocation{cudaMemLocationTypeHost, {0}}));
+                devPtr, memorySize, cudaMemAdviseSetAccessedBy, makeMemLocation(cudaMemLocationTypeHost, 0)));
         }
         hostPtr = devPtr;
     }

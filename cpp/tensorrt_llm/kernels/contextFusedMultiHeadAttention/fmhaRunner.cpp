@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
+#include <bit>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -71,7 +72,7 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
     {
         // TODO HACK!! BF16 Outputs are computed in FP32 for FP8.
         // This is because cublas does not allow current FP32 output.
-        alpha = reinterpret_cast<uint32_t const&>(norm);
+        alpha = std::bit_cast<uint32_t>(norm);
     }
     else
     {
@@ -382,9 +383,6 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
 
     // Is the input layout separate q + kv input ?
     bool const separateQKvInput = mFixedParams.attentionInputLayout != AttentionInputLayout::PACKED_QKV;
-    // Is the mask type padding or causal mask ?
-    bool const paddingOrCausalMask = mFixedParams.attentionMaskType == ContextAttentionMaskType::PADDING
-        || mFixedParams.attentionMaskType == ContextAttentionMaskType::CAUSAL;
 
     // Only warp-specialized FMHA kernels support FP8 on Hopper.
     // Separate Q + KV input layout: enable warp-specialization kernels when s > 512, otherwise use ampere-style flash
@@ -651,7 +649,8 @@ void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
 
         const uint32_t box_size_kv[3] = {d_per_group, 1, kv_step};
 
-        char const *k_ptr, *v_ptr;
+        char const* k_ptr = nullptr;
+        char const* v_ptr = nullptr;
 
         if (layout == AttentionInputLayout::PACKED_QKV)
         {

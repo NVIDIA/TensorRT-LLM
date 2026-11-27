@@ -3856,18 +3856,18 @@ class Launch_params;
 {launchers}
 
 // FIXME: These are duplicated declarations, we should remove them in the future.
-constexpr int32_t kSM_70 = 70;
-constexpr int32_t kSM_72 = 72;
-constexpr int32_t kSM_75 = 75;
-constexpr int32_t kSM_80 = 80;
-constexpr int32_t kSM_86 = 86;
-constexpr int32_t kSM_89 = 89;
-constexpr int32_t kSM_90 = 90;
-constexpr int32_t kSM_100 = 100;
-constexpr int32_t kSM_100f = 10100;
-constexpr int32_t kSM_103 = 103;
-constexpr int32_t kSM_120 = 120;
-constexpr int32_t kSM_121 = 121;
+[[maybe_unused]] constexpr int32_t kSM_70 = 70;
+[[maybe_unused]] constexpr int32_t kSM_72 = 72;
+[[maybe_unused]] constexpr int32_t kSM_75 = 75;
+[[maybe_unused]] constexpr int32_t kSM_80 = 80;
+[[maybe_unused]] constexpr int32_t kSM_86 = 86;
+[[maybe_unused]] constexpr int32_t kSM_89 = 89;
+[[maybe_unused]] constexpr int32_t kSM_90 = 90;
+[[maybe_unused]] constexpr int32_t kSM_100 = 100;
+[[maybe_unused]] constexpr int32_t kSM_100f = 10100;
+[[maybe_unused]] constexpr int32_t kSM_103 = 103;
+[[maybe_unused]] constexpr int32_t kSM_120 = 120;
+[[maybe_unused]] constexpr int32_t kSM_121 = 121;
 
 // FIXME: These are duplicated declarations, we should remove them in the future.
 // The enumerator order has to match kernels/multiHeadAttentionCommon.h, since both describe the

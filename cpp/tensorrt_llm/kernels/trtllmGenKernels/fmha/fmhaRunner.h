@@ -63,11 +63,6 @@ private:
     size_t mTotalDeviceMemory;
     // The class that stores all the kernels.
     TllmGenFmhaKernel* mKernel;
-    // SageAttention extensions.
-    int mNumEltsPerSageAttnBlkQ;
-    int mNumEltsPerSageAttnBlkK;
-    int mNumEltsPerSageAttnBlkP;
-    int mNumEltsPerSageAttnBlkV;
     // Whether DSv4 inverse-RoPE + FP8 quant epilogue fusion is enabled.
     bool mFusesDsv4InvRopeFp8Quant;
 };
