@@ -97,8 +97,12 @@ ROUTE_THREADS = 1024
 # Clusters of 16 (route mode; a non-portable size, which the DSL allows on every kernel) take 257..512 tokens with
 # the same one-warp-per-token routing and 32-bit per-CTA token masks (TPC = ceil(M / 16) <= 32). The launcher then
 # uses 3 quantization clusters, so the grid stays at 64 CTAs. 513..1024 tokens: TPC <= 64, two tokens per warp
-# (the full-sort routing path) and two-word per-expert token masks.
+# (the full-sort routing path) and two-word per-expert token masks. 1025..2048 tokens (`WIDE_MAX_ROWS`): TPC <= 128,
+# three or four tokens per warp (only on the one-token fast path, ``fast2``, or over routed rows, ``ids_in``) and three
+# or four mask words per expert.
 ROUTE_CLUSTER_WIDE = 16
+#: The most rows a launch takes (clusters of 16, four tokens a warp, four mask words an expert).
+WIDE_MAX_ROWS = 2048
 
 
 @dsl_user_op
@@ -346,13 +350,15 @@ def _shape_error(
     cluster: int = ROUTE_CLUSTER,
     lean: bool = False,
     ids_in: bool = False,
+    fast2: Union[bool, int] = False,
 ) -> Optional[str]:
     """Why :class:`MoeRouteFrontKernel` does not take these arguments, or None."""
     if threads % 32 or not 256 <= threads <= 1024:
         return f"threads={threads} must be a multiple of 32 in [256, 1024]"
     if cluster not in (ROUTE_CLUSTER, ROUTE_CLUSTER_WIDE):
         return f"cluster={cluster} must be {ROUTE_CLUSTER} or {ROUTE_CLUSTER_WIDE}"
-    max_tpc = 64 if cluster == ROUTE_CLUSTER_WIDE else 32  # token-mask words per expert: 2 / 1
+    # token-mask words per expert: up to 4 / 1
+    max_tpc = 128 if cluster == ROUTE_CLUSTER_WIDE else 32
     if not 1 <= num_rows <= cluster * max_tpc:
         return f"num_rows={num_rows} must be in [1, {cluster * max_tpc}] with clusters of {cluster}"
     if top_k != 10:
@@ -372,8 +378,10 @@ def _shape_error(
     if num_local * mw > threads:
         return "one thread per token-mask word: num_local * ceil(TPC / 32) <= threads"
     tpw = -(-tpc // (threads // 32))
-    if tpw > 2:
-        return "at most two tokens per warp"
+    if tpw > 4:
+        return "at most four tokens per warp"
+    if tpw > 2 and not (ids_in or int(fast2)):
+        return "three or four tokens a warp only on the one-token fast path (fast2) or over routed rows (ids_in)"
     if lean and (cluster != ROUTE_CLUSTER or mw != 1 or tpw != 1):
         return "the lean table build takes clusters of 8 with one token per warp (<= 256 rows)"
     if ids_in and lean:
@@ -426,7 +434,7 @@ class MoeRouteFrontKernel:
     @staticmethod
     def supports(**kw: Union[int, bool]) -> bool:
         """Whether the constructor takes these keyword arguments (``use_pdl`` aside): ``__init__``'s integer shape
-        arguments and its ``lean`` / ``ids_in`` / ``use_pdl`` flags."""
+        arguments and its ``lean`` / ``ids_in`` / ``use_pdl`` / ``fast2`` flags."""
         kw.pop("use_pdl", None)
         return _shape_error(**kw) is None
 
@@ -467,6 +475,7 @@ class MoeRouteFrontKernel:
             cluster=cluster,
             lean=lean,
             ids_in=ids_in,
+            fast2=fast2,
         )
         if err is not None:
             raise ValueError(err)
@@ -487,7 +496,7 @@ class MoeRouteFrontKernel:
         # Two tokens a warp, each routed on the one-token fast path (`_route_warp_fast`) instead
         # of both on the full per-lane sort (`_route_warp`): the same bits, fewer issued sorts.
         # 2: the second token's logits are loaded before the first token is routed.
-        self.fast2 = int(fast2) if self.tpw == 2 else 0
+        self.fast2 = int(fast2) if self.tpw >= 2 else 0
         # The release right after the kernel's first statement, the wait (the lean form releases at
         # its start already).
         self.early = bool(early) and use_pdl and not lean
@@ -702,36 +711,40 @@ class MoeRouteFrontKernel:
                     logits_ptr, local_start, smask, spick, t_first, warp, lane
                 )
         elif const_expr(self.fast2 == 2):
-            # tokens warp and warp + #warps on the fast path, the second token's logits loaded
-            # first (from a row of this CTA: n_tok > 16 here, so its last row when it has none)
-            pre_tok = warp + Int32(self.warps)
-            pre_logits = self._load_logits(
-                logits_ptr, t_first + cutlass.min(pre_tok, n_tok - Int32(1)), lane
-            )
-            if warp < n_tok:
-                pre_sel, pre_w = self._route_loaded(
-                    self._load_logits(logits_ptr, t_first + warp, lane),
-                    local_start,
-                    smask,
-                    spick,
-                    warp,
-                    lane,
+            # tokens warp + 2 p #warps and warp + (2 p + 1) #warps (pair p; one pair up to 1024 rows) on the
+            # fast path, each pair's second token's logits loaded first (from a row of this CTA: n_tok > 16
+            # here, so its last row when it has none)
+            for pp in cutlass.range_constexpr(-(-self.tpw // 2)):
+                pre_first = warp + Int32(self.warps * 2 * pp)
+                pre_tok = pre_first + Int32(self.warps)
+                pre_logits = self._load_logits(
+                    logits_ptr, t_first + cutlass.min(pre_tok, n_tok - Int32(1)), lane
                 )
-                if lane < top_k:
-                    pre_o = Int64(t_first + warp) * Int64(top_k) + Int64(lane)
-                    _st_b32(ids_ptr + pre_o * Int64(4), pre_sel)
-                    _st_b16(wts_ptr + pre_o * Int64(2), pre_w)
-            if pre_tok < n_tok:
-                pre_sel2, pre_w2 = self._route_loaded(
-                    pre_logits, local_start, smask, spick, pre_tok, lane
-                )
-                if lane < top_k:
-                    pre_o2 = Int64(t_first + pre_tok) * Int64(top_k) + Int64(lane)
-                    _st_b32(ids_ptr + pre_o2 * Int64(4), pre_sel2)
-                    _st_b16(wts_ptr + pre_o2 * Int64(2), pre_w2)
+                if pre_first < n_tok:
+                    pre_sel, pre_w = self._route_loaded(
+                        self._load_logits(logits_ptr, t_first + pre_first, lane),
+                        local_start,
+                        smask,
+                        spick,
+                        pre_first,
+                        lane,
+                    )
+                    if lane < top_k:
+                        pre_o = Int64(t_first + pre_first) * Int64(top_k) + Int64(lane)
+                        _st_b32(ids_ptr + pre_o * Int64(4), pre_sel)
+                        _st_b16(wts_ptr + pre_o * Int64(2), pre_w)
+                if pre_tok < n_tok:
+                    pre_sel2, pre_w2 = self._route_loaded(
+                        pre_logits, local_start, smask, spick, pre_tok, lane
+                    )
+                    if lane < top_k:
+                        pre_o2 = Int64(t_first + pre_tok) * Int64(top_k) + Int64(lane)
+                        _st_b32(ids_ptr + pre_o2 * Int64(4), pre_sel2)
+                        _st_b16(wts_ptr + pre_o2 * Int64(2), pre_w2)
         elif const_expr(self.fast2):
-            # tokens warp and warp + #warps, one after the other on the fast path; stored here
-            for rr in cutlass.range_constexpr(2):
+            # tokens warp, warp + #warps (, warp + 2 #warps, warp + 3 #warps past 1024 rows), one after
+            # the other on the fast path; stored here
+            for rr in cutlass.range_constexpr(self.tpw):
                 fast_tok = warp + Int32(self.warps * rr)
                 if fast_tok < n_tok:
                     fast_sel, fast_w = self._route_warp_fast(
@@ -759,12 +772,18 @@ class MoeRouteFrontKernel:
         if tidx < num_local:
             if const_expr(mw == 1):
                 _st_shared(scnt + tidx * 4, _popc(_ld_shared(smask + tidx * 4)))
-            else:
+            elif const_expr(mw == 2):
                 _st_shared(
                     scnt + tidx * 4,
                     _popc(_ld_shared(smask + (tidx * 2) * 4))
                     + _popc(_ld_shared(smask + (tidx * 2 + 1) * 4)),
                 )
+            else:
+                # three or four mask words an expert (past 1024 rows)
+                wcnt = Int32(0)
+                for wi in cutlass.range_constexpr(mw):
+                    wcnt = wcnt + _popc(_ld_shared(smask + (tidx * Int32(mw) + Int32(wi)) * 4))
+                _st_shared(scnt + tidx * 4, wcnt)
         # The 8 CTAs' counts through distributed shared memory.
         _cluster_arrive_release()
         _cluster_wait_acquire()
@@ -834,6 +853,19 @@ class MoeRouteFrontKernel:
                         rank = _ld_shared(spre + pick * 4) + _popc(
                             _ld_shared(smask + pick * 4) & _below(tl)
                         )
+                    elif const_expr(mw > 2):
+                        # tokens before tl over three or four words: every word below tl // 32 whole,
+                        # word tl // 32 below tl % 32, none above
+                        rank = _ld_shared(spre + pick * 4)
+                        for wi in cutlass.range_constexpr(mw):
+                            mw_wi = _ld_shared(smask + (pick * Int32(mw) + Int32(wi)) * 4)
+                            mw_below = _sel_lt(
+                                tl,
+                                Int32(32 * wi + 32),
+                                _popc(mw_wi & _below(tl - Int32(32 * wi))),
+                                _popc(mw_wi),
+                            )
+                            rank = rank + _sel_lt(tl, Int32(32 * wi), Int32(0), mw_below)
                     else:
                         # tokens before tl: in word 0 (all of word 0 from tl 32 on), in word 1 below tl - 32
                         mw_w0 = _ld_shared(smask + (pick * 2) * 4)

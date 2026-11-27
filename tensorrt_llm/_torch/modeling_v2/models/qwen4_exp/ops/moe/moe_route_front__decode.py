@@ -21,6 +21,11 @@ launch moves).
 tokens on the kernel's one-token fast path instead of both on the full per-lane sort: the same
 bits. `fast2=2` also loads the second token's logits before the first token is routed.
 
+Past `MAX_ROWS` (1025..`WIDE_MAX_ROWS` rows: three or four tokens a warp, three or four token-mask
+words an expert) a launch compiles only on the fast path (`fast2`) or over routed rows (`ids_in`):
+the full per-lane sort routes at most two tokens a warp. `MAX_ROWS` stays the bound the default
+dispatch serves; the target serves the wider rows only behind its own switch (`DP_HICAP_ENV`).
+
 `route_front_only(..., ids_in=True)` (past `LEAN_MAX_ROWS`) takes rows their owners already
 routed (`IDS_ROW_SLOTS` int16 a row: the experts, then their weight bits, which the attention-DP
 packed gather forms with the kernel's own `route_one_token`) and builds the same tables.
@@ -44,9 +49,11 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing
 #: The routing geometry the kernel is written for: 512 experts, top-10.
 NUM_EXPERTS = 512
 TOP_K = 10
-#: Rows a launch takes: clusters of 8 to 256 rows (the lean form), clusters of 16 to 1024.
+#: Rows a launch takes: clusters of 8 to 256 rows (the lean form), clusters of 16 to 1024 (the
+#: default dispatch's bound) and, on the fast path or over routed rows only, to `WIDE_MAX_ROWS`.
 MAX_ROWS = 1024
 LEAN_MAX_ROWS = 256
+WIDE_MAX_ROWS = 2048
 _SF_VEC = 16
 
 _COMPILED: dict = {}
@@ -160,9 +167,9 @@ def compile_front(
         lean=lean,
     )
     if (
-        not 1 <= rows <= MAX_ROWS
+        not 1 <= rows <= WIDE_MAX_ROWS
         or (ids_in and not route_only)
-        or not MoeRouteFrontKernel.supports(ids_in=ids_in, **config)
+        or not MoeRouteFrontKernel.supports(ids_in=ids_in, fast2=int(key[6]), **config)
     ):
         _COMPILED[key] = None
         return False
@@ -242,6 +249,14 @@ class MoeRouteFront(OpWrapper):
             False,
             True,
         ),
+        # Past MAX_ROWS (three / four tokens a warp, three / four mask words an expert): the
+        # target's DP_HICAP rows, dep8 36..56 requests a rank.
+        _cell(1152, 128, 64, "dep8 hicap: 36 a rank (1152 rows, 3 a warp), early", 64, True, True),
+        _cell(1280, 192, 64, "dep8 hicap: 40 a rank (1280 rows, 3 a warp), window 3", 64, True),
+        _cell(1536, 320, 64, "dep8 hicap: 48 a rank (1536 rows, 3 a warp), early", 64, True, True),
+        _cell(1792, 448, 64, "dep8 hicap: 56 a rank (1792 rows, 4 a warp), early", 64, True, True),
+        _cell(1184, 384, 64, "fast2=2 past 1024: 1184 rows (3 a warp), window 3", 128, 2),
+        _cell(2048, 0, 64, "fast2=2: 2048 rows (4 a warp, the launch's last), early", 128, 2, True),
     )
 
     note = """
@@ -249,7 +264,8 @@ class MoeRouteFront(OpWrapper):
     per shape by `compile_front` outside capture. Certified for 128-expert windows of the
     512-expert / top-10 layer at hidden 2560 on GB300 (dep4's gathered rows, tep4's own 4-16
     rows), tiles 8 to 64; written for 64-expert windows (dep8's gathered rows, the last three
-    cells). Not certified: other routing geometries.
+    cells). Past 1024 rows (to 2048) on the fast path or over routed rows only (the hicap cells).
+    Not certified: other routing geometries.
     """
 
     def __call__(
@@ -326,7 +342,7 @@ class MoeRouteFront(OpWrapper):
         rows, hidden = x.shape
         assert x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.data_ptr() % 16 == 0
         assert logits.dtype == torch.bfloat16 and logits.is_contiguous()
-        assert logits.shape == (rows, NUM_EXPERTS) and 1 <= rows <= MAX_ROWS
+        assert logits.shape == (rows, NUM_EXPERTS) and 1 <= rows <= WIDE_MAX_ROWS
         assert 0 <= local_offset and local_offset + num_local <= NUM_EXPERTS
         assert tables.dtype == torch.int32 and tables.is_contiguous()
         assert tables.numel() >= sum(table_sizes(rows, TOP_K, num_local, tile))

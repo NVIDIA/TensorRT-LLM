@@ -9,6 +9,9 @@ activation of a decode MoE block's gathered rows in one launch.
   repeated values exercise the top-k's ties.
 * **GPU**: `route_front_only` alone, and with `ids_in` over rows routed by `routed_rows`, writes
   the full launch's experts, weights and tables.
+* **GPU**: past `MAX_ROWS` (1025..`WIDE_MAX_ROWS` rows, three / four tokens a warp) both fast
+  path forms, `early`, the full launch and the routing-only front write the same bits; the full
+  per-lane sort declines those rows.
 * **GPU**: `fast2=2` (the second token's logits loaded first) and `early` (the release right
   after the wait) write the same bits as the plain launch; `early` under PDL has exactly one
   `griddepcontrol.wait`, first, with no global access, branch or label above it in the SASS / PTX
@@ -151,6 +154,56 @@ def test_preload_and_early_are_bitwise_the_plain_launch(rows, local, tile, ties)
     _assert_matches(spec, logits, x, global_scale, base_tables, base)
 
 
+@_GPU
+@pytest.mark.parametrize(
+    "rows, local",
+    [(1056, 64), (1152, 64), (1536, 64), (1792, 64), (2048, 64), (1184, 128), (2048, 128)],
+)
+def test_wide_rows_fast_path_forms_are_bitwise(rows, local):
+    """Past `MAX_ROWS` (three / four tokens a warp, three / four mask words an expert): forms 1
+    and 2 of the fast path, with and without `early`, the full launch and the routing-only front,
+    write the same codes, scales, experts, weights and tables, which are the reference's; the
+    tables hold their meaning (`check_tables`) at tile 64. Ties send rows to the full per-lane
+    sort inside the fast path."""
+    device = torch.device("cuda")
+    tile = 64
+    spec = dict(rows=rows, hidden=2560, local_offset=local, num_local=local, tile=tile)
+    logits, x, global_scale, tables = _operands(spec, 11000 + rows + local, device)
+    logits[::7, 16:32] = (logits[::7].abs().amax(dim=1, keepdim=True) + 1).to(torch.bfloat16)
+    outs = []
+    for fast2, early in ((1, False), (2, False), (1, True), (2, True)):
+        assert op.compile_front(rows, 2560, x.stride(0), local, tile, fast2, early=early)
+        t = tables.clone()
+        got = op.moe_route_front(logits, x, global_scale, t, tile, local, local, fast2, early)
+        outs.append((got, t))
+    assert op.compile_front(rows, 2560, 2560, local, tile, 1, True)
+    t_only = tables.clone()
+    ids_only, wts_only = op.route_front_only(logits, t_only, tile, local, local, 2560, 1)
+    torch.cuda.synchronize()
+    (base, base_tables) = outs[0]
+    _assert_matches(spec, logits, x, global_scale, base_tables, base)
+    for got, t in outs[1:]:
+        for a, b in zip(base, got):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+        assert torch.equal(t, base_tables)
+    assert torch.equal(ids_only, base[2]) and torch.equal(
+        wts_only.view(torch.int16), base[3].view(torch.int16)
+    )
+    assert torch.equal(t_only, base_tables)
+
+
+@_GPU
+def test_wide_rows_take_only_the_fast_path_or_routed_rows():
+    """Past `MAX_ROWS` the full per-lane sort (two tokens a warp at most) declines; the fast path
+    and routed rows compile; past `WIDE_MAX_ROWS` nothing does."""
+    assert not op.compile_front(1152, 2560, 2560, 64, 64, False)
+    assert not op.compile_front(1152, 2560, 2560, 64, 64, False, True)
+    assert op.compile_front(1152, 2560, 2560, 64, 64, False, True, True)
+    assert op.compile_front(1152, 2560, 2560, 64, 64, True)
+    assert not op.compile_front(op.WIDE_MAX_ROWS + 16, 2560, 2560, 64, 64, True)
+    assert op.MAX_ROWS == 1024 and op.WIDE_MAX_ROWS == 2048
+
+
 _COMPILE_EARLY = """
 import sys
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import moe_route_front__decode as op
@@ -173,6 +226,9 @@ assert op.compile_front(rows, 2560, 2560, local, tile, fast2, bool(route_only), 
         (768, 64, 32, 1, 0, 0),
         (576, 64, 32, 1, 1, 0),  # the packed gather's routing-only front
         (896, 64, 64, 1, 1, 1),  # over owner-routed rows
+        (1152, 64, 64, 1, 0, 0),  # past MAX_ROWS: three tokens a warp
+        (1792, 64, 64, 1, 1, 1),  # four tokens a warp over owner-routed rows
+        (1184, 128, 64, 2, 0, 0),  # past MAX_ROWS: fast2 form 2 (pairs), three tokens a warp
     ],
 )
 def test_early_reads_nothing_before_its_wait(
