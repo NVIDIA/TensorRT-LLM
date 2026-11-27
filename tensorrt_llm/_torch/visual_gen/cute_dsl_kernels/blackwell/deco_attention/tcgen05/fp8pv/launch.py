@@ -32,6 +32,7 @@ from cutlass.cute.typing import Int32, Int64
 from ...constants import key_tiles
 from ...runtime import Layout, compiled, current_stream, gmem_ptr, num_sms, pdl_enabled
 from .kernel import PingPongAttention
+from .tuning import tuning
 
 
 def split_plan(s: int, h: int, b: int, sm_count: int) -> tuple[int, int, int]:
@@ -42,8 +43,9 @@ def split_plan(s: int, h: int, b: int, sm_count: int) -> tuple[int, int, int]:
     rem = n_units - n_full
     n_parts = 1
     # the units of a last partial wave are split into as many KV pieces as keep every SM busy, of at least four KV
-    # tiles each; a wave that cannot be split goes to the main launch
-    if rem > 0:
+    # tiles each; a wave that cannot be split, and every such wave of a target without the split launch
+    # (tuning.kv_split), goes to the main launch
+    if rem > 0 and tuning().kv_split:
         n_parts = max(1, min(sm_count // rem, n_kv // 4))
     if n_parts == 1:
         n_full = n_units

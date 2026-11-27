@@ -63,6 +63,7 @@ def quant16_dq_knownmax(x, am):
     return sc, w0, w1, dq
 
 
-def quant16(x):
-    """Quantize an NVFP4 block of 16 values: return the UE4M3 scale and two words of E2M1 codes."""
-    return _nvfp4_codes(x, _absmax(x))
+def quant16(x, am=None):
+    """Quantize an NVFP4 block of 16 values (am: their max |x| where it is known): return the UE4M3 scale and two
+    words of E2M1 codes."""
+    return _nvfp4_codes(x, _absmax(x) if am is None else am)

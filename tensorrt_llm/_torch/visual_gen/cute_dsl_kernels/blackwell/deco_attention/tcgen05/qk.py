@@ -495,7 +495,7 @@ class QkK96:
         return qk_mma[2][None, None, None, k_stage]
 
     def stage_scales(self, qk_mma, q_stage, k_stage=None):
-        """Copy the K-SF of ring slot k_stage (when given), then the Q-SF of Q stage q_stage, into TMEM."""
+        """Copy the K-SF of ring slot k_stage, then the Q-SF of Q stage q_stage, into TMEM (each when given)."""
         q_sf, k_sf = qk_mma[3], qk_mma[4]
         if cutlass.const_expr(k_stage is not None):
             cute.copy(
@@ -503,7 +503,8 @@ class QkK96:
                 k_sf[1][(None, None, None, None, k_stage)],
                 k_sf[2],
             )
-        cute.copy(q_sf[0], q_sf[1][(None, None, None, None, q_stage)], q_sf[2])
+        if cutlass.const_expr(q_stage is not None):
+            cute.copy(q_sf[0], q_sf[1][(None, None, None, None, q_stage)], q_sf[2])
 
     def descs(self, sA, sB):
         """Return the SMEM descriptors of one QK (two K = 96 instructions), built before the S-empty wait."""

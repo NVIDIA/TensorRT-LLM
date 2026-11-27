@@ -178,9 +178,11 @@ def _multi_launch_call(device: torch.device, v_dtype: str = "fp8") -> tuple[int,
 
     Its plan, asserted from ``split_plan`` of the kernels:
 
-    * tcgen05: two waves of whole units in the main launch and a tail in the split launch. The
-      valid rows end in the first tail unit, so the tail has units without a valid query and
-      pieces without a valid key.
+    * tcgen05: two waves of whole units in the main launch and a tail, a last partial wave. A
+      GPU whose kernels have the split launch (``kv_split`` of their tuning) runs the tail
+      there, in pieces of the key sequence; the others run it in the main launch. The valid
+      rows end in the first tail unit, so the tail has units without a valid query and, where
+      it is split, pieces without a valid key.
     * SM120: whole units and a split tail in the attention launch, and more (batch, head) pairs
       than a quarter of the SMs, so the V pass of the preparation is a launch of its own. The
       valid rows end in the first key half of the sequence.
@@ -190,8 +192,14 @@ def _multi_launch_call(device: torch.device, v_dtype: str = "fp8") -> tuple[int,
         seq_len, num_heads = 256 * (sms // 4 + 1), 8
         plan = _split_plan("tcgen05.fp8pv")(seq_len, num_heads, 1, sms)
         units, main_units, pieces = plan
-        assert main_units >= 2 * sms and units > main_units and pieces > 1, (plan, sms)
-        return 1, seq_len, num_heads, seq_len - 256 * (units - main_units) + 100
+        tail_units = units % sms
+        assert units >= 2 * sms and tail_units > 0, (plan, sms)
+        tuning = importlib.import_module(f"{deco_attention.__name__}.tcgen05.fp8pv.tuning")
+        if tuning.tuning().kv_split:
+            assert main_units == units - tail_units and pieces > 1, (plan, sms)
+        else:
+            assert main_units == units and pieces == 1, (plan, sms)
+        return 1, seq_len, num_heads, seq_len - 256 * tail_units + 100
     seq_len, num_heads = 3072, sms // 4 + 1
     tiles = seq_len // 128
     if v_dtype == "fp8":
@@ -360,8 +368,9 @@ def test_deco_forward_matches_sdpa(
 def test_deco_whole_units_and_split_tail_follow_the_scores(
     require_deco_kernels, v_dtype: str, with_lengths: bool
 ) -> None:
-    """A call whose plan has whole units and a split tail (``_multi_launch_call``) follows the
-    scores, with and without valid lengths, and a second call returns the same bits."""
+    """A call whose plan has whole units and a tail, split where the kernels of the GPU split it
+    (``_multi_launch_call``), follows the scores, with and without valid lengths, and a second
+    call returns the same bits."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads, valid_seq_len = _multi_launch_call(device, v_dtype)
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
@@ -639,7 +648,8 @@ def _two_stream_rounds(device_index: int, result) -> None:
         torch.cuda.set_device(device)
         shapes = [(1, 16384, 4)]
         if deco_attention.target.kernel_family() == "tcgen05":
-            # The tail of this shape runs in the split launch, whose pieces merge.
+            # The tail of this shape runs in the split launch, whose pieces merge, on a GPU
+            # whose kernels have one.
             shapes.append(_multi_launch_call(device)[:3])
         for shape in shapes:
             _run_on_two_streams(device, shape)
@@ -651,8 +661,9 @@ def _two_stream_rounds(device_index: int, result) -> None:
 def test_deco_preparations_on_two_streams_finish(require_deco_kernels) -> None:
     """Two calls with workspaces of their own run their preparations side by side on two
     streams and come back as alone: no CTA of a launch waits for another CTA of its grid, so
-    the launches need not be resident together. On the tcgen05 kernels a second shape adds the
-    split launch, whose pieces merge next to the launches of the other stream. The rounds run
+    the launches need not be resident together. On the tcgen05 kernels a second shape adds a
+    tail, which the split launch runs where the GPU has one: its pieces merge next to the
+    launches of the other stream. The rounds run
     in a child process that a hang cannot leave stuck on the device: the test kills it on the
     timeout."""
     device = require_deco_kernels()

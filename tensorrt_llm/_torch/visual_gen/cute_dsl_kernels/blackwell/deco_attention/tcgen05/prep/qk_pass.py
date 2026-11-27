@@ -31,11 +31,14 @@
   in the log2 units the attention exponentiates while the score scale stays a power of two.
 
 TMEM columns of a CTA:
-    * Two rotated tiles (2 x 128), the residual dq as the A operand of the projections (128) and the projections of a
-      tile in the order of its compensation channels (r_q + r_k columns per buffer).
-    * Up to 64 projected channels: two projection buffers alternate, so the MMA warp projects a tile while the
-      compensation warps still read the previous one. Above: one buffer in the 512 columns; the MMA warp reuses it
-      once those warps loaded it.
+    * Two rotated tiles (2 x 128), the residual dq as the A operand of the projections (128) and, from TM_D on, the
+      projections of a tile (_d_layout):
+        - "pair": two buffers of r_q + r_k columns alternate, so the MMA warp projects a tile while the compensation
+          warps still read the previous one;
+        - "ring": three slots of D_SLOT columns, a term per slot, where two such buffers do not fit: the MMA warp
+          reuses a slot once the compensation warps loaded the term in it;
+        - "single": one buffer, where a term is wider than a slot; the MMA warp reuses it once those warps loaded it.
+    * The CTA allocates 512 columns, or all of the target's when the projections reach beyond them.
 
 Kernel body (qk_kernel): the setup of the CTA and one role per warp, each a function of this module.
     * A CTA takes a contiguous range of tiles in the order (batch, head), 128-token block, q then k; every role walks
@@ -52,8 +55,8 @@ when its consumers have released it; the arrivals of a phase are in parentheses.
                      done (MMA warp)
     AFULL, AEMPTY    the residual dq, and the prescaled values of a Q tile, are in TMEM (the 16 math warps); the
                      projections that read them are done (MMA warp)
-    DFULL, DEMPTY    per projection buffer: the projections are done (MMA warp); their last channels are in registers
-                     (the 4 compensation warps)
+    DFULL, DEMPTY    per projection buffer or slot: the projections are done (MMA warp); their last channels are in
+                     registers (the 4 compensation warps)
     UFULL, UEMPTY    per U operand stage: the basis of a (batch, head) is staged (load warp); the last projection that
                      reads the stage is done (MMA warp)
 """
@@ -65,7 +68,19 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint16, Uint32
 from cutlass.cute.nvgpu import cpasync
 
 from ... import target
-from ...common.dsl import Tcgen05Fence, tcgen05_fence
+from ...common.dsl import (
+    CTAGroup,
+    ReductionKind,
+    Tcgen05Fence,
+    Tcgen05LdStShape,
+    Tcgen05MMAKind,
+    Tcgen05Wait,
+    make_tmem_ptr,
+    tcgen05_fence,
+    tcgen05_ld_red,
+    tcgen05_mma,
+    tcgen05_wait,
+)
 from ...common.expmath import f2u, warp_max
 from ...common.mem import gptr, load_invariant, sptr, store_vector
 from ...common.state import State
@@ -88,6 +103,7 @@ X_STAGES = 3  # input tile ring depth
 # Rows of the U operand up to which two stages of it fit the shared memory of a CTA beside the X ring and the rotation
 U_TWO_STAGE_ROWS = 96
 TM_XR, TM_DQ, TM_D = 0, 256, 384
+D_SLOT = 64  # columns of a slot of the projection ring
 # mbarrier slots (module docstring: Mbarriers)
 B_XFULL, B_XEMPTY, B_XRFULL, B_XREMPTY = 0, X_STAGES, 2 * X_STAGES, 2 * X_STAGES + 2
 B_AFULL, B_AEMPTY, B_DFULL, B_DEMPTY = (
@@ -98,16 +114,70 @@ B_AFULL, B_AEMPTY, B_DFULL, B_DEMPTY = (
 )
 B_UFULL, B_UEMPTY = 2 * X_STAGES + 10, 2 * X_STAGES + 12
 QK_NBARS = 2 * X_STAGES + 14
+# the projection ring has barriers of its own after those: DFULL and DEMPTY of its three slots
+B_RFULL, B_REMPTY, QK_RING_NBARS = QK_NBARS, QK_NBARS + 3, QK_NBARS + 6
 
 
-def _d_buffer(parity, stages):
-    """Return the projection buffer of a tile of this parity in the ring of `stages` buffers (two or one)."""
-    return parity if stages == 2 else 0
+def _d_layout(rank, columns):
+    """Return the layout of the projections of a tile in the TMEM columns from TM_D on, of the `columns` columns a
+    CTA can allocate (module docstring: TMEM columns): "pair" where two buffers of all projected channels fit;
+    "ring" where three slots of D_SLOT columns fit and each of the two terms fits a slot; else "single"."""
+    r_q, r_k = rank
+    if TM_D + 2 * (r_q + r_k) <= columns:
+        return "pair"
+    if TM_D + 3 * D_SLOT <= columns and 0 < r_q <= D_SLOT and 0 < r_k <= D_SLOT:
+        return "ring"
+    return "single"
 
 
-def _d_rounds(i, stages):
-    """Return the earlier uses of tile i's projection buffer in the ring of `stages` buffers."""
-    return i >> 1 if stages == 2 else i
+def _d_columns(rank, layout):
+    """Return the TMEM columns that the projections take from TM_D on in a layout of _d_layout."""
+    comp = rank[0] + rank[1]
+    return {"pair": 2 * comp, "ring": 3 * D_SLOT, "single": comp}[layout]
+
+
+def _d_buffer(st, i, term):
+    """Return the projection buffer or ring slot of term `term` (0: the Q-residual term, 1: the K-residual term) of
+    tile i, and its first DFULL and DEMPTY barrier.
+
+    * "pair", "single": one buffer for both terms, that of the tile's parity or the only one.
+    * "ring": slot 2 i mod 3 for the Q-residual term, the slot after it for the K-residual term.
+    """
+    if st.d_layout == "ring":
+        return (2 * i + term) % 3, B_RFULL, B_REMPTY
+    return (i & 1 if st.d_layout == "pair" else 0), B_DFULL, B_DEMPTY
+
+
+def _d_rounds(st, i, term):
+    """Return the earlier uses of the projection buffer or ring slot of a term of tile i (_d_buffer)."""
+    if st.d_layout == "ring":
+        return (2 * i + term) // 3
+    return i >> 1 if st.d_layout == "pair" else i
+
+
+def _d_column(st, i, term):
+    """Return the first TMEM column after TM_D of the buffer or ring slot of a term of tile i (_d_buffer); in a
+    buffer the K-residual term follows the Q-residual term."""
+    buffer = _d_buffer(st, i, term)[0]
+    return buffer * (D_SLOT if st.d_layout == "ring" else st.comp)
+
+
+def _d_loads(rank, layout):
+    """Return the 32-column TMEM loads of a tile's projected channels by a compensation warp, in order: per load (the
+    term whose buffer or slot it reads from its first column on (_d_column), its first column there, the 16-channel
+    blocks it holds, numbered over the compensation channels, whether it is the last load of that buffer or slot).
+    Outside the ring the loads run through both terms from the columns of the Q-residual term on."""
+    blocks_q, blocks_k = rank[0] // QK_BLOCK, rank[1] // QK_BLOCK
+    spans = [(0, 0, blocks_q + blocks_k)]
+    if layout == "ring":
+        spans = [(0, 0, blocks_q), (1, blocks_q, blocks_q + blocks_k)]
+    loads = []
+    for term, first, end in spans:
+        for j in range(first, end, 2):
+            loads.append(
+                (term, (j - first) * QK_BLOCK, list(range(j, min(j + 2, end))), j + 2 >= end)
+            )
+    return loads
 
 
 def _u_stage(ucount, stages):
@@ -139,8 +209,9 @@ def _u_rows(rank, separate):
 
 
 # ------------------------------------------------------------------------------------------------ setup
-def _init_barriers(bars):
-    """Thread 0: every mbarrier of the CTA, with the arrivals of one phase (16 on AFULL, 4 on each DEMPTY, else one)."""
+def _init_barriers(bars, ring):
+    """Thread 0: every mbarrier of the CTA, with the arrivals of one phase (16 on AFULL, 4 on each DEMPTY, else one);
+    ring: those of the projection ring too."""
     for i in range(X_STAGES):
         cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_XFULL + i)), 1)
         cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_XEMPTY + i)), 1)
@@ -153,6 +224,10 @@ def _init_barriers(bars):
         cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_UEMPTY + i)), 1)
     cute.arch.mbarrier_init(sptr(Int64, bars + 8 * B_AFULL), 16)
     cute.arch.mbarrier_init(sptr(Int64, bars + 8 * B_AEMPTY), 1)
+    if ring:
+        for i in range(3):
+            cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_RFULL + i)), 1)
+            cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_REMPTY + i)), 4)
     cute.arch.mbarrier_init_fence()
 
 
@@ -445,11 +520,28 @@ def _project(st, d, a, ua, row, idesc, accumulate):
         tc_mma(d, a + 8 * kk, bd, idesc, Int32(1 if accumulate else kk), kind="tf32", a_tmem=True)
 
 
+def _project_run(st, d, a, ua, row, idesc, first):
+    """MMA warp: _project with the 16 MMAs issued by one elected lane; first: an Int32 value, nonzero when the first
+    MMA accumulates on the columns at d (the others always do)."""
+    with cute.arch.elect_one():
+        for kk in range(16):
+            bd = smem_desc_sw128(ua + (kk >> 2) * (st.urows * 128) + row + (kk & 3) * 32)
+            tcgen05_mma(
+                Tcgen05MMAKind("tf32"),
+                CTAGroup.CTA_1,
+                make_tmem_ptr(d, Float32),
+                make_tmem_ptr(a + 8 * kk, Float32),
+                Int64(bd),
+                Int32(idesc),
+                (first if kk == 0 else Int32(1)) != 0,
+            )
+
+
 @cute.jit
-def _qk_projections(st, kind, p, dp, us):
-    """MMA warp: the projections of the tile in xr[p] (kind 0: a Q tile, 1: a K tile) into projection buffer dp, with
-    the basis in U stage us, at the columns of the tile's compensation channels: the Q-residual term (r_q columns),
-    then the K-residual term (r_k columns).
+def _qk_projections(st, kind, i, us):
+    """MMA warp: the projections of tile i, in xr[i & 1] (kind 0: a Q tile, 1: a K tile), with the basis in U stage
+    us, at the columns of the tile's compensation channels in its buffer (_d_column): the Q-residual term (r_q
+    columns), then the K-residual term (r_k columns). The ring has _ring_projections.
 
     * Q tile: the Q-residual term is the residual dq B_q, the K-residual term the body (x - dq) B_k.
     * K tile: the Q-residual term is the body (x - dk) B_q, the K-residual term the residual dk B_k.
@@ -460,9 +552,9 @@ def _qk_projections(st, kind, p, dp, us):
     """
     r_q, r_k = st.RANK
     ua = st.u_base + us * st.ustage
-    d = st.tm + TM_D + dp * st.comp
+    d = st.tm + TM_D + _d_column(st, i, 0)
     dq = st.tm + TM_DQ
-    x = st.tm + p * 128
+    x = st.tm + (i & 1) * 128
     rows = (st.u_row_q * 128, st.u_row_k * 128)
     idesc = (idesc_tf32(128, r_q), idesc_tf32(128, r_k))
     neg = 1 << 13
@@ -500,13 +592,66 @@ def _qk_projections(st, kind, p, dp, us):
 
 
 @cute.jit
+def _ring_projections(st, kind, i, us):
+    """MMA warp, projection ring: the projections of tile i (as _qk_projections forms them), each term into its slot.
+
+    * The slot of the Q-residual term is free when the tile starts. The slot of the K-residual term held the
+      Q-residual term of the tile before: its DEMPTY is waited for after the first MMAs into the other slot.
+    * Q tile: the residual dq B_q; then the body x B_k and - dq B_k. K tile: the body x B_q and - dk B_q; then the
+      residual dk B_k. Three runs of 16 MMAs for either kind, each issued by one elected lane (_project_run): the
+      first into the slot of the Q-residual term, the last into that of the K-residual term; the operands, the rows
+      of U, the descriptors, the slot of the second run and what the second and third run accumulate on follow the
+      kind as values.
+    * Commits DFULL of each slot after its last run.
+    """
+    r_q, r_k = st.RANK
+    ua = st.u_base + us * st.ustage
+    d_q = st.tm + TM_D + _d_column(st, i, 0)
+    d_k = st.tm + TM_D + _d_column(st, i, 1)
+    dq = st.tm + TM_DQ
+    x = st.tm + (i & 1) * 128
+    rows = (st.u_row_q * 128, st.u_row_k * 128)
+    idesc = (idesc_tf32(128, r_q), idesc_tf32(128, r_k))
+    neg = 1 << 13
+    q_tile = kind == 0
+    _project_run(
+        st, d_q, Int32(cutlass.select_(q_tile, dq, x)), ua, rows[0], Int32(idesc[0]), Int32(0)
+    )
+    slot, full, empty = _d_buffer(st, i, 1)
+    mbar_wait_bounded(st.bars + 8 * (empty + slot), (_d_rounds(st, i, 1) + 1) & 1)
+    tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
+    _project_run(
+        st,
+        Int32(cutlass.select_(q_tile, d_k, d_q)),
+        Int32(cutlass.select_(q_tile, x, dq)),
+        ua,
+        _by_kind(q_tile, rows[1], rows[0]),
+        Int32(_by_kind(q_tile, idesc[1], idesc[0] | neg)),
+        Int32(cutlass.select_(q_tile, Int32(0), Int32(1))),
+    )
+    slot_q, full_q, _ = _d_buffer(st, i, 0)
+    tc_commit(st.bars + 8 * (full_q + slot_q))
+    _project_run(
+        st,
+        d_k,
+        dq,
+        ua,
+        rows[1],
+        Int32(_by_kind(q_tile, idesc[1] | neg, idesc[1])),
+        Int32(cutlass.select_(q_tile, Int32(1), Int32(0))),
+    )
+    tc_commit(st.bars + 8 * (full + slot))
+
+
+@cute.jit
 def _mma_warp(st):
     """MMA warp (17): rotate every tile and project it on the basis.
 
     * The rotation (_qk_rotation) runs one tile ahead: the math warps work on tile i + 1, the compensation warps on i.
     * The projections of tile i wait UFULL at the first tile of a (batch, head), AFULL (the math warps have stored the
-      residual) and DEMPTY of the tile's projection buffer; they commit DFULL, AEMPTY and XREMPTY, and UEMPTY after
-      the last tile of the (batch, head) or of the CTA.
+      residual) and DEMPTY of the tile's projection buffer (in the ring: of the slot of the Q-residual term;
+      _ring_projections); they commit DFULL of the same, AEMPTY and XREMPTY, and UEMPTY after the last tile of the
+      (batch, head) or of the CTA.
     """
     idesc1 = Int32(idesc_bf16(128, 128))
 
@@ -533,12 +678,15 @@ def _mma_warp(st):
                 )
         us = _u_stage(ucount, st.u_stages)
         p = i & 1
-        dp = _d_buffer(p, st.d_stages)
+        dp, full, empty = _d_buffer(st, i, 0)
         mbar_wait_bounded(st.bars + 8 * B_AFULL, i & 1)
-        mbar_wait_bounded(st.bars + 8 * (B_DEMPTY + dp), (_d_rounds(i, st.d_stages) + 1) & 1)
+        mbar_wait_bounded(st.bars + 8 * (empty + dp), (_d_rounds(st, i, 0) + 1) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
-        _qk_projections(st, kind, p, dp, us)
-        tc_commit(st.bars + 8 * (B_DFULL + dp))
+        if cutlass.const_expr(st.d_layout == "ring"):
+            _ring_projections(st, kind, i, us)
+        else:
+            _qk_projections(st, kind, i, us)
+            tc_commit(st.bars + 8 * (full + dp))
         tc_commit(st.bars + 8 * B_AEMPTY)
         tc_commit(st.bars + 8 * (B_XREMPTY + p))
         # the tile's position in its (batch, head): the U stage is released after the last one
@@ -561,6 +709,25 @@ def _mma_warp(st):
 
 
 # ------------------------------------------------------------------------------------------------ compensation warps
+def _ld_blocks_absmax_wait(addr, count):
+    """Return `count` 16-channel blocks of the thread's TMEM lane from the TMEM address addr on, as lists of 16 f32,
+    and the max |x| of each: one tcgen05.ld.red (32x32b, max.abs) per block and one wait for the loads."""
+    blocks, maxima = [], []
+    for block in range(count):
+        data, maximum = tcgen05_ld_red(
+            Tcgen05LdStShape.SHAPE_32X32B,
+            make_tmem_ptr(addr + 16 * block, Float32),
+            ReductionKind.MAX,
+            num=16,
+            abs=True,
+        )
+        data = cutlass.Vector(data, dtype=Float32)
+        blocks.append([data[i] for i in range(16)])
+        maxima.append(Float32(maximum))
+    tcgen05_wait(Tcgen05Wait.LOAD)
+    return blocks, maxima
+
+
 @cute.jit
 def _compensation_warps(st, codes, scales, gmax):
     """Compensation warps (18-21), one per TMEM lane quadrant: quantize the projected channels of every tile to NVFP4.
@@ -568,12 +735,15 @@ def _compensation_warps(st, codes, scales, gmax):
     * A thread takes the full row of the projected channels of its token (the tile's compensation channels in D),
       loaded 32 channels at a time, and stores their NVFP4 codes and block scales; the maxima of the scales of each
       term go to gmax. codes, scales, gmax: the global addresses of (q4, k4), (q_sfv, k_sfv) and gmax.
+    * Where the target has it, the load of a block returns its max |x| (tcgen05.ld.red).
     * The compensation channels after the two terms get zero codes; their scales are zero in the scale encoding.
     * A tile waits DFULL of its projection buffer; the warp arrives on DEMPTY once its last channels are in registers.
+      In the ring a term waits DFULL of its slot, and the warp arrives on the slot's DEMPTY once the term's last
+      channels are in registers.
     """
     r_q = st.RANK[0]
     blocks = st.comp // QK_BLOCK  # 16-channel blocks of the two terms
-    parts = (blocks + 1) // 2  # 32-channel loads that hold them
+    loads = _d_loads(st.RANK, st.d_layout)  # 32-channel loads that hold them
     lq = st.warp & 3
     row = lq * 32 + st.lane
     tl = (lq * 32) << 16
@@ -585,27 +755,38 @@ def _compensation_warps(st, codes, scales, gmax):
     rstride = Int64(st.H) * Int64(128)
     thr_off = Int64(row) * rstride
     for i in cutlass.range(st.n):
-        dp = _d_buffer(i & 1, st.d_stages)
-        mbar_wait_bounded(st.bars + 8 * (B_DFULL + dp), _d_rounds(i, st.d_stages) & 1)
+        dp, full, empty = _d_buffer(st, i, 0)
+        mbar_wait_bounded(st.bars + 8 * (full + dp), _d_rounds(st, i, 0) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
         tok = sblk * 128 + row
         if cutlass.const_expr(st.lens is not None):
             n_tok = valid_len(st.lens, b, st.S)
         code_base, scale_base, row0 = _tile_outputs(st, codes, scales, rstride, kind, sblk, b, h)
         soff = _scale_tile(st, bh, sblk) + Int64(1024 + lq * 32 + st.lane)
-        if cutlass.const_expr(parts == 0):
-            _warp_arrive(st, B_DEMPTY + dp)
-        for part in cutlass.range_constexpr(parts):
-            dv = ld_tmem_f32_x32_wait(st.tm + tl + TM_D + dp * st.comp + part * 32)
-            if cutlass.const_expr(part == parts - 1):
-                # the last channels are in registers: release the D buffer to the MMA warp
+        if cutlass.const_expr(len(loads) == 0):
+            _warp_arrive(st, empty + dp)
+        for number in cutlass.range_constexpr(len(loads)):
+            term, column, held, last = loads[number]
+            if cutlass.const_expr(term == 1 and column == 0):
+                # the ring: the K-residual term has a slot of its own
+                dp, full, empty = _d_buffer(st, i, 1)
+                mbar_wait_bounded(st.bars + 8 * (full + dp), _d_rounds(st, i, 1) & 1)
+                tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
+            d_addr = st.tm + tl + TM_D + _d_column(st, i, term) + column
+            if cutlass.const_expr(target.has_tmem_ld_red()):
+                dv, dv_max = _ld_blocks_absmax_wait(d_addr, len(held))
+            else:
+                loaded = ld_tmem_f32_x32_wait(d_addr)
+                dv, dv_max = [loaded[0:16], loaded[16:32]], [None, None]
+            if cutlass.const_expr(last):
+                # the last channels are in registers: release the buffer or slot to the MMA warp
                 tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
-                _warp_arrive(st, B_DEMPTY + dp)
+                _warp_arrive(st, empty + dp)
             ws = []
             for grp in cutlass.range_constexpr(2):
-                j = part * 2 + grp
-                if cutlass.const_expr(j < blocks):
-                    sg, w0, w1 = quant16(dv[16 * grp : 16 * grp + 16])
+                if cutlass.const_expr(grp < len(held)):
+                    j = held[grp]
+                    sg, w0, w1 = quant16(dv[grp], dv_max[grp])
                     if cutlass.const_expr(st.lens is not None):
                         sg = Float32(cutlass.select_(tok < n_tok, sg, Float32(0.0)))
                     ws.append(w0)
@@ -623,12 +804,20 @@ def _compensation_warps(st, codes, scales, gmax):
                             mq1 = cute.arch.fmax(mq1, sg)
                         else:
                             mq2 = cute.arch.fmax(mq2, sg)
-            # the blocks of the load: 8 bytes each in the token row, after the 64 bytes of the head channels
+            # the blocks of the load: 8 bytes each in the token row, after the 64 bytes of the head channels; one
+            # store where they start at a multiple of their size
+            at = 64 + held[0] * 8
+            pieces = [ws] if at % (4 * len(ws)) == 0 else [ws[0:2], ws[2:4]]
             if tok < st.S:
-                store_vector(
-                    gptr(Uint32, code_base + row0 + thr_off + Int64(64 + part * 16), 4 * len(ws)),
-                    ws,
-                )
+                for nth in cutlass.range_constexpr(len(pieces)):
+                    store_vector(
+                        gptr(
+                            Uint32,
+                            code_base + row0 + thr_off + Int64(at + 8 * nth),
+                            4 * len(pieces[nth]),
+                        ),
+                        pieces[nth],
+                    )
         # zero codes in the blocks after the two terms, 16 bytes at a time from an even block on
         if cutlass.const_expr(blocks < st.comp_blocks):
             if tok < st.S:
@@ -759,7 +948,13 @@ def _qk_body(
     lane = tidx % 32
 
     smem = utils.SmemAllocator()
-    bars_p = smem.allocate_array(Int64, QK_NBARS, byte_alignment=8)
+    # the layout of the projections in TMEM and the columns of the CTA: 512, or the target's where the projections
+    # reach beyond them
+    d_layout = _d_layout(RANK, cute.arch.get_max_tmem_alloc_cols(target.arch_name()))
+    tmem_columns = max(512, TM_D + _d_columns(RANK, d_layout))
+    tmem_arch = target.arch_name() if tmem_columns > 512 else "sm_100"
+    nbars = QK_RING_NBARS if d_layout == "ring" else QK_NBARS
+    bars_p = smem.allocate_array(Int64, nbars, byte_alignment=8)
     hold_p = smem.allocate_array(Int32, 4, byte_alignment=16)
     sX = smem.allocate_tensor(
         BFloat16, tma_q.smem_layout.outer, byte_alignment=1024, swizzle=tma_q.smem_layout.inner
@@ -771,7 +966,6 @@ def _qk_body(
     urows, u_row_q, u_row_k, u_source = _u_rows(RANK, len(ut_addrs) == 2)
     ustage = urows * 512
     u_stages = 2 if urows <= U_TWO_STAGE_ROWS else 1
-    d_stages = 2 if TM_D + 2 * comp <= 512 else 1
     # BF16 block scales of a tile in the write-coalesced layout, and the 16-channel blocks of the compensation
     # channels of the QK build
     channels = qk_channels(RANK)
@@ -792,9 +986,9 @@ def _qk_body(
     nb2 = NB * 2
 
     if tidx == 0:
-        _init_barriers(bars)
+        _init_barriers(bars, d_layout == "ring")
     if warp == 0:
-        cute.arch.alloc_tmem(512, sptr(Uint32, hold))
+        cute.arch.alloc_tmem(tmem_columns, sptr(Uint32, hold), arch=tmem_arch)
         cute.arch.relinquish_tmem_alloc_permit()
     _stage_hadamard(hadamard, tidx, ht_base)
     # the barriers, the TMEM address and the Hadamard operand are set for every thread after this barrier
@@ -846,7 +1040,7 @@ def _qk_body(
         u_source=u_source,
         ustage=ustage,
         u_stages=u_stages,
-        d_stages=d_stages,
+        d_layout=d_layout,
         sfv_tile=sfv_tile,
         # the TMA of q and k and the MMA slice that partitions their tiles
         tma_q=tma_q,
@@ -882,7 +1076,9 @@ def _qk_body(
     tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
     if warp == 0:
         cute.arch.dealloc_tmem(
-            cute.make_ptr(Float32, tm, cute.AddressSpace.tmem, assumed_align=16), 512
+            cute.make_ptr(Float32, tm, cute.AddressSpace.tmem, assumed_align=16),
+            tmem_columns,
+            arch=tmem_arch,
         )
 
 

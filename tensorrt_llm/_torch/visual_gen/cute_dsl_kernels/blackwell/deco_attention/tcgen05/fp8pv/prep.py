@@ -76,7 +76,7 @@ def _launch_chain(
     q4, k4, q_sf, k_sf, score_scale, v8, v_mean, v8_scale = operands
     gmax, ut_q, ut_k, q_sfv, k_sfv = scratch
     QP, KP, VP = pitches
-    v_grid, qgrid, egrid = grids
+    v_grid, qgrid, egrid, v_counted = grids
     rank, separate, eig, two_row_sets, rows_mode, pdl = config
     # the shape of the call, and the sizes of its launches that follow from it
     B, S, H = (Int32(n) for n in q.shape[:3])
@@ -96,7 +96,7 @@ def _launch_chain(
             use_pdl=pdl,
             stream=stream,
         )
-    vs = v_scan_kernel(v, v_mean, gmax, S, H, VP, NB, v_units, lens, with_lens)
+    vs = v_scan_kernel(v, v_mean, gmax, S, H, VP, NB, v_units, v_counted, lens, with_lens)
     ve = v_encode_kernel(v, v8, v_mean, gmax, S, H, VP, NB, v_units, lens, with_lens)
     vs.launch(
         grid=(v_grid, 1, 1),
@@ -155,7 +155,7 @@ def _make_host(config: tuple) -> Callable:
     * gram_weight: the Gram weight of the shared basis. QP, KP, VP: the bytes between consecutive tokens of q, k
       and v, which the eigensolver and the V scan and encode read in place (the Q/K pass reads them through TMA
       descriptors built on the tensors' layouts). v_grid, qgrid, egrid: the CTAs of the V passes, the Q/K pass and
-      the encode launch.
+      the encode launch. v_counted: nonzero when the V scan shares its SMs with the eigensolver CTAs.
     """
 
     @cute.jit
@@ -183,6 +183,7 @@ def _make_host(config: tuple) -> Callable:
         v_grid: Int32,
         qgrid: Int32,
         egrid: Int32,
+        v_counted: Int32,
         NK: Int32,
         gram_weight: Float32,
         rows_k: Int64,
@@ -195,7 +196,7 @@ def _make_host(config: tuple) -> Callable:
             (q4, k4, q_sf, k_sf, score_scale, v8, v_mean, v8_scale),
             (gmax, ut_q, ut_k, q_sfv, k_sfv),
             (QP, KP, VP),
-            (v_grid, qgrid, egrid),
+            (v_grid, qgrid, egrid, v_counted),
             gram_weight,
             lens,
             stream,
@@ -230,7 +231,7 @@ def scratch(B: int, S: int, H: int, rank: tuple[int, int], bases: str) -> Layout
     atoms = qk_scale_atoms(qk_channels(rank))
     directions = eig_directions(rank)
     return {
-        # the per-call words (maxima and the V pass's CTA count), U^T of the basis (one per term with bases
+        # the per-call words (maxima and the V scan's unit count), U^T of the basis (one per term with bases
         # "separate"; none without compensation channels) and the provisional Q' / K' block scales
         "gmax": (torch.float32, (GMAX_WORDS,)),
         **(
@@ -299,11 +300,13 @@ def run(
     free = min(nsm, max(nsm - eig_ctas, V_SMALL_PASS_MIN_SMS))
     v_sms = free if eig_ctas < nsm and B * S * H * 16 * 40 <= V_SMALL_PASS_BYTES * free else nsm
     v_grid = min(V_CTAS_PER_SM * v_sms, B * ((S + V_BLOCK - 1) // V_BLOCK))
+    # a V scan on SMs that also hold eigensolver CTAs takes its work from the counter of the call (v_pass.py)
+    v_counted = int(eig_ctas > 0 and v_sms + min(eig_ctas, nsm) > nsm)
     qgrid = min(nsm, BH * NB * 2)
     egrid = min(ENCODE_CTAS_PER_SM * nsm, BH * NB)
     tensors = (q, k, v, rows_q, hadamard(dev), *(buffers[n] for n in _HOST_OPERANDS))
     tensors += (gmax, ut_q, buffers["q_sfv"], buffers["k_sfv"])
-    sizes = (*token_pitches(q, k, v), v_grid, qgrid, egrid, nk)
+    sizes = (*token_pitches(q, k, v), v_grid, qgrid, egrid, v_counted, nk)
     lens_addr = 0 if lens is None else lens.data_ptr()
     pdl = pdl_enabled()
     config = (rank, separate, eig, two_row_sets, rows_mode, pdl)

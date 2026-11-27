@@ -135,6 +135,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         self.s_probe = tune.s_probe
         self.rescale_loop = tune.rescale_loop
         self.vs_batched = tune.vs_batched
+        self.q_scales_early = 0 < tune.q_scales_early <= qk_channels
         self.kv_stage = tuning.KV_STAGE
         # V smoothing (mma.py): a means batch has vs_tiles KV tiles and as many v_mean rows. The sum of P over KV tile
         # t is in column 128 + t % 8 of O_j and becomes K slot t % 8 of the means MMA's A operand (K slot = column)

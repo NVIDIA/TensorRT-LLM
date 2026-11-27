@@ -33,7 +33,8 @@
 
 Per-call words of gmax (float32, cleared by the clear launch):
     0..2, 3..5  maxima of the three scale groups of Q' and of K' (head channels, Q-residual term, K-residual term)
-    6           maximum of |V - mean| of the V scan (7 is not used)
+    6           maximum of |V - mean| of the V scan
+    7           the units of the V scan that its CTAs have taken (a count)
 """
 
 import functools
@@ -63,9 +64,9 @@ from ..valid_len import valid_len
 EIG_THREADS = 288  # eigensolver CTA: eight row warps and the pivot warp
 # the directions an eigensolver CTA is built for: 256 / DIRECTIONS threads per eigenvalue
 EIG_DIRECTIONS = (32, 64, 128)
-# Per-call words of gmax (module docstring): count; first Q' and K' maximum, V maximum
+# Per-call words of gmax (module docstring): count; first Q' and K' maximum, V maximum, the V scan's unit count
 GMAX_WORDS = 8
-GMAX_Q, GMAX_K, GMAX_V = 0, 3, 6
+GMAX_Q, GMAX_K, GMAX_V, GMAX_UNIT = 0, 3, 6, 7
 
 
 @functools.cache
@@ -1246,8 +1247,13 @@ def _orthonormalize(st, PASSES: cutlass.Constexpr = 1):
                 d0 = Float32(0.0)
                 d1 = Float32(0.0)
                 for ii in cutlass.range(0, 128, 2, unroll=4):
-                    d0 = cute.fma(sZ[ii, slot], sZ[ii, other], d0)
-                    d1 = cute.fma(sZ[ii + 1, slot], sZ[ii + 1, other], d1)
+                    pair = cute.arch.fma_packed_f32x2(
+                        (sZ[ii, slot], sZ[ii + 1, slot]),
+                        (sZ[ii, other], sZ[ii + 1, other]),
+                        (d0, d1),
+                    )
+                    d0 = pair[0]
+                    d1 = pair[1]
                 at = cutlass.min(slot, other) * 128 + cutlass.max(slot, other)
                 cute.arch.store(sptr(Float32, st.dmb + at * 4), d0 + d1)
             if sub == 0:
@@ -1267,10 +1273,16 @@ def _orthonormalize(st, PASSES: cutlass.Constexpr = 1):
                     c4 = load_vector(sptr(Uint32, crow + g * 16, 16), 4)
                     ya = load_vector(sptr(Uint32, zrow + g * 16, 8), 2)
                     yb = load_vector(sptr(Uint32, zrow + g * 16 + 8, 8), 2)
-                    z0 = cute.fma(-u2f(c4[0]), u2f(ya[0]), z0)
-                    z1 = cute.fma(-u2f(c4[1]), u2f(ya[1]), z1)
-                    z2 = cute.fma(-u2f(c4[2]), u2f(yb[0]), z2)
-                    z3 = cute.fma(-u2f(c4[3]), u2f(yb[1]), z3)
+                    pa = cute.arch.fma_packed_f32x2(
+                        (-u2f(c4[0]), -u2f(c4[1])), (u2f(ya[0]), u2f(ya[1])), (z0, z1)
+                    )
+                    pb = cute.arch.fma_packed_f32x2(
+                        (-u2f(c4[2]), -u2f(c4[3])), (u2f(yb[0]), u2f(yb[1])), (z2, z3)
+                    )
+                    z0 = pa[0]
+                    z1 = pa[1]
+                    z2 = pb[0]
+                    z3 = pb[1]
                 sZ[st.tidx, j] = (z0 + z1) + (z2 + z3)
         cute.arch.sync_threads()
         if st.tidx < nslot:
@@ -1425,7 +1437,8 @@ def _back_transform(st):
 @cute.jit
 def _write_basis(st, uT: cute.Tensor, bh: Int32):
     """Threads < 256, after the barrier that publishes the back-transformed z: write U = Hd^T Z / sqrt(128) to basis bh
-    of uT (Hd is in the D- buffer); a thread takes 16 rotated channels of one basis vector out of every 32."""
+    of uT (Hd is in the D- buffer); a thread takes 16 rotated channels of one basis vector out of every 32. The
+    entries of Hd are +-1, so a term z Hd is exact and the sums add the terms in the order of the rows of z."""
     if st.tidx < 256:
         for part in cutlass.range_constexpr(st.DIRECTIONS // 32):
             urow = st.lane  # basis vector (U^T row)
@@ -1438,8 +1451,14 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
                 zj = st.sZ[j, urow]
                 for c4 in cutlass.range_constexpr(4):
                     h4 = load_vector(sptr(Uint32, st.dmb + (j * 128 + k0 + 4 * c4) * 4, 16), 4)
-                    for e in cutlass.range_constexpr(4):
-                        accu[4 * c4 + e] = accu[4 * c4 + e] + zj * u2f(h4[e])
+                    for e in cutlass.range_constexpr(0, 4, 2):
+                        pair = cute.arch.fma_packed_f32x2(
+                            (zj, zj),
+                            (u2f(h4[e]), u2f(h4[e + 1])),
+                            (accu[4 * c4 + e], accu[4 * c4 + e + 1]),
+                        )
+                        accu[4 * c4 + e] = pair[0]
+                        accu[4 * c4 + e + 1] = pair[1]
             s128 = Float32(INV_SQRT_HEAD_DIM)
             ub = (
                 Int64(uT.iterator.toint())

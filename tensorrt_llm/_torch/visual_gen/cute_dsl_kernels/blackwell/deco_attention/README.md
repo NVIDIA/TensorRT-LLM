@@ -68,6 +68,12 @@ and for any `gram_weight` with `bases="separate"`; `attention` for a rescale thr
   form of their rows, a passed basis) and what a family derives from the shape and the SM count. The Gram weight,
   the row counts and the values of a passed basis are run-time values. Every compilation is logged with its key
   and time (logger `tensorrt_llm.logger`), and each family lists the parts of a key beside it.
+- **Reproducibility.** A call returns the same bits for the same inputs on one GPU, whatever the workspace held.
+  On sm_100a and sm_103a the work units of a last partial wave of the attention (a unit is two 128-row query tiles
+  of one head; the wave has fewer units than the GPU has SMs) are split into pieces of the key sequence over the
+  idle SMs, and each piece starts its own softmax anchor: the output of those units follows the SM count of the
+  GPU, with the same error against the exact attention. sm_107a does not split, so its output does not depend on
+  the SM count.
 - **CUDA graphs.** A call enqueues its launches on the current stream, reads nothing back from the device and
   allocates nothing, so both calls can be captured into one graph. A capture follows one eager call with the same
   shape and arguments: that call compiles the kernels of the call and builds the sampled rows and the rotation

@@ -205,6 +205,8 @@ class MmaRole:
             # QK10 (QK00 staged the K scale factors)
             self.qk.stage_scales(qk_mma, q1_stage)
             self.qk.issue_qk(qk_mma, 1, tStS, self.qk.descs(tSrQ1, tSrK0), s1_out_handle)
+            if cutlass.const_expr(self.q_scales_early):
+                self.qk.stage_scales(qk_mma, q0_stage)
             k_handle.release()
             # O_j must be drained by the previous work tile's epilogue before PV_j(0)
             o0_handle = mma_epi_producer.acquire_and_advance()
@@ -231,11 +233,14 @@ class MmaRole:
                     )
                 else:
                     qk0_descs = self.qk.descs(tSrQ0, tSrKi)
-                self.qk.stage_scales(qk_mma, q0_stage, k_stage)
+                self.qk.stage_scales(qk_mma, None if self.q_scales_early else q0_stage, k_stage)
                 # WG1 has had the preceding PV/TMA interval to drain S. Its next empty credit is the overwrite fence
                 # for QK0.
                 s1_out_handle = mma_s1_producer.acquire_and_advance()
                 self.qk.issue_qk(qk_mma, 0, tStS, qk0_descs, s0_out_handle)
+                if cutlass.const_expr(self.q_scales_early):
+                    # the Q-SF of QK1 follow the MMAs of QK0 into the tensor pipeline, ahead of PV0
+                    self.qk.stage_scales(qk_mma, q1_stage)
                 # probe WG0's S-empty credit before PV0 (not after it)
                 s0_tok = None
                 if cutlass.const_expr(self.s_probe):
@@ -261,12 +266,16 @@ class MmaRole:
                     )
                 else:
                     qk1_descs = self.qk.descs(tSrQ1, tSrKi)
-                self.qk.stage_scales(qk_mma, q1_stage)
+                if cutlass.const_expr(not self.q_scales_early):
+                    self.qk.stage_scales(qk_mma, q1_stage)
                 p1_mma_consumer._PipelineConsumer__state._phase = p_step_phase
                 p1_tok = p1_mma_consumer.try_wait()
                 kv_tok = load_kv_consumer.try_wait()
                 s0_out_handle = mma_s0_producer.acquire_and_advance(s0_tok)
                 self.qk.issue_qk(qk_mma, 1, tStS, qk1_descs, s1_out_handle)
+                if cutlass.const_expr(self.q_scales_early):
+                    # the Q-SF of the next tile's QK0, ahead of PV1 (after the last tile they are not read)
+                    self.qk.stage_scales(qk_mma, q0_stage)
                 p1_mma_consumer = self.mma_pv(
                     pv_whether_acc,
                     (o1_addr, p1_addr, v_desc0, idesc_pv),
