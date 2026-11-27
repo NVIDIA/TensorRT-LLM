@@ -48,9 +48,10 @@ namespace
 struct XferControls
 {
     std::atomic<bool> useNixl{false};
-    std::atomic<bool> failWrites{false};     // every posted write polls as FAILURE
-    std::atomic<bool> allowTerminal{true};   // false -> posted writes stay IN_PROGRESS
-    std::atomic<bool> releaseSucceeds{true}; // false -> release() fails (handle retained)
+    std::atomic<bool> failWrites{false};      // every posted write polls as FAILURE
+    std::atomic<bool> allowTerminal{true};    // false -> posted writes stay IN_PROGRESS
+    std::atomic<bool> releaseSucceeds{true};  // false -> release() fails (handle retained)
+    std::atomic<std::uint64_t> failOnPost{0}; // one-based; zero keeps every post enabled
     std::atomic<std::uint64_t> postCount{0};
     std::atomic<std::uint64_t> releaseCount{0};
 };
@@ -147,7 +148,11 @@ public:
         kvc::TransferDescs const& local, kvc::TransferDescs const& remote, std::string const& peer,
         std::optional<kvc::SyncMessage> const& notification) override
     {
-        mCtl->postCount.fetch_add(1, std::memory_order_relaxed);
+        auto const post = mCtl->postCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (post == mCtl->failOnPost)
+        {
+            return nullptr;
+        }
         if (mCtl->useNixl.load(std::memory_order_acquire))
         {
             auto status = kvc::NixlTransferAgent::postXferRequest(op, local, remote, peer, notification);
@@ -406,6 +411,71 @@ void checkFailedWriteDrain(bool sealBeforeCancel)
 TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
 {
     checkFailedWriteDrain(false);
+}
+
+TEST(BounceTransportFailure, LaterWriteFailureWaitsForEarlierDataOnTheSameRequest)
+{
+    using namespace std::chrono_literals;
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto config = cfg(10000);
+    auto senderConfig = config;
+    capRegions(senderConfig, 1);
+    auto controls = std::make_shared<XferControls>();
+    controls->useNixl = true;
+    controls->failOnPost = 2;
+    auto sender = makeFakeNode("laterFailA", senderConfig, controls);
+    auto receiver = bounce_test::makeNode("laterFailB", config, 1024);
+    if (!sender || !receiver)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    bounce_test::wirePair(*sender, *receiver);
+
+    // The second post needs the first chunk's staging slot. Hold the receiving contexts
+    // so that the first DATA cannot be acknowledged before the second write fails.
+    std::vector<b::ExecCtx*> held;
+    while (auto* ctx = receiver->exec->tryAcquire())
+    {
+        held.push_back(ctx);
+    }
+    EXPECT_EQ(held.size(), receiver->exec->size());
+    auto const key = bounce_test::testWindowKey();
+    auto buffers = bounce_test::makeXferBufs(2, config.maxChunkSizeBytes, 7);
+    auto result = bounce_test::submitTransfer(*sender, *receiver, buffers, key);
+    std::shared_ptr<b::BounceDrain> drain;
+    if (result.wait_for(5s) == std::future_status::ready)
+    {
+        EXPECT_EQ(result.get().state, kvc::TransferState::kFAILURE);
+        EXPECT_EQ(result.get().reason, b::BounceFailReason::kWriteFailed);
+        EXPECT_FALSE(result.get().remoteDrained);
+        drain = result.get().remoteDrain;
+    }
+    EXPECT_EQ(controls->postCount.load(), 2U);
+    if (drain)
+    {
+        EXPECT_EQ(drain->result.wait_for(0s), std::future_status::timeout);
+    }
+    for (auto* ctx : held)
+    {
+        receiver->exec->release(ctx);
+    }
+    ASSERT_NE(drain, nullptr);
+    ASSERT_EQ(drain->result.wait_for(5s), std::future_status::ready);
+    EXPECT_TRUE(drain->result.get());
+    EXPECT_EQ(result.get().state, kvc::TransferState::kFAILURE);
+
+    auto const address = reinterpret_cast<std::uintptr_t>(buffers.dst);
+    bounce_test::freeXferBufs(buffers);
+    EXPECT_EQ(receiver->tx->receiveWindows().find(b::bounceWindowId(key), sender->name), nullptr);
+    EXPECT_EQ(receiver->agent->borrowScatterDestinations().second.count(address), 0U);
+
+    auto next = bounce_test::makeXferBufs(2, config.maxChunkSizeBytes, 8);
+    auto followup = bounce_test::submitTransfer(*sender, *receiver, next);
+    ASSERT_EQ(followup.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(followup.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(next));
+    sender->tx->shutdown();
+    receiver->tx->shutdown();
+    bounce_test::freeXferBufs(next);
 }
 
 TEST(BounceTransportFailure, SealedWindowAllowsTheOriginalWriterToDrain)
