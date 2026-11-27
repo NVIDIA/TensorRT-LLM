@@ -189,9 +189,9 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false, stageNa
                     imagePullPolicy: Always"""
         break
     case "build":
-        // The x86_64 release images can build the wheel from source, which needs more CPU and memory.
-        def buildCores = (build_wheel && arch == "amd64") ? 16 : 12
-        def buildMemoryRequest = (build_wheel && arch == "amd64") ? "72Gi" : "24Gi"
+        // The release images can build the wheel from source, which needs more CPU and memory.
+        def buildCores = build_wheel ? 16 : 12
+        def buildMemoryRequest = build_wheel ? "72Gi" : "24Gi"
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
