@@ -12,6 +12,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique that e
    - [NeMo LoRA Format](#nemo-lora-format)
    - [Routed-Expert MoE LoRA](#routed-expert-moe-lora)
    - [Cache Management](#cache-management)
+   - [CUDA Graph Adapter Capacity](#cuda-graph-adapter-capacity)
    - [Options for Performance Tuning](#options-for-performance-tuning)
 4. [TRTLLM serve with LoRA](#trtllm-serve-with-lora)
    - [YAML Configuration](#yaml-configuration)
@@ -268,6 +269,28 @@ llm = LLM(
 )
 ```
 
+### CUDA Graph Adapter Capacity
+
+CUDA graphs are enabled by default; set `cuda_graph_config: null` in the serving YAML to disable them.
+A decode batch that runs as a CUDA graph can use at most `LoraConfig.max_loras` distinct adapters,
+or 8 when `max_loras` is unset. Requests with the same `lora_int_id` count as one adapter. This is the
+second `LoRARequest` argument, or `lora_request.lora_int_id` in a serve request, rather than `lora_name`.
+
+Size `max_loras` to cover the maximum number of distinct adapters in a CUDA-graph decode batch.
+Using the maximum number of distinct adapters across concurrent requests is sufficient. A CUDA-graph
+decode batch contains at most `cuda_graph_config.max_batch_size` requests (128 by default), which
+also bounds the number of adapter slots a batch can need.
+
+Setting a positive `max_loras` also sizes the device LoRA cache for that many adapters at
+`max_lora_rank`, and takes precedence over `peft_cache_config.device_cache_percent`. Increasing
+`max_loras` therefore uses more GPU memory. The percentage-based sizing in [Cache Management](#cache-management)
+applies when `max_loras` is unset.
+
+If a CUDA-graph decode batch uses more distinct adapters than available slots, the forward step
+fails with `Batch with more unique LoRA adapters (N) than max_num_adapters=M is not supported`.
+Every in-flight request on the executor fails, and repeated overflows can exhaust its error budget
+and shut it down. Decode batches that run eagerly are not subject to this graph adapter-slot limit.
+
 ### Options for Performance Tuning
 
 `LoraConfig` exposes several options for performance tuning depending on the user's workload. The first is `overlap_lora_and_base`:
@@ -301,7 +324,9 @@ Create a `config.yaml` file:
 lora_config:
   lora_target_modules: ['attn_q', 'attn_k', 'attn_v']
   max_lora_rank: 8
+  max_loras: 16  # 16 CUDA graph adapter slots; also sizes the GPU LoRA cache.
 ```
+
 ### Starting the Server
 ```bash
 trtllm-serve /path/to/model --config config.yaml
