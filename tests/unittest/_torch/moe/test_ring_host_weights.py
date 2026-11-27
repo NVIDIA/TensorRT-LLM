@@ -15,13 +15,11 @@
 """Tests for the EPLB host weights that Wide-EP fault tolerance keeps in a ring of nodes."""
 
 import collections
-import concurrent.futures
 import functools
 import itertools
 import os
 import secrets
 import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -374,9 +372,12 @@ def test_staging_pieces_never_overlap():
 
 
 def _restore_in_threads(
-    restores, plans, before_gather=lambda rank: None, progress=lambda rank: None
+    restores, plans, before_gather=lambda rank: None, progress=lambda rank: None, times=None
 ):
-    """Restore ``plans`` on one thread per rank and return each rank's number of allgathers."""
+    """Restore ``plans`` on one thread per rank and return each rank's number of allgathers.
+
+    If given, ``times`` receives each rank's phase durations by rank.
+    """
     barrier = threading.Barrier(len(restores))
     values = {}
     gathers = collections.Counter()
@@ -398,6 +399,7 @@ def _restore_in_threads(
                 plans[rank],
                 workspace,
                 functools.partial(allgather, rank),
+                None if times is None else times.setdefault(rank, {}),
                 progress=functools.partial(progress, rank),
             )
         except BaseException as error:  # noqa: BLE001 - the test thread raises it.
@@ -449,67 +451,36 @@ def test_restore_loads_slots_bit_exactly(monkeypatch):
     _restore_in_threads(restores, plans)
 
 
-class _HostWeightsReadAfter(dict):
-    """Host weights whose reads wait until ``event`` is set."""
-
-    def __init__(self, event, weights):
-        super().__init__(weights)
-        self._event = event
-
-    def __getitem__(self, key):
-        started = self._event.wait(timeout=10)
-        assert started, f"Expert {key[0]} was read before the next layer's backing started"
-        return super().__getitem__(key)
-
-
-def _wait_until(condition, timeout_s=10):
-    deadline = time.monotonic() + timeout_s
-    while not condition():
-        if time.monotonic() > deadline:
-            return False
-        time.sleep(1e-3)
-    return True
-
-
-def _overlap_backing(restore, plan):
-    """Make ``restore`` back one layer per call, overlapping the loads of the layer before it.
-
-    Backing layer L + 1 starts before any host weight of layer L is read, and it ends only once
-    layer L's slots are loaded. Return the layers backed, in order.
-    """
+def _loaded(restore, plan):
+    """Return, by layer, whether each slot that ``plan`` loads on ``restore``'s rank holds data."""
     rank = restore.balancer.ep_rank
-    layers = restore.balancer.single_layer_load_balancers
-    started = [threading.Event() for _ in layers]
-    backed = []
-
-    def loaded(i):
-        """Return whether each slot that ``plan`` loads in layer ``i`` holds its expert."""
+    loaded = []
+    for i, layer in enumerate(restore.balancer.single_layer_load_balancers):
         placement, before = plan.placements[i][rank], plan.placement_before[i][rank]
         slots = np.flatnonzero((placement >= 0) & (placement != before))
-        return [layers[i].slot_tensors["w1"][slot].any() for slot in slots]
+        loaded.append([bool(layer.slot_tensors["w1"][slot].any()) for slot in slots])
+    return loaded
+
+
+def _record_backing(restore, plan):
+    """Record the layers of each call that backs ``restore``'s spare slots, by call.
+
+    Each call checks that no slot that ``plan`` loads holds data yet.
+    """
+    calls = []
 
     def set_spare_slots_backed(layer_slots, is_backed):
         assert is_backed
-        backing = [i for i, slots in enumerate(layer_slots) if slots]
-        assert len(backing) == 1, f"Rank {rank} backed layers {backing} in one call"
-        (i,) = backing
-        assert not any(loaded(i)), f"Rank {rank} loaded layer {i} before backing it"
-        started[i].set()
-        assert i == 0 or _wait_until(lambda: all(loaded(i - 1))), (
-            f"Rank {rank} waited for layer {i} to be backed before it loaded layer {i - 1}"
-        )
-        backed.append(i)
+        assert not any(map(any, _loaded(restore, plan))), "A slot was loaded before its backing"
+        calls.append([i for i, slots in enumerate(layer_slots) if slots])
         return 0
 
     restore.set_spare_slots_backed = set_spare_slots_backed
-    for layer, next_started in zip(layers, started[1:]):
-        sharer = layer.host_tensor_sharer
-        sharer.node_host_weights = _HostWeightsReadAfter(next_started, sharer.node_host_weights)
-    return backed
+    return calls
 
 
-def test_restore_backs_next_layer_while_loading(monkeypatch):
-    """Back each layer before loading it, and back the next layer while loading it."""
+def test_restore_backs_every_layer_in_one_call(monkeypatch):
+    """Back the spare slots of every layer in one call, before loading any slot."""
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: Mock())
     placement = [rank[:3] for rank in _PLACEMENT]
     restores = {
@@ -522,40 +493,28 @@ def test_restore_backs_next_layer_while_loading(monkeypatch):
     # Ranks 0 and 1 read both layers' experts from the staging workspace, and ranks 2 and 3 load
     # them from host weights and stage them out.
     assert all(any(_local_slots(plans[rank], rank)) == (rank >= 2) for rank in range(4))
-    backed = {rank: _overlap_backing(restore, plans[rank]) for rank, restore in restores.items()}
+    backing = {rank: _record_backing(restore, plans[rank]) for rank, restore in restores.items()}
     for rank, restore in restores.items():
         restore.balancer.load_balancer_impl.restore_placement.side_effect = functools.partial(
             _check_loaded, restore, plans[rank]
         )
-    gathers = _restore_in_threads(restores, plans)
-    assert backed == {rank: [0, 1] for rank in range(4)}
+    times = {}
+    gathers = _restore_in_threads(restores, plans, times=times)
+    assert backing == {rank: [[0, 1]] for rank in range(4)}
     # The ranks agree on the plan, then meet once per staged chunk.
     assert set(gathers.values()) == {4}
-    assert not _backing_threads()
-
-
-def _backing_threads():
-    """Return the threads that back spare slots for a restore."""
-    return [
-        thread for thread in threading.enumerate() if thread.name.startswith("spare_slot_backing")
-    ]
+    assert {rank: list(phases) for rank, phases in times.items()} == {
+        rank: ["back", "back op", "load", "install"] for rank in range(4)
+    }
 
 
 class _BackingError(RuntimeError):
     pass
 
 
-class _RunEveryBacking(concurrent.futures.ThreadPoolExecutor):
-    """Run every queued backing at shutdown, so that only the restore can skip a layer."""
-
-    def shutdown(self, wait=True, *, cancel_futures=False):
-        super().shutdown(wait=True)
-
-
 def test_failed_backing_stops_the_restore(monkeypatch):
-    """Raise a layer's backing error in the restore and back no later layer."""
+    """Raise the backing error in the restore before it loads any slot."""
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: Mock())
-    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _RunEveryBacking)
     placement = [rank[:3] for rank in _PLACEMENT]
     restore = _restore(_NODES, 2, layers=2, placement=placement, spares=1)
     plan = restore.plan_expert_restore(_active([4, 5]), [np.array(placement)] * 2)
@@ -571,8 +530,8 @@ def test_failed_backing_stops_the_restore(monkeypatch):
     with pytest.raises(_BackingError) as raised:
         restore.restore_lost_experts(plan, workspace, lambda value: [value] * len(_NODES))
     assert raised.value is error
-    assert backing == [[0]]
-    assert not _backing_threads()
+    assert backing == [[0, 1]]
+    assert not any(map(any, _loaded(restore, plan)))
     restore.balancer.load_balancer_impl.restore_placement.assert_not_called()
 
 
@@ -681,7 +640,6 @@ def test_interrupted_restore_reloads_its_slots(monkeypatch):
     workspace = torch.zeros(len(_NODES), 1024, dtype=torch.uint8)
     with pytest.raises(RuntimeError, match="a newer membership change"):
         restore.restore_lost_experts(plan, workspace, allgather)
-    assert not _backing_threads()
     # Rank 2's view names no expert in the slot until a restore installs a placement.
     ((_, view),) = restore.current_placement()
     assert view[2] == [-1, 5, -1, -1]
