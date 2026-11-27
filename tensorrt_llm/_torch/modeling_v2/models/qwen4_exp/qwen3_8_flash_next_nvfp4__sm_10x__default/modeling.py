@@ -36,9 +36,12 @@ The forward is cut per rank; what the layout settles is settled once, at constru
   largest row count, gathered (`comm/allgather`), routed and run through the window, and
   reduce-scattered back (`comm/reducescatter`), each row's window partials summed once
   (`_expert_sum_op`); at dep4 `DP_MOE_COMM_ENV=lamport` runs the pair as one Lamport launch each
-  (`ops/moe/dep_lamport_round_trip`). The router and the bf16 shared expert are replicated and run on this
-  rank's rows, so the block output `routed + sigmoid(gate) * shared` is formed by the next
-  hyper-connection site on the reduced routed rows.
+  (`ops/moe/dep_lamport_round_trip`). A captured decode step routes the gathered rows, builds the
+  window's pre-routed tables and quantizes them in one launch and enters the runner pre-routed
+  (`DP_ROUTE_FRONT_ENV`, `ops/moe/moe_route_front__decode`). The router and the bf16 shared
+  expert are replicated and run on this rank's rows, so the block output
+  `routed + sigmoid(gate) * shared` is formed by the next hyper-connection site on the reduced
+  routed rows.
 * **Hyper-connections, PLE, the embedding** run replicated on every rank's rows;
   `lm_head` is the shell's (vocab-parallel under attention TP, gathered by the shell's head;
   whole under attention DP, over this rank's own rows).
@@ -395,7 +398,11 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_mo
     fp4_block_scale_moe_renorm_permuted,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (
+    ROUTING_RENORMALIZE,
     fp4_block_scale_moe_renorm_routed,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (
+    _runner as _moe_runner,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_moe_renorm_cute_dsl import (
     fp4_moe_renorm_cute_dsl,
@@ -405,6 +412,26 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_mo
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fused_sigmoid_gate_mul_add import (
     fused_sigmoid_gate_mul_add,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    MAX_ROWS as _ROUTE_FRONT_MAX_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    NUM_EXPERTS as _ROUTE_FRONT_EXPERTS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    TOP_K as _ROUTE_FRONT_TOP_K,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    check_tables as _route_front_check_tables,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    compile_front as _route_front_compile,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    moe_route_front,
+    table_sizes,
+    table_views,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_sort import moe_sort
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_unpermute_inplace import (
@@ -984,6 +1011,26 @@ _MOE_ONE_LAUNCH_MAX_ROWS = 24576  # capacity: fixed: the routed op's certified r
 # an env var read at construction (`_switch`, default on); off drops the copy and every launch
 # runs on trtllm-gen.
 _MOE_PREFILL_COPY_ENV = "TRTLLM_MODELING_V2_MOE_PREFILL_COPY"
+#: Switch, on by default: a captured generation-only step at an attention-DP rank on SM103
+#: (trtllm-gen trunk MoE, a 128-expert window of the 512 experts: dep4) runs each trunk MoE block's
+#: routing, the window's pre-routed tables and the NVFP4 quantization of the gathered rows in
+#: one launch (`ops/moe/moe_route_front__decode`) and enters the runner pre-routed at the tactic
+#: the tables were built for (`_ROUTE_FRONT_TACTICS`): it replaces `fp4_quantize` and the
+#: runner's own routing launches. The same bits (the build checks every layer once, `_RouteFront`).
+#: `0` keeps today's path. Read once, when the target is built.
+DP_ROUTE_FRONT_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTE_FRONT"
+#: Gathered rows a route front serves: from 3 requests of 4 rows at dep4 to the kernel's last.
+_ROUTE_FRONT_MIN_ROWS = 48  # capacity: fixed: a dispatch threshold
+#: The expert window the route front and `_ROUTE_FRONT_TACTICS` are certified for (dep4). Other
+#: windows (dep2's 256, dep8's 64, whose tactics are not ported) keep the runner's routing.
+_ROUTE_FRONT_WINDOW = 128  # capacity: fixed: the certified window, not a buffer size
+#: `(gathered rows below, (tileN, FC1 x FC2 config))`: the trtllm-gen tactic pinned per row
+#: count, the tile the tables are built for. A 128-expert window under real routing is hit by
+#: 45-100 experts with a few pairs each, so the smaller tiles cut an expert into more tiles than
+#: it needs past 96 rows (GB300 dep4, every listed config bitwise one another). A tactic the
+#: runner does not list for the shape falls back to `_ROUTE_FRONT_TACTICS_BASE`'s.
+_ROUTE_FRONT_TACTICS = ((96, (8, 53)), (192, (16, 32)), (704, (32, 32)), (1025, (64, 4)))
+_ROUTE_FRONT_TACTICS_BASE = ((256, (8, 53)), (512, (16, 32)), (1025, (32, 20)))
 
 
 def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: int) -> bool:
@@ -1398,6 +1445,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.expert_sum = None
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
+        # The decode MoE's route front (`DP_ROUTE_FRONT_ENV`), built with the targets.
+        self._route_front: _RouteFront | None = None
         # Everything derived from the KV cache manager (`_bind_cache_manager`).
         self._bound: _Bound | None = None
         self._binds = 0
@@ -1547,6 +1596,12 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
+        # Built after the decode target, whose layer views it checks; a collective-free build.
+        self._route_front = (
+            _route_front_build(self, self._decode._layers, device)
+            if device.type == "cuda"
+            else None
+        )
 
     def _build_draft_one_rank(self, device) -> None:
         """At one rank the draft layer's operands for `DecodeTarget._mtp_layer`: the fused
@@ -3178,6 +3233,228 @@ def _decode_router(x, router):
     return cublas_mm(x, router)
 
 
+class _RouteFront:
+    """What `DP_ROUTE_FRONT_ENV` built (`_route_front_build`): per gathered row count its pinned
+    tactic and, a layer, the int32 table buffer and its six views, made at build so a capture
+    neither allocates nor fills one; `layers` maps a layer's FC1 weight to its index."""
+
+    def __init__(self, runner) -> None:
+        self.runner = runner
+        self.tactics: dict = {}
+        self.views: dict = {}
+        self.flats: dict = {}
+        self.layers: dict = {}
+
+
+def _route_front_tactic(runner, core, rows: int) -> tuple | None:
+    """The pinned tactic of `rows` gathered rows: `_ROUTE_FRONT_TACTICS`'s where the runner lists
+    it for this window, else `_ROUTE_FRONT_TACTICS_BASE`'s, else None."""
+    valid = [
+        list(t)
+        for t in runner.get_valid_configs(
+            core.topk, core.hidden, core.expert_inter, core.local_experts, rows
+        )
+    ]
+    for table in (_ROUTE_FRONT_TACTICS, _ROUTE_FRONT_TACTICS_BASE):
+        tactic = next(t for below, t in table if rows < below)
+        if list(tactic) in valid:
+            return tactic
+    return None
+
+
+def _route_front_run(core, st: _RouteFront, x, L: _LayerWeights, layer: int, logits):
+    """The route front and the pre-routed runner over gathered rows `x` (a built row count) and
+    their router logits: `(out, xq, xsf, ids, wts)`. The runner runs this rank's window numbered
+    from 0, finalized."""
+    rows = x.shape[0]
+    tactic = st.tactics[rows]
+    tile = int(tactic[0])
+    xq, xsf, ids, wts = moe_route_front(
+        logits, x, L.moe_gscale, st.flats[rows][layer], tile, core.expert_offset, core.local_experts
+    )
+    out = st.runner.run_moe_prerouted(
+        None,
+        None,
+        xq,
+        # The runner reads the linear block scales flat.
+        torch.reshape(xsf, [-1]).view(torch.float8_e4m3fn),
+        L.fc1_w,
+        L.fc1_s,
+        None,
+        None,
+        None,
+        None,
+        L.fc2_w,
+        L.fc2_s,
+        None,
+        L.out1_scale,
+        L.out1_gate_scale,
+        L.out2_scale,
+        core.local_experts,
+        core.topk,
+        None,
+        None,
+        core.expert_inter,
+        0,
+        core.local_experts,
+        None,
+        ROUTING_RENORMALIZE,
+        True,
+        list(tactic),
+        wts,
+        ids,
+        None,
+        *st.views[rows][layer],
+        tile,
+    )[0]
+    return out, xq, xsf, ids, wts
+
+
+def _route_front_check(core, st: _RouteFront, L: _LayerWeights, layer: int, rows: int, gen):
+    """One layer at one row count, eagerly, against today's chain at the same tactic (router
+    logits -> `fp4_quantize` -> the runner's own routing over this rank's window), and the
+    tables against their meaning: "" when the window output, the NVFP4 codes and scales, the
+    experts and the weights are bitwise equal and the tables hold, else what differs."""
+    x = torch.randn([rows, core.hidden], generator=gen, device=L.router.device).to(torch.bfloat16)
+    logits = cublas_mm(x, L.router)
+    xq0, xsf0 = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, False)
+    ref = st.runner.run_moe(
+        logits,
+        None,
+        xq0,
+        torch.reshape(xsf0, [-1]).view(torch.float8_e4m3fn),
+        L.fc1_w,
+        L.fc1_s,
+        None,
+        None,
+        None,
+        None,
+        L.fc2_w,
+        L.fc2_s,
+        None,
+        L.out1_scale,
+        L.out1_gate_scale,
+        L.out2_scale,
+        core.num_experts,
+        core.topk,
+        None,
+        None,
+        core.expert_inter,
+        core.expert_offset,
+        core.local_experts,
+        None,
+        ROUTING_RENORMALIZE,
+        True,
+        list(st.tactics[rows]),
+        None,
+        None,
+        None,
+    )[0]
+    ids0, wts0 = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=torch.bfloat16)
+    out, xq, xsf, ids, wts = _route_front_run(core, st, x, L, layer, logits)
+    bad = []
+    for name, got, want in (
+        ("window output", out, ref),
+        ("NVFP4 codes", xq, xq0),
+        ("NVFP4 block scales", xsf, xsf0),
+        ("selected experts", ids.to(torch.int64), ids0.to(torch.int64)),
+        ("routing weights", wts, wts0),
+    ):
+        if got.numel() != want.numel() or not torch.equal(
+            got.reshape(-1).view(torch.uint8), want.reshape(-1).view(torch.uint8)
+        ):
+            bad.append(name)
+    tables = _route_front_check_tables(
+        st.views[rows][layer], ids, core.expert_offset, core.local_experts, int(st.tactics[rows][0])
+    )
+    if tables:
+        bad.append(f"tables ({tables})")
+    return ", ".join(bad)
+
+
+def _route_front_build(core, layers, device) -> _RouteFront | None:
+    """`DP_ROUTE_FRONT_ENV`, read once at build (`post_load_weights`, `layers` the decode
+    target's): None where it is off or cannot take effect (not an attention-DP rank on the
+    trtllm-gen trunk MoE over CUDA weights, another routing geometry, no CUDA-graph batch size
+    in the row range) or where the op is not certified (`moe_route_front.ARCHS`, SM103, and its
+    128-expert window, dep4; the tactic table was measured there). For every gathered row count
+    a graph batch size gives it compiles the
+    route front at the pinned tactic's tile, makes each layer's table buffer (pre-filled with
+    valid row indices: the kernel writes only the live entries), and checks every layer once at
+    a row count that rotates over the built ones (`_route_front_check`). A failed check leaves
+    the whole switch off, with one warning."""
+    if not _switch(DP_ROUTE_FRONT_ENV, default=True):
+        return None
+    if not (
+        core.dp_size > 1
+        and not core.one_rank
+        and core.trunk_moe_backend == "TRTLLM"
+        and device.type == "cuda"
+        and (core.num_experts, core.topk) == (_ROUTE_FRONT_EXPERTS, _ROUTE_FRONT_TOP_K)
+        and core.local_experts == _ROUTE_FRONT_WINDOW
+        and torch.cuda.get_device_capability(device) == archs.SM_103
+    ):
+        return None
+    per_batch = core.dp_size * core.max_verify_rows
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    rows_list = sorted(
+        {
+            per_batch * int(b)
+            for b in sizes
+            if _ROUTE_FRONT_MIN_ROWS <= per_batch * int(b) <= _ROUTE_FRONT_MAX_ROWS
+        }
+    )
+    if not rows_list:
+        return None
+    st = _RouteFront(_moe_runner())
+    with torch.cuda.device(device):
+        for rows in rows_list:
+            tactic = _route_front_tactic(st.runner, core, rows)
+            if tactic is None or not _route_front_compile(
+                rows, core.hidden, core.hidden, core.local_experts, int(tactic[0])
+            ):
+                continue
+            n = sum(table_sizes(rows, core.topk, core.local_experts, int(tactic[0])))
+            fill = (torch.arange(n, device=device) % rows).to(torch.int32)
+            st.tactics[rows] = tactic
+            st.flats[rows] = [fill.clone() for _ in range(core.num_layers)]
+            st.views[rows] = [
+                table_views(flat, rows, core.topk, core.local_experts, int(tactic[0]))
+                for flat in st.flats[rows]
+            ]
+        for i, L in enumerate(layers):
+            st.layers[L.fc1_w.data_ptr()] = i
+        built = sorted(st.tactics)
+        gen = torch.Generator(device=device).manual_seed(20261119)
+        for j in range(max(len(layers), len(built)) if built else 0):
+            rows, i = built[j % len(built)], j % len(layers)
+            bad = _route_front_check(core, st, layers[i], i, rows, gen)
+            if bad:
+                logger.warning(
+                    f"{DP_ROUTE_FRONT_ENV}: layer {i} at {rows} gathered rows differs from the "
+                    f"runner's own routing ({bad}); every MoE block keeps it"
+                )
+                return None
+        torch.cuda.synchronize(device)
+    if not built:
+        return None
+    logger.info(
+        f"MoE route front: rank {core.dp_rank} of {core.dp_size}, gathered rows {built}, "
+        f"tactics {[st.tactics[r] for r in built]}"
+    )
+    return st
+
+
+def _route_front_experts(core, st: _RouteFront, x, L: _LayerWeights) -> torch.Tensor | None:
+    """`_routed_experts` of a captured generation-only step over the route front, or None where
+    no route front was built for the row count (the caller's path)."""
+    rows = x.shape[0]
+    layer = st.layers.get(L.fc1_w.data_ptr())
+    if rows not in st.tactics or layer is None or x.stride(1) != 1 or x.stride(0) != core.hidden:
+        return None
+    return _route_front_run(core, st, x, L, layer, _decode_router(x, L.router))[0]
+
+
 def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) -> torch.Tensor:
     """This rank's partial of the routed experts over every row of `x`: the router logits
     over the whole routing space, and the trtllm-gen runner over this rank's expert window
@@ -3201,6 +3478,16 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
     chunks' router logits: the same bits as the chunks. On the CuteDSL backend (one rank) every
     launch is `_cute_dsl_routed`, in one call."""
     rows = x.shape[0]
+    route_front = getattr(core, "_route_front", None)
+    if (
+        route_front is not None
+        and fp4 is None
+        and router_mm is _decode_router
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        routed = _route_front_experts(core, route_front, x, L)
+        if routed is not None:
+            return routed
     if core.trunk_moe_backend == "CUTEDSL":
         xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, False) if fp4 is None else fp4
         routed_out = torch.empty([rows, core.hidden], dtype=x.dtype, device=x.device)
