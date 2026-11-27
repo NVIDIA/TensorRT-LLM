@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
@@ -31,6 +31,12 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
 
     from tensorrt_llm._utils import global_mpi_size, mpi_world_size
+
+    # Spawn info as MPIPoolExecutor takes it: an MPI.Info, or a mapping of info
+    # keys to values.
+    _MpiSpawnInfo = mpi4py.MPI.Info | Mapping[str, str]
+else:
+    _MpiSpawnInfo = Mapping[str, str]
 
 T = TypeVar("T")
 
@@ -506,7 +512,8 @@ class MpiPoolSession(MpiSession):
     def __init__(self,
                  n_workers: int,
                  wait_shutdown: bool = False,
-                 env_overrides: Optional[Dict[str, str]] = None):
+                 env_overrides: Optional[Dict[str, str]] = None,
+                 mpi_info: Optional[_MpiSpawnInfo] = None):
         """Spawn a pool of MPI worker processes.
 
         Args:
@@ -526,10 +533,14 @@ class MpiPoolSession(MpiSession):
                 replaces the racy "set os.environ around the spawn, then
                 restore" pattern for callers that spawn pools from background
                 threads.
+            mpi_info: MPI info for spawning the workers, as ``MPIPoolExecutor``
+                takes it (an ``MPI.Info`` or a mapping), e.g. to allow
+                oversubscription. ``None`` spawns with mpi4py's defaults.
         """
         self.n_workers = n_workers
         self._wait_shutdown = wait_shutdown
         self._env_overrides = dict(env_overrides) if env_overrides else {}
+        self._mpi_info = mpi_info
         self._worker_identities: Tuple = ()
         # Keeps the copies of one submission contiguous in the pool's queue.
         self._submit_lock = threading.Lock()
@@ -699,9 +710,10 @@ class MpiPoolSession(MpiSession):
                                           "flashinfer")
             workspace_managed |= env.get(
                 _FLASHINFER_WORKSPACE_ENV) == workspace_root
+        # Every pool is isolated, a single-worker one included, so concurrent
+        # instances on one node never share a FlashInfer workspace.
         isolate_workspace = (
-            (self.n_workers > 1 or workspace_managed)
-            and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
+            env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
             and (_FLASHINFER_WORKSPACE_ENV not in env or
                  (workspace_managed and not explicit_workspace_override)))
         python_args = ["-c", _WORKER_ENV_BOOTSTRAP + _WORKER_SERVER_MAIN]
@@ -723,7 +735,8 @@ class MpiPoolSession(MpiSession):
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,
-                                        python_args=python_args)
+                                        python_args=python_args,
+                                        mpi_info=self._mpi_info)
 
     def __del__(self):
         self.shutdown_abort()
@@ -970,8 +983,13 @@ class RemoteMpiCommSessionClient(MpiSession):
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
+        # Resolve relative entries (including "" for the cwd) against this
+        # client's working directory; the ranks only adopt absolute entries.
+        client_sys_path = tuple(
+            path if os.path.isabs(path) else os.path.abspath(path)
+            for path in sys.path)
         self.queue.put(
-            RemoteTask(task, args, kwargs, sync=sync, sys_path=tuple(sys.path)))
+            RemoteTask(task, args, kwargs, sync=sync, sys_path=client_sys_path))
         return []
 
     def submit_sync(self, task, *args, **kwargs) -> List[T]:

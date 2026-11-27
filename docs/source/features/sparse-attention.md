@@ -245,8 +245,8 @@ During decode, it scores retained pages and attends to the selected Top-K
 pages.
 
 RocketKV currently requires CUDA compute capability 10.0 or newer. KV-cache
-block reuse and chunked prefill must be disabled, and disaggregated serving is
-not supported.
+block reuse and chunked prefill must be disabled. Speculative decoding,
+disaggregated serving, KV-cache compression, and beam search are not supported.
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -280,6 +280,17 @@ enable_chunked_prefill: false
 The TRTLLM and Vanilla attention implementations support RocketKV. The
 Vanilla implementation requires a BF16 KT cache.
 
+RocketKV follows `kv_cache_config.use_kv_cache_manager_v2`. With the V2 KV
+cache manager (the default), each KV cache block also stores the KT rows of its
+request, so the KV cache memory budget covers the KT cache. The V2 manager has
+these additional restrictions:
+
+- Sleep mode (`sleep_config`) is not supported; it requires the V1 manager
+  (`kv_cache_config.use_kv_cache_manager_v2: false`).
+- `kv_cache_config.enable_swa_scratch_reuse` must be disabled.
+- Every attention layer must have the same number of KV heads and the same head
+  size on each rank, and all layers must share one attention window.
+
 #### DeepSeek Sparse Attention
 
 DeepSeek Sparse Attention (DSA) is a model-native mechanism introduced by
@@ -298,11 +309,15 @@ llm = LLM(
 )
 ```
 
-On supported Blackwell configurations, Guess-Verify-Refine (GVR) can replace
-the regular decode Top-K dispatcher. The current implementation accepts
-`index_topk` values `512`, `1024`, and `2048`, and indexer compression ratios
-`1` and `4`. Unsupported combinations fall back to the production
-insertion/radix Top-K path.
+On supported Blackwell and Rubin configurations, Guess-Verify-Refine (GVR) can replace the regular decode Top-K dispatcher. The current implementation accepts `index_topk` values `512`, `1024`, and `2048`, and indexer compression ratios `1` and `4`. Unsupported combinations fall back to the production insertion/radix Top-K path.
+
+On Rubin (SM107), the self-sampling decode entry applies shape-based tuning for FP32, FP16, and BF16 logits. FP16/BF16 use the native Rubin router and decode wave with tuned register, sampling and launch options. Ordinary allocations use this global path without probing locality ownership or creating domain resources.
+
+The model `TopK` module uses global GVR. To opt into domain execution, construct `PreparedRowTopK` from `tensorrt_llm._torch.kernels.rubin.top_k.gvr_topk_locality` with `co_local=True`. The default skips ownership queries. The logits producer, such as QK GEMM, must write complete padded rows into allocations owned by the corresponding domains. The prepared call verifies ownership, shape and resources before applying the full-batch plan to each domain's rows. Unknown ownership falls back to tuned global GVR. Inspect `mode` to see which path ran.
+
+For multi-token decode, pass `next_n` to `PreparedRowTopK` (default 1). Each request has one uncompressed `kv_lens` entry and occupies `next_n` consecutive rows in both logits and output. If a domain boundary falls inside a request, the prepared call uses global GVR so every row retains its token position.
+
+Use CUDA Graph replay for domain performance. Prepare and warm outside capture, retain the allocations and executor until graph destruction, then call `close()`. Automatic SM partitioning attempts BACKFILL when the remaining SMs can increase aligned budgets in the original proportions. Explicit SM budgets are honored. Callers own any executor they supply. If construction fails and the exception cause is `LocalityCleanupError`, call its `executor.close()` to retry outstanding releases. A failed synchronization during prepared-call cleanup can be retried with `close()`.
 
 ```yaml
 sparse_attention_config:
@@ -357,23 +372,42 @@ sparse_attention_config:
 
 | Constraint | CSA2 support |
 |---|---|
-| Hardware | SM90: FlashMLA BF16; SM100 family: native trtllm-gen; SM120/121: FlashInfer BF16 FA2 |
+| Hardware | SM100 family: native trtllm-gen. SM90 (FlashMLA BF16) and SM120/121 (FlashInfer BF16 FA2) only for checkpoints without candidate-consumer layers |
 | Attention shape | One KV head, 512-dimensional queries/values, 448 non-RoPE and 64 RoPE channels; checkpoint-defined Q heads |
 | Compression | Ratios `0` (SWA only), `1`, `2`; checkpoint-defined shared KV/index sources |
 | KV-cache block size | `128` or `256` tokens |
 | Persistent cache | Fixed E4M3 SWA, NVFP4 main/index records; `dtype` selects compute staging |
 | Staging | BF16; FP8 on native trtllm-gen without packed attention via `dtype: fp8` or `fp8_ds_mla` |
 | Parallelism | TP/EP and attention DP; PP/CP and disabled-layer masks unsupported |
-| Runtime | Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification unsupported |
+| Runtime | Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification and `kv_cache_config.enable_kv_pool_rebalance` unsupported |
+
+Candidate-consumer layers (index-source layers after the checkpoint's
+`candidate_source_layer_id`; the released checkpoint has them) score their
+candidates with DeepGEMM sparse MQA logits. A checkpoint with such layers needs
+an SM100-family GPU, a DeepGEMM build with those kernels, 32 index heads of 128
+dimensions and a `candidate_block_size` that is a multiple of 8; otherwise model
+construction fails with an error that names the missing requirement.
 
 Decoder bounded replay is an **approximation enabled by default** for eligible
 CED layouts. It computes a trailing Decoder window while the Encoder produces
 the complete GLOBAL history. Set `TRTLLM_V41_DECODER_BOUNDED_REPLAY=0` before
-starting workers to use full Decoder prefill. Encoder replay is opt-in via
-`TRTLLM_V41_ENCODER_REPLAY=1` and requires Decoder bounded replay; it permits
-eviction and recovery of OPTIONAL Encoder SWA state. Set these consistently
-for all workers. Replay eligibility and output requirements can retain full
-prefill, as described in the [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md).
+starting workers to use full Decoder prefill. The replay window is 140 tokens,
+or one more than the required SWA window (including an embedded DSpark capture
+window) when that is larger; `TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides it and
+must exceed the required window. Encoder replay is also enabled by default when
+Decoder bounded replay runs with CED precompute, as on the released checkpoint:
+prefix reuse can then evict OPTIONAL Encoder SWA state and recover it by
+approximate bounded replay over the same window. Set
+`TRTLLM_V41_ENCODER_REPLAY=0` to keep REQUIRED Encoder state instead. Without
+CED precompute, or when `max_num_tokens` does not exceed the replay window,
+Encoder state stays REQUIRED; an explicit `TRTLLM_V41_ENCODER_REPLAY=1` then
+fails model construction in the first case and is ignored with a warning in the
+second. When Encoder replay and prefix block reuse are enabled, its window must also be at least
+`kv_cache_config.tokens_per_block`; smaller combinations are rejected during
+cache initialization and sizing. With 256-token blocks, set
+`TRTLLM_V41_BOUNDED_REPLAY_TOKENS` to at least 256. Set these consistently for
+all workers. Replay eligibility and output
+requirements can retain full prefill, as described in the [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md).
 
 Validate task accuracy against full prefill on the intended checkpoint before
 deploying bounded replay or optional packed/approximate selector paths. Include
@@ -425,7 +459,9 @@ scales. Dense target layers and the shared Eagle3 draft layer keep FP8 caches.
 Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
 within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
-caches with an FP8 indexer.
+caches with an FP8 indexer. The MiniMax-M3.1-Flash targets of the Modeling V2
+`minimax_m3` family also accept a standalone DSpark drafter; see the
+deployment guide.
 
 The sparse path has no dense fallback and does not support KV-cache reuse.
 Eagle3 supports one shared draft layer and linear drafting; other MTP/tree

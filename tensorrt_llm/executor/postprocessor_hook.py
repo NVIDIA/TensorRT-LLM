@@ -151,13 +151,15 @@ class PostProcessorHook(Protocol):
     setup) and called once per output, per chunk. It owns any per-request state
     and is responsible for releasing it on ``chunk.is_final``.
 
-    In a post-processing worker, a request that ends in an error (the executor
-    reports one, or post-processing its response raises) gets no final chunk. A
-    hook that keeps per-request state can also define
-    ``on_request_end(request_id, reason)``. It is optional; the worker calls it
-    through :func:`end_post_processor_hook` when it drops such a request, so the
-    hook can release (or record) what it holds for that request. Without the
-    worker pool, it is called when the executor reports an error for a request.
+    A post-processing worker can drop a request without a final chunk: when the
+    executor reports an error for it, or when its post-processing raises
+    (including an exception from the hook itself). A hook that keeps per-request
+    state can also define ``on_request_end(request_id, reason)``, which the
+    worker calls through :func:`end_post_processor_hook` when it drops such a
+    request. The method is optional, so it is not a member of this protocol, and
+    hooks without it are unaffected. Hook exceptions also call this method on
+    the in-proxy path. Cleanup must be idempotent: the worker may notify the
+    hook again when it drops the failed request.
     """
 
     def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict: ...
@@ -166,26 +168,26 @@ class PostProcessorHook(Protocol):
 def end_post_processor_hook(
     hook: Optional[PostProcessorHook], request_id: int, reason: str
 ) -> None:
-    """Tell ``hook`` that ``request_id`` ended without a final chunk.
+    """Tell ``hook`` that a request ended without a final chunk.
 
     Calls the hook's optional ``on_request_end(request_id, reason)``; a hook
-    without one, or no hook at all, is left alone. Never raises: the request has
-    already failed, and a failing cleanup must not become a second error for it.
+    without that method, or no hook at all, is left alone. Never raises: the
+    request has already failed, so an exception from the hook is logged instead
+    of becoming a second error for that request.
 
     Args:
         hook: The post-processor hook, or None when none is configured.
         request_id: The request's id, as the hook saw it in ``chunk.request_id``.
-        reason: Why the request ended: ``"error"`` when the executor reported an
-            error, ``"postprocessing_error"`` when post-processing its response
-            raised.
+        reason: ``"error"`` when the executor reported an error for the request,
+            ``"postprocessing_error"`` when its post-processing raised.
     """
-    end = getattr(hook, "on_request_end", None)
-    if not callable(end):
-        return
     try:
-        end(request_id, reason)
-    except Exception:  # noqa: BLE001 - cleanup of a request that already failed
-        logger.exception("Post-processor hook cleanup failed for request %s.", request_id)
+        # The lookup is guarded too: a property or ``__getattr__`` can raise.
+        on_request_end = getattr(hook, "on_request_end", None)
+        if callable(on_request_end):
+            on_request_end(request_id, reason)
+    except Exception:
+        logger.exception("Post-processor hook on_request_end failed for request %s.", request_id)
 
 
 def _withhold_token_channel(output, streaming: bool) -> None:
@@ -241,7 +243,18 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
         )
         try:
             verdict = hook(chunk)
-        except Exception:
+        except Exception as exc:
+            # Keep the failure sticky for callers that retry a result read.
+            result._terminal_error = exc
+            result._done = True
+            result._aborted = True
+            abort = getattr(result, "abort", None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception:
+                    logger.exception("Failed to abort request %s after hook failure.", result.id)
+            end_post_processor_hook(hook, result.id, "postprocessing_error")
             logger.exception(
                 "Post-processor hook failed for request %s; failing the request closed.",
                 result.id,

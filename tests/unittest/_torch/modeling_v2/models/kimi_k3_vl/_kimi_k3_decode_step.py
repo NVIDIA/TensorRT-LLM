@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Kimi K3 targets' step checks, host-side, each run by the target's test directory on its own modules: how a
-target's ``modeling`` classifies a step (``decode_step``, the attention-residual epilogue ceiling, which steps the MoE
-layers push on), the one path its text model runs for a step through every layer, and the DSpark worker's spec accept
-and drafter inputs reading the current batch-to-slot buffer.
+"""The Kimi K3 targets' step checks, host-side, each run by the target's test directory on its own modules: the one
+path a target's text model runs for a step through every layer, and the DSpark worker's spec accept and drafter inputs
+reading the current batch-to-slot buffer. How a step is classified (``step.py``, ``attn_res.py``) is checked once for
+the family in ``test_kimi_k3_step.py`` and ``test_kimi_k3_attn_res.py``.
 
-A step in the case tables is a ``DecodeStep``'s fields, built with the target's own class."""
+A step in ``STEP_PATHS`` is a ``DecodeStep``'s fields."""
 
 import types
 from importlib import import_module
@@ -15,7 +15,8 @@ import torch
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 
 spec_accept_op = import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept.op"
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
+    "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_spec_accept.op"
 )
 
 
@@ -25,111 +26,6 @@ def step_metadata(seq_lens, num_contexts=0):
         num_generations=len(seq_lens) - num_contexts,
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
     )
-
-
-#: (requests, tokens): R <= 8 generation requests of the same T <= 8 tokens, a pure decode step.
-PURE_DECODE_STEPS = [
-    (1, 1),
-    (1, 8),
-    (8, 1),
-    (2, 4),
-    (4, 2),
-    (3, 1),
-    (5, 1),
-    (2, 8),
-    (4, 8),
-    (8, 8),
-    (8, 2),
-]
-
-
-def check_pure_decode_step(modeling, requests, tokens):
-    """A pure decode step: small up to one token tile, wide above."""
-    step = modeling.decode_step(step_metadata([tokens] * requests), requests * tokens)
-    assert step == modeling.DecodeStep(requests * tokens, requests, tokens)
-    assert step.decode
-    assert step.small == (requests * tokens <= 8)
-    assert step.wide == (requests * tokens > 8)
-
-
-#: (seq_lens, num_contexts, rows): other steps of at most 8 tokens.
-SHORT_STEPS = [
-    ([5], 1, 5),  # a short prefill
-    ([3, 1], 1, 4),  # a short mixed step
-    ([4, 4], 0, 4),  # rows that are not the step's tokens
-    ([3, 2], 0, 5),  # a ragged decode step
-]
-
-
-def check_short_step_is_small_only(modeling, seq_lens, num_contexts, rows):
-    """Other steps of at most 8 tokens take the token-count kernels only."""
-    step = modeling.decode_step(step_metadata(seq_lens, num_contexts), rows)
-    assert step == modeling.DecodeStep(rows)
-    assert step.small and not step.decode and not step.wide
-
-
-#: (seq_lens, num_contexts, rows): steps no decode kernel takes.
-GENERIC_STEPS = [
-    ([1024], 1, 1024),  # prefill
-    ([100, 8], 1, 108),  # mixed step
-    ([1] * 9, 0, 9),  # more requests than the kernels take
-    ([16], 0, 16),  # more tokens per request than the kernels take
-    ([8, 4], 0, 12),  # ragged decode step
-    ([4, 4], 0, 16),  # rows that are not the step's tokens
-    ([], 0, 0),  # empty step
-]
-
-
-def check_step_takes_the_generic_path(modeling, seq_lens, num_contexts, rows):
-    assert modeling.decode_step(step_metadata(seq_lens, num_contexts), rows) is None
-
-
-#: (step, ceiling): the most tokens of the step the fused attn_res kernels take.
-ATTN_RES_CEILINGS = [
-    ((5,), 8),  # a short prefill or mixed step
-    ((8, 8, 1), 8),  # a decode step of one token tile
-    ((6, 1, 6), 8),
-    ((16, 2, 8), 32),  # a wide decode step
-    ((64, 8, 8), 32),
-]
-
-
-def check_attn_res_epilogue_ceiling(modeling, step, ceiling):
-    """The fused attn_res kernels take a classified step up to one token tile and a wide decode step up to 32
-    tokens."""
-    assert modeling._attn_res_max_tokens(modeling.DecodeStep(*step)) == ceiling
-
-
-#: (step, given, pushes): the flags ``latent_push`` is given beyond the defaults of ``check_latent_push``, and whether
-#: the MoE layers push.
-LATENT_PUSH_STEPS = [
-    ((1, 1, 1), {}, True),  # one token per request on the KDA decode kernels
-    ((8, 8, 1), {}, True),
-    ((8, 1, 8), {"kda_draft_records": True}, True),  # a DSpark verify with per-token states
-    ((4, 2, 2), {"kda_draft_records": True}, True),
-    ((8, 1, 8), {}, False),  # the built-in KDA verify
-    ((5,), {}, False),  # a context request, or rows that are not the step's tokens
-    ((16, 2, 8), {"kda_draft_records": True}, False),  # wide: the routed experts' all-reduce
-    ((1, 1, 1), {"capturing": False}, False),  # an eager step
-    ((1, 1, 1), {"breakable": True}, False),
-    ((1, 1, 1), {"kda_decode_kernels": False}, False),  # a KDA layer on the built-in kernels
-    ((1, 1, 1), {"mla_decode_branch": False}, False),  # MLA on the built-in path
-]
-
-
-def check_latent_push(modeling, step, given, pushes):
-    """Which steps the MoE layers push on (``latent_push``): a pure decode step of at most 8 tokens, captured into a
-    CUDA graph, whose attention layers all run the decode kernels; every other step keeps the routed experts'
-    all-reduce."""
-    flags = dict(
-        capturing=True,
-        breakable=False,
-        kda_draft_records=False,
-        kda_decode_kernels=True,
-        mla_decode_branch=True,
-    )
-    flags.update(given)
-    assert modeling.latent_push(modeling.DecodeStep(*step), **flags) == pushes
 
 
 class _Layer:
@@ -203,6 +99,7 @@ def slot_worker(spec_worker):
     worker._ctx_block_divisor = 1
     worker._ctx_block_counts = torch.full((3,), 4, dtype=torch.int32)
     worker._ctx_block_tables = None
+    worker._ctx_unified_cache = False
     worker._ctx_page_table = None
     worker._ctx_page_size = 32
     worker._ctx_k_buf = torch.empty(4, 1, 64, 1, 4)

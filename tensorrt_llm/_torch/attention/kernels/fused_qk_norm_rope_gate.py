@@ -24,14 +24,21 @@ LoRA, or attention-backend fallback behavior.
 """
 
 import functools
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
+from ...distributed.ll_exchange import ll_pos_gather
 from ...flashinfer_utils import get_env_enable_pdl
 from ...modules.fla.op import gdc_wait_with_memory_clobber
+
+if TYPE_CHECKING:
+    from triton.compiler import CompiledKernel
+
+    from ..backends.fmha.gqa_decode import KvAppendPlan
 
 _MIN_TILED_HEAD_ROWS = 3072  # 384 eight-token CTAs.
 
@@ -65,7 +72,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
     mrope_section1: tl.constexpr,
     mrope_section2: tl.constexpr,
     block_tokens: tl.constexpr,
-):
+) -> None:
     """Normalize and rotate independent rows in a token/head tile.
 
     Normalized Q/K round through the output dtype before RoPE, as in the
@@ -450,12 +457,14 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
 
 
 @triton.jit
-def _fp8_like_cxx(x_bf16_as_f32, scale_bf16_as_f32):
+def _fp8_like_cxx(x_bf16_as_f32: tl.tensor, scale_bf16_as_f32: tl.tensor) -> tl.tensor:
     # mmha::store_8bits_vec for T=bf16: bf16 * bf16 (one rounding), then cvt.rn.satfinite to e4m3.
     return (x_bf16_as_f32 * scale_bf16_as_f32).to(tl.bfloat16).to(tl.float32).to(tl.float8e4nv)
 
 
-@triton.jit
+# ga_grank is not specialized: every member of the KV group compiles the same kernel, so the residency bound of
+# rope_gather_max_tokens (and with it the decision to gather) is the same on every member.
+@triton.jit(do_not_specialize=["ga_grank"])
 def _qkv_rope_gate_fp8_append_kernel(
     qkv_ptr,
     qkv_out_ptr,
@@ -483,6 +492,10 @@ def _qkv_rope_gate_fp8_append_kernel(
     bt_stride_kv,
     max_pages,
     host_bmm1_scale,
+    ga_peers_ptr,
+    ga_state_ptr,
+    ga_out_ptr,
+    ga_grank,
     q_len: tl.constexpr,
     page_size: tl.constexpr,
     num_q_heads: tl.constexpr,
@@ -498,9 +511,14 @@ def _qkv_rope_gate_fp8_append_kernel(
     use_mrope: tl.constexpr,
     mrope_section1: tl.constexpr,
     mrope_section2: tl.constexpr,
-):
-    # Same arithmetic as _fused_qkv_gemma_rmsnorm_rope_gate_kernel (kept verbatim); the FP8 outputs are derived
-    # from the bf16-rounded values it stores.
+    GATHER: tl.constexpr = False,
+    GA_G: tl.constexpr = 1,
+    GA_SLOT_WORDS: tl.constexpr = 1,
+    PDL: tl.constexpr = False,
+) -> None:
+    # Same arithmetic as _fused_qkv_gemma_rmsnorm_rope_gate_kernel; the FP8 outputs come from its bf16-rounded values.
+    # GATHER: every q program also all-gathers its FP8 head over the KV group into ga_out (ll_pos_gather).
+    # PDL: operands no predecessor writes load before griddepcontrol.wait; dependents are released right after it.
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     q_size = num_q_heads * head_dim
@@ -508,8 +526,6 @@ def _qkv_rope_gate_fp8_append_kernel(
     output_dtype = tl.float16 if output_fp16 else tl.bfloat16
     scale = tl.load(kv_scale_orig_quant_ptr).to(tl.bfloat16).to(tl.float32)
 
-    # Paged destination of this token (used by the K / V programs): position cache_seq_len - q_len + t, as in
-    # applyBiasRopeUpdateKVCacheV2 for a uniform q_len.
     req = token // q_len
     t_in_req = token - req * q_len
     pos = tl.load(seq_lens_ptr + req).to(tl.int64) - q_len + t_in_req
@@ -544,35 +560,23 @@ def _qkv_rope_gate_fp8_append_kernel(
 
         head_offsets = tl.arange(0, head_block)
         head_mask = head_offsets < head_dim
-        x = tl.load(input_base + head_offsets, mask=head_mask, other=0.0).to(tl.float32)
         weight = tl.load(weight_ptr + head_offsets, mask=head_mask, other=0.0).to(tl.float32)
-        inverse_rms = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
-        normalized = (x * inverse_rms * (weight + 1.0)).to(output_dtype).to(tl.float32)
-
-        if has_pass_through:
-            pass_mask = head_mask & (head_offsets >= rotary_dim)
-            tl.store(output_base + head_offsets, normalized, mask=pass_mask)
-            tl.store(
-                fp8_base + head_offsets,
-                _fp8_like_cxx(normalized, scale),
-                mask=pass_mask & fp8_ok,
-            )
-
         rotary_offsets = tl.arange(0, rotary_block)
         rotary_mask = rotary_offsets < half_rotary
-        x_first = tl.load(input_base + rotary_offsets, mask=rotary_mask, other=0.0).to(tl.float32)
-        x_second = tl.load(
-            input_base + half_rotary + rotary_offsets, mask=rotary_mask, other=0.0
-        ).to(tl.float32)
         weight_first = tl.load(weight_ptr + rotary_offsets, mask=rotary_mask, other=0.0).to(
             tl.float32
         )
         weight_second = tl.load(
             weight_ptr + half_rotary + rotary_offsets, mask=rotary_mask, other=0.0
         ).to(tl.float32)
-        x_first = (x_first * inverse_rms * (weight_first + 1.0)).to(output_dtype).to(tl.float32)
-        x_second = (x_second * inverse_rms * (weight_second + 1.0)).to(output_dtype).to(tl.float32)
+        if GATHER:
+            ar_g = tl.arange(0, GA_G)
+            pv = tl.load(ga_peers_ptr + ar_g)
+        if PDL:
+            gdc_wait_with_memory_clobber()
+            tl.extra.cuda.gdc_launch_dependents()
 
+        # After the wait: the positions are a copy the immediate predecessor may still be writing.
         if use_mrope:
             section = tl.where(
                 (rotary_offsets % 3 == 1) & (rotary_offsets < mrope_section1 * 3),
@@ -600,6 +604,27 @@ def _qkv_rope_gate_fp8_append_kernel(
         )
         cos = tl.where(position_is_valid, cos, float("nan"))
         sin = tl.where(position_is_valid, sin, float("nan"))
+
+        x = tl.load(input_base + head_offsets, mask=head_mask, other=0.0).to(tl.float32)
+        inverse_rms = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
+        normalized = (x * inverse_rms * (weight + 1.0)).to(output_dtype).to(tl.float32)
+
+        if has_pass_through:
+            pass_mask = head_mask & (head_offsets >= rotary_dim)
+            tl.store(output_base + head_offsets, normalized, mask=pass_mask)
+            tl.store(
+                fp8_base + head_offsets,
+                _fp8_like_cxx(normalized, scale),
+                mask=pass_mask & fp8_ok,
+            )
+
+        x_first = tl.load(input_base + rotary_offsets, mask=rotary_mask, other=0.0).to(tl.float32)
+        x_second = tl.load(
+            input_base + half_rotary + rotary_offsets, mask=rotary_mask, other=0.0
+        ).to(tl.float32)
+        x_first = (x_first * inverse_rms * (weight_first + 1.0)).to(output_dtype).to(tl.float32)
+        x_second = (x_second * inverse_rms * (weight_second + 1.0)).to(output_dtype).to(tl.float32)
+
         rot_first = (x_first * cos - x_second * sin).to(output_dtype)
         rot_second = (x_second * cos + x_first * sin).to(output_dtype)
         tl.store(output_base + rotary_offsets, rot_first, mask=rotary_mask)
@@ -620,6 +645,30 @@ def _qkv_rope_gate_fp8_append_kernel(
             gate_output = gate_out_ptr + token * gate_out_stride_token + local_head * head_dim
             gate = tl.load(gate_input + head_offsets, mask=head_mask, other=0.0)
             tl.store(gate_output + head_offsets, gate, mask=head_mask)
+            if GATHER:
+                # The program's FP8 head (stored above in three pieces) as head_dim / 4 little-endian words.
+                tl.debug_barrier()
+                wq = tl.arange(0, head_dim // 4)
+                qb = q8_ptr + token * q_size + local_head * head_dim + 4 * wq
+                b0 = tl.load(qb).to(tl.uint8, bitcast=True).to(tl.int32)
+                b1 = tl.load(qb + 1).to(tl.uint8, bitcast=True).to(tl.int32)
+                b2 = tl.load(qb + 2).to(tl.uint8, bitcast=True).to(tl.int32)
+                b3 = tl.load(qb + 3).to(tl.uint8, bitcast=True).to(tl.int32)
+                words = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                ll_pos_gather(
+                    words,
+                    pv,
+                    ga_state_ptr,
+                    ga_out_ptr,
+                    token * num_q_heads + local_head,
+                    token,
+                    local_head,
+                    ga_grank,
+                    G=GA_G,
+                    SLOT_WORDS=GA_SLOT_WORDS,
+                    W=head_dim // 4,
+                    HQ=num_q_heads,
+                )
     else:
         local_head = head - num_q_heads - num_kv_heads
         head_offsets = tl.arange(0, head_block)
@@ -630,9 +679,12 @@ def _qkv_rope_gate_fp8_append_kernel(
         output_base = (
             qkv_out_ptr + token * qkv_out_stride_token + q_size + kv_size + local_head * head_dim
         )
+        blk = tl.load(block_tables_ptr + req * bt_stride_req + bt_stride_kv + safe_page)
+        if PDL:
+            gdc_wait_with_memory_clobber()
+            tl.extra.cuda.gdc_launch_dependents()
         value = tl.load(input_base + head_offsets, mask=head_mask, other=0.0)
         tl.store(output_base + head_offsets, value, mask=head_mask)
-        blk = tl.load(block_tables_ptr + req * bt_stride_req + bt_stride_kv + safe_page)
         fp8_ok = pos_ok & (blk >= 0)
         v_base = (
             kv_pool_ptr
@@ -659,11 +711,26 @@ def _qkv_rope_gate_fp8_append_kernel(
         tl.store(scales_ptr + 4, s)
 
 
-@torch.library.custom_op(
-    "trtllm::fused_qkv_rope_gate_fp8_append",
-    mutates_args=("kv_pool",),
-)
-def _fused_qkv_rope_gate_fp8_append(
+# A GATHER grid polls its peers, so all of it must be resident: at most the compiled kernel's occupancy per SM, and
+# at most this many, which leaves warp slots on each SM to the kernels PDL overlaps with it.
+GATHER_MAX_PROGRAMS_PER_SM = 8
+
+
+@functools.lru_cache(maxsize=None)
+def _resident_programs_per_sm(kernel: "CompiledKernel") -> int:
+    """Programs of a compiled Triton kernel the driver keeps resident per SM (its registers, shared memory, warps)."""
+    from cuda.bindings import driver
+
+    kernel._init_handles()
+    err, programs = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        driver.CUfunction(kernel.function), kernel.metadata.num_warps * 32, kernel.metadata.shared
+    )
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuOccupancyMaxActiveBlocksPerMultiprocessor failed: {err}")
+    return programs
+
+
+def _rope_fp8_append_kernel_call(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
@@ -684,7 +751,12 @@ def _fused_qkv_rope_gate_fp8_append(
     use_mrope: bool,
     mrope_section1: int,
     mrope_section2: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ga: Optional[tuple],
+    outputs: tuple,
+) -> Tuple[tuple, tuple, dict]:
+    """Check the operands of both custom ops and return (grid, args, meta) of _qkv_rope_gate_fp8_append_kernel.
+    ``ga``: (peer table, epochs, member index, group size, slot words, PDL) of fused_qkv_rope_gate_fp8_append_gather.
+    ``outputs``: (qkv_out, gate_out, q8, scales, gathered q as int32 words or None), tensors or their dtypes."""
     assert qkv.dim() == 2 and qkv.stride(-1) == 1
     assert qkv.dtype == torch.bfloat16
     assert q_weight.shape == (head_dim,) and k_weight.shape == (head_dim,)
@@ -719,18 +791,18 @@ def _fused_qkv_rope_gate_fp8_append(
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
     assert qkv.shape[1] == 2 * q_size + 2 * kv_size
-    qkv_out = torch.empty((num_tokens, q_size + 2 * kv_size), dtype=qkv.dtype, device=qkv.device)
-    gate_out = torch.empty((num_tokens, num_q_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
-    q8 = torch.empty(
-        (num_tokens, num_q_heads, head_dim), dtype=torch.float8_e4m3fn, device=qkv.device
-    )
-    scales = torch.empty((8,), dtype=torch.float32, device=qkv.device)
-    if num_tokens == 0:
-        return qkv_out, gate_out, q8, scales
-
+    qkv_out, gate_out, q8, scales, q_all_words = outputs
+    ga_peers, ga_state, ga_grank, ga_g, ga_slot_words, pdl = scales, scales, 0, 1, 1, False
+    if ga is not None:
+        ga_peers, ga_state, ga_grank, ga_g, ga_slot_words, pdl = ga
+        assert head_dim % 4 == 0 and (head_dim // 4) & (head_dim // 4 - 1) == 0
+        assert ga_peers.dtype == torch.int64 and ga_peers.numel() == ga_g
+        assert ga_state.dtype == torch.int32 and ga_state.numel() >= num_tokens * num_q_heads
+    else:
+        q_all_words = scales
     half_rotary = rotary_dim // 2
     grid = (num_tokens, num_q_heads + 2 * num_kv_heads)
-    _qkv_rope_gate_fp8_append_kernel[grid](
+    args = (
         qkv,
         qkv_out,
         gate_out,
@@ -748,8 +820,8 @@ def _fused_qkv_rope_gate_fp8_append(
         num_tokens,
         cos_sin.shape[0],
         qkv.stride(0),
-        qkv_out.stride(0),
-        gate_out.stride(0),
+        q_size + 2 * kv_size,  # qkv_out.stride(0)
+        q_size,  # gate_out.stride(0)
         cos_sin.stride(0),
         kv_pool.stride(0),
         kv_pool.stride(1),
@@ -757,6 +829,12 @@ def _fused_qkv_rope_gate_fp8_append(
         block_tables.stride(1),
         block_tables.shape[2],
         host_bmm1_scale,
+        ga_peers,
+        ga_state,
+        q_all_words,
+        ga_grank,
+    )
+    meta = dict(
         q_len=q_len,
         page_size=page_size,
         num_q_heads=num_q_heads,
@@ -772,9 +850,231 @@ def _fused_qkv_rope_gate_fp8_append(
         use_mrope=use_mrope,
         mrope_section1=mrope_section1,
         mrope_section2=mrope_section2,
+        GATHER=ga is not None,
+        GA_G=ga_g,
+        GA_SLOT_WORDS=ga_slot_words,
+        PDL=bool(pdl),
         num_warps=4,
+        launch_pdl=bool(pdl),
+    )
+    return grid, args, meta
+
+
+def _rope_fp8_append_launch(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    kv_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    kv_scale_orig_quant: torch.Tensor,
+    kv_scale_quant_orig: torch.Tensor,
+    host_bmm1_scale: float,
+    q_len: int,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
+    ga: Optional[tuple] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Body of both custom ops. ``ga``: as in _rope_fp8_append_kernel_call; the fifth output is then the gathered q,
+    else None."""
+    num_tokens = qkv.shape[0]
+    q_size = num_q_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    qkv_out = torch.empty((num_tokens, q_size + 2 * kv_size), dtype=qkv.dtype, device=qkv.device)
+    gate_out = torch.empty((num_tokens, num_q_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
+    q8 = torch.empty(
+        (num_tokens, num_q_heads, head_dim), dtype=torch.float8_e4m3fn, device=qkv.device
+    )
+    scales = torch.empty((8,), dtype=torch.float32, device=qkv.device)
+    q_all = None
+    if ga is not None:
+        q_all = torch.empty(
+            (num_tokens, ga[3] * q_size), dtype=torch.float8_e4m3fn, device=qkv.device
+        )
+    grid, args, meta = _rope_fp8_append_kernel_call(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        kv_pool,
+        block_tables,
+        seq_lens,
+        kv_scale_orig_quant,
+        kv_scale_quant_orig,
+        host_bmm1_scale,
+        q_len,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        use_mrope,
+        mrope_section1,
+        mrope_section2,
+        ga,
+        (qkv_out, gate_out, q8, scales, q_all.view(torch.int32) if q_all is not None else None),
+    )
+    if num_tokens:
+        _qkv_rope_gate_fp8_append_kernel[grid](*args, **meta)
+    return qkv_out, gate_out, q8, scales, q_all
+
+
+@torch.library.custom_op(
+    "trtllm::fused_qkv_rope_gate_fp8_append",
+    mutates_args=("kv_pool",),
+)
+def _fused_qkv_rope_gate_fp8_append(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    kv_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    kv_scale_orig_quant: torch.Tensor,
+    kv_scale_quant_orig: torch.Tensor,
+    host_bmm1_scale: float,
+    q_len: int,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    qkv_out, gate_out, q8, scales, _ = _rope_fp8_append_launch(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        kv_pool,
+        block_tables,
+        seq_lens,
+        kv_scale_orig_quant,
+        kv_scale_quant_orig,
+        host_bmm1_scale,
+        q_len,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        use_mrope,
+        mrope_section1,
+        mrope_section2,
     )
     return qkv_out, gate_out, q8, scales
+
+
+@torch.library.custom_op(
+    "trtllm::fused_qkv_rope_gate_fp8_append_gather",
+    mutates_args=("kv_pool", "ga_state"),
+)
+def _fused_qkv_rope_gate_fp8_append_gather(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    kv_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    kv_scale_orig_quant: torch.Tensor,
+    kv_scale_quant_orig: torch.Tensor,
+    host_bmm1_scale: float,
+    q_len: int,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
+    ga_peers: torch.Tensor,
+    ga_state: torch.Tensor,
+    ga_grank: int,
+    ga_group: int,
+    ga_slot_words: int,
+    pdl: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    qkv_out, gate_out, q8, scales, q_all = _rope_fp8_append_launch(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        kv_pool,
+        block_tables,
+        seq_lens,
+        kv_scale_orig_quant,
+        kv_scale_quant_orig,
+        host_bmm1_scale,
+        q_len,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        use_mrope,
+        mrope_section1,
+        mrope_section2,
+        ga=(ga_peers, ga_state, ga_grank, ga_group, ga_slot_words, pdl),
+    )
+    return qkv_out, gate_out, q8, scales, q_all
+
+
+@_fused_qkv_rope_gate_fp8_append_gather.register_fake
+def _(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    kv_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    kv_scale_orig_quant: torch.Tensor,
+    kv_scale_quant_orig: torch.Tensor,
+    host_bmm1_scale: float,
+    q_len: int,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
+    ga_peers: torch.Tensor,
+    ga_state: torch.Tensor,
+    ga_grank: int,
+    ga_group: int,
+    ga_slot_words: int,
+    pdl: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = qkv.shape[0]
+    qkv_width = (num_q_heads + 2 * num_kv_heads) * head_dim
+    return (
+        qkv.new_empty((num_tokens, qkv_width)),
+        qkv.new_empty((num_tokens, num_q_heads, head_dim)),
+        qkv.new_empty((num_tokens, num_q_heads, head_dim), dtype=torch.float8_e4m3fn),
+        qkv.new_empty((8,), dtype=torch.float32),
+        qkv.new_empty((num_tokens, ga_group * num_q_heads * head_dim), dtype=torch.float8_e4m3fn),
+    )
 
 
 @_fused_qkv_rope_gate_fp8_append.register_fake
@@ -822,7 +1122,7 @@ def fused_qkv_rope_gate_fp8_append(
     head_dim: int,
     rotary_dim: int,
     mrope_section: Optional[Tuple[int, int, int]],
-    plan,
+    plan: "KvAppendPlan",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``fused_qkv_gemma_rmsnorm_rope_gate`` plus the FP8 query, the paged FP8 K / V append and the FMHA scales.
 
@@ -855,6 +1155,112 @@ def fused_qkv_rope_gate_fp8_append(
     )
 
 
+def rope_gather_max_tokens(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    mrope_section: Optional[Tuple[int, int, int]],
+    plan: "KvAppendPlan",
+    gather: tuple,
+) -> int:
+    """The most tokens fused_qkv_rope_gate_fp8_append_gather takes with these arguments: its grid polls the peers,
+    so all of it must be resident. Compiles the kernel the call would launch, without launching it."""
+    use_mrope = mrope_section is not None
+    assert qkv.shape[0] > 0
+    # Fresh outputs are aligned like these stand-ins, so Triton compiles the kernel the launch takes.
+    outputs = (qkv.dtype, qkv.dtype, torch.float8_e4m3fn, torch.float32, torch.int32)
+    grid, args, meta = _rope_fp8_append_kernel_call(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        plan.kv_pool,
+        plan.block_tables,
+        plan.seq_lens,
+        plan.kv_scale_orig_quant,
+        plan.kv_scale_quant_orig,
+        plan.host_bmm1_scale,
+        plan.q_len,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        use_mrope,
+        mrope_section[1] if use_mrope else 0,
+        mrope_section[2] if use_mrope else 0,
+        gather,
+        outputs,
+    )
+    compiled = _qkv_rope_gate_fp8_append_kernel.warmup(*args, grid=grid, **meta)
+    per_sm = min(GATHER_MAX_PROGRAMS_PER_SM, _resident_programs_per_sm(compiled))
+    sms = torch.cuda.get_device_properties(qkv.device).multi_processor_count
+    return per_sm * sms // grid[1]
+
+
+def fused_qkv_rope_gate_fp8_append_gather(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    mrope_section: Optional[Tuple[int, int, int]],
+    plan: "KvAppendPlan",
+    gather: tuple,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``fused_qkv_rope_gate_fp8_append`` that also all-gathers the FP8 query over the KV-replica group in the same
+    launch (bit-identical to the plain kernel followed by TPGroupExchange.allgather of its FP8 query).
+
+    ``gather``: (peer table, epochs, member index, group size, slot words) from
+    TPGroupExchange.rope_gather_args, plus the PDL flag. Every member issues the same call, with at most
+    rope_gather_max_tokens tokens. The fifth output is the gathered query
+    ``[num_tokens, group * num_q_heads * head_dim]`` FP8, member-major per token (allgather's layout).
+    """
+    use_mrope = mrope_section is not None
+    ga_peers, ga_state, ga_grank, ga_group, ga_slot_words, pdl = gather
+    return _fused_qkv_rope_gate_fp8_append_gather(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        plan.kv_pool,
+        plan.block_tables,
+        plan.seq_lens,
+        plan.kv_scale_orig_quant,
+        plan.kv_scale_quant_orig,
+        plan.host_bmm1_scale,
+        plan.q_len,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        use_mrope,
+        mrope_section[1] if use_mrope else 0,
+        mrope_section[2] if use_mrope else 0,
+        ga_peers,
+        ga_state,
+        ga_grank,
+        ga_group,
+        ga_slot_words,
+        bool(pdl),
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def _sigmoid_mul_pdl(device_index: int) -> bool:
     """Whether the output-gate kernel launches with PDL. It reads its inputs only after griddepcontrol.wait and
@@ -867,6 +1273,7 @@ def _fused_sigmoid_mul_kernel(
     output_ptr,
     attention_ptr,
     gate_ptr,
+    scale_ptr,
     output_stride_token,
     attention_stride_token,
     gate_stride_token,
@@ -874,8 +1281,12 @@ def _fused_sigmoid_mul_kernel(
     hidden_size: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    OUT_FP8: tl.constexpr = False,
     LAUNCH_WITH_PDL: tl.constexpr = False,
-):
+) -> None:
+    """output = attention * sigmoid(gate). With OUT_FP8 the output is the E4M3 that static_quantize_e4m3_per_tensor
+    makes of that product: rounded to the attention dtype, times the correctly rounded reciprocal of the scale
+    (scale_ptr; unread otherwise), RN-satfinite."""
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
     token = tl.program_id(0).to(tl.int64)
@@ -897,11 +1308,93 @@ def _fused_sigmoid_mul_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    tl.store(
-        output_ptr + token * output_stride_token + offsets,
-        attention * tl.sigmoid(gate),
-        mask=mask,
+    if OUT_FP8:
+        y = (attention * tl.sigmoid(gate)).to(attention_ptr.dtype.element_ty).to(tl.float32)
+        y *= tldevice.rcp_rn(tl.load(scale_ptr).to(tl.float32))
+        tl.store(
+            output_ptr + token * output_stride_token + offsets,
+            y.to(output_ptr.dtype.element_ty),
+            mask=mask,
+        )
+    else:
+        tl.store(
+            output_ptr + token * output_stride_token + offsets,
+            attention * tl.sigmoid(gate),
+            mask=mask,
+        )
+
+
+def _sigmoid_mul_launch(
+    output: torch.Tensor,
+    attention_output: torch.Tensor,
+    gate: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+) -> None:
+    """Launch _fused_sigmoid_mul_kernel for an output-gate call: output = attention_output * sigmoid(gate), as the
+    E4M3 static quant at input_scale when given. One program per (token, block of hidden_size), 4 warps, PDL where
+    _sigmoid_mul_pdl allows it."""
+    assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
+    num_tokens, hidden_size = attention_output.shape
+    if gate.dim() == 3:
+        assert gate.shape[0] == num_tokens
+        assert gate.shape[1] * gate.shape[2] == hidden_size
+        assert gate.stride(-1) == 1
+        head_dim, gate_stride_token, gate_stride_head = (
+            gate.shape[2],
+            gate.stride(0),
+            gate.stride(1),
+        )
+    else:
+        assert gate.dim() == 2 and gate.shape == attention_output.shape
+        assert gate.stride(-1) == 1
+        head_dim, gate_stride_token, gate_stride_head = hidden_size, gate.stride(0), hidden_size
+    if num_tokens == 0:
+        return
+    max_block_size = 1024 if num_tokens < 1024 else 2048
+    block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
+    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+    pdl_kwargs = (
+        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
+        if _sigmoid_mul_pdl(attention_output.device.index)
+        else {}
     )
+    out_fp8 = input_scale is not None
+    _fused_sigmoid_mul_kernel[grid](
+        output,
+        attention_output,
+        gate,
+        input_scale if out_fp8 else attention_output,
+        output.stride(0),
+        attention_output.stride(0),
+        gate_stride_token,
+        gate_stride_head,
+        hidden_size=hidden_size,
+        head_dim=head_dim,
+        block_size=block_size,
+        OUT_FP8=out_fp8,
+        num_warps=4,
+        **pdl_kwargs,
+    )
+
+
+@torch.library.custom_op("trtllm::fused_sigmoid_mul_fp8", mutates_args=())
+def fused_sigmoid_mul_fp8(
+    attention_output: torch.Tensor,
+    gate: torch.Tensor,
+    input_scale: torch.Tensor,
+) -> torch.Tensor:
+    """``static_quantize_e4m3_per_tensor(attention_output * sigmoid(gate), input_scale)`` in one kernel: the E4M3
+    input of an FP8 per-tensor o_proj, bit for bit the in-place gate kernel followed by that quantization."""
+    out = torch.empty_like(attention_output, dtype=torch.float8_e4m3fn)
+    _sigmoid_mul_launch(out, attention_output, gate, input_scale)
+    return out
+
+
+@fused_sigmoid_mul_fp8.register_fake
+def _(
+    attention_output: torch.Tensor, gate: torch.Tensor, input_scale: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty_like(attention_output, dtype=torch.float8_e4m3fn)
 
 
 @torch.library.custom_op(
@@ -913,44 +1406,4 @@ def fused_sigmoid_mul_inplace(
     gate: torch.Tensor,
 ) -> None:
     """Apply ``attention_output *= sigmoid(gate)`` with a Triton kernel."""
-    assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
-    num_tokens, hidden_size = attention_output.shape
-    if gate.dim() == 3:
-        assert gate.shape[0] == num_tokens
-        assert gate.shape[1] * gate.shape[2] == hidden_size
-        assert gate.stride(-1) == 1
-        head_dim = gate.shape[2]
-        gate_stride_token = gate.stride(0)
-        gate_stride_head = gate.stride(1)
-    else:
-        assert gate.dim() == 2 and gate.shape == attention_output.shape
-        assert gate.stride(-1) == 1
-        head_dim = hidden_size
-        gate_stride_token = gate.stride(0)
-        gate_stride_head = hidden_size
-
-    if num_tokens == 0:
-        return
-
-    max_block_size = 1024 if num_tokens < 1024 else 2048
-    block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
-    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
-    pdl_kwargs = (
-        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
-        if _sigmoid_mul_pdl(attention_output.device.index)
-        else {}
-    )
-    _fused_sigmoid_mul_kernel[grid](
-        attention_output,
-        attention_output,
-        gate,
-        attention_output.stride(0),
-        attention_output.stride(0),
-        gate_stride_token,
-        gate_stride_head,
-        hidden_size=hidden_size,
-        head_dim=head_dim,
-        block_size=block_size,
-        num_warps=4,
-        **pdl_kwargs,
-    )
+    _sigmoid_mul_launch(attention_output, attention_output, gate)

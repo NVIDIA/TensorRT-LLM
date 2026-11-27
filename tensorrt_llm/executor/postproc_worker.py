@@ -241,9 +241,9 @@ class PostprocWorker:
     def _end_record(self, client_id: int, reason: str) -> None:
         """Drop the record of a request that ends without a final response.
 
-        The post-processor hook saw no final chunk for it, so the hook is told
-        separately; otherwise any per-request state the hook keeps outlives the
-        request.
+        The post-processing hook gets no final chunk for such a request, so it
+        is told through its optional ``on_request_end`` instead; otherwise any
+        per-request state the hook keeps would live as long as the worker.
         """
         record = self._records.pop(client_id, None)
         if record is not None:

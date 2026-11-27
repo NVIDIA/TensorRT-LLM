@@ -1,4 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Logic for parsing test lists."""
 
 import array
@@ -9,7 +25,7 @@ import time
 import traceback
 from collections import defaultdict
 from textwrap import dedent
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import pytest
 from mako.template import Template
@@ -100,11 +116,14 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
 
     def parse_test_name(s):
         if s.startswith("full:"):
-            s = s.lstrip("full:")
+            s = s[len("full:"):]
             if test_prefix:
+                # Only the leading "<platform>/" component is rewritten, so the
+                # platform string may also appear inside the test name itself.
+                platform, sep, rest = s.partition("/")
                 # Check for SM version pattern (e.g., sm90, sm89, sm100)
-                sm_match = re.match(r'sm(\d+)/', s)
-                if sm_match:
+                sm_match = re.fullmatch(r'sm(\d+)', platform)
+                if sep and sm_match:
                     sm_version = int(sm_match.group(1))
                     # Get current SM version
                     try:
@@ -112,12 +131,12 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
                         current_sm = get_sm_version()
                         # If SM versions match, replace with test_prefix
                         if sm_version == current_sm:
-                            s = s.replace(f'sm{sm_version}', test_prefix)
+                            s = f"{test_prefix}/{rest}"
                     except Exception:
                         # If can't get SM version, skip SM-based filtering
                         pass
-                elif test_prefix.split('-')[0] in s:
-                    s = s.replace(test_prefix.split('-')[0], test_prefix)
+                elif sep and platform == test_prefix.split('-')[0]:
+                    s = f"{test_prefix}/{rest}"
             return s
         elif test_prefix:
             return "/".join([test_prefix, s])
@@ -292,30 +311,6 @@ def strip_prefix(test_prefix, test_name):
     test_name = test_name.lstrip("/")
 
     return test_name
-
-
-def get_test_name_corrections(
-        test_names: Sequence[str],
-        items: Sequence[Any],
-        test_prefix: Optional[str] = None) -> Dict[str, Optional[str]]:
-    """Provided for backwards compatibility with tests which rely on this interface.  Use get_test_name_corrections_v2 instead."""
-
-    all_valid_tests = set(
-        strip_prefix(test_prefix, test.nodeid) for test in items)
-    no_pfx_test_names = set(
-        strip_prefix(test_prefix, test_name) for test_name in test_names)
-
-    corr = get_test_name_corrections_v2(no_pfx_test_names, all_valid_tests,
-                                        TestCorrectionMode.EXACT_MATCH)
-
-    ret = {}
-    for test_name, corrections in corr.items():
-        if corrections:
-            ret[test_name] = corrections[0]
-        else:
-            ret[test_name] = None
-
-    return ret
 
 
 class TestCorrectionMode:
@@ -515,8 +510,7 @@ def apply_test_list_corrections(test_list,
 
     Args:
         test_list (str): The path to a test list.
-        corrections (Dict[str, str]): A mapping of invalid test names to valid tests, as returned by
-                get_test_name_corrections().
+        corrections (Dict[str, str]): A mapping of invalid test names to their replacements.
         test_prefix (Optional[str]): The value of the --test-prefix option, or None if this option isn't set.
     """
     print_info("Applying corrections to: {}".format(test_list))
@@ -619,7 +613,7 @@ def parse_and_validate_test_list(
                                         test_prefix)
 
         output_dir = config.getoption("--output-dir")
-        if record_invalid_tests and corrections:
+        if record_invalid_tests and corrections and output_dir:
             record_invalid_tests(
                 os.path.join(output_dir, "invalid_tests.json"),
                 corrections,

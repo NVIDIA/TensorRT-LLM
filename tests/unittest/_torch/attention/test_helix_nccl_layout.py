@@ -7,7 +7,8 @@ import pytest
 import torch
 import torch._inductor.config as inductor_config
 
-from tensorrt_llm._torch.attention.attention import _helix_nccl_pre_alltoall
+# The compiled reformat that CUDA-graph batches use; other batches run the same helper eagerly.
+from tensorrt_llm._torch.attention.attention import _helix_nccl_pre_alltoall_compiled
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
@@ -49,11 +50,11 @@ def test_helix_nccl_chunks_are_contiguous(num_tokens: int, cp_size: int, mask_ki
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 for _ in range(3):
-                    _helix_nccl_pre_alltoall(partial_o, stats, mask, cp_size)
+                    _helix_nccl_pre_alltoall_compiled(partial_o, stats, mask, cp_size)
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                actual = _helix_nccl_pre_alltoall(partial_o, stats, mask, cp_size)
+                actual = _helix_nccl_pre_alltoall_compiled(partial_o, stats, mask, cp_size)
             graph.replay()
             torch.cuda.synchronize()
 

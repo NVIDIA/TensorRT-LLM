@@ -47,6 +47,20 @@ Inline encoding and prefetch write encoder outputs back to the request.
 Item-scheduled LLM chunks keep their assembled embeddings local to the forward.
 Execution paths retain their CUDA event synchronization responsibilities.
 
+Side-stream prefetch stages a request's encoder inputs, MRoPE positions, and
+embeddings on its own CUDA stream. Input preparation of the first chunk that
+reads them, through its multimodal rows or its MRoPE positions or delta, waits
+for the prefetch event and calls `record_stream` on every CUDA tensor in the
+request's multimodal data. A chunk that reads none leaves the event on the
+request.
+Later chunks then read them without their own wait, and cleanup may drop them
+while forward-stream reads are still queued.
+
+With KV cache manager V2, a request's encoder-cache references are released
+as each chunk completes. When KV reuse starts the prefill past items that were
+already bound, context-chunk item selection releases them first; whole-request
+selection keeps them until the request's next chunk completes.
+
 ## Item Metadata and Selection
 
 `item_refs` identifies processed items by modality and modality-local index, in
@@ -91,6 +105,19 @@ and configuration decide whether items are scheduled separately.
 Custom processors must use this common hook and type. The former
 `get_mm_encoder_item_metadata` hook, `MultimodalEncoderItemMetadata` tuple, and
 Params order/length fallbacks have been removed.
+
+A processor that accepts caller-attached embeddings (`multi_modal_embeddings`)
+stores the same record in the `multimodal_data` that
+`_attach_multimodal_embeddings_impl` returns, under
+`MULTIMODAL_ENCODER_ITEM_METADATA_KEY`, with each item's attached rows as
+`output_embedding_lengths`. The wrapper keys each item by the content of those
+rows, by any metadata passed with them (such as Qwen-VL's `image_grid_thw`,
+which sets the item's positions), and by its `multi_modal_uuids` entry when one
+is given, so KV-cache reuse matches only identical embeddings. Attached
+requests fail for a processor that returns no record. Llama 4 is an exception
+for reuse: its forward does not drop the cached embedding rows, so a request
+that reuses the blocks of an identical attached image fails in
+`fuse_input_embeds` with a token-count mismatch.
 
 ## Onboarding a Model
 

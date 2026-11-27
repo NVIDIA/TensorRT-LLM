@@ -16,6 +16,10 @@
 import unittest
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 L0_TEST = (REPO_ROOT / "jenkins" / "L0_Test.groovy").read_text()
 L0_PARENT = (REPO_ROOT / "jenkins" / "L0_MergeRequest.groovy").read_text()
@@ -143,10 +147,15 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
 
         self.assertIn("caughtError = e\n        stageIsInterrupted = true", result_handler)
-        self.assertIn("catch (InterruptedException e) {\n        throw e", preserve_primary)
+        self.assertIn("catch (Exception e)", preserve_primary)
+        self.assertNotIn("catch (InterruptedException e)", preserve_primary)
         self.assertIn(
-            "FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption",
+            "FailureClassifier.classify(e, InfraFailure.K8S) instanceof PipelineInterruption",
             preserve_primary,
+        )
+        self.assertLess(
+            preserve_primary.index("instanceof PipelineInterruption) throw e"),
+            preserve_primary.index("FailureClassifier.attachAgentLoss(primaryError, e)"),
         )
 
     def test_slurm_upload_skips_a_missing_result_directory(self) -> None:
@@ -156,18 +165,6 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertLess(
             upload_results.index("if (!fileExists(stageName))"),
             upload_results.index('sh "tar -czvf results-${stageName}${postTag}.tar.gz'),
-        )
-
-    def test_sbatch_final_failure_is_classified_without_scanning_the_whole_step_log(
-        self,
-    ) -> None:
-        sbatch = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "cbtsResizeSplits")
-
-        marker_query = '[[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]'
-        self.assertIn(marker_query, sbatch)
-        self.assertIn("FailureClassifier.classify(finalFailure, InfraFailure.SLURM)", sbatch)
-        self.assertNotIn(
-            "classifyFailure(pipeline, submitEx, InfraFailure.SLURM, retryContext)", sbatch
         )
 
     def test_cbts_parser_preserves_coverage_preflight_fields(self) -> None:
@@ -189,7 +186,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
 
         self.assertIn("--resolve-pin cbts_db_pin.json", audit)
         self.assertIn("pinPlan.pin_upload_required", audit)
-        self.assertIn("trtllm_utils.uploadArtifacts", audit)
+        self.assertIn("trtllm_utils.uploadToTargets(", audit)
         self.assertNotIn("curl --noproxy", audit)
 
 

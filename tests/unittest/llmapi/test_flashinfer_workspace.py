@@ -39,6 +39,7 @@ def _isolate_flashinfer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         _FLASHINFER_CUBIN_ENV,
         _FLASHINFER_ISOLATION_ENV,
         _FLASHINFER_MANAGED_ENV,
+        "TRTLLM_CACHE_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -211,8 +212,8 @@ _ISOLATED_WORKER_ARGS = [
 @pytest.mark.parametrize(
     "n_workers, env_overrides, expected",
     [
-        (1, {}, _PLAIN_WORKER_ARGS),
-        (1, {_FLASHINFER_ISOLATION_ENV: "1"}, _PLAIN_WORKER_ARGS),
+        (1, {}, _ISOLATED_WORKER_ARGS),
+        (1, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (4, {}, _ISOLATED_WORKER_ARGS),
         (4, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (
@@ -247,6 +248,7 @@ def test_mpi_pool_configures_worker_bootstrap(
     session = SimpleNamespace(
         n_workers=n_workers,
         _env_overrides=env_overrides,
+        _mpi_info=None,
         mpi_pool=None,
     )
 
@@ -287,6 +289,7 @@ def test_mpi_pool_distinguishes_managed_and_explicit_workspaces(
     session = SimpleNamespace(
         n_workers=n_workers,
         _env_overrides=env_overrides,
+        _mpi_info=None,
         mpi_pool=None,
     )
 

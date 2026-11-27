@@ -24,7 +24,6 @@ class HandleLogits:
         logits: torch.Tensor,
         beam_width: int,
         num_context_logits_prefix_sum: list[int],
-        is_generation_model: bool,
         context_logits_handled: bool = False,
     ):
         """Handles context and generation logits for a batch of requests.
@@ -35,20 +34,9 @@ class HandleLogits:
             logits: Input logits tensor
             beam_width: Beam width for the generation requests
             num_context_logits_prefix_sum: Prefix sum of the logits
-            is_generation_model: Bool containing whether the model is generation or not
         """
         if not any(r.py_return_context_logits or r.py_return_generation_logits
                    for r in chain(context_requests, generation_requests)):
-            return
-
-        if not is_generation_model:
-            for llm_req, logits_temp in zip(context_requests, logits):
-                if logits_temp.ndim == 1:
-                    # For BERT: Add axis to be compatible with LogitsStorage
-                    # (LogitsStorage will interpret this dim as the prompt_len which
-                    # is not relevant for outputting logits of encoder only model).
-                    logits_temp = logits_temp.unsqueeze(0)
-                llm_req.py_result.append_context_logits(logits_temp)
             return
 
         # Copy logits into the per-request logits buffers
@@ -74,6 +62,12 @@ class HandleLogits:
         total_context_logits = num_context_logits_prefix_sum[-1]
         for batch_index, llm_req in enumerate(generation_requests):
             if llm_req.state == LlmRequestState.GENERATION_COMPLETE:
+                # With the overlap scheduler, a request that stopped on its
+                # previous token (end id, stop words) is still in this batch,
+                # and its logits stop here. Keep its last stored row: no extra
+                # row follows for exclude_last_generation_logits to drop.
+                if llm_req.py_return_generation_logits:
+                    llm_req.set_exclude_last_generation_logits(False)
                 continue
 
             logits_begin = total_context_logits + batch_index * beam_width

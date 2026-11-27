@@ -10,6 +10,7 @@ import torch
 
 from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace, context_logits_heads
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm.executor.result import compute_prompt_logprobs
 
@@ -239,7 +240,6 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
             logits,
             1,
             [0, 1 if handled else end - start],
-            True,
             context_logits_handled=handled,
         )
     assert projected_rows == ([32, 22, 1] if legacy_first else [32, 5, 1])
@@ -334,9 +334,9 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         return replay() if graph_key is not None else run_model(inputs)
 
     graphs = SimpleNamespace(
-        attention_dp_execution_batch=lambda value: value,
+        attention_dp_execution_batch=lambda value, *args: value,
         promote_final_contexts=lambda *args, **kwargs: (graph_batch, promoted_ids),
-        pad_batch=lambda *args: nullcontext(graph_batch),
+        pad_batch=lambda *args, **kwargs: nullcontext(graph_batch),
         select=Mock(
             return_value=SimpleNamespace(
                 key=key, use_lora_graph=False, attn_metadata=metadata, spec_metadata=None
@@ -346,9 +346,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         run=Mock(side_effect=run),
     )
     inputs = SimpleNamespace(
-        prepare_inputs=Mock(
-            return_value=SimpleNamespace(kwargs={}, runtime_draft_len=0, static_inputs_staged=0)
-        ),
+        prepare_inputs=Mock(return_value=PreparedInputs(kwargs={})),
         record_promoted_iter_states=Mock(),
         record_input_copy=Mock(),
         _dspark_device_budget=None,
@@ -358,6 +356,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         _model=model,
         _mapping=mapping,
         runtime_hooks=SimpleNamespace(pack_step_inputs=False),
+        _copier=None,
         _context_logits_heads=context_logits_heads(model, mapping, is_spec_decode=False),
         _config=SimpleNamespace(is_spec_decode=False, spec_config=None, use_mrope=False),
         _graphs=graphs,

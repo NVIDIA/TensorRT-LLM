@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/k3_kda_decode_attn catalog entry, on a real cache object and a caller-owned K3KdaBuffers.
+"""GPU test for the ssm/k3_kda_decode_attn op, on a real cache object and a caller-owned K3KdaBuffers.
 
 Kimi K3's fused KDA projection + plain decode of R <= 8 requests of one token, at the TP16 rank slice, on the
 plain-decode pools of a real ``KimiK3HybridCacheManager`` (``_kda_cells.build_manager``: conv bf16
@@ -24,17 +24,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
     CTAS,
     FUSED_CTAS,
     K3KdaBuffers,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_decode_attn import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_decode_attn import (
     k3_kda_decode_attn,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_decode import (
-    kda_decode,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_decode import kda_decode
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating

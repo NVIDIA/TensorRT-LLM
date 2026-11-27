@@ -37,7 +37,9 @@ from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
-from .spec_sampler_base import SpecSampler
+from .spec_sampler_base import (SpecSampler, logit_edits_unsupported_reason,
+                                penalty_unsupported_reason,
+                                verifies_through_edit_pass)
 from .suffix_automaton import SuffixAutomatonManager
 
 _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
@@ -352,7 +354,12 @@ def get_spec_metadata(spec_config,
     # Set here rather than in each branch below: every one-model mode needs it and
     # the per-mode constructors are easy to miss one of.
     if metadata is not None:
-        metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
+        # The pass enable_penalty turns on only reaches the workers that verify
+        # through it; elsewhere it stays off, so no step runs it and no workspace
+        # is allocated for requests admission rejects anyway.
+        metadata.enable_penalty = bool(
+            getattr(spec_config, "enable_penalty", False)
+            and verifies_through_edit_pass(spec_config))
         # advanced_sampling_mode has exactly that property, and getting it wrong fails
         # silently rather than loudly: SpecSampler.validate_request reads the mode off the
         # *config* to decide whether a min_p request is admitted, while the buffer fill
@@ -361,6 +368,7 @@ def get_spec_metadata(spec_config,
         # dispatcher routes to a backend that takes no min_p argument -- so the filter is
         # dropped with nothing raised. One assignment here keeps them in step.
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
+        metadata.rejection_sample_method = spec_config.rejection_sample_method
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
         metadata.temperature_only_graphs = temperature_only_graphs
@@ -714,15 +722,16 @@ def get_spec_decoder(
         # A tree's rows are nodes whose prefix is their root path instead, and
         # sibling branches must not penalize each other -- so tree modes are not
         # supported yet and are rejected at admission rather than mispenalized.
-        penalty_supported = not _is_effective_dynamic_tree(spec_config)
+        # Likewise the workers that verify outside the pass that applies them.
         fused_sampling = (spec_config.advanced_sampling_mode.is_fused)
         return SpecSampler(
             sampler_args,
             enable_penalty=spec_config.enable_penalty,
-            penalty_supported=penalty_supported,
+            penalty_unsupported_reason=penalty_unsupported_reason(spec_config),
             fused_sampling=fused_sampling,
             watermark_unsupported_reason=_watermark_unsupported_reason(
-                spec_config, sampler_args.watermark_config))
+                spec_config, sampler_args.watermark_config),
+            logit_edits_unsupported=logit_edits_unsupported_reason(spec_config))
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -822,6 +831,10 @@ def get_spec_worker(spec_config,
     # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
         if spec_config.draft_is_embedded_in_target:
+            if spec_config.use_ancestral_draft_sampling:
+                raise ValueError(
+                    "use_ancestral_draft_sampling=True is not supported with a "
+                    "drafter embedded in the target checkpoint.")
             return DSv4DSparkWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
@@ -964,7 +977,6 @@ def update_spec_config_from_model_config(spec_config,
         raise ValueError(
             "A replacement MTP checkpoint must contain at least one head")
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
-    spec_config._validate_moe_backend_compatibility(model_config_resolved=True)
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
 
     # Resolve max_draft_len when the user didn't set it:

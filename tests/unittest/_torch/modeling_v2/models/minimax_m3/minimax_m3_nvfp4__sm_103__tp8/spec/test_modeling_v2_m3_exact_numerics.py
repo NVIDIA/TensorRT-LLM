@@ -22,17 +22,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops import (  # noqa: E501
     m3_spec_tail,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
     SHARD_ROWS,
     make_keys,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
     m3_shard_accept as shard_accept_op,
 )
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
@@ -74,7 +74,7 @@ def _stock_accept(logits: torch.Tensor, draft: torch.Tensor):
         is_cuda_graph=False,
         sharded_target_logits=False,
     )
-    worker = SimpleNamespace(force_num_accepted_tokens=0.0)
+    worker = SimpleNamespace(force_num_accepted_tokens=0.0, fused_sample_accept=False)
     worker._sample_tokens_for_batch = lambda *a: Eagle3OneModelWorker._sample_tokens_for_batch(
         worker, *a
     )

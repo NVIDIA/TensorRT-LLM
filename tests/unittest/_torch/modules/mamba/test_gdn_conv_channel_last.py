@@ -10,8 +10,8 @@ import torch
 from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -85,7 +85,7 @@ def test_forward_core_channel_last_matches_channel_major(ctx_lens, n_dec):
         manager = _CacheManager(slots)
         manager.mamba_layer_cache = lambda layer_idx: layer_cache
         manager.is_speculative = lambda: False
-        md = Mamba2Metadata(max_batch_size=8, chunk_size=64)
+        md = GDNMambaMetadata(max_batch_size=8, chunk_size=64)
         attn = SimpleNamespace(
             seq_lens=seq_lens,
             seq_lens_cuda=seq_lens.cuda(),

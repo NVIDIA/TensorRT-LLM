@@ -195,7 +195,7 @@ def test_codeowners_is_exact_path_noop() -> None:
 
 def test_documentation_does_not_trigger_backend_rules() -> None:
     assert not _is_agent_flow_claim("agent-flow/guide.rst")
-    assert not _is_mv2_claim("tensorrt_llm/_torch/_experimental/modeling_v2/guide.rst")
+    assert not _is_mv2_claim("tensorrt_llm/_torch/modeling_v2/guide.rst")
     assert not _is_openengine_claim("tensorrt_llm/grpc/openengine/guide.rst")
     assert not _is_spec_claim("examples/eagle/guide.rst")
     assert not _is_vg_claim("examples/visual_gen/guide.rst")
@@ -274,6 +274,7 @@ def _docstring_pr(tmp_path: Path, before: str, source: str, path: str) -> PRInpu
         ".github/ISSUE_TEMPLATE/guide.md",
         ".codex/skills/new/README.rst",
         ".claude/skills/new/README.md",
+        "skills/new/SKILL.md",
     ),
 )
 def test_noop_metadata_documentation_adds_no_docs_contribution(path: str) -> None:
@@ -655,6 +656,11 @@ def test_out_of_scope_rule_preserves_non_lint_and_ambiguous_toml_impact(
         ".claude/skills/trtllm-test-specialist/references/test_config_template.yaml",
         ".claude/new-config.yaml",
         ".claude/scripts/new-helper.py",
+        "skills/trtllm-serve-config-guide/SKILL.md",
+        "skills/trtllm-serve-config-guide/BENCHMARK.md",
+        "skills/trtllm-serve-config-guide/skill.oms.sig",
+        "skills/trtllm-serve-config-guide/evals/evals.json",
+        "skills/new/scripts/new-helper.py",
         "LICENSE",
         ".pre-commit-config.yaml",
         "agent-flow/.pre-commit-config.yaml",
@@ -871,6 +877,9 @@ def test_noop_directory_filename_policy_handles_clang_configs(path: str) -> None
         ".codex-extra/new-config.toml",
         "nested/.claude/new-config.yaml",
         "nested/.codex/new-config.toml",
+        "skills-extra/new/SKILL.md",
+        "nested/skills/new/SKILL.md",
+        "tensorrt_llm/skills/new-config.yaml",
         ".devcontainer/new-config.json",
         ".devcontainer/make_env.py",
         "jenkins/current_image_tags.properties",

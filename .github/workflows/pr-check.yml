@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,40 +19,43 @@ on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
 
+permissions:
+  contents: read
+
 jobs:
   check-pr-title:
     name: Check PR Title Format
     runs-on: ubuntu-latest
     steps:
       - name: Validate PR Title Format
-        id: check-pr-title
-        uses: agenthunt/conventional-commit-checker-action@v2.0.0
-        continue-on-error: true
+        uses: actions/github-script@v8
         with:
-          pr-title-regex: "^(\\[(None|[A-Z0-9]+-[0-9]+|#[0-9]+|https:\\/\\/nvbugs\\/[0-9]+)\\]) *(\\[[a-z0-9]+\\]) (([^ ].*)?[^ ])$"
-          pr-body-regex: ""
-
-      - name: PR Title Format Guide
-        if: steps.check-pr-title.outcome == 'failure'
-        run: |
-          echo "::error::PR title format check failed."
-          echo "Expected PR title format:"
-          echo "  [JIRA ticket/NVBugs ID/GitHub issue/None][type] Summary"
-          echo ""
-          echo "Valid ticket formats:"
-          echo "  - JIRA ticket: [TRTLLM-1234] or [FOOBAR-123] for other FOOBAR project"
-          echo "  - NVBugs ID: [https://nvbugs/1234567]"
-          echo "  - GitHub issue: [#1234]"
-          echo "  - No ticket: [None]"
-          echo ""
-          echo "Valid types (lowercase): [fix], [feat], [doc], [infra], [chore], etc."
-          echo ""
-          echo "Examples:"
-          echo "  - [TRTLLM-1234][feat] Add new feature"
-          echo "  - [https://nvbugs/1234567][fix] Fix some bugs"
-          echo "  - [#1234][doc] Update documentation"
-          echo "  - [None][chore] Minor clean-up"
-          exit 1
+          script: |
+            const title = context.payload.pull_request?.title ?? '';
+            const pattern = /^(\[(None|[A-Z0-9]+-[0-9]+|#[0-9]+|https:\/\/nvbugs\/[0-9]+)\]) *(\[[a-z0-9]+\]) (([^ ].*)?[^ ])$/;
+            if (pattern.test(title)) {
+              core.info(`PR title format is valid: ${title}`);
+              return;
+            }
+            core.info([
+              'Expected PR title format:',
+              '  [JIRA ticket/NVBugs ID/GitHub issue/None][type] Summary',
+              '',
+              'Valid ticket formats:',
+              '  - JIRA ticket: [TRTLLM-1234] or [FOOBAR-123] for other FOOBAR project',
+              '  - NVBugs ID: [https://nvbugs/1234567]',
+              '  - GitHub issue: [#1234]',
+              '  - No ticket: [None]',
+              '',
+              'Valid types (lowercase): [fix], [feat], [doc], [infra], [chore], etc.',
+              '',
+              'Examples:',
+              '  - [TRTLLM-1234][feat] Add new feature',
+              '  - [https://nvbugs/1234567][fix] Fix some bugs',
+              '  - [#1234][doc] Update documentation',
+              '  - [None][chore] Minor clean-up',
+            ].join('\n'));
+            core.setFailed(`PR title format check failed: ${title}`);
 
   check-pr-body-checklist:
     name: Check PR Checklist Resolution
@@ -60,6 +63,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6

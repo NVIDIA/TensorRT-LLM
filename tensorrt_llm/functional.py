@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from .logger import logger
+
 
 class RotaryScalingType(IntEnum):
     none = 0
@@ -146,6 +148,7 @@ class AllReduceParams:
         enable_allreduce: bool = True,
         trigger_completion_at_end: bool = True,
         fp8_payload: bool = False,
+        l2_prefetch: Optional[Tensor] = None,
     ):
         self.strategy = strategy
         self.fusion_op = fusion_op
@@ -161,6 +164,8 @@ class AllReduceParams:
         # Torch MNNVL path only (lossy): two-shot calls fused with a residual RMSNorm exchange E4M3 values
         # with one FP32 scale per 256 elements instead of BF16 (see MNNVLAllReduce.supports_fp8_payload).
         self.fp8_payload = fp8_payload
+        # Torch MNNVL fused-norm path only: a weight the all-reduce kernel pulls into L2 for the GEMM after it.
+        self.l2_prefetch = l2_prefetch
         assert fusion_op in (AllReduceFusionOp.NONE.value,
                              AllReduceFusionOp.RMS_NORM.value) or (residual
                                                                    is not None)
@@ -193,6 +198,8 @@ class MoEAllReduceParams(AllReduceParams):
         is_cutlass_min_latency: bool = False,
         shared_expert_gate: Optional[Tensor] = None,
         fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
+        l2_prefetch: Optional[Tensor] = None,
+        fc2_lamport: bool = False,
     ):
         super().__init__(
             fusion_op=fusion_op,
@@ -203,6 +210,7 @@ class MoEAllReduceParams(AllReduceParams):
             norm_pre_residual_weight=norm_pre_residual_weight,
             eps=eps,
             enable_allreduce=enable_allreduce,
+            l2_prefetch=l2_prefetch,
         )
         self.device_num_experts = device_num_experts
         self.expert_scale_factor = expert_scale_factor
@@ -210,6 +218,9 @@ class MoEAllReduceParams(AllReduceParams):
         self.shared_expert_output = shared_expert_output
         # Torch MNNVL path only: logits of the shared-expert gate; the shared output is scaled by their sigmoid.
         self.shared_expert_gate = shared_expert_gate
+        # Torch MNNVL fused-norm path only: the un-finalized fc2 rows are in a Lamport FC2 buffer, which the fold
+        # polls instead of waiting for FC2 (MnnvlAllReduceNorm.__call__).
+        self.fc2_lamport = fc2_lamport
         self.is_cutlass_min_latency = is_cutlass_min_latency
 
     def is_valid(self):
@@ -425,8 +436,19 @@ class RopeEmbeddingUtils:
         t_pos = np.arange(np.max([num_pos, original_max_pos]), dtype=np.float32)
 
         # Choose proper freqs based on max_seq_len.
-        factor = (long_factor if max_seq_len is None
-                  or max_seq_len > original_max_pos else short_factor)
+        use_long_factor = max_seq_len is None or max_seq_len > original_max_pos
+        if use_long_factor:
+            reason = ("max_seq_len is not set" if max_seq_len is None else
+                      f"max_seq_len={max_seq_len} is larger than "
+                      f"original_max_position_embeddings={original_max_pos}")
+            logger.warning_once(
+                f"LongRoPE: {reason}, so every request uses the long-context "
+                f"scaling factors, which lowers accuracy on requests shorter "
+                f"than {original_max_pos} tokens. If no request needs more "
+                f"than {original_max_pos} tokens, set max_seq_len to "
+                f"{original_max_pos} or less to use the short factors.",
+                key="long_rope_long_factor")
+        factor = long_factor if use_long_factor else short_factor
         inv_freq = inv_freq / factor
         freqs = np.einsum("i,j->ij", t_pos, inv_freq)
         sinusoid_inp = freqs.astype(np.float32)[..., np.newaxis]

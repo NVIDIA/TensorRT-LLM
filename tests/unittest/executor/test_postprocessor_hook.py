@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the trtllm-serve post-processing hook."""
 
+import logging
+
 import pytest
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
@@ -15,6 +17,8 @@ from tensorrt_llm.executor.postprocessor_hook import (
     terminate,
 )
 from tensorrt_llm.executor.result import CompletionOutput
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _FakeResult:
@@ -341,6 +345,8 @@ def test_harmony_model_rejects_post_processor_hook():
 
 
 class _EndingHook:
+    """A hook that records the requests it is told ended without a final chunk."""
+
     def __init__(self, fail=False):
         self.ended = []
         self.fail = fail
@@ -356,14 +362,24 @@ class _EndingHook:
 
 def test_end_hook_calls_on_request_end_when_the_hook_defines_it():
     hook = _EndingHook()
+
     end_post_processor_hook(hook, 7, "error")
+
     assert hook.ended == [(7, "error")]
 
 
 def test_end_hook_leaves_hooks_without_it_and_no_hook_alone():
+    """The method is optional: a hook without it, or no hook, is not an error."""
     end_post_processor_hook(lambda chunk: emit(chunk.text_diff), 7, "error")
     end_post_processor_hook(None, 7, "error")
 
 
-def test_end_hook_never_raises():
-    end_post_processor_hook(_EndingHook(fail=True), 7, "error")
+def test_end_hook_never_raises(caplog):
+    """A failing on_request_end is logged, never raised as a second error."""
+    with caplog.at_level(logging.ERROR, logger="tensorrt_llm.executor.postprocessor_hook"):
+        end_post_processor_hook(_EndingHook(fail=True), 7, "error")
+
+    assert any(
+        "on_request_end" in record.getMessage() and "7" in record.getMessage()
+        for record in caplog.records
+    )

@@ -9,8 +9,10 @@ current forward. `MultimodalInput` carries the executor boundary representation.
 Processor registration and encoder execution live outside this module.
 """
 
+from collections.abc import Mapping as _Mapping
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import partial
 from itertools import accumulate
 from operator import itemgetter
 from typing import (Any, Container, Dict, Hashable, List, NamedTuple, Optional,
@@ -28,6 +30,13 @@ from tensorrt_llm.logger import logger
 
 # Default hasher
 default_hasher = blake3
+# Attached embeddings are MiB-sized, so each one is hashed on its own pool of a
+# few threads. A fixed thread count builds the pool per hasher; BLAKE3's AUTO
+# mode would share one global pool, which hangs a child forked after it started.
+# The digest does not depend on the thread count.
+_ATTACHED_EMBEDDING_HASH_THREADS = 4
+attached_embedding_hasher = partial(
+    blake3, max_threads=_ATTACHED_EMBEDDING_HASH_THREADS)
 _INT32_MAX = 2**31 - 1
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 
@@ -301,6 +310,30 @@ def get_multimodal_item_metadata(
             f"{MULTIMODAL_ENCODER_ITEM_METADATA_KEY} must be a MultimodalItemMetadata"
         )
     return metadata
+
+
+def split_multimodal_embedding_items(
+        items: Any) -> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
+    """Split one modality's external embedding items into tensors and metadata.
+
+    An item is an embedding tensor, or a dict that holds the tensor under
+    ``"mm_embeddings"`` and per-item metadata by field name, for example
+    ``{"mm_embeddings": tensor, "image_grid_thw": [1, 34, 46]}``. A bare
+    tensor has no metadata. A single item may be passed without a list.
+    """
+    if isinstance(items, (torch.Tensor, dict)):
+        items = [items]
+    tensors, metadata = [], []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            item = {"mm_embeddings": item}
+        elif "mm_embeddings" not in item:
+            raise ValueError(f"Embedding item {index} must hold its tensor "
+                             "under 'mm_embeddings'")
+        item = dict(item)
+        tensors.append(item.pop("mm_embeddings"))
+        metadata.append(item)
+    return tensors, metadata
 
 
 class MultimodalEncoderProgress(Enum):
@@ -938,9 +971,9 @@ class MultimodalParams:
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
-    # When set, the consume site in `get_multimodal_embeddings` issues a
-    # `wait_event` and records attached embeddings on the current stream before
-    # reading them.
+    # Input preparation waits on it and records the request's CUDA tensors on
+    # its stream when the chunk reads them; the consume site in
+    # `get_multimodal_embeddings` waits on it again before reading them.
     # Always `None` unless side-stream prefetch is enabled and a prefetch ran.
     encoder_event: Optional[torch.cuda.Event] = field(default=None,
                                                       repr=False,
@@ -975,8 +1008,8 @@ class MultimodalParams:
         Each entry is a tensor of shape ``[output_rows, feature_size]`` or its
         shared-tensor handle. Item output lengths describe those rows; prompt
         lengths also count model-specific MM framing tokens. Hashes enable
-        the C++ KV-cache representation. Without hashes, only the processed
-        data is retained, as for external embeddings without KV-cache reuse.
+        the C++ KV-cache representation; without them only the processed
+        data is retained.
         """
         item_metadata.validate()
         embedding_lengths = item_metadata.output_embedding_lengths
@@ -1328,9 +1361,26 @@ class MultimodalParams:
         return bool(self.multimodal_input or self.multimodal_data)
 
 
+def _validate_media_io_kwargs(media_io_kwargs: Optional[_Mapping]) -> None:
+    """Check every modality before loading media or merging overrides."""
+    if not isinstance(media_io_kwargs, _Mapping):
+        return
+    for modality, options in media_io_kwargs.items():
+        if isinstance(options, _Mapping):
+            for key in ("format", "device"):
+                if key in options:
+                    raise ValueError(
+                        f"media_io_kwargs.{modality}.{key} is unsupported. "
+                        "Remove this key to use the default media representation."
+                    )
+
+
 @dataclass
 class MultimodalServerConfig():
     media_io_kwargs: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        _validate_media_io_kwargs(self.media_io_kwargs)
 
 
 def _update_hash(hasher, item: object) -> None:
@@ -1592,6 +1642,7 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_metadata",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",

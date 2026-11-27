@@ -3,8 +3,10 @@
 
 import pytest
 import torch
+from transformers import Qwen2_5_VLConfig
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionPatchEmbed
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_qwen2vl
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VisionModel,
@@ -204,3 +206,27 @@ def test_qwen2_5_vision_attention_flashinfer_inplace_cuda(
     torch.testing.assert_close(q, expected_q, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(k, expected_k, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(v, original_v)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tie_word_embeddings", [True, False])
+def test_language_model_inherits_top_level_tie_word_embeddings(
+    monkeypatch: pytest.MonkeyPatch, tie_word_embeddings: bool
+) -> None:
+    """A flat Qwen2.5-VL config ties lm_head only at the top level; the LM must see it."""
+    built = {}
+
+    def capture(llm_model_config: ModelConfig) -> torch.nn.Module:
+        built["config"] = llm_model_config.pretrained_config
+        return torch.nn.Module()
+
+    monkeypatch.setattr(modeling_qwen2vl.AutoModelForCausalLM, "from_config", capture)
+    monkeypatch.setattr(modeling_qwen2vl, "Qwen2VisionModelBase", lambda *args: None)
+    config = Qwen2_5_VLConfig(
+        architectures=["Qwen2_5_VLForConditionalGeneration"],
+        tie_word_embeddings=tie_word_embeddings,
+    )
+
+    modeling_qwen2vl.Qwen2VLModelBase(ModelConfig(pretrained_config=config), disable_fuse_rope=True)
+
+    assert getattr(built["config"], "tie_word_embeddings", None) is tie_word_embeddings

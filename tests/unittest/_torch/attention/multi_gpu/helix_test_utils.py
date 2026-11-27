@@ -14,7 +14,10 @@
 # limitations under the License.
 """Shared utilities for Helix context-parallelism unit tests (MHA & MLA)."""
 
+import sys
 import traceback
+from functools import partial
+from types import SimpleNamespace
 
 import torch
 from mpi4py.futures import MPIPoolExecutor
@@ -37,6 +40,21 @@ CACHE_TYPE_SELFKONLY = tensorrt_llm.bindings.internal.batch_manager.CacheType.SE
 # ---------------------------------------------------------------------------
 # Weight helpers
 # ---------------------------------------------------------------------------
+
+
+def _v_up_projector(num_heads: int, kv_lora_rank: int, v_head_dim: int, v_full: torch.Tensor):
+    """The fields of an MLA module that ``MLA._helix_project_v_partials`` reads."""
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    module = SimpleNamespace(
+        num_heads_tp=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        helix_v_b_proj_full=v_full,
+        use_cute_dsl_bf16_bmm=False,
+    )
+    module._bmm_bf16_out = partial(MLA._bmm_bf16_out, module)
+    return module
 
 
 def copy_weights_for_cp(weights, param_name, dim, rank, world_size):
@@ -148,15 +166,15 @@ def create_helix_gen_metadata(
 # ---------------------------------------------------------------------------
 
 
-def setup_kv_and_metadata(
+def setup_kv_cache(
     scenario,
     mapping: Mapping,
     *,
     cache_type,
     num_kv_heads: int,
     head_dim: int,
-):
-    """Create a :class:`KVCacheManagerV2` and context-phase attention metadata.
+) -> KVCacheManagerV2:
+    """Allocate a :class:`KVCacheManagerV2` and context-plus-generation requests.
 
     The caller supplies the KV-cache geometry that differs between MHA and MLA:
     *cache_type*, *num_kv_heads*, and *head_dim*.  Everything else is read from
@@ -204,6 +222,26 @@ def setup_kv_and_metadata(
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len
+    return kv_cache_manager
+
+
+def setup_kv_and_metadata(
+    scenario,
+    mapping: Mapping,
+    *,
+    cache_type,
+    num_kv_heads: int,
+    head_dim: int,
+):
+    """Create a KV cache and prepared context-phase attention metadata."""
+    kv_cache_manager = setup_kv_cache(
+        scenario,
+        mapping,
+        cache_type=cache_type,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+    ctx_len_per_gpu = scenario.ctx_len // mapping.world_size
     attn_metadata = get_attention_backend("TRTLLM").Metadata(
         seq_lens=torch.tensor([ctx_len_per_gpu] * scenario.batch, dtype=torch.int),
         request_ids=list(range(scenario.batch)),
@@ -326,7 +364,8 @@ def run_helix_test(
     """Parse *comms_medium*, launch MPI workers, and assert mismatch ratio."""
     use_nccl_for_alltoall, fifo_version = parse_comms_medium(comms_medium)
     print(f"Testing with comms_medium={comms_medium}.")
-    with MPIPoolExecutor(max_workers=world_size) as executor:
+    # Workers import the shared test helpers through the same paths as pytest.
+    with MPIPoolExecutor(max_workers=world_size, path=sys.path) as executor:
         results = executor.map(
             run_single_rank,
             *zip(

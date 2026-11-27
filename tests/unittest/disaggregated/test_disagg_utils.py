@@ -4,6 +4,7 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import pytest
 import yaml
@@ -362,6 +363,56 @@ def test_extract_router_config_propagates_kv_model_path() -> None:
     assert router_config.args["model_path"] == "/models/gpt-oss-checkpoint"
 
 
+@pytest.mark.parametrize("router_type", ["kv_cache_aware", "KV_CACHE_AWARE"])
+@pytest.mark.parametrize("revision_key", ["revision", "hf_revision"])
+def test_extract_router_config_propagates_kv_checkpoint(router_type,
+                                                        revision_key) -> None:
+    """A cache-aware router, however its type is spelled, reads the servers' checkpoint."""
+    cfg = {
+        "model": "mistralai/Mistral-Native",
+        revision_key: "0123abcd",
+        "checkpoint_format": "mistral",
+        "router": {
+            "type": router_type
+        },
+    }
+    router_config = extract_router_config(cfg)
+    assert router_config.type == "kv_cache_aware"
+    assert router_config.args == {
+        "model_path": "mistralai/Mistral-Native",
+        "revision": "0123abcd",
+        "checkpoint_format": "mistral",
+    }
+
+    # An explicit router value wins; other router types do not tokenize.
+    cfg["router"] = {"type": router_type, "checkpoint_format": "HF"}
+    assert extract_router_config(cfg).args["checkpoint_format"] == "HF"
+    cfg["router"] = {"type": "load_balancing"}
+    assert extract_router_config(cfg).args == {}
+    assert extract_router_config({"router": {"type": router_type}}).args == {}
+
+
+def test_extract_disagg_cfg_gives_the_top_level_checkpoint_format_to_kv_routers(
+) -> None:
+    config = extract_disagg_cfg(
+        checkpoint_format="mistral_large_3",
+        context_servers={
+            "num_instances": 1,
+            "urls": ["localhost:8001"],
+            "router": {
+                "type": "kv_cache_aware"
+            },
+        },
+        generation_servers={
+            "num_instances": 1,
+            "urls": ["localhost:8002"],
+        },
+    )
+    assert config.ctx_router_config.args[
+        "checkpoint_format"] == "mistral_large_3"
+    assert "checkpoint_format" not in config.gen_router_config.args
+
+
 def test_get_server_configs_dict():
     server_configs = [
         CtxGenServerConfig(type="ctx",
@@ -572,8 +623,10 @@ def test_shared_draft_kv_under_helix_needs_the_cutedsl_dspark_drafter(
 
 @pytest.mark.parametrize(
     "backend, tokens_per_block, blocked",
+    # Equal TRTLLM pages reach the worker gates: a manager hosting draft layers
+    # reads 128-token pages, other managers keep a separate draft KV cache.
     [("CUTEDSL", 128, False), ("CUTEDSL", 64, False), ("CUTEDSL", 96, True),
-     ("TRTLLM", 128, True), ("TRTLLM", 64, False)],
+     ("TRTLLM", 128, False), ("TRTLLM", 64, False)],
 )
 def test_shared_draft_kv_page_size_follows_the_dspark_drafter_backend(
         backend, tokens_per_block, blocked):
@@ -596,6 +649,40 @@ def test_shared_draft_kv_page_size_follows_the_dspark_drafter_backend(
     ]
     blocker = _shared_draft_kv_blocker(configs)
     assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "context_backend, generation_backend, blocked",
+    [("CUTEDSL", "TRTLLM", True), ("TRTLLM", "AUTO", True),
+     (None, "AUTO", False), ("TRTLLM", "TRTLLM", False)],
+)
+def test_shared_draft_kv_needs_one_drafter_backend_in_both_sections(
+        context_backend: Optional[str], generation_backend: Optional[str],
+        blocked: bool) -> None:
+    """Sections whose drafters name different backends would decide differently."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "speculative_config": {
+                    "decoding_type": "DSpark",
+                    "attention_backend": backend
+                },
+                "kv_cache_config": {
+                    "tokens_per_block": 64
+                },
+            },
+        ) for role, backend in (("ctx", context_backend), ("gen",
+                                                           generation_backend))
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
+    if blocked:
+        assert "attention_backend in both sections" in blocker
 
 
 @pytest.mark.parametrize(
