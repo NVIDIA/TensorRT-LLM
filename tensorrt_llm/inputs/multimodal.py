@@ -1088,7 +1088,8 @@ class MultimodalParams:
             )
         return metadata.item_refs, metadata.output_embedding_lengths
 
-    def _is_shared_tensor_dict(self, obj: Any) -> bool:
+    @staticmethod
+    def _is_shared_tensor_dict(obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
 
         Args:

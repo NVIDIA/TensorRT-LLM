@@ -10428,6 +10428,7 @@ class PyExecutor:
                     initialize_multimodal_encoder_request(
                         request,
                         max_num_tokens=self.model_engine.encoder_max_num_tokens,
+                        model=self.model_engine.model,
                         max_output_bytes=self.model_engine.
                         mm_encoder_output_budget_bytes,
                         bytes_per_encoder_embedding=(

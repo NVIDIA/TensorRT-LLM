@@ -217,10 +217,12 @@ def _build_batched_input(fields: list[dict[str, tuple[int | None, Any]]]) -> dic
 
 
 def _encoder_batch_slices(
-    sizes: Iterable[tuple[int, int]], max_tokens: int, max_items: int
+    sizes: Iterable[tuple[int | None, int]], max_tokens: int, max_items: int
 ) -> Iterator[slice]:
     start = end = tokens = items = 0
     for index, (cost, count) in enumerate(sizes):
+        if cost is None:
+            cost = max_tokens + 1  # An unknown-size payload takes a call of its own.
         if index > start and (tokens + cost > max_tokens or items + count > max_items):
             yield slice(start, index)
             start = index
@@ -232,12 +234,14 @@ def _encoder_batch_slices(
         yield slice(start, end)
 
 
-def _encoder_payload_size(param: MultimodalParams, modalities: tuple[str, ...]) -> tuple[int, int]:
+def _encoder_payload_size(
+    param: MultimodalParams, modalities: tuple[str, ...]
+) -> tuple[int | None, int]:
     metadata = param.item_metadata
     assert metadata is not None  # Group members have already supplied an output layout.
     indices = [i for i, (m, _) in enumerate(metadata.item_refs) if m in modalities]
     costs = metadata.encoder_token_lengths
-    return (sum(costs[i] for i in indices) if costs is not None else 0, len(indices))
+    return (sum(costs[i] for i in indices) if costs is not None else None, len(indices))
 
 
 def _encode_modality(
@@ -249,6 +253,7 @@ def _encode_modality(
 ) -> torch.Tensor:
     """Batch compatible payloads and return their embeddings in request and local item order."""
     fields = []
+    whole_payloads = set()
     output_lengths = []
     request_indices = []
     owner = getattr(group.encoder_fn, "__self__", None)
@@ -269,9 +274,9 @@ def _encode_modality(
             if defaults is not None:
                 partitions = {**defaults, **(partitions or {})}
         if partitions is None:
-            raise MultimodalEncoderContractError(
-                f"The {modality} payload declares no input partitions"
-            )
+            # Output lengths still delimit the embeddings of this intact payload.
+            whole_payloads.add(len(fields))
+            partitions = dict.fromkeys(data, MultimodalItemPartition.shared())
         payload = _encoder_fields(data, partitions, len(item_lengths))
         # A single request may carry a list of items with different shapes.
         if any(
@@ -293,7 +298,11 @@ def _encode_modality(
             output_lengths.append(sum(length for _, length in item_lengths))
 
     batches: list[list[int]] = []
+    bounded_batches = []
     for index, candidate in enumerate(fields):
+        if index in whole_payloads:
+            bounded_batches.append([index])
+            continue
         for batch in batches:
             first = fields[batch[0]]
             if first.keys() == candidate.keys() and all(
@@ -304,7 +313,6 @@ def _encode_modality(
         else:
             batches.append([index])
 
-    bounded_batches = []
     for batch in batches:
         # A heterogeneous request can contribute several fields of the same shape.
         # Apply capacity at request boundaries within this compatible batch.
@@ -1127,6 +1135,18 @@ class MultimodalModelMixin:
         metadata = param.item_metadata
         return metadata.input_partitions.get(modality) if metadata is not None else None
 
+    def _can_select_multimodal_items(self, param: MultimodalParams, modalities: set[str]) -> bool:
+        """A model-specific selector can describe layouts that have no field partitions."""
+        if (
+            type(self).build_multimodal_encoder_input
+            is not MultimodalModelMixin.build_multimodal_encoder_input
+        ):
+            return True
+        return all(
+            self.get_multimodal_item_partitions(param, modality) is not None
+            for modality in modalities
+        )
+
     def build_multimodal_encoder_input(
         self,
         param: MultimodalParams,
@@ -1377,7 +1397,7 @@ class MultimodalModelMixin:
                     # request event and records the attached tensor on the consuming stream before
                     # gathering it.
                     continue
-                partition = self.partition_encoder_cache(param, encoder_cache)
+                partition = self._partition_full_request_encoder_cache(param, encoder_cache)
                 if partition is None or partition.is_full_miss:
                     cache_misses.append(param)
                     continue
@@ -1638,6 +1658,22 @@ class MultimodalModelMixin:
         return EncoderCachePartition(
             hits=hits, miss_indices=miss_indices, keys=keys, looked_up=looked_up
         )
+
+    def _partition_full_request_encoder_cache(
+        self, param: MultimodalParams, encoder_cache: TensorLRUCache
+    ) -> Optional[EncoderCachePartition]:
+        partition = self.partition_encoder_cache(param, encoder_cache)
+        if partition is not None and partition.hits and partition.miss_indices:
+            # A default builder can only select its cache misses with known partitions.
+            metadata = param.item_metadata
+            assert metadata is not None
+            misses = {metadata.item_refs[i][0] for i in partition.miss_indices}
+            for group in self.mm_encoder_groups:
+                if group.build_batched_input is None and not self._can_select_multimodal_items(
+                    param, misses.intersection(group.modalities)
+                ):
+                    return None
+        return partition
 
     @staticmethod
     def _apply_metadata_slice(
@@ -1960,7 +1996,7 @@ def _dispatch_cross_iter_prefetch(
                 cache_misses = params_list
             else:
                 for param in params_list:
-                    partition = model.partition_encoder_cache(param, encoder_cache)
+                    partition = model._partition_full_request_encoder_cache(param, encoder_cache)
                     if partition is None or partition.is_full_miss:
                         cache_misses.append(param)
                     elif partition.is_full_hit:

@@ -1101,11 +1101,11 @@ class TestChunkedPrefillCaching:
         assert torch.equal(result2[0], result[0])
 
     def test_multi_request_batch_caching(self):
-        """Two image requests in one batch: both cached after a single batched call."""
+        """Image requests with unknown costs are encoded separately and both are cached."""
         model = self._make_mock_model()
         emb_a = torch.randn(5, self.HIDDEN)
         emb_b = torch.randn(3, self.HIDDEN)
-        model.vision_encoder.return_value = ([emb_a, emb_b], [None, None])
+        model.vision_encoder.side_effect = [([emb_a], [None]), ([emb_b], [None])]
 
         param_a = self._make_param_with_runtime("image", 5)
         param_b = self._make_param_with_runtime("image", 3)
@@ -1116,10 +1116,8 @@ class TestChunkedPrefillCaching:
             multimodal_params=[param_a, param_b],
         )
         assert len(result) == 1
-        assert result[0].shape == (8, self.HIDDEN)
-        assert model.vision_encoder.call_count == 1, (
-            "image params should be encoded in a single batched vision_encoder call"
-        )
+        assert torch.equal(result[0], torch.cat([emb_a, emb_b]))
+        assert model.vision_encoder.call_count == 2
         assert "multimodal_embedding" in param_a.multimodal_data
         assert "multimodal_embedding" in param_b.multimodal_data
 
@@ -1127,7 +1125,7 @@ class TestChunkedPrefillCaching:
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
         )
-        assert model.vision_encoder.call_count == 1, (
+        assert model.vision_encoder.call_count == 2, (
             "`vision_encoder` was called again on the second chunk. Caching is broken."
         )
         assert torch.equal(result2[0], result[0])

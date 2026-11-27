@@ -33,7 +33,8 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          _set_mm_item_metadata)
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -889,6 +890,11 @@ class BaseLLM:
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
             multimodal_params = inputs.multimodal_params
+            if multimodal_params is not None and multimodal_params.multimodal_data:
+                _set_mm_item_metadata(self.input_processor,
+                                      prompt_token_ids,
+                                      multimodal_params.multimodal_data,
+                                      fill_missing_only=True)
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
                 preprocessed_encoder_input_token_ids = self._normalize_token_ids(

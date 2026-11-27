@@ -29,6 +29,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor, nn
+from torch.utils._pytree import tree_any
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
@@ -1606,6 +1607,60 @@ def _validate_media_representations(modality: str, items: list | tuple) -> None:
                 f"got {float_kind} and {byte_kind}")
 
 
+def _set_mm_item_metadata(
+    input_processor: InputProcessor,
+    prompt_token_ids: List[int],
+    multimodal_data: Dict[str, Any],
+    mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    *,
+    fill_missing_only: bool = False,
+) -> None:
+    """Fill the item record from the model's processed inputs."""
+    prepared_metadata = get_multimodal_item_metadata(multimodal_data)
+    if fill_missing_only:
+        if (multimodal_data.get("multimodal_embedding") is not None
+                or not any(m in multimodal_data for m in MEDIA_MODALITIES)):
+            return
+        if (prepared_metadata is not None
+                and prepared_metadata.output_embedding_lengths is not None
+                and prepared_metadata.encoder_token_lengths is not None
+                and all(m in prepared_metadata.input_partitions
+                        for m, _ in prepared_metadata.item_refs)):
+            return
+        # The worker owns exported tensors. Only local inputs can be inspected here.
+        is_handle = multimodal.MultimodalParams._is_shared_tensor_dict
+        if tree_any(is_handle, multimodal_data, is_leaf=is_handle):
+            return
+    get_item_metadata = getattr(input_processor, "get_mm_item_metadata", None)
+    item_metadata = (get_item_metadata(prompt_token_ids, multimodal_data,
+                                       mm_item_order)
+                     if get_item_metadata is not None else prepared_metadata)
+    if item_metadata is not None and not isinstance(item_metadata,
+                                                    MultimodalItemMetadata):
+        raise TypeError(
+            "get_mm_item_metadata() must return a MultimodalItemMetadata or None"
+        )
+    item_metadata = _merge_mm_item_metadata(prepared_metadata, item_metadata)
+    if item_metadata is None:
+        return
+    if mm_item_order and item_metadata.item_refs != tuple(
+        (entry["modality"], entry["index"]) for entry in mm_item_order):
+        raise ValueError(
+            "Multimodal item references do not match the prompt item order")
+    if (fill_missing_only and prepared_metadata is not None
+            and prepared_metadata is not item_metadata):
+        partitions = item_metadata.input_partitions.copy()
+        for modality, fields in prepared_metadata.input_partitions.items():
+            partitions[modality] = {**partitions.get(modality, {}), **fields}
+        item_metadata = replace(
+            item_metadata,
+            encoder_token_lengths=(prepared_metadata.encoder_token_lengths
+                                   or item_metadata.encoder_token_lengths),
+            input_partitions=partitions)
+    item_metadata.validate()
+    multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
+
+
 def create_input_processor_with_hash(
     input_processor: BaseMultimodalInputProcessor,
     hash_lib=default_hasher,
@@ -1848,28 +1903,8 @@ def create_input_processor_with_hash(
         if not isinstance(multimodal_data, dict):
             return prompt_token_ids, extra_processed_inputs
 
-        prepared_metadata = get_multimodal_item_metadata(multimodal_data)
-        get_item_metadata = getattr(input_processor, "get_mm_item_metadata",
-                                    None)
-        item_metadata = (get_item_metadata(prompt_token_ids, multimodal_data,
-                                           inputs.get("mm_item_order")) if
-                         get_item_metadata is not None else prepared_metadata)
-        if item_metadata is not None and not isinstance(item_metadata,
-                                                        MultimodalItemMetadata):
-            raise TypeError(
-                "get_mm_item_metadata() must return a MultimodalItemMetadata or None"
-            )
-        item_metadata = _merge_mm_item_metadata(prepared_metadata,
-                                                item_metadata)
-        if item_metadata is None:
-            return prompt_token_ids, extra_processed_inputs
-        mm_item_order = inputs.get("mm_item_order")
-        if mm_item_order and item_metadata.item_refs != tuple(
-            (entry["modality"], entry["index"]) for entry in mm_item_order):
-            raise ValueError(
-                "Multimodal item references do not match the prompt item order")
-        item_metadata.validate()
-        multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
+        _set_mm_item_metadata(input_processor, prompt_token_ids,
+                              multimodal_data, inputs.get("mm_item_order"))
         return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper

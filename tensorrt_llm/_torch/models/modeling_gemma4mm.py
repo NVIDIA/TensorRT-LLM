@@ -23,7 +23,7 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -52,7 +52,6 @@ from ...inputs.multimodal import (
     MultimodalItemMetadata,
     MultimodalItemPartition,
     MultimodalParams,
-    get_multimodal_item_metadata,
 )
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -224,6 +223,23 @@ def _padded_patches_per_frame(processor) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _gemma4_video_frame_counts(
+    data: dict[str, Any], metadata: MultimodalItemMetadata | None
+) -> Sequence[int] | None:
+    """Read the declared packing, or use all frames for a single video."""
+    if (counts := data.get("num_frames")) is not None:
+        return counts
+    if metadata is not None:
+        num_videos = sum(modality == "video" for modality, _ in metadata.item_refs)
+        partition = metadata.input_partitions.get("video", {}).get("pixel_values")
+        if partition is not None and partition.item_axis == 0:
+            return partition.item_lengths or (1,) * num_videos
+        pixels = data.get("pixel_values")
+        if num_videos == 1 and isinstance(pixels, torch.Tensor) and pixels.ndim > 0:
+            return (len(pixels),)
+    return None
+
+
 def _gemma4_input_partitions(
     multimodal_data: dict[str, Any],
     metadata: MultimodalItemMetadata,
@@ -239,7 +255,11 @@ def _gemma4_input_partitions(
         if not isinstance(data, dict):
             continue
         item_count = sum(m == modality for m, _ in metadata.item_refs)
-        frame_counts = data.get("num_frames") if modality == "video" else None
+        frame_counts = None
+        if modality == "video":
+            frame_counts = _gemma4_video_frame_counts(data, metadata)
+            if frame_counts is None:
+                continue
         item_lengths = tuple(frame_counts) if frame_counts is not None else None
         field_count = sum(item_lengths) if item_lengths is not None else item_count
         value = data.get(fields[0])
@@ -264,7 +284,7 @@ def _gemma4_input_partitions(
                     if item_lengths is not None
                     else MultimodalItemPartition.batched()
                 )
-            if frame_counts is not None:
+            if data.get("num_frames") is not None:
                 modality_partitions["num_frames"] = MultimodalItemPartition.batched()
             partitions[modality] = modality_partitions
     return partitions
@@ -490,14 +510,16 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                 "Gemma4 requests containing multiple multimodal input types are not supported."
             )
         modality = modalities[0]
+        data = multimodal_data[modality]
         if modality == "audio":
-            encoder_token_lengths, output_embedding_lengths = self._audio_item_lengths(
-                multimodal_data[modality]
-            )
+            encoder_token_lengths, output_embedding_lengths = self._audio_item_lengths(data)
         else:
-            encoder_token_lengths, output_embedding_lengths = self._vision_item_lengths(
-                multimodal_data[modality]
-            )
+            if modality == "video" and data.get("num_frames") is None:
+                counts = _gemma4_video_frame_counts(data, prepared)
+                if counts is None:
+                    return prepared
+                data = {**data, "num_frames": counts}
+            encoder_token_lengths, output_embedding_lengths = self._vision_item_lengths(data)
         if mm_item_order:
             item_refs = [(entry["modality"], entry["index"]) for entry in mm_item_order]
         elif prepared is not None:
@@ -508,7 +530,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             item_refs=item_refs,
             encoder_token_lengths=[encoder_token_lengths[i] for _, i in item_refs],
             output_embedding_lengths=[output_embedding_lengths[i] for _, i in item_refs],
-            input_partitions=prepared.input_partitions if prepared is not None else None,
+            input_partitions=prepared.input_partitions.copy() if prepared is not None else None,
         )
         metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
         return metadata
@@ -555,10 +577,13 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     def _audio_item_lengths(modality_data: Dict[str, Any]) -> Tuple[List[int], List[int]]:
         """Return the subsampled frame cost and valid output frame count of every audio clip."""
         audio_features = modality_data["audio_features"]
-        num_clips, num_mel_frames = (int(size) for size in audio_features.shape[:2])
+        num_clips = 1 if audio_features.ndim == 2 else audio_features.shape[0]
+        num_mel_frames = audio_features.shape[-2]
         # Every clip is padded to the longest clip in the request.
         encoder_tokens = len(range(0, num_mel_frames, _AUDIO_SUBSAMPLING_FACTOR))
         mask = modality_data.get("audio_features_mask")
+        if mask is not None and mask.ndim == 1:
+            mask = mask.unsqueeze(0)
         output_embedding_lengths = (
             [encoder_tokens] * num_clips
             if mask is None
@@ -1038,20 +1063,18 @@ def _gemma4_encode_view(param: MultimodalParams, modality: str) -> MultimodalPar
         if positions is not None:
             payload["image_position_ids"] = positions
 
-    partition = MultimodalItemPartition.batched()
     metadata = param.item_metadata
-    if modality == "video" and metadata is not None:
-        recorded = metadata.input_partitions.get("video", {}).get("pixel_values")
-        if recorded is not None:
-            partition = recorded
-        elif (frame_counts := data.get("num_frames")) is not None:
-            partition = MultimodalItemPartition.packed(frame_counts)
+    if modality == "video":
+        counts = _gemma4_video_frame_counts(data, metadata)
+        partition = MultimodalItemPartition.packed(counts) if counts is not None else None
+    else:
+        partition = MultimodalItemPartition.batched()
     refs, lengths = param.get_item_layout()
     layout = MultimodalItemMetadata(
         refs,
         encoder_token_lengths=metadata.encoder_token_lengths if metadata is not None else None,
         output_embedding_lengths=lengths,
-        input_partitions={modality: {name: partition for name in payload}},
+        input_partitions={modality: dict.fromkeys(payload, partition)} if partition else None,
     )
     return MultimodalParams(
         multimodal_data={modality: payload, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: layout}
@@ -1112,24 +1135,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             "video.image_position_ids",
             "audio.audio_features",
         ]
-
-    def validate_multimodal_request_data(self, mm_data: dict) -> None:
-        video = mm_data.get("video")
-        if not isinstance(video, dict) or video.get("num_frames") is not None:
-            return
-        pixels = video.get("pixel_values")
-        metadata = get_multimodal_item_metadata(mm_data)
-        if not isinstance(pixels, torch.Tensor) or pixels.ndim == 0 or metadata is None:
-            return
-        partition = metadata.input_partitions.get("video", {}).get("pixel_values")
-        if partition is not None and partition.item_lengths is not None:
-            return
-        num_videos = sum(modality == "video" for modality, _ in metadata.item_refs)
-        if pixels.shape[0] > num_videos:
-            raise ValueError(
-                f"Gemma4 received {pixels.shape[0]} frames for {num_videos} videos. "
-                "Pass per-video frame counts in num_frames, as the Gemma4 processor does."
-            )
 
     # TODO(TRTLLM-14981): Implement finer-grained caching for videos.
     @classmethod

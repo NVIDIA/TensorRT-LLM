@@ -271,10 +271,11 @@ class TestReorderEmbedsByManifest:
         assert out.numel() == 0
 
 
-def _group_request(refs, **pixels):
+def _group_request(refs, *, known_cost=True, **pixels):
     buckets = {modality: {"pixels": value} for modality, value in pixels.items()}
     metadata = MultimodalItemMetadata(
         refs,
+        encoder_token_lengths=[1] * len(refs) if known_cost else None,
         output_embedding_lengths=[1] * len(refs),
         input_partitions={modality: {"pixels": MultimodalItemPartition()} for modality in buckets},
     )
@@ -297,12 +298,13 @@ def test_default_builder_batches_compatible_shapes_within_each_modality():
         _group_request([("image", 1), ("video", 0), ("image", 0)], image=image, video=video),
         _group_request([("image", 0)], image=wide),
         _group_request([("image", 0)], image=torch.tensor([[5, 5]])),
+        _group_request([("image", 0)], known_cost=False, image=torch.tensor([[6, 6]])),
     ]
     # An optional empty bucket has no items or partition declaration.
     requests[1].multimodal_data["video"] = {}
     out = encode_multimodal_by_groups([EncoderGroup(("image", "video"), encode)], requests)
-    assert out.flatten().tolist() == [2, 3, 1, 4, 5]
-    assert sorted(calls) == [[1, 2, 5], [3], [4]]
+    assert out.flatten().tolist() == [2, 3, 1, 4, 5, 6]
+    assert sorted(calls) == [[1, 2, 5], [3], [4], [6]]
 
 
 def test_default_builder_rejects_item_counts_that_cancel_across_requests():

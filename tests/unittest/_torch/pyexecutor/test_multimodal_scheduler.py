@@ -49,6 +49,7 @@ from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderProgress,
     MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
     strip_mm_encoder_inputs,
 )
@@ -102,8 +103,13 @@ def test_text_requests_do_not_allocate_multimodal_params():
     assert request.py_multimodal_params is None
 
 
-def test_generic_metadata_does_not_enable_item_scheduling():
-    metadata = MultimodalItemMetadata([("image", 0)], output_embedding_lengths=[1])
+@pytest.mark.parametrize(
+    ("costs", "partitions"),
+    [(None, {"image": {"pixel_values": MultimodalItemPartition.batched()}}), ([1], None)],
+    ids=["no-cost", "no-partitions"],
+)
+def test_incomplete_metadata_uses_whole_request_encoding(costs, partitions):
+    metadata = MultimodalItemMetadata([("image", 0)], costs, [1], input_partitions=partitions)
     request = make_llm_request(
         1,
         {
@@ -112,9 +118,9 @@ def test_generic_metadata_does_not_enable_item_scheduling():
         },
     )
     assert request.py_mm_encoder_state is None
-    assert get_multimodal_encoder_token_lengths(request) is None
-    with pytest.raises(ValueError, match="when item-level encoder scheduling is enabled"):
-        initialize_multimodal_encoder_request(request, 32)
+    assert get_multimodal_encoder_token_lengths(request) == metadata.encoder_token_lengths
+    initialize_multimodal_encoder_request(request, 32, model=MultimodalModelMixin())
+    assert request.py_mm_encoder_state is None
     request.py_multimodal_data["multimodal_embedding"] = torch.zeros(1, 2)
     initialize_multimodal_encoder_request(request, 32)
     assert request.py_multimodal_params.encoder_state is None

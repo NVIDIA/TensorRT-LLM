@@ -37,6 +37,8 @@ from __future__ import annotations
 import os
 import unittest
 from copy import deepcopy
+from dataclasses import replace
+from itertools import accumulate
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Type
@@ -91,6 +93,7 @@ from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MultimodalParams,
     MultimodalRuntimeData,
 )
+from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs, RequestOutput  # noqa: E402
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig  # noqa: E402
 from tensorrt_llm.mapping import Mapping  # noqa: E402
 
@@ -194,6 +197,18 @@ class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
         )
 
 
+class _Gemma4FrameEncoder(_Gemma4EncoderCacheHarness):
+    """Emit two embeddings per frame, each containing its first pixel value."""
+
+    def __init__(self):
+        super().__init__(embedding_dim=1)
+        self.frames_per_call = []
+
+    def _get_image_features(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
+        self.frames_per_call.append(len(pixel_values))
+        return pixel_values[:, 0, :1].repeat_interleave(2, dim=0)
+
+
 def _make_keyed_image_param(
     item_hashes: list[list[int]] | None = None,
 ) -> MultimodalParams:
@@ -229,17 +244,17 @@ def _make_keyed_image_param(
     )
 
 
-def _make_keyed_video_param(item_hashes: list[list[int]]) -> MultimodalParams:
-    item_count = len(item_hashes)
-    embedding_lengths = [2] * item_count
+def _make_keyed_video_param(videos: list[list[int]]) -> MultimodalParams:
+    embedding_lengths = [2 * len(frames) for frames in videos]
+    pixels = torch.tensor([value for frames in videos for value in frames], dtype=torch.float32)
     return MultimodalParams(
         multimodal_input=MultimodalInput(
-            multimodal_hashes=item_hashes,
-            multimodal_positions=[0] * item_count,
+            multimodal_hashes=[[frames[0]] * 8 for frames in videos],
+            multimodal_positions=list(accumulate(embedding_lengths[:-1], initial=0)),
             multimodal_lengths=embedding_lengths,
         ),
         multimodal_data={
-            "video": {"pixel_values": torch.arange(item_count).reshape(item_count, 1, 1)},
+            "video": {"pixel_values": pixels.reshape(-1, 1, 1).expand(-1, 18, 1)},
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 [("video", i) for i in range(len(embedding_lengths))],
                 output_embedding_lengths=embedding_lengths,
@@ -381,30 +396,26 @@ def test_prepared_gemma4_implicit_positions_match_processor(processor_class, sid
     torch.testing.assert_close(implicit, embed(pixels, positions), rtol=0, atol=0)
 
 
+def _submit_prepared(param, processor):
+    llm = mock.Mock()
+    llm._encode_only = False
+    llm._executor.is_shutdown.return_value = False
+    llm.args = SimpleNamespace(mm_encoder_only=False, return_perf_metrics=False)
+    llm.input_processor = processor
+    llm._prepare_sampling_params.return_value = SimpleNamespace(return_perf_metrics=False)
+    inputs = PreprocessedInputs([1] * sum(param.get_item_layout()[1]), param)
+    with mock.patch.object(RequestOutput, "_from_generation_result"):
+        BaseLLM.generate_async(llm, inputs)
+    return llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+
+
 @pytest.mark.cpu_only
-def test_prepared_gemma4_video_admission_requires_frame_counts():
-    model = _Gemma4EncoderCacheHarness()
-    one_frame_each = _make_keyed_video_param([[1] * 8, [2] * 8])
-    model.validate_multimodal_request_data(one_frame_each.multimodal_data)
-
-    video = {"pixel_values": torch.zeros(3, 18, 1), "num_frames": [1, 2]}
-    data = {"video": video}
-    param = _with_item_metadata(data, _make_item_input_processor())
-
-    counts = video.pop("num_frames")
-    model.validate_multimodal_request_data(data)  # Recorded partitions still describe both videos.
-    param.item_metadata.input_partitions.clear()
-    with pytest.raises(
-        ValueError, match="3 frames for 2 videos.*Pass per-video frame counts in num_frames"
-    ):
-        model.validate_multimodal_request_data(data)
-
-    video["num_frames"] = counts
-    model.validate_multimodal_request_data(data)
-    outputs = model.forward_multimodal_encoder_items(
-        model.prepare_multimodal_encoder_inputs([(param, 0), (param, 1)])
-    )
-    assert [len(output) for output in outputs] == [2, 4]
+def test_prepared_gemma4_accepts_single_video_without_frame_counts():
+    model = _Gemma4FrameEncoder()
+    param = _submit_prepared(_make_keyed_video_param([[1, 2, 3]]), _make_item_input_processor())
+    model.validate_multimodal_request_data(param.multimodal_data)
+    embeddings = model._get_or_encode_multimodal_embeddings([param])
+    assert embeddings.flatten().tolist() == [1, 1, 2, 2, 3, 3]
 
 
 @pytest.mark.cpu_only
@@ -454,16 +465,21 @@ def test_prepared_gemma4_inline_audio_encoder_capacity():
 
     def request(clip):
         param = _with_item_metadata({"audio": {"audio_features": clip}}, processor)
+        param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = replace(
+            param.item_metadata, encoder_token_lengths=None
+        )
         param.multimodal_runtime = MultimodalRuntimeData(0, 750, torch.arange(1, 751))
-        return param
+        return _submit_prepared(param, processor)
 
     expected = torch.cat(
         [model._get_or_encode_multimodal_embeddings([request(clip)]) for clip in clips.split(1)]
     )
     model.audio_tower.reset_mock()
-    actual = model._get_or_encode_multimodal_embeddings([request(clip) for clip in clips.split(1)])
+    prepared = [request(clip) for clip in clips.split(1)]
+    actual = model._get_or_encode_multimodal_embeddings(prepared)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert max(call.args[0][:, ::4].numel() for call in model.audio_tower.call_args_list) <= 750
+    assert all(param.item_metadata.encoder_token_lengths == (750,) for param in prepared)
 
 
 def test_unified_audio_batch_matches_single_masked_clips():
@@ -1524,13 +1540,6 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
     def test_item_scheduling_encodes_selected_items_in_scheduler_order(self):
         """Selected items are sliced, encoded once per modality run, and split back per item."""
 
-        class _ContentHarness(_Gemma4EncoderCacheHarness):
-            def _get_image_features(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
-                del kwargs
-                self.encoder_calls += 1
-                # Two rows per image or video frame, each holding its first pixel value.
-                return pixel_values[:, 0, :1].repeat_interleave(2, dim=0)
-
         processor = _make_item_input_processor()
         # 18 valid patches pool into 2 soft tokens per image or frame.
         images = _with_item_metadata(
@@ -1552,7 +1561,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             },
             processor,
         )
-        model = _ContentHarness()
+        model = _Gemma4FrameEncoder()
 
         outputs = model.forward_multimodal_encoder_items(
             model.prepare_multimodal_encoder_inputs([(images, 2), (images, 0), (videos, 1)])
@@ -1562,7 +1571,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             [output.flatten().tolist() for output in outputs],
             [[2.0] * 2, [0.0] * 2, [12.0] * 2 + [13.0] * 2 + [14.0] * 2],
         )
-        self.assertEqual(model.encoder_calls, 2)
+        self.assertEqual(len(model.frames_per_call), 2)
 
     @torch.no_grad()
     def test_item_encoding_matches_full_request_encoding(self):
@@ -1671,31 +1680,20 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 self.assertEqual(partition.miss_indices, [0, 1])
                 warning_once.assert_called_once()
 
+    @pytest.mark.cpu_only
     def test_encoder_cache_reuses_full_video_hits_and_reencodes_partial_hits(self):
-        """Gemma4 video reuses full hits and re-encodes complete partial-hit requests."""
-        model = _Gemma4EncoderCacheHarness()
-        shared_hash = [1] * 8
-        first = model._get_or_encode_multimodal_embeddings([_make_keyed_video_param([shared_hash])])
-        full_hit = model._get_or_encode_multimodal_embeddings(
-            [_make_keyed_video_param([shared_hash])]
-        )
-        with unittest.mock.patch(
-            "tensorrt_llm._torch.models.modeling_gemma4mm.logger.warning_once"
-        ) as warning_once:
-            partial_hit = model._get_or_encode_multimodal_embeddings(
-                [_make_keyed_video_param([shared_hash, [2] * 8])]
-            )
-        repeated = model._get_or_encode_multimodal_embeddings(
-            [_make_keyed_video_param([shared_hash, [2] * 8])]
-        )
-
-        warning_once.assert_called_once()
-        self.assertEqual(model.encoder_calls, 2)
-        torch.testing.assert_close(full_hit, first)
-        torch.testing.assert_close(first, torch.ones(2, model.embedding_dim))
-        torch.testing.assert_close(partial_hit, torch.full((4, model.embedding_dim), 2.0))
-        torch.testing.assert_close(repeated, partial_hit)
-        self.assertEqual(len(model._multimodal_encoder_cache), 2)
+        """Three flattened frames describe two videos, even without per-video frame counts."""
+        model = _Gemma4FrameEncoder()
+        processor = _make_item_input_processor()
+        for videos, expected in (
+            ([[1], [2, 3]], [1, 1, 2, 2, 3, 3]),  # cold
+            ([[1], [4, 5]], [1, 1, 4, 4, 5, 5]),  # first video cached
+            ([[1], [4, 5]], [1, 1, 4, 4, 5, 5]),  # both cached
+        ):
+            param = _submit_prepared(_make_keyed_video_param(videos), processor)
+            embeddings = model._get_or_encode_multimodal_embeddings([param])
+            self.assertEqual(embeddings.flatten().tolist(), expected)
+        self.assertEqual(model.frames_per_call, [3, 3])
 
     def test_chunked_prefill_reuses_cached_vision_embeddings(self):
         """Later active chunks slice cached features without rerunning vision."""

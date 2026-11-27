@@ -104,7 +104,9 @@ largest dummy image costs 12,100 patches and the budget is 16,384, only one
 such image fits. Runtime batches then have a 12,100-patch limit. When startup
 skips encoder profiling, the configured token budget applies. Grouped encoders
 apply both limits between request payloads. A payload that exceeds either
-limit runs alone. Without `encoder_token_lengths`, only its item count is known.
+limit or has unknown encoder cost runs alone. When the default builder has no
+input partitions for a modality, it sends the whole payload to the encoder
+and uses the declared output lengths to recover each item's embeddings.
 
 ## Processor Hooks
 
@@ -112,9 +114,10 @@ Processors implement
 `get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)` and
 return `MultimodalItemMetadata`. Generic preparation supplies prompt order and
 known output rows; model processors add encoder costs and input partitions.
-Partial model records retain known prompt rows. Conflicting order or rows fail
-at input preparation. Gemma4 and Nemotron add partitions; Qwen and Mistral also
-provide physical encoder costs.
+Partial model records retain known output lengths. Conflicting order or output
+lengths fail at input preparation. For caller-prepared media tensors,
+`generate_async` uses the same hook to fill missing item metadata. Inputs
+exported by `preprocess` already carry its result.
 
 Unknown costs or row counts remain `None`. Common metadata does not enable item
 scheduling: models can supply order and output rows with
@@ -179,10 +182,9 @@ To opt in, the model sets `supports_mm_encoder_item_scheduling = True`, supports
 item selection, and either declares encoder groups or overrides
 `encode_multimodal_inputs`. The engine also checks `disable_mm_encoder`, the
 scheduling policy, and supported combinations in `mm_item_scheduling_enabled()` and
-`validate_mm_encoder_scheduling_compatibility()`. Under item scheduling, missing
-costs or output rows fail admission; they do not silently switch one request to
-full-request encoding. Keep the capability disabled until the model can supply
-the complete scheduling contract.
+`validate_mm_encoder_scheduling_compatibility()`. When a request has output
+lengths but lacks encoder costs or usable item partitions, prefill encodes the
+whole payload. Its complete output must fit the resident embedding budget.
 
 ### Selecting Unusual Payloads
 
