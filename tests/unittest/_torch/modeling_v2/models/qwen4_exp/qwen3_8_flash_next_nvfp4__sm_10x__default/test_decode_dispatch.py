@@ -807,7 +807,7 @@ def _calls_by_function():
 
 
 #: Build self-checks that run the anchor writers on a scratch bf16 plane no step reads.
-_SCRATCH_ANCHOR_WRITERS = frozenset({"_tep_attn_inplace_check"})
+_SCRATCH_ANCHOR_WRITERS = frozenset({"_tep_attn_inplace_check", "_tep_draft_prologue_check"})
 
 
 def test_index_key_fp8_every_anchor_writer_converts():

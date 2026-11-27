@@ -9,6 +9,8 @@
   tile; a draft pass (`p` = 1) and an unset switch ask nothing.
 * **Bitwise** (GPU): the visible split with one slot a row tile and another program count equals
   the default launch bit for bit at 3 and 4 requests of four verify rows.
+* **One-launch draft prologue** (`TEP_DRAFT_PROLOGUE_ENV`): off unless set, a warning without the
+  tep4 draft layer (CPU); its build check passes at the tep4 shard's geometry (GPU).
 """
 
 from types import SimpleNamespace
@@ -114,3 +116,39 @@ def test_index_split_is_bitwise(requests, pps):
     out = qsa_paged_index_scores(*args, use_pdl=False, wide_split=True, split_shape=(pps, 1))
     for r, v in enumerate(((pos + 1) // cr).tolist()):
         assert torch.equal(out[r, :v].view(torch.int32), ref[r, :v].view(torch.int32))
+
+
+# ---- one-launch draft prologue ----
+
+
+@pytest.mark.cpu_only
+def test_draft_prologue_is_off_unless_set(monkeypatch):
+    monkeypatch.delenv(M.TEP_DRAFT_PROLOGUE_ENV, raising=False)
+    core = SimpleNamespace(tep_fast=True, tep_draft_layer=True)
+    assert M._tep_draft_prologue_build(core, "cuda") is False
+
+
+@pytest.mark.cpu_only
+def test_draft_prologue_warns_without_the_draft_layer(monkeypatch):
+    warned = []
+    monkeypatch.setenv(M.TEP_DRAFT_PROLOGUE_ENV, "1")
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    monkeypatch.setattr(M.torch.cuda, "get_device_capability", lambda *_: M.archs.SM_103)
+    core = SimpleNamespace(tep_fast=True, tep_draft_layer=False)
+    assert M._tep_draft_prologue_build(core, "cuda") is False
+    assert len(warned) == 1 and M.TEP_DRAFT_PROLOGUE_ENV in warned[0]
+
+
+@needs_sm103
+def test_draft_prologue_check_passes_at_the_tep4_shard():
+    """`_tep_draft_prologue_check` at the tep4 shard's geometry (6 q heads on one KV head of 256,
+    4 index heads of 128, rotary 64, mrope sections 11 / 10): the one-launch prologue writes the
+    four launches' bytes in a draft-extend pass of two requests of four rows and in four decode
+    rows."""
+    core = SimpleNamespace(
+        heads_q=6, heads_kv=1, head_dim=256, index_heads=4, index_head_dim=128, index_kv_heads=1,
+        rotary_dim=64, eps=1e-6, mrope_section1=11, mrope_section2=10, compress_ratio=4,
+        attn_in_width=4352, index_col=3584, index_scratch_width=768, attn_in_tail_heads=10,
+        qkv_width=2048, q_width=1536, mapping=SimpleNamespace(tp_rank=0),
+    )  # fmt: skip
+    assert M._tep_draft_prologue_check(core, torch.device("cuda")) == []

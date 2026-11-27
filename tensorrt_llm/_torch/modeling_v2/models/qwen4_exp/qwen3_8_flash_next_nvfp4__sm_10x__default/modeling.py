@@ -1847,6 +1847,157 @@ TEP_ATTN_INPLACE_ENV = "TRTLLM_QWEN4_EXP_TEP_ATTN_INPLACE"
 #: Rows up to which `TEP_ATTN_INPLACE_ENV` engages: one request of an MTP-3 verify step, or up to
 #: four decode rows (the 4-rank micro: 1.06 us a layer saved at 4 rows, nothing at 8).
 _TEP_ATTN_INPLACE_MAX_ROWS = 4  # capacity: fixed: a dispatch threshold
+#: Off by default (opt-in, bitwise). At a tep4 rank with its draft
+#: layer on the multi-rank decode ops (`TEP_DRAFT_LAYER_ENV`) and its fast forms on SM103, a draft
+#: pass over the e4m3 pool (not an IndexShare reuse) runs the draft layer's norm + rope, K/V
+#: append, raw index-key store and group compression as the trunk does, in one launch
+#: (`one_rank_attn_decode_prologue`, in place on the projection row, `p` rows a request) instead
+#: of the four launches over two streams (`qwen4_exp_qk_norm_rope`, then `qsa_paged_index_store`
+#: and `qsa_prefill_compress` on the side stream, the join, `qsa_paged_kv_store`). The prologue's
+#: own contract is to write those four entries' bytes; the build checks it on this rank's
+#: geometry (`_tep_draft_prologue_check`) and keeps the four launches where anything differs.
+#: GB300 tep4 one-node server (forced acceptance 1.32, ~100k-token contexts, alternating on / off
+#: arms): -0.009 / -0.009 / -0.014 / -0.014 ms a step at 1 / 2 / 3 / 4 requests (9 launches a step
+#: fewer); texts identical.
+#: Read once, when the target is built.
+TEP_DRAFT_PROLOGUE_ENV = "TRTLLM_QWEN4_EXP_TEP_DRAFT_PROLOGUE"
+
+
+def _tep_draft_prologue_build(core, device) -> bool:
+    """`TEP_DRAFT_PROLOGUE_ENV`, read once at build: True at a tep4 rank with its draft layer and
+    fast forms on SM103 whose self-check passes; False elsewhere (one warning where set)."""
+    if not _switch(TEP_DRAFT_PROLOGUE_ENV):
+        return False
+    if not (
+        core.tep_fast
+        and getattr(core, "tep_draft_layer", False)
+        and torch.cuda.get_device_capability(device) == archs.SM_103
+    ):
+        logger.warning(
+            f"{TEP_DRAFT_PROLOGUE_ENV} is set but ignored: it serves a tep4 rank with "
+            f"{TEP_FAST_DECODE_ENV} and {TEP_DRAFT_LAYER_ENV} on, on SM103"
+        )
+        return False
+    try:
+        bad = _tep_draft_prologue_check(core, device)
+    except Exception as e:  # noqa: BLE001 -- an opt-in form declines rather than stop the load
+        bad = [f"{type(e).__name__}: {e}"]
+    if bad:
+        logger.warning(
+            f"{TEP_DRAFT_PROLOGUE_ENV}: the one-launch draft prologue is not bitwise the four "
+            f"launches at tp rank {core.mapping.tp_rank} ({'; '.join(bad[:4])}); the rank keeps "
+            "the four launches"
+        )
+        return False
+    logger.info(
+        f"tep4 one-launch draft prologue ({TEP_DRAFT_PROLOGUE_ENV}=1): tp rank "
+        f"{core.mapping.tp_rank}, draft passes over an e4m3 pool"
+    )
+    return True
+
+
+def _tep_draft_prologue_check(core, device) -> list[str]:
+    """Run the draft layer's four launches and the one-launch prologue on one synthetic input of
+    this rank's geometry (an e4m3 K/V pool as the engine lays it out, a bf16 index plane): a
+    draft-extend pass of two requests of four rows whose rows end a group with earlier members in
+    the launch, and four decode rows, one a request, one a group end. Every position lies inside
+    its request's four table pages (a row past its table writes nothing in either form, but the
+    two forms differ on what an unmapped page receives). Returns what differs: the K/V pool, the
+    index plane, the position cache, the index query or the q / k heads."""
+    tpb, width, pages = 32, 4, 40
+    hq, hk, dim = core.heads_q, core.heads_kv, core.head_dim
+    g = torch.Generator(device=device).manual_seed(4711)
+    bad = []
+    # Request 0's group ends on a page's last slot with its three earlier members in the launch;
+    # request 1's group ends at its third row (two earlier members in the launch, one cached).
+    cases = ((4, (28, 29, 30, 31, 113, 114, 115, 116)), (1, (95, 33, 127, 70)))
+    for rows_per_request, pos in cases:
+        rows = len(pos)
+        request = torch.tensor(
+            [r // rows_per_request for r in range(rows)], dtype=torch.int32, device=device
+        )
+        logical = torch.tensor(pos, dtype=torch.int64, device=device)
+        requests = rows // rows_per_request
+        block_table = torch.randperm(pages, generator=g, device=device).to(torch.int32)
+        block_table = block_table[: requests * width].reshape(requests, width).contiguous()
+        ids = torch.stack([logical, logical + 3, logical + 7]).to(torch.int32).contiguous()
+        coords = ids.t()
+        angles = torch.rand(max(pos) + 16, core.rotary_dim // 2, generator=g, device=device) * 6.28
+        cos_sin = torch.cat([torch.cos(angles), torch.sin(angles)], dim=1).contiguous()
+        weights = [
+            (0.3 * torch.randn(n, generator=g, device=device)).to(torch.bfloat16)
+            for n in (dim, dim, core.index_head_dim, core.index_head_dim)
+        ]
+        proj = (2.0 * torch.randn(rows, core.attn_in_width, generator=g, device=device)).to(
+            torch.bfloat16
+        )
+        pool = torch.randn(pages, 2, hk, tpb, dim, generator=g, device=device).to(
+            torch.float8_e4m3fn
+        )
+        index_cache = torch.randn(pages, tpb, 1, core.index_head_dim, generator=g, device=device)
+        index_cache = index_cache.to(torch.bfloat16)
+        position_cache = torch.randint(
+            0, max(pos), (pages, tpb, 3), generator=g, device=device, dtype=torch.int32
+        )
+        runs = []
+        for fused in (False, True):
+            pool_r, index_r, position_r = pool.clone(), index_cache.clone(), position_cache.clone()
+            proj_r = proj.clone()
+            index_q = torch.empty(
+                rows, core.index_heads, core.index_head_dim, dtype=torch.bfloat16, device=device
+            )
+            if fused:
+                one_rank_attn_decode_prologue(
+                    proj_r, index_q, ids, coords, cos_sin, *weights, pool_r[:, 0], pool_r[:, 1],
+                    index_r, position_r, request, logical, block_table, tpb, core.compress_ratio,
+                    num_heads_q=hq, num_heads_k=hk, head_dim=dim, index_heads=core.index_heads,
+                    index_head_dim=core.index_head_dim, index_q_col=core.index_col,
+                    rotary_dim=core.rotary_dim, eps=core.eps, mrope_section1=core.mrope_section1,
+                    mrope_section2=core.mrope_section2, index_mrope_section1=0,
+                    index_mrope_section2=0, compress_mrope_section=_QSA_MROPE_SECTION,
+                    rows_per_request=rows_per_request,
+                )  # fmt: skip
+            else:
+                qwen4_exp_qk_norm_rope(
+                    proj_r, index_q, ids, cos_sin, weights[0], weights[1], weights[2],
+                    num_heads_q=hq, num_heads_k=hk, head_dim=dim, index_heads=core.index_heads,
+                    index_head_dim=core.index_head_dim, index_q_col=core.index_col,
+                    rotary_dim=core.rotary_dim, eps=core.eps, mrope_section1=core.mrope_section1,
+                    mrope_section2=core.mrope_section2, index_mrope_section1=0,
+                    index_mrope_section2=0,
+                )  # fmt: skip
+                token_k = torch.split(
+                    torch.reshape(
+                        proj_r[:, core.index_col :],
+                        [
+                            rows,
+                            core.index_scratch_width // core.index_head_dim,
+                            core.index_head_dim,
+                        ],
+                    ),
+                    [core.index_heads, core.index_kv_heads, 1],
+                    1,
+                )[1]
+                qsa_paged_index_store(
+                    token_k, coords, index_r, position_r, request, logical, block_table, tpb
+                )
+                qsa_prefill_compress(
+                    logical_positions=logical, request_indices=request, block_table=block_table,
+                    index_cache=index_r, position_cache=position_r, k_norm_weight=weights[3],
+                    cos_sin=cos_sin, eps=core.eps, tokens_per_block=tpb,
+                    compress_ratio=core.compress_ratio, mrope_section=_QSA_MROPE_SECTION,
+                )  # fmt: skip
+                _, k_dst, v_dst = _attn_in_heads(core, proj_r)
+                qsa_paged_kv_store(
+                    k_dst, v_dst, pool_r[:, 0], pool_r[:, 1], request, logical, block_table, tpb
+                )
+            runs.append((pool_r, index_r, position_r, index_q, proj_r[:, : (hq + hk) * dim]))
+        torch.cuda.synchronize(device)
+        names = ("K/V pool", "index plane", "position cache", "index query", "q/k heads")
+        for name, a, b in zip(names, *runs):
+            if not torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)):
+                bad.append(f"{name} at {rows} rows, {rows_per_request} a request")
+    return bad
 
 
 def _tep_gqa_e4m3(core, device) -> bool:
@@ -3073,6 +3224,7 @@ def _decode_forms(core) -> str:
             "topk cowrite": getattr(core, "topk_cowrite", False),
             "tp sum lamport": getattr(core, "_tep_tpsum", None) is not None,
             "index split": getattr(core, "tep_index_split", 0),
+            "draft prologue": getattr(core, "tep_draft_prologue", False),
         }
     return f"{head}: " + ", ".join(f"{k} {v}" for k, v in forms.items())
 
@@ -3702,6 +3854,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.tep_gqa_e4m3 = _tep_gqa_e4m3(self, device)
         # A tep4 rank's in-place attention prologue (`TEP_ATTN_INPLACE_ENV`), built below.
         self.tep_attn_inplace = False
+        # A tep4 rank's one-launch draft prologue (`TEP_DRAFT_PROLOGUE_ENV`), built below.
+        self.tep_draft_prologue = False
         self.decode_mm = (
             _one_rank_projection
             if one_rank
@@ -3735,6 +3889,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self.topk_cowrite = _topk_cowrite_build(self, device)
             self._draft_moe_tactics = _draft_moe_tactics_build(self, device)
             self.tep_attn_inplace = _tep_attn_inplace_build(self, device)
+            self.tep_draft_prologue = _tep_draft_prologue_build(self, device)
             self.dp_launch_order = _switch(DP_LAUNCH_ORDER_ENV, default=True) and (
                 _dp_decode_rank(self, device)
             )
@@ -10029,7 +10184,9 @@ class DecodeTarget:
         core = self.core
         M = core._mtp
         dt, dev = x.dtype, x.device
-        proj, q_index = self._mtp_attn_front(x, md, draft, rows, reuse, pos3, coords, gemm)
+        proj, q_index = self._mtp_attn_front(
+            x, md, draft, rows, reuse, pos3, coords, gemm, p=0 if core.one_rank else p
+        )
         qkv_view, gate, _ = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
@@ -10178,12 +10335,17 @@ class DecodeTarget:
             fused_sigmoid_mul_inplace(out, gate)
         return _draft_mm(out, M.o, core._mtp_gemv8.get("o"), gemm)
 
-    def _mtp_attn_front(self, x, md, draft, rows, reuse, pos3, coords, gemm) -> tuple:
+    def _mtp_attn_front(self, x, md, draft, rows, reuse, pos3, coords, gemm, p=0) -> tuple:
         """The draft layer's attention input in the one-rank form: one GEMM against the fused
         `[q | k | v | gate | index | pad]` operand (`core._mtp_attn_in`), the norm + rope of both
         planes in one launch at the module's rope base, and (unless `reuse`) the raw index key's
         store and the compression on the side stream, joined before this returns. Returns
-        `(proj, q_index)`: the projection row and the normalized, rotated index query."""
+        `(proj, q_index)`: the projection row and the normalized, rotated index query.
+
+        With `p` (`p` rows a request) at a tep4 rank under `TEP_DRAFT_PROLOGUE_ENV`, over the
+        e4m3 pool and not under `reuse`, all of it and the K/V append are one launch
+        (`one_rank_attn_decode_prologue`), and `self._kv_done` holds `proj` so that
+        `_mtp_attention_tp` does not append K/V again."""
         core = self.core
         M = core._mtp
         dt, dev = x.dtype, x.device
@@ -10195,6 +10357,31 @@ class DecodeTarget:
         logical = md.qsa_logical_positions[:rows]
         block_table = md.qsa_block_table
         tokens_per_block = md.tokens_per_block
+        kv = draft.kv
+        if (
+            p
+            and not reuse
+            and getattr(core, "tep_draft_prologue", False)
+            and kv.k_scale is None
+            and kv.k.dtype == torch.float8_e4m3fn
+            and rows % p == 0
+        ):
+            one_rank_attn_decode_prologue(
+                proj, q_index, pos3, coords, core._mtp_cos_sin, M.q_norm, M.k_norm, M.idx_qn,
+                M.idx_kn, kv.k, kv.v, draft.index_cache, draft.position_cache, req_idx, logical,
+                block_table, tokens_per_block, core.compress_ratio, num_heads_q=core.heads_q,
+                num_heads_k=core.heads_kv, head_dim=core.head_dim, index_heads=core.index_heads,
+                index_head_dim=core.index_head_dim, index_q_col=core.qkv_width + core.q_width,
+                rotary_dim=core.rotary_dim, eps=core.eps, mrope_section1=core.mrope_section1,
+                mrope_section2=core.mrope_section2, index_mrope_section1=0,
+                index_mrope_section2=0, compress_mrope_section=_QSA_MROPE_SECTION,
+                rows_per_request=p,
+            )  # fmt: skip
+            _index_anchors_fp8(
+                core, draft.index_cache, block_table, req_idx, logical, tokens_per_block
+            )
+            self._kv_done = proj
+            return proj, q_index
         main = torch.cuda.current_stream()
         side = core._side_stream
         side.wait_stream(main)
@@ -10282,11 +10469,17 @@ class DecodeTarget:
         logical = md.qsa_logical_positions[:rows]
         # `[q | k | v | gate]`: the leading columns of the projection row.
         head = proj[:, : core.qkv_width + core.q_width]
+        # `TEP_DRAFT_PROLOGUE_ENV`: the front appended this `proj`'s K/V already. The mark is
+        # cleared on every path (a dense pass appends through `thop_attention`), so it never
+        # outlives its pass.
+        kv_done = getattr(self, "_kv_done", None) is proj
+        self._kv_done = None
         if sparse:
-            _store_kv(
-                core, draft.kv, k_dst, v_dst, req_idx, logical, md.qsa_block_table,
-                md.tokens_per_block,
-            )  # fmt: skip
+            if not kv_done:
+                _store_kv(
+                    core, draft.kv, k_dst, v_dst, req_idx, logical, md.qsa_block_table,
+                    md.tokens_per_block,
+                )  # fmt: skip
             if cont is not None:
                 kept = {"head": head}
                 if not reuse:
