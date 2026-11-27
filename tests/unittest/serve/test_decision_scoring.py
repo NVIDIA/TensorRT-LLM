@@ -90,7 +90,9 @@ def test_labels_must_extend_the_actual_prompt_and_remain_distinct():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("engine_batch", "expected_window"), [(2, 2), (2048, 8)])
+@pytest.mark.parametrize(
+    ("engine_batch", "expected_window"), [(None, 1), (2, 2), (16, 16), (2048, 20)]
+)
 async def test_decision_rendering_and_reads_are_bounded_in_request_order(
     monkeypatch, engine_batch, expected_window
 ):

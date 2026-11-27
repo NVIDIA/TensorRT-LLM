@@ -25,10 +25,6 @@ if TYPE_CHECKING:
 
 __all__ = ["ReadQuestion", "ReadResult", "score_decision_questions"]
 
-# One HTTP request can submit many model reads, one per question. Limit how many
-# it submits at once because each generation read returns a full row of logits.
-_MAX_CONCURRENT_READS = 8
-
 
 @dataclass
 class ReadResult:
@@ -125,7 +121,8 @@ async def score_decision_questions(
         raise ValueError("this embedding checkpoint has no decision head")
     else:
         limits = generator.args
-    window = min(limits.max_batch_size or 1, _MAX_CONCURRENT_READS)
+    # Bound outstanding reads from this request. The backend forms batches across callers.
+    window = limits.max_batch_size or 1
     max_context = limits.max_seq_len
     if config is None and max_context is not None:
         max_context *= limits.context_parallel_size

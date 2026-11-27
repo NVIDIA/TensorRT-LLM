@@ -48,7 +48,7 @@ The probability is in `answers[0].probability`. OpenAI Python SDK 3.26.0 and lat
 
 ## Model execution and limits
 
-Qwen3.5-35B-A3B runs with `trtllm-serve serve MODEL`. The service reads the next-token logits for the specified answer labels. PPLX-Decider v1.1-27B runs on one GPU with `trtllm-serve embeddings MODEL`. Its trained prompt, ordered answer codes, last-position classification head and checkpoint temperature determine each distribution. Both services enforce the configured model context length.
+Qwen3.5-35B-A3B runs with `trtllm-serve serve MODEL`. The service reads the next-token logits for the specified answer labels. PPLX-Decider v1.1-27B runs on one GPU with `trtllm-serve embeddings MODEL`. Its trained prompt, ordered answer codes, last-position classification head and checkpoint temperature determine each distribution. Both services enforce the configured model context length. For a multi-question request, `--max_batch_size` also limits how many questions can be in flight at once.
 
 System One accepts 1–255 choices. On Qwen, each answer label must encode as a distinct single token. OpenAI Decisions accepts 2–26 choices on Qwen and 2–255 on PPLX. The text profile excludes media, `box`, `input_json`, tool histories, per-question refusal and explicit cache controls.
 
