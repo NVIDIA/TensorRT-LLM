@@ -17,6 +17,28 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_generation_token_mapping,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (  # noqa: E501
+    qsa_index_scores_groups_cute__decode as _igc,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (  # noqa: E501
+    qsa_sparse_gqa_splitk_cute__decode as mod,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.draft_continue_rows__decode import (  # noqa: E501
+    draft_continue_select,
+    draft_rows_gather,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_grouped_cute as _sgg_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_splitk_cute as _sgc_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    qsa_topk_expand_cluster as _tkc_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    supports,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
     qsa_topk_expand_decode as family_op,
 )
@@ -30,20 +52,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
     qsa_index_scores_cute__prefill as _isc,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention import (  # noqa: E501
-    qsa_index_scores_groups_cute__decode as _igc,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention import (  # noqa: E501
     qsa_sparse_gqa_rowtile__prefill as _module,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention import (  # noqa: E501
-    qsa_sparse_gqa_splitk_cute__decode as mod,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention import (  # noqa: E501
     qsa_triton_kernels__stable_jit as _stable,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.draft_continue_rows__decode import (  # noqa: E501
-    draft_continue_select,
-    draft_rows_gather,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_fp8_pages_to_bf16__prefill import (  # noqa: E501
     qsa_fp8_pages_to_bf16 as _f2b_op,
@@ -60,26 +72,14 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_paged_sparse_gqa import (  # noqa: E501
     qsa_paged_sparse_gqa,
 )
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
-    qsa_sparse_gqa_grouped_cute as _sgg_op,
-)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
     qsa_sparse_gqa_rowtile as _rtl_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
     rows_per_group,
 )
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
-    qsa_sparse_gqa_splitk_cute as _sgc_op,
-)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_spec_step_metadata__decode import (  # noqa: E501
     qsa_spec_step_metadata,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
-    qsa_topk_expand_cluster as _tkc_op,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
-    supports,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_topk_rows_cute__prefill import (  # noqa: E501
     qsa_topk_rows as _tkr_op,

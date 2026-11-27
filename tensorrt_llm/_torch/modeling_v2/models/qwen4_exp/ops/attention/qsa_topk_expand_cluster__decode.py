@@ -636,7 +636,7 @@ class QsaTopkExpandClusterDecode(OpWrapper):
     )
 
     note = """
-    Source: this target's CuTe DSL kernel, `cute.compile`d (`--enable-tvm-ffi`) on first call
+    Source: this module's CuTe DSL kernel, `cute.compile`d (`--enable-tvm-ffi`) on first call
     per table width and row stride, k, compress ratio, token budget, index dtypes, PDL and
     cluster size.
 

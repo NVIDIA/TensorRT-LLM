@@ -2738,7 +2738,7 @@ class QsaSparseGqaGroupedCute(OpWrapper):
     )
 
     note = """
-    Source: this target's CuTe DSL kernels (`_GroupedKernel`, `_RowMergeKernel`, `_BalPlanKernel`),
+    Source: this module's CuTe DSL kernels (`_GroupedKernel`, `_RowMergeKernel`, `_BalPlanKernel`),
     `cute.compile`d per (T, splits, launch mode); every reachable plan of a geometry is compiled on
     its first call. Called by `modeling._sparse_gqa` for verify / draft-extend rows over an e4m3
     pool with `rows_per_request` > 1 where `serves` (an e4m3 pool on SM103/SM107, 2..4 rows a request,

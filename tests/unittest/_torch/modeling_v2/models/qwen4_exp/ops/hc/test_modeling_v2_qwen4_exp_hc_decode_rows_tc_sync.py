@@ -4,15 +4,16 @@
 
 ``_First2`` receives data from the peer CTAs of its cluster through shared-memory mailboxes
 credited with ``st.async``: the family kernel receives the K half's block rows (``bbar``, folded
-sites only) and the cluster's row partials (``rbar``); the FP8 target's copy receives the row
-partials (``rbar``). ``st.async``'s complete-tx releases at cluster scope, so the receiver's
-mailbox reads must be ordered by a cluster-scope acquire; ``cute.arch.mbarrier_wait`` and an
-inline ``mbarrier.try_wait`` without a scope acquire at CTA scope only. Both kernels use a relaxed
-cluster-scope try-wait followed by ``fence.acquire.sync_restrict::shared::cluster.cluster`` at
-every mailbox wait, which orders the reads without the L1 invalidation an acquire-qualified
-try-wait incurs. An accuracy test cannot pin this down (the payload and its completion are not
-reordered on current hardware), so this test scans the kernels' sources and fails if either
-ordering is changed back. No GPU, no CUDA and no cutlass import are needed.
+sites only) and the cluster's row partials (``rbar``); the ``__decode`` copy (the FP8 target's rows
+pair) receives the row partials (``rbar``). ``st.async``'s complete-tx releases at cluster scope,
+so the receiver's mailbox reads must be ordered by a cluster-scope acquire;
+``cute.arch.mbarrier_wait`` and an inline ``mbarrier.try_wait`` without a scope acquire at CTA
+scope only. Both kernels use a relaxed cluster-scope try-wait followed by
+``fence.acquire.sync_restrict::shared::cluster.cluster`` at every mailbox wait, which orders the
+reads without the L1 invalidation an acquire-qualified try-wait incurs. An accuracy test cannot pin
+this down (the payload and its completion are not reordered on current hardware), so this test
+scans the kernels' sources and fails if either ordering is changed back. No GPU, no CUDA and no
+cutlass import are needed.
 """
 
 import ast
@@ -26,13 +27,7 @@ _QWEN4_EXP = Path(tensorrt_llm.__file__).parent.joinpath(
     "_torch", "modeling_v2", "models", "qwen4_exp"
 )
 _FAMILY = _QWEN4_EXP / "ops" / "hc" / "qwen4_exp_hc_decode_rows_tc.py"
-_FP8_TARGET = (
-    _QWEN4_EXP
-    / "qwen3_8_flash_next_fp8__sm_10x__default"
-    / "ops"
-    / "hc"
-    / "qwen4_exp_hc_decode_rows_tc__decode.py"
-)
+_DECODE = _QWEN4_EXP / "ops" / "hc" / "qwen4_exp_hc_decode_rows_tc__decode.py"
 _WAIT = "prims.mbarrier_try_wait_parity"
 _FENCE = "prims.fence_sync_restrict"
 
@@ -40,12 +35,12 @@ _FENCE = "prims.fence_sync_restrict"
 _RBAR = ("rbar_ptr", "rbar", "_st_async_f32", "sRed")
 _BBAR = ("bbar_ptr", "bbar", "_st_async_v4", "sblk_vec")
 
-# kernel -> (source file, its mailboxes, the barriers an inline CTA-scope wait may take). The FP8
-# target's weight-row barrier (``wbar``) completes on this CTA's own bulk copies from global
-# memory, for which a CTA-scope acquire is enough.
+# kernel -> (source file, its mailboxes, the barriers an inline CTA-scope wait may take). The
+# ``__decode`` copy's weight-row barrier (``wbar``) completes on this CTA's own bulk copies from
+# global memory, for which a CTA-scope acquire is enough.
 _KERNELS = {
     "family": (_FAMILY, [_BBAR, _RBAR], set()),
-    "fp8_target": (_FP8_TARGET, [_RBAR], {"wbar"}),
+    "decode": (_DECODE, [_RBAR], {"wbar"}),
 }
 _CASES = [
     pytest.param(name, mailbox, id=f"{name}-{mailbox[1]}")
