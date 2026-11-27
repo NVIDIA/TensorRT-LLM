@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Differential correctness test for ``fused_expand_group_quant_fp8``.
+"""Differential correctness tests for DeepGemm's fused expand/quant and gather/finalize.
 
 The DeepGemm pre-GEMM pipeline used to be::
 
@@ -17,7 +17,7 @@ Because the eliminated "expand" step is a pure data copy (no arithmetic) and the
 new kernel runs the exact same quant op-sequence over the same input group, the
 result is **bit-identical** -- there is no floating-point reordering, and the
 outputs are FP8 bytes + packed int32 scales, so there is no FMA/rounding
-ambiguity. This test therefore asserts strict equality.
+ambiguity. The expand/quant test checks both outputs for exact equality.
 
 To make the "expanded buffer == compact source, reordered" invariant exact, the
 source ``x`` is **fp32**: ``moe_permute_op`` produces an fp32 expanded buffer, so
@@ -26,9 +26,14 @@ fp32 ``x``) load identical values. This is precisely the off-by-one-prone index
 encoding the kernel relies on (``unpermuted_idx = k_rank * num_tokens +
 token_id``, k_rank slow), so the test directly guards it against the real maps.
 
+After GEMM, the unfused path gathers the expert output into a buffer and calls
+``moe_finalize_scale_op`` to weight and reduce it. ``triton_fused_gather_finalize``
+reads the expert output directly. The test compares their BF16 outputs with
+``rtol=atol=1e-2`` to allow for differences in multiply-add rounding.
+
 Run as::
 
-    pytest tests/unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py -v
+    pytest tests/unittest/_torch/moe/impls/test_deepgemm_cuda_grouped_gemm.py -v
 """
 
 from __future__ import annotations
@@ -43,21 +48,23 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     fused_expand_group_quant_fp8,
     masked_index_copy_group_quant_fp8,
     preprocess_after_permute,
+    triton_fused_gather_finalize,
+    triton_masked_index_gather,
 )
 from tensorrt_llm._utils import get_sm_version
 
 skip_unsupported = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() < 90,
-    reason="Requires CUDA SM90+ (DeepGemm MoE pre-GEMM kernels)",
+    reason="Requires CUDA SM90+ (DeepGemm MoE kernels)",
 )
 
 GROUP_SIZE = 128
 
 
 @dataclass(frozen=True)
-class ExpandQuantShape:
+class DeepGemmShape:
     name: str
-    num_source_tokens: int
+    num_rows: int
     hidden: int
     num_experts: int
     top_k: int
@@ -66,13 +73,22 @@ class ExpandQuantShape:
 # Anchors mirror the PR-2 microbench sweep (study-plan note): the model anchor
 # (32 x 8 x 4096 x 128), the small corner, and a medium batch. ``hidden`` is a
 # multiple of the 128 quant group size (required by both kernels).
-SHAPES = [
-    ExpandQuantShape("anchor", num_source_tokens=32, hidden=4096, num_experts=128, top_k=8),
-    ExpandQuantShape("anchor_h7168", num_source_tokens=32, hidden=7168, num_experts=128, top_k=8),
-    ExpandQuantShape("small", num_source_tokens=1, hidden=512, num_experts=8, top_k=4),
-    ExpandQuantShape("medium_batch", num_source_tokens=64, hidden=7168, num_experts=128, top_k=8),
-    ExpandQuantShape("topk4", num_source_tokens=16, hidden=4096, num_experts=64, top_k=4),
-]
+def _shapes(single_token: DeepGemmShape) -> list[DeepGemmShape]:
+    return [
+        DeepGemmShape("anchor", num_rows=32, hidden=4096, num_experts=128, top_k=8),
+        DeepGemmShape("anchor_h7168", num_rows=32, hidden=7168, num_experts=128, top_k=8),
+        single_token,
+        DeepGemmShape("medium_batch", num_rows=64, hidden=7168, num_experts=128, top_k=8),
+        DeepGemmShape("topk4", num_rows=16, hidden=4096, num_experts=64, top_k=4),
+    ]
+
+
+EXPAND_QUANT_SHAPES = _shapes(
+    DeepGemmShape("small", num_rows=1, hidden=512, num_experts=8, top_k=4)
+)
+GATHER_FINALIZE_SHAPES = _shapes(
+    DeepGemmShape("single_token", num_rows=1, hidden=512, num_experts=64, top_k=4)
+)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -136,12 +152,12 @@ def test_skip_data_expand_omits_unused_outputs() -> None:
 
 
 @skip_unsupported
-@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: s.name)
-def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
+@pytest.mark.parametrize("shape", EXPAND_QUANT_SHAPES, ids=lambda s: s.name)
+def test_fused_expand_quant_matches_unfused(shape: DeepGemmShape) -> None:
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(1234)
 
-    num_rows = shape.num_source_tokens
+    num_rows = shape.num_rows
     hidden = shape.hidden
     num_experts = shape.num_experts
     top_k = shape.top_k
@@ -150,11 +166,9 @@ def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
     cluster_size, cluster_rank = 1, 0
     num_experts_per_node = num_experts
 
-    # Per-row distinct top-k experts with positive normalized weights.
-    logits = torch.randn((num_rows, num_experts), device=device, dtype=torch.float32, generator=gen)
-    topk_vals, topk_ids = logits.topk(top_k, dim=-1)
-    token_selected_experts = topk_ids.to(torch.int32)
-    token_final_scales = torch.softmax(topk_vals, dim=-1).to(torch.float32)
+    token_selected_experts, token_final_scales = _make_routing(
+        num_rows, num_experts, top_k, device=device, generator=gen
+    )
 
     # fp32 source: makes the expanded buffer an exact copy of x, so the old and
     # new kernels read bit-identical values (see module docstring).
@@ -238,3 +252,141 @@ def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
             f"{q_mismatch} FP8 byte mismatches, "
             f"{s_mismatch} int32 scale mismatches"
         )
+
+
+def _make_routing(
+    num_rows: int, num_experts: int, top_k: int, *, device: str, generator: torch.Generator
+):
+    """Synthesize a valid (token_selected_experts, token_final_scales) pair.
+
+    Each row selects ``top_k`` *distinct* experts (top-k never repeats an
+    expert), with positive routing weights that sum to one per row.
+    """
+    logits = torch.randn(
+        (num_rows, num_experts), device=device, dtype=torch.float32, generator=generator
+    )
+    topk_vals, topk_ids = logits.topk(top_k, dim=-1)
+    token_selected_experts = topk_ids.to(torch.int32)
+    token_final_scales = torch.softmax(topk_vals, dim=-1).to(torch.float32)
+    return token_selected_experts, token_final_scales
+
+
+@skip_unsupported
+@pytest.mark.parametrize("shape", GATHER_FINALIZE_SHAPES, ids=lambda s: s.name)
+def test_fused_gather_finalize_matches_unfused(shape: DeepGemmShape) -> None:
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(1234)
+
+    num_rows = shape.num_rows
+    hidden = shape.hidden
+    num_experts = shape.num_experts
+    top_k = shape.top_k
+
+    # Single-rank configuration: every expert is local to this node.
+    tp_size, tp_rank, ep_size, ep_rank = 1, 0, 1, 0
+    cluster_size, cluster_rank = 1, 0
+    num_experts_per_node = num_experts
+
+    token_selected_experts, token_final_scales = _make_routing(
+        num_rows, num_experts, top_k, device=device, generator=gen
+    )
+
+    # Driver activations for the permutation. Only the maps are consumed below;
+    # the expert GEMM output ``h3`` is synthesized independently.
+    x = torch.randn((num_rows, hidden), device=device, dtype=torch.bfloat16, generator=gen)
+
+    # Real permutation maps (self-consistent by construction).
+    (
+        permuted_row_to_unpermuted_row_tensor,
+        _permuted_token_selected_experts_tensor,
+        permuted_data_tensor,
+        expert_first_token_offset_tensor,
+        _permuted_token_final_scales_tensor,
+        unpermuted_row_to_permuted_row_tensor,
+    ) = torch.ops.trtllm.moe_permute_op(
+        x,
+        token_selected_experts,
+        token_final_scales,
+        None,  # fc1_expert_weights
+        None,  # fc2_expert_weights
+        None,  # quant_scales
+        input_sf=None,
+        num_experts_on_rank=num_experts_per_node,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        cluster_size=cluster_size,
+        cluster_rank=cluster_rank,
+        min_latency_mode=False,
+        use_fp8_block_scaling=True,
+    )
+
+    num_expanded = num_rows * top_k
+    assert permuted_data_tensor.shape[0] == num_expanded
+
+    _masked_m, token_to_expert_map = preprocess_after_permute(
+        expert_first_token_offset_tensor, permuted_data_tensor.shape[0]
+    )
+
+    # Synthesize the expert GEMM output h3: [num_experts, max_tokens_per_expert,
+    # hidden]. At most ``num_rows`` tokens can route to any single expert (top-k
+    # picks distinct experts per token), so an m_max of align(num_rows, 128)
+    # safely bounds the per-expert column dimension, matching forward().
+    m_max = ((num_rows + 127) // 128) * 128
+    h3 = torch.randn(
+        (num_experts, m_max, hidden), device=device, dtype=torch.bfloat16, generator=gen
+    )
+
+    # ---- Old path: gather into permuted_data, then finalize-scale ----
+    gather_out = torch.empty((num_expanded, hidden), device=device, dtype=h3.dtype)
+    triton_masked_index_gather(
+        gather_out, h3, expert_first_token_offset_tensor, token_to_expert_map
+    )
+    out_unfused = torch.ops.trtllm.moe_finalize_scale_op(
+        gather_out,
+        None,  # biases
+        token_final_scales,
+        unpermuted_row_to_permuted_row_tensor,
+        permuted_row_to_unpermuted_row_tensor,
+        token_selected_experts,
+        expert_first_token_offset_tensor,
+        False,  # enable_alltoall
+        num_rows,
+        hidden,  # (possibly padded) hidden_size
+        hidden,  # unpadded hidden size (no padding in this test)
+        top_k,
+        num_experts_per_node,
+        tp_size,
+        tp_rank,
+        ep_size,
+        ep_rank,
+    )
+
+    # ---- New path: single fused kernel reading h3 directly ----
+    out_fused = triton_fused_gather_finalize(
+        h3=h3,
+        token_final_scales=token_final_scales,
+        unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row_tensor,
+        token_to_expert_map=token_to_expert_map,
+        expert_first_token_offset=expert_first_token_offset_tensor,
+        token_selected_experts=token_selected_experts,
+        num_rows=num_rows,
+        hidden_size=hidden,
+        unpadded_hidden_size=hidden,
+        experts_per_token=top_k,
+        num_experts_per_node=num_experts_per_node,
+        ep_rank=ep_rank,
+    )
+
+    assert out_fused.shape == out_unfused.shape == (num_rows, hidden)
+    assert out_fused.dtype == out_unfused.dtype == torch.bfloat16
+
+    # Report bit-exactness (documents the PR claim) without gating on it.
+    bitwise_equal = torch.equal(out_fused, out_unfused)
+    max_abs_diff = (out_fused.float() - out_unfused.float()).abs().max().item()
+    print(f"[{shape.name}] bitwise_equal={bitwise_equal} max_abs_diff={max_abs_diff:.3e}")
+
+    # Committed gate: tight tolerance (robust across FMA-contraction differences
+    # between the Triton and nvcc backends).
+    torch.testing.assert_close(out_fused, out_unfused, rtol=1e-2, atol=1e-2)

@@ -23,7 +23,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # NOTE: This file is what is left after the deprecated, permanently-skipped MoE
 # tests were removed; the unified MoE test framework in
-# tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py
+# tests/unittest/_torch/moe/test_moe_impl.py and test_moe_module.py
 # covers them. Add new MoE tests there, not here.
 
 

@@ -27,7 +27,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from _torch.moe.megamoe_ugpu_test_utils import MockVmm
-from _torch.moe.moe_test_utils import MoeBackendType
+from _torch.moe.moe_test_utils import MoeTestFamily
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
@@ -74,7 +74,7 @@ def env(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 def _backend(cls: type = MegaMoECuteDsl) -> MegaMoECuteDsl:
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
-        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        moe_backend=MoeTestFamily.MEGAMOE_CUTEDSL.value,
         skip_create_weights_in_init=True,
     )
     return cls(

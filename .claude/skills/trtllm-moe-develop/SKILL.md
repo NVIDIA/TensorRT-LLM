@@ -32,7 +32,7 @@ weigh owner boundaries and testability above local style.
 2. Do its identity and its implementation sit on one concrete class, and is it
    in the lists the tests iterate (`_SINGLE_FORMAT_IMPLS`,
    `_CUTLASS_DECLARATIONS`, `_CUTEDSL_DECLARATIONS`, `_TRTLLM_GEN_IDS` in
-   `test_moe_impl.py`)? (Canonical Examples)
+   `test_moe_impl_identity.py`)? (Canonical Examples)
 3. Is `can_implement` pure, and are routing, EPLB, and LoRA limits declined
    there with a `MoERejectReason` (activation through `activation_support`),
    rather than only in a factory, scheduler, wrapper, or test-local skip? A

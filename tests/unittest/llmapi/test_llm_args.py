@@ -601,7 +601,7 @@ moe_tactic: cutlass.nvfp4
 class TestMoeConfigTactic:
     """``MoeConfig.tactic`` is checked by MoE resolution's request parsing when built.
 
-    ``test_moe_impl.py`` covers what is checked only at resolution.
+    ``test_moe_impl_identity.py`` covers what is checked only at resolution.
     """
 
     @pytest.mark.parametrize(
