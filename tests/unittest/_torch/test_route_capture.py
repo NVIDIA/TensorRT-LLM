@@ -406,3 +406,73 @@ def test_opt_out_owner_feeds_opt_in_prefix_hit():
     ((_, routes),) = sib.py_result.appended
     assert routes.shape == (5, _L, _K) and int(routes.min()) >= 0
     assert rc._pfx_misses == 0
+
+
+# ---- recompute: decode positions after a re-prefill -----------------------------
+
+
+class _LiveReq(_FakeReq):
+    """A request driven through prefill, decode and a pause for recompute.
+
+    ``prompt_len`` models the C++ prompt length, which a pause grows by the
+    generated tokens; ``py_prompt_len`` is the Python-side copy.
+    """
+
+    def __init__(self, rid, toks):
+        super().__init__(rid)
+        self.is_dummy = False
+        self._toks = list(toks)
+        self.prompt_len = len(toks)
+        self.py_prompt_len = len(toks)
+        self.context_current_position = 0
+        self.context_chunk_size = len(toks)
+
+    def get_tokens(self, beam):
+        return list(self._toks)
+
+    def pause(self, refresh_py_prompt_len):
+        self.prompt_len = len(self._toks)
+        if refresh_py_prompt_len:
+            self.py_prompt_len = self.prompt_len
+        self.context_chunk_size = self.prompt_len
+
+
+def _run_step(rc, ctx=(), gen=()):
+    """One forward: the router output of each row is its true token position."""
+    rc.prepare(_Batch(ctx=ctx, gen=gen))
+    true_pos = [p for req in ctx for p in range(req.prompt_len)]
+    true_pos += [len(req._toks) - 1 for req in gen]
+    rows = torch.stack([_row(p) for p in true_pos]).to(torch.int32)
+    rc.commit(rows, rc._layout)
+    rc.finish_forward()
+    for req in [*ctx, *gen]:
+        req._toks.append(1000 + len(req._toks))  # the token this step sampled
+
+
+def _routes_after_recompute(refresh_py_prompt_len):
+    rc = RouteCapture(rank=0)
+    req = _LiveReq(1, range(100, 104))
+    _run_step(rc, ctx=[req])
+    _run_step(rc, gen=[req])
+    _run_step(rc, gen=[req])
+    req.pause(refresh_py_prompt_len)  # the prompt grows by the 3 generated tokens
+    _run_step(rc, ctx=[req])
+    _run_step(rc, gen=[req])
+    _run_step(rc, gen=[req])
+    rc.attach_routes(req)
+    ((_, routes),) = req.py_result.appended
+    return len(req._toks), routes
+
+
+def test_recompute_restarts_decode_positions_after_the_grown_prompt():
+    seq_len, routes = _routes_after_recompute(refresh_py_prompt_len=True)
+    assert routes.shape == (seq_len - 1, _L, _K)
+    for pos in range(seq_len - 1):
+        assert torch.equal(routes[pos], _row(pos))
+
+
+def test_recompute_reads_the_live_prompt_length_when_py_prompt_len_is_stale():
+    seq_len, routes = _routes_after_recompute(refresh_py_prompt_len=False)
+    assert routes.shape == (seq_len - 1, _L, _K)
+    for pos in range(seq_len - 1):
+        assert torch.equal(routes[pos], _row(pos))
