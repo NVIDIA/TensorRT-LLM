@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.configs.nemotron_shortcut import NemotronShortcutTextConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import resolve_recurrent_state_spec
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
@@ -41,9 +42,13 @@ _TEXT_MODELS = {
     "qwen4": ("Qwen4ExpForCausalLM", "qwen4_exp_text"),
     "kimi": ("KimiLinearForCausalLM", "kimi_linear"),
     "glm": ("Glm5NextForCausalLM", "glm5_next_text"),
+    "shortcut": (
+        NemotronShortcutTextConfig.causal_lm_architecture,
+        NemotronShortcutTextConfig.model_type,
+    ),
 }
 
-# Every architecture name registered for a text model of a recurrent family.
+# Every architecture name registered or declared for a text model of a recurrent family.
 _TEXT_ARCHITECTURES = [
     ("nemotron", "NemotronHForCausalLM"),
     ("nemotron", "NemotronHPuzzleForCausalLM"),
@@ -53,6 +58,7 @@ _TEXT_ARCHITECTURES = [
     ("qwen4", "Qwen4ExpForCausalLM"),
     ("kimi", "KimiLinearForCausalLM"),
     ("glm", "Glm5NextForCausalLM"),
+    ("shortcut", NemotronShortcutTextConfig.causal_lm_architecture),
 ]
 
 # Wrapper architecture -> (family, architecture of the language model, field that holds its
@@ -132,6 +138,14 @@ _MANAGER_LAYOUT = {
         torch.float32,
         {1: ((96, 3), (32, 32, 32), (4, 8, 8)), 2: ((48, 3), (16, 16, 16), (2, 8, 8))},
     ),
+    "shortcut": (
+        torch.bfloat16,
+        torch.float32,
+        {
+            1: ((176, 3), (16, 16, 16, 32, 32, 32, 32), (4, 4, 8)),
+            2: ((88, 3), (8, 8, 8, 16, 16, 16, 16), (2, 4, 8)),
+        },
+    ),
 }
 
 
@@ -165,6 +179,14 @@ def _text_config(
         if family == "qwen4":
             config.ple_layer_ids = [1] if recurrent else []
             config.ple_conv_kernel_size, config.ngram_size, config.hc_count = 2, 3, 1
+    elif family == "shortcut":
+        config.layer_types = (
+            ["linear_attention", "full_attention"] * 2 if recurrent else ["full_attention"] * 4
+        )
+        config.gdp_num_heads, config.gdp_head_dim, config.gdp_key_head_dim = 4, 4, 8
+        config.gdp_conv_kernel, config.gdp_conv_dim = 4, 176
+        config.gdp_conv_section_widths = [16] * 3 + [32] * 4
+        config.head_dim, config.index_topk, config.index_head_dim = 16, None, 16
     else:
         config.kv_lora_rank, config.qk_rope_head_dim, config.index_head_dim = 32, 8, 16
         config.linear_attn_config = {

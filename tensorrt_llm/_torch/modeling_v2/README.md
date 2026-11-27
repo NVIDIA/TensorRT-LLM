@@ -221,6 +221,16 @@ treats a target that does not list it as `NoTarget`: `auto` keeps Modeling V1
 for that deployment and `require` raises with the reason. `EPLB_MODES` is empty
 unless the target sets it.
 
+A family whose checkpoint has no Modeling V1 model also declares its input
+processor in `routing.py`, in a function decorated with
+`@input_processors(...)` for the same architecture names. It receives the
+checkpoint config and `disable_mm_encoder`, and returns the config and the
+input processor class to build, or `None` for the default input processor.
+When its layers carry recurrent state, a function decorated with
+`@recurrent_state_specs(...)` declares that state as
+`get_recurrent_state_spec` does for a Modeling V1 model class.
+[Nemotron Shortcut routing](models/nemotron_shortcut/routing.py) is an example.
+
 `route` reads no MoE tactic (`moe_config.tactic`, `speculative_config.moe_tactic`),
 so a target with MoE layers declares the MoE implementation ids it runs.
 `moe_impls_honored` lists the ids a `moe_config.tactic` may resolve to for the

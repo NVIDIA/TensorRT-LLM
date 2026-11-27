@@ -46,6 +46,10 @@ from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 from tensorrt_llm._torch.configs.musespark_open import MuseSparkOpenConfig
 from tensorrt_llm._torch.configs.nemotron_h import NemotronHConfig
+from tensorrt_llm._torch.configs.nemotron_shortcut import (
+    NemotronShortcutConfig,
+    NemotronShortcutTextConfig,
+)
 from tensorrt_llm._torch.configs.qwen4_exp import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -111,6 +115,9 @@ def _register_custom_configs_with_transformers() -> None:
         # own composite config so AutoTokenizer.from_pretrained works on older
         # releases (the model itself is built via load_pretrained_config).
         "minicpmv4_6": MiniCPMV4_6Config,
+        # Checkpoints can name either the composite config or its text decoder.
+        NemotronShortcutConfig.model_type: NemotronShortcutConfig,
+        NemotronShortcutTextConfig.model_type: NemotronShortcutTextConfig,
         "gemma4_unified": Gemma4UnifiedConfig,
         "gemma4_unified_text": Gemma4UnifiedTextConfig,
         "gemma4_unified_vision": Gemma4UnifiedVisionConfig,
@@ -170,6 +177,8 @@ __all__ = [
     "MiniCPMV4_6VisionConfig",
     "MuseSparkOpenConfig",
     "NemotronHConfig",
+    "NemotronShortcutConfig",
+    "NemotronShortcutTextConfig",
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
     "Qwen4ExpVisionConfig",

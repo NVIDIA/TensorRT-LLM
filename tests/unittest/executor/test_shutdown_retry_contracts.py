@@ -62,8 +62,16 @@ def _llm_args(per_layer_dynamic=True, **fields):
     return SimpleNamespace(moe_config=SimpleNamespace(load_balancer=load_balancer), **fields)
 
 
-def test_collective_shutdown_is_limited_to_per_layer_dynamic_eplb():
-    assert _uses_collective_shutdown(_llm_args())
+def test_collective_shutdown_covers_dynamic_and_online_expert_placement():
+    args = _llm_args()
+    assert _uses_collective_shutdown(args)
+    placement = args.moe_config.load_balancer
+    placement.mode = "standard"
+    # Standard placement has live weight-copy workers only when updates are enabled.
+    placement.layer_updates_per_iter = 1
+    assert _uses_collective_shutdown(args)
+    placement.layer_updates_per_iter = 0
+    assert not _uses_collective_shutdown(args)
     assert not _uses_collective_shutdown(_llm_args(per_layer_dynamic=False))
     assert not _uses_collective_shutdown(SimpleNamespace(backend="pytorch"))
     assert not _uses_collective_shutdown(None)

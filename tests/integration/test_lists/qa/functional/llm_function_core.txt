@@ -812,6 +812,31 @@ accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_accurac
 # without and with MTP 3, and the MTP acceptance length, at both of its layouts.
 accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4] TIMEOUT (45)
 accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4_ep4] TIMEOUT (45)
+# Four-rank Nemotron Shortcut QA uses GB300 for BF16 and GB200 or GB300 for quantized weights.
+test_e2e.py::test_nemotron_shortcut_serving[nvfp4] TIMEOUT (90)
+accuracy/modeling_v2/nemotron_shortcut/bf16__sm_103__default/test_accuracy.py::TestShortcutBf16::test_gsm8k
+accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_10x__default/test_accuracy.py::TestShortcutNvfp4::test_gsm8k
+accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_10x__default/test_accuracy.py::test_mtp_greedy_matches_ordinary_decode
+accuracy/modeling_v2/nemotron_shortcut/mxfp8__sm_10x__default/test_accuracy.py::TestShortcutMxfp8::test_gsm8k
+accuracy/modeling_v2/nemotron_shortcut/test_video.py::test_decoded_video_frames[nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_video.py::test_evs_conditioned_video[unpruned-nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_video.py::test_evs_conditioned_video[evs-nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_lora.py::test_multi_adapter_generation[nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[plain-bf16]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[plain-nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[mtp2-bf16]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[mtp2-nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_host_cache_round_trip[bf16]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_host_cache_round_trip[nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_expert_placement.py::test_hot_expert_replica_uses_migrated_weight_planes
+accuracy/modeling_v2/nemotron_shortcut/test_expert_placement.py::test_expert_placement_preserves_generation[bf16-static]
+accuracy/modeling_v2/nemotron_shortcut/test_expert_placement.py::test_expert_placement_preserves_generation[mxfp8-static]
+accuracy/modeling_v2/nemotron_shortcut/test_expert_placement.py::test_expert_placement_preserves_generation[nvfp4-static]
+accuracy/modeling_v2/nemotron_shortcut/test_expert_placement.py::test_expert_placement_preserves_generation[nvfp4-online]
+accuracy/modeling_v2/nemotron_shortcut/test_batch_invariance.py::test_deterministic_batch_invariance[bf16]
+accuracy/modeling_v2/nemotron_shortcut/test_batch_invariance.py::test_deterministic_batch_invariance[mxfp8]
+accuracy/modeling_v2/nemotron_shortcut/test_batch_invariance.py::test_deterministic_batch_invariance[nvfp4]
+
 # Qwen3.8-Flash-Next-NVFP4, modeling_v2 qwen4_exp target (sm_103 and sm_107): every one-node
 # accuracy test of the target, the CI ones included, and those that run only here (tp1 without
 # speculation, tp1's breakable prefill graph against eager, mmmu at tep4, tp2, dep2 with MTP).

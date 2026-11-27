@@ -30,6 +30,7 @@ slower than context startup.
 """
 
 import contextlib
+import json
 import os
 import re
 import time
@@ -401,3 +402,169 @@ class TestDeepSeekV4ProDSparkMultinode(LlmapiAccuracyTestHarness):
             )
         else:
             raise AssertionError(f"Unexpected Slurm node rank {NODE_RANK}")
+
+
+@pytest.mark.timeout(5400)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("precision", ["nvfp4"])
+def test_nemotron_shortcut_tp4_handoff(precision, record_property) -> None:
+    """The GDP state and sparse index pages must follow the main KV to generation."""
+    _check_shortcut_handoff(record_property, precision, use_mtp=False)
+
+
+@pytest.mark.timeout(5400)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("precision", ["bf16", "nvfp4"])
+def test_nemotron_shortcut_tp4_prefix_mtp_handoff(precision, record_property) -> None:
+    """A warm P-side prefix resumes on an overlapping D-side MTP worker."""
+    _check_shortcut_handoff(record_property, precision, use_mtp=True)
+
+
+def _check_shortcut_handoff(record_property, precision: str, *, use_mtp: bool) -> None:
+    from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.perf_metrics import build_metrics_record_from_headers
+
+    from .modeling_v2.nemotron_shortcut._engine import require_four_rank_platform
+
+    _require_two_node_allocation()
+    # Each role holds a complete four-rank copy of the checkpoint.
+    require_four_rank_platform(precision)
+    model = str(Path(llm_models_root()) / "nemotron_shortcut" / precision)
+    index_topk = json.loads((Path(model) / "config.json").read_text())["text_config"]["index_topk"]
+    env = {**_worker_env(), MODELING_V2_VALIDATE_ENV: "1"}
+    options = {
+        "modeling_v2": "require",
+        "disable_mm_encoder": True,
+        "trust_remote_code": True,
+        "tensor_parallel_size": 4,
+        "moe_tensor_parallel_size": 2,
+        "moe_expert_parallel_size": 2,
+        "enable_attention_dp": False,
+        "disable_overlap_scheduler": False,
+        "max_num_tokens": 4096,
+        "max_seq_len": 4096,
+        "max_batch_size": 1,
+        "enable_chunked_prefill": False,
+        "cuda_graph_config": None,
+        "kv_cache_config": {
+            "use_kv_cache_manager_v2": True,
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.5,
+        },
+    }
+    if use_mtp:
+        options.update(
+            speculative_config={"decoding_type": "MTP", "max_draft_len": 2},
+            per_request_spec_decode_stats=True,
+        )
+        options["kv_cache_config"].update(
+            enable_block_reuse=True,
+            mamba_state_config={"additional_snapshot_offsets_from_end": [1]},
+        )
+    worker_args = {"host": "0.0.0.0", "env": env, "llmapi_launch": False, "rank": 0, "wait": False}
+    prompts = (
+        "The capital of France is",
+        "Read this record and complete the last line.\n"
+        + "Entry: cobalt.\n" * 560
+        + "The repeated entry is",
+    )
+    if use_mtp:
+        prompts += (prompts[-1],)
+
+    def complete(server, prompt):
+        response = requests.post(
+            server.url_for("v1/completions"),
+            timeout=180,
+            headers={"X-TRTLLM-return-metrics": "1"},
+            json={
+                "model": model,
+                "prompt": prompt,
+                "temperature": 0,
+                "top_k": 1,
+                "seed": 0,
+                "max_tokens": 16,
+                "detokenize": False,
+            },
+        )
+        response.raise_for_status()
+        ids = response.json()["choices"][0]["token_ids"]
+        assert len(ids) > 1, response.text
+        return ids, response
+
+    def check_cached_tokens(n, role, response):
+        cached = response.json()["usage"]["prompt_tokens_details"]["cached_tokens"]
+        record_property(f"prompt_{n}_{role}_cached", cached)
+        if n == 1:
+            assert cached == 0, f"Expected a cold prefix on {role}"
+        elif n == 2:
+            assert cached > index_topk, f"Expected a restored sparse prefix on {role}"
+        return cached
+
+    expected = []
+    if _is_context_node():
+        with RemoteOpenAIServer(
+            model, port=CTX_SERVER_PORT, extra_config=options, **worker_args
+        ) as agg:
+            agg.wait_for_server(timeout=SERVER_START_TIMEOUT)
+            for n, prompt in enumerate(prompts):
+                ids, response = complete(agg, prompt)
+                expected.append(ids)
+                if use_mtp:
+                    check_cached_tokens(n, "aggregate", response)
+    options.update(
+        return_perf_metrics=True,
+        cache_transceiver_config={"backend": "NIXL", "transceiver_runtime": "PYTHON"},
+    )
+    port = CTX_SERVER_PORT if _is_context_node() else GEN_SERVER_PORT
+    role = ServerRole.CONTEXT if _is_context_node() else ServerRole.GENERATION
+    if use_mtp and role == ServerRole.GENERATION:
+        options["kv_cache_config"]["enable_block_reuse"] = False
+        options["kv_cache_config"].pop("mamba_state_config")
+    with RemoteOpenAIServer(
+        model, port=port, extra_config=options, role=role, **worker_args
+    ) as worker:
+        worker.wait_for_server(timeout=SERVER_START_TIMEOUT)
+        if _is_generation_node():
+            url = f"http://{NODE_LIST[0]}:{DISAGG_SERVER_PORT}/health"
+            _wait_for_endpoint_ready(url, timeout=SERVER_START_TIMEOUT, interval=1)
+            _wait_for_endpoint_down(url, timeout=SERVER_START_TIMEOUT)
+            return
+        _wait_for_endpoint_ready(
+            f"http://{NODE_LIST[1]}:{GEN_SERVER_PORT}/health", timeout=SERVER_START_TIMEOUT
+        )
+        with RemoteDisaggOpenAIServer(
+            [f"{NODE_LIST[0]}:{CTX_SERVER_PORT}"],
+            [f"{NODE_LIST[1]}:{GEN_SERVER_PORT}"],
+            port=DISAGG_SERVER_PORT,
+            env=env,
+            disagg_config={"return_perf_metrics": True},
+        ) as pd:
+            actual = []
+            for n, (prompt, reference) in enumerate(zip(prompts, expected, strict=True)):
+                ids, response = complete(pd, prompt)
+                actual.append(ids)
+                record = build_metrics_record_from_headers(response.headers, "gen")
+                assert record, response.headers
+                timing = record["phases"]["gen"]["timing_metrics"]
+                start, end = timing["kv_cache_transfer_start"], timing["kv_cache_transfer_end"]
+                assert 0 < start < end, timing
+                length = response.json()["usage"]["prompt_tokens"]
+                record_property(f"prompt_{n}_tokens", length)
+                record_property(f"prompt_{n}_aggregate", reference)
+                record_property(f"prompt_{n}_disaggregated", ids)
+                record_property(f"prompt_{n}_kv_transfer", (start, end))
+                if n == 1:
+                    assert length > index_topk, (
+                        "The second prompt must exercise sparse index selection"
+                    )
+                if use_mtp:
+                    stats = response.json()["choices"][0]["speculative_decoding"]
+                    record_property(f"prompt_{n}_draft", stats)
+                    assert 0 < stats["total_accepted_draft_tokens"] <= stats["total_draft_tokens"]
+                    hit = check_cached_tokens(n, "context", response)
+                    if n == 2:
+                        record_property("warm_prefix_tokens", hit)
+            assert actual == expected
+            if use_mtp:
+                assert actual[1] == actual[2], "Restoring the prefix changed the continuation"

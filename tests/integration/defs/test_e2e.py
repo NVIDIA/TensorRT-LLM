@@ -498,6 +498,24 @@ def test_openai_chat_example(llm_root, llm_venv, backend: str):
     ])
 
 
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("precision", ["nvfp4"])
+def test_nemotron_shortcut_serving(llm_venv, precision, tmp_path):
+    from .test_unittests import _junit_all_tests_skipped
+
+    test_file = unittest_path(
+    ) / "llmapi" / "apps" / "_test_nemotron_shortcut_serving.py"
+    report = tmp_path / "serving.xml"
+    llm_venv.run_cmd([
+        "-m", "pytest", "-sv",
+        str(test_file), "-k", precision, f"--junitxml={report}"
+    ])
+    # Propagate a missing checkpoint or unsupported device to the outer QA result.
+    if _junit_all_tests_skipped(str(report)):
+        pytest.skip(
+            f"All {precision} Nemotron Shortcut serving cases were skipped")
+
+
 @pytest.mark.parametrize("backend", ["pytorch"])
 def test_openai_reasoning(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"

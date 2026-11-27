@@ -99,6 +99,20 @@ Supported entries use TensorRT-LLM's `Attention` and apply encoder overrides exp
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).
 
+### Image and video inputs for Nemotron Shortcut
+
+BF16, MXFP8 and NVFP4 checkpoints with the single-frame video processor
+support image chat with the shipped template and raw image captioning. For a raw caption, place `A photo of` on the line immediately
+after the `<nemo:img>` placeholder.
+The processor uses [OpenCV](#optional-dependencies) to resize images and video frames,
+so image requests for this model need that package too.
+
+For video, use the checkpoint's chat template with a video content item.
+TensorRT-LLM samples video frames uniformly (by default, 2 FPS and up to 64 frames).
+The model adds timestamps from the source frame indices to the prompt. Set
+`multimodal_config.video_pruning_rate` to `0.0` to keep all visual tokens or
+`0.5` to prune half of them.
+
 ## Adding a Model
 
 See the [multimodal onboarding guide](../developer-guide/multimodal.md#onboarding-a-model)

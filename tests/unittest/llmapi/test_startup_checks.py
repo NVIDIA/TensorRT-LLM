@@ -200,6 +200,7 @@ def _arch_args(
     encode_only=False,
     model_kwargs=None,
     checkpoint_loader=None,
+    modeling_v2="auto",
 ):
     return SimpleNamespace(
         checkpoint_format=checkpoint_format,
@@ -207,6 +208,7 @@ def _arch_args(
         encode_only=encode_only,
         model_kwargs=model_kwargs,
         checkpoint_loader=checkpoint_loader,
+        modeling_v2=modeling_v2,
     )
 
 
@@ -249,6 +251,19 @@ def test_architecture_check_passes_or_is_skipped(args, architectures):
 
 def test_architecture_check_skipped_without_config():
     startup_checks.check_architecture_registered(_arch_args(), None)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_v2_only_architecture_passes(mode):
+    config = SimpleNamespace(architectures=["NemotronShortcutForCausalLM"])
+    # The worker has the device information needed to select the target.
+    startup_checks.check_architecture_registered(_arch_args(modeling_v2=mode), config)
+
+
+def test_v2_only_architecture_rejected_when_off():
+    config = SimpleNamespace(architectures=["NemotronShortcutForCausalLM"])
+    with pytest.raises(ValueError, match="Unknown model architecture: NemotronShortcutForCausalLM"):
+        startup_checks.check_architecture_registered(_arch_args(modeling_v2="off"), config)
 
 
 def test_externally_declared_architecture_passes(monkeypatch):

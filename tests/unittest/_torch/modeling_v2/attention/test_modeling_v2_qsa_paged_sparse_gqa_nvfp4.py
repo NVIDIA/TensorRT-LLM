@@ -12,7 +12,8 @@ top-k + expansion lay them out, packed at the front.
 Beside `_compare` against the reference, every cell runs QSA's bf16 sparse GQA
 over a bf16 pool that holds the dequantized values and holds the two outputs to
 the same band: the NVFP4 kernels are the bf16 ones with a dequantizing load.
-Beyond the cells: bitwise determinism and the half-passed prefill pair's refusal.
+Beyond the cells: bitwise determinism, batch-invariant rows and the half-passed prefill
+pair's refusal.
 """
 
 import math
@@ -22,14 +23,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import triton_qsa_paged_sparse_gqa
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
-    qsa_paged_sparse_gqa_nvfp4 as _entry,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog.attention import qsa_paged_sparse_gqa_nvfp4 as _entry
+from tensorrt_llm._torch.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4 import (
     qsa_paged_sparse_gqa_nvfp4 as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_paged_sparse_gqa_nvfp4 requires a CUDA device"
@@ -337,6 +336,17 @@ def _with(**overrides):
 def test_calls_are_bitwise_deterministic() -> None:
     args = _build(_with(segments=tuple((4000 + 37 * i, 2) for i in range(4))), seed=8800)
     assert torch.equal(op(**args), op(**args))
+
+
+def test_batch_invariant_rows_match_their_solo_call() -> None:
+    """Under `batch_invariant` a row is reduced in one order whichever rows share the call."""
+    args = _build(CKPT, seed=8950)
+    together = op(**args, batch_invariant=True)
+    row = 7
+    solo = dict(args)
+    for name in ("q", "selected_tokens", "request_indices"):
+        solo[name] = args[name][row : row + 1]
+    assert torch.equal(op(**solo, batch_invariant=True)[0], together[row])
 
 
 def test_rejects_positions_without_a_compress_ratio() -> None:

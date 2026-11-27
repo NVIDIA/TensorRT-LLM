@@ -475,6 +475,8 @@ def create_engine_input_processor(model_path: str, llm_args: TorchLlmArgs) -> In
         tokenizer=None,
         checkpoint_format=llm_args.checkpoint_format,
         trust_remote_code=llm_args.trust_remote_code,
+        # Text-only workers must skip the vision processor during startup.
+        disable_mm_encoder=llm_args.disable_mm_encoder,
         **input_processor_kwargs,
     )
 

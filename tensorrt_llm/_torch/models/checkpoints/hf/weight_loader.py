@@ -32,6 +32,8 @@ import tqdm
 from mpi4py import MPI as _MPI
 
 from tensorrt_llm._errors import ModelLoadError
+from tensorrt_llm._torch.configs.nemotron_shortcut import (
+    NemotronShortcutConfig, NemotronShortcutTextConfig)
 from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
@@ -62,7 +64,9 @@ _SUPPORTED_REQUESTED_IO_POLICIES = (
 # their models stream rank-local slices out of the lazy mmapped handles. The
 # gate reads the raw config.json, so it names the checkpoint's own model_type.
 _LAZY_SAFETENSORS_MODEL_TYPES = ("kimi_k3", "kimi_linear", "glm5_next",
-                                 "glm5_next_text", "muse_spark")
+                                 "glm5_next_text", "muse_spark",
+                                 NemotronShortcutConfig.model_type,
+                                 NemotronShortcutTextConfig.model_type)
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.

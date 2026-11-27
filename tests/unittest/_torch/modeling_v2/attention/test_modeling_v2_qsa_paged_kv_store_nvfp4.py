@@ -16,11 +16,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store_nvfp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog.attention.qsa_paged_kv_store_nvfp4 import (
     qsa_paged_kv_store_nvfp4 as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_paged_kv_store_nvfp4 requires a CUDA device"

@@ -37,6 +37,7 @@ pytestmark = pytest.mark.cpu_only
         ("kimi_k3", "template"),
         ("nemotron_h_omni", "grammar"),
         ("nemotron_h", "grammar"),
+        ("nemotron4", "grammar"),
         ("qwen3", None),
         ("qwen3_next", None),
         ("unknown", None),
@@ -88,6 +89,36 @@ class TestRequiredToolChoiceDispatch:
 
 
 class TestStructuredOutputDispatch:
+    @pytest.mark.parametrize("parser", ["nemotron-v3", "nano-v3"])
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_nemotron_prefilled_reasoning_boundary(self, parser, thinking):
+        import xgrammar
+
+        from tensorrt_llm.serve.openai_protocol import (
+            ResponseFormat,
+            _response_format_to_guided_decoding_params,
+        )
+
+        params = _response_format_to_guided_decoding_params(
+            ResponseFormat(type="regex", regex="answer"),
+            reasoning_parser=parser,
+            chat_template_kwargs={"enable_thinking": thinking},
+        )
+        if thinking:
+            tokenizer = xgrammar.TokenizerInfo(
+                [bytes([i]) for i in range(256)] + [b"<EOS>"], stop_token_ids=[256]
+            )
+            grammar = xgrammar.GrammarCompiler(tokenizer).compile_structural_tag(
+                params.structural_tag
+            )
+            matcher = xgrammar.GrammarMatcher(grammar)
+            # The template opened the reasoning block before the grammar saw its first token.
+            assert matcher.accept_string("thought</think>answer") and matcher.accept_token(256)
+            matcher.reset()
+            assert not matcher.accept_string("thought</think>other")
+        else:
+            assert params.regex == "answer" and params.structural_tag is None
+
     def test_registered_parser_returns_bound_hook(self, scratch_extension) -> None:
         hook = structured_output_format_for(scratch_extension.parser_key)
         content = {"type": "json_schema", "json_schema": {"type": "object"}}

@@ -75,6 +75,85 @@ def registered_routes() -> Dict[str, Callable[..., type]]:
     return _ROUTES
 
 
+def _declares(registry: Dict[str, Callable], what: str, architectures: Tuple[str, ...]):
+    """Fill ``registry`` with the decorated function for each of ``architectures``."""
+
+    def register(declared):
+        for arch in architectures:
+            assert arch not in registry, (
+                f"{arch} {what} declared by both "
+                f"{registry[arch].__module__} and {declared.__module__}"
+            )
+            registry[arch] = declared
+        return declared
+
+    return register
+
+
+# architectures[0] -> the function that picks its input processor, filled by ``@input_processors``.
+_INPUT_PROCESSORS: Dict[str, Callable[..., tuple]] = {}
+
+
+def input_processors(*architectures: str):
+    """Declare that the decorated function picks the input processor for these ``architectures[0]`` values.
+
+    A family whose checkpoint has no built-in model declares one in its
+    ``routing.py``. It takes the checkpoint config and ``disable_mm_encoder``,
+    and returns the config the input processor is built with and the input
+    processor class, or ``None`` for the default input processor.
+    """
+    return _declares(_INPUT_PROCESSORS, "input processor", architectures)
+
+
+def modeling_v2_input_processor(pretrained_config, *, disable_mm_encoder: bool) -> tuple:
+    """The config and input processor class a family declares for a checkpoint without a built-in model.
+
+    Returns ``(pretrained_config, None)`` when no family declares one for
+    ``architectures[0]``.
+    """
+    architectures = getattr(pretrained_config, "architectures", None)
+    if not architectures:
+        return pretrained_config, None
+    from . import models  # noqa: F401
+
+    select = _INPUT_PROCESSORS.get(architectures[0])
+    if select is None:
+        return pretrained_config, None
+    return select(pretrained_config, disable_mm_encoder=disable_mm_encoder)
+
+
+# architectures[0] -> the function that declares its recurrent state, filled by
+# ``@recurrent_state_specs``.
+_RECURRENT_STATE_SPECS: Dict[str, Callable[..., object]] = {}
+
+
+def recurrent_state_specs(*architectures: str):
+    """Declare that the decorated function declares the recurrent state for these ``architectures[0]`` values.
+
+    A family whose checkpoint has no built-in model declares one in its
+    ``routing.py``. It takes the checkpoint config and ``quant_config``, like
+    ``get_recurrent_state_spec`` of a built-in model class, and returns the
+    ``RecurrentStateSpec``.
+    """
+    return _declares(_RECURRENT_STATE_SPECS, "recurrent state", architectures)
+
+
+def modeling_v2_recurrent_state_spec(pretrained_config, *, quant_config=None):
+    """The recurrent state a family declares for a checkpoint without a built-in model.
+
+    Returns ``None`` when no family declares one for ``architectures[0]``.
+    """
+    architectures = getattr(pretrained_config, "architectures", None)
+    if not architectures:
+        return None
+    from . import models  # noqa: F401
+
+    declare = _RECURRENT_STATE_SPECS.get(architectures[0])
+    if declare is None:
+        return None
+    return declare(pretrained_config, quant_config=quant_config)
+
+
 #: Turns the step contract check on. Off by default, so a served engine runs
 #: the forward and nothing else: the checks describe facts fixed at engine
 #: construction, and a check that can only ever hold is a check whose failure

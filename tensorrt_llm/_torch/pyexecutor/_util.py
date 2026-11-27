@@ -294,6 +294,16 @@ def is_disagg_enabled(
             and cache_transceiver_config.backend is not None)
 
 
+def _require_python_nixl(model: str,
+                         config: Optional[CacheTransceiverConfig]) -> None:
+    backend, runtime = _resolve_disagg_transceiver_route(config)
+    if (backend, runtime) != ("NIXL", "PYTHON"):
+        raise ValueError(
+            f"{model} disaggregated serving requires cache_transceiver_config "
+            "backend='NIXL' with transceiver_runtime='PYTHON' "
+            f"(got backend={backend!r}, transceiver_runtime={runtime!r}).")
+
+
 def is_agg_helix(
         mapping: Mapping,
         cache_transceiver_config: Optional[CacheTransceiverConfig]) -> bool:
@@ -415,6 +425,20 @@ def get_kv_cache_manager_cls(
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
 
+        if config_utils.is_nemotron_shortcut(config):
+            if not use_v2:
+                raise ValueError(
+                    "Nemotron Shortcut GDP and sparse index state require KV cache manager V2."
+                )
+            if is_disagg:
+                # The Python transceiver transfers the sparse index and recurrent state with KV.
+                _require_python_nixl("Nemotron Shortcut",
+                                     cache_transceiver_config)
+            _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
+            from ..modules.nemotron_shortcut.cache_manager import \
+                NemotronShortcutCacheManager
+            return NemotronShortcutCacheManager
+
         if config_utils.is_glm5_next(config):
             # glm5_next indexer state is a V2 extra buffer: reject any knob
             # that would select a non-V2 manager.
@@ -425,15 +449,7 @@ def get_kv_cache_manager_cls(
                     "TRTLLM_USE_PY_MAMBA / TLLM_MAMBA_MANAGER_PREFERENCE.")
             if is_disagg:
                 # Only the Python NIXL transceiver moves KDA and indexer state.
-                backend, runtime = _resolve_disagg_transceiver_route(
-                    cache_transceiver_config)
-                if runtime != "PYTHON" or backend != "NIXL":
-                    raise ValueError(
-                        "glm5_next disaggregated serving requires "
-                        "cache_transceiver_config backend='NIXL' with "
-                        "transceiver_runtime='PYTHON' (got "
-                        f"backend={backend!r}, transceiver_runtime={runtime!r})."
-                    )
+                _require_python_nixl("glm5_next", cache_transceiver_config)
             if not use_v2:
                 raise ValueError(
                     "glm5_next requires KV cache manager V2 (the sparse-layer "
@@ -5088,7 +5104,8 @@ def _create_kv_cache_manager(
             is_disagg=is_disagg,
             **manager_extra_kwargs,
         )
-    elif is_nemotron_hybrid(config):
+    elif is_nemotron_hybrid(config) or config_utils.is_nemotron_shortcut(
+            config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -5579,6 +5596,8 @@ def create_py_executor_resources(
     peft_cache_manager = None
     if lora_config is not None:
         lora_owner = model_engine.initialize_lora_owner()
+        # Meta initialization copies the model config; PEFT must configure the executor's copy.
+        lora_owner.configure_hf_targets(lora_config)
         # TODO: Refactor dimension resolution into a LoraModuleDimensions
         # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
