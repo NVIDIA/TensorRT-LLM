@@ -120,11 +120,13 @@ class ServingExtension:
 
         Mutates ``request`` in place, deriving chat-template kwargs from
         request-level fields. The default passes a ``reasoning_effort`` the
-        client set to the renderer as ``chat_template_kwargs["reasoning_effort"]``,
-        the key chat templates and custom tokenizers read an effort from
-        (Responses and Messages pass theirs the same way). One already in
-        ``chat_template_kwargs`` wins; ``"none"``, which asks for no reasoning
-        rather than for a level, is not passed. An extension that maps the
+        client set through :meth:`normalize_reasoning_effort` and stores the
+        result as ``chat_template_kwargs["reasoning_effort"]``, the key chat
+        templates and custom tokenizers read an effort from (Responses and
+        Messages pass theirs the same way). One already in
+        ``chat_template_kwargs`` wins without normalization; a normalized
+        result of ``None``, empty, or ``"none"`` (which asks for no reasoning
+        rather than for a level) is not passed. An extension that maps the
         field onto its model's own controls overrides this without calling it;
         other overrides call it.
         """
@@ -137,7 +139,10 @@ class ServingExtension:
         # Harmony's ReasoningEffort values are capitalized; templates compare lower-case names.
         effort = effort.lower()
         kwargs = request.chat_template_kwargs or {}
-        if effort == "none" or "reasoning_effort" in kwargs:
+        if "reasoning_effort" in kwargs:
+            return
+        effort = self.normalize_reasoning_effort(effort)
+        if not isinstance(effort, str) or not effort or effort == "none":
             return
         request.chat_template_kwargs = {**kwargs, "reasoning_effort": effort}
         # Derived from an API field, so the unused-kwargs guard must not reject it

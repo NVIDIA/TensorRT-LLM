@@ -844,6 +844,51 @@ class TestRequestedReasoningEffort:
             {"reasoning_effort": "max"}, reasoning_effort="low"
         )
 
+    def test_default_hook_normalizes_derived_effort_and_preserves_explicit_kwarg(self) -> None:
+        class NormalizingExtension(ServingExtension):
+            def __init__(self) -> None:
+                self.seen: list[str] = []
+
+            def normalize_reasoning_effort(self, effort: str):
+                self.seen.append(effort)
+                return {"none": "low", "low": None}.get(effort, effort)
+
+        tokenizer = make_tokenizer(chat_template=EFFORT_TEMPLATE)
+
+        # Normalized value reaches the template (including mapping "none" to a level)
+        # and is marked injected.
+        ext = NormalizingExtension()
+        req_mapped = chat_request(reasoning_effort="none")
+        rendered = render_chat(req_mapped, resources(tokenizer, extension=ext), tokenize=False).text
+        assert rendered.startswith("Reasoning Effort: Low|")
+        assert req_mapped.chat_template_kwargs == {"reasoning_effort": "low"}
+        assert req_mapped.injected_chat_template_kwargs == ["reasoning_effort"]
+        assert ext.seen == ["none"]
+
+        # Returning None leaves the key unset so the template default applies.
+        ext_drop = NormalizingExtension()
+        req_dropped = chat_request(reasoning_effort="low")
+        rendered_dropped = render_chat(
+            req_dropped, resources(tokenizer, extension=ext_drop), tokenize=False
+        ).text
+        assert rendered_dropped.startswith("Reasoning Effort: Max|")
+        assert req_dropped.chat_template_kwargs is None
+        assert req_dropped.injected_chat_template_kwargs is None
+        assert ext_drop.seen == ["low"]
+
+        # Explicit chat_template_kwargs bypasses normalize_reasoning_effort unchanged.
+        ext_explicit = NormalizingExtension()
+        req_explicit = chat_request(
+            reasoning_effort="low", chat_template_kwargs={"reasoning_effort": "high"}
+        )
+        rendered_explicit = render_chat(
+            req_explicit, resources(tokenizer, extension=ext_explicit), tokenize=False
+        ).text
+        assert rendered_explicit.startswith("Reasoning Effort: High|")
+        assert req_explicit.chat_template_kwargs == {"reasoning_effort": "high"}
+        assert req_explicit.injected_chat_template_kwargs is None
+        assert ext_explicit.seen == []
+
 
 class TestFingerprint:
     @pytest.mark.parametrize("model_type", [None, ""])
