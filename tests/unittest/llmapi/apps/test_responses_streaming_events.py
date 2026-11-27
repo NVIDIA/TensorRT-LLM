@@ -995,9 +995,37 @@ class TestKeepaliveInterval:
 async def test_the_environment_sets_the_interval_of_a_stream(monkeypatch):
     """With the module constant at its default, the environment alone makes a short interval."""
     _set_keepalive_env(monkeypatch, "0.05")
-    sent = await _collect(
-        keep_responses_stream_alive(_server_frames([(0.4, "Hello"), (0, " world")]))
-    )
+    release_source = asyncio.Event()
+
+    async def gated_frames():
+        processor = _processor()
+        for frame in processor.get_initial_responses():
+            yield frame
+        await release_source.wait()
+        text = ""
+        for i, diff in enumerate(("Hello", " world")):
+            text += diff
+            result = _step(text, diff, done=i == 1)
+            for frame in processor.process_single_output(result):
+                yield frame
+            if result._done:
+                yield processor.get_final_response_non_store(result)
+
+    sent = []
+    stream = keep_responses_stream_alive(gated_frames())
+
+    async def drain():
+        async for frame in stream:
+            sent.append(frame)
+            if len(_keepalive_positions(sent)) >= 2:
+                release_source.set()
+            assert len(sent) < 500, "the stream does not end"
+
+    try:
+        await asyncio.wait_for(drain(), timeout=5)
+    finally:
+        release_source.set()
+        await stream.aclose()
 
     assert len(_keepalive_positions(sent)) >= 2
     assert _event_type(sent[-1]) == "response.completed"
