@@ -3562,6 +3562,24 @@ def _fp8_context_pages(md, tpb: int) -> int:
     return int(((lens + (tpb - 1)) // tpb).sum())
 
 
+def _fp8_context_groups(core, md, tpb: int, fp8_pages: int) -> list | None:
+    """A step's context rows in groups of consecutive requests whose pages each fit the row-tile
+    scratch (`_FP8_ROWTILE_MAX_SCRATCH`), `(first row, end row, pages)` a group, or None where
+    one launch fits. Without it a step over more history than the scratch holds (three long
+    requests in one batch) falls back to the per-row kernel for every row."""
+    page_bytes = 2 * core.heads_kv * tpb * core.head_dim * 2  # K and V, bf16
+    max_pages = max(1, _FP8_ROWTILE_MAX_SCRATCH // page_bytes)
+    if fp8_pages <= max_pages or md.num_contexts < 2:
+        return None
+    num_contexts = md.num_contexts
+    pages = ((md.kv_lens_runtime[:num_contexts] + (tpb - 1)) // tpb).tolist()
+    rows = md.seq_lens[:num_contexts].tolist()
+    return [
+        (first_row, end_row, sum(pages[first:end]))
+        for first, end, first_row, end_row in _nvfp4_context_groups(pages, rows, max_pages)
+    ]
+
+
 def _sparse_gqa_rowtile(
     core, kv, q, block_table, selected, request_indices, tpb, query_positions, fp8_pages
 ):
@@ -3935,6 +3953,8 @@ class _PrefillStep(NamedTuple):
     # Over an fp8 pool, the context requests' pages the row-tile pass widens
     # (`_fp8_context_pages`); None otherwise.
     fp8_pages: int | None = None
+    # Over an fp8 pool, `_fp8_context_groups` when those pages pass one scratch; None otherwise.
+    fp8_groups: list | None = None
     # `_live_score_columns`: a bound on every row's selection window.
     live_cols: int | None = None
     # A context-only step with in-forward snapshots: `_InforwardSplit`.
@@ -4090,7 +4110,16 @@ class PrefillTarget:
                     step.attn["predicted_tokens_per_seq"],
                 )
                 parts = []
-            for lo, hi, context_rows in parts:
+            if parts and step.fp8_groups is not None:
+                # The context rows a scratch-sized group of requests at a time.
+                assert parts[0] == (0, num_ctx, True), (parts[0], num_ctx)
+                assert step.fp8_groups[-1][1] == num_ctx, (step.fp8_groups[-1], num_ctx)
+                parts = [(lo, hi, True, pages) for lo, hi, pages in step.fp8_groups] + [
+                    (lo, hi, context_rows, None) for lo, hi, context_rows in parts[1:]
+                ]
+            else:
+                parts = [(lo, hi, context_rows, step.fp8_pages) for lo, hi, context_rows in parts]
+            for lo, hi, context_rows, pages in parts:
                 out = _sparse_gqa(
                     core,
                     kv,
@@ -4100,7 +4129,7 @@ class PrefillTarget:
                     req_idx[lo:hi],
                     tokens_per_block,
                     logical[lo:hi] if context_rows else None,
-                    step.fp8_pages,
+                    pages,
                 )
                 attn_out[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
         else:
@@ -4791,12 +4820,14 @@ class PrefillTarget:
                 tokens_per_block=md.tokens_per_block,
             )
         fp8_pages = None
+        fp8_groups = None
         if (
             sparse
             and core.quant_mode == QM_FP8_KV_CACHE
             and num_prefill_tokens >= _ROWTILE_MIN_ROWS
         ):
             fp8_pages = _fp8_context_pages(md, md.tokens_per_block)
+            fp8_groups = _fp8_context_groups(core, md, md.tokens_per_block, fp8_pages)
         nvfp4_context = None
         if (
             sparse
@@ -4818,6 +4849,7 @@ class PrefillTarget:
             vision=vision,
             stage=is_verify,
             fp8_pages=fp8_pages,
+            fp8_groups=fp8_groups,
             nvfp4_context=nvfp4_context,
             live_cols=_live_score_columns(core, md, batch),
             inforward=_inforward_split(md, mm, si_all, hi_all, pools),
