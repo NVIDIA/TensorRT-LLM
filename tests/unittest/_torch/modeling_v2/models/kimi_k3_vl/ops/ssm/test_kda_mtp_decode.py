@@ -15,6 +15,9 @@ pytest.importorskip("cutlass")
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_mtp_decode import (  # noqa: E501, E402
     kda_mtp_decode,
 )
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (  # noqa: E402
+    mtp_ops,
+)
 
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402
@@ -180,3 +183,24 @@ def test_cells(cell) -> None:
         # (2.5 measured on GB300).
         assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=0.25)
     _check_post(args, post, cell.why)
+
+
+@torch.no_grad()
+def test_v1_kernel_matches_reference(monkeypatch) -> None:
+    cell = next(
+        cell
+        for cell in kda_mtp_decode.CELLS
+        if cell.spec == dict(heads=6, requests=1, num_spec=7, variant="bf16")
+    )
+    args = _call_args(cell.spec, seed=20261119)
+    args["use_pdl"] = False
+    ref, post = kda_mtp_decode.reference(**args)
+
+    monkeypatch.setattr(mtp_ops, "_MTP_V2", False)
+    with validating(kda_mtp_decode):
+        out = kda_mtp_decode(**args)
+    torch.cuda.synchronize()
+
+    assert out.shape == (1, 8, 6, K) and out.dtype == torch.bfloat16
+    assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=0.25)
+    _check_post(args, post, "v1 kda_decode_mtp_kernel")
