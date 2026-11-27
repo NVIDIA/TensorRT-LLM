@@ -616,6 +616,15 @@ def collectSlurmTimeoutEvidence(def pipeline, Map remote, String remoteLogPath, 
     }
 }
 
+// A successful SLURM verdict stands only on the results its final copy brought back: a
+// results.xml left by a progress snapshot may be partial.
+def requireFinalSlurmResults(String stageName, String finalXmlMarker) {
+    if (!fileExists(finalXmlMarker) || !fileHasContent("${stageName}/results.xml")) {
+        throw new InfraFailure("The final test results of ${stageName} were not copied back; refusing to report success.",
+            null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-final-results-missing>")
+    }
+}
+
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
@@ -743,6 +752,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     def rerunInfraFailure = null
     def unrerunInfraFailure = null
     def hasUnrerunFailure = false
+    Throwable isolatedFailure = null
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
@@ -762,17 +772,21 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
         isolateTestCmdLine += ["--periodic-junit-xmlpath=${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
+        // The failure that cleanup below must not replace.
+        Throwable testFailure = null
         try {
             sh(label: "Run pytest (isolated_${i})", script: """
                 cd ${llmSrc}/tests/integration/defs && \
                 ${isolateTestCmdLine.join(" ")}
             """)
         } catch (InterruptedException e) {
+            testFailure = e
             throw e
         } catch (Exception e) {
+            testFailure = e
             collectOriginatingStepTimeoutEvidence(pipeline, e, stageName)
             def rerunResult = rerunFailedTests(
-                pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag, retryContext)
+                pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag, retryContext, e)
             if (rerunResult.failed) {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
@@ -799,7 +813,9 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     // Record this crash as a JUnit <testcase> like the regular-test
                     // path does. hasUnrerunFailure stays untouched here: it drives
                     // the duration/no-signature message below, which doesn't apply.
-                    generateTimeoutTestResultXml(pipeline, stageName)
+                    preservePrimaryFailure(e, true) {
+                        generateTimeoutTestResultXml(pipeline, stageName)
+                    }
                     catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                         error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
                     }
@@ -817,11 +833,17 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                         error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun under this stage's rerun policy (the rerun list log says why)"
                     }
                     hasUnrerunFailure = true
+                } else if (rerunResult.rerunAttempted) {
+                    // The failed test passed on rerun.
+                    testFailure = null
                 }
             }
+            isolatedFailure = isolatedFailure ?: testFailure
         } finally {
             // Clean up the temporary test file
-            sh "rm -f ${singleTestFile}"
+            preservePrimaryFailure(testFailure, true) {
+                sh "rm -f ${singleTestFile}"
+            }
         }
     }
 
@@ -842,6 +864,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         rerunInfraFailure: rerunInfraFailure,
         unrerunInfraFailure: unrerunInfraFailure,
         hasUnrerunFailure: hasUnrerunFailure,
+        failure: isolatedFailure,
     ]
 }
 
@@ -3597,6 +3620,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def srunAccountArg = slurmAccountMatch.find() ? "-A ${slurmAccountMatch.group(1)} " : ""
                 def sshStatCmd = Utils.sshUserCmd(remote, "\"srun --overlap ${srunAccountArg}--quiet --jobid='${slurmJobId}' --ntasks=1 stat -c %Y '${remoteWorkspaceTrk}/results.xml' || echo 0\"")
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
+                // Written only when the final copy of the result XMLs succeeds.
+                def finalXmlMarker = "${stageName}/.final-xml-copied"
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
                 def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
@@ -3663,8 +3688,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             fi
                             mkdir -p '${WORKSPACE}/${stageName}'
                             ${sshRefreshCacheCmd}
+                            rm -f '${finalXmlMarker}'
                             for _attempt in 1 2 3; do
-                                ${scpXmlCmd} && break
+                                ${scpXmlCmd} && { touch '${finalXmlMarker}'; break; }
                                 [ \$_attempt -lt 3 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp xml failed, retry \$_attempt/3" && sleep 10
                             done || true
                             _unfinished_ok=0
@@ -3713,6 +3739,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     // ... and re-confirm success, so a transient read blip on a job
                     // that actually passed doesn't fail the stage.
                     if (jobState == null && slurmState == "COMPLETED") {
+                        requireFinalSlurmResults(stageName, finalXmlMarker)
                         echo "[INFRA-RETRY] ${stageName}: verdict unreadable but sacct reports COMPLETED for ${slurmJobId}; treating as success."
                         return
                     }
@@ -3767,6 +3794,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} state=${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}; deferring to classifier."
                     throw jobFailure
                 }
+                requireFinalSlurmResults(stageName, finalXmlMarker)
             }
             echo "Finished test stage execution."
             }  // end CloudManager.withSlurmFrontendFailover
@@ -4408,7 +4436,10 @@ def classifyFailure(def pipeline, Throwable error, String scope, Map retryContex
     return FailureClassifier.classify(error, scope, evidence)
 }
 
-def preservePrimaryFailure(Throwable primaryError, Closure actions)
+// agentLossWins: the caller later reports primaryError through an error of its own, which would
+// drop an agent loss attached to primaryError, so the loss propagates instead unless primaryError
+// is itself an interruption.
+def preservePrimaryFailure(Throwable primaryError, boolean agentLossWins=false, Closure actions)
 {
     try {
         actions()
@@ -4416,6 +4447,7 @@ def preservePrimaryFailure(Throwable primaryError, Closure actions)
         // Post-processing failures must not replace the failure that triggered them.
         // K8s node removal is secondary; control and unknown interruptions still win.
         if (primaryError == null || FailureClassifier.classify(e, InfraFailure.K8S) instanceof PipelineInterruption) throw e
+        if (agentLossWins && !FailureClassifier.hasInterruption(primaryError) && FailureClassifier.hasInterruption(e)) throw e
         // Keep agent loss on the primary so outer handlers do not retry on a dead dispatcher.
         FailureClassifier.attachAgentLoss(primaryError, e)
         echo "[INFRA-RETRY] Secondary failure while handling ${primaryError}:\n${Utils.getStackTrace(e)}"
@@ -5730,7 +5762,7 @@ def fileHasContent(path) {
 // Return whether the rerun failed and any typed infra failure classified from
 // the rerun's originating shell step. The typed failure lets the outer retry
 // layer preserve bounded evidence after result/report generation finishes.
-def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="", Map retryContext=null) {
+def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="", Map retryContext=null, Throwable testFailure=null) {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
         // No results were ever flushed (e.g. the process was killed before any
         // test finished reporting). test_rerun.py treats a missing xml as "no
@@ -5763,16 +5795,24 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
         echo "test_rerun.py in ${llmSrc} does not support --stage-name; generating rerun lists without the stage's rerun policy"
     }
     def stageNameArg = stageNameSupported ? "--stage-name='${stageName}'" : ""
-    sh(label: "Generate rerun test lists (${testType})", script: """
-        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
-        generate_rerun_tests_list \
-        --output-dir=${rerunDir}/ \
-        --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}' \
-        ${stageNameArg} \
-        ${testListArg} \
-        ${unfinishedTestArg}
-    """)
+    // Lists that could not be made rerun nothing, so the caller reports testFailure itself.
+    def listsGenerated = false
+    preservePrimaryFailure(testFailure, true) {
+        sh(label: "Generate rerun test lists (${testType})", script: """
+            python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
+            generate_rerun_tests_list \
+            --output-dir=${rerunDir}/ \
+            --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
+            --fail-signatures='${failSignaturesList}' \
+            ${stageNameArg} \
+            ${testListArg} \
+            ${unfinishedTestArg}
+        """)
+        listsGenerated = true
+    }
+    if (!listsGenerated) {
+        return [failed: false, infraFailure: null, rerunAttempted: false]
+    }
 
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
@@ -5788,12 +5828,14 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
     // Rerun tests
     def isRerunFailed = false
     def rerunInfraFailure = null
+    def rerunAttempted = false
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
         if (!fileExists(currentRerunTestList)) {
             echo "No failed ${testType} tests need to be rerun ${times} time(s)"
             continue
         }
+        rerunAttempted = true
         sh "cat ${currentRerunTestList}"
         def xmlFile = "${rerunDir}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
@@ -5865,7 +5907,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
     }
 
     echo "isRerunFailed for ${testType}: ${isRerunFailed}"
-    return [failed: isRerunFailed, infraFailure: rerunInfraFailure]
+    return [failed: isRerunFailed, infraFailure: rerunInfraFailure, rerunAttempted: rerunAttempted]
 }
 
 def generateRerunReport(stageName, llmSrc, String postTag) {
@@ -6628,6 +6670,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def rerunInfraFailure = null
         def unrerunInfraFailure = null
         def hasUnrerunFailure = false
+        // The test failure this stage will report; post-processing must not replace it.
+        Throwable testFailure = null
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
             testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -6812,14 +6856,18 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
+                        testFailure = e
                         collectOriginatingStepTimeoutEvidence(pipeline, e, stageName)
                         def rerunResult = rerunFailedTests(
-                            pipeline, stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag, retryContext)
+                            pipeline, stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag, retryContext, e)
                         // Unconditional: a test can crash again during the rerun itself
                         // (isRerunFailed=true), and unfinished_test.txt is the only
                         // record of that crash. junit()'s "results*.xml" glob picks up
                         // results-timeout.xml directly, so this is what surfaces it.
-                        def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
+                        def hadUnfinishedTests = false
+                        preservePrimaryFailure(e, true) {
+                            hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
+                        }
                         if (rerunResult.failed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Regular tests failed after rerun attempt"
@@ -6849,6 +6897,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 error "Some tests failed and were not eligible for rerun under this stage's rerun policy (the rerun list log says why), please check the test report."
                             }
                             hasUnrerunFailure = true
+                        } else if (rerunResult.rerunAttempted) {
+                            // Every failed test passed on rerun.
+                            testFailure = null
                         }
                     }
 
@@ -6862,6 +6913,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             rerunInfraFailure = isolatedResult.rerunInfraFailure ?: rerunInfraFailure
                             unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure
                             hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
+                            testFailure = testFailure ?: isolatedResult.failure
                         }
                     } else {
                         echo "No isolated tests to run for stage ${stageName}"
@@ -6893,10 +6945,22 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Generate comprehensive rerun report if any reruns occurred
-        stage ("Generate Report") {
-            timeout(time: 15, unit: 'MINUTES'){
-                generateRerunReport(stageName, llmSrc, postTag)
+        def reportStartMs = System.currentTimeMillis()
+        try {
+            preservePrimaryFailure(testFailure, true) {
+                stage ("Generate Report") {
+                    timeout(time: 15, unit: 'MINUTES'){
+                        generateRerunReport(stageName, llmSrc, postTag)
+                    }
+                }
             }
+        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+            // The report's own time limit is no reason to drop the test failure; an abort or
+            // an enclosing timeout still propagates.
+            if (testFailure == null || !ownTimeoutExpired(e, reportStartMs, 15)) {
+                throw e
+            }
+            echo "Generate Report ran out of its 15 min; reporting the test failure instead."
         }
 
         // Unguarded error() on purpose -- catchError here would swallow the
@@ -6908,7 +6972,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (generateTimeoutTestResultXml(pipeline, stageName) || fileExists("${stageName}/results-timeout.xml")) {
+        def hadTimeoutResults = false
+        preservePrimaryFailure(testFailure, true) {
+            hadTimeoutResults = generateTimeoutTestResultXml(pipeline, stageName)
+        }
+        if (hadTimeoutResults || fileExists("${stageName}/results-timeout.xml")) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
@@ -6917,6 +6985,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 throw unrerunInfraFailure
             }
             error "Some tests failed and were not eligible for rerun under this stage's rerun policy (the rerun list log says why), please check the test report."
+        }
+
+        // A pytest failure that no branch above reports, e.g. one outside any test
+        // (teardown), which leaves nothing to rerun.
+        if (testFailure != null) {
+            throw testFailure
         }
     }
 
