@@ -92,7 +92,7 @@ def _build(spec, seed):
 def _gate(out, ref):
     o, r = out.float(), ref.float()
     per = (o - r).norm(dim=-1) / r.norm(dim=-1).clamp_min(1e-30)
-    whole = float((o - r).norm() / r.norm())
+    whole = float((o - r).norm() / r.norm().clamp_min(1e-30))
     assert float(per.max()) < 1e-2 and whole < 4e-3, (float(per.max()), whole)
 
 
