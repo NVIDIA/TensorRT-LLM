@@ -90,3 +90,23 @@ stress:
     - "10"
     - --request-cancellation-delay
     - "0.5"
+
+# Accuracy threshold is a fraction in [0, 1].
+accuracy:
+  threshold: 0.90
+  num_samples: 200
+  num_fewshot: 32
+  concurrency: 8
+  max_gen_toks: 1024
+  max_length: 8192
+  request_timeout: 600
+  random_seed: 0
+  tokenizer: deepseek_v41
+  apply_chat_template: true
+  system_prompt: "Solve the problem carefully. End your response with a final line exactly in the form #### <answer>."
+  chat_template_kwargs:
+    enable_thinking: false
+  stop_strings: []
+
+# Omit this for models without speculative decoding.
+min_acceptance_length: 3.0

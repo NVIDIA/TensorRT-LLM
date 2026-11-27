@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import pytest
 import yaml
 from defs.conftest import skip_pre_blackwell
+from defs.stress_test.gsm8k import Gsm8kConfig, check_acceptance_length, evaluate_gsm8k_server
 from multinode_utils import check_peer, peer_connection, slurm_topology, wait_for_signal
 
 if TYPE_CHECKING:
@@ -75,6 +76,8 @@ class _StressConfig:
     env: dict[str, str]
     unset_env_prefixes: list[str]
     stress: _Workload
+    accuracy: Gsm8kConfig
+    min_acceptance_length: float | None = None
 
     @classmethod
     def from_yaml(cls, path: Path) -> "_StressConfig":
@@ -83,6 +86,7 @@ class _StressConfig:
         if not isinstance(data, dict):
             raise ValueError(f"Stress config must be a YAML mapping: {path}")
         data["stress"] = _Workload(**data["stress"])
+        data["accuracy"] = Gsm8kConfig(**data["accuracy"])
         return cls(**data)
 
 
@@ -236,9 +240,8 @@ def disagg_cluster(
             yield cluster
 
 
-def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
-    """Gate cross-node KV-transfer stability under 8k/1k load and post-stress accuracy."""
-    cluster = disagg_cluster
+def _run_stress_test(cluster: _Cluster) -> None:
+    """Drive the configured stress load and post-stress server accuracy checks."""
     timeouts = cluster.config.timeouts
     workload = cluster.config.stress
     if cluster.rank == 1:
@@ -253,7 +256,6 @@ def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
         cluster.connection.sendall(b"P")
         return
 
-    from defs.deepseek_v41_gsm8k import evaluate_gsm8k_server
     from defs.disaggregated.test_disaggregated import enforce_aiperf_error_rate
     from defs.stress_test.stress_test import (
         ServerConfig,
@@ -261,8 +263,6 @@ def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
         run_aiperf_process,
         warmup_inference,
     )
-
-    from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
 
     server = ServerConfig(host=cluster.hosts[0], port=FRONTEND_PORT)
     assert warmup_inference(server.url, cluster.model_path, timeout=timeouts["warmup"])
@@ -289,10 +289,16 @@ def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
         expected_records=workload.request_count,
     )
     cluster.check()
-    tokenizer = DeepseekV41Tokenizer.from_pretrained(
-        cluster.model_path, trust_remote_code=True, local_files_only=True
+    result = evaluate_gsm8k_server(
+        server.url,
+        cluster.model_path,
+        cluster.config.accuracy,
+        cluster.artifacts / "gsm8k",
+        timeout=timeouts["accuracy"],
+        collect_acceptance_stats=cluster.config.min_acceptance_length is not None,
     )
-    evaluate_gsm8k_server(server.url, cluster.model_path, tokenizer, cluster.artifacts / "gsm8k")
+    if cluster.config.min_acceptance_length is not None:
+        check_acceptance_length(result, cluster.config.min_acceptance_length)
     assert warmup_inference(
         server.url,
         cluster.model_path,
@@ -303,3 +309,8 @@ def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
     cluster.check_logs()
     cluster.connection.sendall(b"D")
     wait_for_signal(cluster.connection, b"P", timeouts["peer_completion"], cluster.check_local)
+
+
+def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
+    """Gate cross-node KV-transfer stability under 8k/1k load and post-stress accuracy."""
+    _run_stress_test(disagg_cluster)
