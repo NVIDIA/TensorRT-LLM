@@ -64,6 +64,9 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_nvfp4_kv_no_reuse] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_finar] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_opt_in] TIMEOUT (60)
+  # qwen4_exp target, post-merge: FP8 KV at dep4 on the opt-in, lossy e4m3 QSA index anchors
+  # alone (TRTLLM_QWEN4_EXP_INDEX_KEY_FP8=1), apart from the stack cases that also set them.
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_index_key_fp8] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_disaggregated_dep2 TIMEOUT (90)
   # qwen4_exp FP8 target, post-merge: dep4 MTP3, dep2 disaggregated.
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[dep4] TIMEOUT (60)
