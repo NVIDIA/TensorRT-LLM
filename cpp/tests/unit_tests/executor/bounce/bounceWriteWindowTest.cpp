@@ -114,7 +114,8 @@ TEST(BounceReceiveWindow, SelectedSlotsPreservePaddingHolesAndWriterPieces)
     std::array<std::int64_t, 2> const offsets{0, 12};
     std::array<std::int64_t, 2> const lengths{4, 4};
     b::BounceWriteWindows windows;
-    auto window = windows.addSlots("writer", "endpoint", std::string(16, 'w'), slots, {64, 32, 20, 3, offsets, lengths});
+    auto window
+        = windows.addSlots("writer", "endpoint", std::string(16, 'w'), slots, {64, 32, 20, 3, offsets, lengths});
     for (auto base : {64U, 128U})
     {
         EXPECT_TRUE(window->contains(base, 4));

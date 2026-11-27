@@ -206,8 +206,8 @@ std::shared_ptr<BounceWriteWindow> BounceWriteWindows::addSlots(std::string peer
         throw std::invalid_argument("Invalid bounce receive pool geometry");
     }
     auto const available = std::numeric_limits<std::uint64_t>::max() - layout.base;
-    if (layout.numSlots && (layout.slotBytes > available
-            || layout.numSlots - 1 > (available - layout.slotBytes) / layout.stride))
+    if (layout.numSlots
+        && (layout.slotBytes > available || layout.numSlots - 1 > (available - layout.slotBytes) / layout.stride))
     {
         throw std::invalid_argument("Bounce receive pool exceeds the address space");
     }

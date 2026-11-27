@@ -340,15 +340,16 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
                 nb::gil_scoped_release release;
                 agent.registerBounceWindow(peer, endpoint, key, descs);
             })
-        .def("register_bounce_window_slots",
+        .def(
+            "register_bounce_window_slots",
             [](kvc::NixlTransferAgent& agent, std::string const& peer, std::string const& endpoint, nb::bytes token,
                 Int64Array slots, std::uint64_t base, std::uint64_t stride, std::uint64_t slotBytes,
                 std::uint64_t numSlots, Int64Array offsets, Int64Array lengths)
             {
                 std::string key(token.c_str(), token.size());
                 std::span<std::int64_t const> selected(slots.data(), slots.size());
-                kvc::bounce::BounceSlotLayout layout{
-                    base, stride, slotBytes, numSlots, {offsets.data(), offsets.size()}, {lengths.data(), lengths.size()}};
+                kvc::bounce::BounceSlotLayout layout{base, stride, slotBytes, numSlots,
+                    {offsets.data(), offsets.size()}, {lengths.data(), lengths.size()}};
                 nb::gil_scoped_release release;
                 agent.registerBounceWindowSlots(peer, endpoint, key, selected, layout);
             },
