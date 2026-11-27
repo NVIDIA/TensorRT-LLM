@@ -1369,6 +1369,63 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         restored, fresh = second.outputs[0].token_ids, cold.outputs[0].token_ids
         assert restored[:4] == fresh[:4], (restored, fresh)
 
+    @skip_unserved_gpu
+    @pytest.mark.parametrize("offsets", [[0, 128], [128]], ids=["end_and_128", "128"])
+    def test_tp1_long_snapshot_tail_keeps_two_iterations(self, monkeypatch, offsets):
+        """Snapshot offsets past the tail the in-forward split runs (FlashInfer's in-place path,
+        `inforward_snapshot_max_tail`) keep the two-iteration path instead of failing the bind.
+
+        With `[0, 128]` the final snapshot is at the prompt end, and with `[128]` the tail is
+        twice the split's: neither prompt is split in its forward, and a second turn still
+        restores its prefix from the snapshot and names the pass key."""
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        splits = []
+        split = target_modeling.flashinfer_chunk_gdn_inforward_split
+
+        def counting_split(*args, **kwargs):
+            splits.append(1)
+            return split(*args, **kwargs)
+
+        monkeypatch.setattr(target_modeling, "flashinfer_chunk_gdn_inforward_split", counting_split)
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        prompt, key = _passkey_prompts(tokenizer, (3000,))[0]
+        turn1 = tokenizer.encode(prompt)
+        greedy = SamplingParams(max_tokens=48, temperature=0)
+        end_of_turn = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        follow_up = tokenizer.encode(
+            "<|im_end|>\n<|im_start|>user\nRepeat the secret pass key once more, digits only."
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+        snapshot = KvCacheConfig(
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=True,
+            mamba_ssm_cache_dtype="float32",
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=0, additional_snapshot_offsets_from_end=offsets
+            ),
+        )
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                **dict(self.TP1_ENGINE, kv_cache_config=snapshot),
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            splits.clear()
+            first = llm.generate({"prompt_token_ids": turn1}, greedy, use_tqdm=False)
+            assert not splits, "a tail past the split's took the in-forward split"
+            answer = list(first.outputs[0].token_ids)
+            if answer and answer[-1] == end_of_turn:
+                answer.pop()
+            second = llm.generate(
+                {"prompt_token_ids": turn1 + answer + follow_up}, greedy, use_tqdm=False
+            )
+        assert 0 < second.cached_tokens <= len(turn1), (second.cached_tokens, len(turn1))
+        assert key in first.outputs[0].text, first.outputs[0].text
+        assert key in second.outputs[0].text, second.outputs[0].text
+
     # The target's AgentX deployment environment at tp1 on both engines: PDL, eight K/V
     # transfer threads and every opt-in projection of the target.
     AGENTX_ENV = {

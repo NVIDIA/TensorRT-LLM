@@ -256,6 +256,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         gdn_fused_verify: bool = False,
         gdn_mtp_replay: bool = False,
         inforward_snapshot_min_main: int = 0,
+        inforward_snapshot_max_tail: int = 0,
         **kwargs,
     ) -> None:
         kwargs.pop("mamba_ssm_stochastic_rounding", False)
@@ -269,6 +270,9 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         # by naming its fewest chunk tokens before P; 0 leaves the path off.
         self._supports_inforward_snapshot = inforward_snapshot_min_main > 0
         self._inforward_min_main_request = inforward_snapshot_min_main
+        # The longest tail the model's split runs (0: no limit). Snapshots with a longer tail keep
+        # the two-iteration path: the chunk ends at P and the tail runs as a step of its own.
+        self._inforward_max_tail_request = inforward_snapshot_max_tail
         self._inforward_snapshots = InforwardSnapshots()
         self._inforward_stage_ple: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._ple_params = qwen4_exp_ple_cache_params
@@ -743,6 +747,13 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         rows = snapshots.rows
         if rows == 0:
             return
+        cap = self._inforward_max_tail_request
+        if 0 < cap < snapshots.max_tail:
+            logger.info(
+                f"In-forward Mamba snapshots: tails of up to {cap} tokens run in the forward; "
+                f"a longer one (up to {snapshots.max_tail}) runs as a context step of its own"
+            )
+            snapshots.max_tail = cap
         min_main = max(snapshots.min_main, self._inforward_min_main_request)
         device = self.all_ssm_states[0].device
         for layer_id in self._ple_layer_ids:

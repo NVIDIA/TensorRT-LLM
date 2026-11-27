@@ -2712,13 +2712,14 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"{rank_pools.ple_state[0].shape[0]} PLE slots (bind {self._binds})",
             flush=True,
         )
-        # The tail of an in-forward snapshot split runs FlashInfer's in-place path.
+        # The tail of an in-forward snapshot split runs FlashInfer's in-place path. The manager
+        # caps its tails at `inforward_snapshot_max_tail`; one that does not cannot be served.
         max_tail = getattr(cm, "inforward_snapshot_max_tail", 0)
         if getattr(cm, "inforward_snapshot_rows", 0) > 0 and max_tail > _GDN_INPLACE_MAX_TOKENS:
             raise NotImplementedError(
-                f"in-forward Mamba snapshots with a tail of up to {max_tail} tokens "
-                "(kv_cache_config.mamba_state_config.additional_snapshot_offsets_from_end): this "
-                f"target splits tails of at most {_GDN_INPLACE_MAX_TOKENS} tokens"
+                f"the KV cache manager {type(cm).__name__} plans in-forward Mamba snapshots with "
+                f"a tail of up to {max_tail} tokens: this target splits tails of at most "
+                f"{_GDN_INPLACE_MAX_TOKENS} tokens (`inforward_snapshot_max_tail`)"
             )
         bound = _Bound(cm, rank_pools)
         if self.spec_rollback is not None:
@@ -9241,6 +9242,9 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
     # on in the cache manager; 1 leaves the fewest chunk tokens before the snapshot point at
     # the manager's own floor (the GDN conv window and the PLE windows).
     inforward_snapshot_min_main = 1
+    # The longest tail the split runs: FlashInfer's in-place path. A snapshot further from the
+    # prompt end (`additional_snapshot_offsets_from_end`) keeps the two-iteration path.
+    inforward_snapshot_max_tail = _GDN_INPLACE_MAX_TOKENS
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
