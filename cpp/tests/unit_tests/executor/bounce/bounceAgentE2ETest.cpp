@@ -229,6 +229,15 @@ TEST(BounceAgentE2E, WindowsFollowDestinationRegistrationLifetime)
     EXPECT_THROW(publish(secondKey, second), std::invalid_argument);
     agent->deregisterMemory(first);
     agent->deregisterMemory(second);
+
+    // Shrinking a registration also retires windows wholly inside its former tail.
+    agent->registerMemory(both);
+    publish(secondKey, second);
+    agent->registerMemory(first);
+    EXPECT_NO_THROW(publish(secondKey, second));
+    agent->revokeBounceWindow(secondKey);
+    agent->deregisterMemory(first);
+    agent->deregisterMemory(both);
 }
 
 TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
