@@ -7,11 +7,16 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
-from test_common.disagg_timeout import PhaseBudget, checked_worker_command, configure_weight_loading
+from test_common.disagg_timeout import (
+    PhaseBudget,
+    configure_weight_loading,
+    require_worker_startup_events,
+)
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -65,7 +70,9 @@ def test_worker_environments_and_fresh_attempts(
 ) -> None:
     first = tmp_path / "first"
     first.mkdir()
-    (first / "budgets.json").write_text('{"loading": 10, "execution": 20}', encoding="utf-8")
+    (first / "budgets.json").write_text(
+        '{"loading": 10, "execution": 20, "started": 0}', encoding="utf-8"
+    )
     monkeypatch.setenv("TRTLLM_TEST_DISAGG_TIMEOUT_DIR", str(first))
     context, generation = {}, {}
     readiness = configure_weight_loading([(context, 2), (generation, 1)])
@@ -79,16 +86,24 @@ def test_worker_environments_and_fresh_attempts(
     for name in expected[:-1]:
         _event(first, name, 5)
     assert readiness.remaining(3, 2, 6) is None
+    assert readiness.limit_address_timeout(300, 6) == 1.5
     with pytest.raises(RuntimeError, match=r"worker-1/model_weight_loading\.rank-0\.done"):
         readiness.require_complete()
+    with pytest.raises(TimeoutError, match="Weight loading did not finish within 7.5s"):
+        readiness.limit_address_timeout(300, 7.5)
     _event(first, expected[-1], 6)
     readiness.require_complete()
     assert readiness.remaining(3, 2, 7) == 1
     with pytest.raises(TimeoutError, match="within 2s after weight loading"):
         readiness.remaining(3, 2, 8)
+    assert readiness.remaining(10, 2, 11) == 1
+    with pytest.raises(TimeoutError, match="within 2s after weight loading"):
+        readiness.remaining(10, 2, 12)
     second = tmp_path / "retry"
     second.mkdir()
-    (second / "budgets.json").write_text('{"loading": 10, "execution": 20}', encoding="utf-8")
+    (second / "budgets.json").write_text(
+        '{"loading": 10, "execution": 20, "started": 10}', encoding="utf-8"
+    )
     monkeypatch.setenv("TRTLLM_TEST_DISAGG_TIMEOUT_DIR", str(second))
     configure_weight_loading([({}, 1)])
     assert PhaseBudget(second, 10, 20, 10).remaining(11) == ("weight_loading", 9)
@@ -99,13 +114,20 @@ def test_disabled_does_not_mutate_worker_env(monkeypatch: pytest.MonkeyPatch) ->
     env = {"EXISTING": "value"}
     assert configure_weight_loading([(env, 2)]) is None
     assert env == {"EXISTING": "value"}
-    command = ["trtllm-serve", "serve", "model"]
-    assert checked_worker_command(command, {"TRTLLM_STARTUP_EVENT_DIR": "/tmp"}) == command
+
+    def unexpected_probe(*args: object, **kwargs: object) -> None:
+        pytest.fail("unmarked worker ran a probe")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_probe)
+    require_worker_startup_events({"TRTLLM_STARTUP_EVENT_DIR": "/tmp"})
 
 
 @pytest.mark.parametrize("supports_events", [False, True], ids=["stale_wheel", "current_wheel"])
-def test_checked_worker_uses_its_wheel_and_reports_phase_completion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supports_events: bool
+def test_worker_probe_keeps_console_script_and_reports_phase_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture,
+    supports_events: bool,
 ) -> None:
     package = tmp_path / "wheel" / "tensorrt_llm"
     package.mkdir(parents=True)
@@ -115,6 +137,8 @@ def test_checked_worker_uses_its_wheel_and_reports_phase_completion(
     (cwd / "tensorrt_llm" / "__init__.py").write_text(
         'raise AssertionError("source tree shadowed wheel")'
     )
+    (cwd / "tensorrt_llm" / "_startup_events.py").touch()
+    monkeypatch.chdir(cwd)
     if supports_events:
         for name in (
             "_startup.py",
@@ -133,7 +157,8 @@ import sys
 from tensorrt_llm._startup import _StartupTimer
 
 def main():
-    assert sys.argv == ["trtllm-serve", "serve", "model"]
+    assert sys.argv[1:] == ["serve", "model"]
+    assert sys.modules["__main__"].__file__ == sys.argv[0]
     with _StartupTimer("executor_creation") as timer:
         with timer.phase("model_engine"):
             with timer.phase("model_weight_loading", completion_rank=0):
@@ -151,20 +176,26 @@ def main():
             'raise AssertionError("preflight imported the runtime")'
         )
 
-    (tmp_path / "budgets.json").write_text('{"loading": 10, "execution": 20}', encoding="utf-8")
+    (tmp_path / "budgets.json").write_text(
+        '{"loading": 10, "execution": 20, "started": 0}', encoding="utf-8"
+    )
     monkeypatch.setenv("TRTLLM_TEST_DISAGG_TIMEOUT_DIR", str(tmp_path))
     env = dict(os.environ, PYTHONPATH=str(package.parent))
     readiness = configure_weight_loading([(env, 1)])
     assert readiness is not None
-    cmd = checked_worker_command(["trtllm-serve", "serve", "model"], env)
-    result = subprocess.run(cmd, env=env, cwd=cwd, capture_output=True, text=True, timeout=10)
     if not supports_events:
-        assert result.returncode != 0
-        assert "Install a TensorRT-LLM wheel built from this checkout." in result.stderr
-        assert "preflight imported" not in result.stderr
+        with pytest.raises(
+            RuntimeError, match="Install a TensorRT-LLM wheel built from this checkout"
+        ):
+            require_worker_startup_events(env)
+        assert "preflight imported" not in capfd.readouterr().err
         return
 
-    assert result.returncode == 0, result.stderr
+    require_worker_startup_events(env)
+    script = tmp_path / "trtllm-serve"
+    script.write_text("from tensorrt_llm.commands.serve import main\nmain()\n", encoding="utf-8")
+    cmd = [sys.executable, str(script), "serve", "model"]
+    subprocess.run(cmd, env=env, cwd=cwd, check=True, timeout=10)
     readiness.require_complete()
     event = tmp_path / "worker-0" / "model_weight_loading.rank-0.done"
     first = event.read_text()
@@ -181,8 +212,8 @@ def _prepare_pytester(pytester: pytest.Pytester) -> None:
         "from test_common.disagg_timeout import register\n"
         "from periodic_junit import register_pytest_timeout_evidence, report_test_timeout, PeriodicJUnitXML\n"
         "def pytest_configure(config):\n"
-        "    register(config, report_timeout=report_test_timeout)\n"
         "    register_pytest_timeout_evidence(config)\n"
+        "    register(config, report_timeout=report_test_timeout)\n"
         "    reporter = PeriodicJUnitXML('reports/results.xml', dump_hang_traceback=True)\n"
         "    reporter.pytest_configure(config)\n"
         "    config.pluginmanager.register(reporter, 'periodic_junit')\n"
@@ -327,9 +358,10 @@ def test_hard_timeout_in_each_phase(pytester: pytest.Pytester, phase: str) -> No
     assert "test_hangs" in (pytester.path / "reports/hang_traceback.txt").read_text()
 
 
-def test_readiness_timeout_leaves_time_for_cleanup(pytester: pytest.Pytester) -> None:
+@pytest.mark.parametrize("loaded", [False, True], ids=["loading", "readiness"])
+def test_launcher_timeout_leaves_time_for_cleanup(pytester: pytest.Pytester, loaded: bool) -> None:
     _prepare_pytester(pytester)
-    pytester.makepyfile("""
+    pytester.makepyfile(f"""
         import time
         import pytest
         from rank_event import publish
@@ -337,13 +369,14 @@ def test_readiness_timeout_leaves_time_for_cleanup(pytester: pytest.Pytester) ->
 
         cleaned_up = False
 
-        @pytest.mark.disagg_weight_loading(5)
+        @pytest.mark.disagg_weight_loading(3)
         def test_ready_hangs():
             global cleaned_up
-            env = {}
+            env = {{}}
             readiness = configure_weight_loading([(env, 1)])
             start = time.monotonic()
-            publish(env)
+            if {loaded}:
+                publish(env)
             try:
                 while True:
                     readiness.remaining(start, 0.05, time.monotonic())
@@ -358,8 +391,53 @@ def test_readiness_timeout_leaves_time_for_cleanup(pytester: pytest.Pytester) ->
         "--timeout=2", "--timeout-method=thread", "-s", timeout=20
     )
     result.assert_outcomes(failed=1, passed=1)
-    assert "Cluster did not become ready within 0.05s after weight loading" in result.stdout.str()
+    if loaded:
+        assert (
+            "Cluster did not become ready within 0.05s after weight loading" in result.stdout.str()
+        )
+    else:
+        assert "Weight loading did not finish within 2.25s" in result.stdout.str()
+        assert "Missing events: worker-0/model_weight_loading.rank-0.done" in result.stdout.str()
     assert "TRTLLM_PYTEST_TIMEOUT " not in result.stderr.str()
+
+
+def test_late_publish_during_cleanup_keeps_session_running(pytester: pytest.Pytester) -> None:
+    _prepare_pytester(pytester)
+    pytester.makepyfile("""
+        import os
+        from pathlib import Path
+        import pytest
+        from test_common.disagg_timeout import configure_weight_loading
+
+        raced = False
+        original_rmdir = os.rmdir
+
+        @pytest.mark.disagg_weight_loading(5)
+        def test_worker_failed():
+            env = {}
+            configure_weight_loading([(env, 1)])
+            worker = Path(env["TRTLLM_STARTUP_EVENT_DIR"])
+
+            def rmdir_with_late_publish(path, *args, **kwargs):
+                global raced
+                if Path(path).name == worker.name and not raced:
+                    (worker / "late-rank.done").touch()
+                    raced = True
+                return original_rmdir(path, *args, **kwargs)
+
+            os.rmdir = rmdir_with_late_publish
+            pytest.fail("worker failed during startup")
+
+        def test_next():
+            os.rmdir = original_rmdir
+            assert raced
+            assert "TRTLLM_TEST_DISAGG_TIMEOUT_DIR" not in os.environ
+    """)
+    result = pytester.runpytest_subprocess(
+        "--timeout=2", "--timeout-method=thread", "-s", timeout=20
+    )
+    result.assert_outcomes(failed=1, passed=1)
+    assert "worker failed during startup" in result.stdout.str()
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGALRM"), reason="requires POSIX signal timers")
@@ -391,18 +469,22 @@ def test_signal_mode_keeps_session_running(pytester: pytest.Pytester) -> None:
 def test_func_only_keeps_standard_timeout(pytester: pytest.Pytester) -> None:
     _prepare_pytester(pytester)
     pytester.makepyfile("""
+        import time
         import pytest
         from test_common.disagg_timeout import configure_weight_loading
 
-        @pytest.mark.timeout(func_only=True)
+        @pytest.mark.timeout(1, func_only=True)
         @pytest.mark.disagg_weight_loading(5)
         def test_no_phase_supervisor():
             assert configure_weight_loading([({}, 1)]) is None
+            time.sleep(5)
     """)
     result = pytester.runpytest_subprocess(
         "--timeout=1", "--timeout-method=thread", "-s", timeout=20
     )
-    result.assert_outcomes(passed=1)
+    assert result.ret != 0
+    assert "Timeout" in result.stdout.str()
+    assert "TRTLLM_PYTEST_TIMEOUT " in result.stderr.str()
     assert "[disagg-timeout]" not in result.stdout.str()
 
 

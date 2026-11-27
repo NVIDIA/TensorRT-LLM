@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -32,9 +33,8 @@ _WATCHDOG = pytest.StashKey["_Watchdog"]()
 _SETTINGS = pytest.StashKey[Settings]()
 _ReportTimeout = Callable[[pytest.Item, float], None]
 
-# Check the package in the same interpreter that will call the console entry
-# point. Finding the submodule directly avoids importing the CUDA runtime.
-_CHECKED_SERVE = """\
+# Find the submodule without importing the CUDA runtime.
+_STARTUP_EVENTS_PROBE = """\
 from importlib.machinery import PathFinder
 from importlib.util import find_spec
 import sys
@@ -44,31 +44,35 @@ if sys.path and sys.path[0] == "":
     sys.path.pop(0)
 
 package = find_spec("tensorrt_llm")
-if (package is None or not package.submodule_search_locations or
-        PathFinder.find_spec("tensorrt_llm._startup_events",
-                             package.submodule_search_locations) is None):
-    sys.exit("Disaggregated weight-loading supervision requires startup phase events. "
-             "Install a TensorRT-LLM wheel built from this checkout.")
-
-from tensorrt_llm.commands.serve import main
-sys.argv[0] = "trtllm-serve"
-sys.exit(main())
+sys.exit(package is None or not package.submodule_search_locations
+         or PathFinder.find_spec("tensorrt_llm._startup_events",
+                                 package.submodule_search_locations) is None)
 """
 
 
-def checked_worker_command(args: list[str], env: Mapping[str, str]) -> list[str]:
-    """Wrap an opted-in worker's serve entry point with a runtime capability check.
+def require_worker_startup_events(env: Mapping[str, str]) -> None:
+    """Check an opted-in worker's runtime before its console script starts.
+
+    The worker's PATH must select Python 3 and trtllm-serve from the same
+    environment. The console script remains the worker's main module so MPI
+    workers can use its directory to resolve imports.
 
     Args:
-        args: The trtllm-serve command and its arguments.
         env: The same environment passed to the worker subprocess.
 
-    Returns:
-        The command to run in the worker subprocess.
+    Raises:
+        RuntimeError: The worker's Python environment lacks startup phase events.
     """
-    if os.environ.get(_ATTEMPT_ENV) and env.get(_WORKER_ENV):
-        return ["python3", "-c", _CHECKED_SERVE, *args[1:]]
-    return args
+    if not os.environ.get(_ATTEMPT_ENV) or not env.get(_WORKER_ENV):
+        return
+    probe = subprocess.run(
+        ["python3", "-c", _STARTUP_EVENTS_PROBE], env=env, timeout=120, check=False
+    )
+    if probe.returncode:
+        raise RuntimeError(
+            "Disaggregated weight-loading supervision requires startup phase events. "
+            "Install a TensorRT-LLM wheel built from this checkout."
+        )
 
 
 def configure_weight_loading(workers: list[tuple[dict[str, str], int]]) -> ReadinessBudget | None:
@@ -111,7 +115,7 @@ def configure_weight_loading(workers: list[tuple[dict[str, str], int]]) -> Readi
     temporary.write_text(json.dumps(expected), encoding="utf-8")
     temporary.replace(root / "expected.json")
     budgets = json.loads((root / "budgets.json").read_text(encoding="utf-8"))
-    return ReadinessBudget(root, budgets["loading"] + budgets["execution"])
+    return ReadinessBudget(root, budgets["loading"], budgets["execution"], budgets["started"])
 
 
 class _RankCompletions:
@@ -154,11 +158,39 @@ class _RankCompletions:
 
 
 class ReadinessBudget:
-    """Apply the caller's readiness limit once the last worker rank has loaded."""
+    """Bound launcher waits while leaving time for normal worker cleanup."""
 
-    def __init__(self, root: Path, safety_timeout: float) -> None:
-        self._completions = _RankCompletions(root)
-        self.safety_timeout = math.ceil(safety_timeout)
+    def __init__(self, root: Path, loading: float, execution: float, started: float) -> None:
+        """Initialize from the test's watchdog budgets.
+
+        Args:
+            root: Directory containing the expected rank events.
+            loading: Hard loading budget in seconds.
+            execution: Hard execution budget in seconds.
+            started: Monotonic start of the loading budget.
+        """
+        self._completions = _RankCompletions(root, started)
+        self.safety_timeout = math.ceil(loading + execution)
+        self._loading_wait = loading - min(60.0, loading / 4)
+        self._loading_deadline = started + self._loading_wait
+
+    def _loading_remaining(self, now: float) -> float:
+        remaining = self._loading_deadline - now
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Weight loading did not finish within {self._loading_wait:g}s "
+                f"before the cleanup window. Missing events: {self._completions.missing()}"
+            )
+        return remaining
+
+    def limit_address_timeout(self, timeout: float, now: float) -> float:
+        """Cap the coordinator's address wait by the remaining loading time.
+
+        Args:
+            timeout: The coordinator's existing address timeout in seconds.
+            now: Current host monotonic timestamp before starting any workers.
+        """
+        return min(timeout, self._loading_remaining(now))
 
     def remaining(self, wait_start: float, timeout: float, now: float) -> float | None:
         """Check the deadline and return seconds remaining, or None while loading.
@@ -169,10 +201,11 @@ class ReadinessBudget:
             now: Current host monotonic timestamp.
 
         Raises:
-            TimeoutError: The cluster did not become ready before its deadline.
+            TimeoutError: The launcher exceeded its loading or readiness wait.
         """
         completed_at = self._completions.completed_at()
         if completed_at is None:
+            self._loading_remaining(now)
             return None
         remaining = max(wait_start, completed_at) + timeout - now
         if remaining <= 0:
@@ -226,11 +259,17 @@ class _Watchdog:
         if output:
             output = str(Path(output).resolve())
             Path(output).mkdir(parents=True, exist_ok=True)
-        self.directory = tempfile.TemporaryDirectory(prefix="disagg-timeout-", dir=output)
+        # A rank that is still exiting can publish while the directory is removed.
+        self.directory = tempfile.TemporaryDirectory(
+            prefix="disagg-timeout-", dir=output, ignore_cleanup_errors=True
+        )
         root = Path(self.directory.name).resolve()
         self.budget = PhaseBudget(root, loading, settings.timeout, time.monotonic())
         (root / "budgets.json").write_text(
-            json.dumps({"loading": loading, "execution": settings.timeout}), encoding="utf-8"
+            json.dumps(
+                {"loading": loading, "execution": settings.timeout, "started": self.budget.start}
+            ),
+            encoding="utf-8",
         )
         self.previous_env = os.environ.get(_ATTEMPT_ENV)
         os.environ[_ATTEMPT_ENV] = str(root)
@@ -342,9 +381,10 @@ class DisaggTimeoutPlugin:
             self._cancel(item)
 
     def _cancel(self, item: pytest.Item) -> None:
-        if _WATCHDOG in item.stash:
-            item.stash[_WATCHDOG].cancel()
+        watchdog = item.stash.get(_WATCHDOG, None)
+        if watchdog is not None:
             del item.stash[_WATCHDOG]
+            watchdog.cancel()
 
     @pytest.hookimpl(tryfirst=True, optionalhook=True)
     def pytest_timeout_set_timer(self, item: pytest.Item, settings: Settings) -> bool | None:

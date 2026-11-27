@@ -240,11 +240,13 @@ The opt-in markers on individual tests define the loading budgets. Set
 the loading budget for every marked test. Selected standalone tests specify
 their execution budgets explicitly so Jenkins can provide a larger group timeout.
 
-After all ranks have loaded, the harness applies the test's service readiness
-limit within the execution budget. This lets the harness report a readiness
-failure and clean up the workers while execution time remains. The separate
-wait for the coordinator to report its initial address starts when the
-coordinator launches.
+While any rank's loading event is missing, the launchers reserve up to 60
+seconds or one quarter of the loading budget, whichever is smaller, to report
+the failure and clean up workers. The coordinator's address wait also observes
+this deadline. The watchdog still enforces the hard loading budget if a
+blocked launcher or a short override leaves too little time for cleanup. After
+all ranks have loaded, the test's service readiness limit applies within the
+execution budget.
 
 This version supports one cluster launch per test attempt and single-host
 PyTorch workers with the main/one-model checkpoint. It does not separate the
@@ -253,9 +255,10 @@ attempt has its own shared state directory. The runtime's startup timer publishe
 an atomic `model_weight_loading` completion event for each rank that finishes
 loading successfully. The phase boundary uses the last event on the shared
 host clock. Some initialization precedes or overlaps loading and is included in
-the first budget. Supervised workers check the selected TensorRT-LLM wheel for
-startup event support before importing the runtime. Build the wheel from the
-same checkout as the tests.
+the first budget. A separate Python process checks for startup event support
+before launching each supervised worker with `trtllm-serve`. Build the wheel
+from the same checkout as the tests and use a PATH that selects Python 3 and
+`trtllm-serve` from the same environment.
 
 Use `--timeout-method=thread` with a whole-test pytest timeout to enable the
 supervisor. It emits `[disagg-timeout] phase=weight_loading` and

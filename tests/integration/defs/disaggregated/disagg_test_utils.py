@@ -33,7 +33,7 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import single_host_ucx_env
 from defs.conftest import is_sm_100f
-from test_common.disagg_timeout import checked_worker_command
+from test_common.disagg_timeout import require_worker_startup_events
 
 from tensorrt_llm.logger import logger
 
@@ -188,6 +188,9 @@ def _run_worker(
         # Every worker started here serves on localhost, so its UCX peers all
         # run on this host.
         env.update(single_host_ucx_env())
+        if device != -1:
+            env["CUDA_VISIBLE_DEVICES"] = str(device)
+        require_worker_startup_events(env)
         log_file = None
         log_path = None
         # WAR for QA env (pytest --capture=tee-sys): sys.stdout/sys.stderr lack
@@ -200,12 +203,8 @@ def _run_worker(
             log_file = open(log_path, "w+")
             stdout = log_file
             stderr = log_file
-        if device != -1:
-            env["CUDA_VISIBLE_DEVICES"] = str(device)
         return ProcessWrapper(
-            subprocess.Popen(
-                checked_worker_command(cmd, env), env=env, stdout=stdout, stderr=stderr
-            ),
+            subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr),
             log_file=log_file,
             log_path=log_path,
             port=port,

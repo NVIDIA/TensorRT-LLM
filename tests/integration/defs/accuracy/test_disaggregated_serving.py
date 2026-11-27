@@ -39,8 +39,8 @@ import requests
 import yaml
 from datasets import load_dataset
 from defs.common import single_host_ucx_env, wait_for_reported_addr
-from test_common.disagg_timeout import (checked_worker_command,
-                                        configure_weight_loading)
+from test_common.disagg_timeout import (configure_weight_loading,
+                                        require_worker_startup_events)
 from test_common.moe_tactics import (cutedsl_grouped_gemm_moe_tactic,
                                      sm100f_moe_tactic_or_cutlass)
 
@@ -508,7 +508,7 @@ def launch_disaggregated_llm(
         try:
             for i, (env, args) in enumerate(server_configs):
                 if server_name in ("ctx", "gen"):
-                    args = checked_worker_command(args, env)
+                    require_worker_startup_events(env)
                 if enable_redirect_log:
                     log_path = os.path.join(temp_dir.name,
                                             f"output_{server_name}_{i}.log")
@@ -549,8 +549,12 @@ def launch_disaggregated_llm(
     ):
         server_processes = server_stack.enter_context(
             multi_popen([(base_env, server_cmd)], "disagg"))
+        address_timeout = server_waiting_timeout
+        if readiness is not None:
+            address_timeout = readiness.limit_address_timeout(
+                address_timeout, time.monotonic())
         _, serve_port = wait_for_reported_addr(disagg_addr_path,
-                                               server_waiting_timeout,
+                                               address_timeout,
                                                server_processes[0])
         print(f"Using HTTP service discovery at http://localhost:{serve_port}")
         write_worker_configs(f"http://localhost:{serve_port}")

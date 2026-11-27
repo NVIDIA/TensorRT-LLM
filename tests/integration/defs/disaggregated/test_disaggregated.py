@@ -976,8 +976,12 @@ def setup_disagg_cluster(
                                               server_port,
                                               report_addr=report_addr,
                                               **server_launch_kwargs)
+            address_timeout = server_start_timeout
+            if readiness is not None:
+                address_timeout = readiness.limit_address_timeout(
+                    address_timeout, time.monotonic())
             _, server_port = wait_for_reported_addr(report_addr,
-                                                    server_start_timeout,
+                                                    address_timeout,
                                                     disagg_server.process)
             disagg_server.port = server_port
             disagg_cluster = dict(
