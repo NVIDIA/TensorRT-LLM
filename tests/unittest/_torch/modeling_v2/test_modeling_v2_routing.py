@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -55,6 +56,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MOE_LOAD_BALANCE
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     DeepSeekSparseAttentionConfig,
+    DSparkDecodingConfig,
     KvCacheConfig,
     MoeLoadBalancerConfig,
     MoePerLayerDynamicLoadBalancerConfig,
@@ -81,6 +83,30 @@ _R1_DEFAULT_TARGET = (
 )
 _GLM52_TARGET = (
     "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.modeling.ModelingV2Glm52Nvfp4Sm103Tep4"
+)
+_MISTRAL_LARGE4_NVFP4_TEP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm103Tep"
+)
+_MISTRAL_LARGE4_NVFP4_DEP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__dep.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm103Dep"
+)
+_MISTRAL_LARGE4_NVFP4_TP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm103Tp"
+)
+_MISTRAL_LARGE4_NVFP4_SM107_TEP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_107__tep.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm107Tep"
+)
+_MISTRAL_LARGE4_NVFP4_SM107_DEP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm107Dep"
+)
+_MISTRAL_LARGE4_NVFP4_SM107_TP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm107Tp"
 )
 
 
@@ -154,6 +180,115 @@ def _glm52_config(**overrides):
     return PretrainedConfig(**fields)
 
 
+_ML4_LAYERS = 72
+#: Mistral Large 4's per-layer structure: every fourth layer NoPE, the NoPE layers past 35
+#: reading layer 35's latent, an indexer on the first 17 layers and then on each pair
+#: following two that reuse its selection.
+_ML4_NOPE = [i % 4 == 3 for i in range(_ML4_LAYERS)]
+_ML4_KV_SOURCE = [35 if i > 35 and i % 4 == 3 else i for i in range(_ML4_LAYERS)]
+_ML4_INDEX_SHARING = ["full" if i < 17 or i % 4 in (0, 3) else "shared" for i in range(_ML4_LAYERS)]
+
+
+def _ml4_mixed_precision_layers() -> dict:
+    """The NVFP4 export's `quantized_layers`, written out from its module structure: NVFP4 group
+    16 for the routed experts of layers 1..71; FP8_PB_WO for every layer's wq and wo, the full
+    indexers' wq_b, the shared experts' w1/w2/w3 and layer 0's dense w1/w2/w3."""
+    fp8 = {"quant_algo": "FP8_PB_WO"}
+    layers = {}
+    for i in range(_ML4_LAYERS):
+        if i:
+            layers[f"layers.{i}.experts"] = {"quant_algo": "NVFP4", "group_size": 16}
+        layers[f"layers.{i}.attention.wq"] = dict(fp8)
+        layers[f"layers.{i}.attention.wo"] = dict(fp8)
+        if _ML4_INDEX_SHARING[i] == "full":
+            layers[f"layers.{i}.attention.indexer.wq_b"] = dict(fp8)
+        mlp = "shared_experts" if i else "feed_forward"
+        for w in ("w1", "w2", "w3"):
+            layers[f"layers.{i}.{mlp}.{w}"] = dict(fp8)
+    assert len(layers) == 475
+    return layers
+
+
+def _mistral_large4_nvfp4_config(**overrides):
+    """The fields Mistral-Large-4-1T-A52B-NVFP4's configuration, adapted from its params.json,
+    declares that routing reads: the architecture, YaRN factor 2048 over 1048576 positions, and
+    its ModelOpt MIXED_PRECISION quantization."""
+    fields = dict(
+        architectures=["MistralLarge4ForCausalLM"],
+        model_type="mistral_large_4",
+        num_hidden_layers=_ML4_LAYERS,
+        hidden_size=6144,
+        num_attention_heads=64,
+        q_lora_rank=None,
+        kv_lora_rank=512,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        n_routed_experts=128,
+        num_experts_per_tok=4,
+        n_shared_experts=1,
+        moe_intermediate_size=6144,
+        intermediate_size=24576,
+        first_k_dense_replace=1,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_topk=2048,
+        vocab_size=204800,
+        # transformers validates the YaRN factor against it.
+        max_position_embeddings=1048576,
+        nope_layer_flags=list(_ML4_NOPE),
+        indexer_nope_layer_flags=list(_ML4_NOPE),
+        kv_source_layers=list(_ML4_KV_SOURCE),
+        index_sharing=list(_ML4_INDEX_SHARING),
+        ssmax_scaling=True,
+        indexer_ssmax_scaling=True,
+        lerope=True,
+        softmax_tanh_gating=30.0,
+        scoring_func="softmax",
+        norm_topk_prob=True,
+        n_group=1,
+        topk_group=1,
+        topk_method=None,
+        rope_parameters=dict(
+            rope_type="yarn",
+            attention_factor=1.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            factor=2048.0,
+            mscale_all_dim=1,
+            original_max_position_embeddings=512,
+            rope_theta=10000.0,
+        ),
+        quantization_config=dict(
+            group_size=16,
+            ignore=[],
+            quant_algo="MIXED_PRECISION",
+            quant_method="modelopt",
+            quantized_layers=_ml4_mixed_precision_layers(),
+        ),
+        fp8_kv_cache=True,
+    )
+    fields.update(overrides)
+    return PretrainedConfig(**fields)
+
+
+def _ml4_nvfp4_quant(**overrides) -> dict:
+    """The NVFP4 export's `quantization_config` with `overrides` applied."""
+    return dict(_mistral_large4_nvfp4_config().quantization_config, **overrides)
+
+
+def _ml4_layers_with(**changes) -> dict:
+    """The NVFP4 export's map with module entries changed (a value of None drops it)."""
+    layers = _ml4_mixed_precision_layers()
+    for key, value in changes.items():
+        key = key.replace("__", ".")
+        if value is None:
+            del layers[key]
+        else:
+            layers[key] = value
+    return layers
+
+
 def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
     """The deployment, as the LLM API would have been given it.
 
@@ -171,12 +306,14 @@ def _model_config(
     pretrained_config, spec_config=None, kv_cache_quant_algo=_CHECKPOINT_KV, **mapping_kwargs
 ):
     """The loaded config. Its KV-cache algorithm is the checkpoint's own: FP8 for
-    DeepSeek-R1-0528-NVFP4 and GLM-5.2-NVFP4, none (a bf16 pool) for the others."""
+    DeepSeek-R1-0528-NVFP4, GLM-5.2-NVFP4 and Mistral-Large-4-1T-A52B-NVFP4, none (a bf16
+    pool) for the others."""
     mapping = Mapping(**mapping_kwargs) if mapping_kwargs else Mapping()
     if kv_cache_quant_algo is _CHECKPOINT_KV:
         fp8_kv = pretrained_config.architectures[0] in (
             "DeepseekV3ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "MistralLarge4ForCausalLM",
         )
         kv_cache_quant_algo = QuantAlgo.FP8 if fp8_kv else None
     return ModelConfig(
@@ -240,6 +377,17 @@ def _qwen4_exp_config(**vision_overrides):
 _MTP3 = MTPDecodingConfig(max_draft_len=3)
 _DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True)
 _TEP4 = dict(_DEP4, enable_attention_dp=False)
+_TP4 = dict(_TEP4, moe_ep_size=1, moe_tp_size=4)
+# Eight ranks over two nodes of four, as the engine resolves them (gpus_per_node is the visible
+# device count of rank 0's node): tep4's layout over eight ranks, the tep8 deployment.
+_TEP8 = dict(_TEP4, world_size=8, tp_size=8, moe_ep_size=8, gpus_per_node=4)
+# The same eight ranks with the routed experts tensor parallel (tp8): every expert on every rank,
+# cut by width. Stated, as options/core.yaml states it, and bare, as `--tp_size=8` leaves it (the
+# mapping resolves the unset MoE split to moe_tp 8, moe_ep 1).
+_TP8 = dict(_TEP8, moe_ep_size=1, moe_tp_size=8)
+_TP8_BARE = dict(world_size=8, tp_size=8, gpus_per_node=4)
+# Eight ranks over two nodes of four with attention data parallel (dep8): dep4 over eight ranks.
+_DEP8 = dict(_DEP4, world_size=8, tp_size=8, moe_ep_size=8, gpus_per_node=4)
 
 
 def test_off_resolves_nothing():
@@ -2112,3 +2260,310 @@ def test_minimax_m3_1_checkpoint_is_not_taken_by_the_m3_targets(_m31_route):
     assert _m31_route._layout_mismatch(_m3_text_config(**_M31_LAYOUT)) is not None
     resolved = _m31_route.route(_m31_model_config(_M3_TP4), _m3_llm_args("auto", "nvfp4"), (10, 7))
     assert resolved.__name__ == _M31_TARGETS["tp4"][1]
+
+
+# --- Mistral-Large-4-1T-A52B-NVFP4 on sm103 and sm107 ------------------------------
+
+
+@pytest.fixture
+def _mistral_large4_sm(_on_sm10x):
+    """The Mistral-Large-4 targets are certified on sm_103 and sm_107; on sm_100 they route
+    nowhere. `_on_sm10x` covers sm_100 and sm_103, so the sm_107 cases set the capability."""
+    if _on_sm10x != (10, 3):
+        pytest.skip("the Mistral-Large-4 targets are certified on sm_103 and sm_107 only")
+
+
+_ML4_VISION = dict(
+    num_hidden_layers=30,
+    hidden_size=2048,
+    num_attention_heads=16,
+    intermediate_size=6144,
+    num_channels=3,
+    image_size=1540,
+    patch_size=14,
+    rope_theta=10000.0,
+    spatial_merge_size=2,
+    mm_projector_id="patch_merge",
+    adapter_bias=False,
+    add_pre_mm_projector_layer_norm=True,
+    image_token_id=10,
+    image_break_token_id=12,
+    image_end_token_id=13,
+)
+
+_ML4_TOPO_CASES = [
+    (_TEP4, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+    (_TEP8, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+    (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+    (_DEP8, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+    (_TP4, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+    (dict(world_size=4, tp_size=4, gpus_per_node=4), _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+    (_TP8, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+    (_TP8_BARE, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+]
+_ML4_TOPO_IDS = ["tep4", "tep8", "dep4", "dep8", "tp4", "tp4_bare", "tp8", "tp8_bare"]
+
+
+def _ml4_target_for_sm(target: str, sm: int) -> str:
+    return target.replace("sm_103", f"sm_{sm}").replace("Sm103", f"Sm{sm}")
+
+
+def _flip(values, i):
+    flipped = list(values)
+    flipped[i] = not flipped[i]
+    return flipped
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize("sm", [103, 107])
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("mapping,target", _ML4_TOPO_CASES, ids=_ML4_TOPO_IDS)
+def test_mistral_large4_nvfp4_topologies_match(monkeypatch, sm, mode, mapping, target):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (sm // 10, sm % 10))
+    config = _model_config(_mistral_large4_nvfp4_config(), **mapping)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ml4_target_for_sm(
+        target, sm
+    )
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+def test_mistral_large4_rope_factor_and_positions_are_not_criteria():
+    """The YaRN factor and max_position_embeddings are configuration the rope table is built
+    from: the NVFP4 export at YaRN factor 512 over 262144 positions is still the NVFP4 target."""
+    config = _mistral_large4_nvfp4_config(
+        max_position_embeddings=262144,
+        rope_parameters=dict(_mistral_large4_nvfp4_config().rope_parameters, factor=512.0),
+    )
+    resolved = modeling_v2_resolve(_model_config(config, **_TEP4), _llm_args("require"))
+    assert _qualified(resolved) == _MISTRAL_LARGE4_NVFP4_TEP_TARGET
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize(
+    "config_kwargs, mapping_kwargs, missed",
+    [
+        # Trunk depth, expert count, or q-LoRA query path: other declared weights
+        (dict(num_hidden_layers=61), _TEP4, r"config shape \(61, 6144"),
+        (
+            dict(n_routed_experts=256),
+            _TEP4,
+            r"config shape \(72, 6144, 64, None, 512, 64, 64, 128, 256,",
+        ),
+        (dict(q_lora_rank=1536), _TEP4, r"config shape \(72, 6144, 64, 1536,"),
+        # Layer pattern mismatches (NoPE, indexer NoPE, KV sharing, indexer sharing)
+        (dict(nope_layer_flags=_flip(_ML4_NOPE, 0)), _TEP4, "pattern differs"),
+        (dict(indexer_nope_layer_flags=_flip(_ML4_NOPE, 3)), _TEP4, "pattern differs"),
+        (dict(kv_source_layers=list(range(_ML4_LAYERS))), _TEP4, "pattern differs"),
+        (dict(index_sharing=["shared"] + _ML4_INDEX_SHARING[1:]), _TEP4, "pattern differs"),
+        # Forward math switches
+        (dict(ssmax_scaling=False), _TEP4, "switches .* differ"),
+        (dict(softmax_tanh_gating=None), _TEP4, "switches .* differ"),
+        (dict(fp8_kv_cache=False), _TEP4, "switches .* differ"),
+        (dict(scoring_func="sigmoid"), _TEP4, "switches .* differ"),
+        (
+            dict(
+                rope_parameters=dict(
+                    _mistral_large4_nvfp4_config().rope_parameters, mscale=1.0, mscale_all_dim=0
+                )
+            ),
+            _TEP4,
+            "switches .* differ",
+        ),
+        # Quantization algorithm, group size, and per-module map
+        (
+            dict(quantization_config=_ml4_nvfp4_quant(quant_method="fp8")),
+            _TEP4,
+            "quantization differs",
+        ),
+        (
+            dict(quantization_config=_ml4_nvfp4_quant(quant_algo="NVFP4")),
+            _TEP4,
+            "quantization differs",
+        ),
+        (dict(quantization_config=_ml4_nvfp4_quant(group_size=32)), _TEP4, "quantization differs"),
+        (
+            dict(quantization_config=_ml4_nvfp4_quant(quantized_layers=None)),
+            _TEP4,
+            "quantization differs",
+        ),
+        (
+            dict(
+                quantization_config=_ml4_nvfp4_quant(
+                    quantized_layers=_ml4_layers_with(
+                        layers__5__experts={"quant_algo": "FP8_PB_WO"}
+                    )
+                )
+            ),
+            _TEP4,
+            "quantization differs",
+        ),
+        (
+            dict(
+                quantization_config=_ml4_nvfp4_quant(
+                    quantized_layers=_ml4_layers_with(
+                        layers__71__experts={"quant_algo": "NVFP4", "group_size": 32}
+                    )
+                )
+            ),
+            _TEP4,
+            "quantization differs",
+        ),
+        (
+            dict(
+                quantization_config=_ml4_nvfp4_quant(
+                    quantized_layers=_ml4_layers_with(layers__9__shared_experts__w2=None)
+                )
+            ),
+            _TEP4,
+            "quantization differs",
+        ),
+        (
+            dict(
+                quantization_config=_ml4_nvfp4_quant(
+                    quantized_layers=_ml4_layers_with(
+                        layers__3__attention__wkv_b={"quant_algo": "FP8_PB_WO"}
+                    )
+                )
+            ),
+            _TEP4,
+            "quantization differs",
+        ),
+    ],
+)
+def test_mistral_large4_nvfp4_near_misses_do_not_match(config_kwargs, mapping_kwargs, missed):
+    config = _model_config(_mistral_large4_nvfp4_config(**config_kwargs), **mapping_kwargs)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize("sm", [103, 107])
+@pytest.mark.parametrize(
+    "mapping, missed",
+    [
+        (dict(_TEP8, world_size=16, tp_size=16, moe_ep_size=16), r"4 ranks|8 ranks"),
+        (dict(_TEP8, tp_size=4, pp_size=2, moe_ep_size=4), r"pp=2"),
+        (dict(_TEP4, moe_ep_size=2, moe_tp_size=2), r"moe_ep=2"),
+        (dict(_DEP4, enable_lm_head_tp_in_adp=True), r"lm_head_tp_in_adp=True"),
+        (dict(_DEP8, enable_lm_head_tp_in_adp=True), r"dep is attention data parallel"),
+        (dict(_TEP4, world_size=2, tp_size=2, moe_ep_size=2), r"4 ranks|8 ranks"),
+    ],
+)
+def test_mistral_large4_nvfp4_refuses_other_topologies(monkeypatch, sm, mapping, missed):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (sm // 10, sm % 10))
+    config = _model_config(_mistral_large4_nvfp4_config(), **mapping)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize("mapping", [_TEP4, _DEP4, _TP4, _TEP8, _DEP8, _TP8])
+def test_mistral_large4_nvfp4_refuses_sm100_and_non_native_speculation(monkeypatch, mapping):
+    config = _model_config(
+        _mistral_large4_nvfp4_config(), spec_config=MTPDecodingConfig(max_draft_len=1), **mapping
+    )
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="speculative decoding MTP"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
+    config_sm100 = _model_config(_mistral_large4_nvfp4_config(), **mapping)
+    with pytest.raises(ValueError, match=r"compute capability \(10, 0\)"):
+        modeling_v2_resolve(config_sm100, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize("world", [4, 8])
+@pytest.mark.parametrize("sm", [103, 107])
+@pytest.mark.parametrize("with_images", [False, True])
+@pytest.mark.parametrize(
+    "parallel,target",
+    [
+        ("tep", _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        ("dep", _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+        ("tp", _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+    ],
+)
+def test_mistral_large4_native_dspark_routes_each_topology(
+    tmp_path, monkeypatch, world, parallel, target, sm, with_images
+):
+    import json
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (sm // 10, sm % 10))
+    target = _ml4_target_for_sm(target, sm)
+    (tmp_path / "params.json").write_text(
+        json.dumps(
+            {
+                "vocab_size": 204800,
+                "mtp": {
+                    "n_layers": 3,
+                    "depth": 3,
+                    "target_activation_layers": "1,18,36,54,71",
+                    "ragged_attention": "2048,2048,2048",
+                    "norm_strategy": "eagle",
+                    "dspark": {
+                        "markov_rank": 512,
+                        "head_type": "rnn",
+                        "draft_input": "position_specific",
+                    },
+                },
+            }
+        )
+    )
+    spec = DSparkDecodingConfig(max_draft_len=3)
+    from tensorrt_llm._torch.models.checkpoints.dspark_config import resolve_dspark_checkpoint
+
+    resolve_dspark_checkpoint(spec, str(tmp_path))
+    config = _model_config(
+        _mistral_large4_nvfp4_config(
+            **({"vision_config": SimpleNamespace(**_ML4_VISION)} if with_images else {})
+        ),
+        spec_config=spec,
+        world_size=world,
+        tp_size=world,
+        gpus_per_node=4,
+        moe_ep_size=1 if parallel == "tp" else world,
+        moe_tp_size=world if parallel == "tp" else 1,
+        enable_attention_dp=parallel == "dep",
+    )
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == target
+    spec._draft_model_config["norm_strategy"] = "none"
+    with pytest.raises(ValueError, match="native DSpark"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize("sm", [103, 107])
+@pytest.mark.parametrize(
+    "mapping, target",
+    [
+        (_TEP4, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+        (_TP4, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+        (_TEP8, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        (_DEP8, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+        (_TP8, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+    ],
+    ids=["tep4", "dep4", "tp4", "tep8", "dep8", "tp8"],
+)
+def test_mistral_large4_nvfp4_with_a_vision_encoder_serves_images(monkeypatch, mapping, target, sm):
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.routing import serves_images
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (sm // 10, sm % 10))
+    pretrained_config = _mistral_large4_nvfp4_config(vision_config=SimpleNamespace(**_ML4_VISION))
+    config = _model_config(pretrained_config, **mapping)
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _ml4_target_for_sm(
+        target, sm
+    )
+    assert serves_images(pretrained_config)
+    assert not serves_images(_mistral_large4_nvfp4_config())
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+def test_mistral_large4_nvfp4_with_another_vision_encoder_does_not_match():
+    vision = SimpleNamespace(**dict(_ML4_VISION, patch_size=16))
+    config = _model_config(_mistral_large4_nvfp4_config(vision_config=vision), **_TEP4)
+    with pytest.raises(ValueError, match="vision encoder or projector geometry"):
+        modeling_v2_resolve(config, _llm_args("require"))

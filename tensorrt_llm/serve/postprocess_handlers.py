@@ -562,15 +562,19 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                   finished=(output.finish_reason
                                                             is not None))
             if forced_tool and calls:
-                forced_name = _forced_call_name(calls,
-                                                forced_tool.function.name)
-                calls = calls[:1]
-                if calls[0].name:
-                    calls[0].name = forced_name
+                # One chunk can contain several argument deltas for the first
+                # call. Keep those together while dropping subsequent calls.
+                calls = [call for call in calls if call.tool_index == 0]
+                for call in calls:
+                    if call.name is not None:
+                        call.name = _forced_call_name([call],
+                                                      forced_tool.function.name)
             tool_calls = []
             for call_item in calls:
-                # Tool call ID should be generated only once per tool call
-                if call_item.name:
+                # Tool call ID should be generated only once per tool call. A
+                # call may be named "" (mistral_large_4 keeps unnamed calls), so
+                # only an absent name marks an argument delta.
+                if call_item.name is not None:
                     # First chunk: include ID and function name
                     tool_call_id = make_tool_call_id(
                         id_type=args.tool_call_id_type,
@@ -745,8 +749,13 @@ def chat_response_post_processor(
                     content=text,
                     reasoning_content=reasoning_text,
                     tool_calls=[
-                        ToolCall(function=FunctionCall(
-                            name=forced_name, arguments=calls[0].parameters))
+                        ToolCall(id=make_tool_call_id(
+                            id_type=args.tool_call_id_type,
+                            func_name=forced_name,
+                            idx=0),
+                                 function=FunctionCall(
+                                     name=forced_name,
+                                     arguments=calls[0].parameters))
                     ])
             else:
                 # No tool markup despite the forced choice (nothing
@@ -763,7 +772,10 @@ def chat_response_post_processor(
         else:
             text, calls = apply_tool_parser(args, output.index, text, False)
             tool_calls = [
-                ToolCall(function=FunctionCall(name=call.name or "",
+                ToolCall(id=make_tool_call_id(id_type=args.tool_call_id_type,
+                                              func_name=call.name,
+                                              idx=call.tool_index),
+                         function=FunctionCall(name=call.name or "",
                                                arguments=call.parameters))
                 for call in calls
             ]

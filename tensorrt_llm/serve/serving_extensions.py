@@ -37,10 +37,14 @@ import importlib
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional
 
 if TYPE_CHECKING:
+    from tensorrt_llm.sampling_params import GuidedDecodingParams
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
 
-RequiredToolChoiceMode = Literal["template", "grammar"]
+# "template": the chat template enforces the call; "grammar": a mandatory
+# structural tag built by the tool parser; "native": the extension's own
+# grammar (see ``ServingExtension.forced_tool_call_decoding``).
+RequiredToolChoiceMode = Literal["template", "grammar", "native"]
 
 
 class OutputMode(enum.Enum):
@@ -62,6 +66,14 @@ class ServingExtension:
     # Part of the rendering fingerprint: bump it when a revision of the extension changes
     # the prompt it renders, so prepared requests from the older revision are refused.
     render_version: int = 1
+
+    # The format of the ids the server gives this model's tool calls
+    # (``make_tool_call_id``); None keeps the server's choice.
+    tool_call_id_type: Optional[str] = None
+
+    # Whether this model's chats are rendered without a Jinja chat template, so
+    # a server-level ``chat_template`` is ignored with a warning.
+    ignores_server_chat_template: bool = False
 
     def render_prompt(
         self, request: "ChatCompletionRequest", res: Any = None
@@ -137,6 +149,25 @@ class ServingExtension:
         template default applies. The default forwards the value unchanged.
         """
         return effort
+
+    def forced_tool_call_decoding(
+        self,
+        request: "ChatCompletionRequest",
+        tokenizer: Any,
+        *,
+        tool_parser: Optional[str],
+        guided_decoding_backend: Optional[str],
+    ) -> Optional["GuidedDecodingParams"]:
+        """Guided decoding that forces the call a required or named ``tool_choice`` asks for.
+
+        ``None`` leaves the request to the generic paths: the named-tool begin
+        prefix and the mode :meth:`required_tool_choice_mode` returns. A model
+        whose own grammar describes its tool-call format returns that grammar
+        instead; it replaces both, and cannot be combined with a client-supplied
+        guided-decoding setting. Raises ``ValueError`` for a server configuration
+        the grammar cannot be built for.
+        """
+        return None
 
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]

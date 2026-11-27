@@ -158,6 +158,18 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(m=5580, k=1152, n=3456, dtype=torch.bfloat16, bias=True, out_dtype=None),
         ),
     ),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (
+        Cell(
+            why="ML4 router: bf16 in, fp32 logits out, 128 experts",
+            spec=dict(
+                m=16, k=6144, n=128, dtype=torch.bfloat16, bias=False, out_dtype=torch.float32
+            ),
+        ),
+        Cell(
+            why="ML4 wkv_a: hidden 6144 -> kv_lora 512 + rope 64",
+            spec=dict(m=16, k=6144, n=576, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

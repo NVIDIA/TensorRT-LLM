@@ -724,6 +724,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "kimi_k3": "kimi_k3",
     "minimax_m3": "minimax_m3",
     "minimax_m3_vl": "minimax_m3",
+    "mistral_large_4": "mistral_large_4",
     "muse_spark": "musespark",
 }
 
@@ -1404,6 +1405,8 @@ class KimiK3ReasoningParser(BaseReasoningParser):
 # class it has not defined yet. The classes are re-exported lazily below so
 # callers can import every parser from this module.
 _MODEL_REASONING_PARSERS = {
+    "MistralLarge4ReasoningParser":
+    "tensorrt_llm.llmapi.reasoning.mistral_large_4",
     "MuseSparkReasoningParser": "tensorrt_llm.llmapi.reasoning.musespark",
 }
 for _module in set(_MODEL_REASONING_PARSERS.values()):

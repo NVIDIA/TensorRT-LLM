@@ -37,6 +37,16 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(16, 512), dtype=torch.bfloat16),
         ),
     ),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (
+        Cell(
+            why="ML4 tep4 dense layer 0 gate+up: 2 x 24576/4",
+            spec=dict(shape=(16, 12288), dtype=torch.bfloat16),
+        ),
+        Cell(
+            why="ML4 tep4 shared expert gate+up: 2 x 6144/4",
+            spec=dict(shape=(16, 3072), dtype=torch.bfloat16),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
@@ -76,3 +86,16 @@ def test_guard_refuses_widths_the_kernel_faults_on(width, match) -> None:
     with pytest.raises(AssertionError, match=match):
         with validating(op):
             op(x)
+
+
+def test_guard_refuses_strided_and_misaligned_inputs() -> None:
+    """The kernel ignores strides and faults on bases off a 16-byte boundary."""
+    strided = torch.randn(8, 3072, dtype=torch.bfloat16, device="cuda")[::2]
+    with pytest.raises(AssertionError, match="contiguous"):
+        with validating(op):
+            op(strided)
+
+    misaligned = torch.randn(4, 3074, dtype=torch.bfloat16, device="cuda")[:, 1:-1]
+    with pytest.raises(AssertionError, match="contiguous|16-byte aligned"):
+        with validating(op):
+            op(misaligned)

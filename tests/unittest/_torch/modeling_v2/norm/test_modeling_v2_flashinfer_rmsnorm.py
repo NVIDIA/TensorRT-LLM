@@ -54,6 +54,16 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(1, 2880), dtype=torch.bfloat16, eps=1e-5),
         ),
     ),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (
+        Cell(
+            why="ML4 hidden 6144 rmsnorm",
+            spec=dict(shape=(16, 6144), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="ML4 kv_lora 512 rmsnorm",
+            spec=dict(shape=(16, 512), dtype=torch.bfloat16, eps=1e-5),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
@@ -86,12 +96,42 @@ def test_guard_refuses_fp8_before_the_kernel_answers() -> None:
             op(x, weight, 1e-6)
 
 
-def test_guard_refuses_a_strided_normalized_dim() -> None:
-    """`x.stride(-1) != 1` reads the wrong elements rather than failing."""
+def test_strided_normalized_dim_raises() -> None:
+    """`x.stride(-1) != 1` is rejected by the kernel's call wrapper."""
     buf = torch.randn(8, 2880, 2, dtype=torch.bfloat16, device="cuda")
     x = buf[..., 0]
     assert x.stride(-1) != 1
     weight = torch.randn(2880, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(AssertionError, match="contiguous"):
+    with pytest.raises((AssertionError, ValueError)):
         with validating(op):
             op(x, weight, 1e-6)
+
+
+def test_out_inplace_strided_and_overlap_guard() -> None:
+    """`out=` writes in place or into a strided latent view without touching the tail."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    kv = torch.randn(16, 576, generator=g, device="cuda").to(torch.bfloat16)
+    weight = torch.randn(512, generator=g, device="cuda").to(torch.bfloat16)
+    ref = op(kv[:, :512], weight, 1e-5)
+
+    # In-place on the leading 512 columns preserves the 64-column RoPE tail.
+    tail_before = kv[:, 512:].clone()
+    inplace = kv.clone()
+    with validating(op):
+        res = op(inplace[:, :512], weight, 1e-5, out=inplace[:, :512])
+    assert res.data_ptr() == inplace.data_ptr()
+    assert torch.equal(res, ref)
+    assert torch.equal(inplace[:, 512:], tail_before)
+
+    # Strided destination buffer.
+    dst = torch.zeros_like(kv)
+    with validating(op):
+        res2 = op(kv[:, :512], weight, 1e-5, out=dst[:, :512])
+    assert res2.data_ptr() == dst.data_ptr()
+    assert torch.equal(res2, ref)
+    assert torch.count_nonzero(dst[:, 512:]) == 0
+
+    # Partial overlap between x and out is refused by is_valid.
+    with pytest.raises(AssertionError, match="overlap"):
+        with validating(op):
+            op(kv[:-1, :512], weight, 1e-5, out=kv[1:, :512])

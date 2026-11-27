@@ -1106,7 +1106,7 @@ def load_pretrained_config(model_name_or_path: str,
                              CheckpointFormat.MISTRAL_LARGE_3):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
-        return MistralConfigLoader().load(model_name_or_path).pretrained_config
+        return MistralConfigLoader().load_pretrained_config(model_name_or_path)
 
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
         model_name_or_path, **kwargs)
@@ -1115,13 +1115,7 @@ def load_pretrained_config(model_name_or_path: str,
     model_kwargs = kwargs.get("model_kwargs") or {}
     requested_architectures = model_kwargs.get("architectures") or architectures
 
-    if checkpoint_format in (CheckpointFormat.MISTRAL,
-                             CheckpointFormat.MISTRAL_LARGE_3):
-        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-            MistralConfigLoader
-        model_config = MistralConfigLoader().load(
-            model_name_or_path).pretrained_config
-    elif is_speculators_dspark_config(config_dict):
+    if is_speculators_dspark_config(config_dict):
         # A DSpark drafter in the vLLM speculators format: no top-level
         # model_type, and its auto_map needs the speculators package. Build
         # the backbone's config from the translation the spec config uses.

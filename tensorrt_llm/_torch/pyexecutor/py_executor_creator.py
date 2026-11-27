@@ -657,6 +657,24 @@ def _llguidance_tokenizer(guided_decoding_config: GuidedDecodingConfig,
     return tokenizer.llguidance_tokenizer(vocab_size_padded)
 
 
+def _llguidance_json_schema_lark(guided_decoding_config: GuidedDecodingConfig,
+                                 tokenizer: Optional[TokenizerBase],
+                                 reasoning_parser: Optional[str] = None):
+    """Renders the llguidance grammar of a JSON response for a tokenizer whose
+    structured responses may open with a reasoning section (Mistral's [THINK]),
+    or None to constrain a JSON response from its first token.
+
+    Only enabled when ``reasoning_parser`` is configured so the serving layer
+    separates the reasoning section from ``message.content``.
+    """
+    if (guided_decoding_config.backend
+            != GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
+            or not reasoning_parser
+            or getattr(tokenizer, "renders_grammars", False) is not True):
+        return None
+    return tokenizer.llguidance_json_schema_lark
+
+
 def _load_guided_decoding_tokenizer(llm_args: TorchLlmArgs,
                                     checkpoint_dir: str) -> TokenizerBase:
     """Load the tokenizer whose vocabulary guided decoding masks, from the checkpoint.
@@ -1307,6 +1325,10 @@ def _create_py_executor(
                 kwargs["llguidance_tokenizer"] = _llguidance_tokenizer(
                     guided_decoding_config, tokenizer,
                     model_engine.model.vocab_size_padded)
+                kwargs[
+                    "llguidance_json_schema_lark"] = _llguidance_json_schema_lark(
+                        guided_decoding_config, tokenizer,
+                        llm_args.reasoning_parser)
                 if spec_config is not None:
                     kwargs[
                         "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1

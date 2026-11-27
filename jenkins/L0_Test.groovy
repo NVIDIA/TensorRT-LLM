@@ -8013,7 +8013,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-KeyModels-Post-Merge-{split}_of_2",
         "auto:gb300-x4",
         "l0_gb300_multi_gpus_perf_sanity_key_models",
-        2,
+        3,
         4,
         1, true
     )
@@ -8125,11 +8125,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge-1_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_node4_gpu16", 1, 1, 16, 4],
         // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
         "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge-3_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32", 1, 1, 32, 8],
-        // GLM-5.3-Flash FP8 8k1k con16: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
-        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-KeyModels-Post-Merge-1_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4_key_models", 1, 1, 8, 2],
         // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
         "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge-3_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4", 1, 1, 8, 2],
     ]
+    // GLM-5.3-Flash FP8 8k1k con16 and Mistral Large 4 NVFP4 8k1k con64/1024:
+    // ctx1 (1 node, 4 GPUs) + gen1 (1 node, 4 GPUs) = 8 GPUs, one test per split.
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-KeyModels-Post-Merge-{split}_of_2",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4_key_models",
+        3,
+        8,
+        2
+    )
     // Nemotron-Ultra-V3 50k2k con12: ctx1 (1 node, 4 GPUs) + gen6 (6 nodes, 4 GPUs each) = 28 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge-{split}_of_4",

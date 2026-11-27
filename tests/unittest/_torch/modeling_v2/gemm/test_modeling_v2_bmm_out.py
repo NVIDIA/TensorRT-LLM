@@ -77,6 +77,16 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(batch=64, m=2048, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
         ),
     ),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (
+        Cell(
+            why="ML4 tep4 absorb: 16 heads per rank, qk_nope 64 -> kv_lora 512",
+            spec=dict(batch=16, m=16, k=64, n=512, dtype=torch.bfloat16, transposed_out=True),
+        ),
+        Cell(
+            why="ML4 tep4 expand: 16 heads per rank, kv_lora 512 -> v_head 128",
+            spec=dict(batch=16, m=16, k=512, n=128, dtype=torch.bfloat16, transposed_out=True),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

@@ -881,7 +881,8 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         """No caller-side check: this processor checks the images against the prompt.
 
         Text places the images at its ``[IMG]`` markers, or after itself without
-        markers; token ids carry a whole image grid per image.
+        markers; token ids carry a whole image grid per image, or one ``[IMG]``
+        per image that expands to its grid.
         """
         return False
 
@@ -903,6 +904,23 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         if len(expected) != len(images):
             raise ValueError(
                 "Native tokenizer image grid count does not match images")
+        delimiters = (self.processor.image_break_id,
+                      self.processor.image_end_id)
+        if not any(token in delimiters for token in token_ids):
+            # Every grid ends with [IMG_END], so ids without delimiters hold one
+            # [IMG] per image, as a renderer that leaves the grids to the server
+            # writes them: each expands to its image's grid.
+            if token_ids.count(self.processor.image_token_id) != len(images):
+                raise ValueError(
+                    "Image placeholder count does not match images")
+            grids = iter(expected)
+            expanded = []
+            for token in token_ids:
+                if token == self.processor.image_token_id:
+                    expanded.extend(next(grids))
+                else:
+                    expanded.append(token)
+            return expanded, self._image_payload(processed)
         actual = [token_ids[a:b] for a, b in self._image_blocks(token_ids)]
         if actual != expected:
             raise ValueError(
@@ -935,6 +953,14 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
 # place (OPENAI content), not from text with placeholders.
 MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
     "mistral_common",
+    MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "[IMG]"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.OPENAI,
+    ),
+    registrant_module=__name__)
+MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+    "mistral_large_4",
     MultimodalPlaceholderMetadata(
         placeholder_map={"image": "[IMG]"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,

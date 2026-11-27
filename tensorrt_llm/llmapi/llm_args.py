@@ -4694,6 +4694,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "decode pass over context and block, on SM100/SM103/SM107. Which "
         "kernel each name selects: MLADSparkForCausalLM.")
 
+    # Checkpoint adapters own the model-specific draft metadata. These runtime
+    # attributes travel with the resolved config but are not public arguments.
+    _draft_model_config: Optional[dict] = PrivateAttr(default=None)
+    _draft_weights_in_target: bool = PrivateAttr(default=False)
+
+    @property
+    def needs_separate_draft_weights(self) -> bool:
+        # Weight ownership is independent of the worker and its KV-cache layout.
+        return not self._draft_weights_in_target
+
     @model_validator(mode="after")
     def validate_ancestral_draft_sampling(self) -> "DSparkDecodingConfig":
         """Ancestral drafting acts only on rejection-sampled drafts."""
@@ -10062,6 +10072,9 @@ class TorchLlmArgs(BaseLlmArgs):
                 if not spec_cfg.max_draft_len:
                     raise ValueError("DSpark max_draft_len must be > 0; got "
                                      f"{spec_cfg.max_draft_len}")
+                from .._torch.models.checkpoints.dspark_config import \
+                    resolve_dspark_checkpoint
+                resolve_dspark_checkpoint(spec_cfg, self.model)
                 # Same convention as MTP (see resolve_mtp_checkpoint_source):
                 # an unset speculative_model means "the draft lives in the
                 # target checkpoint". For DSpark that is the embedded

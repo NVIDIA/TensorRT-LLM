@@ -540,5 +540,10 @@
 /tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia @kaiyux
 /tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia @kaiyux
 
+# Mistral Large 4
+/tensorrt_llm/_torch/modeling_v2/models/mistral_large4 @yizhang-nv @yt0428
+/tests/unittest/_torch/modeling_v2/models/mistral_large4 @yizhang-nv @yt0428
+/tests/integration/defs/accuracy/modeling_v2/mistral_large4 @yizhang-nv @yt0428
+
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval

@@ -96,7 +96,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicMessagesRequest)
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
                                                 resolve_request_conversation_id)
@@ -163,7 +164,8 @@ from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
-from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
+from tensorrt_llm.serve.serving_extensions import (get_serving_extension,
+                                                   load_builtin_extensions)
 from tensorrt_llm.serve.tokenization_owners import (TokenizationOwners,
                                                     start_tokenization_owners)
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
@@ -1064,7 +1066,14 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
 
+        model_type = (resolve_top_level_model_type(self.model_config)
+                      if self.model_config is not None else None)
+        model_extension = get_serving_extension(model_type)
         self.chat_template = load_chat_template(chat_template)
+        if model_extension.ignores_server_chat_template and self.chat_template:
+            logger.warning("This model renders chats without a chat template; "
+                           "ignoring the server chat template.")
+            self.chat_template = None
 
         # Enable response storage for Responses API
         self.enable_store = (len(
@@ -1098,6 +1107,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tool_call_id_type = "kimi_k2"
             elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
+        if model_extension.tool_call_id_type is not None:
+            self.tool_call_id_type = model_extension.tool_call_id_type
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
@@ -2345,6 +2356,30 @@ class OpenAIServer(_VideoRoutesMixin):
                     guided_decoding_backend,
                     tool_parser=self.tool_parser,
                     reasoning_parser=self.generator.args.reasoning_parser)
+            # A model whose own grammar forces a required or named call takes
+            # it here, in place of the begin prefix and the required-tool modes
+            # below.
+            forced_tool_decoding = None
+            if request.tool_choice == "required" or isinstance(
+                    request.tool_choice, ChatCompletionNamedToolChoiceParam):
+                forced_tool_decoding = extension.forced_tool_call_decoding(
+                    request,
+                    self.tokenizer,
+                    tool_parser=self.tool_parser,
+                    guided_decoding_backend=self.generator.args.
+                    guided_decoding_backend)
+            if forced_tool_decoding is not None:
+                if sampling_params.guided_decoding is not None:
+                    raise ValueError(
+                        "Required or named tool calls cannot be combined with "
+                        "response_format.")
+                sampling_params.guided_decoding = forced_tool_decoding
+            elif (request.tool_choice == "required"
+                  and required_mode == "native"):
+                # Only the extension's grammar enforces "required" here; without
+                # it the request would silently degrade to "auto".
+                raise ValueError(
+                    "tool_choice='required' is not supported for this model.")
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
@@ -2367,8 +2402,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # the tool call.
             forced_tool_name = None
             forced_tool_begin_prefix = None
-            if isinstance(request.tool_choice,
-                          ChatCompletionNamedToolChoiceParam):
+            if forced_tool_decoding is None and isinstance(
+                    request.tool_choice, ChatCompletionNamedToolChoiceParam):
                 if not request.tools:
                     return self.create_error_response(
                         message=("tool_choice with a named function requires "

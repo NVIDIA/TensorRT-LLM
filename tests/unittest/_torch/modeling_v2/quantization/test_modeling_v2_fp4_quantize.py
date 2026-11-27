@@ -86,6 +86,12 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(8192, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     ),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (
+        Cell(
+            why="ML4 decode: 16 tokens, hidden 6144, linear",
+            spec=dict(shape=(16, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

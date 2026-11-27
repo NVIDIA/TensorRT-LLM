@@ -32,6 +32,7 @@ from tensorrt_llm._torch.configs import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
     DeepseekV41VisionConfig,
+    MistralLarge4Config,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -554,3 +555,9 @@ def test_load_hf_model_config_handles_dense_nemotron_h(tmp_path):
 
     assert cfg is not None
     assert cfg.hybrid_override_pattern == _NEMOTRON_H_DENSE_PATTERN
+
+
+def test_mistral_large4_index_sharing_rejects_unknown_role():
+    cfg = MistralLarge4Config(index_sharing=["full", "partial"])
+    with pytest.raises(ValueError, match="'full' or 'shared'"):
+        _ = cfg.index_topk_pattern

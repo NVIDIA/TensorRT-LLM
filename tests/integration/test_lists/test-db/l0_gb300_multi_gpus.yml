@@ -25,6 +25,7 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/ops/comm
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/comm
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[modeling_v2-dep4]
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[stock-dep4]
@@ -63,6 +64,12 @@ l0_gb300_multi_gpus:
   # sampling, the breakable prefill graph, every opt-in projection) on one context and one
   # generation GPU.
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_disaggregated_mtp2 TIMEOUT (90)
+  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 post-merge: native DSpark quick
+  # coverage (GSM8K + AL, MMMU, multimodal panel with block reuse) on dep4/tp4 and
+  # llguidance on tp4. tep4-quick runs pre-merge (l0_gb300); spec-off tp4 GSM8K runs in QA.
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_accuracy[dep4-quick]
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp4-quick]
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_llguidance
   # Covers the GPU cases of tests/unittest/_torch/attention/ on GB300, kernels/ and
   # multi_gpu/ included; its cpu_only cases run on CPU (l0_cpu). The GPU cases of
   # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that

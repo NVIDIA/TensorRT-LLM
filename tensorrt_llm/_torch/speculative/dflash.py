@@ -1439,6 +1439,17 @@ class DFlashWorker(SpecWorkerBase):
         )
         return True
 
+    def _uses_fused_paged_latent_prepare(self, draft_model, kv_factor: int) -> bool:
+        """Whether the fused paged-latent preparation prepares this drafter's steps.
+
+        It stores single-latent context entries projected from the captured target
+        features through ``fc`` and ``hidden_norm`` (which every loaded DFlash drafter
+        owns), as the eager path does, and embeds the block from the drafter's token
+        embedding. LiLiCorr drafters keep the eager path, as does a subclass whose
+        drafter projects or embeds otherwise.
+        """
+        return kv_factor == 1 and not draft_model._uses_lilicorr
+
     def _lazy_init_ctx_buffers(
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
     ):
@@ -1667,11 +1678,9 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_kv_ptrs = torch.tensor(
                     [layer.data_ptr() for layer in pool], dtype=torch.int64, device="cuda"
                 )
-                # The fused preparation stores single-latent context entries
-                # projected from the captured target features through fc and
-                # hidden_norm (which every loaded DFlash drafter owns), as the
-                # eager path does; LiLiCorr drafters keep the eager path.
-                self._paged_latent_prepare = kv_factor == 1 and not draft_model._uses_lilicorr
+                self._paged_latent_prepare = self._uses_fused_paged_latent_prepare(
+                    draft_model, kv_factor
+                )
                 # Only a manager that publishes and matches its own blocks can
                 # hand back a reused prefix's drafter K/V; the private arena and
                 # an unpaired draft pool both start every request at 0.
@@ -2149,7 +2158,7 @@ class DFlashWorker(SpecWorkerBase):
         and store them per-request so the draft model can use the full prompt
         as cross-attention context on subsequent gen steps.
         """
-        if not hasattr(draft_model, "fc") or not hasattr(draft_model, "hidden_norm"):
+        if not callable(getattr(draft_model, "project_target_hidden", None)):
             return
 
         num_ctx_tokens = attn_metadata.num_ctx_tokens
@@ -2470,7 +2479,9 @@ class DFlashWorker(SpecWorkerBase):
 
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                hidden_states_out = draft_model.dflash_forward(
+                hidden_states_out = self._draft_block_forward(
+                    draft_model,
+                    attn_metadata,
                     noise_embedding=inputs["noise_embedding"],
                     query_positions=inputs["query_positions"],
                     num_ctx_per_req=inputs["num_ctx_per_req"],
@@ -2625,6 +2636,36 @@ class DFlashWorker(SpecWorkerBase):
         variant, which reads slots 0..K-1 instead.
         """
         return dflash_draft_slot_ids(num_gens, block_size, num_draft_tokens, False, device="cuda")
+
+    def _draft_block_embedding(
+        self,
+        draft_model,
+        bonus: torch.Tensor,
+        mask_token_id: int,
+        block_size: int,
+        trained_mask_embedding: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """The drafter's input block per request, ``[len(bonus), block_size, hidden]``.
+
+        The accepted anchor token, then mask tokens, through the drafter's token
+        embedding (:func:`dflash_noise_block_embedding`). A subclass whose drafter
+        embeds its block otherwise overrides this.
+        """
+        return dflash_noise_block_embedding(
+            draft_model.draft_model_full.model.embed_tokens,
+            bonus,
+            mask_token_id,
+            block_size,
+            trained_mask_embedding,
+        )
+
+    def _draft_block_forward(self, draft_model, attn_metadata, **block_inputs) -> torch.Tensor:
+        """Run the drafter's block forward over this step's generation requests.
+
+        A subclass whose drafter's forward depends on the step's attention metadata
+        overrides this.
+        """
+        return draft_model.dflash_forward(**block_inputs)
 
     def _refine_block_logits(
         self,
@@ -2845,8 +2886,6 @@ class DFlashWorker(SpecWorkerBase):
                 )
         mask_token_id = self._resolved_mask_token_id
 
-        # Get the embed_tokens layer from the draft model
-        embed_tokens = draft_model.draft_model_full.model.embed_tokens
         hidden_dim = (
             spec_metadata.hidden_size if spec_metadata.hidden_size > 0 else hidden_states.shape[-1]
         )
@@ -2879,10 +2918,8 @@ class DFlashWorker(SpecWorkerBase):
 
             # Get captured multi-layer hidden states from spec_metadata
             captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
-            has_target_features = (
-                captured_hs is not None
-                and hasattr(draft_model, "fc")
-                and hasattr(draft_model, "hidden_norm")
+            has_target_features = captured_hs is not None and callable(
+                getattr(draft_model, "project_target_hidden", None)
             )
 
             # Use cached block_size (resolved once on first call)
@@ -2913,8 +2950,8 @@ class DFlashWorker(SpecWorkerBase):
             query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
-            noise_embed_2d = dflash_noise_block_embedding(
-                embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+            noise_embed_2d = self._draft_block_embedding(
+                draft_model, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
             )
 
             # Accumulate new accepted features into context buffers

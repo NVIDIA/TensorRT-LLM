@@ -1758,8 +1758,21 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
+        kwargs = {}
+        # A Mistral-Large-4 checkpoint keeps its config in params.json, which
+        # the Mistral-native format reads; every other checkpoint keeps the HF
+        # config lookup.
+        checkpoint_format = getattr(self.args, "checkpoint_format", None)
+        if checkpoint_format in (CheckpointFormat.MISTRAL,
+                                 CheckpointFormat.MISTRAL_LARGE_3):
+            from .._torch.models.checkpoints.mistral.config_loader import \
+                is_mistral_large4_checkpoint
+            if is_mistral_large4_checkpoint(self.args.model):
+                kwargs["checkpoint_format"] = checkpoint_format
         return ModelLoader.load_hf_model_config(
-            self.args.model, trust_remote_code=self.args.trust_remote_code)
+            self.args.model,
+            trust_remote_code=self.args.trust_remote_code,
+            **kwargs)
 
     @set_api_status("prototype")
     def start_profile(self,
