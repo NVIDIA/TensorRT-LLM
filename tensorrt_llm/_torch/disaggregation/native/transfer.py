@@ -2069,9 +2069,9 @@ class Sender(SenderBase):
 
                 bounce_args = {}
                 if (
-                    getattr(self._agent, "bounce_enabled", False) is True
+                    write_meta.bounce_window_key
                     and write_meta.meta_type == WriteMetaType.KV
-                    and write_meta.bounce_window_key
+                    and getattr(self._agent, "bounce_enabled", False) is True
                 ):
                     bounce_args["bounce_window_key"] = write_meta.bounce_window_key
                 transfer_finished, last_status = self._submit_transfer(
