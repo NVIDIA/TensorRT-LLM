@@ -1492,9 +1492,9 @@ class TestKVCacheFailuresGen:
 
         def alloc_fn(req: Mock) -> bool:
             request_id = req.request_id
-            if request_id == 7:
-                return True
-            if request_id == 0:
+            if generation_ahead and request_id == 0:
+                return not mgr.kv_cache_map[2].is_active
+            if request_id == (1 if generation_ahead else 0):
                 return 3 in freed_request_ids
             raise AssertionError(f"Evicted request {request_id} was revisited")
 
@@ -1517,10 +1517,10 @@ class TestKVCacheFailuresGen:
 
         reqs = [current, active_victim, suspended_tail]
         if generation_ahead:
-            reqs.insert(0, make_gen_request(7))
+            reqs.insert(1, make_gen_request(1))
         out = sched.schedule_request(reqs, set())
 
-        assert ids(out.generation_requests) == ([7, 0] if generation_ahead else [0])
+        assert ids(out.generation_requests) == ([0, 1] if generation_ahead else [0])
         assert ids(out.paused_requests) == [2]
         assert ids(out.recompute_paused_requests) == [3]
         mgr.suspend_request.assert_called_once_with(active_victim)
