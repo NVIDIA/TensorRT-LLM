@@ -129,7 +129,14 @@ def _core(raw: dict):
 
 @pytest.fixture
 def moe_identity(monkeypatch):
-    monkeypatch.setattr(MOD, "_mtp_moe_block", lambda core, M, x, pad_rows=0: x)
+    """The routed experts are the identity and the shared expert adds zero, so the one-launch
+    combination and injection (`mtp_moe_combine_inject`) injects the mixed rows themselves."""
+    monkeypatch.setattr(MOD, "_mtp_moe_block", lambda core, M, x, pad_rows=0, routed_only=False: x)
+    monkeypatch.setattr(
+        MOD,
+        "_mtp_shared_expert",
+        lambda core, M, x: (x.new_zeros(x.shape[0], 1), torch.zeros_like(x)),
+    )
 
 
 # ------------------------------------------------------------------- references ---

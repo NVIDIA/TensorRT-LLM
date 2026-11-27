@@ -451,6 +451,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_sort import mo
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_unpermute_inplace import (
     moe_unpermute_inplace,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.mtp_moe_combine_inject__decode import (  # noqa: E501
+    mtp_moe_combine_inject,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
     renorm_moe_routing_op,
 )
@@ -2983,10 +2986,15 @@ def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False
         routed = core.expert_sum(run, x, pad_rows)
     if routed_only:
         return routed
+    return fused_sigmoid_gate_mul_add(routed, *_mtp_shared_expert(core, M, x))
+
+
+def _mtp_shared_expert(core, M: _MtpWeights, x) -> tuple:
+    """The draft layer's replicated bf16 shared expert in the trunk's form over `x`: one GEMM
+    forms gate|up and the per-token gate logit. Returns `(gate_logits, shared)`."""
     gug = cublas_mm(x, M.sh_gug)
     shared = cublas_mm(silu_and_mul_rows(gug, core.shared_inter), M.sh_dn)
-    gate_logits = gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1]
-    return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+    return gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1], shared
 
 
 def _mtp_routed_nvfp4(core, M: _MtpWeights, x) -> torch.Tensor:
@@ -3066,12 +3074,26 @@ def _mtp_tail(core, M: _MtpWeights, x, attn, inject, pad_rows: int) -> torch.Ten
     over the TP group and injected, the MoE-side hyper-connection, the MoE and its injection.
     `attn` is the `[T, q_width]` gated attention output; `pad_rows` is the MoE round trip's
     padding under attention DP (`_draft_pad_rows`). The MoE-side site is the trunk's
-    (`qwen4_exp_hc_inject_norm`, `_hc_mixer`)."""
+    (`qwen4_exp_hc_inject_norm`, `_hc_mixer`). The MoE's combination `routed + sigmoid(gate
+    logit) * shared` and its injection are one launch (`mtp_moe_combine_inject`, as the FP8
+    target runs them), bitwise the two launches it replaces."""
     x, normed = qwen4_exp_hc_inject_norm(
         x, core.tp_sum(cublas_mm(attn, M.o)), inject, M.mhc_norm, core.eps, core.hc_count
     )
     mixed, inject = _hc_mixer(core, normed, M.mhc_first, M.mhc_up, True)
-    return qwen4_exp_post_inject(x, _mtp_moe_block(core, M, mixed, pad_rows), inject)
+    routed = _mtp_moe_block(core, M, mixed, pad_rows, routed_only=True)
+    gate_logits, shared = _mtp_shared_expert(core, M, mixed)
+    if _combine_inject_fits(x, routed, shared, inject):
+        return mtp_moe_combine_inject(x, routed, gate_logits, shared, inject)
+    return qwen4_exp_post_inject(x, fused_sigmoid_gate_mul_add(routed, gate_logits, shared), inject)
+
+
+def _combine_inject_fits(x, routed, shared, inject) -> bool:
+    """Whether `mtp_moe_combine_inject` takes these operands: 2-D bf16, unit column stride."""
+    return all(
+        t.dim() == 2 and t.dtype == torch.bfloat16 and t.stride(1) == 1
+        for t in (x, routed, shared, inject)
+    )
 
 
 def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
