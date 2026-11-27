@@ -141,6 +141,7 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
     worker._ctx_base_host = [0, 0, 0]
     worker._ctx_len = torch.zeros(3, dtype=torch.long)
     worker._ctx_base_pages = torch.zeros(3, dtype=torch.long)
+    worker._ctx_paged = False
     warnings = []
     monkeypatch.setattr(dflash.logger, "warning", warnings.append)
 

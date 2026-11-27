@@ -20,6 +20,7 @@
 // byte arrives. Sizing is chosen so the chunk count exceeds the per-request in-flight limit,
 // forcing credit recycling. Skips if no CUDA device or the NIXL backend cannot initialize.
 
+#include "bounceGateKernel.h"
 #include "bounceTestNixlNode.h"
 
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -28,6 +29,7 @@
 
 #include <cuda.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -36,6 +38,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
@@ -248,6 +251,268 @@ TEST(BounceTransport, SenderArenaBackpressureParksCredits)
     // 32 x 4KiB = 128KiB in ~8 chunks of 16KiB: double the sender's usable arena, so at least half
     // the granted credits must park and retry.
     runTransfer("btPark", /*nDescs=*/32, /*descBytes=*/4096, small, big, /*seed=*/11);
+}
+
+namespace
+{
+// Two nodes (A sends, B receives) sized like the many-small-descriptor KV pattern, plus a
+// non-blocking stream standing in for the receiver's forward stream.
+struct OrderFixture
+{
+    std::unique_ptr<bounce_test::Node> A;
+    std::unique_ptr<bounce_test::Node> B;
+    cudaStream_t stream{nullptr};
+
+    ~OrderFixture()
+    {
+        if (A)
+        {
+            A->tx->shutdown();
+        }
+        if (B)
+        {
+            B->tx->shutdown();
+        }
+        if (stream != nullptr)
+        {
+            cudaStreamDestroy(stream);
+        }
+    }
+};
+
+constexpr std::uint32_t kOrderDescs = 1200; // above the default min_descriptor_count admission gate
+constexpr std::uint32_t kOrderDescBytes = 256;
+
+b::BounceConfig orderTestConfig(bool scatterOnOrderStream, bool copyEngine)
+{
+    b::BounceConfig cfg;
+    cfg.maxChunkSizeBytes = 64 << 10;
+    cfg.maxInflightChunksPerRequest = 4;
+    cfg.scatterWorkerCount = 2;
+    cfg.arenaAllocationGranularityBytes = 256;
+    cfg.arenaSizeBytes = 4ULL << 20;
+    cfg.scatterOnOrderStream = scatterOnOrderStream;
+    cfg.scatterCopyEngine = copyEngine;
+    return cfg;
+}
+
+// Returns false (after GTEST_SKIP) when CUDA or NIXL is unavailable.
+// copyEngine defaults to off: the order-stream tests below exercise the kernel scatter paths.
+bool makeOrderFixture(OrderFixture& f, std::string const& tag, bool scatterOnOrderStream, bool copyEngine = false)
+{
+    if (!bounce_test::hasCuda())
+    {
+        return false;
+    }
+    auto const cfg = orderTestConfig(scatterOnOrderStream, copyEngine);
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
+    f.A = bounce_test::makeNode(tag + "A", cfg, maxDescs);
+    f.B = bounce_test::makeNode(tag + "B", cfg, maxDescs);
+    if (!f.A || !f.B)
+    {
+        return false;
+    }
+    bounce_test::wirePair(*f.A, *f.B);
+    // One untimed transfer first, so lazy transport setup (connections, registration caches) is not
+    // part of the timed window below.
+    auto warm = bounce_test::makeXferBufs(64, kOrderDescBytes, /*seed=*/3);
+    auto warmFut = f.A->tx->submit(warm.srcDescs, warm.dstDescs, f.B->name);
+    bool const warmOk = warmFut.wait_for(std::chrono::seconds(30)) == std::future_status::ready
+        && warmFut.get().state == kvc::TransferState::kSUCCESS;
+    if (!warmOk)
+    {
+        // Drain the warm-up transfer still in flight before its buffers are freed.
+        f.A->tx->shutdown();
+        f.B->tx->shutdown();
+    }
+    bounce_test::freeXferBufs(warm);
+    EXPECT_TRUE(warmOk) << "warm-up transfer failed";
+    return warmOk && cudaStreamCreateWithFlags(&f.stream, cudaStreamNonBlocking) == cudaSuccess;
+}
+
+// True when no byte of the destination was written yet (makeXferBufs zero-fills it).
+bool dstUntouched(bounce_test::XferBufs const& x)
+{
+    std::vector<unsigned char> got(x.total, 0xEE);
+    if (cudaMemcpy(got.data(), x.dst, x.total, cudaMemcpyDeviceToHost) != cudaSuccess)
+    {
+        return false;
+    }
+    for (unsigned char c : got)
+    {
+        if (c != 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Submits one transfer of kOrderDescs descriptors and checks it completes byte-exact.
+void transferExact(OrderFixture& f, std::uint32_t seed)
+{
+    auto bufs = bounce_test::makeXferBufs(kOrderDescs, kOrderDescBytes, seed);
+    auto fut = f.A->tx->submit(bufs.srcDescs, bufs.dstDescs, f.B->name);
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
+    bounce_test::freeXferBufs(bufs);
+}
+
+// Submits one transfer while a kernel occupying every SM holds the order stream and checks it
+// completes byte-exact without waiting for that kernel.
+void transferExactWhileGateHolds(OrderFixture& f, std::uint32_t seed)
+{
+    auto bufs = bounce_test::makeXferBufs(kOrderDescs, kOrderDescBytes, seed);
+    bounce_test::GateKernel gate;
+    ASSERT_EQ(gate.launch(f.stream), cudaSuccess);
+    auto fut = f.A->tx->submit(bufs.srcDescs, bufs.dstDescs, f.B->name);
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
+    EXPECT_TRUE(gate.running()) << "the scatter should not have waited for the order stream";
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
+    gate.release();
+    bounce_test::freeXferBufs(bufs);
+}
+
+// Submits one transfer while the order stream is being captured and checks that the captured graph
+// holds only the test's own node and the data is exact.
+void transferExactWhileCapturing(OrderFixture& f, std::uint32_t seed)
+{
+    auto bufs = bounce_test::makeXferBufs(kOrderDescs, kOrderDescBytes, seed);
+    void* scratch = nullptr;
+    ASSERT_EQ(cudaMalloc(&scratch, 256), cudaSuccess);
+    ASSERT_EQ(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeThreadLocal), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(scratch, 0, 256, f.stream), cudaSuccess); // the test's one captured node
+    auto fut = f.A->tx->submit(bufs.srcDescs, bufs.dstDescs, f.B->name);
+    auto const status = fut.wait_for(std::chrono::seconds(30));
+    cudaGraph_t graph = nullptr;
+    ASSERT_EQ(cudaStreamEndCapture(f.stream, &graph), cudaSuccess);
+    ASSERT_EQ(status, std::future_status::ready) << "transfer hung";
+    std::size_t numNodes = 0;
+    ASSERT_EQ(cudaGraphGetNodes(graph, nullptr, &numNodes), cudaSuccess);
+    EXPECT_EQ(numNodes, 1u) << "a scatter was captured into the graph";
+    cudaGraphDestroy(graph);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
+    cudaFree(scratch);
+    bounce_test::freeXferBufs(bufs);
+}
+
+} // namespace
+
+// scatter_copy_engine: without a registered order stream the receive scatter runs on the copy
+// engines (none ordered, none on the private kernel path); once an order stream is registered it
+// wins over the copy engines and the scatters stay ordered. Both transfers are byte-exact.
+TEST(BounceTransport, ScatterCopyEngineYieldsToOrderStream)
+{
+    OrderFixture f;
+    if (!makeOrderFixture(f, "btCe", /*scatterOnOrderStream=*/true, /*copyEngine=*/true))
+    {
+        GTEST_SKIP() << "CUDA or NIXL agent/backend unavailable";
+    }
+    auto ceBefore = f.B->tx->copyEngineScatterCount();
+    auto const privateBefore = f.B->tx->privateScatterCount();
+    transferExact(f, /*seed=*/13);
+    EXPECT_GT(f.B->tx->copyEngineScatterCount(), ceBefore);
+    EXPECT_EQ(f.B->tx->orderedScatterCount(), 0u);
+    EXPECT_EQ(f.B->tx->privateScatterCount(), privateBefore);
+
+    ASSERT_TRUE(f.B->tx->setScatterOrderStream(f.stream));
+    ceBefore = f.B->tx->copyEngineScatterCount();
+    transferExact(f, /*seed=*/17);
+    EXPECT_GT(f.B->tx->orderedScatterCount(), 0u);
+    EXPECT_EQ(f.B->tx->copyEngineScatterCount(), ceBefore);
+    EXPECT_EQ(f.B->tx->privateScatterCount(), privateBefore);
+}
+
+// The receive scatter is enqueued on the registered order stream: while a kernel occupying every SM
+// holds that stream (a forward in flight), no chunk is copied into the destination and no ACK is
+// sent; once it finishes, the transfer completes byte-exact.
+TEST(BounceTransport, ScatterOrderedOnOrderStream)
+{
+    OrderFixture f;
+    if (!makeOrderFixture(f, "btOrd", /*scatterOnOrderStream=*/true))
+    {
+        GTEST_SKIP() << "CUDA or NIXL agent/backend unavailable";
+    }
+    ASSERT_TRUE(f.B->tx->setScatterOrderStream(f.stream));
+    auto const privateBefore = f.B->tx->privateScatterCount(); // the warm-up transfer ran before the stream was set
+    auto bufs = bounce_test::makeXferBufs(kOrderDescs, kOrderDescBytes, /*seed=*/11);
+    bounce_test::GateKernel gate;
+    ASSERT_EQ(gate.launch(f.stream), cudaSuccess);
+
+    auto fut = f.A->tx->submit(bufs.srcDescs, bufs.dstDescs, f.B->name);
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout)
+        << "transfer completed while the order stream was still busy";
+    EXPECT_TRUE(gate.running());
+    EXPECT_TRUE(dstUntouched(bufs)) << "scatter wrote the destination while the order stream was busy";
+
+    gate.release();
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
+    EXPECT_GT(f.B->tx->orderedScatterCount(), 0u);
+    EXPECT_EQ(f.B->tx->privateScatterCount(), privateBefore);
+    bounce_test::freeXferBufs(bufs);
+}
+
+// scatter_on_order_stream=0 refuses the stream, and clearing a registered stream (nullptr) restores
+// the private copy streams: either way the transfer completes while the "forward" holds the stream.
+TEST(BounceTransport, ScatterOrderStreamKillSwitchAndClear)
+{
+    {
+        OrderFixture f;
+        if (!makeOrderFixture(f, "btOrdOff", /*scatterOnOrderStream=*/false))
+        {
+            GTEST_SKIP() << "CUDA or NIXL agent/backend unavailable";
+        }
+        EXPECT_FALSE(f.B->tx->setScatterOrderStream(f.stream));
+        auto const privateBefore = f.B->tx->privateScatterCount();
+        transferExactWhileGateHolds(f, /*seed=*/12);
+        EXPECT_EQ(f.B->tx->orderedScatterCount(), 0u);
+        EXPECT_GT(f.B->tx->privateScatterCount(), privateBefore);
+    }
+    {
+        OrderFixture f;
+        if (!makeOrderFixture(f, "btOrdClr", /*scatterOnOrderStream=*/true))
+        {
+            GTEST_SKIP() << "CUDA or NIXL agent/backend unavailable";
+        }
+        ASSERT_TRUE(f.B->tx->setScatterOrderStream(f.stream));
+        ASSERT_TRUE(f.B->tx->setScatterOrderStream(nullptr));
+        transferExactWhileGateHolds(f, /*seed=*/13);
+        EXPECT_EQ(f.B->tx->orderedScatterCount(), 0u);
+    }
+}
+
+// While the order stream is being captured, scatters fall back to the private copy streams, or to
+// the copy engines with scatter_copy_engine (never the private kernel path, which could wait for SMs
+// a persistent forward grid holds); nothing is captured into the graph.
+TEST(BounceTransport, ScatterOrderStreamCaptureFallback)
+{
+    for (bool const copyEngine : {false, true})
+    {
+        OrderFixture f;
+        if (!makeOrderFixture(f, copyEngine ? "btCeCap" : "btOrdCap", /*scatterOnOrderStream=*/true, copyEngine))
+        {
+            GTEST_SKIP() << "CUDA or NIXL agent/backend unavailable";
+        }
+        ASSERT_TRUE(f.B->tx->setScatterOrderStream(f.stream));
+        auto const ceBefore = f.B->tx->copyEngineScatterCount();
+        auto const privateBefore = f.B->tx->privateScatterCount();
+        transferExactWhileCapturing(f, copyEngine ? 15 : 14);
+        EXPECT_EQ(f.B->tx->orderedScatterCount(), 0u);
+        if (copyEngine)
+        {
+            EXPECT_GT(f.B->tx->copyEngineScatterCount(), ceBefore);
+            EXPECT_EQ(f.B->tx->privateScatterCount(), privateBefore);
+        }
+        else
+        {
+            EXPECT_GT(f.B->tx->privateScatterCount(), privateBefore);
+        }
+    }
 }
 
 namespace

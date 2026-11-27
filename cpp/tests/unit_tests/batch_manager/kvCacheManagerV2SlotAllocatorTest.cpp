@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -137,6 +138,58 @@ TEST(KvCacheManagerV2SlotAllocatorTest, ReusesReleasedSlotsInReleaseOrder)
     releaseSlots(allocator, second, 3, 4);
     EXPECT_EQ(allocator.numOccupiedSlots(), 0);
     allocator.synchronize();
+}
+
+// The lazy scrub must keep the eager scrub's choice: allocate() hands out recycled slots from the
+// front, in release order, and only then never-issued ids.
+TEST(KvCacheManagerV2SlotAllocatorTest, LazyScrubReusesReleasedSlotsBeforeFreshIds)
+{
+    SlotAllocator allocator{SlotCount{8}};
+    auto slots = allocateSlots(allocator, 4);
+    std::vector<Slot> reordered;
+    for (std::size_t const i : {std::size_t{2}, std::size_t{0}, std::size_t{3}, std::size_t{1}})
+    {
+        reordered.emplace_back();
+        reordered.back().setSlot(slots[i]);
+    }
+    releaseSlots(allocator, reordered);
+
+    auto again = allocateSlots(allocator, 5);
+    std::vector<SlotId::ValueType> ids;
+    for (auto const& slot : again)
+    {
+        ids.push_back(slot.slotId().value());
+    }
+    EXPECT_EQ(ids, (std::vector<SlotId::ValueType>{2, 0, 3, 1, 4}));
+
+    releaseSlots(allocator, again);
+}
+
+// An allocator destroyed right after its slots come back, with no synchronize() in between, must pass
+// the debug-build destructor checks: the released slots carry no pending event. The checks run only
+// with TLLM_DEBUG_MODE=1, latched at library load, so the destructor runs in a child process that
+// inherits it; without the release-time scrub the child aborts in the destructor.
+TEST(KvCacheManagerV2SlotAllocatorDeathTest, DestroyedRightAfterRelease)
+{
+    {
+        SlotAllocator allocator{SlotCount{4}};
+        auto slots = allocateSlots(allocator, 4);
+        releaseSlots(allocator, slots);
+        EXPECT_EQ(allocator.numFreeSlots(), 4);
+    }
+    ::setenv("TLLM_DEBUG_MODE", "1", 1);
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            {
+                SlotAllocator allocator{SlotCount{4}};
+                auto slots = allocateSlots(allocator, 4);
+                releaseSlots(allocator, slots);
+            }
+            std::exit(0);
+        },
+        ::testing::ExitedWithCode(0), "");
+    ::unsetenv("TLLM_DEBUG_MODE");
 }
 
 // SlotId is signed, so an upper-bound-only test admits negative ids, which convert to a huge

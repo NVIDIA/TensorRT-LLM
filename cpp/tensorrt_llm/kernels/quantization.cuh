@@ -1038,6 +1038,214 @@ __global__ void __launch_bounds__(1024)
 #endif
 }
 
+// The elements per thread of the 16-element MXFP8 path (two PackedVecs: 32-byte loads, 16-byte stores).
+constexpr int CVT_FP16_TO_MXFP8_X16_ELTS_PER_THREAD = 2 * CVT_ELTS_PER_THREAD;
+
+// cvt_warp_fp16_to_mxfp8<Type, 32, 1> over 16 elements per thread, so 2 lanes share one 32-element SF. The SF and
+// element math are the same, so every output byte equals the 8-element path's.
+template <class Type>
+__device__ uint4 cvt_warp_fp16_to_mxfp8_x16(PackedVec<Type> const& lo, PackedVec<Type> const& hi, uint8_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    auto localMax = cuda_abs(lo.elts[0]);
+#pragma unroll
+    for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++)
+    {
+        localMax = cuda_max(localMax, cuda_abs(lo.elts[i]));
+    }
+#pragma unroll
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++)
+    {
+        localMax = cuda_max(localMax, cuda_abs(hi.elts[i]));
+    }
+    localMax = cuda_max(__shfl_xor_sync(cvt_sf_group_shfl_mask<2>(), localMax, 1), localMax);
+    float vecMax = float(cuda_max(localMax.x, localMax.y));
+
+    float SFValue = vecMax * reciprocal_approximate_ftz(448.0f);
+    __nv_fp8_e8m0 tmpSFVal;
+    tmpSFVal.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
+    uint8_t const fp8SFVal = tmpSFVal.__x;
+    // As in cvt_warp_fp16_to_mxfp8: the reciprocal of the SF from its E8M0 exponent (exact, and finite for the
+    // subnormal 2^-127).
+    float const outputScale = vecMax != 0.f ? exp2f_rcp(fp8SFVal) : 0.0f;
+    cvt_store_replicated_sf<1>(SFout, fp8SFVal);
+
+    float2 loVals[CVT_ELTS_PER_THREAD / 2], hiVals[CVT_ELTS_PER_THREAD / 2];
+#pragma unroll
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++)
+    {
+        if constexpr (std::is_same_v<Type, half>)
+        {
+            loVals[i] = __half22float2(lo.elts[i]);
+            hiVals[i] = __half22float2(hi.elts[i]);
+        }
+        else
+        {
+            loVals[i] = __bfloat1622float2(lo.elts[i]);
+            hiVals[i] = __bfloat1622float2(hi.elts[i]);
+        }
+        loVals[i].x *= outputScale;
+        loVals[i].y *= outputScale;
+        hiVals[i].x *= outputScale;
+        hiVals[i].y *= outputScale;
+    }
+    uint64_t const loE4m3 = fp32_vec_to_e4m3(loVals);
+    uint64_t const hiE4m3 = fp32_vec_to_e4m3(hiVals);
+    return make_uint4(static_cast<uint32_t>(loE4m3), static_cast<uint32_t>(loE4m3 >> 32), static_cast<uint32_t>(hiE4m3),
+        static_cast<uint32_t>(hiE4m3 >> 32));
+#else
+    return make_uint4(0u, 0u, 0u, 0u);
+#endif
+}
+
+// quantize_with_block_size<FP16_TO_MXFP8, Type, 32, true, 32> with 16 elements per thread. Requires numCols and
+// numPaddedCols to be multiples of 16 (always true for MXFP8: both are multiples of 32).
+template <class Type>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 4) quantize_mxfp8_x16(
+#else
+quantize_mxfp8_x16(
+#endif
+        int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in, uint32_t* out,
+        uint32_t* SFout, QuantizationSFLayout layout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_MXFP8_X16_ELTS_PER_THREAD;
+    static constexpr int SF_VEC_SIZE = 32;
+    static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+
+    bool const isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED;
+    int const numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, 128) : numRows;
+    int const numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+    int const numColThreads = numCols / ELTS_PER_THREAD;
+    int const numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
+    int const numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
+    std::optional<int> const optionalNumRows = numRows;
+
+    cudaGridDependencySynchronize();
+    for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x)
+    {
+        // Padding rows exist only in the swizzled SF layout: zero their SFs, write no output.
+        bool const isRowPadding = rowIdx >= numRows;
+        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        {
+            std::optional<int> const optionalBatchIdx = batchIdx;
+            for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
+            {
+                auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF, 1>(
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+                if (isRowPadding || colIdx >= numColThreads)
+                {
+                    if (!isRowPadding && colIdx < numPaddedColThreads)
+                    {
+                        int64_t const outOffset
+                            = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+                        reinterpret_cast<uint4*>(out)[outOffset] = make_uint4(0u, 0u, 0u, 0u);
+                    }
+                    cvt_store_replicated_sf<1>(sf_out, 0x00);
+                    continue;
+                }
+                int64_t const inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+                int64_t const outOffset
+                    = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+                PackedVec<Type> const* src = reinterpret_cast<PackedVec<Type> const*>(in) + 2 * inOffset;
+                PackedVec<Type> const lo = src[0];
+                PackedVec<Type> const hi = src[1];
+                reinterpret_cast<uint4*>(out)[outOffset] = cvt_warp_fp16_to_mxfp8_x16<Type>(lo, hi, sf_out);
+            }
+        }
+    }
+    // See quantize_with_block_size: every thread's stores are device-visible before any thread triggers.
+    __threadfence();
+    __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+constexpr int MXFP8_TILE128X4_THREADS = 256;
+constexpr int MXFP8_TILE128X4_BLOCKS_PER_SM = 4;
+
+// quantize_mxfp8_x16 over 128-row x 4-SF-column tiles, for the swizzled SF layout with one batch and no padded
+// columns. A row's SFs land in a different 128 B line every 4 SF blocks, but a tile's 512 SF bytes are one contiguous
+// block of the 128x4 layout, so they are staged in shared memory and written with full-line stores. Every output byte
+// equals the 8-element path's, padding rows and padding SF columns included.
+template <class Type>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+__launch_bounds__(MXFP8_TILE128X4_THREADS, MXFP8_TILE128X4_BLOCKS_PER_SM) quantize_mxfp8_tile128x4(
+#else
+quantize_mxfp8_tile128x4(
+#endif
+    int32_t numRows, int32_t numCols, Type const* in, uint32_t* out, uint32_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static constexpr int SF_VEC_SIZE = 32;
+    static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_MXFP8_X16_ELTS_PER_THREAD;
+    static constexpr int THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+    static constexpr int TILE_ROWS = 128;
+    static constexpr int TILE_SF_COLS = 4;
+    static constexpr int TILE_SF_BYTES = TILE_ROWS * TILE_SF_COLS;
+    static constexpr int LANES_PER_ROW = THREADS_PER_SF * TILE_SF_COLS;
+    static constexpr int ROWS_PER_PASS = MXFP8_TILE128X4_THREADS / LANES_PER_ROW;
+    static_assert(TILE_ROWS % ROWS_PER_PASS == 0 && TILE_SF_BYTES / sizeof(uint4) <= MXFP8_TILE128X4_THREADS);
+
+    __shared__ __align__(16) uint8_t sfTile[TILE_SF_BYTES];
+
+    int const numSfCols = numCols / SF_VEC_SIZE;
+    int const numKTiles = (numSfCols + TILE_SF_COLS - 1) / TILE_SF_COLS;
+    int const numTiles = (numRows + TILE_ROWS - 1) / TILE_ROWS * numKTiles;
+    int const numColThreads = numCols / ELTS_PER_THREAD;
+    int const rowInPass = threadIdx.x / LANES_PER_ROW;
+    int const sfColInTile = threadIdx.x % LANES_PER_ROW / THREADS_PER_SF;
+    int const threadInSf = threadIdx.x % THREADS_PER_SF;
+
+    cudaGridDependencySynchronize();
+    for (int tile = blockIdx.x; tile < numTiles; tile += gridDim.x)
+    {
+        int const mTile = tile / numKTiles;
+        int const kTile = tile % numKTiles;
+        int const sfCol = kTile * TILE_SF_COLS + sfColInTile;
+        bool const colValid = sfCol < numSfCols;
+        // Loads are clamped rather than predicated so both lanes of an SF block always reach the max-reduce shuffle.
+        int const colThread = min(sfCol, numSfCols - 1) * THREADS_PER_SF + threadInSf;
+#pragma unroll
+        for (int pass = 0; pass < TILE_ROWS / ROWS_PER_PASS; pass++)
+        {
+            int const localRow = pass * ROWS_PER_PASS + rowInPass;
+            int const rowIdx = mTile * TILE_ROWS + localRow;
+            bool const valid = colValid && rowIdx < numRows;
+            int64_t const inOffset = static_cast<int64_t>(min(rowIdx, numRows - 1)) * numColThreads + colThread;
+            PackedVec<Type> const* src = reinterpret_cast<PackedVec<Type> const*>(in) + 2 * inOffset;
+            PackedVec<Type> const lo = src[0];
+            PackedVec<Type> const hi = src[1];
+            uint8_t sfVal = 0;
+            uint4 const q = cvt_warp_fp16_to_mxfp8_x16<Type>(lo, hi, &sfVal);
+            if (valid)
+            {
+                reinterpret_cast<uint4*>(out)[static_cast<int64_t>(rowIdx) * numColThreads + colThread] = q;
+            }
+            if (threadInSf == 0)
+            {
+                // get_sf_out_offset_128x4 inside one tile.
+                sfTile[(localRow % 32) * 16 + (localRow / 32) * 4 + sfColInTile] = valid ? sfVal : 0;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < TILE_SF_BYTES / sizeof(uint4))
+        {
+            int64_t const tileOffset = (static_cast<int64_t>(mTile) * numKTiles + kTile) * TILE_SF_BYTES;
+            reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(SFout) + tileOffset)[threadIdx.x]
+                = reinterpret_cast<uint4 const*>(sfTile)[threadIdx.x];
+        }
+        __syncthreads();
+    }
+    __threadfence();
+    __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 __global__ void block_scale_interleave_kernel(
     int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
 } // namespace kernels

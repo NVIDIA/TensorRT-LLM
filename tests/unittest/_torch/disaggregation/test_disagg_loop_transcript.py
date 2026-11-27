@@ -459,7 +459,7 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
         }
         executor._enqueue_responses = lambda responses: calls.append(("enqueue_responses",))
 
-        def handle_responses(*, emit_first_iter: bool) -> list:
+        def handle_responses(*, emit_first_iter: bool, gpu_times_cache=None) -> list:
             executor._enqueue_responses([])
             return []
 

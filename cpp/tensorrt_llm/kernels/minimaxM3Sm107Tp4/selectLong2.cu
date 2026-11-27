@@ -102,8 +102,9 @@ __device__ __forceinline__ int selectRow(SelectSmem& sm, float const* rowBase, l
     __syncthreads();
     // Every score of the row is loaded: release the sparse decode, so its launch and its pre-wait prologue overlap
     // the rank below. This comes after this grid's own dependency wait, which the sparse decode relies on: it reads
-    // q and the seq_lens / block-table row before its own wait (sparseDecodeLc2.cu), safe only while every kernel
-    // between the producer and it releases its dependents after its own wait.
+    // seq_lens and may stage the block-table row before its own wait, and reads q only after it
+    // (csrc/m3/sm107Tp2SparseDecodeLc2.cu): on identity-selection steps the producer may release it before q is
+    // written.
     if (loadedTrigger)
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     uint32_t bound = 0;

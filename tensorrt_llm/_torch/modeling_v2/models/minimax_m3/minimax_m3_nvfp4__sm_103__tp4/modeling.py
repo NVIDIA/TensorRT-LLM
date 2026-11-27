@@ -4528,7 +4528,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm103Tp4(
             f"this target is built for sm_{_SM[0]}{_SM[1]}, the device is sm_"
             f"{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
-        # The fused all-reduces and the low-M MXFP8 GEMM run the family library's fixed copies: an installation
+        # The fused all-reduces and the low-M MXFP8 GEMM run the family library's kernels: an installation
         # without the library refuses here (NoTarget), and modeling_v2='auto' keeps the built-in model.
         family_ops()
         # Under modeling_v2='require' a covered decode shape that cannot take its fast path raises.

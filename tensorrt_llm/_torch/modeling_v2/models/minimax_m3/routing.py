@@ -293,6 +293,38 @@ def _m31_speculation_mismatch(spec_config: Optional[Any]) -> Optional[str]:
     return None
 
 
+# The engine's MSA KV pool zero-initialization switch ("1" = on, the default). The M3.1 targets read page tails no
+# request has written, so they decline a process that turns it off.
+_KV_POOL_ZERO_INIT_ENV = "TRTLLM_M3_KV_POOL_ZERO_INIT"
+
+
+def _m31_refused(
+    llm_args: TorchLlmArgs,
+    compute_capability: Tuple[int, int],
+    topology: Optional[str],
+    kv_cache_quant_algo: Any,
+    spec_config: Optional[Any],
+) -> List[str]:
+    """What the MiniMax-M3.1-Flash targets do not run for this deployment of the M3.1 checkpoint; empty when one is
+    admitted (``topology`` names it)."""
+    refused = []
+    speculation_miss = _m31_speculation_mismatch(spec_config)
+    if speculation_miss is not None:
+        refused.append(speculation_miss)
+    if compute_capability != _SM_RUBIN:
+        refused.append("not sm107 (Rubin)")
+    if kv_cache_quant_algo not in (QuantAlgo.FP8, QuantAlgo.NVFP4):
+        refused.append("a KV cache other than FP8 or NVFP4")
+    if topology is None:
+        refused.append("a parallel layout no target runs")
+    zero_init = os.environ.get(_KV_POOL_ZERO_INIT_ENV, "1")
+    if zero_init != "1":
+        refused.append(
+            f"{_KV_POOL_ZERO_INIT_ENV}={zero_init} (the MSA KV pool must be zero-initialized)"
+        )
+    return refused
+
+
 def _m31_drafter_window(spec_config: Any) -> Optional[int]:
     """The DSpark drafter's attention window as its ``config.json`` declares it, or None for full attention.
 
@@ -331,60 +363,34 @@ def _m31_drafter_window(spec_config: Any) -> Optional[int]:
     return window
 
 
-def _m31_disagg_generation(llm_args: TorchLlmArgs) -> bool:
-    """Whether this worker is a disaggregated generation worker: the generation role, or a KV cache transceiver
-    without the context role."""
-    role = os.environ.get("TRTLLM_DISAGG_ROLE", "").strip().lower()
-    if role.startswith(("generation", "gen")):
-        return True
-    return llm_args.cache_transceiver_config is not None and not role.startswith(("context", "ctx"))
+def _m31_draft_pool_guard(
+    target_cls: type, llm_args: TorchLlmArgs, spec_config: Optional[Any]
+) -> None:
+    """Raise ``NoTarget`` when ``target_cls``'s hooks lack the draft pool fixes a windowed drafter with
+    chunked prefill and no host KV cache needs (the mirror's history-first resize).
 
+    Called as a statement before ``return <target class>``: the native loader reads the routed
+    targets from those plain returns (``_native._routed_targets``).
 
-def _m31_refused(
-    llm_args: TorchLlmArgs,
-    compute_capability: Tuple[int, int],
-    topology: Optional[str],
-    kv_cache_quant_algo: Any,
-    spec_config: Optional[Any],
-) -> List[str]:
-    """What the MiniMax-M3.1-Flash targets do not run for this deployment of the M3.1 checkpoint; empty when one is
-    admitted (``topology`` names it)."""
-    from .runtime_hooks_compat import missing_defaults
-
-    refused = []
-    speculation_miss = _m31_speculation_mismatch(spec_config)
-    if speculation_miss is not None:
-        refused.append(speculation_miss)
-    if compute_capability != _SM_RUBIN:
-        refused.append("not sm107 (Rubin)")
-    if kv_cache_quant_algo not in (QuantAlgo.FP8, QuantAlgo.NVFP4):
-        refused.append("a KV cache other than FP8 or NVFP4")
-    if topology is None:
-        refused.append("a parallel layout no target runs")
-    if spec_config is not None and speculation_miss is None:
-        window = _m31_drafter_window(spec_config)
-        max_seq_len = getattr(llm_args, "max_seq_len", None)
-        windowed = window is not None and (max_seq_len is None or window < max_seq_len)
-        if (
-            windowed
-            and llm_args.enable_chunked_prefill
-            and llm_args.kv_cache_config.host_cache_size in (None, 0)
-        ):
-            refused.append(
-                f"a DSpark drafter with a {window}-token window, chunked prefill and no host KV cache, whose "
-                "separate draft pool needs a history-first resize this engine does not have"
-            )
-        if (
-            windowed
-            and topology in ("tp2", "tp4", "tp8", "dep")
-            and _m31_disagg_generation(llm_args)
-        ):
-            refused.append(
-                f"a disaggregated generation worker with a {window}-token DSpark draft window, which this engine "
-                "does not carry from the context worker"
-            )
-    refused.extend(missing_defaults())
-    return refused
+    A target that builds its hooks per instance declares them on the class as ``draft_pool_fixes``;
+    otherwise its class-level ``runtime_hooks`` decides."""
+    if spec_config is None or getattr(target_cls, "draft_pool_fixes", False) is True:
+        return
+    if getattr(getattr(target_cls, "runtime_hooks", None), "draft_pool_fixes", False):
+        return
+    window = _m31_drafter_window(spec_config)
+    max_seq_len = getattr(llm_args, "max_seq_len", None)
+    windowed = window is not None and (max_seq_len is None or window < max_seq_len)
+    if (
+        windowed
+        and llm_args.enable_chunked_prefill
+        and llm_args.kv_cache_config.host_cache_size in (None, 0)
+    ):
+        raise NoTarget(
+            f"MiniMax-M3.1-Flash: a DSpark drafter with a {window}-token window, chunked prefill and no host "
+            f"KV cache, whose separate draft pool needs a history-first resize {target_cls.__name__}'s hooks "
+            "do not turn on (draft_pool_fixes)"
+        )
 
 
 @routes("MiniMaxM3SparseForConditionalGeneration")
@@ -517,36 +523,42 @@ def route(
                 ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2,
             )
 
+            _m31_draft_pool_guard(ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2, llm_args, spec_config)
             return ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2
         if not m31_refused and m31_topology == "tp4":
             from .minimax_m3_1_flash_nvfp4__sm_107__tp4.modeling import (
                 ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4,
             )
 
+            _m31_draft_pool_guard(ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4, llm_args, spec_config)
             return ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4
         if not m31_refused and m31_topology == "tp8":
             from .minimax_m3_1_flash_nvfp4__sm_107__tp8.modeling import (
                 ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8,
             )
 
+            _m31_draft_pool_guard(ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8, llm_args, spec_config)
             return ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8
         if not m31_refused and m31_topology == "tp2ctx":
             from .minimax_m3_1_flash_nvfp4__sm_107__tp2ctx.modeling import (
                 ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx,
             )
 
+            _m31_draft_pool_guard(ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx, llm_args, spec_config)
             return ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx
         if not m31_refused and m31_topology == "dep2ctx":
             from .minimax_m3_1_flash_nvfp4__sm_107__dep2ctx.modeling import (
                 ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx,
             )
 
+            _m31_draft_pool_guard(ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx, llm_args, spec_config)
             return ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx
         if not m31_refused and m31_topology == "dep":
             from .minimax_m3_1_flash_nvfp4__sm_107__dep.modeling import (
                 ModelingV2MiniMaxM31FlashNvfp4Sm107Dep,
             )
 
+            _m31_draft_pool_guard(ModelingV2MiniMaxM31FlashNvfp4Sm107Dep, llm_args, spec_config)
             return ModelingV2MiniMaxM31FlashNvfp4Sm107Dep
         raise NoTarget(
             f"MiniMax-M3.1-Flash: {'; '.join(m31_refused)}; got compute capability {compute_capability}, parallel "

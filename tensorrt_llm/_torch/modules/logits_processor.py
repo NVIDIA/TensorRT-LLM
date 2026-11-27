@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,20 @@ from .context_logits import project_context_logits
 from .embedding import LMHead
 from .linear import Linear
 from .logits_cast import widen_logits_to_fp32
+
+# A model's replacement of the logits widening, installed at load time:
+# fn(logits) returns exactly ``logits.float()`` (the same values and a
+# contiguous layout) or None, and the stock widening then runs. None (the
+# default) keeps the stock widening.
+_LogitsWidenOverride = Callable[[torch.Tensor], Optional[torch.Tensor]]
+_LOGITS_WIDEN_OVERRIDE: Optional[_LogitsWidenOverride] = None
+
+
+def set_logits_widen_override(fn: Optional[_LogitsWidenOverride]) -> None:
+    """Install (or, with None, remove) the logits widen override used by
+    ``LogitsProcessor.forward``."""
+    global _LOGITS_WIDEN_OVERRIDE
+    _LOGITS_WIDEN_OVERRIDE = fn
 
 
 def scale_and_soft_cap_logits(logits: torch.Tensor, multiplier: float,
@@ -81,6 +95,10 @@ class LogitsProcessor(nn.Module):
         logits = lm_head(hidden_states)
         if keep_lm_head_dtype:
             return logits
+        widened = (None if _LOGITS_WIDEN_OVERRIDE is None else
+                   _LOGITS_WIDEN_OVERRIDE(logits))
+        if widened is not None:
+            return widened
         # Bit-identical to .float(); the vectorized kernel runs at HBM
         # bandwidth when the logits fit it (see logits_cast.py).
         return widen_logits_to_fp32(logits)

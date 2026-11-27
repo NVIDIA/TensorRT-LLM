@@ -242,7 +242,8 @@ void NixlTransferAgent::maybeInitBounce(
             return;
         }
         st->arenaRegistered = true;
-        st->exec = std::make_unique<bounce::ExecPool>(cfg.copyStreamCount, maxDescs, dev, cfg.useZeroCopyArguments);
+        st->exec = std::make_unique<bounce::ExecPool>(cfg.copyStreamCount, maxDescs, dev, cfg.useZeroCopyArguments,
+            cfg.copyStreamPriority, cfg.scatterOnOrderStream && cfg.scatterBlockingSync);
         st->transport = std::make_unique<bounce::BounceTransport>(
             mName, cfg, dev, st->channel.get(), *this, st->arena.get(), st->exec.get());
         // Log EVERY resolved knob so a mis-tuned deployment can tell which of dict/env/default won. The
@@ -254,13 +255,16 @@ void NixlTransferAgent::maybeInitBounce(
             "maxInflightChunksPerRequest=%u "
             "copyStreamCount=%u scatterWorkerCount=%u minDescriptorCount=%zu maxAverageDescriptorSizeBytes=%zu "
             "requestTimeoutMs=%d receiverFlowTimeoutMs=%d quarantineMs=%d disableFabricMemory=%d "
-            "enableEagerGather=%d useZeroCopyArguments=%d control=%s)",
+            "enableEagerGather=%d useZeroCopyArguments=%d scatterOnOrderStream=%d scatterCopyEngine=%d "
+            "scatterBlockingSync=%d copyStreamPriority=%s control=%s)",
             mName.c_str(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes, st->transport->maxChunkSizeBytes(),
             cfg.maxChunkSizeBytes, static_cast<unsigned>(cfg.maxInflightChunksPerRequest),
             static_cast<unsigned>(cfg.copyStreamCount), static_cast<unsigned>(cfg.scatterWorkerCount),
             cfg.minDescriptorCount, cfg.maxAverageDescriptorSizeBytes, cfg.requestTimeoutMs, cfg.receiverFlowTimeoutMs,
             cfg.quarantineMs, static_cast<int>(cfg.disableFabricMemory), static_cast<int>(cfg.enableEagerGather),
-            static_cast<int>(cfg.useZeroCopyArguments), controlDesc.c_str());
+            static_cast<int>(cfg.useZeroCopyArguments), static_cast<int>(cfg.scatterOnOrderStream),
+            static_cast<int>(cfg.scatterCopyEngine), static_cast<int>(cfg.scatterBlockingSync),
+            bounce::BounceConfig::toString(cfg.copyStreamPriority), controlDesc.c_str());
         if (cfg.maxAverageDescriptorSizeBytes == 0)
         {
             // Make "enabled but nothing routed" visible once; the per-rejection log stays DEBUG-only.
@@ -406,6 +410,17 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
     }
     return false;
 }
+
+bool NixlTransferAgent::setScatterOrderStream(std::uintptr_t stream)
+{
+    // shutdown() resets mBounce under the exclusive lock: hold the shared one across the check and the call.
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    if (mShutdown.load() || !mBounce || !mBounce->transport)
+    {
+        return false;
+    }
+    return mBounce->transport->setScatterOrderStream(reinterpret_cast<cudaStream_t>(stream));
+}
 #else  // !TLLM_BOUNCE_V2 — bounce not built; the member stays null; the stubs warn or throw as documented.
 namespace bounce
 {
@@ -442,6 +457,11 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
 }
 
 bool NixlTransferAgent::shouldUseBounce(TransferRequest const&) const
+{
+    return false;
+}
+
+bool NixlTransferAgent::setScatterOrderStream(std::uintptr_t)
 {
     return false;
 }

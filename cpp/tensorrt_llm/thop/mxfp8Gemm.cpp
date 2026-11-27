@@ -29,6 +29,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -298,6 +299,12 @@ public:
         return static_cast<int64_t>(mConfigs.size());
     }
 
+    //! A stable description of native tactic ``configIdx`` (its CUTLASS config), for name-keyed tactic caches.
+    std::string getConfigName(int64_t configIdx) const
+    {
+        return getConfig(configIdx).toString();
+    }
+
 private:
     tkc::CutlassGemmConfig const& getConfig(int64_t const configIdx) const
     {
@@ -320,6 +327,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def(torch::init<at::ScalarType>())
         .def("run_gemm", &tensorrt_llm::torch_ext::MXFP8GemmRunner::runGemm)
         .def("get_num_configs", &tensorrt_llm::torch_ext::MXFP8GemmRunner::getNumConfigs)
+        .def("get_config_name", &tensorrt_llm::torch_ext::MXFP8GemmRunner::getConfigName)
         .def("register_tactic", &tensorrt_llm::torch_ext::MXFP8GemmRunner::registerTactic)
         .def("get_cached_tactic", &tensorrt_llm::torch_ext::MXFP8GemmRunner::getCachedTactic)
         .def("clear_tactic_cache", &tensorrt_llm::torch_ext::MXFP8GemmRunner::clearTacticCache);

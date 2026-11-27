@@ -149,11 +149,26 @@ def _step(draft_width: int):
     return scheduled, outputs
 
 
-def _reference_store(before: dict[str, torch.Tensor], outputs: dict) -> dict[str, torch.Tensor]:
-    """What the sampler has always stored: each live row's outputs at its slot, zero-padded."""
+def _native_scatter(sampler: SpecSampler) -> bool:
+    """Whether the sampler's own store update is the native slot scatter (taken when no fold is bound)."""
+    return sampler.spec_step_fold is None and sampler._store_scatter is not None
+
+
+def _reference_store(
+    before: dict[str, torch.Tensor], outputs: dict, zero_past_lens: bool = False
+) -> dict[str, torch.Tensor]:
+    """What the sampler has always stored: each live row's outputs at its slot, zero-padded.
+
+    With ``zero_past_lens`` (the native slot scatter), a row's new_tokens at or past its new_tokens_lens are zeros.
+    """
     expected = {name: tensor.clone() for name, tensor in before.items()}
     count = len(SEQ_SLOTS)
     slots = torch.tensor(SEQ_SLOTS, dtype=torch.long, device="cuda")
+    if zero_past_lens:
+        new_tokens = outputs["new_tokens"].clone()
+        cols = torch.arange(new_tokens.shape[1], device="cuda")
+        new_tokens[cols[None, :] >= outputs["new_tokens_lens"][:, None]] = 0
+        outputs = dict(outputs, new_tokens=new_tokens)
 
     def padded(tensor: torch.Tensor, width: int) -> torch.Tensor:
         tensor = tensor[:count, :width]
@@ -184,7 +199,7 @@ def test_without_a_fold_the_store_is_written_as_before(draft_width):
     state = sampler.sample_async(scheduled, outputs, [])
 
     assert sampler.spec_step_fold is None
-    expected = _reference_store(before, outputs)
+    expected = _reference_store(before, outputs, zero_past_lens=_native_scatter(sampler))
     _assert_store_equals(sampler, expected)
     state.sampler_event.synchronize()
     assert torch.equal(state.host.new_tokens, expected["new_tokens"].cpu())
@@ -277,15 +292,17 @@ def test_store_copies_go_on_the_side_stream_when_the_sampler_stored_the_rows():
 def test_side_stream_store_copies_match_the_main_stream_copies(draft_width):
     scheduled, outputs = _step(draft_width)
     main_sampler = _sampler()
-    expected = _reference_store(_store_snapshot(main_sampler), outputs)
+    sampler = _sampler()
+    sampler.d2h_side_stream_copies = True
+    expected = _reference_store(
+        _store_snapshot(main_sampler), outputs, zero_past_lens=_native_scatter(sampler)
+    )
     for name, tensor in expected.items():
         getattr(main_sampler.store, name).copy_(tensor)
     main_sampler.bind_spec_step_fold(_fold(rows_stored=True))
     main_state = main_sampler.sample_async(scheduled, outputs, [])
     assert main_state.sampler_event.side_stream_event is None
     on_main = _host_outputs(main_state)
-    sampler = _sampler()
-    sampler.d2h_side_stream_copies = True
 
     state = sampler.sample_async(scheduled, outputs, [])
 
@@ -348,9 +365,12 @@ def test_static_slot_ids_are_off_by_default():
 def test_static_slot_ids_store_the_same_rows(draft_width):
     scheduled, outputs = _step(draft_width)
     plain = _sampler()
-    expected = _reference_store(_store_snapshot(plain), outputs)
     sampler = _sampler()
     sampler.static_slot_ids = True
+    sampler._store_scatter = (
+        None  # force _scatter_to_stores, the only path that reads static_slot_ids
+    )
+    expected = _reference_store(_store_snapshot(plain), outputs)
 
     sampler.sample_async(scheduled, outputs, [])
     sampler.sample_async(scheduled, outputs, [])  # second step reuses the uploaded ids

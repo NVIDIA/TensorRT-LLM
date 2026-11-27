@@ -601,6 +601,18 @@ def test_connector_timeout_constraints(
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("yes", False)])
+def test_connector_context_only_type(
+    schemas: dict[str, dict], filename: str, value: bool | str, valid: bool
+) -> None:
+    config = {"kv_connector_config": {"connector": "lmcache", "context_only": value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 def test_memory_monitor_config_matches_runtime(schemas: dict[str, dict], filename: str) -> None:
     from pydantic import ValidationError
 
@@ -761,6 +773,24 @@ def test_dspark_device_reranking_field(
             "enable_fused_confidence_scheduler": value,
         }
     }
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("value", "valid"), [(True, True), (False, True), ("invalid", False), (None, False)]
+)
+def test_disagg_completion_reservation_field(
+    schemas: dict[str, dict], filename: str, value: object, valid: bool
+) -> None:
+    field = schemas[filename]["$defs"]["KvCacheConfig"]["properties"][
+        "enable_disagg_completion_reservation"
+    ]
+    assert field["default"] is False
+    config = {"kv_cache_config": {"enable_disagg_completion_reservation": value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 

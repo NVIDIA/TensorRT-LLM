@@ -573,6 +573,38 @@ There are some other useful environment variables that may help when encounterin
 
 * `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
 
+### KV cache V2 scheduler: context policies
+
+These variables tune how the KV cache V2 scheduler (`KVCacheV2Scheduler`) admits and preempts context requests, which matters most on context workers serving long prompts. They are read once at executor startup.
+
+Context preemption (both default off):
+
+* `TLLM_V2_CTX_ONLY_PREEMPTION`: A disaggregated worker runs with recompute pause off, because a generation worker cannot replay a prefill it received. If set to `1`, a context-only request that has started its prefill stays a preemption victim on a context worker, so a pool full of started prefills preempts one of them (re-prefilled later, its committed blocks reusable) instead of declaring a scheduler deadlock. Requests whose KV is being sent, requests with a chunk possibly still in flight and generation-only requests are never taken, and it stays off under pipeline parallelism.
+* `TLLM_V2_CTX_PREEMPT_LEAST_PROGRESS`: If set to `1`, a context request that is out of pages preempts the eligible request with the least progress (tokens computed past its reused or loaded prefix, generated tokens included; the newest on a tie) instead of the newest eligible request, so the pass discards the least finished work.
+
+The scheduler logs its context page pressure (passes, preemptions and the prefill tokens they discarded, deferred preemptions, out-of-pages requests without a victim, suspends) in one `ctx preemption:` line per 60 s window in which a context request was pending.
+
+Shortest-uncached-first aging (`scheduler_config.context_scheduling_policy: shortest_uncached_first` only; off by default, on where a model's runtime hooks opt in):
+
+* `TLLM_CTX_SRPT_MAX_WAIT_PASSES`: A context request that has waited this many scheduling passes is aged: it moves ahead of the shortest-first order, so a long cold prompt is not crowded out by shorter ones indefinitely, and a first chunk can no longer preempt a started request. Setting it turns aging on (or, with `0`, off) either way; with a model's opt-in the default is `600` (`128` with `TLLM_CTX_SRPT_AGE_FROM_ARRIVAL=0`).
+* `TLLM_CTX_SRPT_AGE_FROM_ARRIVAL`: The default `1` counts the age from the pass a request first waits and keeps it aged until its prefill completes; `0` counts from the last chunk it received.
+* `TLLM_CTX_SRPT_MAX_WAIT_S`: Wall-clock bound on the same age (default `120`, `0` off), used with age from arrival on ranks that schedule their own requests (attention DP or a single rank).
+* `TLLM_CTX_SRPT_AGED_SLOTS`: How many aged requests go ahead of the shortest-first order, started ones first (default `1`); the other aged requests follow the shortest-first ones. `0` puts every aged request first.
+
+Per-request context chunk cap (default off):
+
+* `TLLM_CTX_REQUEST_CHUNK_CAP`: With chunked prefill and several context requests pending, caps each one's chunk at the larger of this many tokens and its even share of the step budget, so long prompts interleave with shorter ones. A lone context request keeps the whole budget, and forced (snapshot) chunks are not capped.
+* `TLLM_CTX_CHUNK_CAP_ELIGIBLE_SHARE`: The default `1` divides the budget still left among the requests still able to take a chunk in the pass; `0` gives every pending request one share of the whole budget.
+
+Context fill (on whenever store-aware shortest-uncached-first ranking is on, which a model's runtime hooks or `TLLM_CTX_SHORTEST_FIRST_STORE_AWARE=1` turn on with a KV connector whose scheduler implements `probe_num_matched_tokens` and declares `loads_async`; off by default, and inert with a connector that implements neither):
+
+* `TRTLLM_DISABLE_CTX_FILL`: A first chunk whose ranking probe predicts that the connector serves its prefix is charged only the tokens its forward pass computes (one chunk unit for an asynchronous load, the tokens past the served end for a synchronous one), so the rest of the step budget goes to other requests. It needs a connector scheduler that declares `loads_async` under attention DP. If set to `1`, such a chunk is charged in full.
+* `TRTLLM_DISABLE_CTX_FILL_V2`: By default an asynchronously served chunk that is shrunk also reserves the pages of its probed served prefix during scheduling (a request whose prefix does not fit is deferred a pass instead of losing its hit), and chunks shrink only while the previous pass left a backlog of context requests. If set to `1`, the shrink applies without either. `TRTLLM_CTX_FILL_MIN_BACKLOG` (default `8`) sets the backlog and `TRTLLM_CTX_FILL_MAX_DEFER` (default `4`) the deferrals after which a request is no longer shrunk.
+
+Out-of-pages retry gate (chunked prefill; off by default, on where a model's runtime hooks opt in or with `TRTLLM_CTX_OOP_RETRY_GATE=1`, which with `0` also turns an opt-in off):
+
+* `TRTLLM_DISABLE_CTX_OOP_RETRY_GATE`: While the KV pool is full, a first-chunk context request that failed to allocate is not retried (reuse probe, claim and resize) until the pools' free or evictable page counts rise, a smaller chunk would be tried, or `TRTLLM_CTX_OOP_RETRY_GATE_MAX_SKIP` (default `16`) plus a per-request offset passes have gone by; the replayed failure still preempts as an attempt would. The gate stands aside as the scheduler nears a deadlock declaration. A replayed failure attempts for real when a decoder-hold window or the connector completion reservation could defer it instead of preempting. If set to `1`, every pass attempts every request. `TRTLLM_CTX_OOP_RETRY_GATE_SHADOW=1` attempts every request but counts what the gate would have skipped.
+
 ### Opt-in transfer lifecycle diagnostics
 
 For a targeted native Python-transceiver/Scheduler V2 debugging run, set

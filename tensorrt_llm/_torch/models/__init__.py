@@ -64,6 +64,7 @@ __all__ = [
     "LlavaNextModel",
     "MBartForConditionalGeneration",
     "MiniCPMV4_6Model",
+    "MiniMaxDSparkBackbone",
     "MiniMaxM2ForCausalLM",
     "MiniMaxM3ForCausalLM",
     "MiniMaxM3VLForConditionalGeneration",

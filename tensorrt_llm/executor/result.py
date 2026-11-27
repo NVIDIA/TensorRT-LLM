@@ -718,6 +718,8 @@ class GenerationResultBase:
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
+                    draft_ctx_state=getattr(response_result, "draft_ctx_state",
+                                            None),
                     multimodal_embedding_handles=None,
                     multimodal_input_layout=None,
                 )
@@ -1382,6 +1384,10 @@ class IterationResult:
     def __init__(self):
         self._done = False
         self._timeout = 2
+        # Stats RPCs still in flight (add_pending_records): each is a
+        # concurrent.futures.Future of a record list, queued in order before
+        # the next read.
+        self._pending_records = []
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -1397,9 +1403,37 @@ class IterationResult:
         # should be called when new prompts are submitted
         self._done = False
 
+    def add_pending_records(self, future) -> None:
+        """Queue the records of an RPC still in flight.
+
+        ``future`` is a ``concurrent.futures.Future`` of a list of records. The
+        next read awaits it (async iteration) or waits for it (``get_results``)
+        and queues its records before reading, so a caller's event loop is not
+        blocked while the RPC runs, and the records and their order are the
+        same as when they are queued on arrival. A failed RPC queues nothing.
+        """
+        self._pending_records.append(future)
+
+    def has_inflight_records(self) -> bool:
+        """Whether a stats RPC queued by ``add_pending_records`` is still running."""
+        return any(not future.done() for future in self._pending_records)
+
+    def _queue_records(self, records) -> None:
+        for record in records:
+            self.queue.put(record)
+
+    def _take_pending_records(self) -> list:
+        pending, self._pending_records = self._pending_records, []
+        return pending
+
     def get_results(self) -> List[dict]:
         """Return all runtime results in the queue.
         """
+        for future in self._take_pending_records():
+            try:
+                self._queue_records(future.result())
+            except Exception as e:
+                logger.debug(f"Error fetching iteration results via RPC: {e}")
         results = []
         while not self._done:
             try:
@@ -1413,6 +1447,19 @@ class IterationResult:
         return self
 
     async def __anext__(self):
+        # Each future stays pending here until its records are queued, so a
+        # read cancelled while it waits leaves it (and the ones after it) to
+        # the next read; the shield keeps that cancellation off the RPC.
+        while self._pending_records:
+            future = self._pending_records[0]
+            try:
+                records = await asyncio.shield(asyncio.wrap_future(future))
+            except Exception as e:
+                logger.debug(f"Error fetching iteration results via RPC: {e}")
+                records = ()
+            if self._pending_records and self._pending_records[0] is future:
+                self._pending_records.pop(0)
+                self._queue_records(records)
         if self._done:
             raise StopAsyncIteration
 

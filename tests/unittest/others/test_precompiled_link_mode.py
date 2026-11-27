@@ -149,6 +149,7 @@ def test_precompiled_preserves_source_schemas(
     paths = (
         "tensorrt_llm/schemas/trtllm-serve-config.schema.json",
         "tensorrt_llm/usage/schemas/trtllm_usage_event_schema.json",
+        "tensorrt_llm/_torch/modeling_v2/models/minimax_m3/m31_tuning/sm107/tp2/autotuner_cache.json",
     )
     for name in paths:
         path = Path(name)
@@ -166,7 +167,14 @@ def test_precompiled_preserves_source_schemas(
                 archive.writestr(name, "old-precompiled-build")
     monkeypatch.setenv("TRTLLM_PRECOMPILED_LINK", "1" if source_kind == "link" else "0")
     extract_from_precompiled(
-        str(source), PACKAGE_DATA + ["schemas/*.json", "usage/schemas/*.json"], str(tmp_path)
+        str(source),
+        PACKAGE_DATA
+        + [
+            "schemas/*.json",
+            "usage/schemas/*.json",
+            "_torch/modeling_v2/models/minimax_m3/m31_tuning/**/*.json",
+        ],
+        str(tmp_path),
     )
     for name in paths:
         assert Path(name).read_text() == "current-checkout"
@@ -285,3 +293,20 @@ def test_skew_check_is_skipped_outside_a_repo(warn_on_build_skew, monkeypatch, c
     warn_on_build_skew("/src")
 
     assert "Cannot check for build skew" in capfd.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "filename, skipped",
+    [
+        (
+            "tensorrt_llm/_torch/modeling_v2/models/minimax_m3/m31_tuning/sm107/tp2/autotuner_cache.json",
+            True,
+        ),
+        (
+            "tensorrt_llm/_torch/modeling_v2/models/minimax_m3/m31_tuning/sm107/tp2/autotuner_cache.bin",
+            False,
+        ),
+    ],
+)
+def test_m31_tactic_pins_are_source_owned(filename, skipped):
+    assert _load("should_skip_precompiled_package_data")(filename) is skipped

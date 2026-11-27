@@ -30,13 +30,55 @@ the two means giving the provider one class that holds these methods and
 having a leaf inherit it, which touches every kernel call site.
 """
 
+import functools
+import os
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._utils import env_switch
 
 from .impl_contract import EngineRouting, MoERoutingTables, PreroutedRouting
+
+# Large-M BF16 NVFP4 activation quantization through FlashInfer's TMA kernel, byte-exact with the
+# TRT op: a backend instance a model opts in (TRTLLMOpBackend.enable_flashinfer_fp4_quantize,
+# RuntimeHooks.moe_flashinfer_fp4_quantize) takes it from FLASHINFER_FP4_QUANTIZE_MIN_ROWS rows when
+# FlashInfer imports, unless the disable switch is 1. Off otherwise. Read at import.
+FLASHINFER_FP4_QUANTIZE_DISABLE_ENV = "TRTLLM_MOE_DISABLE_FLASHINFER_FP4_QUANTIZE"
+FLASHINFER_FP4_QUANTIZE_MIN_ROWS_ENV = "TRTLLM_MOE_FLASHINFER_FP4_QUANTIZE_MIN_ROWS"
+
+
+def _flashinfer_available() -> bool:
+    from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+    return IS_FLASHINFER_AVAILABLE
+
+
+_FLASHINFER_FP4_QUANTIZE = (
+    env_switch(FLASHINFER_FP4_QUANTIZE_DISABLE_ENV) is not True and _flashinfer_available()
+)
+_FLASHINFER_FP4_QUANTIZE_MIN_ROWS = int(
+    os.environ.get(FLASHINFER_FP4_QUANTIZE_MIN_ROWS_ENV, "4096")
+)
+# Set once a FlashInfer call failed: every backend then keeps the TRT op (disables the route only).
+_FLASHINFER_FP4_BROKEN = False
+
+
+@functools.cache
+def _flashinfer_fp4_recipe_is_native() -> bool:
+    """Whether FlashInfer's NVFP4 quantizer runs the native recipe (no NVFP4 recipe knob set).
+
+    A recipe knob changes the quantized bits, so the TRT op serves the input instead.
+    """
+    try:
+        from flashinfer.quantization import fp4_quantization
+    except ImportError:
+        return False  # a FlashInfer without the module is not a route to use
+    return not any(
+        os.environ.get(name) for name in getattr(fp4_quantization, "NVFP4_QUANT_ENV_VARS", ())
+    )
+
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
@@ -230,6 +272,17 @@ class MoEOpBackend:
 class TRTLLMOpBackend(MoEOpBackend):
     """TRTLLM native op backend implementation."""
 
+    # Rows from which fp4_quantize takes FlashInfer's kernel; None (the default) keeps the TRT op.
+    flashinfer_fp4_quantize_min_rows: Optional[int] = None
+
+    def enable_flashinfer_fp4_quantize(self) -> bool:
+        """Opt this instance in to the FlashInfer NVFP4 quantization route; returns whether it is on
+        (off under the disable switch or without FlashInfer)."""
+        self.flashinfer_fp4_quantize_min_rows = (
+            _FLASHINFER_FP4_QUANTIZE_MIN_ROWS if _FLASHINFER_FP4_QUANTIZE else None
+        )
+        return self.flashinfer_fp4_quantize_min_rows is not None
+
     def __init__(self):
         from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 
@@ -249,6 +302,45 @@ class TRTLLMOpBackend(MoEOpBackend):
         is_sf_8x4_layout: bool = False,
         enable_pdl: Optional[bool] = None,
     ):
+        global _FLASHINFER_FP4_BROKEN
+        min_rows = self.flashinfer_fp4_quantize_min_rows
+        if (
+            min_rows is not None
+            and not _FLASHINFER_FP4_BROKEN
+            and global_scale is not None
+            and input.dim() == 2
+            and input.dtype == torch.bfloat16
+            and input.shape[0] >= min_rows
+            and input.shape[1] % 64 == 0
+            and sf_vec_size == 16
+            and not sf_use_ue8m0
+            and input.is_contiguous()
+            and _flashinfer_fp4_recipe_is_native()
+        ):
+            try:
+                from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
+
+                # Like the TRT op: PDL on SM90+ (FlashInfer's own default) unless TRTLLM_ENABLE_PDL=0.
+                q, sf = _flashinfer_fp4_quantize(
+                    input,
+                    global_scale,
+                    16,
+                    False,
+                    is_sf_swizzled_layout,
+                    enable_pdl=False if os.environ.get("TRTLLM_ENABLE_PDL") == "0" else None,
+                    backend="cuda",
+                )
+                return q.view(torch.uint8).view(input.shape[0], input.shape[1] // 2), sf.view(
+                    torch.uint8
+                ).reshape(-1)
+            except (ImportError, RuntimeError, TypeError) as error:
+                from tensorrt_llm.logger import logger
+
+                _FLASHINFER_FP4_BROKEN = True
+                logger.warning_once(
+                    f"FlashInfer NVFP4 quantization failed ({error}); the TRT op quantizes instead",
+                    key="moe_flashinfer_fp4_quantize_broken",
+                )
         return torch.ops.trtllm.fp4_quantize(
             input, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled_layout
         )

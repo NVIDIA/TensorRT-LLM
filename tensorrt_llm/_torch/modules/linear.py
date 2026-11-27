@@ -23,9 +23,10 @@ from tensorrt_llm._torch.custom_ops.mxfp8_gemm import (MXFP8_DEFAULT_BACKENDS,
                                                        validate_mxfp8_backends)
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     _FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP, IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
-    BufferKind, FP8BlockScaleGemmRunner, MXFP8QuantizeRunner,
-    fp8_block_scale_gemm_autotuned, fp8_block_scale_swiglu_prefers_bf16,
-    mxfp8_quantize_gemm_autotuned, small_m_applies_on_tuning_group)
+    BufferKind, FlashInferMXFP8GemmRunner, FP8BlockScaleGemmRunner,
+    MXFP8QuantizeRunner, fp8_block_scale_gemm_autotuned,
+    fp8_block_scale_swiglu_prefers_bf16, mxfp8_quantize_gemm_autotuned,
+    small_m_applies_on_tuning_group)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3745,6 +3746,20 @@ _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_decode_graph_capture_active", default=False)
+_MXFP8_NATIVE_DISPATCH_ACTIVE = ContextVar("mxfp8_native_dispatch_active",
+                                           default=False)
+_MXFP8_CUTE_DSL_DISPATCH_ACTIVE = ContextVar("mxfp8_cute_dsl_dispatch_active",
+                                             default=False)
+
+
+def mxfp8_native_dispatch_active() -> bool:
+    """Whether the current call runs inside ``mxfp8_native_dispatch``."""
+    return _MXFP8_NATIVE_DISPATCH_ACTIVE.get()
+
+
+def mxfp8_cute_dsl_dispatch_active() -> bool:
+    """Whether the current call runs inside ``mxfp8_cute_dsl_dispatch``."""
+    return _MXFP8_CUTE_DSL_DISPATCH_ACTIVE.get()
 
 
 def flashinfer_mxfp8_autotune_active() -> bool:
@@ -3760,7 +3775,7 @@ def flashinfer_mxfp8_decode_graph_capture_active() -> bool:
 @contextmanager
 def flashinfer_mxfp8_autotune() -> Iterator[None]:
     """Tune FlashInfer MXFP8 tactics while enabling auto-dispatched calls."""
-    from flashinfer import autotune
+    from ..flashinfer_autotune_cache import autotune
 
     token = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.set(True)
     try:
@@ -3844,6 +3859,39 @@ def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
         yield
     finally:
         _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
+
+
+@contextmanager
+def mxfp8_native_dispatch() -> Iterator[None]:
+    """Run automatically dispatched MXFP8 linears on the native TensorRT-LLM GEMM.
+
+    Inside, an MXFP8 linear skips the decode-graph tuned quantize and GEMM and
+    the automatic FlashInfer dispatch, and runs the native op with its tuned
+    tactic. An explicit ``TRTLLM_MXFP8_GEMM_BACKEND=flashinfer`` still runs
+    FlashInfer.
+    """
+    token = _MXFP8_NATIVE_DISPATCH_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _MXFP8_NATIVE_DISPATCH_ACTIVE.reset(token)
+
+
+@contextmanager
+def mxfp8_cute_dsl_dispatch() -> Iterator[None]:
+    """Run automatically dispatched MXFP8 linears on FlashInfer's CuTe DSL GEMM.
+
+    Inside, an MXFP8 linear skips the decode-graph tuned quantize and GEMM and
+    the automatic FlashInfer dispatch: it quantizes its activation with the
+    native op, then runs FlashInfer's CuTe DSL MXFP8 GEMM, whose persistent
+    grid leaves SMs to a kernel running beside it. Without that GEMM it runs
+    the native op. An explicit ``TRTLLM_MXFP8_GEMM_BACKEND`` still applies.
+    """
+    token = _MXFP8_CUTE_DSL_DISPATCH_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _MXFP8_CUTE_DSL_DISPATCH_ACTIVE.reset(token)
 
 
 class MXFP8LinearMethod(LinearMethodBase):
@@ -4038,8 +4086,11 @@ class MXFP8LinearMethod(LinearMethodBase):
 
         if self.use_cutlass:
             input = input.contiguous()
-            if self.uses_mxfp8_backend_autotune:
-                # Profiling is controlled by flashinfer_mxfp8_autotune.
+            if (self.uses_mxfp8_backend_autotune
+                    and not _MXFP8_NATIVE_DISPATCH_ACTIVE.get()
+                    and not _MXFP8_CUTE_DSL_DISPATCH_ACTIVE.get()):
+                # Profiling is controlled by flashinfer_mxfp8_autotune; the
+                # native and CuTe DSL dispatch scopes keep their own GEMM.
                 output = mxfp8_quantize_gemm_autotuned(
                     input,
                     module.weight,
@@ -4051,12 +4102,27 @@ class MXFP8LinearMethod(LinearMethodBase):
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
                 act_e4m3, act_sf = mxfp8_quantize_activation(input)
+                cute_dsl_dispatch = (self.backend == "auto"
+                                     and not is_torch_compiling()
+                                     and _MXFP8_CUTE_DSL_DISPATCH_ACTIVE.get())
+                if cute_dsl_dispatch and not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+                    logger.warning_once(
+                        "FlashInfer's CuTe DSL MXFP8 GEMM is unavailable; "
+                        "mxfp8_cute_dsl_dispatch runs the native GEMM.",
+                        key="mxfp8_cute_dsl_dispatch_unavailable")
                 use_flashinfer = self.backend == "flashinfer" or (
-                    self.backend == "auto" and not is_torch_compiling() and
+                    self.backend == "auto" and not is_torch_compiling()
+                    and not _MXFP8_NATIVE_DISPATCH_ACTIVE.get()
+                    and not _MXFP8_CUTE_DSL_DISPATCH_ACTIVE.get() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
                      (self._flashinfer_autotuned
                       and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
-                if use_flashinfer:
+                if cute_dsl_dispatch and IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+                    output = FlashInferMXFP8GemmRunner(module.dtype).forward(
+                        [act_e4m3, act_sf, module.weight, module.weight_scale],
+                        tactic=FlashInferMXFP8GemmRunner.CUTE_DSL,
+                    )
+                elif use_flashinfer:
                     flashinfer_mxfp8 = self._flashinfer_mxfp8
                     assert flashinfer_mxfp8 is not None
                     output = flashinfer_mxfp8(

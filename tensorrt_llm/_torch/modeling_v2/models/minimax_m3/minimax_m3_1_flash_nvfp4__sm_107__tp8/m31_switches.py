@@ -26,7 +26,6 @@ _UNSET = frozenset(("", "0", "false", "off", "no"))
 # Item id -> what TRTLLM_M31_DISABLE_<id>=1 restores.
 ITEMS: Dict[str, str] = {
     "ADV_PAR": "the serial drafter context advance (instead of the parallel advance + read view)",
-    "BATCH_CHANGED_ONLY": "the every-step copies of the drafter's batch indices and batch-to-slot map",
     "BLOCKOFF_GUARD": "the drafter KV cache manager's block-table copy on every step",
     "BLOCKOFF_PATCH": "the full-width block-table copy on steps that change one page index per row",
     "CTXNORMQ": "the fused all-reduce + norm and the consumers' own quantize at large prefill layer boundaries",
@@ -65,8 +64,7 @@ ITEMS: Dict[str, str] = {
     "FRONT_CAPFORK": "the hidden-state capture copy in line on the main stream",
     "GQAMIX": "the in-tree block-sparse decode for the generation rows of mixed steps",
     "H2D_CHANGED_SPAN": "the whole packed 2-D upload (instead of each row's changed column span)",
-    "HOSTTAIL": "the stock host step loop: turns off HOST_D2H_SIDE, SMALL_H2D, BATCH_CHANGED_ONLY, "
-    "SKIP_ACCEPTED_UPLOAD, PHILOX_PACK and KV_LENS_ONCE together",
+    "HOSTTAIL": "the stock host step loop: turns off HOST_D2H_SIDE, SMALL_H2D, PHILOX_PACK and KV_LENS_ONCE together",
     "HOST_D2H_SIDE": "the stock device-to-host copies on the main stream",
     "KV_LENS_ONCE": "both KV-length passes of the step",
     "LINEAR_CUBLASLT": "FlashInfer's MXFP8 GEMM for the 33..64-row projections cuBLASLt takes",
@@ -102,7 +100,6 @@ ITEMS: Dict[str, str] = {
     "SHARED_SWIGLU_MXFP8": "the bf16 SwiGLU + quantize for the shared expert's down projection",
     "SHARED_SWIGLU_MXFP8_NATIVE": "the Triton producer of the shared expert's MXFP8 SwiGLU",
     "SILU_VEC": "the stock Triton silu_and_mul everywhere",
-    "SKIP_ACCEPTED_UPLOAD": "the stock per-step upload of the accepted-draft counts",
     "SM107_DRAFT_FMHA_SM100F": "the drafter attention on thop.attention's in-tree runner",
     "SMALL_H2D": "the stock per-step uploads",
     "SOFTMAX_MC": "the stock FlashInfer softmax",

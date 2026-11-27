@@ -8,17 +8,166 @@ and per-request metric bookkeeping.  Extracted from PyExecutor to improve
 readability and separation of concerns.
 """
 
+import threading
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm._utils import get_steady_clock_now_in_seconds
+from tensorrt_llm._utils import env_switch, get_steady_clock_now_in_seconds, prefer_pinned
 from tensorrt_llm.logger import logger
 
 from .llm_request import PerfTimingInfo
+
+# GPU timestamps for the executor's timing events (the per-request perf metrics, the iteration log's device step):
+# a model opt-in (RuntimeHooks.gpu_timestamps) armed process-wide by that model's executor (arm_gpu_timestamps).
+# Kill switch TRTLLM_DISABLE_GPU_TIMESTAMPS=1. Needs the native stamp op (trtllm::globaltimer_stamp).
+_GPU_TIMESTAMPS = False
+_STAMP_OP = None
+
+
+def _native_stamp_op():
+    try:
+        return torch.ops.trtllm.globaltimer_stamp
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def arm_gpu_timestamps() -> bool:
+    """Time the executor with GpuTimestamp in this process, unless killed or the native stamp op is missing."""
+    global _GPU_TIMESTAMPS, _STAMP_OP
+    if env_switch("TRTLLM_DISABLE_GPU_TIMESTAMPS") is True:
+        _GPU_TIMESTAMPS = False
+    else:
+        _STAMP_OP = _native_stamp_op()
+        # The stamp lands in pinned host memory with a non-blocking copy; without pinned memory (Confidential
+        # Compute) that copy would block the host, so keep timed events there.
+        _GPU_TIMESTAMPS = _STAMP_OP is not None and prefer_pinned()
+    logger.info(f"Executor timing: {'GPU timestamps' if _GPU_TIMESTAMPS else 'timed CUDA events'}")
+    return _GPU_TIMESTAMPS
+
+
+def disarm_gpu_timestamps() -> None:
+    """Time the executor with timed CUDA events again (an executor whose model does not opt in)."""
+    global _GPU_TIMESTAMPS
+    _GPU_TIMESTAMPS = False
+
+
+# Follower streams of GpuTimestamps that were collected, per device: a new GpuTimestamp takes one
+# instead of creating a stream, so the stream count stays at the high-water mark of live stamps.
+_FOLLOWER_POOL: dict = {}
+_FOLLOWER_POOL_LOCK = threading.Lock()
+
+
+def _return_follower(index: int, handle: int) -> None:
+    """Give a collected GpuTimestamp's follower stream back to the pool (no CUDA call)."""
+    with _FOLLOWER_POOL_LOCK:
+        _FOLLOWER_POOL.setdefault(index, []).append(handle)
+
+
+def timing_event() -> Union[torch.cuda.Event, "GpuTimestamp"]:
+    """A GPU timing event for the executor: a GpuTimestamp when armed, else a timed CUDA event."""
+    if _GPU_TIMESTAMPS:
+        return GpuTimestamp()
+    return torch.cuda.Event(enable_timing=True)
+
+
+class GpuTimestamp:
+    """The torch.cuda.Event surface the executor's timing uses (record, query, synchronize, elapsed_time), measured
+    with %globaltimer.
+
+    A timed event record waits for its stream to drain before it takes its timestamp, and while one is in flight the
+    next decode graph's launch waits behind it (a few microseconds per record at every step boundary).
+    record() instead makes this timestamp's own non-blocking follower stream wait for the recording stream (through a
+    reused fork event), then stores %globaltimer there into a device word, copies it to pinned host memory and records
+    an untimed event, all on the follower. The stamp is taken when its one-thread kernel gets an SM, right after the
+    follower passes the recording stream's position; the follower runs at the device's greatest priority to keep it
+    at that position, though it can still lag behind persistent kernels that already hold every SM. Each timestamp
+    has its own follower (taken from a per-device pool and returned when the timestamp is collected), so stamps
+    recorded at one position do not queue behind each other. Under stream capture record() records nothing and
+    leaves the timestamp unrecorded.
+    """
+
+    def __init__(self) -> None:
+        self._follower: Optional[torch.cuda.Stream] = None
+        self._stamp: Optional[torch.Tensor] = None
+        self._host: Optional[torch.Tensor] = None
+        self._done: Optional[torch.cuda.Event] = None
+        self._fork: Optional[torch.cuda.Event] = None
+        self._recorded = False
+
+    @staticmethod
+    def _new_stream(device: torch.device) -> tuple:
+        """``(stream, device index, raw handle)``: a non-blocking stream at the greatest priority (not one of
+        PyTorch's pooled streams, which can alias the timed one), from the per-device pool when one is free."""
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        with _FOLLOWER_POOL_LOCK:
+            free = _FOLLOWER_POOL.get(index)
+            handle = free.pop() if free else None
+        if handle is None:
+            from tensorrt_llm._utils import CUASSERT
+
+            try:
+                from cuda.bindings import runtime as cudart
+            except ImportError:
+                from cuda import cudart
+            with torch.cuda.device(index):
+                _, greatest = CUASSERT(cudart.cudaDeviceGetStreamPriorityRange())
+                handle = int(
+                    CUASSERT(
+                        cudart.cudaStreamCreateWithPriority(cudart.cudaStreamNonBlocking, greatest)
+                    )[0]
+                )
+        stream = torch.cuda.ExternalStream(int(handle), device=torch.device("cuda", index))
+        return stream, index, int(handle)
+
+    @staticmethod
+    def _write_stamp(out: torch.Tensor) -> None:
+        (_STAMP_OP or _native_stamp_op())(out)
+
+    def record(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        if torch.cuda.is_current_stream_capturing():
+            # A stale earlier stamp must not pair in elapsed_time.
+            self._recorded = False
+            return
+        if self._follower is None:
+            self._follower, index, handle = self._new_stream(stream.device)
+            weakref.finalize(self, _return_follower, index, handle)
+            self._fork = torch.cuda.Event()
+        follower = self._follower
+        # cudaStreamWaitEvent takes the event's state at the call, so re-recording it at the next stamp leaves the
+        # waits already queued unchanged.
+        self._fork.record(stream)
+        follower.wait_event(self._fork)
+        with torch.cuda.stream(follower):
+            if self._stamp is None:
+                self._stamp = torch.empty(1, dtype=torch.int64, device=stream.device)
+                self._host = torch.empty(1, dtype=torch.int64, pin_memory=prefer_pinned())
+                self._done = torch.cuda.Event()
+            self._write_stamp(self._stamp)
+            self._host.copy_(self._stamp, non_blocking=True)
+            self._done.record(follower)
+        self._recorded = True
+
+    def query(self) -> bool:
+        return not self._recorded or self._done.query()
+
+    def synchronize(self) -> None:
+        if self._recorded:
+            self._done.synchronize()
+
+    def elapsed_time(self, end_event: "GpuTimestamp") -> float:
+        """Milliseconds from this stamp to ``end_event``'s, once both landed."""
+        if not (self._recorded and end_event._recorded):
+            raise RuntimeError("GpuTimestamp.elapsed_time: a timestamp was not recorded")
+        self.synchronize()
+        end_event.synchronize()
+        return (int(end_event._host[0]) - int(self._host[0])) / 1e6
 
 
 class PerfMetricsManager:
@@ -35,7 +184,7 @@ class PerfMetricsManager:
     # Marks the current stream's position for the side stream to wait on; reused every record.
     _fork_event: Optional[torch.cuda.Event] = None
 
-    def __init__(self, enabled: bool, timing_side_stream: bool = False):
+    def __init__(self, enabled: bool, timing_side_stream: bool = False) -> None:
         self.enabled = enabled
         if enabled and timing_side_stream:
             self._timing_stream = torch.cuda.Stream()
@@ -68,8 +217,8 @@ class PerfMetricsManager:
             return None, None, None
         if self._perf_events is None:
             self._perf_events = [
-                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3)),
-                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3)),
+                tuple(timing_event() for _ in range(3)),
+                tuple(timing_event() for _ in range(3)),
             ]
             self._perf_event_idx = 0
         events = self._perf_events[self._perf_event_idx % 2]
@@ -80,7 +229,7 @@ class PerfMetricsManager:
         """Borrow a forward-only pair when the ping-pong perf events are unavailable."""
         if self._forward_event_pool:
             return self._forward_event_pool.pop()
-        return (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        return (timing_event(), timing_event())
 
     def release_forward_timing_events(self, start_event, end_event) -> None:
         if start_event is not None and end_event is not None:

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import List, Optional
 
 import msgpack
@@ -87,12 +87,44 @@ class RankInfo:
     # compares global KV heads; their views reshard like the target's at any
     # attention TP.
     draft_layers_reshard_across_tp: bool = False
+    # A standalone drafter's separate KV pool (DFlash / DSpark context window), shipped as a second
+    # block set when the disagg draft-window transfer is engaged; None everywhere else. Serialized
+    # only when set, so a rank without it emits exactly the bytes it always did.
+    draft_attention: Optional[AttentionInfo] = None
+    draft_page_table: Optional[KVCachePageTable] = None
+    # Set on a rank that takes part in the draft-window exchange but will not RECEIVE a window
+    # (the reason, e.g. "sync_path_tp"); senders then ship it the target set only.
+    draft_receive_disabled: Optional[str] = None
+    # FABRIC handles of the physical chunks backing this rank's KV pools, for peers that write
+    # them with copy engines (native/fabric_writer.py). Serialized only when set.
+    fabric_export: Optional[bytes] = None
 
     @property
     def tp_size_per_dp_group(self) -> int:
         if self.attention is None:
             return self.tp_size
         return self.tp_size // self.dp_size if self.attention.enable_attention_dp else self.tp_size
+
+    @property
+    def has_draft_kv(self) -> bool:
+        return self.draft_attention is not None and self.draft_page_table is not None
+
+    def draft_view(self) -> Optional["RankInfo"]:
+        """This rank with the draft pool's geometry in place of the target's, or None without one.
+
+        Topology (TP/PP/DP/CP, layer split, endpoints) is unchanged, so every overlap, routing,
+        policy and mapper path built for the target serves the draft set as is.
+        """
+        if not self.has_draft_kv:
+            return None
+        return replace(
+            self,
+            attention=self.draft_attention,
+            page_table=self.draft_page_table,
+            draft_attention=None,
+            draft_page_table=None,
+            draft_receive_disabled=None,
+        )
 
     def to_bytes(self) -> bytes:
         data = asdict(self)
@@ -108,19 +140,21 @@ class RankInfo:
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
+        if self.has_draft_kv:
+            data["draft_attention"] = self.draft_attention.to_dict()
+            data["draft_page_table"] = self.draft_page_table.to_dict()
+        else:
+            # Absent rather than null: a peer built before these fields parses the message.
+            data.pop("draft_attention", None)
+            data.pop("draft_page_table", None)
+        if self.draft_receive_disabled is None:
+            data.pop("draft_receive_disabled", None)
+        if self.fabric_export is None:
+            data.pop("fabric_export", None)
         return msgpack.packb(data)
 
-    @classmethod
-    def from_kv_cache_manager(
-        cls,
-        instance_name: str,
-        kv_cache_manager: KVCacheManager,
-        device_id: int,
-        aux_buffer_meta: Optional[AuxBufferMeta] = None,
-    ) -> "RankInfo":
-        m = kv_cache_manager.mapping
-        kvm = kv_cache_manager
-        enable_attention_dp = m.enable_attention_dp
+    @staticmethod
+    def _attention_info(kvm: KVCacheManager, enable_attention_dp: bool) -> AttentionInfo:
         # Keep AttentionInfo on attention-free PP stages so it can still carry
         # the attention-DP topology used by Mamba transfers.  A zero head count
         # means that this rank has no local attention cache; AttentionPolicy
@@ -134,6 +168,27 @@ class RankInfo:
             if bytes_for_eight_elements % 8 == 0
             else bytes_for_eight_elements / 8
         )
+        return AttentionInfo(
+            kv_heads_per_rank=kv_heads_per_rank,
+            tokens_per_block=kvm.tokens_per_block,
+            dims_per_head=kvm.head_dim,
+            element_bytes=element_bytes,
+            enable_attention_dp=enable_attention_dp,
+            is_mla=kvm.kv_factor == 1,
+        )
+
+    @classmethod
+    def from_kv_cache_manager(
+        cls,
+        instance_name: str,
+        kv_cache_manager: KVCacheManager,
+        device_id: int,
+        aux_buffer_meta: Optional[AuxBufferMeta] = None,
+        draft_kv_cache_manager: Optional[KVCacheManager] = None,
+    ) -> "RankInfo":
+        m = kv_cache_manager.mapping
+        kvm = kv_cache_manager
+        enable_attention_dp = m.enable_attention_dp
         # Explicit draft layers (layer specs) ride the target's pages and
         # requests; folded MTP/Eagle layers travel as ordinary layers.
         get_draft_view = getattr(kvm, "get_draft_kv_cache_view", None)
@@ -143,6 +198,11 @@ class RankInfo:
         if draft_layer_ids:
             dtype = kvm.get_layer_dtype(draft_layer_ids[0])
             draft_kv_dtype = getattr(dtype, "name", str(dtype))
+        draft_attention = None
+        draft_page_table = None
+        if draft_kv_cache_manager is not None:
+            draft_attention = cls._attention_info(draft_kv_cache_manager, enable_attention_dp)
+            draft_page_table = build_page_table_from_manager(draft_kv_cache_manager)
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -159,14 +219,7 @@ class RankInfo:
             sender_endpoints=[],
             self_endpoint="",
             transfer_engine_info=bytes(),
-            attention=AttentionInfo(
-                kv_heads_per_rank=kv_heads_per_rank,
-                tokens_per_block=kvm.tokens_per_block,
-                dims_per_head=kvm.head_dim,
-                element_bytes=element_bytes,
-                enable_attention_dp=enable_attention_dp,
-                is_mla=kvm.kv_factor == 1,
-            ),
+            attention=cls._attention_info(kvm, enable_attention_dp),
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
@@ -174,6 +227,8 @@ class RankInfo:
             draft_kv_dtype=draft_kv_dtype,
             draft_layers_reshard_across_tp=shares_draft_layers
             and getattr(kvm, "hosts_unified_draft_layers", False),
+            draft_attention=draft_attention,
+            draft_page_table=draft_page_table,
         )
 
     @classmethod
@@ -197,4 +252,8 @@ class RankInfo:
                 f"RankInfo from peer has fields this build does not define: {unknown}; "
                 "run the same TensorRT-LLM build on every worker."
             )
+        if unpacked.get("draft_attention") is not None:
+            unpacked["draft_attention"] = AttentionInfo.from_dict(unpacked["draft_attention"])
+        if unpacked.get("draft_page_table") is not None:
+            unpacked["draft_page_table"] = KVCachePageTable.from_dict(unpacked["draft_page_table"])
         return cls(**unpacked)

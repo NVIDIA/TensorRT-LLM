@@ -210,10 +210,44 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
         return;
     }
 
-    // SM107: one unpadded matrix with swizzled K32 scales runs quantize_mxfp8_rows (same math, one column chunk per
-    // thread, 8 rows in flight); bitwise the same output.
+    // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
+    int const numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
+
+    // SM107 fast paths for one K32 output, each bitwise the 8-element path's output:
+    // * quantize_mxfp8_tile128x4 for wide swizzled inputs: 128-row x 4-SF-column tiles whose SFs are written as full
+    //   128 B lines. Kill switch: TRTLLM_DISABLE_MXFP8_QUANT_TILE128X4=1.
+    // * quantize_mxfp8_rows for one unpadded matrix with swizzled scales (one column chunk per thread, 8 rows in
+    //   flight).
+    // * quantize_mxfp8_x16 (SM107; unmeasured elsewhere) from 4096 rows: 16 elements per thread, 128-thread CTAs,
+    //   16 CTAs per SM. Below 4096 rows its fixed cost loses to the 8-element launch. Kill switch:
+    //   TRTLLM_DISABLE_MXFP8_QUANT_16ELT=1.
     if constexpr (SF_VEC_SIZE == 32 && SF_OUTPUT_VEC_SIZE == 32)
     {
+        static bool const disableTile = tensorrt_llm::common::getBoolEnv("TRTLLM_DISABLE_MXFP8_QUANT_TILE128X4");
+        int64_t const rowBytes = static_cast<int64_t>(n) * sizeof(T);
+        int64_t const totalBytes = rowBytes * m;
+        bool const wideEnough
+            = rowBytes >= (8 << 10) ? totalBytes >= (16 << 20) : rowBytes >= (4 << 10) && totalBytes >= (64 << 20);
+        if (!disableTile && tensorrt_llm::common::getSMVersion() == 107 && layout == QuantizationSFLayout::SWIZZLED
+            && b == 1 && n == padded_n && n % 32 == 0 && m >= 1024 && n >= 2048 && wideEnough
+            && reinterpret_cast<uintptr_t>(SFOuput) % 16 == 0)
+        {
+            int const numTiles = (PadUpFn(m, 128) / 128) * (PadUpFn(n / 32, 4) / 4);
+            cudaLaunchConfig_t config;
+            config.gridDim = dim3(std::min(numTiles, multiProcessorCount * MXFP8_TILE128X4_BLOCKS_PER_SM));
+            config.blockDim = dim3(MXFP8_TILE128X4_THREADS);
+            config.dynamicSmemBytes = 0;
+            config.stream = stream;
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+            config.numAttrs = 1;
+            config.attrs = attrs;
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, quantize_mxfp8_tile128x4<T>, m, n, input,
+                reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput)));
+            return;
+        }
+
         int const colThreads = n / CVT_ELTS_PER_THREAD;
         if (kMxfp8QuantSm107Rows && tensorrt_llm::common::getSMVersion() == 107 && b == 1 && n == padded_n
             && layout == QuantizationSFLayout::SWIZZLED && n % 128 == 0 && colThreads <= 1024 && colThreads % 32 == 0)
@@ -235,6 +269,27 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
                 reinterpret_cast<uint64_t*>(output), reinterpret_cast<uint32_t*>(SFOuput)));
             return;
         }
+
+        constexpr int64_t kMinRowsFor16Elt = 4096;
+        static bool const disable16Elt = tensorrt_llm::common::getBoolEnv("TRTLLM_DISABLE_MXFP8_QUANT_16ELT");
+        if (!disable16Elt && tensorrt_llm::common::getSMVersion() == 107
+            && static_cast<int64_t>(b) * m >= kMinRowsFor16Elt && n % CVT_FP16_TO_MXFP8_X16_ELTS_PER_THREAD == 0
+            && padded_n % CVT_FP16_TO_MXFP8_X16_ELTS_PER_THREAD == 0)
+        {
+            cudaLaunchConfig_t config;
+            config.gridDim = dim3(std::min(numBlocksForM, multiProcessorCount * 16));
+            config.blockDim = dim3(128);
+            config.dynamicSmemBytes = 0;
+            config.stream = stream;
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+            config.numAttrs = 1;
+            config.attrs = attrs;
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, quantize_mxfp8_x16<T>, b, m, n, padded_n, input,
+                reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput), layout));
+            return;
+        }
     }
 
     // Grid, Block size.
@@ -242,8 +297,6 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     dim3 block(std::min(int(padded_n / CVT_ELTS_PER_THREAD), 512));
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-    // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
-    int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
     dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.

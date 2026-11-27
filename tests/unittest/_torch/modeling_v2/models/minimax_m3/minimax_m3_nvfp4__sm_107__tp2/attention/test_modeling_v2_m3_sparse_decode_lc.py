@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU tests for trtllm::minimax_m3_sm107_tp2_sparse_decode_lc (one-launch long-context sparse decode, TP2).
+"""GPU tests for mv2_minimax_m3::minimax_m3_sm107_tp2_sparse_decode_lc (one-launch long-context sparse decode, TP2).
 
 Two contracts:
 - the BF16 rows sit in the same band around a float64 reference as the stock Triton sparse decode, and every variant
@@ -23,6 +23,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107_
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.attention.m3_sparse_decode_lc import (  # noqa: E501
     mxfp8_handoff_reference,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 __extra_import_path__ = ["../../../.."]
 from _validating import (  # noqa: E402, F401 — needs the path declared above
@@ -47,7 +48,7 @@ _E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
 
 
 def _op():
-    return torch.ops.trtllm.minimax_m3_sm107_tp2_sparse_decode_lc
+    return family_ops().minimax_m3_sm107_tp2_sparse_decode_lc
 
 
 def _e4m3_bytes(shape, gen, lo=0x28, hi=0x48):

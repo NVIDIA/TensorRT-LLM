@@ -32,7 +32,7 @@
 // rows to every GEMV CTA, the tcgen05 block-scaled GEMV with the weights read from shared memory, a DSMEM K-split
 // reduce and the producer as its epilogue) with every arithmetic stage replaced by the served kernel it fuses, so that
 // at split 8 its outputs are bit for bit those of the 3-kernel chain:
-//   1. boundary = minimaxM3Sm107Tp4/mcAllreduceNormTp4.cu's 8-CTA cluster kernel at options 32 (the stock TP4 oneshot
+//   1. boundary = csrc/m3/sm107Tp4McAllreduceNorm.cu's 8-CTA cluster kernel at options 32 (the stock TP4 oneshot
 //      reduction order) as the prepushed 2 / 3 consumer: the ranks' BF16 words summed in FP32 in rank order, rounded
 //      to BF16, plus the residual (BF16), the RMS statistic in the oneshot tree (24 warp sums as 4 groups of 6),
 //      rsqrtf(sum / H + eps), (v * inv) * w, and the MXFP8 copy of the normed row in FlashInfer's CuTe DSL quantize
@@ -240,7 +240,7 @@ __device__ __forceinline__ uint64_t sdesc(uint32_t saddr, uint32_t lbo, uint32_t
 }
 
 // ---------------------------------------------------------------- the cluster all-reduce's MXFP8 quantize, verbatim
-// (mcAllreduceNormTp4.cu: FlashInfer's CuTe DSL mxfp8 quantize PTX)
+// (csrc/m3/sm107Tp4McAllreduceNorm.cu: FlashInfer's CuTe DSL mxfp8 quantize PTX)
 __device__ __forceinline__ uint32_t mxfp8_ue8m0(float amax)
 {
     float value;

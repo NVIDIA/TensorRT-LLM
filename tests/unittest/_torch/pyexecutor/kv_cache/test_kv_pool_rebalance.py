@@ -676,7 +676,9 @@ class TestConsumePreviousBatch:
         exe._update_v2_generation_resources = MethodType(
             PyExecutor._update_v2_generation_resources, exe
         )
-        exe._process_previous_batch = lambda: PyExecutor._process_previous_batch(exe)
+        exe._process_previous_batch = lambda **kwargs: PyExecutor._process_previous_batch(
+            exe, **kwargs
+        )
         exe._add_kv_cache_events = lambda: PyExecutor._add_kv_cache_events(exe)
 
         def update_generation_resources(*args) -> None:
@@ -692,8 +694,8 @@ class TestConsumePreviousBatch:
         manager.update_resources = MagicMock(side_effect=update_generation_resources)
         exe.resource_manager.update_resources.side_effect = update_resources
         exe.perf_manager = MagicMock()
-        exe.perf_manager.compute_batch_gpu_times.side_effect = lambda requests: calls.append(
-            "compute_batch_gpu_times"
+        exe.perf_manager.compute_batch_gpu_times.side_effect = (
+            lambda requests, **kwargs: calls.append("compute_batch_gpu_times")
         )
 
         PyExecutor._consume_previous_batch_for_rebalance(exe)

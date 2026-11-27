@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""KVCacheV2Scheduler forward batch with a disaggregated generation KV prefetch request.
+
+With KV prefetch (disagg_gen_prefetch) a generation worker holds up to max_batch_size + N
+requests. The extra one is receiving its KV (DISAGG_GENERATION_INIT / TRANS_IN_PROGRESS) or
+has received it (TRANS_COMPLETE) while max_batch_size requests decode. The forward batch must
+stay at max_batch_size: a receiving request does not count toward the request budget, and a
+landed one is scheduled only once a running request leaves the budget.
+"""
+
+import itertools
+
+import pytest
+from _torch.pyexecutor.kv_cache.test_kv_cache_v2_scheduler import (
+    DISAGG_GEN_TRANS_IN_PROGRESS,
+    GEN_TO_COMPLETE,
+    ids,
+    make_disagg_request,
+    make_gen_request,
+    make_kv_cache_manager,
+    make_scheduler,
+)
+
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+
+pytestmark = pytest.mark.cpu_only
+
+TRANS_COMPLETE = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE.value
+
+
+def _landed(request_id):
+    req = make_gen_request(request_id)
+    req.state_value = TRANS_COMPLETE
+    req.is_generation_in_progress_state = False
+    return req
+
+
+def _receiving(request_id):
+    req = make_gen_request(request_id)
+    req.state_value = DISAGG_GEN_TRANS_IN_PROGRESS
+    req.is_generation_in_progress_state = False
+    return req
+
+
+def _retiring(request_id):
+    req = make_gen_request(request_id)
+    req.state_value = GEN_TO_COMPLETE
+    req.is_generation_in_progress_state = False
+    req.is_generation_to_complete_state = True
+    return req
+
+
+def _schedule(mbs, reqs):
+    sched = make_scheduler(make_kv_cache_manager(), max_batch_size=mbs, max_num_tokens=120)
+    return sched.schedule_request(reqs, set())
+
+
+def _forward_size(out):
+    return len(out.context_requests) + len(out.generation_requests)
+
+
+@pytest.mark.parametrize(
+    "extra, retire_first, expected_tail",
+    [
+        pytest.param(make_disagg_request, False, [], id="new_prefetch_request"),
+        pytest.param(_receiving, False, [], id="receiving"),
+        pytest.param(_landed, False, [], id="landed_waits_for_a_full_batch"),
+        pytest.param(_landed, True, [10], id="landed_takes_the_retiring_place"),
+    ],
+)
+def test_prefetch_request_beside_a_full_batch(extra, retire_first, expected_tail):
+    mbs = 2
+    running = [_retiring(0) if retire_first else make_gen_request(0), make_gen_request(1)]
+    out = _schedule(mbs, running + [extra(10)])
+    assert ids(out.generation_requests) == [0, 1][int(retire_first) :] + expected_tail
+    assert _forward_size(out) == mbs
+    if extra is make_disagg_request:
+        assert ids(out.fitting_disagg_gen_init_requests) == [10]
+
+
+@pytest.mark.parametrize("mbs", [1, 2])
+@pytest.mark.parametrize("prefetch", [1, 2])
+def test_forward_batch_never_exceeds_max_batch_size(mbs, prefetch):
+    """Every mix of running, retiring, receiving and landed requests the prefetch cap allows."""
+    makers = [make_gen_request, _retiring, _receiving, _landed, make_disagg_request]
+    for combo in itertools.product(range(len(makers)), repeat=mbs + prefetch):
+        reqs = [makers[k](i) for i, k in enumerate(combo)]
+        out = _schedule(mbs, reqs)
+        assert _forward_size(out) <= mbs, combo

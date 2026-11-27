@@ -163,6 +163,13 @@ public:
         return mBounce != nullptr;
     }
 
+    /// Enqueue bounce receive scatters on the CUDA stream `stream` (a cudaStream_t passed as an
+    /// integer handle; 0 restores the private copy streams), so each scatter runs between the model
+    /// forwards queued on that stream instead of concurrently with them. Returns whether the stream is
+    /// now in effect: false when bounce is inactive, the scatter_on_order_stream knob is off, or the
+    /// stream belongs to another device.
+    bool setScatterOrderStream(std::uintptr_t stream);
+
     [[nodiscard]] bool peerSupportsBounce(std::string const& name) const;
 
     /// Number of transfer requests routed to the bounce fast path so far.

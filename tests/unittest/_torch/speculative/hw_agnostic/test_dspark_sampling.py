@@ -415,6 +415,86 @@ def test_only_sampled_drafts_with_a_markov_head_take_the_ancestral_path() -> Non
     assert len(calls) == K and tokens.shape == (B, K)
 
 
+@pytest.mark.cpu_only
+def test_ancestral_overrides_opt_in_and_a_worker_can_narrow_the_route(monkeypatch) -> None:
+    """An installed override applies only to a worker that opted in
+    (``enable_ancestral_override``). There, a block override draws first and may decline; a
+    glue override replaces the per-position lines; either opts in without the option; a worker
+    subclass can keep its own route."""
+    from tensorrt_llm._torch.speculative import dspark
+
+    generator = torch.Generator().manual_seed(9)
+    drafter = _drafter(generator)
+    base = torch.randn(B, K, V, generator=generator)
+    anchors = torch.randint(V, (B,), generator=generator)
+    worker = _worker(ancestral=False)
+
+    drawn = (torch.zeros(B, K, dtype=torch.int32), V)
+    seen = []
+    monkeypatch.setattr(dspark, "_ANCESTRAL_GLUE_OVERRIDE", None)
+    monkeypatch.setattr(dspark, "_ANCESTRAL_BLOCK_OVERRIDE", None)
+    dspark.set_ancestral_block_override(lambda *args: seen.append(args) or drawn)
+    # Without the opt-in an installed override is ignored and the DFlash path runs.
+    with patch.object(
+        DFlashWorker, "_sample_block_draft_tokens", return_value=("dflash", V)
+    ) as hook:
+        assert _sample_with(
+            _cpu_sampler(generator), worker, drafter, base, anchors, _metadata(B)
+        ) == ("dflash", V)
+        hook.assert_called_once()
+    assert seen == []
+
+    assert worker.enable_ancestral_override()
+    assert (
+        _sample_with(_cpu_sampler(generator), worker, drafter, base, anchors, _metadata(B)) is drawn
+    )
+    assert len(seen) == 1 and seen[0][0] is worker
+
+    # A declining block override and a glue override whose methods decline give the stock draws.
+    monkeypatch.setattr(dspark, "_ANCESTRAL_BLOCK_OVERRIDE", lambda *args: None)
+    glue = types.SimpleNamespace(
+        step_bias=lambda *args: None,
+        biased_logits=lambda *args: None,
+        store_probs=lambda *args: False,
+    )
+    monkeypatch.setattr(dspark, "_ANCESTRAL_GLUE_OVERRIDE", glue)
+    meta = _metadata(B, temperature=0.7)
+    tokens, _ = _sample_with(_cpu_sampler(generator), worker, drafter, base, anchors, meta)
+    expected = _expected_rows(drafter, base, anchors, tokens, temperature=0.7)
+    torch.testing.assert_close(meta.draft_probs[meta.batch_slot_ids], expected)
+
+    # A glue override alone opts in: the ancestral loop runs and consults it at every step.
+    monkeypatch.setattr(dspark, "_ANCESTRAL_BLOCK_OVERRIDE", None)
+    glue_calls = []
+    glue = types.SimpleNamespace(
+        step_bias=lambda *args: glue_calls.append("bias"),
+        biased_logits=lambda *args: None,
+        store_probs=lambda *args: False,
+    )
+    monkeypatch.setattr(dspark, "_ANCESTRAL_GLUE_OVERRIDE", glue)
+    meta2 = _metadata(B, temperature=0.7)
+    tokens2, _ = _sample_with(_cpu_sampler(generator), worker, drafter, base, anchors, meta2)
+    assert glue_calls.count("bias") == K
+    expected2 = _expected_rows(drafter, base, anchors, tokens2, temperature=0.7)
+    torch.testing.assert_close(meta2.draft_probs[meta2.batch_slot_ids], expected2)
+
+    # A worker that narrows _samples_block_ancestrally keeps the DFlash hook.
+    class _Narrowed(DSparkWorker):
+        def _samples_block_ancestrally(self, draft_model, spec_metadata) -> bool:
+            return False
+
+    narrowed = _worker(ancestral=True)
+    narrowed.__class__ = _Narrowed
+    assert narrowed.enable_ancestral_override()
+    with patch.object(
+        DFlashWorker, "_sample_block_draft_tokens", return_value=("dflash", V)
+    ) as hook:
+        assert narrowed._sample_block_draft_tokens(
+            drafter, base, None, {"first_prev_tokens": anchors}, _metadata(B), 0, B
+        ) == ("dflash", V)
+        hook.assert_called_once()
+
+
 @pytest.mark.parametrize("num_contexts", [0, 2])
 @pytest.mark.cpu_only
 def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_contexts: int) -> None:

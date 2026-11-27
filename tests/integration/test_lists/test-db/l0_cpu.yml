@@ -21,10 +21,15 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_dspark_worker_hooks.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_switches.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_target_runtime_hooks.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_modeling_v2_spec_tail_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/kernels/gemm/test_modeling_v2_m3_lowm_splitk_sync.py
-  # MiniMax-M3 family code shared with MiniMax-M3.1-Flash: the CuTe DSL object cache, the draft prob1 worker and
-  # the MSA backend's host logic.
+  # MiniMax-M3 family code shared with MiniMax-M3.1-Flash: the runtime hooks, the MegaMoE local leaf resolution,
+  # the tactic pins, the CuTe DSL object cache, the draft prob1 worker and the MSA backend's host logic.
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe/megamoe_local/test_megamoe_local_resolution.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe/megamoe_local/test_megamoe_local_runner.py
+  - unittest/_torch/pyexecutor/test_runtime_hooks_sparse_attention.py
+  - unittest/_torch/modeling_v2/test_m31_pins.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_cute_aot.py
   - unittest/_torch/modeling_v2/models/minimax_m3/kernels/m3ll/prob1
   - unittest/_torch/modeling_v2/models/minimax_m3/msa
@@ -254,6 +259,7 @@ l0_cpu:
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
   - unittest/_torch/flashinfer/test_flashinfer_cubin_pool.py
   - unittest/_torch/test_custom_config_registration.py
+  - unittest/_torch/test_flashinfer_autotune_cache.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py
@@ -352,6 +358,7 @@ l0_cpu:
   - unittest/executor/test_shutdown_retry_contracts.py
   - unittest/executor/test_rpc_proxy_submit_order.py
   - unittest/executor/test_stats_serializer.py
+  - unittest/executor/test_proxy_aget_stats_async.py
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_spec_decode_serialization.py
   - unittest/executor/test_stop_word_side_output_trim.py
@@ -389,6 +396,7 @@ l0_cpu:
   - unittest/llmapi/test_disagg_worker_role.py
   - unittest/llmapi/test_tokenizer_factory_mistral.py
   - unittest/llmapi/test_session_reuse.py
+  - unittest/llmapi/test_minimax_m3_indexer_nvfp4_config.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py
   - unittest/llmapi/apps/test_anthropic_gateway.py

@@ -452,6 +452,16 @@ class RequestScheduler(ABC):
             probe: Whether cancelled receives still retain local resources.
         """
 
+    def set_unprocessed_context(self, request_ids: frozenset[int]) -> None:
+        """Record the context requests of a batch the executor keeps unprocessed.
+
+        Only schedulers with context-only preemption use it; the default is a
+        no-op.
+
+        Args:
+            request_ids: Their request ids; empty once no batch is held back.
+        """
+
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the executor's AsyncTransferManager, which owns the KV
         pages of finished disaggregated sends until they land.
@@ -843,6 +853,10 @@ class MultimodalScheduler(RequestScheduler):
             probe: Whether cancelled receives still retain local resources.
         """
         self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def set_unprocessed_context(self, request_ids: frozenset[int]) -> None:
+        """Forward the held-back context requests to the wrapped scheduler."""
+        self.scheduler.set_unprocessed_context(request_ids)
 
     def set_async_transfer_manager(self, mgr) -> None:
         self.scheduler.set_async_transfer_manager(mgr)

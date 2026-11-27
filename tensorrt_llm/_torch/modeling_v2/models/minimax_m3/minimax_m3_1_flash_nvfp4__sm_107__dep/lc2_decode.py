@@ -3,7 +3,7 @@
 """DEP_LC2: the sparse layers' generation decode attention as one LC2 launch at the attention-DP geometry.
 
 Attention DP keeps all 4 KV heads of the model on every rank. ``family_ops().minimax_m3_sm107_tp2_sparse_decode_lc``
-(cpp/tensorrt_llm/thop/minimaxM3/minimaxM3Sm107Tp2SparseDecodeLc2Op.cpp; its kernels take the KV-head count from the
+(csrc/m3/sm107Tp2SparseDecodeLc2Op.cpp; its kernels take the KV-head count from the
 cache view) replaces the in-tree Triton producer + merge (``minimax_m3_sparse_attn_decode``) through each layer's
 ``MsaDecodeFmha.sparse_decode_hook``: the split grid at 33..448 rows and the 16-CTA cluster below that, the log-domain
 recurrence, the MXFP8 o_proj hand-off when ``merge_mxfp8`` reserved its buffers (DEP_MERGE_MXFP8), no pre-wait staging
@@ -14,7 +14,8 @@ float64-reference band at 8..448 rows of 8-row verify steps over 32k..220k-token
 bitwise the cluster.
 
 ``dep_lc2_decode`` takes a call with E4M3 q, the packed-NVFP4 cache at 4 KV heads, BF16 output, decode_query_len 8
-and at most 448 rows (``decline_reason``); any other call raises with the reason, as there is no Triton fallback. The
+and at most 448 rows (``decline_reason``); any other call runs the stock decode (``minimax_m3_sparse_attn_decode``),
+logged once with the reason. The
 generation steps are always taken: max_num_tokens 384 caps a step at 384 rows (48 requests), and the DSpark verify with
 7 draft tokens reads 8 rows per request. ``TRTLLM_M31_DISABLE_DEP_LC2=1`` installs no hook (the stock decode on every
 call, the reference arm). With the switch on, a build without the op fails at ``install``. Read at import.
@@ -80,7 +81,8 @@ PAGE = 128
 TOPK = 16
 #: The verify step with 7 draft tokens (7 + 1 rows per request), the only query length this geometry takes.
 DECODE_QUERY_LEN = 8
-#: The widest step the split's workspace is reserved for; a wider step raises (generation steps are at most 384 rows).
+#: The widest step the split's workspace is reserved for; a wider step runs the stock decode (generation steps are at
+#: most 384 rows).
 MAX_ROWS = 448  # capacity: fixed: LC2's widest supported step
 
 #: OWN-T's widest step: (request, KV head) items.
@@ -225,6 +227,15 @@ def _log_once(taken: bool, detail: str, item: str = "DEP_LC2", other: str = "dec
         logger.info(f"[M3.1 DEP] {item} {'taken' if taken else other}: {detail}")
 
 
+def _stock_decode(*args, **kwargs) -> None:
+    """The in-tree sparse decode (``minimax_m3_sparse_attn_decode``), imported on first use."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (  # noqa: E501
+        minimax_m3_sparse_attn_decode,
+    )
+
+    minimax_m3_sparse_attn_decode(*args, **kwargs)
+
+
 def dep_lc2_decode(
     q: torch.Tensor,
     k_paged: torch.Tensor,
@@ -244,9 +255,10 @@ def dep_lc2_decode(
     num_topk_chunks: Optional[int] = None,
 ) -> None:
     """The layers' ``sparse_decode_hook``: ``minimax_m3_sparse_attn_decode``'s arguments and in-place output, on LC2
-    when ``decline_reason`` finds none, else a RuntimeError naming the reason; a call LC2 takes runs OWN-T when
-    DEP_OWNT is on, the op is built and ``own_t_decline_reason`` finds none. A call LC2 or OWN-T runs with the hand-off
-    buffers reserved also publishes the output's MXFP8 form in ``merge_mxfp8.SLOT``; every call first clears it."""
+    when ``decline_reason`` finds none, else the stock decode (logged once with the reason); a call LC2 takes runs
+    OWN-T when DEP_OWNT is on, the op is built and ``own_t_decline_reason`` finds none. A call LC2 or OWN-T runs with
+    the hand-off buffers reserved also publishes the output's MXFP8 form in ``merge_mxfp8.SLOT``; every call first
+    clears it."""
     _mx.SLOT.clear()
     op = lc2_op()
     reason = (
@@ -270,10 +282,28 @@ def dep_lc2_decode(
         )
     )
     if reason is not None:
-        raise RuntimeError(
-            f"[M3.1 DEP] DEP_LC2 cannot take this sparse decode call: {reason}. The DEP target has no Triton "
-            "fallback; TRTLLM_M31_DISABLE_DEP_LC2=1 runs the stock decode on every call"
+        # The stock decode with the real lengths; SLOT stays clear, so the MXFP8 o_proj hand-off
+        # takes its stock path. decline_reason reads shapes and dtypes only, so the choice is
+        # fixed per captured graph shape.
+        _log_once(False, f"{reason}; the stock decode runs")
+        _stock_decode(
+            q,
+            k_paged,
+            v_paged,
+            topk_idx,
+            block_table,
+            seq_lens,
+            sm_scale=sm_scale,
+            output=output,
+            decode_query_len=decode_query_len,
+            kv_scale=kv_scale,
+            k_block_scale=k_block_scale,
+            v_block_scale=v_block_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            num_topk_chunks=num_topk_chunks,
         )
+        return
     total_q = q.shape[0]
     width = KV_HEADS * HEADS_PER_KV * HEAD_DIM
     handoff = _mx.buffers(total_q, output.device)

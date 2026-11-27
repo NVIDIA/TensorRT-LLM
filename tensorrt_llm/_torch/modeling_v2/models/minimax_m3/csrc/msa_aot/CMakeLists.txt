@@ -27,6 +27,8 @@ set(MSA_ARCHS ${CMAKE_CUDA_ARCHITECTURES})
 list(FILTER MSA_ARCHS INCLUDE REGEX "^10[0-9]")
 if(NOT MSA_ARCHS)
   message(STATUS "MSA fmha_sm100: no SM10x architecture in this build, skipped")
+  # A reused build tree must not ship modules this configure no longer builds.
+  file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/msa_fmha_sm100)
   return()
 endif()
 
@@ -206,4 +208,16 @@ else()
 endif()
 
 get_property(MSA_OUTPUTS GLOBAL PROPERTY MSA_FMHA_SM100_OUTPUTS)
+# The wheel ships every .so under MSA_OUT: remove the ones a reused build tree
+# holds from an earlier configure (a dropped variant, or the BF16X module once
+# its toolchain is gone).
+file(
+  GLOB_RECURSE MSA_EXISTING_OUTPUTS
+  LIST_DIRECTORIES false
+  ${MSA_OUT}/*.so)
+foreach(stale ${MSA_EXISTING_OUTPUTS})
+  if(NOT stale IN_LIST MSA_OUTPUTS)
+    file(REMOVE ${stale})
+  endif()
+endforeach()
 add_custom_target(msa_fmha_sm100_aot ALL DEPENDS ${MSA_OUTPUTS})
