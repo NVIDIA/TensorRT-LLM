@@ -8089,6 +8089,42 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
                 quant_mode=0,
             ),
         ),
+        Cell(
+            why="spark 4B full layer: GQA 16q/4kv d256, no window",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=16,
+                num_kv_heads=4,
+                head_size=256,
+                v_head_dim=256,
+                sinks=False,
+                window=None,
+                quant_mode=0,
+            ),
+        ),
+        Cell(
+            why="spark sliding layer where the window cuts: 600 cached + 17 new "
+            "KV against window 512, so the oldest 105 keys are masked",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=8,
+                num_kv_heads=2,
+                head_size=256,
+                v_head_dim=256,
+                sinks=False,
+                window=512,
+                quant_mode=0,
+                mask_type=1,
+                tokens_per_block=64,
+                num_blocks=32,
+                max_num_requests=4,
+                use_paged_context_fmha=True,
+                cached=(600,),
+                new=(17,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
     ),
 }
 

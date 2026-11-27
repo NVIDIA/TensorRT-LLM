@@ -186,14 +186,17 @@ class Spark2_5Attention(Attention):
             config.sliding_window if layer_type == "sliding_attention" else None
         )
 
-        # RoPE is per layer type (theta and partial rotary factor differ
-        # between sliding and full layers). Attention backends read the rope
-        # parameters from this layer's own PositionalEmbeddingParams, so the
-        # fusion decision is left to the backend (same approach as Gemma3's
-        # per-layer theta).
+        # RoPE is per layer type; backends read it from this layer's own
+        # PositionalEmbeddingParams, so fusion stays the backend's decision.
+        # The cos/sin table is sized to the engine's max sequence length when
+        # known -- the checkpoint's 1M would preallocate ~1.25 GiB of mostly
+        # untouched table; _ensure_rope_table_size grows it on demand.
+        rope_max_positions = config.max_position_embeddings
+        if model_config.max_seq_len is not None:
+            rope_max_positions = min(rope_max_positions, model_config.max_seq_len)
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
-            rope=_build_rope_params(config, layer_type),
+            rope=_build_rope_params(config, layer_type, max_positions=rope_max_positions),
         )
 
         self.gate_act_mode = config.gate_attn_act_mode

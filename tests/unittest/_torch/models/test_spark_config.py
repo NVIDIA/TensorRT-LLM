@@ -116,6 +116,23 @@ def test_spark2_5_config_rejects_bad_inputs():
         Spark2_5Config(num_hidden_layers=4, layer_types=["full_attention"] * 3)
 
 
+def test_spark2_5_config_rejects_unknown_layer_types():
+    # Exact-match validation: a near-miss value must not pass and then run
+    # silently as full attention.
+    with pytest.raises(ValueError, match="unsupported entries"):
+        Spark2_5Config(
+            num_hidden_layers=4,
+            layer_types=["sliding_window"] * 4,
+            sliding_window=512,
+        )
+    with pytest.raises(ValueError, match="unsupported entries"):
+        Spark2_5Config(
+            num_hidden_layers=4,
+            layer_types=["sliding_attention", "full_attention", "local", "full_attention"],
+            sliding_window=512,
+        )
+
+
 def test_spark2_5_config_rejects_sliding_without_window():
     # Sliding layers with no (or a non-positive) window would silently run as
     # full attention; the config must reject them instead.

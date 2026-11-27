@@ -102,10 +102,20 @@ class Spark2_5Config(PretrainedConfig):
                 f"layer_types length ({len(layer_types)}) must match "
                 f"num_hidden_layers ({num_hidden_layers})"
             )
+        # Exact-match validation, the same set the models and routing check:
+        # an unknown value (e.g. "sliding_window") would pass a looser test
+        # and then silently run as full attention with the wrong RoPE.
+        allowed_layer_types = {"sliding_attention", "full_attention"}
+        unknown = sorted({str(lt) for lt in layer_types} - allowed_layer_types)
+        if unknown:
+            raise ValueError(
+                f"layer_types contains unsupported entries {unknown}; "
+                f"expected values from {sorted(allowed_layer_types)}"
+            )
         # Without this, sliding layers would silently run as full attention:
         # both the model (attention_window_size=None) and the KV-cache window
         # derivation treat a missing sliding_window as "no window".
-        if any("sliding" in str(lt) for lt in layer_types) and (
+        if "sliding_attention" in layer_types and (
             not isinstance(sliding_window, int)
             or isinstance(sliding_window, bool)
             or sliding_window <= 0
