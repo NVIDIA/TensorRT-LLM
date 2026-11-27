@@ -115,7 +115,7 @@ def test_shared_block_requires_all_served_stages_supported(other: str) -> None:
 
 
 def test_main_does_not_force_dropped_multi_gpu_back_to_baseline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     single, multi = "H100-PyTorch-1", "H100-4_GPUs-PyTorch-1"
     stages = {n: block_utils.Stage(n, "sample", "x86", 1, 1) for n in (single, multi)}
@@ -151,7 +151,7 @@ def test_main_does_not_force_dropped_multi_gpu_back_to_baseline(
         )
         == 0
     )
-    decision = json.loads(capsys.readouterr().out)
+    decision = json.loads(capfd.readouterr().out)
     assert decision["scope"] == "coverage"
     assert decision["affected_stages"] == [single]
     assert decision["coverage_dropped_stages"] == [multi]
