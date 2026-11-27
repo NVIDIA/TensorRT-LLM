@@ -1391,6 +1391,7 @@ def mxfp8_lowm_linear(
     n_tiles: int = 1,
     swiglu_out_limit: Optional[float] = None,
     release_after_wait: bool = False,
+    mma_options: tuple[bool, bool] | None = None,
 ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     """y = x @ dequant(weight).T for small M, in BF16.
 
@@ -1406,6 +1407,7 @@ def mxfp8_lowm_linear(
     ``swiglu_out_limit`` = L (``swiglu_out_supported``): ``weight`` is a ``[2I, K]`` gate | up
     weight and the result ``swiglu(x @ dequant(weight).T, swiglu_limit=L)`` ``[M, I]``, bit for
     bit. ``release_after_wait``: dependents are released after this launch's dependency wait.
+    ``mma_options`` overrides (BF16 dequantization, operand swap) for this call.
     """
     m, k = x.shape
     n = weight.shape[0]
@@ -1418,7 +1420,7 @@ def mxfp8_lowm_linear(
         if split_n or rope is not None or rms_norm is not None or scale_swizzled or n_tiles != 1:
             raise ValueError("swiglu_out_limit takes a plain launch")
         out_swiglu_limit = float(swiglu_out_limit)
-    bf16_dequant, swap_ab = lowm_mma_options()
+    bf16_dequant, swap_ab = lowm_mma_options() if mma_options is None else mma_options
     fn, rows = _mma_kernel(
         m,
         n,

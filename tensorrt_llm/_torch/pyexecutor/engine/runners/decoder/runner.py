@@ -340,6 +340,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs.attach_cuda_graph_runners(
             self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
         )
+        self._metadata.keep_steady_growth_blocks = self._inputs.steady_decode_prepare_enabled
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -956,6 +957,7 @@ class DecoderRunner(ScheduledModelRunner):
                     enable_spec_decode=enable_spec_decode,
                     gather_context_logits=gather_context_logits,
                     static_inputs_staged=prepared.static_inputs_staged,
+                    pre_replay_staged=prepared.pre_replay_staged,
                     position_id_offsets=(
                         self._buffers.previous_pos_id_offsets_cuda
                         if enable_spec_decode
@@ -1399,6 +1401,11 @@ class DecoderRunner(ScheduledModelRunner):
     @_dspark_device_budget.setter
     def _dspark_device_budget(self, value) -> None:
         self._inputs._dspark_device_budget = value
+
+    @property
+    def steady_mtp_reads_output_rows(self) -> bool:
+        """Whether steady MTP graph prepare can read the previous step's output rows."""
+        return self._graphs.enabled and self._inputs.steady_decode_prepare_enabled
 
     @property
     def previous_request_ids(self):

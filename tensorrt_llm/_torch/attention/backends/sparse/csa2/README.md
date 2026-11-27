@@ -200,7 +200,7 @@ sits between the mask and the finalize launch, so exact, self-sampling and
 temporal GVR TopK all select over the same masked scores; a temporal prior that
 lands on a masked column is dropped before the GVR kernel seeds its threshold.
 
-On SM100/SM103, split-row decode batches without temporal GVR hints skip that
+On SM100/SM103/SM107, split-row decode batches without temporal GVR hints skip that
 chain from more than 64 rows on the candidate source (of 8-position candidate
 blocks) and from 256 rows on other Full layers: one `block_select.py` launch
 selects from the scorer's maxima of every 32 visible positions and, on the
@@ -517,7 +517,9 @@ launch at its first layer. Decoder boundaries raise read-only SWA floors: rows
 below them still write their SWA. Live KV-length updates refresh positions and
 every KV owner's GLOBAL write slots and compressed groups in one CuTe DSL launch; host-resident metadata uses the equivalent PyTorch
 expressions. A steady generation step keeps the previous geometry and re-reads
-the page tables only when a request crosses a page.
+the page tables when a request joins, rows are remapped, or a request's page
+storage may have changed. It validates the write pages for joining and changed
+requests before those tables are used.
 
 `set_source_batch()` permits encoder source lengths to differ from decoder
 query lengths. Compressor output capacity follows source rows; incomplete

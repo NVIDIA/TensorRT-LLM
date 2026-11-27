@@ -46,7 +46,7 @@ data_cmd += [
 ```
 
 ### 2.2 PyTorch Configuration Generation
-In `pytorch_model_config.py`, we override PyTorch configurations for certain specific cases and generate YAML configuration files.
+The runner merges the configuration selected by the test name and writes the resulting YAML for `trtllm-bench` or `trtllm-serve`.
 
 ### 2.3 Calling trtllm-bench for Throughput Testing
 
@@ -85,13 +85,11 @@ if self._config.streaming == "streaming":
     benchmark_cmd += [f"--streaming"]
 ```
 
-#### PyTorch Default Configuration
+#### PyTorch Launch Configuration
 ```python
-# Use default YAML configuration
 if self._config.backend == "pytorch":
     import yaml
-    config = get_model_yaml_config(self._config.to_string(),
-                                   lora_dirs=self.lora_dirs)
+    config = self._get_model_yaml_config()
     print_info(f"pytorch model config: {config}")
     with open('config.yml', 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
@@ -115,23 +113,31 @@ if self._config.backend == "pytorch":
 
 ### 4.1 PyTorch Model Configuration
 
-The default PyTorch configuration is defined in [pytorch_model_config.py](pytorch_model_config.py) and can be overridden for specific test patterns. For example:
+Put model settings in the final `-cfg:` suffix. Explicit test-name options such as
+`maxbs`, `maxnt`, `tp`, `pp`, `ep`, `kv_frac` and `moe` override the selected
+YAML. Fields omitted from both use the runner and TensorRT-LLM defaults.
 
-```python
-{
-    'patterns': [
-        'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
-    ],
-    'config': {
-        'enable_attention_dp': False,
-        'moe_config': {
-            'backend': 'TRTLLM'
-        }
-    }
-}
-```
+- Select a file in [examples/configs/curated](../../../../examples/configs/curated)
+  by filename, for example `-cfg:deepseek-v4-pro-latency.yaml`.
+- Use a named preset for workloads whose historical settings would make the ID too long.
+  For example, `-cfg:lightning_mtp` supplies the shared KV, MTP and streaming settings
+  for both Nemotron Lightning variants. Each case selects its own `moe:` backend.
+  Look up the name in `_PERF_PRESETS` to see all fields for that preset, including
+  GPU-specific overrides. See [pytorch_model_config.py](pytorch_model_config.py).
+- Set a case-specific field directly with `-cfg:enable_attention_dp=true`.
+  Append comma-separated overrides to the selected preset or YAML, as in
+  `-cfg:glm53_flash_fp8,decoding_type=MTP,max_draft_len=3`.
+  Use YAML scalar values and dotted field names, for example
+  `cfg:speculative_config.decoding_type=NGram,max_draft_len=3`. The runner passes these fields to
+  the same configuration validation as a YAML file. Put paths and lists in the selected recipe or preset.
 
-This configuration allows you to customize PyTorch-specific settings for different model patterns while maintaining the base configuration as a fallback.
+Each Core and Spark case selects at most one named preset or curated YAML file.
+Draft paths prefixed with `${LLM_MODELS_ROOT}/` resolve against the test model
+cache at launch.
+
+The test parameter also names the engine directory. Keep both the full parameter and
+the exported benchmark name within 255 bytes. Reuse a shared profile when inlining
+its fields would exceed that limit.
 
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files

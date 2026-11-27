@@ -16201,6 +16201,8 @@ def get_compiled__reg(
         succ_la = 0  # only GvrTopkRegKernel.kern_cr takes the lookahead
     if succ_la:
         key += (("succ_la", int(succ_la)),)
+    if pcw:
+        key += (("pcw_bins", int(pcw_bins)),)
     static_env_bf16 = (
         tuple(map(int, static_env_bf16))
         if dtype == "bf16" and not pcw and not code_radix and static_env_bf16 is not None
