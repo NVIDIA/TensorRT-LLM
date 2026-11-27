@@ -373,6 +373,29 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             generator.VISUAL_GEN_SCHEMA,
             {
                 "attention_config": {
+                    "backend": "CUTEDSL",
+                    "quant_attention_config": {
+                        "algorithm": "deco_attention",
+                        "equalize": True,
+                        "center_k": True,
+                    },
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "quant_attention_config": {"algorithm": "deco_attention", "equalize": "both"}
+                }
+            },
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
                     "quant_attention_config": {"algorithm": "deco_attention", "qk_dtype": "fp8"}
                 }
             },

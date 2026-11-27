@@ -34,7 +34,7 @@ import functools
 import torch
 
 from ...constants import HEAD_DIM, QK_ROW_BYTES, key_tiles, qk_channels, qk_scale_atoms
-from ...inputs import Compensation
+from ...inputs import Compensation, Transforms
 from ...runtime import Layout
 from . import launch, prep
 
@@ -61,6 +61,8 @@ def layout(b: int, s: int, h: int, rank: tuple[int, int], bases: str, nsm: int) 
         # scratch of the preparation and of the split launch
         **prep.scratch(b, s, h, rank, bases),
         **launch.scratch(b, s, h, nsm),
+        # the records of the transformations of Q and K, behind every other buffer
+        **prep.transform_scratch(b, h),
     }
 
 
@@ -72,6 +74,7 @@ def prepare(
     lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> None:
     """Run the preparation of this kernel on the buffers of a call (layout); the arguments as in prep.run."""
     # every buffer may hold anything on entry; only the arrival counters of a split launch must be zero when the
@@ -79,7 +82,7 @@ def prepare(
     flags = buffers.get("split_flags")
     if flags is not None:
         flags.zero_()
-    prep.run(q, k, v, buffers, lens, comp, scale_rule)
+    prep.run(q, k, v, buffers, lens, comp, scale_rule, transforms)
 
 
 def attention(

@@ -46,18 +46,26 @@ from ...common.dsl import Tcgen05Fence, tcgen05_fence
 from ...common.expmath import (
     bf16x2,
     ex2_sub_f16x2,
+    f2u,
     f16x2x2_to_e4m3x4,
     subnormal_anchor_bias,
     subnormal_scale,
     tree_sum,
 )
 from ...common.mem import sptr, store_vector
-from ...constants import SUBNORMAL_ULPS
+from ...constants import COMP_CHANNELS, E4M3_MAX, HEAD_DIM, SUBNORMAL_ULPS
 from ..tmem import ld_tmem_f32, st_tmem_f32
 
 # The score-scale floor of this family: log2 of the smallest multiplier of the raw scores the landing takes exactly,
 # a power of two from 1 / SUBNORMAL_ULPS up (I-ExpCast above); the preparation raises the score scale to at least it.
 MIN_SCORE_LOG2 = -(SUBNORMAL_ULPS.bit_length() - 1)
+# A far anchor is an anchor at least this many log2 units from zero: one last place of it is worth 16 log2 units or
+# more, and the addend of the landing cannot hold the bias next to it. A masking step lands its row by distances.
+FAR_ANCHOR_LOG2 = 16 * 2**23
+# The raw scores stay below this magnitude: the channels of the widest QK build, each the product of two NVFP4
+# values (at most 6 times an E4M3 scale). A score scale that brings it to a far anchor makes every step a masking
+# step.
+RAW_SCORE_BOUND = (HEAD_DIM + 2 * COMP_CHANNELS) * (6 * E4M3_MAX) ** 2
 
 
 class SoftmaxRole:
@@ -88,7 +96,8 @@ class SoftmaxRole:
         tensor_args: Tuple,
         vs: Tuple,
     ):
-        """One KV tile of a softmax warpgroup: S_j(i) -> P_j(i); stats_args: (anchor, row sum of P so far)."""
+        """One KV tile of a softmax warpgroup: S_j(i) -> P_j(i); stats_args: (anchor, row sum of P so far). A masking
+        step (whether_apply_mask) also lands the rows of far anchors by distances."""
         row_max, row_sum = stats_args
         vs_row, step, kv_begin = vs
         cS, is_last_iter = iter_args
@@ -156,11 +165,17 @@ class SoftmaxRole:
         row_max_safe = cutlass.select_(moved, tile_row_max, old_row_max)
         # the addend takes the subnormal multiplier of the exp, and 15 is the exponent bias of the f16 pattern: the
         # anchor score maps exactly onto s_P = 2^p_prescale_log2 (exact in the P format)
-        self.exp_cast(
-            tTMEM_LOADrS,
-            tTMEM_STORErS_x4,
-            (scale_sub, subnormal_anchor_bias(row_max_safe, scale_sub, self.p_prescale_log2)),
-        )
+        anchor_bias = subnormal_anchor_bias(row_max_safe, scale_sub, self.p_prescale_log2)
+        if whether_apply_mask:
+            # the addend of a far anchor (FAR_ANCHOR_LOG2) has no room for the bias: its row lands the distances of
+            # its scores to the anchor, which are exact near it, with the bias alone
+            far = cute.math.absf(row_max_safe) * score_scale >= Float32(FAR_ANCHOR_LOG2)
+            origin = Float32(cutlass.select_(far, row_max_safe, Float32(0.0)))
+            for i in cutlass.range_constexpr(cute.size(tTMEM_LOADrS)):
+                tTMEM_LOADrS[i] = tTMEM_LOADrS[i] - origin
+            bias = Float32((15 + self.p_prescale_log2) * SUBNORMAL_ULPS * 2.0**-149)
+            anchor_bias = Float32(cutlass.select_(far, bias, anchor_bias))
+        self.exp_cast(tTMEM_LOADrS, tTMEM_STORErS_x4, (scale_sub, anchor_bias))
         # Rare: the anchor moved for a row of this warp -> rescale O_j once PV_j(i-1) has landed, before P_j(i) is
         # published (PV_j(i) accumulates on top of it). Rows that kept their anchor, or start a work tile, use 1.
         need_rescale = moved & (old_row_max != -Float32.inf)
@@ -440,6 +455,13 @@ class SoftmaxRole:
             else:
                 if seqlen_k % self.qk_mma_tiler[1] != 0:
                     n_unmasked = n_kv_tiles - 1
+            # A score scale that can bring a raw score to a far anchor: every step is then a masking step. The test
+            # reads the multiplier of the landing as an integer (SUBNORMAL_ULPS per unit of the score scale; the bit
+            # patterns of positive values keep their order) against the bound, rounded down
+            if f2u(scale_sub) >= Uint32(
+                math.floor(FAR_ANCHOR_LOG2 / RAW_SCORE_BOUND * SUBNORMAL_ULPS)
+            ):
+                n_unmasked = Int32(0)
             value_args_ = (mask_len, score_scale, o_done_ptr, p_tail_stage_ptr, thr_inc, scale_sub)
             for i in cutlass.range(0, n_unmasked, 1, unroll=1):
                 cS_iter = cute.domain_offset((0, (kv_begin + i) * self.qk_mma_tiler[1]), cS)

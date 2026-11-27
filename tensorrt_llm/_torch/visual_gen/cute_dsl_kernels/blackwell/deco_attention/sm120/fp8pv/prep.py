@@ -20,7 +20,7 @@ smoothed E4M3 V, its means and its non-finite flags, next to Q', K' and their sc
 
 import torch
 
-from ...inputs import Compensation
+from ...inputs import Compensation, Transforms
 from ..prep import chain
 from .softmax import MIN_SCORE_LOG2
 from .v_pass import V_THREADS, basis_kernel, v_kernel
@@ -44,12 +44,15 @@ _HOST_BUFFERS = (
     "gmax",
     "prov",
     "done",
+    "transform",
 )
 
 
 # the scratch of the chain at a shape on a device of nsm SMs for a rank and a bases kind, name -> (dtype, shape):
 # that of both chains
 scratch = chain.scratch
+# the records of the transformations of Q and K, the last buffer of a layout
+transform_record = chain.transform_record
 
 
 def run(
@@ -60,9 +63,21 @@ def run(
     lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> None:
     """Fill the operands of the attention from raw q, k, v: Q'/K', score_scale (>= 2^MIN_SCORE_LOG2), smoothed V.
-    lens, comp, scale_rule: as in chain.run."""
+    lens, comp, scale_rule, transforms: as in chain.run."""
     chain.run(
-        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, buffers, lens, comp, scale_rule
+        _host,
+        _compiled,
+        _HOST_BUFFERS,
+        MIN_SCORE_LOG2,
+        q,
+        k,
+        v,
+        buffers,
+        lens,
+        comp,
+        scale_rule,
+        transforms,
     )

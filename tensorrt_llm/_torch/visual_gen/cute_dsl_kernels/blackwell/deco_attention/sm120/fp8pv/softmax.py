@@ -25,7 +25,8 @@ keeps the T binades above the anchor inside the E4M3 range.
       piecewise-linear 2^t; a saturating pack flushes everything below the grid (and -inf) to +0.
     * Landing paths, behind a warp-uniform index (expcast_guard): one FMA per pair with the subnormal multiplier
       c 2^-139, which needs it exact on the grid (c a multiple of 2^-10: the power-of-two scales of the preparation
-      from 2^MIN_SCORE_LOG2 up) and finite anchors; otherwise c s - a in the normal domain, then a second FMA.
+      from 2^MIN_SCORE_LOG2 up) and the anchors below ptx.fp8pv.ONE_FMA_ANCHOR_LIMIT in magnitude; otherwise
+      c s - a in the normal domain, then a second FMA.
     * Lazy rescale (softmax_tile): a tile is landed with the current anchors first; a max tree over the landed
       patterns tells whether some score exceeds an anchor by more than T or is not finite (landed_flags).
     * Only then does the warp take the exact tile max, move the anchors, rescale O, the row sums and the pending block

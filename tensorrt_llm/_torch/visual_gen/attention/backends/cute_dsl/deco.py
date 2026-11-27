@@ -28,6 +28,9 @@ like any other backend.
   package and checks the config against the GPU when it is built.
 * Quantizer of Q and K: ``scale_rule`` of the config is the rule for the scale of an NVFP4
   block of the head channels.
+* Transformations of Q and K: ``equalize`` and ``center_k`` of the config reach the
+  preparation, which takes their statistics from the sampled tokens. With token tags
+  ``center_k`` takes the mean of K over the video tokens of the draw.
 * VANILLA calls (unquantized): every other call, that is cross-attention, a causal
   ``attention_mask``, other dtypes or devices, shorter sequences, and every call of a layer whose
   head dimension or K/V head count the kernels do not take.
@@ -54,8 +57,9 @@ like any other backend.
 * CUDA graphs: a capture follows one eager call with the same shape and arguments: that call
   compiles the kernels of the call and builds the sampled rows and the rotation matrix, and
   a first use of any of them under capture raises a ``RuntimeError``. The warm-up of a graph
-  runner is that call. The channels of the two terms, the bases kind, the scale rule, one or
-  two row sets, the presence of a mask and the shape of a call each select kernel variants.
+  runner is that call. The channels of the two terms, the bases kind, the scale rule, the
+  transformations of Q and K, one or two row sets, the presence of a mask and the shape of a
+  call each select kernel variants.
   A captured call computes its token counts and sampled tokens inside the graph: a replay
   follows the content of the captured mask and tags tensors.
 """
@@ -273,7 +277,7 @@ class DeCoAttention(AttentionBackend):
                 f"DeCo-Attention got {token_tags.numel()} token tags for a sequence of "
                 f"{seq_len} tokens."
             )
-        token_counts, rows = None, None
+        token_counts, rows, video_rows = None, None, None
         if key_padding_mask is not None:
             key_padding_mask = key_padding_mask.to(q.device)
             token_counts = key_padding_mask.sum(dim=1, dtype=torch.int32)
@@ -300,6 +304,17 @@ class DeCoAttention(AttentionBackend):
                 for rate in rate_of_count.values()
             )
             rows = draws[0] if len(draws) == 1 else draws
+            if config.center_k and token_tags is not None:
+                # The video rows of the draw that serves the rows of K, which is the last one.
+                video_rows = deco_attention.video_rows(
+                    seq_len,
+                    q.device,
+                    token_tags,
+                    self._rank,
+                    tokens=key_padding_mask,
+                    rate=list(rate_of_count.values())[-1],
+                    min_rows=min_rows,
+                )
         pv = config.v_dtype
         num_bytes = deco_attention.workspace_size(
             batch_size, seq_len, num_heads, q.device, pv, self._rank, bases=config.basis
@@ -319,6 +334,9 @@ class DeCoAttention(AttentionBackend):
                 # The kernels take a Gram weight with shared bases only.
                 gram_weight=config.gram_weight if config.basis == "shared" else None,
                 scale_rule=config.scale_rule,
+                equalize=config.equalize,
+                center_k=config.center_k,
+                video_rows=video_rows,
             )
             return deco_attention.attention(operands, torch.empty_like(q))
 

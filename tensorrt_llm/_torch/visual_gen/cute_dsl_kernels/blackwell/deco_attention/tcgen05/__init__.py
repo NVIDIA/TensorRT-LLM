@@ -43,7 +43,7 @@ import torch
 
 from .. import target
 from ..constants import COMP_CHANNELS
-from ..inputs import Compensation
+from ..inputs import Compensation, Transforms
 from ..runtime import Basis, carve, check_caller_basis, num_sms, workspace_bytes
 from . import fp8pv
 
@@ -96,11 +96,13 @@ def prepare(
     valid_seq_lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> dict[str, torch.Tensor]:
     """Carve the buffers of a call from the workspace and fill the operands from raw q, k, v, on the current stream.
 
     * valid_seq_lens, comp: the valid prefix lengths and the compensation of the call (fp8pv.prep.run).
     * scale_rule: the rule for the scale of a head block of Q' and K' (constants.SCALE_RULES).
+    * transforms: the transformations of Q and K (inputs.Transforms).
     * A caller's basis has the directions of the basis of these buffers, and one that overlaps the bytes of the
       call in the workspace is that basis (runtime.check_caller_basis). Returns the buffers, name -> tensor.
     """
@@ -110,7 +112,7 @@ def prepare(
     buffers = carve(workspace, layout)
     if comp.basis is not None:
         check_caller_basis(comp.basis, kernel.basis(buffers, comp.bases), workspace, layout)
-    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp, scale_rule)
+    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp, scale_rule, transforms)
     return buffers
 
 

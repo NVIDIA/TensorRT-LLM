@@ -23,6 +23,12 @@
   leading direction last. One problem per (batch, head) weighs the two Gram matrices; of the two problems of
   bases "separate" the first takes the Gram of k alone, for the basis of the Q-residual term, and the second
   that of q, for the basis of the K-residual term.
+* Transformations of Q and K (prepare: equalize, center_k; the `transform` of _eig): the threads reduce the rows
+  of every Gram round per channel (round_statistics); the factors of the channels follow the last round
+  (channel_factors: the mean m of k over its video rows, d from the largest magnitudes, m / d), the accumulators
+  become the Gram matrices of the transformed rows (transform_gram), and the first problem of a (batch, head)
+  writes its record for the Q'/K' pass: d, 1 / d and the center (m / d) Hd (TRANSFORM_*). Both operands are staged
+  in every problem then.
 * The other CTAs scan V for the range of what the kernel's PV format casts (the maxima that set its tensor scale).
   When the launch has room for it (FUSED), they scan the tiles a counter hands out and then run the kernel's V pass
   on the tiles another counter hands out, joined by the eigensolver CTAs as basis_cta describes; the V pass is a
@@ -37,10 +43,16 @@ from cutlass import Float32, Int16, Int32, Int64, Uint16, Uint32
 from cutlass.utils import SmemAllocator
 
 from ...common.dsl import MMALayout, ldmatrix, nanosleep
-from ...common.expmath import f2u, hash01, u2f, warp_max, warp_sum
+from ...common.expmath import bf16x2, f2u, hash01, u2f, warp_max, warp_sum
 from ...common.mem import cp_async16, gptr, load_invariant, load_vector, sptr, store_vector
 from ...common.state import State
-from ...constants import INV_SQRT_HEAD_DIM, MIN_GRAM_TRACE
+from ...constants import (
+    EQUALIZE_MAX_FACTOR,
+    EQUALIZE_MIN_MAGNITUDE,
+    INV_SQRT_HEAD_DIM,
+    MIN_GRAM_TRACE,
+    QPRE,
+)
 from ..ptx.shared import ld_global_nc_b32_hint_pred, ld_shared_f32_v4_pred, mma_bf16
 from ..valid_len import valid_len
 
@@ -54,6 +66,10 @@ REFLECT_FLOOR = 1e-30
 # MGS: at most this many sweeps; a sweep runs when a column of the sweep before kept less than half of its squared
 # norm
 MGS_SWEEPS = 2
+# The record of the transformations of a (batch, head): d and 1 / d as BF16 [128] each, then the center of the
+# rotated K as FP32 [128]; the byte offsets of the three
+TRANSFORM_BYTES = 1024
+TRANSFORM_D, TRANSFORM_INV_D, TRANSFORM_CENTER = 0, 256, 512
 # directions of a problem -> (threads of an eigenvalue in the multisection, its rounds)
 BISECTION = {32: (16, 6), 64: (8, 8)}
 
@@ -76,6 +92,11 @@ SM_SCL = SM_IDX2 + 256  # up to 64 inverse-iteration scales
 SM_VSTG = 73728
 SM_TOTAL = 92160
 IDX = (SM_IDX2, SM_VSTG)  # the sampled token indices of q and of k
+# Transformations, between the Gram rounds and the traces, in the area of the round buffers: the statistics of the
+# threads (32 B each), then five FP32 [128] arrays of the channels: d and 1 / d (the values of their BF16), m, the
+# sum of the rows of k, m / d
+SM_STAT = 0
+FACT_D, FACT_INV_D, FACT_MEAN, FACT_SUM, FACT_CENTER = (16384 + 512 * i for i in range(5))
 # The eigensolver also uses the start of the buffer twice: for the two cp.async buffers of the Gram rounds, 26112 B
 # each (2 x 48 rows at a 272-byte stride) at 0 and 26112, and at the end for the Hadamard matrix (32 KB at SM_UHH).
 
@@ -243,6 +264,31 @@ def gram_round(st, part, buf):
 
 
 @cute.jit
+def round_statistics(st, stat, buf, rd):
+    """Adds the thread's rows of round rd, staged at buf, to its statistics of channel tid % 128.
+
+    * Rows 12 (tid // 128) .. + 11 of q and of k; a row past the rows of its operand (st.count) is left out.
+    * stat = (largest |q|, largest k, smallest k, sum of k over its video rows (the samples below st.videos),
+      sum of k over every row).
+    """
+    row0 = (st.tid >> 7) * 12
+    first = rd * 48 + row0
+    src = buf + row0 * 272 + (st.tid & 127) * 2
+    for r in cutlass.range_constexpr(12):
+        xq = u2f(Uint32(cute.arch.load(sptr(Uint16, src + r * 272), Uint16)) << Uint32(16))
+        xk = u2f(Uint32(cute.arch.load(sptr(Uint16, src + (48 + r) * 272), Uint16)) << Uint32(16))
+        in_q = first + r < st.count[0]
+        in_k = first + r < st.count[1]
+        stat[0] = cute.arch.fmax(
+            stat[0], Float32(cutlass.select_(in_q, cute.math.abs(xq), Float32(0.0)))
+        )
+        stat[1] = cute.arch.fmax(stat[1], Float32(cutlass.select_(in_k, xk, Float32(-3.0e38))))
+        stat[2] = cute.arch.fmin(stat[2], Float32(cutlass.select_(in_k, xk, Float32(3.0e38))))
+        stat[3] = stat[3] + Float32(cutlass.select_(first + r < st.videos, xk, Float32(0.0)))
+        stat[4] = stat[4] + Float32(cutlass.select_(in_k, xk, Float32(0.0)))
+
+
+@cute.jit
 def close_part(part, acc):
     """acc += part, part = 0: the sums of a part of the Gram rounds join the accumulators of Xq^T Xq and Xk^T Xk."""
     for e in cutlass.range_constexpr(64):
@@ -260,6 +306,125 @@ def refill(st, buf, rd):
         src, nbytes = staged_chunk(st, mat, (rd + 2) * 48 + sm, chk, True)
         cp_async16(buf + (mat * 48 + sm) * 272 + chk * 16, src, nbytes)
     cute.arch.cp_async_commit_group()
+
+
+@cute.jit
+def publish_statistics(st, stat):
+    """Thread tid stores its statistics of the Gram rounds (round_statistics) at SM_STAT + 32 tid."""
+    base = st.sb + SM_STAT + st.tid * 32
+    store_vector(sptr(Float32, base, 16), (stat[0], stat[1], stat[2], stat[3]))
+    cute.arch.store(sptr(Float32, base + 16), stat[4])
+
+
+@cute.jit
+def channel_factors(st, switches: cutlass.Constexpr, record, write):
+    """Thread c < 128 reduces the statistics of channel c over its four threads (publish_statistics, barrier) and
+    stores the factors of the channel in the FACT_* arrays.
+
+    * switches = (equalize, center_k).
+    * m (FACT_MEAN): with center_k the mean of k over its video rows, 0 without a video row or when it is not
+      finite; else 0. FACT_SUM: the sum of k over every row.
+    * d and 1 / d (FACT_D, FACT_INV_D), the values of their BF16, each rounded on its own: with equalize
+      d = sqrt(largest |k - m| / (QPRE largest |q|)), 1 where a guard of constants.py holds; else 1.
+    * FACT_CENTER: m / d, the center of the scaled k.
+    * record, write: the global address of the record of the (batch, head), which takes the BF16 of d and of
+      1 / d when write is not zero.
+    """
+    equalize, center_k = switches
+    if st.tid < 128:
+        largest_q = Float32(0.0)
+        top = Float32(-3.0e38)
+        bottom = Float32(3.0e38)
+        video_sum = Float32(0.0)
+        row_sum = Float32(0.0)
+        for j in cutlass.range_constexpr(4):
+            base = st.sb + SM_STAT + (st.tid + 128 * j) * 32
+            w = load_vector(sptr(Float32, base, 16), 4)
+            largest_q = cute.arch.fmax(largest_q, w[0])
+            top = cute.arch.fmax(top, w[1])
+            bottom = cute.arch.fmin(bottom, w[2])
+            video_sum = video_sum + w[3]
+            row_sum = row_sum + cute.arch.load(sptr(Float32, base + 16), Float32)
+        one = Float32(1.0)
+        zero = Float32(0.0)
+        m = zero
+        if cutlass.const_expr(center_k):
+            m = video_sum / Float32(cutlass.max(st.videos, Int32(1)))
+            m = Float32(cutlass.select_((st.videos > 0) & (m - m == zero), m, zero))
+        d = one
+        if cutlass.const_expr(equalize):
+            largest_k = cute.arch.fmax(top - m, m - bottom)
+            scaled_q = largest_q * Float32(QPRE)
+            ratio = largest_k / scaled_q
+            kept = (scaled_q >= Float32(EQUALIZE_MIN_MAGNITUDE)) & (
+                largest_k >= Float32(EQUALIZE_MIN_MAGNITUDE)
+            )
+            kept = kept & (ratio >= Float32(EQUALIZE_MAX_FACTOR**-2))
+            kept = kept & (ratio <= Float32(EQUALIZE_MAX_FACTOR**2))
+            d = Float32(cutlass.select_(kept, cute.math.sqrt(ratio), one))
+        pair = bf16x2(d, one / d)
+        inv_d = u2f(pair & Uint32(0xFFFF0000))
+        fact = st.sb + st.tid * 4
+        cute.arch.store(sptr(Float32, fact + FACT_D), u2f(pair << Uint32(16)))
+        cute.arch.store(sptr(Float32, fact + FACT_INV_D), inv_d)
+        cute.arch.store(sptr(Float32, fact + FACT_MEAN), m)
+        cute.arch.store(sptr(Float32, fact + FACT_SUM), row_sum)
+        cute.arch.store(sptr(Float32, fact + FACT_CENTER), m * inv_d)
+        if write != 0:
+            cute.arch.store(gptr(Uint16, record + Int64(TRANSFORM_D + 2 * st.tid)), pair.to(Uint16))
+            cute.arch.store(
+                gptr(Uint16, record + Int64(TRANSFORM_INV_D + 2 * st.tid)),
+                (pair >> Uint32(16)).to(Uint16),
+            )
+
+
+@cute.jit
+def transform_gram(st, acc, center_k: cutlass.Constexpr):
+    """The thread's entries of Xq^T Xq and Xk^T Xk become those of the Gram matrices of the transformed rows
+    (channel_factors, barrier): D Xq^T Xq D and D^-1 (Xk^T Xk - s m^T - m s^T + n m m^T) D^-1, with D = diag(d),
+    s the sum and n = st.count[1] the number of the rows of k (the mean terms with center_k). The entries of an
+    operand without weight in the problem become zero. Thread: rows 16 mi + g + 8 hh, columns
+    8 (nb + n) + 2 t + e (gram_round)."""
+    rows = [st.sb + (16 * st.mi + st.g + 8 * hh) * 4 for hh in range(2)]
+    row_d = [cute.arch.load(sptr(Float32, r + FACT_D), Float32) for r in rows]
+    row_i = [cute.arch.load(sptr(Float32, r + FACT_INV_D), Float32) for r in rows]
+    if cutlass.const_expr(center_k):
+        row_m = [cute.arch.load(sptr(Float32, r + FACT_MEAN), Float32) for r in rows]
+        row_s = [cute.arch.load(sptr(Float32, r + FACT_SUM), Float32) for r in rows]
+        nk = Float32(st.count[1])
+    zero = Float32(0.0)
+    for n in cutlass.range_constexpr(8):
+        col = st.sb + (8 * (st.nb + n) + 2 * st.t) * 4
+        col_d = load_vector(sptr(Float32, col + FACT_D, 8), 2)
+        col_i = load_vector(sptr(Float32, col + FACT_INV_D, 8), 2)
+        if cutlass.const_expr(center_k):
+            col_m = load_vector(sptr(Float32, col + FACT_MEAN, 8), 2)
+            col_s = load_vector(sptr(Float32, col + FACT_SUM, 8), 2)
+        for hh in cutlass.range_constexpr(2):
+            for e in cutlass.range_constexpr(2):
+                i = n * 4 + 2 * hh + e
+                gq = acc[i] * (row_d[hh] * col_d[e])
+                gk = acc[32 + i]
+                if cutlass.const_expr(center_k):
+                    gk = gk - (row_s[hh] * col_m[e] + row_m[hh] * col_s[e])
+                    gk = gk + nk * (row_m[hh] * col_m[e])
+                gk = gk * (row_i[hh] * col_i[e])
+                acc[i] = Float32(cutlass.select_(st.weighted[0] != 0, gq, zero))
+                acc[32 + i] = Float32(cutlass.select_(st.weighted[1] != 0, gk, zero))
+
+
+@cute.jit
+def rotated_center(st, had_p, record):
+    """Thread j < 128 stores element j of (m / d) Hd, the center of the scaled k in the rotated frame, in the
+    record of the (batch, head) at the global address record (FACT_CENTER: channel_factors, barrier; Hd at
+    had_p)."""
+    if st.tid < 128:
+        sCenter = cute.make_tensor(sptr(Float32, st.sb + FACT_CENTER), cute.make_layout(128))
+        center = Float32(0.0)
+        for c in cutlass.range(128, unroll=8):
+            hd = Uint32(load_invariant(Uint16, had_p + Int64((c * 128 + st.tid) * 2)))
+            center = center + sCenter[c] * u2f(hd << Uint32(16))
+        cute.arch.store(gptr(Float32, record + Int64(TRANSFORM_CENTER + 4 * st.tid)), center)
 
 
 @cute.jit
@@ -796,6 +961,7 @@ def _eig(
     rows_mode,
     rank: cutlass.Constexpr,
     separate: cutlass.Constexpr,
+    transform=None,
 ):
     """Run the eigensolver CTA of a problem (thread tid of EIG_THREADS, shared memory at sb with the map SM_*).
 
@@ -819,6 +985,11 @@ def _eig(
     * QP, KP: the bytes between consecutive tokens of q and of k.
     * lens_p, rows_mode: None, or the global address of the valid prefix lengths and the rows mode of
       sampled_token: the sampled tokens then lie in the valid prefix of the batch element.
+    * transform: None, or (switches, tr_p, video_p, video_mode) of the transformations of Q and K (module
+      docstring): switches = (equalize, center_k) at trace time; tr_p: the records [B H] of TRANSFORM_BYTES
+      bytes; video_mode: 0 (every row of k is a video row), or the int32 counts of the leading video rows at
+      video_p, 1: one for the batch, 2: one per batch element. The Gram matrices are then those of the
+      transformed rows.
     """
     problems, directions = basis_plan(rank, separate)
     st = State(
@@ -835,8 +1006,10 @@ def _eig(
     bh = problem // problems
     basis_p = ut_addrs[0]
     keep = max(rank)
+    first_problem = Int32(1)
     if cutlass.const_expr(problems == 2):
         second = problem - bh * 2
+        first_problem = Int32(second == 0)
         weight_q = Float32(2 * second)
         weights = (weight_q, Float32(2.0) - weight_q)
         basis_p = of_side(Int64, ut_addrs, second)
@@ -844,12 +1017,33 @@ def _eig(
     st.weights = weights
     # the tokens of an operand without weight are not copied (staged_chunk); its rows are still preloaded
     st.used = (Int32(weights[0] != Float32(0.0)), Int32(weights[1] != Float32(0.0)))
+    if cutlass.const_expr(transform is not None):
+        # the statistics take the rows of both operands
+        st.weighted = st.used
+        st.used = (Int32(1), Int32(1))
     b = bh // H
     st.h = bh - b * H  # head, of batch b
     st.S = S
     if cutlass.const_expr(lens_p is not None):
         st.b = b
         st.nv = valid_len(lens_p, b, S)  # the valid tokens of the batch element
+    if cutlass.const_expr(transform is not None):
+        switches, tr_p, video_p, video_mode = transform
+        # the rows of an operand that hold a token, and the leading ones of k that are video rows
+        alive = Int32(1)
+        if cutlass.const_expr(lens_p is not None):
+            alive = Int32(st.nv > 0)
+        st.count = (N[0] * alive, N[1] * alive)
+        videos = N[1]
+        if video_mode != 0:
+            own = Int64(cutlass.select_(video_mode == 2, b, Int32(0)))
+            given = Int32(load_invariant(Uint32, video_p + own * 4))
+            videos = cutlass.max(cutlass.min(given, N[1]), Int32(0))
+        st.videos = videos * alive
+        stat = cute.make_rmem_tensor((5,), Float32)
+        stat.fill(0.0)
+        stat[1] = Float32(-3.0e38)
+        stat[2] = Float32(3.0e38)
     st.work = sb + SM_WORK  # also Z [128][directions], once G has left it
     # the 16 warp parts of two sums or bounds (the second set at 16; at 4 for the bounds of four warps)
     st.sRed = cute.make_tensor(sptr(Float32, sb + SM_RED), cute.make_layout(32))
@@ -878,6 +1072,8 @@ def _eig(
         cute.arch.sync_threads()  # publishes round rd: every thread has waited for its copies
         buf = sb + (rd & 1) * 26112
         gram_round(st, part, buf)
+        if cutlass.const_expr(transform is not None):
+            round_statistics(st, stat, buf, rd)
         cute.arch.sync_threads()  # every warp is done with the buffer
         refill(st, buf, rd)
     close_part(part, acc)
@@ -887,11 +1083,25 @@ def _eig(
             cute.arch.sync_threads()  # publishes round rd
             buf = sb + (rd & 1) * 26112
             gram_round(st, part, buf)
+            if cutlass.const_expr(transform is not None):
+                round_statistics(st, stat, buf, rd)
             cute.arch.sync_threads()  # every warp is done with the buffer
             refill(st, buf, rd)
         close_part(part, acc)
     cute.arch.cp_async_commit_group()
     cute.arch.cp_async_wait_group(0)
+    if cutlass.const_expr(transform is not None):
+        # the factors of the channels, then the Gram matrices of the transformed rows
+        cute.arch.sync_threads()  # every thread has waited for its copies: the round buffers are free
+        record = tr_p + Int64(bh) * TRANSFORM_BYTES
+        publish_statistics(st, stat)
+        cute.arch.sync_threads()  # publishes the statistics of the threads
+        channel_factors(st, switches, record, first_problem)
+        cute.arch.sync_threads()  # publishes the factors of the channels
+        transform_gram(st, acc, switches[1])
+        if cutlass.const_expr(switches[1]):
+            if first_problem != 0:
+                rotated_center(st, had_p, record)
     publish_traces(st, acc)
     cute.arch.sync_threads()  # publishes the warp parts of the two traces
     normalize_gram(st, acc)
@@ -1321,6 +1531,7 @@ def basis_cta(
     lens_p,
     rank: cutlass.Constexpr,
     separate: cutlass.Constexpr,
+    transform=None,
 ):
     """Run the CTA of a basis launch (grid neig + nspare, EIG_THREADS threads).
 
@@ -1332,7 +1543,7 @@ def basis_cta(
     * eig, the run-time arguments of the eigenproblems: (the addresses of the basis of the Q-residual term and
       of that of the K-residual term, the rows of q and of k, their counts NQ and NK, neig, the weights weight_q and
       weight_k, the rows mode). neig is 0 when the caller gave the basis.
-    * QP, KP: the token pitches of q and k; lens_p, rank, separate: as in _eig.
+    * QP, KP: the token pitches of q and k; lens_p, rank, separate, transform: as in _eig.
     """
     ut_q_p, ut_k_p, rows_q_p, rows_k_p, NQ, NK, neig, weight_q, weight_k, rows_mode = eig
     tid, _, _ = cute.arch.thread_idx()
@@ -1363,6 +1574,7 @@ def basis_cta(
                 rows_mode,
                 rank,
                 separate,
+                transform,
             )
     elif cutlass.const_expr(not FUSED):
         vscan_gs(pid - neig, tid, sb)

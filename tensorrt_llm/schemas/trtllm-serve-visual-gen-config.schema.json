@@ -376,7 +376,7 @@
     },
     "DeCoAttentionConfig": {
       "additionalProperties": false,
-      "description": "DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.\n\nQ/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the\nfirst-order quantization error of the scores; V is smoothed over blocks of keys and\nquantized to FP8 or NVFP4. Self-attention with head dimension 128.\n\n* Compensation channels: ``q_channels`` of the Q-residual term, which compensates the\n  rounding residual of Q, and ``k_channels`` of the K-residual term, which compensates\n  that of K.\n* Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated\n  on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,\n  ``min_sample_rows``).\n* Quantizer of Q/K: the rule for the scale of an NVFP4 block of the head channels\n  (``scale_rule``).\n* The recipe sets its scaling granularity and smooths V itself: it has no block size,\n  smoothing or VC-Attention options.",
+      "description": "DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.\n\nQ/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the\nfirst-order quantization error of the scores; V is smoothed over blocks of keys and\nquantized to FP8 or NVFP4. Self-attention with head dimension 128.\n\n* Compensation channels: ``q_channels`` of the Q-residual term, which compensates the\n  rounding residual of Q, and ``k_channels`` of the K-residual term, which compensates\n  that of K.\n* Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated\n  on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,\n  ``min_sample_rows``).\n* Quantizer of Q/K: the rule for the scale of an NVFP4 block of the head channels\n  (``scale_rule``).\n* Transformations of Q and K before quantization (``equalize``, ``center_k``).\n* The recipe sets its scaling granularity and smooths V itself: it has no block size,\n  smoothing or VC-Attention options.",
       "properties": {
         "algorithm": {
           "const": "deco_attention",
@@ -396,6 +396,20 @@
           "status": "prototype",
           "title": "Basis",
           "type": "string"
+        },
+        "center_k": {
+          "default": false,
+          "description": "K centering: per head, K minus its mean over the sampled video tokens. The scores of a query move by one constant, and its attention is unchanged. Needs compensation channels.",
+          "status": "prototype",
+          "title": "Center K",
+          "type": "boolean"
+        },
+        "equalize": {
+          "default": false,
+          "description": "Channel equalization: per head, channel c of Q is multiplied and channel c of K divided by one factor, taken from the largest magnitudes of the channel over the sampled tokens. With exact factors every score is unchanged. Needs compensation channels.",
+          "status": "prototype",
+          "title": "Equalize",
+          "type": "boolean"
         },
         "gram_weight": {
           "default": 0.5,

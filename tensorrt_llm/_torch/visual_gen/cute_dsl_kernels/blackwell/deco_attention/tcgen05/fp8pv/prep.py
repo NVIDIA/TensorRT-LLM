@@ -33,6 +33,7 @@ scan starts beside the eigensolver CTAs and ends with a wait for them, so the pl
 Without an eigensolver launch the V scan is a plain launch after the clear launch.
 """
 
+import functools
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -44,11 +45,19 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
 from ...constants import HEAD_DIM, KEY_TILE, key_tiles, qk_channels, qk_scale_atoms
-from ...inputs import Compensation, hadamard
+from ...inputs import Compensation, Transforms, hadamard
 from ...runtime import Basis, Layout, compiled, num_sms, pdl_enabled, token_pitches
-from ..prep.basis import EIG_THREADS, GMAX_WORDS, clear_kernel, eig_directions, eig_kernel
+from ..prep.basis import (
+    EIG_THREADS,
+    GMAX_WORDS,
+    TRANSFORM_BYTES,
+    clear_kernel,
+    eig_directions,
+    eig_kernel,
+    eig_transform_kernel,
+)
 from ..prep.encode import encode_kernel, encode_threads
-from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel, qk_rule_kernel
+from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel, qk_rule_kernel, qk_transform_kernel
 from .softmax import MIN_SCORE_LOG2
 from .v_pass import V_BLOCK, V_CTAS_PER_SM, V_THREADS, v_encode_kernel, v_scan_kernel
 
@@ -68,6 +77,9 @@ def _launch_chain(
     grids: tuple,
     gram_weight: Float32,
     lens: Int64,
+    records: Int64,
+    video: Int64,
+    rotation_t: Int64,
     stream: cuda.CUstream,
     config: tuple,
 ) -> None:
@@ -77,7 +89,9 @@ def _launch_chain(
     gmax, ut_q, ut_k, q_sfv, k_sfv = scratch
     QP, KP, VP = pitches
     v_grid, qgrid, egrid, v_counted = grids
-    rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule = config
+    rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule, transforms = config
+    equalize, center_k, counted = transforms
+    transformed = equalize or center_k
     # the shape of the call, and the sizes of its launches that follow from it
     B, S, H = (Int32(n) for n in q.shape[:3])
     BH = B * H
@@ -90,7 +104,12 @@ def _launch_chain(
     if eig:
         NQ = Int32(rows_q.shape[-1])
         eig_args = (q, k, rows_q, rows_k, hadamard, ut_q, S, H, QP, KP, NQ, NK, gram_weight, lens)
-        eig_kernel(*eig_args, eig_directions(rank), rows_mode, two_row_sets, separate).launch(
+        eig_build = (eig_directions(rank), rows_mode, two_row_sets, separate)
+        if transformed:
+            eigs = eig_transform_kernel(*eig_args, records, video, *eig_build, *transforms)
+        else:
+            eigs = eig_kernel(*eig_args, *eig_build)
+        eigs.launch(
             grid=(BH * (2 if separate else 1), 1, 1),
             block=(EIG_THREADS, 1, 1),
             use_pdl=pdl,
@@ -127,11 +146,16 @@ def _launch_chain(
         op, _gemm_view(k), a_layout, (128, 128, 128), tiled_mma
     )
     qk_args = (tiled_mma, tma_q, tma_k, hadamard, ut_q, ut_k, q4, k4, q_sfv, k_sfv, gmax)
-    qk_args += (S, H, NB, ntiles, lens, rank, with_lens, separate)
-    if scale_rule == "max":
-        qkp = qk_kernel(*qk_args)
+    qk_args += (S, H, NB, ntiles, lens)
+    qk_build = (rank, with_lens, separate)
+    if transformed:
+        qkp = qk_transform_kernel(
+            *qk_args, records, rotation_t, *qk_build, scale_rule, equalize, center_k
+        )
+    elif scale_rule == "max":
+        qkp = qk_kernel(*qk_args, *qk_build)
     else:
-        qkp = qk_rule_kernel(*qk_args, scale_rule)
+        qkp = qk_rule_kernel(*qk_args, *qk_build, scale_rule)
     qkp.launch(grid=(qgrid, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
     encode_kernel(
         q_sfv, k_sfv, q_sf, k_sf, gmax, score_scale, BH * NB, v8_scale, min_prod, rank
@@ -141,7 +165,7 @@ def _launch_chain(
 def _make_host(config: tuple) -> Callable:
     """Return the host function that launches the chain of a configuration on its `stream` argument.
 
-    * config: (rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule).
+    * config: (rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule, transforms).
         - rank: (r_q, r_k), the channels of the compensation terms. separate: each term has a basis of its own, ut_q
           (the Q-residual term's) and the one at the address ut_k (else both read ut_q); the eigensolver then writes
           both from the address of ut_q.
@@ -154,6 +178,10 @@ def _make_host(config: tuple) -> Callable:
           (the default draw) or takes them as given.
         - pdl: the launches of the chain follow each other as programmatic dependents.
         - scale_rule: the rule for the scale of a head block in the Q/K pass (constants.SCALE_RULES).
+        - transforms: (equalize, center_k, counted): the transformations of Q and K; either one takes the
+          transformed eigensolver and Q/K pass, which write and read the records at the address records
+          (basis.py). counted: the video row counts of center_k are at the address video. With equalize
+          the transformed Q/K pass reads the transposed rotation at the address rotation_t.
     * The score prescale log2(e) / sqrt(128) is folded into Q' (QPRE), so the multiplier of the raw scores in log2
       units is the score scale (group scale product / 128) itself, a power of two; the encode launch raises it to at
       least 2^MIN_SCORE_LOG2, the floor of the attention's landing (softmax.py), by shrinking the Q' / K' block scales.
@@ -194,6 +222,9 @@ def _make_host(config: tuple) -> Callable:
         rows_k: Int64,
         ut_k: Int64,
         lens: Int64,
+        records: Int64,
+        video: Int64,
+        rotation_t: Int64,
         stream: cuda.CUstream,
     ):
         _launch_chain(
@@ -204,6 +235,9 @@ def _make_host(config: tuple) -> Callable:
             (v_grid, qgrid, egrid, v_counted),
             gram_weight,
             lens,
+            records,
+            video,
+            rotation_t,
             stream,
             config,
         )
@@ -254,6 +288,19 @@ def scratch(B: int, S: int, H: int, rank: tuple[int, int], bases: str) -> Layout
     }
 
 
+@functools.cache
+def _transposed_rotation(device: torch.device) -> torch.Tensor:
+    """Return the transposed rotation of Q and K (inputs.hadamard), contiguous, built once per device: row n holds
+    column n of the rotation, which the transformed Q/K pass stages from."""
+    return hadamard(device).t().contiguous()
+
+
+def transform_scratch(B: int, H: int) -> Layout:
+    """Return the records of the transformations of Q and K, name -> (dtype, shape): TRANSFORM_BYTES per
+    (batch, head), which a call with equalize or center_k writes (basis.py) and no other call reads."""
+    return {"transform": (torch.uint8, (B, H, TRANSFORM_BYTES))}
+
+
 def basis(buffers: dict[str, torch.Tensor], bases: str) -> Basis:
     """Return the basis that the eigensolver left in the buffers of a call: U^T [B, H, directions, 128], the leading
     direction last; with bases "separate" the two (basis of the Q-residual term, of the K-residual term)."""
@@ -269,6 +316,7 @@ def run(
     lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> None:
     """Fill the operands of a call (buffers: the buffers of the call, the layout of this package) from raw BF16 q, k, v.
 
@@ -278,6 +326,7 @@ def run(
     * comp: the compensation of the call (inputs.Compensation). With a caller's basis the eigensolver is not
       launched and the rows are None, as they are with rank (0, 0).
     * scale_rule: the rule for the scale of a head block of Q' and K' (constants.SCALE_RULES).
+    * transforms: the transformations of Q and K (inputs.Transforms); they need the eigensolver launch.
     """
     B, S, H, _ = q.shape
     NB = key_tiles(S)
@@ -316,8 +365,19 @@ def run(
     sizes = (*token_pitches(q, k, v), v_grid, qgrid, egrid, v_counted, nk)
     lens_addr = 0 if lens is None else lens.data_ptr()
     pdl = pdl_enabled()
+    equalize, center_k, video = transforms
+    video_addr = 0 if video is None else video.data_ptr()
     config = (rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule)
-    values = (gram_weight, rows_k_addr, ut_k_addr, lens_addr)
+    config += ((equalize, center_k, video is not None),)
+    values = (
+        gram_weight,
+        rows_k_addr,
+        ut_k_addr,
+        lens_addr,
+        buffers["transform"].data_ptr(),
+        video_addr,
+    )
+    values += (_transposed_rotation(dev).data_ptr() if equalize else 0,)
 
     # the chain compiles per device and configuration (_make_host)
     def make():

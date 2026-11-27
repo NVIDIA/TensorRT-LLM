@@ -321,6 +321,7 @@ class TestAttentionConfigQuantValidation:
             dict(basis="separate"),
             dict(q_sample_rate=1 / 64, k_sample_rate=1.0, min_sample_rows=256),
             dict(scale_rule="search"),
+            dict(equalize=True, center_k=True),
         ],
         ids=[
             "defaults",
@@ -332,11 +333,12 @@ class TestAttentionConfigQuantValidation:
             "separate_bases",
             "sampling",
             "scale_rule",
+            "transformations",
         ],
     )
     def test_supported_deco_attention_config(self, quant):
         """DeCo-Attention validates on CUTEDSL with nvfp4 Q/K, fp8 or nvfp4 V and its
-        compensation, sampling and scale rule fields. ``algorithm`` selects its config class
+        compensation, sampling, scale rule and transformation fields. ``algorithm`` selects its config class
         from a mapping, as a YAML file gives it, and the config survives a dump, also one that
         leaves out the defaults or the fields that were not set."""
         attention = AttentionConfig(
@@ -355,7 +357,7 @@ class TestAttentionConfigQuantValidation:
         """A config without an algorithm is a QuantAttentionConfig, also with the dtypes of
         DeCo-Attention. The DeCo-Attention fields default to the shared basis of equal weights
         on 1/256 of the tokens, with the channels and the fewest sampled tokens left to the
-        GPU."""
+        GPU and both transformations off."""
         plain = AttentionConfig(
             backend="CUTEDSL", quant_attention_config={"qk_dtype": "nvfp4", "v_dtype": "fp8"}
         )
@@ -365,6 +367,7 @@ class TestAttentionConfigQuantValidation:
         assert (deco.q_channels, deco.k_channels, deco.min_sample_rows) == (None, None, None)
         assert (deco.basis, deco.gram_weight) == ("shared", 0.5)
         assert (deco.q_sample_rate, deco.k_sample_rate) == (1 / 256, 1 / 256)
+        assert (deco.equalize, deco.center_k) == (False, False)
 
     @pytest.mark.parametrize(
         "backend, quant, sparse, match",
@@ -407,6 +410,18 @@ class TestAttentionConfigQuantValidation:
                 None,
                 "Input should be 'max', 'band' or 'search'",
             ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", q_channels=0, k_channels=0, equalize=True),
+                None,
+                "equalize takes its statistics",
+            ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", q_channels=0, k_channels=0, center_k=True),
+                None,
+                "center_k takes its statistics",
+            ),
         ],
         ids=[
             "other_backend",
@@ -417,6 +432,8 @@ class TestAttentionConfigQuantValidation:
             "too_many_channels",
             "gram_weight_with_separate",
             "unknown_scale_rule",
+            "equalize_without_channels",
+            "center_k_without_channels",
         ],
     )
     def test_deco_attention_rejections(self, backend, quant, sparse, match):
@@ -425,7 +442,7 @@ class TestAttentionConfigQuantValidation:
         without an algorithm takes none of its fields, and its config none of the block size,
         smoothing or VC-Attention fields of the other recipes; the two terms take at most 128
         compensation channels; the Gram weight belongs to the shared basis; a scale rule is one
-        of the three of the kernels."""
+        of the three of the kernels; a transformation needs compensation channels."""
         with pytest.raises(ValidationError, match=match):
             AttentionConfig(
                 backend=backend, quant_attention_config=quant, sparse_attention_config=sparse

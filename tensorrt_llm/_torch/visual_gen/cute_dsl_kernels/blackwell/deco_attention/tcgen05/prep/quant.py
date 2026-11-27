@@ -48,7 +48,7 @@ def _mul2_list(x, s):
     return out
 
 
-def _absmax(x):
+def absmax(x):
     """Return max |x_j|, as a chain of maxima with the absolute values."""
     am = cute.math.absf(x[0])
     for j in range(1, len(x)):
@@ -142,4 +142,4 @@ def quant16_dq_knownmax(x, am, rule="max"):
 def quant16(x, am=None):
     """Quantize an NVFP4 block of 16 values (am: their max |x| where it is known): return the UE4M3 scale and two
     words of E2M1 codes."""
-    return _nvfp4_codes(x, _absmax(x) if am is None else am)
+    return _nvfp4_codes(x, absmax(x) if am is None else am)

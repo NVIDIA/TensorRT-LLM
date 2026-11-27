@@ -26,7 +26,7 @@ Files:
 import torch
 
 from ...constants import QK_ROW_BYTES, QK_SCALE_ATOMS
-from ...inputs import Compensation
+from ...inputs import Compensation, Transforms
 from ...runtime import Layout
 from . import launch, prep
 from .layout import STAGE, key_tiles
@@ -40,6 +40,7 @@ def layout(b: int, s: int, h: int, nsm: int, rank: tuple[int, int], bases: str) 
     q_sf        UE4M3 per token and 16 channels, in the scale atoms of the QK MMA
     img         per key tile the image of K', V', their scales and v_mean (layout.py); zero past S
     score_scale, v4_scale: one float32 each
+    transform   the records of the transformations of Q and K (prep.transform_record), behind the scratch
     """
     tiles = key_tiles(s)
     return {
@@ -50,6 +51,7 @@ def layout(b: int, s: int, h: int, nsm: int, rank: tuple[int, int], bases: str) 
         "v4_scale": (torch.float32, (1,)),
         **prep.scratch(b, s, h, nsm, rank, bases),
         **launch.scratch(b, s, h, nsm),
+        **prep.transform_record(b, h, rank),
     }
 
 
@@ -61,13 +63,14 @@ def prepare(
     lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> None:
     """Run the preparation on the buffers of a call (layout): the operands from BF16 q, k, v. Every buffer may hold
     anything on entry; the counters of the basis launch and of the attention's split units, which must be zero when
-    their launches start, are zeroed here. lens, comp, scale_rule: as in prep.run."""
+    their launches start, are zeroed here. lens, comp, scale_rule, transforms: as in prep.run."""
     buffers["done"].zero_()
     launch.split_counters(buffers["split"]).zero_()
-    prep.run(q, k, v, buffers, lens, comp, scale_rule)
+    prep.run(q, k, v, buffers, lens, comp, scale_rule, transforms)
 
 
 def attention(

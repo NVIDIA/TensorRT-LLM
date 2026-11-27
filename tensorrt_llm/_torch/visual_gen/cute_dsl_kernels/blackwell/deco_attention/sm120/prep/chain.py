@@ -28,9 +28,9 @@ import torch
 from cutlass import Float32, Int32, Int64
 
 from ...constants import HEAD_DIM, QK_CHANNELS, key_tiles
-from ...inputs import Compensation, hadamard
+from ...inputs import Compensation, Transforms, hadamard
 from ...runtime import Basis, Layout, compiled, current_stream, num_sms, token_pitches
-from .basis import EIG_THREADS, basis_plan
+from .basis import EIG_THREADS, TRANSFORM_BYTES, basis_plan
 from .encode import ENCODE_THREADS, encode_kernel
 from .qk_pass import QK_THREADS, TILE_SCALES, qk_kernel
 
@@ -65,16 +65,18 @@ def _compile(
     rank: tuple[int, int],
     separate: bool,
     scale_rule: str,
+    transform: tuple[bool, bool],
 ) -> Callable:
     """Return the host function of a chain compiled for one key, kept in the cache of its kernel package.
 
     * Key: the device; the chain form (fused: the V pass in the basis launch), which _grids takes from the
       eigenproblems of the call against the SM count, so it follows the shape; with_lens (the kernels read valid
       prefix lengths); rank (the channels of the two terms); separate (each term on a basis of its own);
-      scale_rule (the rule for the scale of a head block of Q' and K').
+      scale_rule (the rule for the scale of a head block of Q' and K'); transform (equalize, center_k: the
+      transformations of Q and K).
     * A first use of a key compiles (runtime.compiled); the rule of a capture is that of api.py.
     """
-    key = (device.index, fused, with_lens, rank, separate, scale_rule)
+    key = (device.index, fused, with_lens, rank, separate, scale_rule, transform)
 
     def make() -> tuple:
         # the host function, placeholders of its run-time parameters (Int64 addresses, Int32 sizes, Float32
@@ -93,6 +95,7 @@ def _compile(
             rank,
             separate,
             scale_rule,
+            transform,
         )
 
     return compiled(cache, key, make)
@@ -103,17 +106,20 @@ def make_host(
 ) -> Callable:
     """Return the host function of the chain of a kernel package.
 
-    * Every launch takes the shape at run time; FUSED, LENS, RANK, SEPARATE and SCALE_RULE are the trace-time
-      switches of the function, the key of _compile.
+    * Every launch takes the shape at run time; FUSED, LENS, RANK, SEPARATE, SCALE_RULE and TRANSFORM are the
+      trace-time switches of the function, the key of _compile.
     * ut_q_p, ut_k_p: the addresses of the basis of the Q-residual term and of that of the K-residual term
       (basis_rows); with bases "shared" the one address, twice.
     * Basis launch (basis_kernel): the eigenproblems of the compensation basis, neig of them (none when the caller
       gave the basis), on the Gram matrices of the sampled q and k tokens; the other CTAs scan V for max|v - vbar|
       and, when the launch has room for it, run the V pass.
     * V pass (v_kernel, v_threads threads), otherwise.
-    * Q'/K' pass: rotation, body and compensation channels in NVFP4 (the scale of a body block by SCALE_RULE),
+    * Q'/K' pass: rotation, head and compensation channels in NVFP4 (the scale of a head block by SCALE_RULE),
       provisional block scales, group maxima.
     * Encode launch: group scales, the score-scale floor, score_scale, UE4M3 block scales.
+    * TRANSFORM = (equalize, center_k): with a switch the basis launch takes the statistics of the sampled rows,
+      solves for the basis of the transformed operands and writes the record of every (batch, head) at tr_p,
+      which the Q'/K' pass applies; video_p, video_mode: the video rows of k (basis._eig).
     * The host takes four output addresses of the V pass after score_scale_p; the first n_vout go to the kernels.
       k_image = (codes offset, scales offset, pitch): K' goes to tile images, at these offsets from k4_p and ksf_p
       and that many bytes apart; without a pitch to k4 and k_sf.
@@ -142,7 +148,9 @@ def make_host(
         gmax_p: Int64,
         prov_p: Int64,
         done_p: Int64,
+        tr_p: Int64,
         lens_p: Int64,
+        video_p: Int64,
         B: Int32,
         S: Int32,
         H: Int32,
@@ -161,6 +169,7 @@ def make_host(
         nv_cta: Int32,
         nenc_cta: Int32,
         rows_mode: Int32,
+        video_mode: Int32,
         weight_q: Float32,
         weight_k: Float32,
         stream: cuda.CUstream,
@@ -169,10 +178,15 @@ def make_host(
         RANK: cutlass.Constexpr,
         SEPARATE: cutlass.Constexpr,
         SCALE_RULE: cutlass.Constexpr,
+        TRANSFORM: cutlass.Constexpr,
     ):
         # LENS: the kernels read the lengths at lens_p in place and take the rows mode; otherwise both are None
         lens_p = lens_p if cutlass.const_expr(LENS) else None
         rows_mode = rows_mode if cutlass.const_expr(LENS) else None
+        # TRANSFORM: the kernels take the records and the video rows; otherwise None
+        tr_p = tr_p if cutlass.const_expr(any(TRANSFORM)) else None
+        video_p = video_p if cutlass.const_expr(any(TRANSFORM)) else None
+        video_mode = video_mode if cutlass.const_expr(any(TRANSFORM)) else None
         BH = B * H
         vout = (vo0_p, vo1_p, vo2_p, vo3_p)[:n_vout]
         k_codes, k_scales, k_pitch = k_image
@@ -207,6 +221,10 @@ def make_host(
             rows_mode,
             rank=RANK,
             separate=SEPARATE,
+            transform=TRANSFORM,
+            tr_p=tr_p,
+            video_p=video_p,
+            video_mode=video_mode,
         ).launch(grid=(neig + nspare, 1, 1), block=(EIG_THREADS, 1, 1), stream=stream)
         if cutlass.const_expr(not FUSED):
             v_kernel(v_p, vmax_p, *vout, S, H, VP, T, nspare, nv_items, nv_cta, lens_p).launch(
@@ -235,6 +253,8 @@ def make_host(
             rank=RANK,
             separate=SEPARATE,
             scale_rule=SCALE_RULE,
+            transform=TRANSFORM,
+            tr_p=tr_p,
         ).launch(grid=(nqk_cta, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
         encode_kernel(
             prov_p,
@@ -325,6 +345,13 @@ def scratch(B: int, S: int, H: int, nsm: int, rank: tuple[int, int], bases: str)
     }
 
 
+def transform_record(B: int, H: int, rank: tuple[int, int]) -> Layout:
+    """Return the buffer of the records of the transformations of Q and K (basis.TRANSFORM_*), the last of the
+    layout of a kernel package: one record per (batch, head) for a rank with compensation channels, which the
+    basis launch writes and the Q'/K' pass reads when a transformation is on."""
+    return {"transform": (torch.float32, (B, H, TRANSFORM_BYTES // 4 if max(rank) else 0))}
+
+
 def run(
     host: Callable,
     cache: dict,
@@ -337,6 +364,7 @@ def run(
     lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> None:
     """Run the launches of a chain on the current stream: raw BF16 q, k, v [B, S, H, 128] into the buffers of the call.
 
@@ -351,6 +379,7 @@ def run(
     * comp: the compensation of the call (inputs.Compensation).
     * scale_rule: the rule for the scale of an NVFP4 block of the head channels of Q' and K', one of
       constants.SCALE_RULES; a block of the compensation channels takes that of "max" under every rule.
+    * transforms: the transformations of Q and K (inputs.Transforms); its video rows are read in place.
     """
     B, S, H, _ = q.shape
     T = key_tiles(S)
@@ -358,7 +387,11 @@ def run(
     nsm = num_sms(dev)
     separate = comp.bases == "separate"
     grids = _grids(B, S, H, nsm, comp.rank, separate)
-    fn = _compile(host, cache, dev, grids.fused, lens is not None, comp.rank, separate, scale_rule)
+    transform = (transforms.equalize, transforms.center_k)
+    video = transforms.video_rows
+    fn = _compile(
+        host, cache, dev, grids.fused, lens is not None, comp.rank, separate, scale_rule, transform
+    )
     neig, rows, ut = grids.neig, (comp.rows_q, comp.rows_k), basis(buffers, comp.bases)
     if comp.basis is not None:
         neig, rows, ut = 0, (None, None), comp.basis
@@ -373,6 +406,7 @@ def run(
         hadamard(dev).data_ptr(),
         *(buffers[n].data_ptr() if n else 0 for n in host_buffers),
         lens.data_ptr() if lens is not None else 0,
+        video.data_ptr() if video is not None else 0,
         B,
         S,
         H,
@@ -390,6 +424,8 @@ def run(
         # the rows mode of the eigensolver, once per operand (q in bits 0..1, k in bits 2..3): 0 the mapped
         # default draw, 1 the caller's shared rows, 2 its rows per element
         0 if comp.map_rows or neig == 0 else rows[0].dim() | rows[1].dim() << 2,
+        # the video rows of k: 0 every row, 1 one count for the batch, 2 one per batch element
+        0 if video is None else 1 if video.numel() == 1 else 2,
         # weight_q and weight_k of one problem per (batch, head): 1 and 1 at gram_weight 0.5 (the two problems of
         # bases "separate" each take one Gram matrix alone)
         2.0 * comp.gram_weight,

@@ -46,14 +46,17 @@ attention(operands, out)                   # BF16 [B, S, H, 128] out
 | `rescale_thresholds(pv)` | The rescale thresholds that the attention of a PV format offers on the current GPU, the default first. |
 | `min_seq_len(pv)` | The shortest sequence of the kernel: one token, or 128 for `"fp8"` on `sm120`. |
 | `workspace_size(batch, seq_len, heads, device, pv, rank, *, bases)` | The bytes of workspace of a call, a small multiple of the bytes of `q`. |
-| `prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens, *, bases, gram_weight, basis, scale_rule)` | The operands of the attention, views into the workspace that hold until it is written again. |
+| `prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens, *, bases, gram_weight, basis, scale_rule, equalize, center_k, video_rows)` | The operands of the attention, views into the workspace that hold until it is written again. |
 | `attention(operands, out, *, rescale_threshold)` | `out`, written by the attention kernel. |
+| `video_rows(seq_len, device, token_tags, rank, tokens, *, rate, min_rows)` | The number of leading video rows of the draw of `sample_rows` with the same arguments, for `prepare(..., rows=sample_rows(...), center_k=True, video_rows=...)`. |
 | `sample_rows(seq_len, device, token_tags, rank, tokens, *, rate, min_rows)` | Basis rows for `prepare`: the default draw, or a draw of another rate or minimum, of tagged tokens or within given tokens. |
 
 `workspace_size` and `prepare` raise `ValueError` for a PV format or a rank that the GPU does not offer, for an
 unknown `bases` and for a sequence shorter than `min_seq_len(pv)`; `prepare` also for a `gram_weight` outside [0, 1],
-for any `gram_weight` with `bases="separate"` and for a `scale_rule` outside `SCALE_RULES`; `attention` for a
-rescale threshold that is not offered. A pair (`rank`, `rows`, `basis`) is a tuple or a list of two.
+for any `gram_weight` with `bases="separate"`, for a `scale_rule` outside `SCALE_RULES`, for `equalize` or
+`center_k` without compensation channels or with a caller's basis and for `video_rows` without `center_k` or
+without a caller's `rows`; `attention` for a rescale threshold that is not offered. A pair (`rank`, `rows`,
+`basis`) is a tuple or a list of two.
 
 - **Tensors.** `q`, `k`, `v` and `out` are BF16 tensors of one shape on one device, at 256-byte aligned addresses:
   every allocation is, and a view into one at an offset of a multiple of 128 elements. `out` is contiguous; `q`, `k`
@@ -64,10 +67,11 @@ rescale threshold that is not offered. A pair (`rank`, `rows`, `basis`) is a tup
   keep nothing between calls and a call writes every byte it reads, so one buffer serves calls of any shape that
   fits, in any order.
 - **Compilation.** Kernels compile on first use and are cached per device and key. A key holds what changes the
-  generated code: arguments of the call (the rank, the bases kind, the scale rule, the rescale threshold,
-  valid lengths and the form of their rows, a passed basis) and what a family derives from the shape and the SM
-  count. The Gram weight, the row counts and the values of a passed basis are run-time values. Every compilation
-  is logged with its key and time (logger `tensorrt_llm.logger`), and each family lists the parts of a key beside it.
+  generated code: arguments of the call (the rank, the bases kind, the scale rule, the transformations of Q and K,
+  the rescale threshold, valid lengths and the form of their rows, a passed basis) and what a family derives from
+  the shape and the SM count. The Gram weight, the row counts and the values of a passed basis are run-time
+  values. Every compilation is logged with its key and time (logger `tensorrt_llm.logger`), and each family lists the
+  parts of a key beside it.
 - **Reproducibility.** A call returns the same bits for the same inputs on one GPU, whatever the workspace held.
   On sm_100a and sm_103a the work units of a last partial wave of the attention (a unit is two 128-row query tiles
   of one head; the wave has fewer units than the GPU has SMs) are split into pieces of the key sequence over the
@@ -145,6 +149,23 @@ attention(operands, out, rescale_threshold=2.0)
   m / 6 under every rule. The operands, the workspace and the attention kernels are the same under every rule; the
   rule is part of the compile key of the preparation. `"band"` adds a test of every head value to the preparation,
   `"search"` a second quantization of the head channels.
+- **Channel equalization.** `equalize=True` multiplies channel c of Q by d_c and divides channel c of K by it, per
+  (batch, head) and before the rotation: d_c = sqrt(max |K_c| / max |Q_c|), the largest magnitudes over the basis
+  rows, Q with its score prescale. With exact d every score is unchanged; the kernels apply d and 1 / d as BF16
+  values, each the rounding of its own value, so the term of a channel in a score changes by a factor within
+  2^-7 of 1. A channel keeps d = 1 where a largest magnitude is zero, tiny or infinite, or where d would be
+  extreme (`EQUALIZE_MIN_MAGNITUDE`, `EQUALIZE_MAX_FACTOR`, `constants.py`); a NaN among the basis rows is left out
+  of the largest magnitudes.
+- **K centering.** `center_k=True` subtracts from K, per (batch, head), its mean over the video rows among the basis
+  rows of K: the scores of a query move by one constant, and its attention is unchanged. `video_rows` is the number
+  of leading basis rows of K that are video rows, an int32 tensor [1] (rows [m]) or [B] (rows [B, m]) on the
+  device, which the kernels read in place and clamp to the rows: `video_rows(...)` returns it for the draw of
+  `sample_rows(...)` with the same arguments. None counts every row; a head without a video row is not centered.
+  A channel with a NaN or an infinity among those rows is not centered either.
+- **Both transformations** are off by default. With both, K is centered first and its largest magnitudes are those
+  of the centered rows; the compensation basis is that of the transformed operands. They take their statistics in
+  the eigensolver launch of the call, so they need compensation channels and no caller's basis, and they are part of the
+  compile key of the preparation.
 - **Rescale threshold.** `attention(..., rescale_threshold=T)` takes one of `rescale_thresholds(pv)`: the running
   maximum of a row, its anchor, moves, and the output is rescaled, only when a key tile exceeds it by more than T
   binades (default 4). T trades the reach of P below the anchor against rescales: a lower value keeps weights
@@ -187,12 +208,26 @@ residual of one operand, projected on the directions of its term, against the pr
 The QK is then one block-scaled NVFP4 product over 192 channels (256 above 64 compensation channels).
 
 The attention runs the online softmax over tiles of 128 keys. It forms P without an exponential instruction: a fused
-multiply-add puts the scaled score on the subnormal grid of FP32, and a hardware conversion rounds it to E4M3 or
-E2M1. The running maximum of a row moves, and the output is rescaled, only when a tile exceeds it by more than T
-binades (4 by default). The E4M3 codes of P hold weights down to 2^-(18 - T) of the row's anchor, 2^-14 at the
-default T; a smaller weight rounds to zero and leaves the row sum with it, so a row whose mass lies in thousands of
-keys that far below its maximum loses that mass. V smoothing subtracts from V its means over blocks of keys before
-the cast and adds them back weighted by the block sums of P.
+multiply-add puts the scaled score on the subnormal grid of FP32, and a hardware conversion rounds it to E4M3 or E2M1.
+The multiply-add carries a reference of the scores in its offset (the anchor of the row; with NVFP4 PV on `sm120` the
+largest score of the block of 16 keys), which FP32 holds on that grid only up to a magnitude of the reference; beyond
+it the scores have the reference subtracted first, so P is right for scores of any finite size. The switch is at an
+anchor of 2^16 log2 units (`sm120`, FP8 PV), of 7900 log2 units or a score scale above 1/16 (`sm120`, NVFP4 PV) and of
+2^27 log2 units (`tcgen05`), where a call whose score scale is 2^-3 or more runs every step of its tiles that way. The
+running maximum of a row moves, and the output is rescaled, only when a tile exceeds it by more than T binades (4 by
+default). The E4M3 codes of P hold weights down to 2^-(18 - T) of the row's anchor, 2^-14 at the default T; a smaller
+weight rounds to zero and leaves the row sum with it, so a row whose mass lies in thousands of keys that far below its
+maximum loses that mass. V smoothing subtracts from V its means over blocks of keys before the cast and adds them back
+weighted by the block sums of P.
+
+The operands of a call share their scales. The block scales of Q' and of K', one per token and 16 channels, are stored
+as UE4M3 values under one power-of-two scale per tensor and scale group of the call (the head channels and the
+channels of each compensation term). The codes of V lie under one power-of-two scale of the call as well: E4M3 codes
+with FP8 PV, and with NVFP4 PV E2M1 codes with one UE4M3 scale per channel and 16 keys. A head, a token or a batch
+element whose Q, K or V lies about 2^14 or more below the largest values of that tensor in the call loses precision,
+and from about 2^17 below them it is not resolved. The inputs are expected to be finite: an infinity in Q, K or V
+takes the scale of its tensor, so no row of the call is finite; a NaN in V reaches the rows of its head, and a NaN in
+Q or K is not carried to the output.
 
 ## Layout
 
@@ -200,8 +235,10 @@ the cast and adds them back weighted by the block sums of P.
 tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/deco_attention/
   api.py          workspace_size, prepare, attention and the queries of the GPU: argument checks, defaults,
                   dispatch to the family
-  inputs.py       the rank argument, the sampled tokens of the compensation bases and the Hadamard rotation
-  constants.py    head dimension, QK channels and blocks, bases, rescale threshold, score prescale
+  inputs.py       the rank argument, the sampled tokens of the compensation bases and their video rows, the
+                  Hadamard rotation, the records of a call for a family (compensation, transformations)
+  constants.py    head dimension, QK channels and blocks, bases, scale rules, equalization limits, rescale
+                  threshold, score prescale
   target.py       compile target and the hardware capabilities the kernels branch on
   runtime.py      the buffers of a call in the workspace, pointers, the current stream, the compile cache
   common/         what both families use: inline PTX and its emitter (ptx.py), DSL primitive imports (dsl.py),
@@ -221,8 +258,9 @@ tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/deco_attention/
 
 - A family package exports `DEFAULT_PV`, `pv_formats`, `max_comp_channels`, `min_seq_len`, `workspace_size`,
   `prepare`, `attention` and `basis`, takes resolved arguments from `api.py` (the compensation of a call as one
-  record, `inputs.Compensation`) and dispatches on the PV format to a kernel package. Its `layout` lists the
-  buffers of a call in their order in the workspace; `workspace_size` and `prepare` share it.
+  record, `inputs.Compensation`, the scale rule, and the transformations as `inputs.Transforms`) and dispatches
+  on the PV format to a kernel package. Its `layout` lists the buffers of a call in their order in the
+  workspace; `workspace_size` and `prepare` share it.
 - The module docstrings describe the schedule of each kernel and the passes of its preparation. A long kernel body
   is a sequence of named steps that share a `State` object (`common/state.py`).
 - Inline PTX is in `common/ptx.py`, `tcgen05/ptx.py` and `sm120/ptx/` only: operations the DSL does not offer in

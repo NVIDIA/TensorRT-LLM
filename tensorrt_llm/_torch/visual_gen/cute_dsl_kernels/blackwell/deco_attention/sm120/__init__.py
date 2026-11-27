@@ -49,7 +49,7 @@ import functools
 import torch
 
 from ..constants import COMP_CHANNELS, KEY_TILE
-from ..inputs import Compensation
+from ..inputs import Compensation, Transforms
 from ..runtime import Basis, Layout, carve, check_caller_basis, num_sms, workspace_bytes
 from . import fp8pv, nvfp4pv
 from .prep import chain
@@ -112,12 +112,14 @@ def prepare(
     valid_seq_lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> dict[str, torch.Tensor]:
     """Return the buffers of the call (name -> tensor, views into the workspace), filled from raw BF16 q, k, v.
 
     * valid_seq_lens: batch element b attends its first valid_seq_lens[b] keys; its later query rows are zero in o.
     * comp: the compensation of the call (prep.chain.run).
     * scale_rule: the rule for the scale of a head block of Q' and K' (prep.chain.run).
+    * transforms: the transformations of Q and K (prep.chain.run).
     * A caller's basis has the directions of the basis of these buffers, and one that overlaps the bytes of the
       call in the workspace is that basis (runtime.check_caller_basis); the kernels read it in place.
     """
@@ -127,7 +129,7 @@ def prepare(
     buffers = carve(workspace, layout)
     if comp.basis is not None:
         check_caller_basis(comp.basis, chain.basis(buffers, comp.bases), workspace, layout)
-    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp, scale_rule)
+    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp, scale_rule, transforms)
     return buffers
 
 

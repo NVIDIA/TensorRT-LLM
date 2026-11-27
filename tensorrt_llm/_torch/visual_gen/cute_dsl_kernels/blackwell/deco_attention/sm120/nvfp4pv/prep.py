@@ -20,7 +20,7 @@ their scales and the means go to the tile images of the attention (layout.py).
 
 import torch
 
-from ...inputs import Compensation
+from ...inputs import Compensation, Transforms
 from ..prep import chain
 from .layout import SK_OFF, SKSF_OFF, STAGE
 from .softmax import MIN_SCORE_LOG2
@@ -45,12 +45,15 @@ _HOST_BUFFERS = (
     "gmax",
     "prov",
     "done",
+    "transform",
 )
 
 
 # the scratch of the chain at a shape on a device of nsm SMs for a rank and a bases kind, name -> (dtype, shape):
 # that of both chains
 scratch = chain.scratch
+# the records of the transformations of Q and K, the last buffer of a layout
+transform_record = chain.transform_record
 
 
 def run(
@@ -61,12 +64,24 @@ def run(
     lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> None:
     """Fill the operands of the attention kernel from raw BF16 q, k, v [B, S, H, 128], in the buffers of the call.
 
     * Q' (q4, q_sf), score_scale (floored at 2^MIN_SCORE_LOG2), K', V' and the means (img, v4_scale).
-    * lens, comp, scale_rule: as in chain.run.
+    * lens, comp, scale_rule, transforms: as in chain.run.
     """
     chain.run(
-        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, buffers, lens, comp, scale_rule
+        _host,
+        _compiled,
+        _HOST_BUFFERS,
+        MIN_SCORE_LOG2,
+        q,
+        k,
+        v,
+        buffers,
+        lens,
+        comp,
+        scale_rule,
+        transforms,
     )

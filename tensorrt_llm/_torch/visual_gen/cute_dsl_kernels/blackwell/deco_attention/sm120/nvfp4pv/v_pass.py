@@ -278,10 +278,15 @@ def basis_kernel(
     *,
     rank: cutlass.Constexpr,
     separate: cutlass.Constexpr,
+    transform: cutlass.Constexpr = (False, False),
+    tr_p=None,
+    video_p=None,
+    video_mode=None,
 ):
     """The basis launch of the NVFP4-PV kernel: basis_cta with the scan and the pass of V'. ut_q_p, ut_k_p,
     those from rows_q_p to weight_k, rows_mode, rank and separate: the arguments of its eigenproblems. lens_p,
-    rows_mode: None, or the global address of the valid prefix lengths and the rows mode of the eigensolver."""
+    rows_mode: None, or the global address of the valid prefix lengths and the rows mode of the eigensolver.
+    transform, tr_p, video_p, video_mode: the transformations of Q and K (basis._eig)."""
     basis_cta(
         q_p,
         k_p,
@@ -320,6 +325,7 @@ def basis_kernel(
         lens_p,
         rank,
         separate,
+        (transform, tr_p, video_p, video_mode) if cutlass.const_expr(any(transform)) else None,
     )
 
 

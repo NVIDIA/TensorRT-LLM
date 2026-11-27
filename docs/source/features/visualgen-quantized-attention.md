@@ -356,7 +356,7 @@ attention_config:
 - **Padding.** A self-attention call marks its tokens with `key_padding_mask` (`[B, S]`, true for a token). Padded rows get no attention weight, whatever they hold, and return zeros. The tokens of every sample come first and its padding after them (`requires_trailing_padding`): the backend reads the mask as the count of tokens of every sample, on the kernels and on `VANILLA` alike, so a mask with padding between tokens is attended as if those tokens came first. Samples of a batch may hold different numbers of tokens. MiniMax-H3 rejects a packed sequence with padding between its tokens under this recipe.
 - **Joint sequences.** A model whose sequence packs text or audio tokens with the video tokens passes the modality of every position (`token_tags`). Half of the sampled tokens then come from the text and audio tokens, for every sample from its own tokens; without tags the sample is uniform.
 - **Fixed options.** The recipe sets its scaling granularity and smooths V itself with fixed parameters, so `DeCoAttentionConfig` has no block size, `smooth_k`, `smooth_v` or VC-Attention fields. It does not compose with sparse attention (see [Interaction With Other Features](#interaction-with-other-features)).
-- **CUDA graphs.** The kernels are JIT-compiled on first use and keep no state between calls. A capture follows one eager call with the same shape and arguments: that call compiles the kernels of the call and builds the sampled rows and the rotation matrix, and a first use of any of them under capture raises a `RuntimeError`. The CUDA graph runner's warm-up is that call. The channels of the two terms, the bases kind, the scale rule, one or two sets of sampled tokens, the presence of a mask and the shape of a call each select kernel variants. Every kernel compilation is logged with its key and its time. The token counts and the sampled tokens of a call are computed on the device, so a captured call follows the content of its mask and tags tensors on replay.
+- **CUDA graphs.** The kernels are JIT-compiled on first use and keep no state between calls. A capture follows one eager call with the same shape and arguments: that call compiles the kernels of the call and builds the sampled rows and the rotation matrix, and a first use of any of them under capture raises a `RuntimeError`. The CUDA graph runner's warm-up is that call. The channels of the two terms, the bases kind, the scale rule, the transformations of Q and K, one or two sets of sampled tokens, the presence of a mask and the shape of a call each select kernel variants. Every kernel compilation is logged with its key and its time. The token counts and the sampled tokens of a call are computed on the device, so a captured call follows the content of its mask and tags tensors on replay.
 
 **Fields.** `DeCoAttentionConfig`, selected by `algorithm: deco_attention`. `algorithm` alone runs the defaults.
 
@@ -373,6 +373,8 @@ attention_config:
 | `k_sample_rate` | float in `(0, 1]` | `0.00390625` (1/256) | Fraction of the tokens of the sequence, padding included, whose K rows estimate the Gram matrix of K. With a rate that gives another count of sampled tokens than `q_sample_rate`, Q and K are sampled on token sets of their own. |
 | `min_sample_rows` | int ≥ 1 or null | null | Fewest sampled tokens per Gram matrix, whatever the rate gives. Null is twice the channels of the larger term, at least 64. |
 | `scale_rule` | `"max" \| "band" \| "search"` | `"band"` | Rule for the scale of an NVFP4 block of the head channels of Q and K, the 128 rotated channels of each. |
+| `equalize` | bool | `false` | Channel equalization: per head, channel c of Q is multiplied and channel c of K divided by one factor. Needs compensation channels. |
+| `center_k` | bool | `false` | K centering: per head, K minus its mean over the sampled video tokens. Needs compensation channels. |
 
 The two terms share the compensation channels that the kernels of the GPU offer:
 
@@ -385,6 +387,9 @@ The two terms share the compensation channels that the kernels of the GPU offer:
 - **Bases.** The directions of a term decide which part of the rounding residual it carries. `shared` with `gram_weight: 0.5` treats Q and K alike; another weight moves the shared directions towards the operand with the larger weight.
 - **Sampling.** The Gram matrices are estimated on sampled tokens. A higher rate or a larger minimum estimates them on more tokens and lengthens the preparation. In YAML a rate is a decimal number, such as `0.015625` for 1/64. Under a key padding mask every sample draws from its own tokens, and with token tags half of the draw comes from the text and audio tokens.
 - **Scale rule.** An NVFP4 block of 16 values has one scale, and `scale_rule` chooses it for the blocks of the head channels. With m the largest magnitude of the block, `max` takes m / 6, which puts the largest magnitude on the largest code. `band` takes m / 4 where a value of the block has 0.76 m ≤ |x| < 0.85 m, and m / 6 otherwise: a value in that band lies between two codes of the scale m / 6 and near a code of the scale m / 4. `search` quantizes the block with both scales and keeps the one with the smaller squared rounding error. `band` adds a test of every head value to the preparation, `search` a second quantization of the head channels. The compensation terms take the residual of the kept scale, and a block of the compensation channels takes m / 6 under every rule.
+- **Channel equalization.** `equalize` multiplies channel c of Q by a factor and divides channel c of K by it, per head and before the rotation. The factor is the square root of the ratio of the largest magnitudes of the channel in K and in Q over the sampled tokens, so the two operands of a channel reach the quantizer at the same magnitude. With exact factors every score is unchanged; the kernels apply the factor and its inverse as bfloat16 values.
+- **K centering.** `center_k` subtracts from K, per head, its mean over the sampled video tokens. The scores of a query move by one constant, which leaves its attention unchanged, and the quantizer no longer spends its range on what every key shares. With token tags the mean is that of the video tokens of the draw; without them every sampled token counts.
+- **Both transformations** are off by default and take their statistics from the tokens sampled for the compensation bases, so they need compensation channels: the config rejects either with `q_channels: 0` and `k_channels: 0`. Their statistics are those of the sampled tokens, so they need a larger sample than the default to pay off: for MiniMax-H3, `equalize: true` and `center_k: true` with `q_sample_rate: 0.03125`, `k_sample_rate: 0.03125` and `min_sample_rows: 1024` lower the kernel-level error of its hard layers by about a quarter and raise its end-to-end fidelity for well under 1 % more denoising time, while with the default sample they do not change it end to end. `center_k` raises the kernel-level error on HunyuanVideo 1.5 by a few percent.
 
 **Configuration.**
 
@@ -418,6 +423,20 @@ attention_config:
 ```
 
 The example spells out the defaults of SM100, SM103 and SM120; `algorithm: deco_attention` alone selects the defaults of the GPU. For NVFP4 PV, set `v_dtype` to `nvfp4`.
+
+For MiniMax-H3, both transformations with the larger sample:
+
+```yaml
+attention_config:
+  backend: CUTEDSL
+  quant_attention_config:
+    algorithm: deco_attention
+    equalize: true
+    center_k: true
+    q_sample_rate: 0.03125
+    k_sample_rate: 0.03125
+    min_sample_rows: 1024
+```
 
 ## Interaction With Other Features
 

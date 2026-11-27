@@ -474,6 +474,75 @@ def test_deco_scale_rules_follow_the_scores(require_deco_kernels, deco_recipe) -
     assert not any(torch.equal(a, b) for a, b in itertools.combinations(outs, 2))
 
 
+def test_deco_center_k_removes_what_the_keys_share(require_deco_kernels, deco_recipe) -> None:
+    """One vector added to K on every token moves the scores of a query by one constant and
+    leaves the attention unchanged. With ``center_k`` the error against FP32 SDPA on such keys
+    is less than half of the error without it."""
+    device = require_deco_kernels()
+    num_heads = 2
+    q, k, v = _random_qkv(1, 1024, num_heads, device, q_scale=4.0)
+    gen = torch.Generator(device=device).manual_seed(3)
+    shared = 4.0 * torch.randn((1, 1, num_heads, HEAD_DIM), generator=gen, device=device)
+    k = (k.float() + shared).bfloat16()
+    ref = _sdpa(q, k, v)
+    assert _relative_error(_sdpa(q, k.float() - shared, v), ref) < 1e-3
+
+    errors = [
+        _relative_error(_backend(num_heads, deco_recipe(center_k=on)).forward(q, k, v), ref)
+        for on in (False, True)
+    ]
+
+    assert errors[1] < 0.5 * errors[0], errors
+
+
+def test_deco_equalize_balances_the_channels_of_q_and_k(require_deco_kernels, deco_recipe) -> None:
+    """A power of two that divides a channel of Q and multiplies the same channel of K leaves
+    every score unchanged. With ``equalize`` the error against FP32 SDPA on such operands is
+    less than half of the error without it."""
+    device = require_deco_kernels()
+    num_heads = 2
+    q, k, v = _random_qkv(1, 1024, num_heads, device, q_scale=4.0)
+    ref = _sdpa(q, k, v)
+    factors = torch.ones(HEAD_DIM, device=device)
+    factors[::8] = 16.0
+    q, k = (q.float() / factors).bfloat16(), (k.float() * factors).bfloat16()
+    assert _relative_error(_sdpa(q, k, v), ref) < 1e-6
+
+    errors = [
+        _relative_error(_backend(num_heads, deco_recipe(equalize=on)).forward(q, k, v), ref)
+        for on in (False, True)
+    ]
+
+    assert errors[1] < 0.5 * errors[0], errors
+
+
+def test_deco_center_k_takes_the_video_tokens_of_the_draw(
+    require_deco_kernels, deco_recipe, kernel_inputs: list
+) -> None:
+    """With token tags ``center_k`` takes the mean of K over the video tokens among the sampled
+    tokens: the backend passes the kernels the count of the leading video rows of its draw. The
+    output is that of the kernels with that count, and differs from their output when every
+    sampled row counts, for text keys that carry another mean than the video keys."""
+    device = require_deco_kernels()
+    seq_len, num_heads, num_text = 2048, 2, 512
+    q, k, v = _random_qkv(1, seq_len, num_heads, device, q_scale=4.0)
+    gen = torch.Generator(device=device).manual_seed(3)
+    text_mean = torch.randn((1, 1, num_heads, HEAD_DIM), generator=gen, device=device)
+    k[:, -num_text:] = (k[:, -num_text:].float() + text_mean).bfloat16()
+    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    token_tags[-num_text:] = 1
+
+    out = _backend(num_heads, deco_recipe(center_k=True)).forward(q, k, v, token_tags=token_tags)
+
+    assert torch.isfinite(out).all()
+    rows = kernel_inputs[-1][0]
+    rank = deco_attention.max_comp_channels() // 2
+    video_rows = deco_attention.video_rows(seq_len, device, token_tags, rank, rate=1 / 256)
+    assert 0 < int(video_rows) < rows.numel()
+    assert torch.equal(out, _kernels(q, k, v, rows=rows, center_k=True, video_rows=video_rows))
+    assert not torch.equal(out, _kernels(q, k, v, rows=rows, center_k=True))
+
+
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_sample_rates_and_minimum_set_the_basis_rows(
     require_deco_kernels, deco_recipe, kernel_inputs: list, v_dtype: str
@@ -817,6 +886,24 @@ def test_deco_constant_v_comes_back_as_the_constant(require_deco_kernels, v_dtyp
         out = _kernels(q, k, v, v_dtype)
         assert torch.isfinite(out).all()
         torch.testing.assert_close(out, v, rtol=2e-2, atol=0)
+
+
+def test_deco_very_large_score_takes_the_whole_row(require_deco_kernels, deco_recipe) -> None:
+    """One key whose scores are about 2^30 log2 units takes the whole weight of the queries it
+    scores highest for: the output is finite, and those rows are the V row of that key within
+    the rounding of the V format."""
+    device = require_deco_kernels()
+    num_heads, key = 2, 300
+    q, k, v = _random_qkv(1, 1024, num_heads, device)
+    k[:, key] = (k[:, key].float() * 2.0**28).bfloat16()
+    scores = torch.einsum("bqhd,bhd->bqh", q.float(), k[:, key].float())
+
+    out = _backend(num_heads, deco_recipe()).forward(q, k, v)
+
+    assert torch.isfinite(out).all()
+    sees_key = scores > 0.5 * scores.amax(dim=1, keepdim=True)
+    v_row = v[:, key].float()[:, None].expand_as(out)
+    assert _relative_error(out[sees_key], v_row[sees_key]) < 0.05
 
 
 def test_deco_call_leaves_no_workspace_behind(require_deco_kernels, deco_recipe) -> None:
@@ -1308,20 +1395,25 @@ def test_deco_token_tags_with_a_key_padding_mask(
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 @pytest.mark.parametrize(
-    "sampling",
-    [dict(), dict(q_sample_rate=0.0078125, k_sample_rate=0.00390625, min_sample_rows=512)],
-    ids=["default_sampling", "one_count_for_two_rates"],
+    "fields",
+    [
+        dict(),
+        dict(q_sample_rate=0.0078125, k_sample_rate=0.00390625, min_sample_rows=512),
+        dict(equalize=True, center_k=True),
+    ],
+    ids=["default_sampling", "one_count_for_two_rates", "both_transformations"],
 )
 def test_deco_cuda_graph_with_a_key_padding_mask(
-    require_deco_kernels, deco_recipe, kernel_inputs: list, v_dtype: str, sampling: dict
+    require_deco_kernels, deco_recipe, kernel_inputs: list, v_dtype: str, fields: dict
 ) -> None:
     """A captured forward with a mask and token tags computes its token counts and basis rows
     inside the graph: a replay follows the content of the mask and tags tensors of the capture,
     which the eager forward before it has not seen. Two sample rates that give one count of
-    rows for the sequence draw one set of rows, in the eager forward and in the capture alike."""
+    rows for the sequence draw one set of rows, in the eager forward and in the capture alike.
+    With both transformations the capture also holds the count of the video rows of the draw."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads = 2, 2048, 2
-    attn = _backend(num_heads, deco_recipe(v_dtype, **sampling))
+    attn = _backend(num_heads, deco_recipe(v_dtype, **fields))
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
     token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
     token_tags[1800:] = 1

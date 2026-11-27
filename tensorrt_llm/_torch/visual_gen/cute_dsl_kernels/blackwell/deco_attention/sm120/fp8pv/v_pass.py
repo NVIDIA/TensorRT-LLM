@@ -251,9 +251,14 @@ def basis_kernel(
     *,
     rank: cutlass.Constexpr,
     separate: cutlass.Constexpr,
+    transform: cutlass.Constexpr = (False, False),
+    tr_p=None,
+    video_p=None,
+    video_mode=None,
 ):
     """Run the basis launch of the FP8-PV kernel: basis_cta with the scan and the pass of the smoothed V. ut_q_p,
-    ut_k_p, those from rows_q_p to weight_k, rows_mode, rank and separate: the arguments of its eigenproblems."""
+    ut_k_p, those from rows_q_p to weight_k, rows_mode, rank and separate: the arguments of its eigenproblems.
+    transform, tr_p, video_p, video_mode: the transformations of Q and K (basis._eig)."""
     basis_cta(
         q_p,
         k_p,
@@ -279,6 +284,7 @@ def basis_kernel(
         lens_p,
         rank,
         separate,
+        (transform, tr_p, video_p, video_mode) if cutlass.const_expr(any(transform)) else None,
     )
 
 

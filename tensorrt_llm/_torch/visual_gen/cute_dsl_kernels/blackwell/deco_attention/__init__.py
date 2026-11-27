@@ -26,7 +26,7 @@ from .api import (
     token_rows,
     workspace_size,
 )
-from .inputs import sample_rows
+from .inputs import sample_rows, video_rows
 
 __all__ = [
     "TENSOR_ALIGNMENT",
@@ -38,5 +38,6 @@ __all__ = [
     "rescale_thresholds",
     "sample_rows",
     "token_rows",
+    "video_rows",
     "workspace_size",
 ]

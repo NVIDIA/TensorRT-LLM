@@ -30,7 +30,7 @@ The kernel takes sequences of at least one key tile (128 tokens).
 import torch
 
 from ...constants import HEAD_DIM, QK_ROW_BYTES, QK_SCALE_ATOMS, key_tiles
-from ...inputs import Compensation
+from ...inputs import Compensation, Transforms
 from ...runtime import Layout
 from . import launch, prep
 
@@ -45,6 +45,8 @@ def layout(b: int, s: int, h: int, nsm: int, rank: tuple[int, int], bases: str) 
         v_mean                  BF16, one row per 16 keys (a tile's mean in all 8 of its rows), divided by v8_scale
         score_scale, v8_scale   one float32 each
         v_flags                 one int32 per key tile: a NaN in v8 or a non-finite v_mean
+        transform               the records of the transformations of Q and K (prep.transform_record), behind
+                                the scratch
     """
     tiles = key_tiles(s)
     return {
@@ -59,6 +61,7 @@ def layout(b: int, s: int, h: int, nsm: int, rank: tuple[int, int], bases: str) 
         "v_flags": (torch.int32, (b, h, tiles)),
         **prep.scratch(b, s, h, nsm, rank, bases),
         **launch.scratch(b, s, h, nsm),
+        **prep.transform_record(b, h, rank),
     }
 
 
@@ -70,12 +73,13 @@ def prepare(
     lens: torch.Tensor | None,
     comp: Compensation,
     scale_rule: str,
+    transforms: Transforms,
 ) -> None:
     """Run the preparation of this kernel (prep.run) on the buffers of a call, which may hold anything on entry."""
     # the four words of the basis launch must be zero when it starts; the V pass sets the flags of its tiles
     buffers["done"].zero_()
     buffers["v_flags"].zero_()
-    prep.run(q, k, v, buffers, lens, comp, scale_rule)
+    prep.run(q, k, v, buffers, lens, comp, scale_rule, transforms)
 
 
 def attention(

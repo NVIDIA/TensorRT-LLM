@@ -162,6 +162,7 @@ class DeCoAttentionConfig(BaseQuantAttentionConfig):
       ``min_sample_rows``).
     * Quantizer of Q/K: the rule for the scale of an NVFP4 block of the head channels
       (``scale_rule``).
+    * Transformations of Q and K before quantization (``equalize``, ``center_k``).
     * The recipe sets its scaling granularity and smooths V itself: it has no block size,
       smoothing or VC-Attention options.
     """
@@ -271,6 +272,25 @@ class DeCoAttentionConfig(BaseQuantAttentionConfig):
             "every rule."
         ),
     )
+    equalize: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Channel equalization: per head, channel c of Q is multiplied and channel c of K "
+            "divided by one factor, taken from the largest magnitudes of the channel over the "
+            "sampled tokens. With exact factors every score is unchanged. Needs compensation "
+            "channels."
+        ),
+    )
+    center_k: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "K centering: per head, K minus its mean over the sampled video tokens. The scores "
+            "of a query move by one constant, and its attention is unchanged. Needs "
+            "compensation channels."
+        ),
+    )
 
     @model_serializer(mode="wrap")
     def _serialize_with_algorithm(self, handler: SerializerFunctionWrapHandler) -> Dict[str, Any]:
@@ -290,6 +310,14 @@ class DeCoAttentionConfig(BaseQuantAttentionConfig):
                 "gram_weight weighs the Gram matrices of basis='shared' and does not apply to "
                 f"basis='separate', got gram_weight={self.gram_weight}."
             )
+        if self.q_channels == 0 and self.k_channels == 0:
+            for name in ("equalize", "center_k"):
+                if getattr(self, name):
+                    raise ValueError(
+                        f"{name} takes its statistics from the tokens sampled for the "
+                        "compensation bases and needs compensation channels, got q_channels=0 "
+                        "and k_channels=0."
+                    )
         return self
 
 

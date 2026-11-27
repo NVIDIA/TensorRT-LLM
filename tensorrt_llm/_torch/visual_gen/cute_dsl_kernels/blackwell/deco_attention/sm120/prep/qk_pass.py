@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Q'/K' pass of the sm_120 preparation: rotation, NVFP4 body and compensation channels, per 16-token warp tile.
+"""Q'/K' pass of the sm_120 preparation: rotation, NVFP4 head and compensation channels, per 16-token warp tile.
 
-* Per tile: the Hadamard rotation, NVFP4 of the 8 body blocks, the projections of q1 (the dequantized body) and dq
+* Per tile: the Hadamard rotation, NVFP4 of the 8 head blocks, the projections of q1 (the dequantized body) and dq
   (its quantization residual) on the compensation basis (their A fragments come from the accumulators of the
   rotation), NVFP4 of the compensation blocks.
-* Block scale (_quant_block): a body block takes it by the scale rule of the call (constants.SCALE_RULES), and q1
+* Block scale (_quant_block): a head block takes it by the scale rule of the call (constants.SCALE_RULES), and q1
   and dq are those of the scale it takes; a compensation block takes that of "max".
 * Compensation channels, rank = (r_q, r_k) directions: the blocks of the Q-residual term (Q: dq B_q, K: k1 B_q),
   the blocks of the K-residual term (Q: q1 B_k, K: dk B_k), then zero blocks up to COMP_CHANNELS. B_q and B_k
@@ -25,7 +25,12 @@
   with bases "shared", of a basis of its own with "separate".
 * Projections: on the min(r_q, r_k) leading directions of both terms the body and the residual are each projected,
   and the two results change places with the side; the further directions of the wider term take one projection, of
-  the operand that the term has on the side of the tile. One MMA per 8 directions of a term and body block.
+  the operand that the term has on the side of the tile. One MMA per 8 directions of a term and head block.
+* Transformations of Q and K (prepare: equalize, center_k; the record of a (batch, head) that its eigenproblem
+  wrote, basis.TRANSFORM_*): with equalize the rotation of a tile is Hd with input channel c times d_c on a Q tile
+  and times 1 / d_c on a K tile, staged per (batch, head) and side as the directions are (_stage_rotation); with
+  center_k the rotated values of a K tile take off the center of their channels on the rows that hold a token
+  (_centered).
 * Outputs: codes through a per-warp smem stage, provisional (unencoded) block scales as BF16 in the final atom
   layout, per-CTA group maxima (the encode launch turns them into the group scales and the UE4M3 bytes).
 * A fragments come straight from 8-byte global loads: k-step a (16 channels 16a..16a+15) maps logical k = 2t + e to
@@ -41,7 +46,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint16, Uint32
 from cutlass.utils import SmemAllocator
 
-from ...common.expmath import bf16x2, f2u, round_m3, warp_max
+from ...common.expmath import bf16x2, f2u, round_m3, u2f, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
 from ...constants import (
     COMP_CHANNELS,
@@ -61,7 +66,14 @@ from ..ptx.shared import (
     st_global_b32_v2_hint,
 )
 from ..valid_len import valid_len
-from .basis import row_addr, tok_addr
+from .basis import (
+    TRANSFORM_BYTES,
+    TRANSFORM_CENTER,
+    TRANSFORM_D,
+    TRANSFORM_INV_D,
+    row_addr,
+    tok_addr,
+)
 
 QK_THREADS = 256
 # block scales of a key tile of Q' or K': one per token and 16 channels, in the atom layout of the QK MMA
@@ -96,6 +108,33 @@ def _hd_fragment(hdt, stage_row, j, s, t):
     return load_vector(
         sptr(Uint32, hdt + stage_row * 256 + ((4 * s + t) ^ ((j & 3) << 2)) * 8, 8), 2
     )
+
+
+def _stage_rotation(hdt, had_p, c, j0, row0, factor):
+    """Store Hd[c][j0 .. j0 + 7] times a factor in the Hd^T stage whose row j - row0 holds output channel j
+    (_hd_slot). factor: the bits of a BF16, in the low half of a word; the products are rounded to BF16."""
+    w = load_invariant(Uint32, had_p + Int64(c * 128 + j0) * 2, 4)
+    f = u2f(factor << Uint32(16))
+    for i in range(4):
+        pair = bf16x2(u2f(w[i] << Uint32(16)) * f, u2f(w[i] & Uint32(0xFFFF0000)) * f)
+        for e in range(2):
+            j = j0 + 2 * i + e
+            cute.arch.store(_hd_slot(hdt, j - row0, c, j), (pair >> Uint32(16 * e)).to(Uint16))
+
+
+def _centered(x, cen, bo, t, on_row):
+    """Return x[0..7] of head block bo (n-tile 0 c0..c3, n-tile 1 c0..c3) minus the center of their output
+    channels, FP32 [128] at the shared address cen, on the rows that hold a token (on_row: whether rows g and
+    g + 8 do)."""
+    out = []
+    for n in range(2):
+        c2 = load_vector(sptr(Float32, cen + (16 * bo + 8 * n + 2 * t) * 4, 8), 2)
+        out += [
+            x[4 * n + 2 * hh + e] - Float32(cutlass.select_(on_row[hh], c2[e], Float32(0.0)))
+            for hh in range(2)
+            for e in range(2)
+        ]
+    return out
 
 
 @cute.jit
@@ -203,7 +242,7 @@ def _stage_rows(rank, separate):
 
 
 def _body_block(bo, x, side, proj, uts, stg, sst, g, t, rule):
-    """Quantize and emit body block bo and accumulate its projections; return the larger of its two block scales.
+    """Quantize and emit head block bo and accumulate its projections; return the larger of its two block scales.
 
     * A trace-time helper. x[0..7]: n-tile 0 c0..c3, n-tile 1 c0..c3. rule: that of _quant_block.
     * proj = (body, residual, further), each (accumulators, directions, first row in the U stage).
@@ -338,6 +377,8 @@ def qk_kernel(
     rank: cutlass.Constexpr,
     separate: cutlass.Constexpr,
     scale_rule: cutlass.Constexpr,
+    transform: cutlass.Constexpr = (False, False),
+    tr_p=None,
 ):
     """Run the Q'/K' pass of the CTA's share of the nitems items (side, batch, head, tile).
 
@@ -347,11 +388,14 @@ def qk_kernel(
       without a valid token is left as it is.
     * tile_pitch: None, or K' goes to tile images.
     * rank, separate: the channels of the two compensation terms and whether each has a basis of its own.
-    * scale_rule: the rule for the scale of a body block, one of constants.SCALE_RULES (_quant_block); a
+    * scale_rule: the rule for the scale of a head block, one of constants.SCALE_RULES (_quant_block); a
       compensation block takes that of "max".
     * ut_q_p, ut_k_p: the basis of the Q-residual term and that of the K-residual term, FP32
       [B H][directions][128] with the leading direction last; with bases "shared" the one address, twice.
+    * transform = (equalize, center_k), tr_p: the transformations of Q and K (module docstring) and the global
+      address of their records [B H] (None without one).
     """
+    equalize, center_k = transform
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     lane = tid & 31
@@ -362,7 +406,10 @@ def qk_kernel(
     both, wide = min(rank), int(rank[1] > rank[0])
     hd_rows, sq_uts, sq_stg, sq_red, sq_bytes = _smem_map(stage_rows)
     smem = SmemAllocator()
-    buf = smem.allocate_array(Uint32, sq_bytes // 4, byte_alignment=128)
+    # with center_k the center of the tile in work follows the map: FP32 [128]
+    buf = smem.allocate_array(
+        Uint32, (sq_bytes + (512 if center_k else 0)) // 4, byte_alignment=128
+    )
     sb = Int32(buf.toint())
     hdt = sb
     uts = sb + sq_uts
@@ -370,6 +417,7 @@ def qk_kernel(
     sst = stg + 16 * 144
     red = sb + sq_red
     flag = red + 256
+    cen = sb + sq_bytes
 
     if tid == 0:
         cute.arch.store(sptr(Uint32, flag), Uint32(1))
@@ -411,6 +459,9 @@ def qk_kernel(
     BH = B * H
     af = cute.make_rmem_tensor((32,), Uint32)
     afn = cute.make_rmem_tensor((32,), Uint32)
+    if cutlass.const_expr(equalize):
+        # the factor of the thread's input channel tid >> 1 on the tile in work, as BF16 bits
+        fac = Uint32(0x3F80)
 
     if item_lo < item_hi:
         _, tile0, side0, _, bb0, hh0 = _item_coords(item_lo, T, BH, H)
@@ -468,12 +519,42 @@ def qk_kernel(
                         sptr(Uint32, uts + r * 272 + cc * 8, 8),
                         (bf16x2(u4[0], u4[1]), bf16x2(u4[2], u4[3])),
                     )
+                if cutlass.const_expr(equalize or center_k):
+                    rec = tr_p + Int64(bh) * TRANSFORM_BYTES
+                if cutlass.const_expr(equalize):
+                    # the rows of Hd^T that the fast path reads, or with the whole of Hd^T staged the general
+                    # rotation: input channel c times d_c on a Q tile, times 1 / d_c on a K tile
+                    factors = rec + Int64(
+                        cutlass.select_(side != 0, Int32(TRANSFORM_INV_D), Int32(TRANSFORM_D))
+                    )
+                    fac = Uint32(load_invariant(Uint16, factors + Int64(tid >> 1) * 2))
+                    narrow = cutlass.const_expr(hd_rows < 128) or fast != 0
+                    if narrow:
+                        _stage_rotation(hdt, had_p, tid >> 1, (tid & 1) * 8, 0, fac)
+                    else:
+                        for it in cutlass.range_constexpr(8):
+                            idx = it * QK_THREADS + tid
+                            c = idx >> 4
+                            fc = Uint32(load_invariant(Uint16, factors + Int64(c) * 2))
+                            _stage_rotation(hdt, had_p, c, (idx & 15) * 8, 0, fc)
+                if cutlass.const_expr(center_k):
+                    # the center of a K tile; a Q tile has none
+                    if tid < 128:
+                        cv = load_invariant(Float32, rec + Int64(TRANSFORM_CENTER + tid * 4))
+                        cute.arch.store(
+                            sptr(Float32, cen + tid * 4),
+                            Float32(cutlass.select_(side != 0, cv, Float32(0.0))),
+                        )
                 cute.arch.sync_threads()
                 cur = bhs
             if cutlass.const_expr(tile_pitch is None):
                 dst = Int64(cutlass.select_(side != 0, k4_p, q4_p))
             pre = Float32(cutlass.select_(side != 0, Float32(1.0), Float32(QPRE)))
             tok0 = tile * 128 + warp * 16
+            if cutlass.const_expr(center_k):
+                # whether rows g and g + 8 of the warp tile hold a token
+                held = valid_len(lens_p, bb, S)
+                on_row = [tok0 + g + 8 * hh < held for hh in range(2)]
             # the projections (module docstring), 4 accumulators per 8 directions: the body and the residual on the
             # directions both terms have, and the wider term's further directions, from their rows of the stage
             pb = cute.make_rmem_tensor((COMP_CHANNELS // 2,), Float32)
@@ -508,6 +589,11 @@ def qk_kernel(
                                 u1 = yv[(a + hstep) * 8 + pos]
                                 yv[a * 8 + pos] = u0 + u1
                                 yv[(a + hstep) * 8 + pos] = u0 - u1
+                if cutlass.const_expr(center_k):
+                    for bo in cutlass.range_constexpr(8):
+                        xc = _centered([yv[bo * 8 + i] for i in range(8)], cen, bo, t, on_row)
+                        for i in cutlass.range_constexpr(8):
+                            yv[bo * 8 + i] = xc[i]
                 for bo in cutlass.range_constexpr(8):
                     x = [yv[bo * 8 + i] * pre for i in range(8)]
                     gb = cute.arch.fmax(
@@ -521,14 +607,17 @@ def qk_kernel(
                         cute.arch.sync_threads()
                         hc = tid >> 1
                         hj = 16 * bo + (tid & 1) * 8
-                        hw = load_invariant(Uint32, had_p + Int64(hc * 128 + hj) * 2, 4)
-                        for e in cutlass.range_constexpr(8):
-                            hv = (hw[e // 2] if e % 2 == 0 else hw[e // 2] >> Uint32(16)) & Uint32(
-                                0xFFFF
-                            )
-                            cute.arch.store(
-                                _hd_slot(hdt, hj + e - 16 * bo, hc, hj + e), hv.to(Uint16)
-                            )
+                        if cutlass.const_expr(equalize):
+                            _stage_rotation(hdt, had_p, hc, hj, 16 * bo, fac)
+                        else:
+                            hw = load_invariant(Uint32, had_p + Int64(hc * 128 + hj) * 2, 4)
+                            for e in cutlass.range_constexpr(8):
+                                hv = (
+                                    hw[e // 2] if e % 2 == 0 else hw[e // 2] >> Uint32(16)
+                                ) & Uint32(0xFFFF)
+                                cute.arch.store(
+                                    _hd_slot(hdt, hj + e - 16 * bo, hc, hj + e), hv.to(Uint16)
+                                )
                         cute.arch.sync_threads()
                     acc = [Float32(0.0)] * 8
                     for s in cutlass.range_constexpr(8):
@@ -544,6 +633,8 @@ def qk_kernel(
                             for e in cutlass.range_constexpr(4):
                                 acc[4 * n + e] = r[e]
                     x = [acc[i] * pre for i in range(8)]
+                    if cutlass.const_expr(center_k):
+                        x = _centered(x, cen, bo, t, on_row)
                     gb = cute.arch.fmax(
                         gb, _body_block(bo, x, side, proj, uts, stg, sst, g, t, scale_rule)
                     )

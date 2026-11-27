@@ -48,6 +48,18 @@ Kernel body (qk_kernel): the setup of the CTA and one role per warp, each a func
     * The state object holds what the roles share: the thread's warp and lane, the shared-memory and TMEM addresses,
       the tile range and the trace-time constants.
 
+Transformations of Q and K (prepare: equalize, center_k; qk_transform_kernel), from the (batch, head) records that the
+eigensolver launch wrote (basis.py):
+    * equalize: two rotation operands in shared memory, diag(d) Hd for the Q tiles and diag(1 / d) Hd for the K tiles.
+    * center_k: the rotated centers of two (batch, head)s in shared memory, in two slots that the (batch, head)s of
+      the CTA take in turn; the math warps subtract the center of a rotated K tile from it, take the block maxima of
+      the result and store it back to TMEM for the projections, as they store a prescaled Q tile (_centered). The
+      load warp notes the slot of every tile it copies (eight notes, by the tile's index).
+    * The load warp stages the operands and the center of a (batch, head) before it copies the first tile of that
+      (batch, head), after the first one once the rotation of the tile before is done (_stage_transform): the
+      rotation of the new tile follows its copy, and the slot that the center takes was last read two (batch, head)s
+      earlier. With equalize no thread stages the plain Hadamard operand.
+
 Mbarriers, on which the roles meet. A full barrier completes when its producer has published the data, an empty barrier
 when its consumers have released it; the arrivals of a phase are in parentheses.
     XFULL, XEMPTY    per X ring stage: the tile is copied (the TMA bytes); the rotation that read it is done (MMA warp)
@@ -82,7 +94,7 @@ from ...common.dsl import (
     tcgen05_wait,
 )
 from ...common.expmath import f2u, warp_max
-from ...common.mem import gptr, load_invariant, sptr, store_vector
+from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
 from ...common.state import State
 from ...constants import HEAD_DIM, QK_BLOCK, QPRE, qk_channels
 from ..ptx import idesc_bf16, idesc_tf32, mbar_wait_bounded, smem_desc_sw128
@@ -94,9 +106,17 @@ from ..tmem import (
     tc_mma,
 )
 from ..valid_len import valid_len
-from .basis import GMAX_K, GMAX_Q, eig_directions
+from .basis import (
+    GMAX_K,
+    GMAX_Q,
+    TRANSFORM_BYTES,
+    TRANSFORM_CENTER,
+    TRANSFORM_D,
+    TRANSFORM_INV_D,
+    eig_directions,
+)
 from .encode import sfv_tile_bytes
-from .quant import quant16, quant16_dq_knownmax
+from .quant import absmax, quant16, quant16_dq_knownmax
 
 QK_THREADS = 22 * 32  # 16 math warps, load warp 16, MMA warp 17, compensation warps 18-21
 X_STAGES = 3  # input tile ring depth
@@ -257,6 +277,46 @@ def _stage_hadamard(hadamard, tidx, ht_base):
                 cute.arch.store(sptr(Uint16, dst), hv.to(Uint16))
 
 
+@cute.jit
+def _stage_transform(st, bh, slot):
+    """Load warp: stage the transformations of (batch, head) bh from its record.
+
+    * equalize: the two rotation operands, in place of those of the (batch, head) before: element (k, n) of the
+      Hadamard matrix with the magnitude d_k in the operand of the Q tiles and 1 / d_k in that of the K tiles, in the
+      layout of _stage_hadamard. A lane takes the 16-byte chunks of eight channels k of every row n: their signs
+      from the transposed matrix, eight chunks loaded at a time; d and 1 / d of its channels once.
+    * center_k: the rotated center in the slot.
+    """
+    record = st.records + Int64(bh) * Int64(TRANSFORM_BYTES)
+    if cutlass.const_expr(st.equalize):
+        kc = st.lane & 15
+        d = load_invariant(Uint32, record + Int64(TRANSFORM_D) + Int64(kc) * Int64(16), 4)
+        inv_d = load_invariant(Uint32, record + Int64(TRANSFORM_INV_D) + Int64(kc) * Int64(16), 4)
+        for group in cutlass.range(8):
+            loaded = []
+            for e in cutlass.range_constexpr(8):
+                ch = st.lane + 32 * (8 * group + e)
+                loaded.append((ch, load_invariant(Uint32, st.had_t + Int64(ch) * Int64(16), 4)))
+            for e in cutlass.range_constexpr(8):
+                n = loaded[e][0] >> 4
+                signs = [w & Uint32(0x80008000) for w in loaded[e][1]]
+                off = (kc >> 3) * 16384 + n * 128 + (((kc & 7) ^ (n & 7)) << 4)
+                store_vector(
+                    sptr(Uint32, st.ht_base + off, 16), tuple(signs[w] | d[w] for w in range(4))
+                )
+                store_vector(
+                    sptr(Uint32, st.hk_base + off, 16), tuple(signs[w] | inv_d[w] for w in range(4))
+                )
+    if cutlass.const_expr(st.center_k):
+        c = load_invariant(
+            Float32, record + Int64(TRANSFORM_CENTER) + Int64(st.lane) * Int64(16), 4
+        )
+        store_vector(
+            sptr(Float32, st.c_base + slot * 512 + st.lane * 16, 16), (c[0], c[1], c[2], c[3])
+        )
+    cute.arch.fence_proxy("async.shared", space="cta")
+
+
 # ------------------------------------------------------------------------------------------------ steps of the roles
 def _tile_origin(st):
     """Return (bh, rem) of the CTA's first tile t0: its (batch, head) and its position among that bh's 2 NB tiles."""
@@ -414,6 +474,9 @@ def _load_warp(st, ut_addrs, scales):
       the copy of that tile, with one stage after it. The one stage is released by the projections of the tile
       before, and the MMA warp rotates the first tile ahead of them: its copy must be on the way.
     * A tile waits XEMPTY of its ring stage (the rotation that read the stage is done); its TMA copy completes XFULL.
+    * With a transformation, before the copy of the first tile of a (batch, head): the transformations of that
+      (batch, head), after the CTA's first one once the rotation of the tile before is done (_stage_transform); with
+      center_k the slot of the center of every tile is noted before its copy.
     """
     gQ = cute.local_tile(st.tma_q.tma_tensor, (128, 128), (None, 0, None))
     gK = cute.local_tile(st.tma_k.tma_tensor, (128, 128), (None, 0, None))
@@ -422,12 +485,29 @@ def _load_warp(st, ut_addrs, scales):
     bh_prev = Int32(-1)
     ucount = Int32(-1)
     kind, sblk, bh, h, b = _first_tile(st)
+    # the (batch, head) whose transformations are staged (none at the start) and its center slot: the first one
+    # takes slot 0
+    bh_staged = Int32(-1)
+    slot = Int32(1)
     for i in cutlass.range(st.n):
         if cutlass.const_expr(st.urows > 0 and st.u_stages == 2):
             if bh != bh_prev:
                 ucount = ucount + 1
                 bh_prev = bh
                 _stage_basis(st, ut_addrs, bh, ucount)
+        if cutlass.const_expr(st.equalize or st.center_k):
+            if bh != bh_staged:
+                bh_staged = bh
+                slot = slot ^ 1
+                if i > 0:
+                    # the rotation of the tile before, the last one of its (batch, head), has released its ring stage
+                    mbar_wait_bounded(
+                        st.bars + 8 * (B_XEMPTY + (i - 1) % X_STAGES), ((i - 1) // X_STAGES) & 1
+                    )
+                _stage_transform(st, bh, slot)
+            if cutlass.const_expr(st.center_k):
+                if st.lane == 0:
+                    cute.arch.store(sptr(Int32, st.slot_base + (i & 7) * 4), slot)
         xs = i % X_STAGES
         mbar_wait_bounded(st.bars + 8 * (B_XEMPTY + xs), ((i // X_STAGES) + 1) & 1)
         if st.lane == 0:
@@ -482,9 +562,12 @@ def _zero_scales(st, scales):
 
 
 # ------------------------------------------------------------------------------------------------ MMA warp
-def _qk_rotation(st, j, idesc):
+def _qk_rotation(st, j, idesc, operand=None):
     """MMA warp: rotate tile j, xr[j & 1] = X[j % X_STAGES] * Hd. Waits XFULL of the ring stage and XREMPTY of the
-    rotated tile buffer; commits XRFULL of the buffer and XEMPTY of the stage."""
+    rotated tile buffer; commits XRFULL of the buffer and XEMPTY of the stage. operand: the shared address of the
+    rotation operand of the tile where it is not the Hadamard operand of the CTA."""
+    if operand is None:
+        operand = st.ht_base
     xs = j % X_STAGES
     s = j & 1
     mbar_wait_bounded(st.bars + 8 * (B_XFULL + xs), (j // X_STAGES) & 1)
@@ -496,7 +579,7 @@ def _qk_rotation(st, j, idesc):
         tc_mma(
             st.tm + TM_XR + s * 128,
             smem_desc_sw128(xa + off),
-            smem_desc_sw128(st.ht_base + off),
+            smem_desc_sw128(operand + off),
             idesc,
             Int32(kk),
             kind="f16",
@@ -504,6 +587,12 @@ def _qk_rotation(st, j, idesc):
         )
     tc_commit(st.bars + 8 * (B_XRFULL + s))
     tc_commit(st.bars + 8 * (B_XEMPTY + xs))
+
+
+def _rotation_operand(st, kind):
+    """Return the shared address of the rotation operand of a tile of the kind (equalize): diag(d) Hd for a Q tile,
+    diag(1 / d) Hd for a K tile."""
+    return Int32(cutlass.select_(kind == 0, st.ht_base, st.hk_base))
 
 
 def _by_kind(q_tile, for_q, for_k):
@@ -655,8 +744,9 @@ def _mma_warp(st):
     """
     idesc1 = Int32(idesc_bf16(128, 128))
 
-    if st.n > 0:
-        _qk_rotation(st, Int32(0), idesc1)
+    if cutlass.const_expr(not st.equalize):
+        if st.n > 0:
+            _qk_rotation(st, Int32(0), idesc1)
     bh_prev = Int32(-1)
     ucount = Int32(-1)
     if cutlass.const_expr(st.lens is not None):
@@ -665,9 +755,17 @@ def _mma_warp(st):
     else:
         bh, rem = _tile_origin(st)
         kind = rem & 1
+    if cutlass.const_expr(st.equalize):
+        # the tiles alternate between Q and K: each takes the rotation operand of its kind
+        if st.n > 0:
+            _qk_rotation(st, Int32(0), idesc1, _rotation_operand(st, kind))
     for i in cutlass.range(st.n):
-        if i + 1 < st.n:
-            _qk_rotation(st, i + 1, idesc1)
+        if cutlass.const_expr(st.equalize):
+            if i + 1 < st.n:
+                _qk_rotation(st, i + 1, idesc1, _rotation_operand(st, kind ^ 1))
+        else:
+            if i + 1 < st.n:
+                _qk_rotation(st, i + 1, idesc1)
         if bh != bh_prev:
             ucount = ucount + 1
             bh_prev = bh
@@ -844,6 +942,16 @@ def _prescaled(x, am0, am1):
     return xs, am0 * pre, am1 * pre
 
 
+def _centered(x, addr):
+    """Return the 32 values x minus the 32 FP32 values at the shared address addr, and the largest magnitudes of the
+    two 16-value blocks of the result."""
+    xs = []
+    for j in range(0, 32, 4):
+        c = load_vector(sptr(Float32, addr + j * 4, 16), 4)
+        xs += [x[j + e] - c[e] for e in range(4)]
+    return xs, absmax(xs[0:16]), absmax(xs[16:32])
+
+
 @cute.jit
 def _math_warps(st, codes, scales, gmax):
     """Math warps (0-15): quantize the rotated tiles to NVFP4 and write the residual for the projections.
@@ -852,7 +960,8 @@ def _math_warps(st, codes, scales, gmax):
       writes the quantization residual to the A columns of the projections and stores the codes and the block scales;
       the maxima of the scales go to gmax. codes, scales, gmax: as in _compensation_warps.
     * A tile waits XRFULL of its rotated buffer, and AEMPTY (the projections of the tile before are done) before the
-      residual is overwritten; the warp arrives on AFULL once its residual and a Q tile's prescaled values are in TMEM.
+      residual is overwritten; the warp arrives on AFULL once its residual and a Q tile's prescaled values (with
+      center_k also a K tile's centered values) are in TMEM.
     """
     lq = st.warp & 3
     row_half = (st.warp >> 2) & 1
@@ -879,6 +988,12 @@ def _math_warps(st, codes, scales, gmax):
         if kind == 0:
             x, am0, am1 = _prescaled(x, am0, am1)
             st_tmem_16x32bx2_f32_x32_wait(xr, x)
+        if cutlass.const_expr(st.center_k):
+            # K tiles lose the center of their (batch, head): the centered tile goes back to TMEM like a scaled Q tile
+            if kind == 1:
+                slot = cute.arch.load(sptr(Int32, st.slot_base + (i & 7) * 4), Int32)
+                x, am0, am1 = _centered(x, st.c_base + slot * 512 + cq * 128)
+                st_tmem_16x32bx2_f32_x32_wait(xr, x)
         sc0, w0, w1, dq0 = quant16_dq_knownmax(x[0:16], am0, st.scale_rule)
         sc1, w2, w3, dq1 = quant16_dq_knownmax(x[16:32], am1, st.scale_rule)
         mbar_wait_bounded(st.bars + 8 * B_AEMPTY, (i + 1) & 1)
@@ -933,6 +1048,7 @@ def _qk_body(
     RANK,
     lens,
     scale_rule,
+    transform=None,
 ):
     """Run the Q'/K' pass of the CTA's share of the ntiles tiles: the setup, the role of the thread's warp, the release.
 
@@ -943,6 +1059,8 @@ def _qk_body(
       their batch element are then zero and stay out of the maxima, and the CTAs share the live tiles (_live_tiles).
     * scale_rule: the rule for the scale of an NVFP4 block of the head channels (quant.py); the compensation terms
       take the residual at that scale, and a block of the compensation channels has the scale of the rule "max".
+    * transform: None, or (equalize, center_k, the global address of the records of the transformations, the
+      global address of the transposed Hadamard matrix).
     """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -957,6 +1075,8 @@ def _qk_body(
     tmem_columns = max(512, TM_D + _d_columns(RANK, d_layout))
     tmem_arch = target.arch_name() if tmem_columns > 512 else "sm_100"
     nbars = QK_RING_NBARS if d_layout == "ring" else QK_NBARS
+    equalize = transform is not None and transform[0]
+    center_k = transform is not None and transform[1]
     bars_p = smem.allocate_array(Int64, nbars, byte_alignment=8)
     hold_p = smem.allocate_array(Int32, 4, byte_alignment=16)
     sX = smem.allocate_tensor(
@@ -982,6 +1102,19 @@ def _qk_body(
     if cutlass.const_expr(urows > 0):
         sU = smem.allocate_array(Uint8, u_stages * ustage, byte_alignment=1024)
         u_base = Int32(sU.toint())
+    # with equalize: sHT is the rotation operand of the Q tiles and a second one that of the K tiles
+    hk_base = ht_base
+    if cutlass.const_expr(equalize):
+        sHK = smem.allocate_array(Uint8, 32768, byte_alignment=1024)
+        hk_base = Int32(sHK.toint())
+    # with center_k: two slots of a rotated center, and the notes of the slot of a tile
+    c_base = Int32(0)
+    slot_base = Int32(0)
+    if cutlass.const_expr(center_k):
+        sC = smem.allocate_array(Float32, 2 * HEAD_DIM, byte_alignment=16)
+        sSlot = smem.allocate_array(Int32, 8, byte_alignment=4)
+        c_base = Int32(sC.toint())
+        slot_base = Int32(sSlot.toint())
 
     # the tiles of this CTA: n tiles from t0
     t0 = (bidx * ntiles) // gdim
@@ -993,7 +1126,8 @@ def _qk_body(
     if warp == 0:
         cute.arch.alloc_tmem(tmem_columns, sptr(Uint32, hold), arch=tmem_arch)
         cute.arch.relinquish_tmem_alloc_permit()
-    _stage_hadamard(hadamard, tidx, ht_base)
+    if cutlass.const_expr(not equalize):
+        _stage_hadamard(hadamard, tidx, ht_base)
     # the barriers, the TMEM address and the Hadamard operand are set for every thread after this barrier
     cute.arch.fence_proxy("async.shared", space="cta")
     tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -1032,6 +1166,15 @@ def _qk_body(
         t0_all=t0_all,
         n_all=n_all,
         B=batch,
+        # the transformations: the switches, the records, the transposed rotation, the K operand of equalize, the
+        # center slots and their notes
+        equalize=equalize,
+        center_k=center_k,
+        records=transform[2] if transform is not None else None,
+        had_t=transform[3] if transform is not None else None,
+        hk_base=hk_base,
+        c_base=c_base,
+        slot_base=slot_base,
         # trace-time constants
         scale_rule=scale_rule,
         RANK=RANK,
@@ -1202,4 +1345,57 @@ def qk_rule_kernel(
         RANK,
         lens if LENS else None,
         SCALE_RULE,
+    )
+
+
+@cute.kernel
+def qk_transform_kernel(
+    tiled_mma: cute.TiledMma,
+    tma_q: cpasync.TmaInfo,
+    tma_k: cpasync.TmaInfo,
+    hadamard: cute.Tensor,
+    ut_q: cute.Tensor,
+    ut_k: Int64,
+    q4: cute.Tensor,
+    k4: cute.Tensor,
+    q_sfv: cute.Tensor,
+    k_sfv: cute.Tensor,
+    gmax: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    ntiles: Int32,
+    lens: Int64,
+    records: Int64,
+    rotation_t: Int64,
+    RANK: cutlass.Constexpr,
+    LENS: cutlass.Constexpr,
+    SEPARATE: cutlass.Constexpr,
+    SCALE_RULE: cutlass.Constexpr,
+    EQUALIZE: cutlass.Constexpr,
+    CENTER_K: cutlass.Constexpr,
+):
+    """Run the Q'/K' pass (_qk_body) of RANK = (r_q, r_k) with the scale rule SCALE_RULE and the transformations of Q
+    and K, EQUALIZE, CENTER_K or both, from the records at the global address records (module docstring);
+    rotation_t: with EQUALIZE, the global address of the transposed Hadamard matrix. The other arguments as for
+    qk_kernel."""
+    _qk_body(
+        tiled_mma,
+        tma_q,
+        tma_k,
+        hadamard,
+        (Int64(ut_q.iterator.toint()), ut_k) if SEPARATE else (Int64(ut_q.iterator.toint()),),
+        q4,
+        k4,
+        q_sfv,
+        k_sfv,
+        gmax,
+        S,
+        H,
+        NB,
+        ntiles,
+        RANK,
+        lens if LENS else None,
+        SCALE_RULE,
+        (EQUALIZE, CENTER_K, records, rotation_t),
     )

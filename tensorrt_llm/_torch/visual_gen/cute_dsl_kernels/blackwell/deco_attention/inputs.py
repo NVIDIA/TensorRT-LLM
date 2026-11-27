@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inputs of the DeCo preparation besides q, k and v, the same for every kernel family: rank_pair, sample_rows,
-hadamard and the record of the compensation of a call that the host API hands to a family (Compensation). What the
-functions need is built on first use and kept: the default rows per sequence length, row count and device,
-the priorities of the drawn tokens and the rotation per device. Building them is not capturable, so a first use under
-CUDA graph capture raises (the rule of a capture: api.py). The last two draws of given tokens are kept as well, for
-the calls of a forward that pass the same tensors."""
+video_rows, hadamard and the records of a call that the host API hands to a family: its compensation (Compensation)
+and the transformations of Q and K (Transforms). What the functions need is built on first use and kept: the default
+rows per sequence length, row count and device, the priorities of the drawn tokens and the rotation per device.
+Building them is not capturable, so a first use under CUDA graph capture raises (the rule of a capture: api.py). The
+last two draws of given tokens are kept as well, for the calls of a forward that pass the same tensors."""
 
 import functools
 from typing import NamedTuple
@@ -33,7 +33,8 @@ _NOT_DRAWN = 1 << 30
 # Smallest number of positions a priority table is built for.
 _MIN_PRIORITIES = 1 << 16
 # The last draws of given tokens outside a capture, the newest first: per draw its key (token_tags, tokens, their
-# version counters, s, device, row count), its rows and the event of their completion on the stream that drew them.
+# version counters, s, device, row count), its rows, the number of its leading video rows and the event of their
+# completion on the stream that drew them.
 # Two are kept: the rows of Q and the rows of K of a call may be draws of two rates.
 _KEPT_DRAWS = 2
 _token_draws = []
@@ -62,6 +63,22 @@ class Compensation(NamedTuple):
     rows_k: torch.Tensor | None
     map_rows: bool
     basis: Basis | None
+
+
+class Transforms(NamedTuple):
+    """The transformations of Q and K of a call of prepare, as the host API resolved them for a kernel family.
+
+    equalize      channel c of Q times d_c and of K over d_c, d_c from the largest magnitudes of the basis rows
+                  (constants.py)
+    center_k      K minus its mean over the video rows among the basis rows of K
+    video_rows    None (every basis row of K is a video row), or int32 [1] or, with rows [B, m], [B] on the device:
+                  the number of leading rows of rows_k that are video rows, which the kernels read in place and clamp
+                  to the rows
+    """
+
+    equalize: bool
+    center_k: bool
+    video_rows: torch.Tensor | None
 
 
 def rank_pair(rank: int | tuple[int, int] | list[int] | None) -> tuple[int, int]:
@@ -167,23 +184,57 @@ def sample_rows(
       same token_tags and tokens tensors, compared by identity and, where a tensor has one, by its version counter:
       a mask is built once and passed again, and one rebuilt for every call is drawn anew every time.
     """
+    return _draw(s, device, token_tags, rank, tokens, rate, min_rows)[0]
+
+
+def video_rows(
+    s: int,
+    device: torch.device | str = "cuda",
+    token_tags: torch.Tensor | None = None,
+    rank: int | tuple[int, int] | list[int] | None = None,
+    tokens: torch.Tensor | None = None,
+    *,
+    rate: float | None = None,
+    min_rows: int | None = None,
+) -> torch.Tensor:
+    """Return the number of leading video rows of the draw of sample_rows with the same arguments, the video_rows
+    argument of prepare with center_k: an int32 tensor on the device, [1] or, with `tokens`, [B].
+
+    * A tagged draw holds its video rows first; the count is that of the video tokens it took (0 without one).
+    * Without token_tags every drawn token counts: their number, per batch element with `tokens`.
+    * With token_tags or tokens nothing is read back to the host: a CUDA graph can capture the draw and the count.
+    """
+    return _draw(s, device, token_tags, rank, tokens, rate, min_rows)[1]
+
+
+def _draw(
+    s: int,
+    device: torch.device | str,
+    token_tags: torch.Tensor | None,
+    rank: int | tuple[int, int] | list[int] | None,
+    tokens: torch.Tensor | None,
+    rate: float | None,
+    min_rows: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (the rows, the number of leading video rows) of the draw of sample_rows: int32 tensors on the device,
+    the second [1] or, with `tokens`, [B]."""
     device = _indexed(device)
     m = sample_count(s, rank, rate, min_rows)
     if token_tags is None and tokens is None:
-        rows, drawn = _sample_rows(s, device, m)
+        rows, video, drawn = _sample_rows(s, device, m)
         # A capture cannot wait on an outside event; the eager call before it did.
         if not torch.cuda.is_current_stream_capturing():
             torch.cuda.current_stream(device).wait_event(drawn)
-        return rows
+        return rows, video
     capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
     key = (token_tags, tokens, _version(token_tags), _version(tokens), s, device, m)
     if not capturing:
-        for kept, rows, drawn in _token_draws:
+        for kept, rows, video, drawn in _token_draws:
             if kept[0] is token_tags and kept[1] is tokens and kept[2:] == key[2:]:
                 if drawn is not None:
                     # Another stream may have drawn the rows and still be at it.
                     torch.cuda.current_stream(device).wait_event(drawn)
-                return rows
+                return rows, video
     if tokens is not None:
         if tokens.dtype != torch.bool or tokens.dim() != 2 or tokens.shape[1] != s:
             raise ValueError(f"tokens must be a bool tensor [B, {s}], got {tuple(tokens.shape)}")
@@ -195,6 +246,7 @@ def sample_rows(
         # Every token counts as video: one group, of which the draw takes the first k in priority order.
         drawn_rows = torch.where(tokens, priority, _NOT_DRAWN).topk(k, largest=False).indices
         num_drawn = tokens.sum(-1, keepdim=True).clamp(max=m)
+        take_video = num_drawn
         index = slot % num_drawn.clamp(min=1)
     else:
         tags = token_tags.to(device).reshape(-1)
@@ -206,7 +258,7 @@ def sample_rows(
         groups = torch.stack([tags == 0, tags > 0])
         # The first k tokens of each group in priority order; behind the tokens of a shorter group come positions
         # that no slot below reads.
-        video_rows, other_rows = (
+        video_tokens, other_tokens = (
             torch.where(groups, priority, _NOT_DRAWN).topk(k, largest=False).indices
         )
         num_video, num_other = groups.sum(-1, keepdim=True)
@@ -216,15 +268,16 @@ def sample_rows(
         num_drawn = take_video + take_other
         slot = slot % num_drawn.clamp(min=1)
         index = torch.where(slot < take_video, slot, slot - take_video + k)
-        drawn_rows = torch.cat([video_rows, other_rows], dim=-1)
+        drawn_rows = torch.cat([video_tokens, other_tokens], dim=-1)
     # Slot j holds draw j modulo the number drawn, the video tokens first: a short draw repeats.
     rows = drawn_rows.gather(-1, index)
     rows = rows.masked_fill(num_drawn == 0, 0).to(torch.int32)
+    video = take_video.reshape(-1).to(torch.int32)
     if not capturing:
         drawn = torch.cuda.current_stream(device).record_event() if device.type == "cuda" else None
-        _token_draws.insert(0, (key, rows, drawn))
+        _token_draws.insert(0, (key, rows, video, drawn))
         del _token_draws[_KEPT_DRAWS:]
-    return rows
+    return rows, video
 
 
 @functools.cache
@@ -242,13 +295,16 @@ def _priorities(device: torch.device, capacity: int) -> torch.Tensor:
 
 
 @functools.cache
-def _sample_rows(s: int, device: torch.device, m: int) -> tuple[torch.Tensor, torch.cuda.Event]:
-    """Return the cached default draw of m rows and the event of its completion on the stream that drew it, which the
-    streams of later callers wait on."""
+def _sample_rows(
+    s: int, device: torch.device, m: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]:
+    """Return the cached default draw of m rows, the number of its rows as the count of its video rows ([1]) and the
+    event of their completion on the stream that drew them, which the streams of later callers wait on."""
     not_under_capture(device, f"sampled rows of sequence length {s}")
     perm = torch.randperm(s, device=device, generator=torch.Generator(device=device).manual_seed(0))
     rows = perm[:m].to(torch.int32).contiguous()
-    return rows, torch.cuda.current_stream(device).record_event()
+    video = torch.full((1,), rows.numel(), dtype=torch.int32, device=device)
+    return rows, video, torch.cuda.current_stream(device).record_event()
 
 
 @functools.cache

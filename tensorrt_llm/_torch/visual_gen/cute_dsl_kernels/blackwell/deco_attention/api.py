@@ -31,7 +31,8 @@ Kernels:
     * A family package deco_attention/<family> exports DEFAULT_PV, pv_formats, max_comp_channels, min_seq_len,
       workspace_size, prepare, attention and basis; the functions here check the caller's arguments (ValueError),
       resolve the defaults and forward resolved values to it: the compensation of a call as inputs.Compensation, a
-      basis as the tuple of its tensors (runtime.Basis), the scale rule as its name.
+      basis as the tuple of its tensors (runtime.Basis), the scale rule as its name, the transformations of Q and K
+      as inputs.Transforms.
 
 Compensation (the switches of prepare; workspace_size takes rank and bases):
     * rank: the channels (r_q, r_k) of the two compensation terms, multiples of 16 with r_q + r_k at most
@@ -59,6 +60,21 @@ Quantizer of Q' and K' (a switch of prepare):
       under every rule.
     * It changes neither the operand layout nor the workspace nor the attention kernels.
 
+Transformations of Q and K (switches of prepare, off by default):
+    * equalize: per (batch, head), channel c of Q is multiplied and channel c of K divided by
+      d_c = sqrt(max |K_c| / max |Q_c|), the largest magnitudes over the basis rows (Q with its score prescale).
+      With exact d every score is unchanged; the kernels apply d and 1 / d as BF16 values, each the rounding of its
+      own value, so the term of a channel in a score changes by a factor within 2^-7 of 1. A channel keeps d = 1
+      where a magnitude is zero, tiny or infinite or d would be extreme (constants.py); a NaN among the basis rows
+      is left out of the largest magnitudes.
+    * center_k: per (batch, head), K minus its mean over the video rows among the basis rows of K: the scores of a
+      query move by one constant. video_rows counts the leading basis rows of K that are video rows
+      (video_rows(...) for the draw of sample_rows(...) with the same arguments); None counts every row.
+    * With both, K is centered first and its largest magnitudes are those of the centered rows. The basis is that
+      of the transformed operands.
+    * They take their statistics in the eigensolver launch of the call: ValueError without compensation channels
+      and with a caller's basis.
+
 CUDA graphs:
     * prepare and attention can be captured: every scale stays on the device, nothing is read back or allocated.
     * A capture follows one eager call with the same shape and arguments. That call compiles the kernels of the
@@ -73,7 +89,7 @@ import torch
 
 from . import target
 from .constants import BASES, DEFAULT_SCALE_RULE, HEAD_DIM, RESCALE_THRESHOLDS, SCALE_RULES
-from .inputs import Compensation, rank_pair, sample_rows
+from .inputs import Compensation, Transforms, rank_pair, sample_rows
 from .runtime import Basis
 
 
@@ -156,6 +172,44 @@ def _scale_rule(scale_rule: str | None) -> str:
     if type(scale_rule) is not str or scale_rule not in SCALE_RULES:
         raise ValueError(f"scale_rule {scale_rule!r} is not one of {SCALE_RULES}")
     return scale_rule
+
+
+def _transforms(
+    equalize: bool,
+    center_k: bool,
+    video_rows: torch.Tensor | None,
+    rows_k: torch.Tensor | None,
+    drawn: bool,
+    shape: tuple[int, ...],
+    device: torch.device,
+) -> Transforms:
+    """Check the transformation switches of prepare and return them for a family.
+
+    * rows_k: the basis rows of K of the call, None without an eigensolver launch (no compensation channels, or a
+      caller's basis); drawn: they are the default draw of prepare, not a caller's rows.
+    * video_rows: an int32 tensor that the kernels read in place, [1] for rows [m] and [B] for rows [B, m]; it goes
+      with center_k and with a caller's rows.
+    """
+    for name, value in (("equalize", equalize), ("center_k", center_k)):
+        if type(value) is not bool:
+            raise ValueError(f"{name} must be a bool, got {value!r}")
+    if (equalize or center_k) and rows_k is None:
+        raise ValueError(
+            "equalize and center_k take their statistics from the basis rows of the call: they need compensation "
+            "channels and no caller's basis"
+        )
+    if video_rows is not None:
+        if not center_k or drawn:
+            raise ValueError(
+                "video_rows needs center_k=True and a caller's rows; the default draw counts every row"
+            )
+        count = 1 if rows_k.dim() == 1 else shape[0]
+        in_place = _read_in_place(video_rows, torch.int32, device)
+        if not in_place or tuple(video_rows.shape) != (count,):
+            raise ValueError(
+                f"video_rows must be a contiguous int32 tensor [{count}] on {device} at a 16-byte aligned address"
+            )
+    return Transforms(equalize, center_k, video_rows)
 
 
 def min_seq_len(pv: str | None = None) -> int:
@@ -318,6 +372,9 @@ def prepare(
     gram_weight: float | None = None,
     basis: torch.Tensor | Basis | None = None,
     scale_rule: str | None = None,
+    equalize: bool = False,
+    center_k: bool = False,
+    video_rows: torch.Tensor | None = None,
 ) -> Operands:
     """Run the preparation: write the operands of the attention into the workspace and return them (views into it).
 
@@ -357,6 +414,11 @@ def prepare(
               lengths: sample_rows keeps a draw for the mask tensor it was made from.
         scale_rule: the rule for the scale of an NVFP4 block of the head channels of Q' and K' (module docstring):
             "max", "band" or "search", None for the default.
+        equalize, center_k: the transformations of Q and K (module docstring).
+        video_rows: with center_k and a caller's rows: None (every basis row of K is a video row), or int32
+            [1] (rows [m]) or [B] (rows [B, m]) on that device at a 16-byte aligned address: the number of leading
+            basis rows of K that are video rows, as video_rows(...) returns it for the draw of sample_rows(...).
+            The kernels read it in place and clamp it to the rows; nothing reads it on the host.
     """
     family, pv = _family(pv)
     rank, bases, gram_weight = _terms(rank, bases, gram_weight)
@@ -402,8 +464,9 @@ def prepare(
             _check_rows("rows", rows, shape, device, lens is not None)
             rows_q = rows_k = rows
     map_rows = rows is None and lens is not None
+    transforms = _transforms(equalize, center_k, video_rows, rows_k, rows is None, shape, device)
     comp = Compensation(rank, bases, gram_weight, rows_q, rows_k, map_rows, basis)
-    buffers = family.prepare(q, k, v, workspace, pv, lens, comp, scale_rule)
+    buffers = family.prepare(q, k, v, workspace, pv, lens, comp, scale_rule, transforms)
     if compensated and basis is None:
         basis = family.basis(buffers, pv, bases)
     if basis is not None and len(basis) == 1:

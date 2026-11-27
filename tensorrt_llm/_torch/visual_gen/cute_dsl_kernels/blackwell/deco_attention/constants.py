@@ -90,6 +90,12 @@ def p_prescale_log2(rescale_threshold: float) -> int:
     return int(math.log2(E4M3_MAX) - rescale_threshold)
 
 
+# Channel equalization (prepare: equalize): channel c of Q is multiplied and channel c of K divided by
+# d_c = sqrt(max |K_c| / max |Q_c|) over the basis rows, Q with its score prescale QPRE. A channel keeps d_c = 1 where
+# either largest magnitude is below EQUALIZE_MIN_MAGNITUDE or infinite, or where d_c would lie outside
+# [1 / EQUALIZE_MAX_FACTOR, EQUALIZE_MAX_FACTOR]. A NaN among the basis rows is left out of the largest magnitudes
+EQUALIZE_MIN_MAGNITUDE = 2.0**-60
+EQUALIZE_MAX_FACTOR = 2.0**20
 E2M1_MAX = 6.0  # the largest E2M1 value
 # The rules for the scale of an NVFP4 block of QK_BLOCK values of the head channels of Q' and K' (prepare:
 # scale_rule). m is the largest magnitude of the block, and a scale is rounded to three mantissa bits:
