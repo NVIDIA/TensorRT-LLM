@@ -135,7 +135,7 @@ class NemotronHConfig(PretrainedConfig):
         mamba_head_dim: int = 64,
         mamba_hidden_act: str = "silu",
         mamba_proj_bias: bool = False,
-        mamba_ssm_cache_dtype: str = "float32",
+        mamba_ssm_cache_dtype: str | None = None,
         n_groups: int = 8,
         conv_kernel: int = 4,
         expand: int = 2,

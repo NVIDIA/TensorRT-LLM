@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import os
 import signal
@@ -40,8 +41,6 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.executor import (
     CANCELLED,
-    PERF,
-    TUNER,
     SpoolCommandExecutor,
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.scheduler import (
@@ -296,94 +295,6 @@ def test_a_device_that_never_releases_its_memory_is_quarantined(
     assert sched.snapshot(_spool_scheduler_clock.now)["quarantined"] == ["0"]
 
 
-def test_a_campaigns_job_never_ages_ahead_of_the_onboardings_nor_holds_one_back(
-    _spool_scheduler_spool, _spool_scheduler_clock
-):
-    """Background work (``priority=-1``) waits behind every other job, however long it waited."""
-    sched = _spool_scheduler_make(_spool_scheduler_spool, _spool_scheduler_clock)
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "holder",
-        _spool_scheduler_blocking(_spool_scheduler_spool, "holder"),
-        header="gpus=1 wall=8h",
-    )
-    _spool_scheduler_pump(sched, lambda: "holder" in running(sched))
-    # The campaign's whole-node measurement cannot place beside the holder, and waits.
-    _spool_scheduler_submit(
-        _spool_scheduler_spool, "tune-measure", "echo measured", header="gpus=4 priority=-1"
-    )
-    sched.tick()
-    _spool_scheduler_clock.advance(3 * _spool_scheduler_scheduler.AGING_S)
-    # A check queued hours later still ranks first, and starts on the free devices.
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "boot",
-        "echo started",
-        header="gpus=1 priority=1",
-        submitted=_spool_scheduler_clock.now,
-    )
-    _spool_scheduler_pump(
-        sched, lambda: _spool_scheduler_rc(_spool_scheduler_spool, "boot") is not None
-    )
-    assert (
-        _spool_scheduler_rc(_spool_scheduler_spool, "boot") == 0
-        and _spool_scheduler_rc(_spool_scheduler_spool, "tune-measure") is None
-    )
-    pending = {p["name"]: p for p in sched.snapshot(_spool_scheduler_clock.now)["pending"]}
-    assert pending["tune-measure"]["effective_priority"] == -1
-    _spool_scheduler_release(_spool_scheduler_spool, "holder")
-    _spool_scheduler_pump(
-        sched, lambda: _spool_scheduler_rc(_spool_scheduler_spool, "tune-measure") is not None
-    )
-
-
-def test_a_tuners_job_waits_behind_the_campaigns_measurement_queued_after_it(
-    _spool_scheduler_spool, _spool_scheduler_clock
-):
-    """The campaign measures one candidate at a time; a tuner's job never runs ahead of that."""
-    sched = _spool_scheduler_make(_spool_scheduler_spool, _spool_scheduler_clock)
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "holder",
-        _spool_scheduler_blocking(_spool_scheduler_spool, "holder"),
-        header="gpus=4 wall=8h",
-    )
-    _spool_scheduler_pump(sched, lambda: "holder" in running(sched))
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "tuner-ab",
-        "echo tuned",
-        header=f"gpus=4 priority={TUNER}",
-        submitted=_spool_scheduler_clock.now,
-    )
-    _spool_scheduler_clock.advance(_spool_scheduler_scheduler.AGING_S)
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "tune-measure",
-        "echo measured",
-        header=f"gpus=4 priority={PERF}",
-        submitted=_spool_scheduler_clock.now,
-    )
-    sched.tick()
-    pending = {p["name"]: p for p in sched.snapshot(_spool_scheduler_clock.now)["pending"]}
-    assert pending["tuner-ab"]["effective_priority"] == TUNER
-    _spool_scheduler_release(_spool_scheduler_spool, "holder")
-    _spool_scheduler_pump(
-        sched,
-        lambda: (
-            "tune-measure" in running(sched)
-            or _spool_scheduler_rc(_spool_scheduler_spool, "tune-measure") is not None
-        ),
-    )
-    assert (
-        "tuner-ab" not in running(sched)
-        and _spool_scheduler_rc(_spool_scheduler_spool, "tuner-ab") is None
-    )
-    _spool_scheduler_pump(
-        sched, lambda: _spool_scheduler_rc(_spool_scheduler_spool, "tuner-ab") is not None
-    )
-
-
 def test_a_cancelled_job_measured_nothing_and_says_so(_spool_scheduler_spool, served):
     """Cancelled through the spool (by the operator, say): no verdict, and no lost session."""
     results = []
@@ -402,6 +313,61 @@ def test_a_cancelled_job_measured_nothing_and_says_so(_spool_scheduler_spool, se
     (result,) = results
     assert result.returncode == RC_CANCELLED and not result.timed_out
     assert result.infrastructure.startswith(CANCELLED)
+
+
+def _hold(root: Path, name: str, reason: str) -> None:
+    """``name`` queued on ``root``, held by its scheduler for ``reason`` (its ``status.json``)."""
+    (root / "pending" / f"{name}.sh").write_text("true\n")
+    snapshot = json.loads(SpoolPaths(root).snapshot.read_text())
+    snapshot["pending"] = [{"name": name, "reason": reason}]
+    _spool_sessions_write_json_atomic(SpoolPaths(root).snapshot, snapshot)
+
+
+@pytest.mark.usefixtures("_no_ambient_spool")
+def test_a_long_wait_on_a_gate_job_is_said_once_per_period(tmp_path):
+    """A gate queued past the period says so once, with the session's hold reason."""
+    gates = session(tmp_path, "gates-1")
+    hold = "the allocation ends in 4974s, too soon for a job allowed 7200s"
+    _hold(gates, "gate-core", hold)
+    lines: list[str] = []
+    waiting = threading.Thread(
+        target=spoolctl.wait_for_job,
+        args=(gates, "gate-core"),
+        kwargs={"poll_s": 0.01, "submitted_at": time.time() - 16 * 60, "note": lines.append},
+        daemon=True,
+    )
+    waiting.start()
+    deadline = time.time() + 10
+    while not lines and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)  # further polls inside the period say nothing more
+    (gates / "done" / "gate-core.rc").write_text("0\n")
+    waiting.join(timeout=10)
+    assert len(lines) == 1
+    assert lines[0].startswith(f"gate-core on {gates} queued since ")
+    assert lines[0].endswith(f"; held: {hold}")
+    # A wait shorter than the period says nothing; a status record that does not read, no line.
+    _hold(gates, "gate-quick", hold)
+    (gates / "done" / "gate-quick.rc").write_text("0\n")
+    spoolctl.wait_for_job(gates, "gate-quick", submitted_at=time.time() - 14 * 60, note=pytest.fail)
+    SpoolPaths(gates).snapshot.write_text('{"pending": [{"reason": "no name"}]}')
+    assert spoolctl.waiting_line(gates, "gate-core", time.time()) == ""
+
+
+@pytest.mark.usefixtures("_no_ambient_spool")
+def test_a_queued_job_names_what_runs_ahead_of_it_on_its_spool(tmp_path):
+    """A job sat 20 min behind a profiling job an agent had launched, and nothing said so."""
+    work = session(tmp_path, "work-1")
+    hold = "waiting for the whole node to drain"
+    _hold(work, "gate-core", hold)
+    running = SpoolPaths(work).running
+    (running / "sol-profile.sh").write_text("true\n")
+    line = spoolctl.waiting_line(work, "gate-core", time.time())
+    assert line.endswith(f"; held: {hold}; running there: sol-profile")
+    for name in ("a", "b", "c"):
+        (running / f"{name}.sh").write_text("true\n")
+    line = spoolctl.waiting_line(work, "gate-core", time.time())
+    assert line.endswith("; running there: a, b, c and 1 more")
 
 
 def _task(tmp_path):
@@ -441,9 +407,7 @@ def test_session_cli_prepares_a_missing_spool_without_submitting(tmp_path, monke
             session([removed, *options])
 
 
-def test_session_status_and_tune_host_follow_the_latest_watcher(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.tune.measure import spool_host
-
+def test_session_status_follows_the_latest_watcher(tmp_path):
     task = _task(tmp_path)
     spool = tmp_path / "spool-a"
     (spool / "watchers").mkdir(parents=True)
@@ -455,7 +419,6 @@ def test_session_status_and_tune_host_follow_the_latest_watcher(tmp_path):
     )
     status = sessions.session_status(task, now=200)[0]
     assert status["slurm_job"] == "2" and status["heartbeat_age_s"] == 10
-    assert spool_host(str(spool)) == "new-node"
 
 
 _spool_sessions_HOUR = 3600.0
@@ -518,6 +481,42 @@ def test_an_ending_session_is_handed_over_to_the_next_session_on_its_spool(tmp_p
         old.pending_reasons["free-short"]
         == f"this session is handing over to {successor.watcher_id}"
     )
+
+
+def test_a_successor_that_stops_heart_beating_is_dropped_and_jobs_start_again(
+    _spool_scheduler_spool, _spool_scheduler_clock, monkeypatch
+):
+    """The successor's allocation was cancelled a minute after its watcher started."""
+    spool, clock = _spool_scheduler_spool, _spool_scheduler_clock
+    old = _spool_scheduler_make(
+        spool,
+        clock,
+        watcher_id="old",
+        devices=("0",),
+        ends_at=clock.now + 6 * _spool_sessions_HOUR,
+        handover_lead_s=_spool_sessions_HOUR,
+    )
+    old.device_memory_mib = lambda: {"0": 0}
+    _spool_scheduler_make(
+        spool, clock, watcher_id="new", ends_at=clock.now + 20 * _spool_sessions_HOUR
+    ).heartbeat()
+    _spool_scheduler_submit(spool, "next", header="gpus=1 wall=30m")
+    old.tick()
+    assert old.pending_reasons["next"] == "this session is handing over to new"
+
+    clock.advance(_spool_scheduler_scheduler.WATCHER_STALE_S + 1)
+
+    def full(line: str) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    # Even when the status line cannot be written, the gone successor is forgotten.
+    monkeypatch.setattr(old, "_append_status", full)
+    with pytest.raises(OSError):
+        old.tick()
+    monkeypatch.undo()
+    assert old.handover == {}, "a successor that is gone is no reason to exit"
+    _spool_scheduler_pump(old, lambda: _spool_scheduler_rc(spool, "next") is not None)
+    assert _spool_scheduler_rc(spool, "next") == 0
 
 
 def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(
@@ -861,7 +860,6 @@ def test_hung_gpu_inspection_returns_unknown_instead_of_blocking_teardown(monkey
         raise subprocess.TimeoutExpired(argv, 30)
 
     monkeypatch.setattr(server_runtime.subprocess, "run", hung)
-    assert server_runtime.device_memory_used_mib() is None
     assert server_runtime.device_holders() == set()
 
 
@@ -960,6 +958,22 @@ def test_the_gate_pool_skips_a_session_in_hand_over_for_one_that_can_take_the_jo
     assert executor._pick(gate) == busy
 
 
+def test_gate_jobs_reach_any_sessions_but_not_work_ones():
+    """An `any` session on another spool shares the gates; a `work` one keeps to its workers."""
+    env = RunEnvironment(
+        "session_spool",
+        "/p",
+        spool="/s/main",
+        sessions=(
+            sessions.SessionSpec("shared", "/s/shared"),
+            sessions.SessionSpec("gates", "/s/gates", role="gates"),
+            sessions.SessionSpec("work", "/s/work", role="work"),
+        ),
+    )
+    executor = priority.select_command_executor(env)
+    assert executor.pool == [Path("/s/main"), Path("/s/shared"), Path("/s/gates")]
+
+
 def test_a_fresh_inode_leaves_a_mapped_library_untouched(tmp_path):
     lib = tmp_path / "libs" / "libth_common.so"
     lib.parent.mkdir()
@@ -1008,5 +1022,5 @@ def test_the_first_units_inner_checks_go_ahead_of_every_other():
         ("mtp:boot@tp1", priority.FEATURE),
         ("mtp:acceptance@tp1", priority.FEATURE),
     ]
-    # Outside a check: the scheduler's default, never the campaign's background class.
-    assert priority.current_job_priority() == 0 > priority.PERF
+    # Outside a check: the scheduler's default, a worker's own jobs.
+    assert priority.current_job_priority() == 0

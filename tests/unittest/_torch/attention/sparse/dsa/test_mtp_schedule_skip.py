@@ -21,7 +21,7 @@ HEAD_DIM = 128
 TOKENS_PER_BLOCK = 64
 MAX_SEQ_LEN = 4096
 KV_LENS = [1000, 1500]
-# One draft token so the full-next_n schedule is part of the rebuild.
+# One draft token exercises the full-next_n schedule on DeepGEMM, including SM90.
 MAX_DRAFT_TOKENS = 1
 
 
@@ -41,8 +41,8 @@ pytestmark = [
 ]
 
 
-@pytest.fixture
-def decode_metadata():
+@pytest.fixture(params=[False, True], ids=["deepgemm", "cute_dsl_requested"])
+def decode_metadata(request):
     """A prepared one-token-per-request generation batch, as draft steps >= 1 see it.
 
     The cache manager is shut down on teardown: it owns CUDA reservations that a
@@ -56,6 +56,7 @@ def decode_metadata():
         indexer_k_dtype="fp8",
         skip_indexer_for_short_seqs=False,
         index_share_for_mtp_iteration=True,
+        use_cute_dsl_paged_mqa_logits=request.param,
     )
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     kv_cache_manager = DSACacheManager(
@@ -147,12 +148,14 @@ def _snapshot(buffers):
 
 def test_schedule_is_skipped_only_inside_the_draft_loop(decode_metadata):
     metadata = decode_metadata
+    # Use the resolved backend: requesting CuTe DSL can fall back to DeepGEMM.
+    expected_poisoned = [False, metadata.use_cute_dsl_paged_mqa_logits, False]
 
-    # Outside the draft loop: full rebuild.
+    # Outside the draft loop: rebuild the active schedules; CuTe leaves full_next_n untouched.
     _poison(metadata)
     metadata.update_for_spec_dec()
     assert not metadata.indexer_schedule_stale
-    assert _is_poisoned(metadata) == [False, False, False]
+    assert _is_poisoned(metadata) == expected_poisoned
     before_advance = _snapshot(_kv_lens_buffers(metadata))
 
     # Inside the index-sharing draft loop, after a draft step appends a token: the schedule
@@ -167,11 +170,11 @@ def test_schedule_is_skipped_only_inside_the_draft_loop(decode_metadata):
     assert _is_poisoned(metadata) == [True, True, True]
     in_draft_loop = _snapshot(_kv_lens_buffers(metadata))
 
-    # The next full rebuild (target forward) restores the schedule, clears the marker and
+    # The next full rebuild (target forward) restores active schedules, clears the marker and
     # writes the same slot mappings and gen indptrs, which follow the advanced lengths.
     metadata.on_update_kv_lens()
     assert not metadata.indexer_schedule_stale
-    assert _is_poisoned(metadata) == [False, False, False]
+    assert _is_poisoned(metadata) == expected_poisoned
     full_rebuild = _snapshot(_kv_lens_buffers(metadata))
     for skipped, rebuilt, stale in zip(in_draft_loop, full_rebuild, before_advance):
         assert torch.equal(skipped, rebuilt)

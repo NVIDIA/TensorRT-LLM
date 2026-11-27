@@ -15,11 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
-    modeling_v2_resolve_on_all_ranks,
-)
 from tensorrt_llm._torch.distributed import communicator
+from tensorrt_llm._torch.modeling_v2 import _router_index
+from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve_on_all_ranks
 
 pytestmark = pytest.mark.cpu_only
 

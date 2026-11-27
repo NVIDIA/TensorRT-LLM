@@ -9,6 +9,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fp4_mla.graph_resolvers import (
+    PackedSplitDecisions,
+    kv_regime_variant,
+    packed_split_variant,
+)
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as graph_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
@@ -372,12 +377,59 @@ def test_cached_shape_agreement_keeps_sampling_tier_collective():
     )
     runner._resolve_sample_type = lambda *_args: SampleType.FAST
 
-    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FULL)
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (
+        True,
+        SampleType.FULL,
+        (),
+    )
     assert exchanges == [[True, 4, 16, 5, SampleType.FAST.value]]
     runner.enable_in_graph_sampling = False
     exchanges.clear()
-    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, None)
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, None, None)
     assert exchanges == []
+
+
+def test_shape_agreement_carries_the_packed_split_when_graphs_are_keyed_by_it():
+    runner = _runner_stub()
+    batch = _Batch([SimpleNamespace(py_verify_len=3, py_draft_tokens=[0] * 5)] * 4)
+    runner.adp_shape_agreement = None
+    runner.agreed_ragged_bucket = 16
+    runner.enabled = True
+    runner.enable_in_graph_sampling = False
+    runner.set_graph_variants(
+        (
+            kv_regime_variant(lambda batch_size, draft_len: (8192, 16384)),
+            packed_split_variant(
+                PackedSplitDecisions(
+                    variants=lambda batch_size, draft_len: (False, True),
+                    decide=lambda batch_size, draft_len, kv_lens: False,
+                )
+            ),
+        )
+    )
+    runner._graph_variants_for_batch = lambda *_args: (8192, 0)
+    exchanges = []
+
+    def allgather(payload):
+        exchanges.append(payload)
+        peer = list(payload)
+        peer[-1] = 1
+        return torch.tensor([payload, peer])
+
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=2),
+        dist=SimpleNamespace(tp_allgather_int64=allgather),
+    )
+    runner._resolve_sample_type = lambda *_args: SampleType.FULL
+
+    # the decision follows the regime in the one shape exchange; a peer that splits makes every rank split
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (
+        True,
+        SampleType.FULL,
+        (8192, 1),
+    )
+    assert exchanges == [[True, 4, 16, 5, SampleType.FULL.value, 8192, 0]]
 
 
 def test_cached_shape_agreement_rejects_a_changed_ragged_key():
@@ -428,7 +480,11 @@ def test_stale_replay_vote_rejoins_the_shape_collective():
         dist=SimpleNamespace(tp_allgather_int64=exchange),
     )
     runner._resolve_sample_type = lambda *_args: SampleType.FAST
-    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FAST)
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (
+        True,
+        SampleType.FAST,
+        (),
+    )
     assert exchanges == [[True, 4, 16, 5, SampleType.FAST.value]]
 
 
@@ -441,7 +497,9 @@ def test_shape_vote_is_consumed_on_normal_and_exceptional_forward_exit(monkeypat
     runner.adp_shape_agreement = agreement
 
     @contextmanager
-    def parent_pad(self, scheduled_requests, _resource_manager, _runtime_draft_len):
+    def parent_pad(
+        self, scheduled_requests, _resource_manager, _runtime_draft_len, _sampling_mode=None
+    ):
         if failure == "enter":
             raise RuntimeError("padding failed")
         yield scheduled_requests

@@ -27,6 +27,31 @@ _GVR_IMPLEMENTATIONS = {
 _MAX_RADIX_BLOCKS_PER_ROW = 10
 # One 16-byte vector per copy, matching the Blackwell prefill op's contract.
 _CUTE_DSL_PREFILL_COPY_BITS = 128
+# logits dtypes the self-sampling GVR decode and prefill engines read natively
+_SELFSAMPLING_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+# The CUDA radix decode's 16-bit entry has no split-work tier: from this width
+# (its split-work threshold) on it rejects the rows, which take the FP32 entry.
+_RADIX_16BIT_MAX_COLUMNS = 200_000
+
+
+def _widen_to_fp32(scores: torch.Tensor, keep_row_stride: bool = False) -> torch.Tensor:
+    """Exact FP32 copy of 16-bit scores in a row-major view with a float4-aligned row stride.
+
+    ``keep_row_stride`` keeps a multirow view's row stride (rounded up to a float4
+    multiple): the varlen decode launcher key includes the row stride, so the copy then
+    finds the launcher an FP32 producer of the same layout warms. Otherwise the rows are
+    packed. One temporary per call from the caching allocator (CUDA-graph safe, no host
+    reads).
+    """
+    num_rows, width = scores.shape
+    row_stride = max(scores.stride(0), width) if keep_row_stride and num_rows > 1 else width
+    widened = torch.empty(
+        (num_rows, (row_stride + 3) // 4 * 4),
+        dtype=torch.float32,
+        device=scores.device,
+    )[:, :width]
+    widened.copy_(scores)
+    return widened
 
 
 class TopK(nn.Module):
@@ -48,6 +73,9 @@ class TopK(nn.Module):
         gvr_self_sampling: bool = True,
         gvr_deterministic: bool = False,
         gvr_sorting: str | None = None,
+        wide_fp32_rows: bool = False,
+        wide_cta_rows: bool = False,
+        split_long_rows: bool = False,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -68,6 +96,12 @@ class TopK(nn.Module):
         self._gvr_det_kwargs = (
             {"deterministic": True, "sorting": gvr_sorting} if gvr_deterministic else {}
         )
+        # Caller opt-ins for the CuTe DSL decode kernels, forwarded only when enabled: the radix op's
+        # wide FP32-row configuration and split of short rows off the cluster launch, and the
+        # self-sampling GVR engine's _WIDE_CTA_ROWS.
+        self.wide_fp32_rows = wide_fp32_rows
+        self.wide_cta_rows = wide_cta_rows
+        self.split_long_rows = split_long_rows
         # emission-assisted GVR (opt-in via prepare_gvr_emission): the module
         # owns the closed-loop emission state; only reachable on the temporal
         # (gvr_self_sampling=False) V1 path.
@@ -124,7 +158,9 @@ class TopK(nn.Module):
                 ``[num_requests, top_k]`` on ``scores.device``. The
                 self-sampling engine does not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
-                shape ``[num_requests]`` on the same device.
+                shape ``[num_requests]`` on the same device. ``gvr_pdl``,
+                ``gvr_r_cap`` and ``gvr_finalize`` (``done`` set once the launch
+                ran it) are the self-sampling decode's ``run_varlen`` options.
             radix_aux_indices: Caller-owned int32 workspace for native CUDA
                 Radix split work.
             radix_aux_logits: Caller-owned float32 workspace for native CUDA
@@ -168,6 +204,21 @@ class TopK(nn.Module):
         if self.prefill_implementation == TopKImplementation.CUTE_DSL_GVR:
             # hint-free k derives from the output width; pin it to the module's k
             assert output_indices.shape[1] == self.top_k
+            if (
+                self.gvr_self_sampling
+                and self.gvr_deterministic
+                and scores.dtype in (torch.bfloat16, torch.float16)
+            ):
+                # The deterministic engine is FP32-only, as in decode. Widening before
+                # the format gate keeps every 16-bit layout on that engine (the copy
+                # is float4-aligned).
+                logger.warning_once(
+                    "deterministic self-sampling GVR prefill top-K received "
+                    f"{scores.dtype} scores; widening them to FP32 for the "
+                    "deterministic engine (one FP32 copy of the scores per call).",
+                    key="selfsampling_topk_prefill_det_low_precision_widen",
+                )
+                scores = _widen_to_fp32(scores)
             if not self.gvr_self_sampling:
                 # the temporal (hint) GVR engine has no prefill form
                 logger.warning_once(
@@ -213,7 +264,7 @@ class TopK(nn.Module):
                     return output_indices
             else:
                 # engine hardware-format gate missed (e.g. a non-fp4 layer with
-                # an odd DeepGEMM width, or a bf16 producer): exact radix.
+                # an odd DeepGEMM width): exact radix.
                 logger.warning_once(
                     "self-sampling GVR prefill is selected but the scores do "
                     "not satisfy the engine's hardware-format gate "
@@ -236,6 +287,9 @@ class TopK(nn.Module):
             raise NotImplementedError(
                 f"{self.prefill_implementation.value} does not support prefill Top-K"
             )
+        if scores.dtype in (torch.bfloat16, torch.float16):
+            # the CUDA radix prefill kernel reads FP32 scores only
+            scores = _widen_to_fp32(scores)
         torch.ops.trtllm.indexer_topk_prefill(
             scores,
             row_starts,
@@ -246,17 +300,23 @@ class TopK(nn.Module):
         return output_indices
 
     def _selfsampling_prefill_ok(self, scores: torch.Tensor) -> bool:
-        """Engine format gate: fp32 row-major scores with a float4-aligned row
-        stride and a 16B base (the DeepGEMM prefill logits arena)."""
+        """Engine format gate: fp32/bf16/fp16 row-major scores with a 16B-aligned
+        row stride and base (the DeepGEMM prefill logits arena); the 16-bit
+        engine needs K >= 8."""
         return (
-            scores.dtype == torch.float32
+            scores.dtype in _SELFSAMPLING_DTYPES
             and scores.stride(1) == 1
-            and scores.stride(0) % 4 == 0
+            and scores.stride(0) % (16 // scores.element_size()) == 0
             and scores.data_ptr() % 16 == 0
+            and (scores.dtype == torch.float32 or self.top_k >= 8)
         )
 
     @staticmethod
     def _prefill_capturing(scores: torch.Tensor) -> bool:
+        return scores.is_cuda and torch.cuda.is_current_stream_capturing()
+
+    @staticmethod
+    def _decode_capturing(scores: torch.Tensor) -> bool:
         return scores.is_cuda and torch.cuda.is_current_stream_capturing()
 
     def _forward_decode(
@@ -341,6 +401,8 @@ class TopK(nn.Module):
                 output_indices,
                 self.top_k,
                 next_n,
+                **({"wide_fp32_rows": True} if self.wide_fp32_rows else {}),
+                **({"split_long_rows": True} if self.split_long_rows else {}),
             )
             return output_indices
 
@@ -392,58 +454,111 @@ class TopK(nn.Module):
         radix_aux_logits: torch.Tensor | None,
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
+        gvr_pdl: bool = False,
+        gvr_r_cap: int = 0,
+        gvr_finalize: dict | None = None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and self.gvr_self_sampling:
             assert max_seq_len is not None
+            alignment_elements = 16 // scores.element_size()
             if (
                 # engine hardware-format gate (falls through otherwise):
-                # fp32 row-major scores with a float4-aligned row stride and
-                # a 16B-aligned base (the DSL paged-MQA arena view — column-
-                # sliced from a 256-aligned buffer — satisfies this; odd
-                # max_seq_len DeepGEMM layouts do not). Single-row batches
-                # derive their row window from shape[1] (arena last-row
-                # safety), so that width must satisfy the same float4 rule —
-                # otherwise run_varlen raises instead of falling through.
-                scores.dtype == torch.float32
+                # fp32/bf16/fp16 row-major scores with a 16B-aligned row stride
+                # and base. Single-row batches derive their row window from
+                # shape[1] (arena last-row safety), so that width must also
+                # satisfy the alignment rule; otherwise run_varlen raises
+                # instead of falling through.
+                scores.dtype in _SELFSAMPLING_DTYPES
                 and scores.stride(1) == 1
-                and scores.stride(0) % 4 == 0
+                and scores.stride(0) % alignment_elements == 0
                 and scores.data_ptr() % 16 == 0
-                and (scores.shape[0] > 1 or scores.shape[1] % 4 == 0)
+                and (scores.shape[0] > 1 or scores.shape[1] % alignment_elements == 0)
             ):
                 # hint-free k derives from the output width; pin it to the module's k
                 assert output_indices.shape[1] == self.top_k
-                from ..kernels.blackwell.top_k import selfsampling_topk_run_varlen
-
-                logger.info_once(
-                    "self-sampling GVR top-K engaged "
-                    f"(K={self.top_k}, cr={self.compress_ratio}, "
-                    f"next_n={next_n}, hint-free).",
-                    key="selfsampling_topk_engaged",
+                from ..kernels.blackwell.top_k import (
+                    selfsampling_topk_run_varlen,
+                    selfsampling_topk_varlen_ready,
                 )
-                # Self-sampling GVR varlen engine:
-                # one launch for the batch; per-row n from device kv_lens,
-                # capture-stable tuning from the max-seq-len engine constant
-                # (no host reads — CUDA-graph safe). The module receives
-                # max_seq_len in compressed index space; run_varlen's value
-                # is in KV-token space like sequence_lengths, so multiply it
-                # back by the compression ratio.
-                selfsampling_topk_run_varlen(
+
+                if self.gvr_deterministic and scores.dtype is not torch.float32:
+                    # The deterministic engine is FP32-only. Widen the 16-bit
+                    # scores so the requested selection and order semantics
+                    # hold; the 16-bit gate above (8-element row stride,
+                    # 8-element single-row width) implies the FP32 alignment
+                    # rule for the widened view, which keeps the row stride
+                    # the launcher key (and the FP32 warmup) uses.
+                    logger.warning_once(
+                        "deterministic self-sampling GVR top-K received "
+                        f"{scores.dtype} scores; widening them to FP32 for the "
+                        "deterministic engine (one FP32 copy of the scores per call).",
+                        key="selfsampling_topk_det_low_precision_widen",
+                    )
+                    scores = _widen_to_fp32(scores, keep_row_stride=True)
+                # The module receives max_seq_len in compressed index space;
+                # run_varlen's value is in KV-token space like sequence_lengths,
+                # so multiply it back by the compression ratio.
+                kv_max_seq_len = max_seq_len * self.compress_ratio
+                if self._decode_capturing(scores) and not selfsampling_topk_varlen_ready(
                     scores,
-                    sequence_lengths,
                     output_indices,
                     next_n=next_n,
                     compress_ratio=self.compress_ratio,
-                    max_seq_len=max_seq_len * self.compress_ratio,
-                    **self._gvr_det_kwargs,
+                    max_seq_len=kv_max_seq_len,
+                    **({"deterministic": True} if self.gvr_deterministic else {}),
+                    **({"wide_cta_rows": True} if self.wide_cta_rows else {}),
+                    **({"pdl": True} if gvr_pdl else {}),
+                    **({"r_cap": gvr_r_cap} if gvr_r_cap else {}),
+                ):
+                    # the engine never JIT-compiles under capture; a launcher
+                    # missed by warmup takes the exact radix path in the graph
+                    logger.warning_once(
+                        "self-sampling GVR decode engine is not compiled for this "
+                        "shape and cannot JIT under CUDA graph capture; using the "
+                        "CUDA radix decode Top-K"
+                        + (
+                            ", which does not apply the deterministic selection, order or sorting."
+                            if self.gvr_deterministic
+                            else "."
+                        ),
+                        key="selfsampling_topk_decode_capture_radix",
+                    )
+                else:
+                    logger.info_once(
+                        "self-sampling GVR top-K engaged "
+                        f"(K={self.top_k}, cr={self.compress_ratio}, "
+                        f"next_n={next_n}, hint-free).",
+                        key="selfsampling_topk_engaged",
+                    )
+                    # Self-sampling GVR varlen engine: one launch for the batch;
+                    # per-row n from device kv_lens, capture-stable tuning from
+                    # the max-seq-len engine constant (no host reads).
+                    selfsampling_topk_run_varlen(
+                        scores,
+                        sequence_lengths,
+                        output_indices,
+                        next_n=next_n,
+                        compress_ratio=self.compress_ratio,
+                        max_seq_len=kv_max_seq_len,
+                        **self._gvr_det_kwargs,
+                        **({"wide_cta_rows": True} if self.wide_cta_rows else {}),
+                        **({"pdl": True} if gvr_pdl else {}),
+                        **({"r_cap": gvr_r_cap} if gvr_r_cap else {}),
+                        **({"finalize": gvr_finalize} if gvr_finalize is not None else {}),
+                    )
+                    return output_indices
+            else:
+                logger.warning_once(
+                    "self-sampling GVR is selected but the decode scores do not "
+                    "satisfy the engine's hardware-format gate "
+                    f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
+                    "falling back to the CUDA insertion/radix Top-K path.",
+                    key="selfsampling_topk_fallthrough",
                 )
-                return output_indices
-            logger.warning_once(
-                "self-sampling GVR is selected but the decode scores do not "
-                "satisfy the engine's hardware-format gate "
-                f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
-                "falling back to the CUDA insertion/radix Top-K path.",
-                key="selfsampling_topk_fallthrough",
-            )
+            if scores.dtype in (torch.bfloat16, torch.float16) and (
+                scores.shape[1] >= _RADIX_16BIT_MAX_COLUMNS
+            ):
+                scores = _widen_to_fp32(scores)
             radix_indices, radix_values = self._get_radix_workspace(
                 scores, radix_aux_indices, radix_aux_logits
             )

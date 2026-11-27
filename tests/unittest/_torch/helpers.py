@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 from typing import Dict, Optional, Tuple
 
+import pytest
 import torch
 import torch.nn.functional as F
 import triton
@@ -100,6 +102,8 @@ def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
         bits_in_type = 8
     elif weight_dtype == torch.quint4x2:
         bits_in_type = 4
+    else:
+        raise ValueError(f"Unsupported weight dtype: {weight_dtype}")
     quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
     max_val = torch.max(abs(x)).item()
     atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
@@ -346,3 +350,142 @@ def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
     sampled = temperatures >= greedy_threshold
     return torch.where(sampled, scores.argmax(-1),
                        logits.float().argmax(-1)).to(torch.int32)
+
+
+@triton.jit
+def _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, cols, u, inv_t):
+    ok = cols < vocab
+    x = tl.load(logits_ptr + row * vocab + cols, mask=ok,
+                other=0.0).to(tl.float32)
+    u = tl.minimum(tl.maximum(u, 1e-12), 0.99999994)
+    tl.store(out_ptr + row * vocab + cols,
+             x * inv_t - tl.log(-tl.log(u)),
+             mask=ok)
+
+
+@triton.jit
+def _fast_gumbel_scores_kernel(logits_ptr, temp_ptr, seed_ptr, out_ptr, vocab,
+                               BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    n = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    u0, u1, u2, u3 = tl.rand4x(tl.load(seed_ptr), row * (vocab // 4) + n)
+    inv_t = 1.0 / tl.load(temp_ptr + row).to(tl.float32)
+    # Entry 4 * n + j takes Philox word (0, 2, 1, 3)[j].
+    _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, 4 * n, u0, inv_t)
+    _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, 4 * n + 1, u2, inv_t)
+    _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, 4 * n + 2, u1, inv_t)
+    _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, 4 * n + 3, u3, inv_t)
+
+
+def fast_gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
+                              seed: torch.Tensor,
+                              greedy_threshold: float) -> torch.Tensor:
+    """As ``gumbel_max_reference`` with the noise of ``TPKeyExchange``'s
+    ``fast_gumbel`` kernel: entry ``4 * n + j`` of ``row`` takes word
+    ``(0, 2, 1, 3)[j]`` of ``philox(seed, row * vocab / 4 + n)``, scaled logits
+    ``x * (1 / T)``."""
+    rows, vocab = logits.shape
+    assert vocab % 4 == 0
+    scores = torch.empty((rows, vocab),
+                         dtype=torch.float32,
+                         device=logits.device)
+    block = 256
+    grid = (rows, triton.cdiv(vocab // 4, block))
+    _fast_gumbel_scores_kernel[grid](logits.contiguous(),
+                                     temperatures,
+                                     seed,
+                                     scores,
+                                     vocab,
+                                     BLOCK=block)
+    sampled = temperatures >= greedy_threshold
+    return torch.where(sampled, scores.argmax(-1),
+                       logits.float().argmax(-1)).to(torch.int32)
+
+
+def triton_num_compiled(kernel) -> int:
+    """Specializations of a ``triton.jit`` kernel compiled in this process.
+
+    A launch that raises the count compiled a new variant of the kernel. Skips
+    the calling test when this Triton does not expose the per-device caches.
+    """
+    caches = getattr(kernel, "device_caches", None)
+    if caches is None:
+        pytest.skip("this Triton has no JITFunction.device_caches")
+    return sum(len(cache[0]) for cache in caches.values())
+
+
+@triton.jit
+def _late_copy_kernel(src_ptr, dst_ptr, n, delay_ns, BLOCK: tl.constexpr):
+    # Releases its PDL dependents at entry, then copies after ~delay_ns.
+    tl.extra.cuda.gdc_launch_dependents()
+    t0 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;",
+                                   "=l", [],
+                                   dtype=tl.int64,
+                                   is_pure=False,
+                                   pack=1)
+    t = t0
+    while t - t0 < delay_ns:
+        t = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;",
+                                      "=l", [],
+                                      dtype=tl.int64,
+                                      is_pure=False,
+                                      pack=1)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)
+
+
+def late_copy(src: torch.Tensor, dst: torch.Tensor, delay_ns: int) -> None:
+    """``dst.copy_(src)`` by a one-program kernel that releases a PDL-launched
+    successor at entry and stores ``dst`` only ~``delay_ns`` later: a
+    successor that reads ``dst`` before its griddepcontrol.wait sees the old
+    values."""
+    assert src.is_contiguous() and dst.is_contiguous()
+    assert src.dtype == dst.dtype and src.numel() == dst.numel()
+    _late_copy_kernel[(1, )](src,
+                             dst,
+                             src.numel(),
+                             delay_ns,
+                             BLOCK=triton.next_power_of_2(src.numel()))
+
+
+def chi_square(counts: torch.Tensor,
+               probs: torch.Tensor,
+               z: float = 5.0) -> Tuple[float, float]:
+    """Pearson statistic of ``counts`` against ``probs`` and its critical value
+    at ``z`` standard deviations (Wilson-Hilferty; z = 5 rejects a correct
+    sampler with probability 3e-7).
+
+    Tokens of at least 5 expected draws keep their own bin. The others are
+    grouped in index order into consecutive bins of at least 5 expected draws
+    each (a short tail joins the last group), so a nearly uniform
+    distribution over many tokens is still tested on many bins.
+    """
+    expected = probs.double() * counts.sum()
+    big = expected >= 5
+    obs, exp = list(counts[big].double().tolist()), list(expected[big].tolist())
+    group_obs = group_exp = 0.0
+    small_obs, small_exp = [], []
+    for o, e in zip(counts[~big].double().tolist(), expected[~big].tolist()):
+        group_obs += o
+        group_exp += e
+        if group_exp >= 5:
+            small_obs.append(group_obs)
+            small_exp.append(group_exp)
+            group_obs = group_exp = 0.0
+    if small_exp:
+        small_obs[-1] += group_obs
+        small_exp[-1] += group_exp
+    elif exp:
+        obs[-1] += group_obs
+        exp[-1] += group_exp
+    else:
+        small_obs, small_exp = [group_obs], [group_exp]
+    obs = torch.tensor(obs + small_obs, dtype=torch.float64)
+    exp = torch.tensor(exp + small_exp, dtype=torch.float64)
+    stat = float(((obs - exp)**2 / exp).sum())
+    dof = obs.numel() - 1
+    if dof == 0:  # a single bin holds every draw: nothing to test
+        return stat, 1.0
+    crit = dof * (1 - 2 / (9 * dof) + z * math.sqrt(2 / (9 * dof)))**3
+    return stat, crit

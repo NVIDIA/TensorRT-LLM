@@ -207,6 +207,7 @@ def _executor(monkeypatch, pp_size: int) -> PyExecutor:
     executor.resource_manager = SimpleNamespace(resource_managers={})
     executor.virtual_memory_pools = None
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
     return executor
 
 

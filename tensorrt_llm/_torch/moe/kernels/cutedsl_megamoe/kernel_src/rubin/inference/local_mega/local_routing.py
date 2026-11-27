@@ -18,13 +18,7 @@ from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dsl_helpers import mark_alignment
 from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.iket_compat import iket
-from .....helpers.ptx_helpers import (
-    cp_async_bulk_s2g,
-    nanosleep,
-    stg_b64,
-    stg_f32,
-    tma_load_1d,
-)
+from .....helpers.ptx_helpers import cp_async_bulk_s2g, nanosleep, stg_b64, stg_f32, tma_load_1d
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.software_sync import SoftwareGridSync
 from .....helpers.utils import ceil_div, round_up

@@ -127,6 +127,64 @@ def save_mooncake_worker_config(worker_config, log_dir, role, instance_id):
     return config_path
 
 
+#: Rendezvous directory of the KV cache manager v2 remote level, under log_dir.
+REMOTE_CACHE_DIR_NAME = 'kvcm2_remote'
+
+
+def resolve_remote_cache(worker_config: Dict[str, Any],
+                         num_ranks: Dict[str, int], directory: str) -> None:
+    """Fill the job-wide fields of the KV cache remote level from the layout.
+
+    Each role's kv_cache_config.remote_cache_config gets the job's rendezvous
+    directory; a role with a `level` also gets `level.expected`: the number of
+    donating ranks and the bytes all ranks with a level claim, which only the
+    launcher can count. The claim is the sum of level.size: ranks round each
+    layer group up to whole chunks, which the launcher cannot see, so a claim
+    that runs out stops once every expected donor has reported. An explicit
+    `level.expected` is left alone.
+
+    Args:
+        worker_config: {'ctx': ..., 'gen': ...} worker configs, edited in place.
+        num_ranks: {'ctx': ..., 'gen': ...} ranks of each role in the job.
+        directory: Rendezvous directory to use when none is set.
+
+    Raises:
+        ValueError: Roles sharing a directory set different transports.
+    """
+    remote = {}
+    for role in ('ctx', 'gen'):
+        kv_cache_config = worker_config[role].get('kv_cache_config') or {}
+        if kv_cache_config.get('remote_cache_config'):
+            remote[role] = kv_cache_config['remote_cache_config']
+            remote[role].setdefault('directory', directory)
+    # Donors and claims are counted per rendezvous directory, whose ranks must
+    # share one transport: a client passes over donors of another transport.
+    by_directory = {}
+    for role, config in remote.items():
+        by_directory.setdefault(config['directory'], []).append(role)
+    for shared, roles in by_directory.items():
+        transports = {
+            role: (remote[role].get('transport') or {}).get('kind', 'nixl')
+            for role in roles
+        }
+        if len(set(transports.values())) > 1:
+            raise ValueError(
+                f"remote_cache_config of roles {', '.join(roles)} share "
+                f"directory {shared!r} with different transports {transports}; "
+                "use one transport, or a directory per role")
+        num_donors = sum(num_ranks[role] for role in roles
+                         if remote[role].get('donor'))
+        claim_size = sum(num_ranks[role] * remote[role]['level']['size']
+                         for role in roles if remote[role].get('level'))
+        for role in roles:
+            level = remote[role].get('level')
+            if level and num_donors and 'expected' not in level:
+                level['expected'] = {
+                    'num_donors': num_donors,
+                    'claim_size': claim_size
+                }
+
+
 def calculate_nodes(world_size, num_servers, gpus_per_node):
     """Required node count under per-worker whole-node ownership.
 
@@ -228,9 +286,21 @@ def allocate_gpus(
     return allocations
 
 
-def convert_allocations_to_server_config(allocations,
-                                         server_port=8333,
-                                         router_config=None):
+# Router options of pooled generation dispatch; a context router rejects them.
+GEN_ONLY_ROUTER_KEYS = ("max_requests_per_server", "max_queue_wait_s")
+
+
+def convert_allocations_to_server_config(
+        allocations: dict,
+        server_port: int = 8333,
+        router_config: dict | None = None,
+        ctx_cache_transceiver_config: dict | None = None) -> dict:
+    """Build the disaggregated server config.
+
+    ``router_config`` applies to both roles, without its generation-only keys for the context
+    servers. The context workers' ``kv_transfer_timeout_ms`` (from
+    ``ctx_cache_transceiver_config``, null included) bounds the pooled generation wait.
+    """
     generation_servers = {}
     context_servers = {}
     server_hostname = None
@@ -246,6 +316,15 @@ def convert_allocations_to_server_config(allocations,
         server_config_entry = {'num_instances': num_servers, 'urls': urls}
         if router_config:
             server_config_entry['router'] = router_config.copy()
+            if server_type == "CTX":
+                for key in GEN_ONLY_ROUTER_KEYS:
+                    server_config_entry['router'].pop(key, None)
+        if (server_type == "CTX" and ctx_cache_transceiver_config
+                and 'kv_transfer_timeout_ms' in ctx_cache_transceiver_config):
+            server_config_entry['cache_transceiver_config'] = {
+                'kv_transfer_timeout_ms':
+                ctx_cache_transceiver_config['kv_transfer_timeout_ms']
+            }
 
         if server_type == "GEN":
             generation_servers = server_config_entry
@@ -639,6 +718,10 @@ def submit_job(config, log_dir, dry_run):
                                               mooncake_pool_file)
     gen_uses_mooncake = resolve_mooncake_pool(worker_config['gen'],
                                               mooncake_pool_file)
+    resolve_remote_cache(worker_config, {
+        'ctx': ctx_num * ctx_world_size,
+        'gen': gen_num * gen_world_size
+    }, os.path.join(log_dir, REMOTE_CACHE_DIR_NAME))
     save_worker_config(worker_config['ctx'], ctx_config_path)
     save_worker_config(worker_config['gen'], gen_config_path)
 
@@ -658,7 +741,10 @@ def submit_job(config, log_dir, dry_run):
     # Generate disagg server config
     router_config = config.get('router_config', None)
     server_config = convert_allocations_to_server_config(
-        allocations, router_config=router_config)
+        allocations,
+        router_config=router_config,
+        ctx_cache_transceiver_config=worker_config['ctx'].get(
+            'cache_transceiver_config'))
     # Merge server_config_extra into disagg server config
     if 'server_config_extra' in config:
         server_config.update(config['server_config_extra'])

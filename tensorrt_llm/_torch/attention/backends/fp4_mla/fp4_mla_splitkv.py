@@ -3,7 +3,6 @@
 """Device-updated split-KV adapter for the CuTeDSL FP4 MLA backends."""
 
 import math
-import os
 from types import ModuleType
 from typing import Any
 
@@ -11,7 +10,9 @@ import torch
 import triton
 import triton.language as tl
 
-_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
+from .config import _FP4_MLA_SPLIT_KV_ENV as _SPLIT_KV_ENV
+from .config import _fp4_mla_split_kv_override
+
 _MAX_PARTITION_TOKENS = 160 * 1024
 
 
@@ -21,7 +22,7 @@ def select_split_count(max_kv_len: int) -> int:
     The environment override is an internal testing/tuning control. The default
     long-context size is conservative and has not been performance tuned.
     """
-    value = os.getenv(_SPLIT_KV_ENV, "auto")
+    value = _fp4_mla_split_kv_override()
     if value == "auto":
         if max_kv_len <= _MAX_PARTITION_TOKENS:
             return 1
@@ -93,21 +94,6 @@ def _partition_pages_kernel(
             tl.store(dst_indptr + task + 1, (task + 1) * PARTITION_PAGES)
 
 
-@triton.jit
-def _scale_row_max_kernel(
-    maxima,
-    q_scale,
-    kv_scale,
-    COUNT: tl.constexpr,
-    SOFTMAX_SCALE_LOG2: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    scale = SOFTMAX_SCALE_LOG2 / (tl.load(q_scale) * tl.load(kv_scale))
-    values = tl.load(maxima + offsets, offsets < COUNT, other=0)
-    tl.store(maxima + offsets, values * scale, offsets < COUNT)
-
-
 def run_fp4_mla_splitkv(
     module: ModuleType,
     metadata: Any,
@@ -137,12 +123,12 @@ def run_fp4_mla_splitkv(
     TRTLLM swizzle for the same rows. Output is [queries, 1-128, 512], FP16/BF16.
     KV lengths include the final query of each uniform linear-MTP request.
     Workspace is owned by metadata and must be warmed before graph capture.
-    Each graph bucket reserves only its fixed query count; eager metadata
-    reserves the configured query capacity for reuse across batch sizes.
+    The workspaces retain metadata ownership and reserve the configured query
+    capacity before capture.
     All input replication and partition planning execute on the current stream
     on every invocation; graph replay therefore consumes the current inputs.
     """
-    from .fp4_mla_splitkv_reduce import fp4_mla_split_kv_reduce
+    from .fp4_mla_splitkv_vector import reduce_splitkv_vector
     from .layout import _ensure_workspace_tensor
 
     queries, output_heads, value_dim = output.shape
@@ -154,7 +140,8 @@ def run_fp4_mla_splitkv(
     if q_batch_capacity < queries:
         raise ValueError("Q capacity must cover the active query count")
     tasks = splits * queries
-    workspace_queries = queries if getattr(metadata, "is_cuda_graph", False) else q_batch_capacity
+    # Reserve per-forward scratch for the Q capacity before capture.
+    workspace_queries = q_batch_capacity
     task_capacity = splits * workspace_queries
     if splits < 2 or tasks > 65535:
         raise ValueError(f"split-KV requires splits >= 2 and <= 65535 tasks, got {tasks}")
@@ -182,15 +169,15 @@ def run_fp4_mla_splitkv(
         raise ValueError("split-KV inputs must be contiguous on the output device")
 
     def workspace(name: str, count: int, capacity: int, dtype: torch.dtype) -> torch.Tensor:
-        # Graph buckets own separate metadata and have fixed query counts.
-        # Avoid reserving the full engine capacity independently in each bucket.
-        # Eager metadata still reserves capacity to reuse storage across batches.
+        # Views of the shared, capacity-sized scratch (layout._ensure_workspace_tensor).
         return _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_splitkv_" + name,
             (capacity,),
             dtype=dtype,
             device=output.device,
+            shared=True,
+            capacity_numel=capacity,
         )[:count]
 
     repeated_q = workspace("q", tasks * heads * 320, task_capacity * heads * 320, torch.uint8)
@@ -259,40 +246,16 @@ def run_fp4_mla_splitkv(
     )
     # These tiles cover the small-head TEP and full-head DEP decode shapes.
     default_columns = 512 if output_heads >= 96 else (128 if queries >= 24 else 256)
-    vector_columns = getattr(metadata, "_fp4_mla_splitkv_reduce_tile", default_columns)
-    if vector_columns:
-        from .fp4_mla_splitkv_vector import reduce_splitkv_vector
-
-        reduce_splitkv_vector(
-            partial,
-            maxima,
-            sums,
-            output,
-            q_global_scale,
-            kv_global_scale,
-            splits=splits,
-            queries=queries,
-            softmax_scale_log2=sm_scale * math.log2(math.e),
-            output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
-            tile_columns=vector_columns,
-        )
-        return
-
-    # Read global scales on the device so their values need no host sync and
-    # may change between graph replays. The existing reducer then uses scale=1.
-    _scale_row_max_kernel[(triton.cdiv(maxima.numel(), 256),)](
+    reduce_splitkv_vector(
+        partial,
         maxima,
+        sums,
+        output,
         q_global_scale,
         kv_global_scale,
-        maxima.numel(),
-        sm_scale * math.log2(math.e),
-        256,
-    )
-    fp4_mla_split_kv_reduce(
-        partial.view(splits, queries, heads, value_dim)[:, :, :output_heads].permute(0, 2, 3, 1),
-        maxima.view(splits, queries, heads)[:, :, :output_heads].permute(0, 2, 1),
-        sums.view(splits, queries, heads)[:, :, :output_heads].permute(0, 2, 1),
-        output.permute(1, 2, 0),
-        softmax_scale_log2=1.0,
+        splits=splits,
+        queries=queries,
+        softmax_scale_log2=sm_scale * math.log2(math.e),
         output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
+        tile_columns=getattr(metadata, "_fp4_mla_splitkv_reduce_tile", None) or default_columns,
     )

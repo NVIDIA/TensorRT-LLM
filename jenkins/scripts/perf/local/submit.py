@@ -32,6 +32,7 @@ from benchmark_utils import (  # noqa: E402
     DISAGG_BENCHMARK_MODES,
     DISAGG_CONFIG_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    add_eplb_shm_mount,
     ctx_only_world_size,
     dwdp_ctx_layout,
     dwdp_ctx_size,
@@ -573,7 +574,9 @@ def generate_sbatch_params(args, hardware_config, work_dir):
     return lines
 
 
-def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_config=None):
+def generate_srun_args(
+    args, runtime_mode, timestamp, llm_src="", hardware_config=None, config=None
+):
     """Generate srun arguments."""
     is_aggr = runtime_mode == "aggregated"
     container_name = f"{'aggr' if is_aggr else 'disagg'}_test-{timestamp}"
@@ -591,6 +594,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
     if llm_src and llm_src not in mounts:
         llm_src_mount = f"{llm_src}:{llm_src}"
         mounts = f"{mounts},{llm_src_mount}" if mounts else llm_src_mount
+    mounts = add_eplb_shm_mount(mounts, config, llm_src)
     if mounts:
         lines.append(f"--container-mounts={mounts}")
 
@@ -961,7 +965,9 @@ def main():
     sbatch_lines = generate_sbatch_params(args, hardware_config, work_dir)
 
     # Generate srun args
-    srun_args_lines = generate_srun_args(args, runtime_mode, timestamp, llm_src, hardware_config)
+    srun_args_lines = generate_srun_args(
+        args, runtime_mode, timestamp, llm_src, hardware_config, config
+    )
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
@@ -1011,15 +1017,10 @@ def main():
         if _kv:
             script_prefix_lines.append(f"export {_kv}")
 
-    # Also splice EXTRA_CONTAINER_EXPORTS *inline* into the per-role env prefixes
-    # built below. Aggregated ranks inherit these from the container env, but
-    # disaggregated ctx/gen/benchmark workers are launched with a curated inline
-    # env prefix (TLLM_PROFILE_START_STOP, FLASHINFER_JIT_DIR, HF_HOME, ...) and
-    # anything not on that prefix -- nor in the srun --container-env allowlist --
-    # is dropped at the worker boundary. Putting the same KEY=VALUE pairs inline
-    # guarantees opt-in passthroughs (e.g. cache-dir overrides, BOLT
-    # clear-counters env, BOLT_ITER_MULT) reach every disagg role. Values here are
-    # simple (no spaces); generic and a no-op when EXTRA_CONTAINER_EXPORTS unset.
+    # Repeat EXTRA_CONTAINER_EXPORTS in each role's command prefix so these
+    # values are applied immediately before launching the command. Other exported
+    # variables still inherit normally; an inline prefix is not an allowlist.
+    # Values here are simple (no spaces); unset means no additional assignments.
     _extra_inline_exports = " ".join(
         _kv.strip()
         for _kv in os.environ.get("EXTRA_CONTAINER_EXPORTS", "").split(";")
@@ -1250,9 +1251,8 @@ def main():
                 f"export testOutputDir={test_output_dir}",
             ]
         )
-        # Forward pytestCommand into the pyxis container on every rank (matches the
-        # disagg branch's --container-env=pytestCommand). Without this, exports
-        # in the launch script don't survive the container boundary on multi-node.
+        # Exported job variables inherit by default. This requests priority for
+        # pytestCommand over a same-named container value; it is not an allowlist.
         srun_args_lines.append("--container-env=pytestCommand")
 
     # Export accuracy config to BENCHMARK node (disagg only)

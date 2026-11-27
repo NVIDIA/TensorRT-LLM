@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,24 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace detail
+{
+
+struct TrtllmGenMaskSelection
+{
+    TrtllmGenAttentionMaskType maskType;
+    int32_t leftSlidingWindow = -1;
+    int32_t rightSlidingWindow = -1;
+    int32_t chunkedAttentionSize = 0;
+};
+
+TrtllmGenMaskSelection selectTrtllmGenMask(ContextAttentionMaskType attentionMaskType, int32_t slidingWindowSize,
+    int32_t chunkedAttentionSize, int32_t kvSeqLen);
+
+} // namespace detail
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -95,8 +95,8 @@ def plan_decoder_replay(
     """Prepare local decoder rows before the input-preparation count exchange.
 
     ADP keeps identity plans so every peer can adopt the exchanged Decoder
-    counts. This function performs no communication. Private decoder recovery
-    still applies its SWA floor when all local rows are kept.
+    counts. This function performs no communication. Final-window replay and
+    private decoder recovery apply their SWA floors even when all rows are kept.
     """
     if metadata.is_cuda_graph or window <= 0:
         return None
@@ -166,7 +166,7 @@ def plan_decoder_replay(
     # Generation and speculative verification rows keep their live endpoints
     # and every query; their cached counts must agree with the KV manager.
     compact_local = replay_lens != host_seq_lens
-    updates_local_metadata = compact_local or updates_private_metadata
+    updates_local_metadata = compact_local or updates_private_metadata or any(floors)
     if not attention_dp and not updates_local_metadata:
         return None
 
@@ -254,6 +254,8 @@ def enter_decoder_replay(
     if first_layer is not None:
         metadata.set_decoder_query_boundary(first_layer)
     metadata.prepare()
+    if getattr(metadata, "_csa2_pending_prepare", None) is not None:
+        metadata._prepare_deferred()
     metadata.kv_lens_cuda[: metadata.num_seqs].copy_(live_kv_lens)
     metadata.on_update_kv_lens()
     metadata.csa2_precomputed_kv_layers = precomputed

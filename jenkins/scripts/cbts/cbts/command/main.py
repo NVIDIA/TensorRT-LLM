@@ -18,7 +18,7 @@ Modes:
   python3 -m cbts.command main --list-needed-diffs
       Print the union of rules' `needs_diff_for` patterns, one per line.
   python3 -m cbts.command main INPUT_JSON
-      INPUT_JSON: {changed_files: [...], diffs: {path: diff}, post_merge: bool}.
+      INPUT_JSON: {changed_files: [...], diffs: {path: diff}}.
       Stages are parsed from jenkins/L0_Test.groovy; YAMLs from
       tests/integration/test_lists/test-db/. Decision JSON goes to stdout
       with keys: scope, affected_stages, reasons, test_db_dir_override,
@@ -39,7 +39,6 @@ from typing import Optional
 import click
 
 from cbts.blocks import (
-    ALWAYS_RUN_STAGE_PREFIX,
     Stage,
     YAMLIndex,
     compute_stage_split_counts,
@@ -73,7 +72,7 @@ from cbts.rules.visual_gen import VisualGenRule
 from cbts.rules.waives import WaivesRule
 
 # Files the coverage tier maps to qualnames; without their diffs it stays file-level.
-COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("tensorrt_llm/**/*.py",)
+COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("**/*.py",)
 
 # --- Rule registry -----------------------------------------------------------
 
@@ -209,6 +208,8 @@ def _coverage_decline_category(reason: str) -> str:
         ("a rule forced fallback", "rule_forced_fallback"),
         ("no residual", "no_residual"),
         ("non-core-Python residual file", "non_core_python"),
+        ("non-Python residual file", "non_python"),
+        ("shared test infrastructure change", "shared_test_infrastructure"),
         ("zero-touch residual file", "zero_touch"),
         ("no usable diff", "no_usable_diff"),
         ("import-executed change", "import_executed"),
@@ -236,6 +237,7 @@ def _rule_reason(rule, r) -> dict:
 # combines to a single "testsonly" scope rather than falling back.
 _TESTSONLY_FAMILY: frozenset[str] = frozenset(
     {
+        "testsonly",
         "waiveonly",
         "testdefonly",
         "testlistonly",
@@ -397,7 +399,6 @@ def _load_pr_inputs(input_json_path: Path, repo_root: Path) -> PRInputs:
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,
-        post_merge=bool(data.get("post_merge", False)),
         raw_diffs=raw_diffs,
         docstring_files=docstring_files,
         docstring_only_files=docstring_only_files,
@@ -527,8 +528,7 @@ def _run(args: _Args) -> int:
         return 2
 
     yaml_index = YAMLIndex.load(test_db_dir)
-    # Include post-merge stages; the trigger-mode filter below selects the
-    # subset matching the user's flag.
+    # Return candidates from every stage; Groovy applies the command-selected scope.
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path, repo_root)
     rules = build_rules(yaml_index, stages, repo_root)
@@ -640,23 +640,7 @@ def _run(args: _Args) -> int:
             durations=durations,
         )
 
-    # Added before the trigger-mode filter, and outside the counts Layer 2.5 resizes.
-    if result.scope is not None:
-        result.affected_stages |= {s for s in stages if s.startswith(ALWAYS_RUN_STAGE_PREFIX)}
-
-    # Trigger-mode filter; recompute derived counts. pre-merge drops Post-Merge
-    # stages; post-merge keeps both (adds Post-Merge on top, matching baseline).
-    pre_filter_stages = set(result.affected_stages)
-    if not pr.post_merge:
-        result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" not in s}
-    result.affected_stage_test_counts = {
-        k: v for k, v in result.affected_stage_test_counts.items() if k in result.affected_stages
-    }
-    result.affected_stage_split_counts = {
-        k: v for k, v in result.affected_stage_split_counts.items() if k in result.affected_stages
-    }
-
-    _log_decision_to_stderr(stages, result, pr, pre_filter_stages)
+    _log_decision_to_stderr(stages, result)
     sys.stdout.write(result.to_json())
     return 0
 
@@ -664,24 +648,13 @@ def _run(args: _Args) -> int:
 def _log_decision_to_stderr(
     stages: dict[str, Stage],
     result: SelectionResult,
-    pr: PRInputs,
-    pre_filter_stages: set[str],
 ) -> None:
     """Print the CBTS decision to stderr for Jenkins console diagnostics."""
     out = sys.stderr
-    mode = "post_merge" if pr.post_merge else "pre_merge"
-    dropped = sorted(pre_filter_stages - set(result.affected_stages))
     print("=" * 64, file=out)
-    print(f"CBTS decision (diagnostic; stderr only) [trigger mode: {mode}]:", file=out)
+    print("CBTS decision (diagnostic; stderr only):", file=out)
     print(f"  scope: {result.scope}", file=out)
     print(f"  test_db_dir_override: {result.test_db_dir_override}", file=out)
-    if dropped:
-        print(
-            f"  stages dropped by trigger-mode filter ({len(dropped)}, would run if mode flipped):",
-            file=out,
-        )
-        for s in dropped:
-            print(f"    - {s}", file=out)
     if result.reasons:
         print("  reasons:", file=out)
         for r in result.reasons:

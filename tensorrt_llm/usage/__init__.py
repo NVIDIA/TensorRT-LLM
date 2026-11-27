@@ -41,6 +41,7 @@ record_llm_initialization_failure = _usage_lib.record_llm_initialization_failure
 record_llm_initialized = _usage_lib.record_llm_initialized
 record_llm_shutdown = _usage_lib.record_llm_shutdown
 record_observed_signal = _usage_lib.record_observed_signal
+record_startup_error_category = _usage_lib.record_startup_error_category
 record_termination_observation = _usage_lib.record_termination_observation
 set_lifecycle_phase = _usage_lib.set_lifecycle_phase
 set_usage_context = _usage_lib.set_usage_context
@@ -60,6 +61,7 @@ __all__ = [
     "record_llm_initialized",
     "record_llm_shutdown",
     "record_observed_signal",
+    "record_startup_error_category",
     "record_termination_observation",
     "report_exit",
     "report_usage",

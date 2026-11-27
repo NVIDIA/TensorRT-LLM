@@ -159,6 +159,10 @@ Tiling applies to preprocessing batches with at least 256 tokens, at least 3,072
 
 Tiling can change Q/K rounding. Changing batch size across a dispatch boundary can therefore change cached K values and generated tokens. Leave the flag unset when batch-invariant results are required.
 
+### Disabling Eager Fusions
+
+`TRTLLM_QWEN3_EAGER_FUSION_DISABLED=1` turns off the fused all-reduce and RMSNorm kernels and the FP8 copies that RMSNorm writes for static FP8 layers, which can help when bisecting a numerics issue.
+
 ### Launch the TensorRT LLM Server
 
 Below is an example command to launch the TensorRT LLM server from within the container with the checkpoint that matches the configuration file you selected above.
@@ -209,6 +213,15 @@ node, plus memory for weights, loading, staging, and the operating system. The
 source system has 840 GiB of host memory per four-GPU node. A fully occupied
 four-rank node reserves 512 GiB for host KV cache. Check the remaining host-memory
 budget before increasing worker count or cache size.
+
+These profiles do not use the
+[remote KV cache level](../features/kvcache.md#remote-cache-level-in-donated-host-memory-prototype).
+If you add it, every rank with `remote_cache_config.donor.size` also holds that
+many bytes of host memory for the life of its process, on top of its
+`host_cache_size`. For example, decode ranks that donate 100 GiB each on a full
+four-rank node with 128 GiB host caches use 912 GiB, which exceeds the 840 GiB of
+the source system. Lower `host_cache_size` or `donor.size` on the donating ranks
+so that host cache plus donation fits each node's budget.
 
 Use a GB300 NVL72 system with working GPU peer access and NIXL/UCX transport.
 For workers spanning nodes, the hosts must share the required NVLink fabric and
@@ -303,6 +316,14 @@ mpirun --allow-run-as-root -np 2 --bind-to none \
     --extra-engine-args "$CONFIG_DIR/qwen3.5-gb300-agentic-decode.yaml" \
     --publish-metrics
 ```
+
+If you also enable MTP (`speculative_config`) on the prefill worker, add
+`export TRTLLM_DISAGG_ROLE=context` to the prefill shell. Ranks started by
+`trtllm-llmapi-launch` do not receive a server role, so without it the prefill
+worker reserves the GDN replay-state KV region that only decode uses. With
+`pool_ratio` set, startup then fails with `initial_pool_ratio length must match
+number of layer groups`. The profile above runs MTP on decode only and needs no
+role setting.
 
 The container runs as root; omit `--allow-run-as-root` when using a non-root user.
 The rank counts must

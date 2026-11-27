@@ -32,7 +32,9 @@ from ..operators.coverage import (
     CATALOG_TESTS_DIR,
     MODEL_OPS_DIRNAME,
     MODELING_V2_PACKAGE,
-    model_ops_tests_dir,
+    OP_MATRIX_SUFFIX,
+    collected_test_names,
+    entry_tests_dir,
 )
 
 ACCURACY_REFERENCES_DIR = "tests/integration/defs/accuracy/references"
@@ -40,7 +42,7 @@ ACCURACY_TESTS_DIR = "tests/integration/defs/accuracy"
 TEST_DB_DIR = "tests/integration/test_lists/test-db"
 
 _MODEL_OPS_IMPORT = re.compile(
-    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.models\.[a-z0-9_]+\."
+    r"tensorrt_llm\._torch\.modeling_v2\.models\.[a-z0-9_]+\."
     r"([a-z0-9_]+)\.ops\.([a-z_]+)\.([a-z0-9_]+)"
 )
 _RELATIVE_OPS_IMPORT = re.compile(r"^ops\.([a-z_]+)\.([a-z0-9_]+)")
@@ -269,18 +271,15 @@ def check_model_ops(
     return checks
 
 
-def _test_check(repo_root: Path, tests_dir: str, label: str, category: str, name: str) -> Check:
-    candidates = [
-        f"{tests_dir}/{category}/test_modeling_v2_{name}{suffix}.py"
-        for suffix in ("", "_op_matrix")
-    ]
+def _test_check(repo_root: Path, tests_dir: str, label: str, name: str) -> Check:
+    candidates = [f"{tests_dir}/{filename}" for filename in collected_test_names(name)]
     found = next((rel for rel in candidates if (repo_root / rel).is_file()), None)
     if found is None:
         return Check(name=label, passed=False, detail=f"missing: {candidates[0]}")
     test = repo_root / found
     # A multi-rank entry's collected file only launches its rank body, which
     # sits beside it as `_<name>_op_matrix.py`; the cells are driven there.
-    sources = [test, test.parent / f"_{name}_op_matrix.py"]
+    sources = [test, test.parent / f"_{name}{OP_MATRIX_SUFFIX}.py"]
 
     def drives_cells(path: Path) -> bool:
         if not path.is_file():
@@ -321,7 +320,12 @@ def check_catalog_tests(repo_root: Path, entries: Iterable[tuple[str, str]]) -> 
     are; either name satisfies the check.
     """
     return [
-        _test_check(repo_root, CATALOG_TESTS_DIR, f"test:{category}/{name}", category, name)
+        _test_check(
+            repo_root,
+            entry_tests_dir(category, name, repo_root),
+            f"test:{category}/{name}",
+            name,
+        )
         for category, name in entries
     ]
 
@@ -331,9 +335,13 @@ def check_model_op_tests(
 ) -> list[Check]:
     """Every own ``ops/`` entry has its GPU test under the target's mirror of the tests tree."""
     own = Path(target_rel.rstrip("/")).name
-    tests_dir = model_ops_tests_dir(target_rel)
     return [
-        _test_check(repo_root, tests_dir, f"test:ops/{category}/{name}", category, name)
+        _test_check(
+            repo_root,
+            entry_tests_dir(category, name, repo_root, owner_rel=target_rel),
+            f"test:ops/{category}/{name}",
+            name,
+        )
         for target_dir, category, name in ops
         if target_dir == own
     ]
@@ -501,15 +509,18 @@ def _dependency_checks(repo_root: Path, target_rel: str) -> list[Check]:
         if entry.is_relative_to(catalog):
             category = entry.parent.name
             label = f"test:{category}/{entry.stem}"
-            tests_dir = CATALOG_TESTS_DIR
+            tests_dir = entry_tests_dir(category, entry.stem, repo_root)
         else:
             owner = entry.parent.parent.parent
             category = entry.parent.name
             label = f"test:{entry.relative_to(family).with_suffix('')}"
-            tests_dir = str(
-                Path(CATALOG_TESTS_DIR) / owner.relative_to(repo_root / MODELING_V2_PACKAGE)
+            tests_dir = entry_tests_dir(
+                category,
+                entry.stem,
+                repo_root,
+                owner_rel=str(owner.relative_to(repo_root)),
             )
-        checks.append(_test_check(repo_root, tests_dir, label, category, entry.stem))
+        checks.append(_test_check(repo_root, tests_dir, label, entry.stem))
     return checks
 
 
@@ -578,7 +589,7 @@ def _check_sibling_imports(repo_root: Path, target: Path) -> list[Check]:
 
 
 def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
-    """The target is reachable: routing names it, and the claims test exists."""
+    """The target is reachable: routing names it."""
     routing = repo_root / MODELING_V2_PACKAGE / "models" / family / "routing.py"
     if not routing.is_file():
         return [Check(name="routing:module", passed=False, detail=f"missing: {routing}")]
@@ -590,7 +601,6 @@ def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
     dotted = target_rel.split(f"{MODELING_V2_PACKAGE}/", 1)[-1].replace("/", ".").rstrip(".")
     relative = f"from .{Path(target_rel.rstrip('/')).name}."
     referenced = dotted in text or relative in text
-    claims_test = repo_root / CATALOG_TESTS_DIR / "test_modeling_v2_claims.py"
     return [
         Check(
             name="routing:target",
@@ -602,11 +612,6 @@ def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
                 f"never be selected, and under `auto` the built-in implementation "
                 f"would answer instead"
             ),
-        ),
-        Check(
-            name="routing:claims-test",
-            passed=claims_test.is_file(),
-            detail=str(claims_test) if claims_test.is_file() else f"missing: {claims_test}",
         ),
     ]
 
@@ -634,16 +639,21 @@ def check_accuracy_reference(repo_root: Path, reference_yaml: str, model_key: st
     ]
 
 
-def accuracy_test_path(repo_root: Path | str, family: str) -> str:
+def accuracy_test_path(repo_root: Path | str, family: str, target: str) -> str:
     """A target's CI accuracy test under ``ACCURACY_TESTS_DIR``, in the tree's own layout.
 
-    Newer trees keep the modeling_v2 accuracy tests in a package,
-    ``modeling_v2/test_<family>.py``; older ones beside the rest, as
-    ``test_modeling_v2_<family>.py``. The package's presence says which.
+    Current trees give each target a directory of its own,
+    ``modeling_v2/<family>/<target>/test_accuracy.py``. Older ones keep a
+    family's targets in one file, ``modeling_v2/test_<family>.py``, and the
+    oldest keep it beside the rest, as ``test_modeling_v2_<family>.py``. The
+    package's presence, and whether it still holds per-family files, says which.
     """
-    if (Path(repo_root) / ACCURACY_TESTS_DIR / "modeling_v2").is_dir():
+    package = Path(repo_root) / ACCURACY_TESTS_DIR / "modeling_v2"
+    if not package.is_dir():
+        return f"test_modeling_v2_{family}.py"
+    if any(package.glob("test_*.py")):
         return f"modeling_v2/test_{family}.py"
-    return f"test_modeling_v2_{family}.py"
+    return f"modeling_v2/{family}/{target}/test_accuracy.py"
 
 
 def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
@@ -657,20 +667,23 @@ def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
         )
     ]
     db = repo_root / TEST_DB_DIR
-    stem = Path(accuracy_test).stem
+    # Test-db entries name tests relative to the defs root, by file or by a directory above it.
+    wanted = f"{Path(ACCURACY_TESTS_DIR).name}/{accuracy_test}"
     listed: list[str] = []
     if db.is_dir():
         for yml in sorted(db.glob("*.yml")):
-            if stem in yml.read_text(encoding="utf-8"):
+            entries = re.findall(r"^\s*-\s+(\S+)", yml.read_text(encoding="utf-8"), re.MULTILINE)
+            paths = {entry.split("::")[0].rstrip("/") for entry in entries}
+            if any(wanted == path or wanted.startswith(f"{path}/") for path in paths):
                 listed.append(yml.name)
     checks.append(
         Check(
             name="tests:test-db",
             passed=bool(listed),
             detail=(
-                f"{stem} is listed in {', '.join(listed)}"
+                f"{accuracy_test} is listed in {', '.join(listed)}"
                 if listed
-                else f"{stem} appears in no {TEST_DB_DIR}/*.yml; CI would never run it"
+                else f"{accuracy_test} appears in no {TEST_DB_DIR}/*.yml; CI would never run it"
             ),
         )
     )

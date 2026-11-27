@@ -24,6 +24,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.logger import logger, set_level
 
+from .._errors import ConfigInputError
 from .._utils import mpi_world_size
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -499,6 +500,10 @@ class GenerationExecutor(ABC):
         """Return startup metrics, or ``None`` when temporarily unavailable."""
         return {}
 
+    def get_engine_config(self) -> dict:
+        """Return resolved model and KV-cache dtype metadata from the runtime."""
+        return {}
+
     @staticmethod
     def _create_ray_executor(
         worker_kwargs: Dict,
@@ -581,10 +586,12 @@ class GenerationExecutor(ABC):
             world_size = mpi_world_size()
 
         if world_size > 1 and world_size < model_world_size:
-            raise RuntimeError(
+            raise ConfigInputError(
                 "Cannot instantiate an executor requiring "
                 f"{model_world_size} ranks, while currently running "
-                f"on {world_size} ranks.")
+                f"on {world_size} ranks. Launch tensor_parallel_size x "
+                "pipeline_parallel_size x context_parallel_size MPI ranks "
+                "(srun -n / mpirun -np), or lower the parallel sizes.")
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )

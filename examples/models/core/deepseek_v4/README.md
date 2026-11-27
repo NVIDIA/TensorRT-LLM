@@ -223,7 +223,7 @@ moe_config:
   backend: TRTLLM
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 1
+  max_draft_len: 1
 EOF
 
 trtllm-bench --model <MODEL_ID> \
@@ -243,10 +243,11 @@ trtllm-bench --model <MODEL_ID> \
 The example enables attention DP because it is typically beneficial for high-throughput, large-batch
 workloads. It also uses FP8 KV cache (`kv_cache_config.dtype: fp8`), which is the recommended
 starting point for benchmarking DeepSeek-V4 throughput. For checkpoints with MTP layers, enable MTP
-for benchmarking as well: use `num_nextn_predict_layers: 1` for throughput-oriented runs, and use
-`num_nextn_predict_layers: 3` for low-latency runs. When `enable_attention_dp` is enabled,
+for benchmarking as well: use `max_draft_len: 1` for throughput-oriented runs, and use
+`max_draft_len: 3` for low-latency runs. These values select the maximum number of draft
+tokens; MTP-Eagle reuses the checkpoint's single MTP layer. When `enable_attention_dp` is enabled,
 `--max_batch_size` is the maximum batch size per local rank; use `--concurrency` high enough to
-saturate all ranks. Tune `--max_batch_size`, `--max_num_tokens`, `--concurrency`, MTP depth, and the
+saturate all ranks. Tune `--max_batch_size`, `--max_num_tokens`, `--concurrency`, maximum draft tokens, and the
 KV cache memory fraction for the target ISL/OSL distribution.
 
 
@@ -472,6 +473,12 @@ TensorRT LLM detects supported quantization metadata from the checkpoint directo
 MXFP4 routed MoE expert weights, TensorRT LLM automatically applies the routed-expert quantization
 configuration.
 
+On Rubin (SM107), the MXFP4 routed experts can also run as NVFP4_PLUS (E2M1 values with one UE5M3
+scale per 32 values and no global scale): the MXFP4 weights load unchanged and the expert
+activations are quantized to FP4 as well. Set `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` and use the CuteDSL
+MoE backend (`moe_config.backend: CUTEDSL`, which `AUTO` selects under this override). See
+[NVFP4_PLUS MoE from MXFP4 Checkpoints](../../../../docs/source/features/quantization.md#nvfp4_plus-moe-from-mxfp4-checkpoints).
+
 
 ## DSpark confidence scheduling (prototype)
 
@@ -518,6 +525,9 @@ again adds or replaces the profiled `K` and `G` rows in the same file, so `--k 4
 `--graph-batch-sizes 512` extends an existing table. `--graph-batch-sizes`, `--tier-fractions` and
 `--dataset` override the defaults; see `--help`.
 
+To reproduce the published DeepSeek-V4-Pro results, or to reuse the 8x B300 cost table and
+calibration, see [CONFIDENCE_REPRODUCTION.md](CONFIDENCE_REPRODUCTION.md).
+
 At startup the runtime checks the table against the engine and fails with the command above when:
 
 - the file is missing, or has no entry for `max_draft_len`;
@@ -532,6 +542,25 @@ A table from another TensorRT LLM version only warns. Tables in the earlier sing
 `confidence_calibration_path` points to per-position temperatures (`{"sts_temperatures": [...]}`).
 A vector longer than `K` is truncated, so one file fitted at the checkpoint's block size serves
 every `K`. Without it the raw sigmoid confidence is used.
+
+### Device re-ranking
+
+The host chooses the verifier budget from a copy of the previous step's confidence, so it never
+waits for the GPU. The GPU then re-ranks which drafted positions to verify, using the confidence of
+the block being verified. This is on by default with confidence scheduling; it costs compact steps
+a full input rebuild and a small extra GPU pass. It needs the overlap scheduler, so with
+`disable_overlap_scheduler: true` ranking stays on the host. To rank on the host only:
+
+```yaml
+speculative_config:
+  enable_confidence_scheduling: true
+  enable_fused_confidence_scheduler: false   # host ranking only
+```
+
+On DeepSeek-V4-Pro (8x B300) with attention DP, re-ranking raised throughput over host ranking in
+13 of 15 dataset and batch-size settings, by up to 5.5%, without changing GSM8K accuracy; the larger
+of its two losses (-2.2%) measured +0.4% when repeated on a later main. With TP8 attention and no
+attention DP it raised throughput in 14 of 16 settings at batch sizes 8 to 64, by up to 6.4%.
 
 ### Limitations
 
