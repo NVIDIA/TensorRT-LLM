@@ -45,6 +45,10 @@ class _Exchange:
         return SimpleNamespace(tp_allgather=gather, tp_allgather_int64=gather)
 
 
+class _RequestId(int):
+    pass
+
+
 class _Context:
     py_request_id = 9
     context_current_position = 0
@@ -534,15 +538,19 @@ def _gloo_rank(rank, rendezvous, ready, results):
             if scenario == "ineligible" and rank == 1:
                 manager.kv_cache_map[9].is_active = False
             error = None
+            agreement_dist = GlooDist()
             try:
                 coordinate_periodic_snapshot(
                     batch,
                     manager,
-                    GlooDist(),
+                    agreement_dist,
                     extra_budget=768,
                     max_context_length=1024,
                     chunk_unit_size=64,
                 )
+                if scenario == "success":
+                    # Agreement, resource vote, and commit vote are all fixed-width.
+                    assert agreement_dist.object_gathers == 0 and agreement_dist.int64_gathers == 3
                 if scenario in ("forward_commit_success", "forward_commit_error"):
                     assert batch.periodic_snapshot_tp
 
@@ -617,6 +625,39 @@ def _gloo_rank(rank, rendezvous, ready, results):
             chunk_unit_size=64,
         )
         observations.append(("decode_only", dist.object_gathers, dist.int64_gathers))
+
+        mismatched_decode = ScheduledRequests()
+        mismatched_decode.append_generation_request(
+            SimpleNamespace(py_request_id=5 + rank, py_beam_width=1)
+        )
+        dist = GlooDist()
+        try:
+            coordinate_periodic_snapshot(
+                mismatched_decode,
+                _Manager(),
+                dist,
+                extra_budget=768,
+                max_context_length=1024,
+                chunk_unit_size=64,
+            )
+        except RuntimeError as error:
+            observations.append(
+                ("decode_mismatch", dist.object_gathers, dist.int64_gathers, str(error))
+            )
+        fallback_decode = ScheduledRequests()
+        fallback_decode.append_generation_request(
+            SimpleNamespace(py_request_id=_RequestId(5) if rank else 5, py_beam_width=1)
+        )
+        dist = GlooDist()
+        assert not coordinate_periodic_snapshot(
+            fallback_decode,
+            _Manager(),
+            dist,
+            extra_budget=768,
+            max_context_length=1024,
+            chunk_unit_size=64,
+        )
+        observations.append(("decode_unencodable", dist.object_gathers, dist.int64_gathers))
         results.put((rank, observations))
     finally:
         distributed.destroy_process_group()
@@ -683,6 +724,8 @@ def test_two_process_gloo_agreement_and_failure_paths(tmp_path):
             precomputed,
             decode,
             decode_only,
+            decode_mismatch,
+            decode_unencodable,
         ) = observations[rank]
         assert success == ("success", 1024, 1024, (1024, (256, 512, 768)), None)
         assert failed == ("reservation_failure", 256, 256, None, None)
@@ -737,7 +780,10 @@ def test_two_process_gloo_agreement_and_failure_paths(tmp_path):
         assert text == ("text_only", 1024, True)
         assert precomputed == ("precomputed_mm", 256, False)
         assert decode == ("mm_decode", 1024, True)
-        assert decode_only == ("decode_only", 1, 0)
+        assert decode_only == ("decode_only", 0, 1)
+        assert decode_mismatch[:3] == ("decode_mismatch", 1, 1)
+        assert "TP baseline batches differ" in decode_mismatch[3]
+        assert decode_unencodable == ("decode_unencodable", 1, 1)
 
 
 def _native_collective_rank(rank, rendezvous, ready, results, backend):
@@ -1054,11 +1100,22 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
         assert failure[:4] == ("reservation_failure", 256, 256, None)
         assert success[5] is True
         assert failure[5] is (rank == 0)
-        assert success[6] == [(1, 0), (0,)]
-        assert failure[6] == ([(1, 0), (0,)] if rank == 0 else [(0, 0), (0,)])
+        exchanges = (
+            success[6],
+            failure[6],
+            capacity_failure[6],
+            growth_error[6],
+            commit_failure[6],
+            finish_failure[6],
+            partial_finish_failure[5],
+        )
+        for votes in exchanges:
+            assert len(votes[0]) == 11 and votes[0][0] == 2
+        assert success[6][1:] == [(1, 0), (0,)]
+        assert failure[6][1:] == ([(1, 0), (0,)] if rank == 0 else [(0, 0), (0,)])
         assert capacity_failure[:4] == ("capacity_failure", 256, 256, None)
         assert capacity_failure[5] is True
-        assert capacity_failure[6] == ([(1, 0), (0,)] if rank == 0 else [(0, 0), (0,)])
+        assert capacity_failure[6][1:] == ([(1, 0), (0,)] if rank == 0 else [(0, 0), (0,)])
         for observation in (success, failure, capacity_failure):
             assert observation[7] is None, (rank, observation[0], observation[7])
         assert growth_error[:4] == (
@@ -1068,17 +1125,17 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
             None,
         )
         assert growth_error[5] is True
-        assert growth_error[6] == ([(1, 0), (0,)] if rank == 0 else [(0, 1), (0,)])
+        assert growth_error[6][1:] == ([(1, 0), (0,)] if rank == 0 else [(0, 1), (0,)])
         assert "injected error after native growth" in growth_error[7]
         assert commit_failure[0] == "commit_failure"
         assert commit_failure[3] is None
         assert commit_failure[5] is True
-        assert commit_failure[6] == [(1, 0), (int(rank == 1),)]
+        assert commit_failure[6][1:] == [(1, 0), (int(rank == 1),)]
         assert "injected native commit fill error" in commit_failure[7]
         assert finish_failure[0] == "finish_failure"
         assert finish_failure[3] is None
         assert finish_failure[5] is True
-        assert finish_failure[6] == [(1, 0), (0,), (int(rank == 1),)]
+        assert finish_failure[6][1:] == [(1, 0), (0,), (int(rank == 1),)]
         assert "injected native forward commit error" in finish_failure[7]
         assert partial_finish_failure[:3] == (
             "partial_finish_failure",
@@ -1086,7 +1143,7 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
             256,
         )
         assert partial_finish_failure[4] == partial_finish_failure[3] - (1 if rank == 1 else 3)
-        assert partial_finish_failure[5] == [(1, 0), (0,), (int(rank == 1),)]
+        assert partial_finish_failure[5][1:] == [(1, 0), (0,), (int(rank == 1),)]
         assert "injected second snapshot commit error" in partial_finish_failure[6]
         if rank == 1:
             assert failure[4] == 2

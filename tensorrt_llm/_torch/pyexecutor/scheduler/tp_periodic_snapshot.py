@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Agree on a periodic-snapshot expansion after the baseline batch is scheduled."""
 
+import hashlib
+import marshal
+import operator
+import struct
 from typing import TYPE_CHECKING
 
 from ..kv_cache.mamba_cache_manager.multi_snapshot import (
@@ -16,6 +20,66 @@ if TYPE_CHECKING:
     )
 
     from .scheduler import ScheduledRequests
+
+
+_USE_OBJECT_AGREEMENT = (0,) * 11
+
+
+def _digest_words(value: tuple) -> tuple[int, ...]:
+    # Marshal format 2 encodes the scheduler's tuples and scalars by value,
+    # without recording object sharing. The digest is never deserialized.
+    return struct.unpack("<4q", hashlib.sha256(marshal.dumps(value, 2)).digest())
+
+
+def _snapshot_agreement_words(
+    baseline: tuple, proposal: tuple[tuple, int, int | None] | None
+) -> tuple[int, ...]:
+    try:
+        baseline_digest = _digest_words(baseline)
+        if proposal is None:
+            return (1, *baseline_digest, 0, 0, 0, 0, 0, 0)
+        identity, capacity, budget = proposal
+        capacity = operator.index(capacity)
+        budget = None if budget is None else operator.index(budget)
+        if not 0 <= capacity < (1 << 63) or (budget is not None and not 0 <= budget < (1 << 63)):
+            return _USE_OBJECT_AGREEMENT
+        return (
+            2,
+            *baseline_digest,
+            *_digest_words(identity),
+            capacity,
+            -1 if budget is None else budget,
+        )
+    except (TypeError, ValueError):
+        # Signal fallback in the common collective so a rank cannot switch
+        # to the object transport before its peers do.
+        return _USE_OBJECT_AGREEMENT
+
+
+def _agreed_expansion_limits(
+    dist: "Distributed",
+    baseline: tuple,
+    proposal: tuple[tuple, int, int | None] | None,
+) -> list[tuple[int, int | None]]:
+    """Agree in one fixed-width exchange, comparing objects if digests differ."""
+    rows = [
+        tuple(row) for row in dist.tp_allgather_int64(_snapshot_agreement_words(baseline, proposal))
+    ]
+    if all(row[0] and row[1:5] == rows[0][1:5] for row in rows):
+        if any(row[0] == 1 for row in rows):
+            return []
+        if all(row[5:9] == rows[0][5:9] for row in rows):
+            return [(int(row[9]), None if row[10] == -1 else int(row[10])) for row in rows]
+
+    exchanged = dist.tp_allgather((baseline, proposal))
+    if any(item[0] != exchanged[0][0] for item in exchanged):
+        raise RuntimeError("TP baseline batches differ before periodic snapshot agreement")
+    proposals = [item[1] for item in exchanged]
+    if any(item is None for item in proposals) or any(
+        item[0] != proposals[0][0] for item in proposals
+    ):
+        return []
+    return [(item[1], item[2]) for item in proposals]
 
 
 def coordinate_periodic_snapshot(
@@ -101,23 +165,18 @@ def coordinate_periodic_snapshot(
             )
             proposal = (identity, manager.periodic_snapshot_capacity, extra_budget)
 
-    exchanged = dist.tp_allgather((baseline, proposal))
-    if any(item[0] != exchanged[0][0] for item in exchanged):
-        raise RuntimeError("TP baseline batches differ before periodic snapshot agreement")
-    proposals = [item[1] for item in exchanged]
-    if any(item is None for item in proposals):
-        return False
-    if any(item[0] != proposals[0][0] for item in proposals):
+    limits = _agreed_expansion_limits(dist, baseline, proposal)
+    if not limits:
         return False
 
     req = contexts[0]
     start = req.context_current_position
     interval = manager.kv_cache_config.mamba_state_config.periodic_snapshot_interval
-    capacity = min(item[1] for item in proposals)
+    capacity = min(capacity for capacity, _ in limits)
     if capacity < 2:
         return False
     available = min(
-        req.context_remaining_length if item[2] is None else item[2] for item in proposals
+        req.context_remaining_length if budget is None else budget for _, budget in limits
     )
     desired = min(req.context_remaining_length, req.context_chunk_size + available)
     if max_context_length is not None:
