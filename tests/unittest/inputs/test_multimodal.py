@@ -95,7 +95,6 @@ def test_item_partition_selects_packed_items_and_preserves_contiguous_views(
     if axis != 0:
         values = values.T
     layout = MultimodalItemPartition(item_axis=axis, item_lengths=(2, 3, 1))
-    assert MultimodalItemPartition.packed([2, 3, 1], axis) == layout
 
     selected = layout.select(values, indices)
 
@@ -305,7 +304,7 @@ def test_item_metadata_selection_keeps_partitions_in_payload_order(indices) -> N
         input_partitions={
             "image": {"pixels": MultimodalItemPartition(item_lengths=(2, 3))},
             "audio": {
-                "features": MultimodalItemPartition(1, (1, 4)),
+                "features": MultimodalItemPartition.packed([1, 4], axis=1),
                 "shared": MultimodalItemPartition(item_axis=None),
             },
         },

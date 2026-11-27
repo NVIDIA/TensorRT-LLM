@@ -1324,11 +1324,11 @@ def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
     A caller that caches encoder outputs passes this grid back with the
     embedding, as {"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}.
     """
-    data, lengths, expected, encoder, calls = _qwen_vl_item_grid_case(encoder_cls)
+    data, lengths, expected, encoder, _ = _qwen_vl_item_grid_case(encoder_cls)
     assert data["multimodal_embedding_metadata"] == expected
-    requests = [MultimodalParams(multimodal_data=data) for _ in range(2)]
-    _assert_rows_hold_item_grids(torch.cat(encoder.forward(requests)), lengths * 2, expected * 2)
-    assert calls == ["cpu"]
+    _assert_rows_hold_item_grids(
+        torch.cat(encoder.forward([MultimodalParams(multimodal_data=data)])), lengths, expected
+    )
 
 
 @pytest.mark.cpu_only

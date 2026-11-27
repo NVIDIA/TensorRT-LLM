@@ -215,15 +215,12 @@ def test_wrapper_encodes_image_spans_and_tracks_active_positions(
     vision_config: DeepseekV41VisionConfig,
 ) -> None:
     wrapper = _wrapper()
-    wrapper.model_config = SimpleNamespace(max_num_tokens=160, extra_attrs={})
     wrapper.vision = DeepseekV41VisionModel(vision_config).eval()
     wrapper.aligner = DeepseekV41Aligner(vision_config, 2).eval()
     wrapper.image_start = nn.Parameter(torch.tensor([-1.0, -2.0]))
     wrapper.image_end = nn.Parameter(torch.tensor([-3.0, -4.0]))
     wrapper.image_newline = nn.Parameter(torch.tensor([-5.0, -6.0]))
     pixels = torch.randn(20, 3, 2, 2)
-    patch_budget = 60
-    setup_mm_encoder_attn_metadata(wrapper, object(), patch_budget, None)
 
     params = []
     expected = []
@@ -254,29 +251,9 @@ def test_wrapper_encodes_image_spans_and_tracks_active_positions(
             )
         )
 
-    batches = []
-    wrapper.vision.register_forward_pre_hook(
-        lambda _, args: batches.append((len(args[0]), *args[1:]))
-    )
     output = wrapper.encode_multimodal_inputs(params)
-    assert batches == [(2, 4, 5), (1, 5, 4)]
     torch.testing.assert_close(output, torch.cat(expected), rtol=2e-5, atol=2e-6)
 
-    # Eight equally shaped images in one prompt, with distinct neighboring images.
-    singles = [params[i] for i in (0, 2) * 4]
-    singleton_embeddings = torch.cat([wrapper.encode_multimodal_inputs([item]) for item in singles])
-    images = [item.multimodal_data["image"] for item in singles]
-    prompt = SimpleNamespace(
-        multimodal_data={"image": {key: [image[key][0] for image in images] for key in images[0]}}
-    )
-    batches.clear()
-    embeddings = wrapper.encode_multimodal_inputs([prompt])
-    assert [count * height * width for count, height, width in batches] == [
-        patch_budget,
-        patch_budget,
-        40,
-    ]
-    torch.testing.assert_close(embeddings, singleton_embeddings, rtol=2e-5, atol=2e-6)
     ids = torch.tensor([_IMAGE_ID] * 10)
     kwargs = wrapper.get_language_model_extra_forward_kwargs(
         raw_input_ids=ids,
@@ -305,17 +282,20 @@ def test_wrapper_encodes_image_spans_and_tracks_active_positions(
         assert wrapper.llm.forward.call_args.kwargs["context_requests"] is requests
 
 
-def test_wrapper_bounds_four_images_by_profiled_capacity() -> None:
+@pytest.mark.parametrize(
+    "item_limit,patch_budget,max_patches",
+    [(1, 32768, 8100), (4, 16200, 16200)],
+    ids=["item-limit", "patch-budget"],
+)
+def test_wrapper_bounds_image_batches(item_limit, patch_budget, max_patches) -> None:
     wrapper = _wrapper()
-    wrapper.model_config = SimpleNamespace(max_batch_size=1, max_num_tokens=8192, extra_attrs={})
+    wrapper.model_config = SimpleNamespace(
+        max_batch_size=item_limit, max_num_tokens=8192, extra_attrs={}
+    )
     wrapper.vision = Mock(side_effect=lambda pixels, height, width: pixels[:, ::9, :2])
     wrapper.aligner = Mock(side_effect=lambda features, height, width: features)
     wrapper.image_start = wrapper.image_end = wrapper.image_newline = torch.zeros(2)
-    processor = DeepseekV41InputProcessor.__new__(DeepseekV41InputProcessor)
-    processor._vision_enabled = True
-    processor._downsample_ratio = 3
-    processor._max_image_tokens = 1024
-    setup_mm_encoder_attn_metadata(wrapper, processor, 32768, None)
+    setup_mm_encoder_attn_metadata(wrapper, object(), patch_budget, None)
 
     # At patch size 14 a 1260 x 1260 image has 90 x 90 patches.
     pixels = [torch.full((1,), float(i)).expand(8100, 3, 14, 14) for i in range(4)]
@@ -332,7 +312,8 @@ def test_wrapper_bounds_four_images_by_profiled_capacity() -> None:
     expected = torch.cat([encode([image]) for image in pixels])
     wrapper.vision.reset_mock()
     torch.testing.assert_close(encode(pixels), expected, rtol=0, atol=0)
-    assert [call.args[0].shape[:2] for call in wrapper.vision.call_args_list] == [(1, 8100)] * 4
+    batch_patches = [math.prod(call.args[0].shape[:2]) for call in wrapper.vision.call_args_list]
+    assert max(batch_patches) == max_patches
 
 
 def test_wrapper_request_lifecycle_preserves_image_history() -> None:

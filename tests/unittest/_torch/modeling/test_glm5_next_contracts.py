@@ -492,17 +492,22 @@ def test_mixed_vision_batch_matches_single_items():
         MultimodalParams,
     )
 
+    max_patches = 64
+
     def encode_patches(pixel_values, grid_thw):
+        assert len(pixel_values) <= max_patches
         widths = grid_thw[:, 2].repeat_interleave(grid_thw.prod(1) // 4)
         return pixel_values[::4] + widths[:, None]
 
     model = Glm5NextVisionModelBase.__new__(Glm5NextVisionModelBase)
     torch.nn.Module.__init__(model)
+    model.model_config = SimpleNamespace(extra_attrs={"encoder_max_num_tokens": max_patches})
     model.encode_batched = encode_patches
     params = []
     for modality, grid, key in (
         ("video", [2, 4, 6], "pixel_values_videos"),
         ("image", [1, 4, 4], "pixel_values"),
+        ("image", [1, 2, 6], "pixel_values"),
     ):
         patches = grid[0] * grid[1] * grid[2]
         params.append(
@@ -513,7 +518,9 @@ def test_mixed_vision_batch_matches_single_items():
                         f"{modality}_grid_thw": torch.tensor([grid]),
                     },
                     MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                        [(modality, 0)], output_embedding_lengths=[patches // 4]
+                        [(modality, 0)],
+                        encoder_token_lengths=[patches],
+                        output_embedding_lengths=[patches // 4],
                     ),
                 }
             )

@@ -345,8 +345,8 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
 
 
 @pytest.mark.parametrize(
-    ("encoder_max_num_tokens", "max_num_tokens", "tower_budget"),
-    [(None, 4096, 4096), (1024, 4096, 1024), (None, None, 128)],
+    ("encoder_max_num_tokens", "max_num_tokens", "tower_budget", "encoder_batch_size"),
+    [(None, 4096, 4096, None), (1024, 4096, 1024, 2), (None, None, 128, None)],
     ids=["configured", "encoder_budget", "resolved"],
 )
 def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
@@ -354,11 +354,13 @@ def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
     encoder_max_num_tokens: int | None,
     max_num_tokens: int | None,
     tower_budget: int,
+    encoder_batch_size: int | None,
 ) -> None:
     """A merged item fits a prompt shorter than its patches, so the clamped budget is too small."""
     from tensorrt_llm._torch.pyexecutor.engine import model_setup
 
-    model = SimpleNamespace(model_config=SimpleNamespace())
+    model = torch.nn.Module()
+    model.model_config = SimpleNamespace(mm_encoder_only=True, extra_attrs={})
     loader = Mock()
     loader.load.return_value = (model, None)
     for name in ("init_process_setup", "configure_autotuner_nvmmh", "prepare_loaded_model"):
@@ -370,13 +372,12 @@ def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
         model_setup, "compile_model", Mock(return_value=SimpleNamespace(model=model))
     )
     monkeypatch.setattr(model_setup.MultimodalEncoderRunner, "create", Mock())
-    setup_metadata, setup_graphs = Mock(), Mock()
-    monkeypatch.setattr(model_setup, "setup_mm_encoder_attn_metadata", setup_metadata)
+    setup_graphs = Mock()
     monkeypatch.setattr(model_setup, "setup_mm_encoder_cuda_graphs", setup_graphs)
     llm_args = SimpleNamespace(
         max_num_tokens=max_num_tokens,
         encoder_max_num_tokens=encoder_max_num_tokens,
-        encoder_max_batch_size=None,
+        encoder_max_batch_size=encoder_batch_size,
         get_runtime_sizes=lambda: (1, max_num_tokens, 128, 1),
         multimodal_config=None,
         cuda_graph_config=None,
@@ -388,8 +389,8 @@ def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
     ) as built:
         assert built.max_num_tokens == 128
 
-    assert setup_metadata.call_args.args[2] == tower_budget
-    assert setup_metadata.call_args.kwargs["encoder_batch_size"] == 1
+    assert built.model_config.extra_attrs["encoder_max_num_tokens"] == tower_budget
+    assert built.model_config.extra_attrs["encoder_batch_size"] == (encoder_batch_size or 1)
     assert setup_graphs.call_args.kwargs["max_num_tokens"] == tower_budget
 
 
