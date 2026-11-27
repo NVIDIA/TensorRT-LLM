@@ -2426,6 +2426,11 @@ class MoeAdaptiveLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         description=
         "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and at least the number of experts; the slots beyond one per expert hold replicas. A placement fills at most half of the replica slots (rounded up per rank); the other half stays empty so that every install has free slots to copy new replicas into.",
         status="prototype")
+    balance: Literal["on", "off"] = Field(
+        default="on",
+        description=
+        "`on` balances the decode steps. `off` runs every balanced MoE layer as without a load balancer, on the home slots that hold one copy of each expert: no replica, route table lookup or statistics, the backend's kernel of the expert count per rank.",
+        status="prototype")
     rows_per_expert: PositiveInt = Field(
         default=512,
         description=

@@ -5297,6 +5297,17 @@
       "additionalProperties": false,
       "description": "Configure decode-time adaptive EPLB.",
       "properties": {
+        "balance": {
+          "default": "on",
+          "description": "`on` balances the decode steps. `off` runs every balanced MoE layer as without a load balancer, on the home slots that hold one copy of each expert: no replica, route table lookup or statistics, the backend's kernel of the expert count per rank.",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "status": "prototype",
+          "title": "Balance",
+          "type": "string"
+        },
         "calibration_cache_dir": {
           "anyOf": [
             {

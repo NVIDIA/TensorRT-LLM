@@ -163,3 +163,46 @@ def test_only_a_bucket_whose_kernel_has_the_adaptive_route_maps_routes_in_its_ro
     assert not IMPL.routes_adaptive_in_router(backend, 8)
     backend._router_launch_max_tokens = lambda num_tokens: 4096
     assert IMPL.routes_adaptive_in_router(backend, 8)
+
+
+def test_home_slots_launch_the_kernel_and_weights_of_a_layer_without_a_balancer():
+    """A layer whose balancer is off launches as without one: the kernel of the experts per rank,
+    its bucket properties, and leading views (no copy) of the weight tensors, whose leading axis
+    is the slot: the home slots."""
+    backend = SimpleNamespace(
+        num_experts=8,
+        ep_size=2,
+        expert_size_per_partition=6,
+        layer_load_balancer=None,
+        _home_slots=IMPL._home_slots,  # the class default a subclass without __init__ reads
+        _maxt_buckets=[256, 1024],
+        _genphase_direct_input_buckets={256},
+        _padding_drop_buckets={256},
+        _adaptive_router_buckets={256},
+    )
+    slot_count = lambda: IMPL.compute_slot_count.fget(backend)  # noqa: E731
+    assert slot_count() == 6
+    asked = []
+
+    def properties(max_T, world_size):
+        asked.append((max_T, world_size, slot_count()))
+        big = max_T > 256
+        return SimpleNamespace(
+            supports_direct_inputs=big, masks_invalid_routes=big, routes_adaptive=False
+        )
+
+    backend._kernel_properties = properties
+    backend._record_bucket_kernel = lambda max_T, p: IMPL._record_bucket_kernel(backend, max_T, p)
+    IMPL.serve_home_slots(backend)
+    assert slot_count() == 4 and asked == [(256, 2, 4), (1024, 2, 4)]
+    assert backend._genphase_direct_input_buckets == backend._padding_drop_buckets == {1024}
+    assert not backend._adaptive_router_buckets
+    names = ("mega_fc1_weight", "mega_fc1_weight_sf", "mega_fc2_weight", "mega_fc2_weight_sf")
+    names += ("fc31_alpha", "fc2_alpha", "fc1_norm_const")
+    for name in names:
+        setattr(backend, name, torch.arange(6 * 3).view(6, 3))
+    view = IMPL._build_weight_view(backend)
+    for name, tensor in zip(names, vars(view).values()):
+        full = getattr(backend, name)
+        assert tensor.shape[0] == 4 and tensor.data_ptr() == full.data_ptr()
+        assert torch.equal(tensor, full[:4])

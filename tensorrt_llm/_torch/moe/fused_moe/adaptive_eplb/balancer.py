@@ -546,8 +546,19 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         rank, or the ranks balance different layers, every rank logs why and keeps adaptive EPLB
         off: the layers serve their home layouts and record no statistics. Under ``auto``, rank 0's
         cached calibration of this run serves every rank; without one, :meth:`before_capture`
-        calibrates the time model and starts the runtime.
+        calibrates the time model and starts the runtime. Under ``balance`` off the MoE modules
+        drop their handles and the backends serve their home slots, as without a load balancer.
         """
+        if self.config.balance == "off":  # one config on every rank: no collective
+            backends = find_backends(model, self.layers)
+            for module in model.modules():
+                if getattr(module, "layer_load_balancer", None) in self.layers:
+                    module.layer_load_balancer = None
+            for backend in backends.values():
+                backend.serve_home_slots()
+            self.off_reason = "balance is off"
+            logger.info("adaptive EPLB balance=off: the MoE layers serve their home slots")
+            return
         backends = find_backends(model, self.layers)
         first = self.layers[0].layer_idx if self.layers else None
         backend = backends.get(first)

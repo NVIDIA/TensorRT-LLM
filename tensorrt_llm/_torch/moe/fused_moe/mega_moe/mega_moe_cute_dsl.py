@@ -521,6 +521,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         allocated (e.g. ``torch.distributed`` not initialised).
     """
 
+    # The home slots a layer whose balancer is detached launches on (serve_home_slots); None: every
+    # slot. A class default, so a model's subclass that sets its state without ``__init__`` has it.
+    _home_slots: Optional[int] = None
+
     descriptor = MoEImplDescriptor(
         identity=MoEImplId("trtllm", "cutedsl", "mega_moe", "nvfp4"),
         # Kernel owns dispatch + GEMM1 + SwiGLU + GEMM2 + combine via the
@@ -896,6 +900,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         without one, M is H. Only the seven live kernel planes, symmetric
         workspace, and launch geometry use this wider axis.
         """
+        if self._home_slots is not None:  # serve_home_slots
+            return self._home_slots
         resident_experts = int(self.expert_size_per_partition)
         layer_load_balancer = self.layer_load_balancer
         if layer_load_balancer is None or not layer_load_balancer.produces_replica_plan:
@@ -1665,6 +1671,53 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         return _sm107_use_in_kernel_fc2_reduce(max_tokens_per_rank, self.apply_topk_in_fc1)
 
+    def _kernel_properties(self, max_T: int, world_size: int):
+        """The default kernel's ``MegaMoeKernelProperties`` of bucket ``max_T`` at this layer's
+        slot count (``compute_slot_count``) over ``world_size`` ranks."""
+        # Shared-workspace probe lives behind ``IS_MEGAMOE_OP_AVAILABLE``
+        # in cute_dsl_megamoe_custom_op so the import stays lazy.
+        from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+            query_megamoe_kernel_properties,
+        )
+
+        return query_megamoe_kernel_properties(
+            world_size=world_size,
+            num_topk=self.routing_method.experts_per_token,
+            num_experts_per_rank=self.compute_slot_count,
+            hidden_size=self.hidden_size,
+            intermediate_size_per_partition=int(self.intermediate_size_per_partition),
+            expand_intermediate_size_per_partition=int(self.expand_intermediate_size_per_partition),
+            max_tokens_per_rank=max_T,
+            apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
+            gate_up_clamp=self.act_clamp,
+            swiglu_alpha=(
+                self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
+            ),
+            swiglu_beta=(
+                self.act_beta if self.activation_type is ActivationType.SwigluBias else None
+            ),
+            situ_beta=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
+            situ_linear_beta=(
+                self.act_beta if self.activation_type is ActivationType.SiTu else None
+            ),
+            in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
+            combine_format=self.combine_format,
+            ugpu_weight_layout=self._ugpu_weight_layout,
+        )
+
+    def serve_home_slots(self) -> None:
+        """Launch on the home slots alone, as the layer would without a load balancer: the kernel
+        of ``num_experts / ep_size`` experts per rank, on the leading rows of the slot planes
+        (every expert's home slot; the rows after them hold an adaptive balancer's replicas). The
+        caller detaches the balancer from the layer; nothing has launched yet. The symmetric
+        workspaces stay: the home kernel's is no larger than the one they were sized for."""
+        self._home_slots = self.num_experts // self.ep_size
+        self._genphase_direct_input_buckets.clear()
+        self._padding_drop_buckets.clear()
+        self._adaptive_router_buckets.clear()
+        for max_T in self._maxt_buckets:
+            self._record_bucket_kernel(max_T, self._kernel_properties(max_T, self.ep_size))
+
     def _record_bucket_kernel(self, max_T: int, properties) -> None:
         """Keep what bucket ``max_T``'s kernel tells the launches (``MegaMoeKernelProperties``)."""
         if properties.supports_direct_inputs:
@@ -1693,7 +1746,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
             get_megamoe_symm_provider,
-            query_megamoe_kernel_properties,
         )
 
         if self._ep_pg is None:
@@ -1707,32 +1759,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._profiling_scratch_provider_ref = None
         self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
-            properties = query_megamoe_kernel_properties(
-                world_size=self.ep_size,
-                num_topk=top_k,
-                num_experts_per_rank=self.compute_slot_count,
-                hidden_size=self.hidden_size,
-                intermediate_size_per_partition=int(self.intermediate_size_per_partition),
-                expand_intermediate_size_per_partition=int(
-                    self.expand_intermediate_size_per_partition
-                ),
-                max_tokens_per_rank=max_T,
-                apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
-                gate_up_clamp=self.act_clamp,
-                swiglu_alpha=(
-                    self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
-                ),
-                swiglu_beta=(
-                    self.act_beta if self.activation_type is ActivationType.SwigluBias else None
-                ),
-                situ_beta=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
-                situ_linear_beta=(
-                    self.act_beta if self.activation_type is ActivationType.SiTu else None
-                ),
-                in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
-                combine_format=self.combine_format,
-                ugpu_weight_layout=self._ugpu_weight_layout,
-            )
+            properties = self._kernel_properties(max_T, self.ep_size)
             shared_workspace_bytes = properties.shared_workspace_bytes
             self._record_bucket_kernel(max_T, properties)
             provider = get_megamoe_symm_provider(
@@ -1883,14 +1910,19 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         kernel sees the latest dynamic-EPLB migration outcome (once
         that path lands; currently the slots are static).
         """
+        home = self._home_slots  # serve_home_slots: the slot is every tensor's leading axis
+
+        def slots(t: torch.Tensor) -> torch.Tensor:
+            return t if home is None else t[:home]
+
         return MegaMoECuteDslWeightView(
-            fc1_weight=self.mega_fc1_weight,
-            fc1_weight_sf=self.mega_fc1_weight_sf,
-            fc2_weight=self.mega_fc2_weight,
-            fc2_weight_sf=self.mega_fc2_weight_sf,
-            fc31_alpha=self.fc31_alpha,
-            fc2_alpha=self.fc2_alpha,
-            fc1_norm_const=self.fc1_norm_const,
+            fc1_weight=slots(self.mega_fc1_weight),
+            fc1_weight_sf=slots(self.mega_fc1_weight_sf),
+            fc2_weight=slots(self.mega_fc2_weight),
+            fc2_weight_sf=slots(self.mega_fc2_weight_sf),
+            fc31_alpha=slots(self.fc31_alpha),
+            fc2_alpha=slots(self.fc2_alpha),
+            fc1_norm_const=slots(self.fc1_norm_const),
         )
 
     # ------------------------------------------------------------------
@@ -2400,38 +2432,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 dtype=torch.bfloat16,
                 device=device,
             )
-            # Shared-workspace probe lives behind ``IS_MEGAMOE_OP_AVAILABLE``
-            # in cute_dsl_megamoe_custom_op so the import stays lazy.
-            from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
-                query_megamoe_kernel_properties,
-            )
-
-            properties = query_megamoe_kernel_properties(
-                world_size=1,
-                num_topk=top_k,
-                num_experts_per_rank=self.compute_slot_count,
-                hidden_size=hidden,
-                intermediate_size_per_partition=int(self.intermediate_size_per_partition),
-                expand_intermediate_size_per_partition=int(
-                    self.expand_intermediate_size_per_partition
-                ),
-                max_tokens_per_rank=max_T,
-                apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
-                gate_up_clamp=self.act_clamp,
-                swiglu_alpha=(
-                    self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
-                ),
-                swiglu_beta=(
-                    self.act_beta if self.activation_type is ActivationType.SwigluBias else None
-                ),
-                situ_beta=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
-                situ_linear_beta=(
-                    self.act_beta if self.activation_type is ActivationType.SiTu else None
-                ),
-                in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
-                combine_format=self.combine_format,
-                ugpu_weight_layout=self._ugpu_weight_layout,
-            )
+            properties = self._kernel_properties(max_T, 1)
             self._record_bucket_kernel(max_T, properties)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the

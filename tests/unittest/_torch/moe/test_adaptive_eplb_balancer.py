@@ -196,6 +196,30 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     assert layer.route(ids).tolist() == [[6, 6], [NUM_SLOTS, NUM_SLOTS]]
 
 
+def test_balance_off_runs_every_layer_as_without_a_balancer(monkeypatch):
+    """``balance`` off: the MoE modules drop their handles and the backends serve their home slots;
+    no weight moves, no route op, statistics or runtime runs."""
+    balancer = _balancer(ep_rank=0, balance="off")
+    layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
+    served = []
+    backend = torch.nn.Module()
+    backend.layer_load_balancer, backend.serve_home_slots = layer, lambda: served.append(1)
+    model = torch.nn.Module()
+    model.backend, model.layer_load_balancer = backend, layer
+
+    def unused(*args, **kwargs):
+        raise AssertionError("balance off touched the balancing path")
+
+    monkeypatch.setattr(module, "find_backends", lambda model, layers: {layer.layer_idx: backend})
+    for name in ("prepare_layers", "PeerSlotTransport", "migrate_model_weights", "time_layer_copy"):
+        monkeypatch.setattr(module, name, unused)
+    balancer.prepare_runtime(model, [8, 16])
+    assert served == [1] and model.layer_load_balancer is None is backend.layer_load_balancer
+    assert balancer.runtime is None and balancer.off_reason == "balance is off"
+    _observe(balancer, 4)
+    assert not balancer.recording and balancer.iteration_stats() is None
+
+
 FIELDS = dict(zip(TimeModel.__dataclass_fields__, (1.0, 2.0, 3.0, 4.0, 0.9, 8)))
 
 

@@ -7,7 +7,8 @@ and prefill (1024 / 4096 / 8192, the metadata-push router) sizes.
 Bit for bit: an adaptive layer whose dispatch router maps and counts its routes returns what the same layer returns
 on the staged route, and what a layer without the balancer returns; its statistics are the routing's picks of the
 live rows, nothing while the recording flag is clear. A graph captured on home tables replays an install as eager
-routes it, and the server's mixed forward captures after its warmup and replays as eager.
+routes it, and the server's mixed forward captures after its warmup and replays as eager. Under ``balance`` off the
+512-slot layers return what the layers without a balancer return and launch the same kernels.
 """
 
 import pickle
@@ -233,6 +234,34 @@ def _run() -> None:
                 )
             _assert_on_all_ranks(problem)
 
+        # balance off: layers of the 512-slot configuration run as the layers without a balancer, on their
+        # home slots: the same outputs bit for bit and the same kernel launches (name, grid, block, shared
+        # memory), with no route op, statistics or runtime. Before any capture: their home kernel's first
+        # eager launch fences the adaptive layers' shared workspace.
+        off_config = model_config(False)
+        off_config.moe_load_balancer = MoeAdaptiveLoadBalancerConfig(
+            num_slots=_NUM_SLOTS, balance="off"
+        )
+        with maybe_create_moe_load_balancer(off_config, mapping) as off_balancer:
+            off = torch.nn.ModuleList(build(off_config, i) for i in range(2))
+        off_balancer.register_weight_slots_after_to_cuda()
+        off_balancer.finalize_model()
+        off_balancer.prepare_runtime(off, list(_DECODE_ROWS))
+        detached = all(layer.experts.layer_load_balancer is None for layer in off)
+        problem = (
+            None if detached and off_balancer.runtime is None else "balance off kept its balancer"
+        )
+        for rows in (*_DECODE_ROWS, *_PREFILL_ROWS):
+            counts = [rows] * world_size
+            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            want, got = forward(plain, x, counts), forward(off, x, counts)
+            if problem is None and not all(torch.equal(a, b) for a, b in zip(got, want)):
+                problem = f"{rows} rows: balance off differs from the layer without a balancer"
+        for rows in _DECODE_ROWS:
+            if problem is None and _launches(off[0], rows) != _launches(plain[0], rows):
+                problem = f"{rows} rows: balance off launches other kernels than the plain layer"
+        _assert_on_all_ranks(problem)
+
         # The route tables a runtime install rewrites in place (fixed address), and a replicated version.
         tables = balancer.route_tables(device)
         home_tables = tables.clone()
@@ -320,6 +349,26 @@ def _run() -> None:
             del graph
             _assert_on_all_ranks(problem)
         use_router(True)
+
+
+def _launches(layer, rows: int) -> list:
+    """(name, grid, block, dynamic shared memory) of every kernel one forward of ``layer`` launches, in order."""
+    import json
+    import tempfile
+
+    x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+    counts = [rows] * mpi_world_size()
+    layer(x, all_rank_num_tokens=counts)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        layer(x, all_rank_num_tokens=counts)
+        torch.cuda.synchronize()
+    with tempfile.NamedTemporaryFile(suffix=".json") as trace:
+        prof.export_chrome_trace(trace.name)
+        events = json.load(open(trace.name))["traceEvents"]
+    kernels = sorted((e for e in events if e.get("cat") == "kernel"), key=lambda e: e["ts"])
+    keys = ("grid", "block", "shared memory")
+    return [(e["name"], *(str(e.get("args", {}).get(k)) for k in keys)) for e in kernels]
 
 
 @pytest.mark.threadleak(enabled=False)
