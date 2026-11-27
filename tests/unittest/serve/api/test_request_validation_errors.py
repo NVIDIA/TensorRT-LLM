@@ -68,6 +68,12 @@ def client(serve_env: ServeTestEnv) -> TestClient:
     return serve_env.client(server.app)
 
 
+@pytest.fixture
+def context_client(serve_env: ServeTestEnv) -> TestClient:
+    server = serve_env.build_openai_server(AggConfig(role=ServerRole.CONTEXT, model_name=MODEL))
+    return serve_env.client(server.app)
+
+
 def _error(response):
     assert response.status_code == 400
     body = response.json()
@@ -91,10 +97,8 @@ def test_missing_parameter_is_named(client):
     assert error["param"] == "messages"
 
 
-def test_context_role_returns_the_openai_error_object(serve_env: ServeTestEnv) -> None:
-    server = serve_env.build_openai_server(AggConfig(role=ServerRole.CONTEXT, model_name=MODEL))
-    client = serve_env.client(server.app)
-    resp = client.post("/v1/chat/completions", json={"model": MODEL})
+def test_context_role_returns_the_openai_error_object(context_client: TestClient) -> None:
+    resp = context_client.post("/v1/chat/completions", json={"model": MODEL})
     assert resp.status_code == 400
     assert resp.json() == {
         "error": {
@@ -410,16 +414,22 @@ def test_validation_error_messages_have_per_error_and_joined_caps(kind: str) -> 
     assert joined_size <= 4096
 
 
-@pytest.mark.parametrize("server_fixture", ["client", "disagg"])
+@pytest.fixture
+def http_endpoint(request: pytest.FixtureRequest) -> tuple[str, TestClient]:
+    server_fixture: str = request.param
+    target = request.getfixturevalue(server_fixture)
+    http: TestClient = target if server_fixture == "client" else target.client
+    return server_fixture, http
+
+
+@pytest.mark.parametrize("http_endpoint", ["client", "disagg"], indirect=True)
 @pytest.mark.parametrize("field", ["thinking", "lora_request", "response_format"])
 def test_large_rejected_values_are_bounded_at_the_http_boundary(
-    request: pytest.FixtureRequest,
+    http_endpoint: tuple[str, TestClient],
     monkeypatch: pytest.MonkeyPatch,
-    server_fixture: str,
     field: str,
 ) -> None:
-    server = request.getfixturevalue(server_fixture)
-    http: TestClient = server if server_fixture == "client" else server.client
+    server_fixture, http = http_endpoint
     warning = Mock()
     monkeypatch.setattr(openai_disagg_server.logger, "warning", warning)
     value = _rejected_value()
