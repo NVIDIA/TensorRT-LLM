@@ -147,26 +147,79 @@ def test_forced_gate_allows_only_post_stop_tokens() -> None:
 
 
 @pytest.mark.parametrize(
-    "change",
+    ("change", "message"),
     [
-        {"token_ids": [7, 8, 12, 10, 11]},
-        {"token_ids": [7, 8, 9, 10]},
-        {"id": "other"},
-        {"prompt_sha256": "other"},
-        {"finish_reason": "stop"},
-        {"answer": "C"},
-        {"correct": False},
+        ({"token_ids": [7, 8, 12, 10, 11]}, "valid prefix differs"),
+        ({"token_ids": [7, 8, 9, 10]}, "forced completion lengths differ"),
+        ({"id": "other"}, "ordinary sample ID differs"),
+        ({"prompt_sha256": "other"}, "ordinary tokenized prompt differs"),
+        ({"finish_reason": "stop"}, "finish reasons differ"),
     ],
 )
-def test_forced_gate_preserves_prefix_and_metadata(change: dict) -> None:
-    with pytest.raises(AssertionError):
+def test_forced_gate_preserves_prefix_and_metadata(change: dict, message: str) -> None:
+    reference = _forced()
+    candidate = {**reference, **change}
+    if "id" in change or "prompt_sha256" in change:
+        reference = copy.deepcopy(candidate)
+    with pytest.raises(AssertionError, match=message):
         assert_forced_token_parity(
-            _forced(),
-            {**_forced(), **change},
+            reference,
+            candidate,
             ordinary_reference=_completion(),
             ordinary_candidate=_completion(),
             label="invalid forced",
         )
+
+
+@pytest.mark.parametrize("tokens", [[], [7, 8]])
+def test_forced_gate_rejects_empty_or_short_shared_rows(tokens: list[int]) -> None:
+    forced = {**_forced(), "token_ids": tokens}
+    with pytest.raises(AssertionError, match="empty or shorter than the ordinary"):
+        assert_forced_token_parity(
+            forced,
+            copy.deepcopy(forced),
+            ordinary_reference=_completion(),
+            ordinary_candidate=_completion(),
+            label="short forced",
+        )
+
+
+def test_forced_gate_allows_suffix_derived_answer_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm.evaluate import interface, longbench_v2
+
+    monkeypatch.setattr(longbench_v2, "load_dataset", lambda *arguments, **keywords: [])
+    with monkeypatch.context() as setup:
+        setup.setattr(interface.random, "seed", lambda seed: None)
+        setup.setattr(interface.np.random, "seed", lambda seed: None)
+        setup.setattr(interface.torch, "manual_seed", lambda seed: None)
+        evaluator = longbench_v2.LongBenchV2(length="short")
+    prefix = "The correct answer is (B)."
+    reference_answer = evaluator._extract_answer(
+        evaluator._post_process(prefix + "</think>The correct answer is (B).")
+    )
+    candidate_answer = evaluator._extract_answer(
+        evaluator._post_process(prefix + "</think>The correct answer is (C).")
+    )
+    assert reference_answer == "B" and candidate_answer == "C"
+    reference = {**_forced(), "answer": reference_answer, "correct": True}
+    candidate = {
+        **_forced(),
+        "token_ids": [7, 8, 9, 12, 13],
+        "answer": candidate_answer,
+        "correct": False,
+    }
+    assert (
+        assert_forced_token_parity(
+            reference,
+            candidate,
+            ordinary_reference=_completion(),
+            ordinary_candidate=_completion(),
+            label="post-stop answer",
+        )
+        == 3
+    )
 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "length"])
@@ -208,10 +261,10 @@ def test_forced_gate_keeps_full_equality_without_an_ordinary_stop() -> None:
 def test_forced_gate_reports_suffix_before_metadata_failure(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    with pytest.raises(AssertionError, match="extracted answers differ"):
+    with pytest.raises(AssertionError, match="finish reasons differ"):
         assert_forced_token_parity(
             _forced(),
-            {**_forced(), "token_ids": [7, 8, 9, 12, 13], "answer": "C"},
+            {**_forced(), "token_ids": [7, 8, 9, 12, 13], "finish_reason": "stop"},
             ordinary_reference=_completion(),
             ordinary_candidate=_completion(),
             label="suffix metadata",
@@ -232,11 +285,17 @@ def test_history_verifier_rejects_injected_wrong_slots() -> None:
     original_host, original_arena, original_units = host_view.clone(), arena.clone(), units.clone()
     verifier = SparseHistoryVerifier()
     verifier.check_tensors(0, units, slots, host_view, host_pages, arena, token_position=8)
-    with pytest.raises(AssertionError, match="Offload history row mismatch"):
-        verifier.check_tensors(
-            0, units, slots.roll(1), host_view, host_pages, arena, token_position=9
-        )
+    verifier.check_tensors(0, units, slots.roll(1), host_view, host_pages, arena, token_position=9)
     assert verifier.mismatched_rows == 2
+    assert verifier.metrics()["first_mismatch"] == {"layer": 0, "unit": 0, "slot": 0, "position": 9}
+    with pytest.raises(AssertionError, match="rank 0, request 1: Offload history row mismatch"):
+        assert_history_integrity(
+            [_integrity_event(verifier.metrics())],
+            prompt_lengths=[8],
+            completion_lengths=[3],
+            world_size=1,
+            require_eviction=False,
+        )
     assert torch.equal(host_view, original_host)
     assert torch.equal(arena, original_arena)
     assert torch.equal(units, original_units)
@@ -254,6 +313,7 @@ def test_history_verifier_counts_eviction_and_refetch_per_layer() -> None:
         "evictions": 2,
         "refetches": 1,
         "checked_positions": {"0": [8, 9, 10], "1": [8]},
+        "first_mismatch": None,
     }
 
 
@@ -275,19 +335,33 @@ def _integrity_event(metrics: dict | None) -> dict:
 
 
 @pytest.mark.parametrize(
-    "metrics",
+    ("metrics", "message"),
     [
-        None,
-        {"checked_rows": 0, "mismatched_rows": 0, "evictions": 0, "refetches": 0},
-        {"checked_rows": 1, "mismatched_rows": 1, "evictions": 1, "refetches": 1},
-        {"checked_rows": 1, "mismatched_rows": 0, "evictions": 0, "refetches": 1},
-        {"checked_rows": 1, "mismatched_rows": 0, "evictions": 1, "refetches": 0},
+        (None, "integrity check did not run"),
+        (
+            {"checked_rows": 0, "mismatched_rows": 0, "evictions": 1, "refetches": 1},
+            "integrity check did not run",
+        ),
+        (
+            {"checked_rows": 1, "mismatched_rows": 1, "evictions": 1, "refetches": 1},
+            "Offload history row mismatch",
+        ),
+        (
+            {"checked_rows": 1, "mismatched_rows": 0, "evictions": 0, "refetches": 1},
+            "No observed sparse-cache eviction",
+        ),
+        (
+            {"checked_rows": 1, "mismatched_rows": 0, "evictions": 1, "refetches": 0},
+            "No observed sparse-history re-fetch",
+        ),
     ],
 )
-def test_history_gate_requires_checked_evicted_and_refetched_data(metrics: dict | None) -> None:
+def test_history_gate_requires_checked_evicted_and_refetched_data(
+    metrics: dict | None, message: str
+) -> None:
     if metrics is not None:
         metrics = {**metrics, "checked_positions": {"0": [8]}}
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match=message):
         assert_history_integrity(
             [_integrity_event(metrics)],
             prompt_lengths=[8],

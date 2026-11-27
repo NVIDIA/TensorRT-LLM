@@ -1,19 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Read-only FP8 sparse-history verification at the native attention boundary."""
+"""Read-only FP8 history verification at the shared sparse-prediction boundary."""
 
 from __future__ import annotations
 
 import functools
-import importlib.abc
-import importlib.machinery
-import sys
-from collections.abc import Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+    import torch
+
+    from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
+        DeepseekV4TrtllmAttention,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4TrtllmAttentionMetadata,
+    )
     from tensorrt_llm._torch.attention.backends.sparse.offload import SparseOffloadCacheMixin
     from tensorrt_llm.runtime.kv_cache_manager_v2 import _KVCache
 
@@ -21,55 +25,86 @@ if TYPE_CHECKING:
 else:
     from sparse_offload_accuracy import SparseHistoryVerifier
 
-_MODULE = "tensorrt_llm._torch.attention.backends.fmha.fallback"
 _verifiers: dict[tuple[int, int, int], SparseHistoryVerifier] = {}
 
 
 def finish_request(
     manager: SparseOffloadCacheMixin, request_id: int, cache: _KVCache
 ) -> dict | None:
-    """Remove one request's verifier and return its completed integrity evidence."""
+    """Remove one request's verifier and return its completed integrity evidence.
+
+    Args:
+        manager: Sparse offload manager that owns the released request.
+        request_id: Manager-local request identifier.
+        cache: Native cache identity associated with that request.
+    """
     verifier = _verifiers.pop((id(manager), request_id, id(cache)), None)
     return None if verifier is None else verifier.metrics()
 
 
-def _verify_generation(params: FmhaParams) -> None:
+def _verify_generation(
+    attention: DeepseekV4TrtllmAttention,
+    metadata: DeepseekV4TrtllmAttentionMetadata,
+    forward_args: AttentionForwardArgs,
+    indices: torch.Tensor | None,
+) -> None:
     import torch
 
     from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 
-    metadata = params.meta
     state = getattr(metadata, "sparse_offload_state", None)
-    layer = params.attn.layer_idx
+    layer = attention.layer_idx
     if state is None or layer not in state.layers:
         return
     manager = metadata.kv_cache_manager
     members = manager._sparse_batch_members
     if not members:
         return
-    assert state.prepared and state.batch is not None
-    assert params.token_offset == params.seq_offset == 0 and metadata.num_contexts == 0
-    assert params.attn.compress_ratio == 4 and not params.attn._uses_nvfp4_compress
+    label = f"layer {layer}, requests {metadata.request_ids}"
+    assert state.prepared, f"{label}: sparse state is not prepared"
+    assert state.batch is not None, f"{label}: sparse batch is missing"
+    assert metadata.num_contexts == 0, f"{label}: expected decode-only metadata"
+    assert attention.compress_ratio == 4, f"{label}: expected ratio-4 compression"
+    assert not attention._uses_nvfp4_compress, f"{label}: expected FP8 compressed history"
     descriptor = state.layers[layer]
     data_index = descriptor.data_buffer_index
     buffer_id = descriptor.buffer_ids[data_index]
     pages = list(manager.impl.get_aggregated_pages([buffer_id]))
-    assert len(pages) == 1
+    assert len(pages) == 1, f"{label}: expected one host page group, got {len(pages)}"
     host = pages[0]
-    assert len(host.buffers) == 1 and host.buffers[0].id == buffer_id
-    assert host.buffers[0].expansion == 1
+    assert len(host.buffers) == 1, f"{label}: expected one host buffer, got {len(host.buffers)}"
+    assert host.buffers[0].id == buffer_id, (
+        f"{label}: host buffer {host.buffers[0].id} differs from descriptor {buffer_id}"
+    )
+    assert host.buffers[0].expansion == 1, f"{label}: expected an unexpanded FP8 host buffer"
     units_per_page = manager.tokens_per_block // descriptor.unit_tokens
-    assert int(host.size) % units_per_page == 0
+    assert int(host.size) % units_per_page == 0, (
+        f"{label}: host row size {host.size} is not divisible by {units_per_page} units"
+    )
     row_bytes = int(host.size) // units_per_page
-    assert row_bytes == params.attn.head_dim
-    native = params.fwd.sparse_runtime_params
-    assert int(native.aux_kv_cache_pool_ptr) == descriptor.arena_base_addresses[data_index]
-    indices = native.sparse_attn_indices.detach().cpu()
-    selected = params.fwd.sparse_backend_args.topk_indices.detach().cpu()
-    window = params.attn.sparse_attention_config.window_size
+    assert row_bytes == attention.head_dim, (
+        f"{label}: host row bytes {row_bytes} differ from head dimension {attention.head_dim}"
+    )
+    native = forward_args.sparse_runtime_params
+    assert int(native.aux_kv_cache_pool_ptr) == descriptor.arena_base_addresses[data_index], (
+        f"{label}: attention pool does not match the offload descriptor"
+    )
+    assert indices is not None, f"{label}: sparse predictor returned no attention indices"
+    indices = indices.detach().cpu()
+    backend_args = forward_args.sparse_backend_args
+    assert backend_args is not None, f"{label}: sparse backend arguments are missing"
+    assert backend_args.topk_indices is not None, f"{label}: sparse selections are missing"
+    selected = backend_args.topk_indices.detach().cpu()
+    window = attention.sparse_attention_config.window_size
     extra = metadata.max_compressed_indices[4]
-    assert indices.shape[1] == window + extra and selected.shape[1] == extra
-    assert indices.shape[0] == selected.shape[0] == params.num_tokens
+    assert indices.shape[1] == window + extra, (
+        f"{label}: index width {indices.shape[1]} differs from window/history {window}/{extra}"
+    )
+    assert selected.shape[1] == extra, f"{label}: selection width {selected.shape[1]} != {extra}"
+    assert indices.shape[0] == selected.shape[0] == metadata.num_tokens, (
+        f"{label}: index/selection/token rows "
+        f"{indices.shape[0]}/{selected.shape[0]}/{metadata.num_tokens} differ"
+    )
     request_positions = metadata.req_idx_per_token.detach().cpu().flatten().tolist()
     token_positions = metadata.token_positions_cuda.detach().cpu().flatten().tolist()
     request_ids = metadata.request_ids
@@ -83,23 +118,34 @@ def _verify_generation(params: FmhaParams) -> None:
             (descriptor.arena_row_counts[data_index], row_bytes),
         )
     )
-    for query in range(params.num_tokens):
+    for query in range(metadata.num_tokens):
         request_position = int(request_positions[query])
-        assert 0 <= request_position < active_count
+        assert 0 <= request_position < active_count, (
+            f"{label}: request position {request_position} outside {active_count} active requests"
+        )
         request_id = int(request_ids[request_position])
         member = members[request_id]
-        assert int(batch_rows[request_position]) == int(member.row)
+        request_label = f"layer {layer}, request {request_id}, position {token_positions[query]}"
+        assert int(batch_rows[request_position]) == int(member.row), (
+            f"{request_label}: batch row {batch_rows[request_position]} != member row {member.row}"
+        )
         history = int(member.cache.history_length)
         units = selected[query].to(torch.int64)
         slots = indices[query, window:].to(torch.int64)
         valid = (units >= 0) & (units < lengths[request_position])
-        assert bool((slots[~valid] == -1).all())
-        assert bool((slots[valid] >= 0).all())
+        assert bool((slots[~valid] == -1).all()), (
+            f"{request_label}: invalid logical units have non-padding slots"
+        )
+        assert bool((slots[valid] >= 0).all()), (
+            f"{request_label}: valid logical units have negative slots"
+        )
         committed = valid & (units < history // descriptor.unit_tokens)
         units = units[committed]
         slots = slots[committed]
         if units.numel() == 0:
-            assert history < descriptor.unit_tokens
+            assert history < descriptor.unit_tokens, (
+                f"{request_label}: no committed selection from {history} history tokens"
+            )
             continue
         host_pages = list(member.cache.get_aggregated_page_indices(int(host.layer_group_id)))
         host_view = convert_to_torch_tensor(
@@ -125,42 +171,25 @@ def _verify_generation(params: FmhaParams) -> None:
         )
 
 
-def _observe(module: ModuleType) -> None:
-    generation = module.thop.run_generation
+def observe(module: ModuleType) -> None:
+    """Observe the predictor shared by fallback and PrimTS attention consumers.
 
-    @functools.wraps(generation)
-    def observed_generation(params: FmhaParams):
-        _verify_generation(params)
-        return generation(params)
+    Args:
+        module: Imported DeepSeek V4 sparse backend module.
+    """
+    attention_cls = module.DeepseekV4TrtllmAttention
+    predictor = attention_cls.sparse_attn_predict
 
-    module.thop.run_generation = observed_generation
+    @functools.wraps(predictor)
+    def observed_prediction(
+        self: DeepseekV4TrtllmAttention,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        indices, offsets = predictor(self, query, key, metadata, forward_args)
+        _verify_generation(self, metadata, forward_args, indices)
+        return indices, offsets
 
-
-class _IntegrityLoader(importlib.abc.Loader):
-    def __init__(self, loader: importlib.abc.Loader) -> None:
-        self._loader = loader
-
-    def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType | None:
-        return self._loader.create_module(spec)
-
-    def exec_module(self, module: ModuleType) -> None:
-        self._loader.exec_module(module)
-        _observe(module)
-
-
-class _IntegrityFinder(importlib.abc.MetaPathFinder):
-    def find_spec(
-        self, fullname: str, path: Sequence[str] | None, target: ModuleType | None = None
-    ) -> importlib.machinery.ModuleSpec | None:
-        if fullname != _MODULE:
-            return None
-        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
-        assert spec is not None and spec.loader is not None
-        spec.loader = _IntegrityLoader(spec.loader)
-        return spec
-
-
-def install() -> None:
-    """Install before attention imports, without initializing CUDA or MPI."""
-    assert _MODULE not in sys.modules, "Integrity observer must precede attention imports"
-    sys.meta_path.insert(0, _IntegrityFinder())
+    attention_cls.sparse_attn_predict = observed_prediction
