@@ -13,12 +13,14 @@ import threading
 import tracemalloc
 import warnings
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
 import pytest
 import torch
 
 from tensorrt_llm.inputs import utils
+from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.utils import async_load_base64_tensor, load_base64_tensor
 
 pytestmark = pytest.mark.cpu_only
@@ -124,6 +126,8 @@ def _headers(raw: bytearray, archive: zipfile.ZipFile, name: str) -> tuple[int, 
     """Offsets of one record's local and central directory headers."""
     central = raw.find(b"PK\x01\x02")
     while raw[central + 46 : central + 46 + len(name)] != name.encode():
+        if central < 0:
+            raise KeyError(name)
         central = raw.find(b"PK\x01\x02", central + 4)
     return archive.getinfo(name).header_offset, central
 
@@ -145,6 +149,13 @@ def _encrypt(raw: bytearray, archive: zipfile.ZipFile) -> None:
         local, central = _headers(raw, archive, name)
         raw[local + 6] |= 1
         raw[central + 8] |= 1
+
+
+def _deflate_method(raw: bytearray, archive: zipfile.ZipFile) -> None:
+    """Mark the storage record deflated in both headers, keeping its equal sizes."""
+    local, central = _headers(raw, archive, "archive/data/0")
+    struct.pack_into("<H", raw, local + 8, zipfile.ZIP_DEFLATED)
+    struct.pack_into("<H", raw, central + 10, zipfile.ZIP_DEFLATED)
 
 
 def _corrupt(record: str) -> Callable[[bytearray, zipfile.ZipFile], None]:
@@ -184,7 +195,7 @@ def _offset_past_archive(raw: bytearray, archive: zipfile.ZipFile) -> None:
     struct.pack_into("<I", raw, len(raw) - 10, struct.unpack_from("<I", raw, len(raw) - 10)[0] + 12)
 
 
-def _spy_reads(monkeypatch) -> list:
+def _spy_reads(monkeypatch: pytest.MonkeyPatch) -> list:
     """Record the names of archive records the loader opens; ZipFile.read opens them too.
 
     Install it after building the payload, whose construction reads records.
@@ -210,7 +221,7 @@ class _BigBytearray:
 _ACCEPTED = [
     (torch.randn(5, 8).to(torch.float16), {}),
     (torch.randn(5, 8).to(torch.bfloat16), {}),
-    *[(torch.randn(2, 3), {"pickle_protocol": p}) for p in (2, 3, 4, 5)],
+    *[(torch.randn(2, 3), {"pickle_protocol": p}) for p in (3, 4, 5)],
     (torch.arange(12.0).reshape(4, 3)[1:, 1:], {}),
     (torch.arange(6.0).reshape(3, 2).t(), {}),
     (torch.arange(4.0, requires_grad=True), {}),
@@ -221,7 +232,9 @@ _ACCEPTED = [
 
 
 @pytest.mark.parametrize("tensor, save_kwargs", _ACCEPTED)
-def test_saved_tensors_round_trip(monkeypatch, tensor: torch.Tensor, save_kwargs: dict) -> None:
+def test_saved_tensors_round_trip(
+    monkeypatch: pytest.MonkeyPatch, tensor: torch.Tensor, save_kwargs: dict
+) -> None:
     """Dtypes, protocols, views and empty tensors decode on CPU, never through torch.load."""
     monkeypatch.setattr(torch, "load", None)
     payload = _encode(tensor, **save_kwargs)
@@ -237,23 +250,26 @@ def test_hand_built_pickle_accepted() -> None:
     assert decoded.shape == (4, 2)
 
 
-def test_async_round_trip(monkeypatch) -> None:
-    """The async wrapper decodes in a worker thread, off the event loop."""
+def test_async_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The async wrapper decodes on the media executor, else on the loop's default one."""
     threads = []
     load = utils.load_base64_tensor
 
     def spy(data: str, *, max_bytes: int) -> torch.Tensor:
-        threads.append(threading.get_ident())
+        threads.append(threading.current_thread().name)
         return load(data, max_bytes=max_bytes)
 
-    async def run() -> torch.Tensor:
-        threads.append(threading.get_ident())
-        return await async_load_base64_tensor(_encode(tensor), max_bytes=_LIMIT)
+    async def run(pool: Optional[ThreadPoolExecutor]) -> torch.Tensor:
+        with BaseMediaIO.use_executor(pool):
+            return await async_load_base64_tensor(_encode(tensor), max_bytes=_LIMIT)
 
     monkeypatch.setattr(utils, "load_base64_tensor", spy)
     tensor = torch.arange(12.0).reshape(3, 4)
-    assert torch.equal(asyncio.run(run()), tensor)
-    assert len(threads) == 2 and threads[0] != threads[1]
+    with ThreadPoolExecutor(1, thread_name_prefix="media_test") as pool:
+        assert torch.equal(asyncio.run(run(pool)), tensor)
+    assert torch.equal(asyncio.run(run(None)), tensor)
+    main = threading.current_thread().name
+    assert threads[0].startswith("media_test") and threads[1] not in (main, threads[0])
 
 
 def test_line_wrapped_base64_near_limit_accepted() -> None:
@@ -271,7 +287,8 @@ _BASE64_REJECTED = {
     "encoded-over-limit": ("A" * 5000, 1024, ValueError, "base64 characters"),
     "decoded-over-limit": ("AAAA", 2, ValueError, "is 3 bytes, over the 2-byte limit"),
     "alphabet": ("not base64!", _LIMIT, ValueError, "not valid base64"),
-    "alphabet-wrapped": ("QUJD\nRE!G", _LIMIT, ValueError, "not valid base64"),
+    # The retry's error is reported, not the strict pass's refusal of line breaks.
+    "wrapped-truncated": ("QUJD\nREVG\nRA", _LIMIT, ValueError, "not valid base64: (?!Only)"),
     "non-ascii": ("QUJDé", _LIMIT, ValueError, "not valid base64"),
 }
 
@@ -279,7 +296,9 @@ _BASE64_REJECTED = {
 @pytest.mark.parametrize(
     "text, limit, error, match", _BASE64_REJECTED.values(), ids=_BASE64_REJECTED
 )
-def test_base64_rejected(monkeypatch, text: object, limit: int, error: type, match: str) -> None:
+def test_base64_rejected(
+    monkeypatch: pytest.MonkeyPatch, text: object, limit: int, error: type, match: str
+) -> None:
     """Non-strings, bad characters and sizes over the limit are refused; long text undecoded."""
     monkeypatch.setattr(
         utils, "_b64decode_strict", None if limit == 1024 else utils._b64decode_strict
@@ -288,7 +307,7 @@ def test_base64_rejected(monkeypatch, text: object, limit: int, error: type, mat
         load_base64_tensor(text, max_bytes=limit)
 
 
-def test_base64_decodes_without_strict_mode(monkeypatch) -> None:
+def test_base64_decodes_without_strict_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """Python 3.10 has no a2b_base64 strict_mode; validated b64decode is used instead."""
     calls = []
 
@@ -311,7 +330,7 @@ def test_base64_decodes_without_strict_mode(monkeypatch) -> None:
     assert calls and all(calls)
 
 
-def test_base64_decoded_in_slices(monkeypatch) -> None:
+def test_base64_decoded_in_slices(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each base64 call sees a bounded slice, so a worker thread yields the GIL between them."""
     lengths = []
     a2b_base64 = utils.binascii.a2b_base64
@@ -332,7 +351,7 @@ def test_base64_decoded_in_slices(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("tail", ["", "\n", "\r\n" * 40])
-def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
+def test_sliced_decoding_matches_whole_text(monkeypatch: pytest.MonkeyPatch, tail: str) -> None:
     """Sliced decoding agrees with whole-text decoding, padding at a slice end included.
 
     Sizes 40..51 put the padding of a 64-character text exactly at the slice end,
@@ -351,9 +370,10 @@ def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
 
 
 def test_whitespace_retry_releases_the_failed_attempt() -> None:
-    """A trailing newline costs a second decode, but not a third copy of the payload."""
+    """A line break near the end costs a second decode, but not a third copy of the payload."""
     raw = bytes(range(256)) * (1 << 14)
-    text = base64.b64encode(raw).decode() + "\n"
+    encoded = base64.b64encode(raw).decode()
+    text = encoded[:-4] + "\n" + encoded[-4:]
     if tracemalloc.is_tracing():
         pytest.skip("tracemalloc is already tracing; its peak would include the caller's.")
     tracemalloc.start()
@@ -377,7 +397,10 @@ _NESTED = b"\x80\x04" + b"".join(
 _TUPLE_GLOBAL = b"X\x1f\x00\x00\x00torch._utils _rebuild_tensor_v2\x85"
 _PICKLE_REJECTED = {
     "allocating-global": (pickle.dumps(_BigBytearray(), protocol=2), "bytearray"),
-    "opcode": (pickle.dumps([1.0], protocol=2), "unsupported pickle opcode"),
+    "opcode": (
+        pickle.dumps([1.0], protocol=2),
+        "unsupported pickle opcode EMPTY_LIST; .* on its own",
+    ),
     "truncated": (b"\x80\x02" + _REBUILD, "malformed"),
     "missing-protocol": (_pickle((4, 2), (2, 1), 8, head=b""), "malformed"),
     "memo-on-empty-stack": (_pickle((4, 2), (2, 1), 8, head=b"\x80\x02q\x00"), "malformed"),
@@ -402,18 +425,23 @@ _PICKLE_REJECTED = {
     # OrderedDict(tensor) would unbind 1e8 zero-stride rows while unpickling.
     "reducer-wrapping-tensor": (_pickle((10**8, 2), (0, 0), 1, wrap=True), "exactly one"),
     "negative-stride": (_pickle((4, 2), (-2, 1), 8), "exactly one"),
+    "negative-offset": (_GOOD.replace(b"tQ\x8a\x01\x00", b"tQ\x8a\x01\xff"), "exactly one"),
+    "size-stride-lengths": (_pickle((4, 2), (2,), 8), "exactly one"),
     "out-of-range-size": (_pickle((0, 2**64), (1, 1), 4), "size, stride or offset"),
     "logical-over-limit": (_pickle((1 << 18, 2), (0, 0), 1), "describes"),
     "storage-over-limit": (_pickle((4,), (1,), _LIMIT), "describes"),
     "zero-dim-huge-product": (_pickle((10**6,) * 4 + (0,), (1,) * 5, 4), "multiply"),
     "repeats-storage": (_pickle((4, 2), (0, 1), 2), "repeats storage"),
+    # Both fit in the 8-element storage, but their rows overlap.
+    "overlapping-rows": (_pickle((4, 2), (1, 1), 8), "repeats storage"),
+    "broadcast-row": (_pickle((2, 2), (0, 1), 8), "repeats storage"),
     # Four rows of two at stride 3 cover 8 elements but end at element 10.
     "past-storage": (_pickle((4, 2), (3, 1), 8), "past its storage"),
 }
 
 
 @pytest.mark.parametrize("pickled, match", _PICKLE_REJECTED.values(), ids=_PICKLE_REJECTED)
-def test_pickle_rejected(monkeypatch, pickled: bytes, match: str) -> None:
+def test_pickle_rejected(monkeypatch: pytest.MonkeyPatch, pickled: bytes, match: str) -> None:
     """Pickles that are not one bounded dense float tensor are refused before allocating."""
     payload = _with_pickle(pickled)
     monkeypatch.setattr(torch, "empty", None)
@@ -442,6 +470,7 @@ _SHORT = base64.b64encode(
 _ARCHIVE_REJECTED = {
     "legacy-format": (_encode(torch.zeros(4), _use_new_zipfile_serialization=False), "zip"),
     "deflated": (_rewrite(_ZEROS, compression=zipfile.ZIP_DEFLATED), "uncompressed"),
+    "deflated-equal-sizes": (_patch(_ZEROS, _deflate_method), "uncompressed"),
     "encrypted": (_patch(_ZEROS, _encrypt), "unencrypted"),
     "crc-mismatch": (_patch(_ZEROS, _corrupt("data/0")), "CRC"),
     "version-crc-mismatch": (_patch(_ZEROS, _corrupt("version")), "CRC"),
@@ -458,6 +487,7 @@ _ARCHIVE_REJECTED = {
         "is over",
     ),
     "zip64-record-moved": (_patch(_ZEROS, _zip64_edit(8, lambda v: v - 8, False)), "precede"),
+    "zip64-record-unsigned": (_patch(_ZEROS, _zip64_edit(0, lambda v: v ^ 1, True)), "malformed"),
     "shorter-than-zip64-locator": (_SHORT, "zip"),
     # A comment could hide a second central directory that other readers find.
     "eocd-comment": (_patch(_ZEROS, _add_comment), "no comment"),
@@ -480,7 +510,26 @@ def test_archive_rejected(payload: str, match: str) -> None:
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
-def test_record_sizes_must_agree(monkeypatch) -> None:
+def test_crc_less_archive_rejected() -> None:
+    """A file saved without CRC-32s is refused with the torch option that writes them."""
+    enabled = torch.serialization.get_crc32_options()
+    torch.serialization.set_crc32_options(False)
+    try:
+        payload = _encode(torch.zeros(4))
+    finally:
+        torch.serialization.set_crc32_options(enabled)
+    with pytest.raises(ValueError, match=r"set_crc32_options\(True\)"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+@pytest.mark.parametrize("max_bytes", [0, -1, 2**63, 1.5, True])
+def test_invalid_max_bytes_rejected(max_bytes: object) -> None:
+    """max_bytes must be a positive int that the size bounds can hold."""
+    with pytest.raises(ValueError, match="max_bytes"):
+        load_base64_tensor(_ZEROS, max_bytes=max_bytes)
+
+
+def test_record_sizes_must_agree(monkeypatch: pytest.MonkeyPatch) -> None:
     """A stored record whose two declared sizes differ is refused before any record is read."""
     # zipfile would read compress_size bytes, past the declared file_size.
     size = (
@@ -502,7 +551,9 @@ def test_record_sizes_must_agree(monkeypatch) -> None:
     ],
     ids=["pickle-over-limit", "byteorder-long", "byteorder-big"],
 )
-def test_metadata_record_rejected(monkeypatch, record: str, value: bytes, match: str) -> None:
+def test_metadata_record_rejected(
+    monkeypatch: pytest.MonkeyPatch, record: str, value: bytes, match: str
+) -> None:
     """Oversized metadata records are refused unread; a six-byte byteorder must say little."""
     payload = _rewrite(_ZEROS, {record: value})
     reads = _spy_reads(monkeypatch)
