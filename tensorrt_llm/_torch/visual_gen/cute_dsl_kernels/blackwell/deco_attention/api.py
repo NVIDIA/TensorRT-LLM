@@ -31,7 +31,7 @@ Kernels:
     * A family package deco_attention/<family> exports DEFAULT_PV, pv_formats, max_comp_channels, min_seq_len,
       workspace_size, prepare, attention and basis; the functions here check the caller's arguments (ValueError),
       resolve the defaults and forward resolved values to it: the compensation of a call as inputs.Compensation, a
-      basis as the tuple of its tensors (runtime.Basis).
+      basis as the tuple of its tensors (runtime.Basis), the scale rule as its name.
 
 Compensation (the switches of prepare; workspace_size takes rank and bases):
     * rank: the channels (r_q, r_k) of the two compensation terms, multiples of 16 with r_q + r_k at most
@@ -48,6 +48,17 @@ Compensation (the switches of prepare; workspace_size takes rank and bases):
     * attention takes rescale_threshold, one of rescale_thresholds(pv).
     * A pair (rank, rows, basis) is a tuple or a list of two.
 
+Quantizer of Q' and K' (a switch of prepare):
+    * scale_rule: how the scale of an NVFP4 block of 16 values of the head channels is chosen, one of
+      constants.SCALE_RULES; None is constants.DEFAULT_SCALE_RULE, "band". With m the largest magnitude of the block:
+        - "max": m / 6, which puts the largest magnitude on the largest code.
+        - "band": m / 4 where a value of the block has 0.76 m <= |x| < 0.85 m, else m / 6.
+        - "search": the block is quantized with m / 6 and with m / 4 and keeps the scale with the smaller squared
+          rounding error, m / 6 when they are equal.
+    * The compensation terms take the residual of the kept scale; a block of the compensation channels takes m / 6
+      under every rule.
+    * It changes neither the operand layout nor the workspace nor the attention kernels.
+
 CUDA graphs:
     * prepare and attention can be captured: every scale stays on the device, nothing is read back or allocated.
     * A capture follows one eager call with the same shape and arguments. That call compiles the kernels of the
@@ -61,7 +72,7 @@ from typing import NamedTuple
 import torch
 
 from . import target
-from .constants import BASES, HEAD_DIM, RESCALE_THRESHOLDS
+from .constants import BASES, DEFAULT_SCALE_RULE, HEAD_DIM, RESCALE_THRESHOLDS, SCALE_RULES
 from .inputs import Compensation, rank_pair, sample_rows
 from .runtime import Basis
 
@@ -135,6 +146,16 @@ def _terms(
     if type(gram_weight) not in (float, int) or not 0.0 <= gram_weight <= 1.0:
         raise ValueError(f"gram_weight must be a float in [0, 1], got {gram_weight!r}")
     return rank, bases, float(gram_weight)
+
+
+def _scale_rule(scale_rule: str | None) -> str:
+    """Check scale_rule; return the rule for the scale of a head block that a family runs: one of
+    constants.SCALE_RULES, the default for None."""
+    if scale_rule is None:
+        return DEFAULT_SCALE_RULE
+    if type(scale_rule) is not str or scale_rule not in SCALE_RULES:
+        raise ValueError(f"scale_rule {scale_rule!r} is not one of {SCALE_RULES}")
+    return scale_rule
 
 
 def min_seq_len(pv: str | None = None) -> int:
@@ -296,6 +317,7 @@ def prepare(
     bases: str = "shared",
     gram_weight: float | None = None,
     basis: torch.Tensor | Basis | None = None,
+    scale_rule: str | None = None,
 ) -> Operands:
     """Run the preparation: write the operands of the attention into the workspace and return them (views into it).
 
@@ -333,9 +355,12 @@ def prepare(
               sample_rows(seq_len, device, rank=rank, tokens=mask, rate=..., min_rows=...) with the bool mask
               [B, seq_len] of the valid prefixes, arange(seq_len) < valid_seq_lens[:, None], built once per set of
               lengths: sample_rows keeps a draw for the mask tensor it was made from.
+        scale_rule: the rule for the scale of an NVFP4 block of the head channels of Q' and K' (module docstring):
+            "max", "band" or "search", None for the default.
     """
     family, pv = _family(pv)
     rank, bases, gram_weight = _terms(rank, bases, gram_weight)
+    scale_rule = _scale_rule(scale_rule)
     shape, device = _check(None, None, token_views=True, q=q, k=k, v=v)
     _check_seq_len(family, pv, shape[1])
     if (
@@ -378,7 +403,7 @@ def prepare(
             rows_q = rows_k = rows
     map_rows = rows is None and lens is not None
     comp = Compensation(rank, bases, gram_weight, rows_q, rows_k, map_rows, basis)
-    buffers = family.prepare(q, k, v, workspace, pv, lens, comp)
+    buffers = family.prepare(q, k, v, workspace, pv, lens, comp, scale_rule)
     if compensated and basis is None:
         basis = family.basis(buffers, pv, bases)
     if basis is not None and len(basis) == 1:

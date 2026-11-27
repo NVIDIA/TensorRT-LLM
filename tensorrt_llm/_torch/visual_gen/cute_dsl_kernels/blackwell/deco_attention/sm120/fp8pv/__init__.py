@@ -69,12 +69,13 @@ def prepare(
     buffers: dict[str, torch.Tensor],
     lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> None:
     """Run the preparation of this kernel (prep.run) on the buffers of a call, which may hold anything on entry."""
     # the four words of the basis launch must be zero when it starts; the V pass sets the flags of its tiles
     buffers["done"].zero_()
     buffers["v_flags"].zero_()
-    prep.run(q, k, v, buffers, lens, comp)
+    prep.run(q, k, v, buffers, lens, comp, scale_rule)
 
 
 def attention(

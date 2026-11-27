@@ -48,7 +48,7 @@ from ...inputs import Compensation, hadamard
 from ...runtime import Basis, Layout, compiled, num_sms, pdl_enabled, token_pitches
 from ..prep.basis import EIG_THREADS, GMAX_WORDS, clear_kernel, eig_directions, eig_kernel
 from ..prep.encode import encode_kernel, encode_threads
-from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel
+from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel, qk_rule_kernel
 from .softmax import MIN_SCORE_LOG2
 from .v_pass import V_BLOCK, V_CTAS_PER_SM, V_THREADS, v_encode_kernel, v_scan_kernel
 
@@ -77,7 +77,7 @@ def _launch_chain(
     gmax, ut_q, ut_k, q_sfv, k_sfv = scratch
     QP, KP, VP = pitches
     v_grid, qgrid, egrid, v_counted = grids
-    rank, separate, eig, two_row_sets, rows_mode, pdl = config
+    rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule = config
     # the shape of the call, and the sizes of its launches that follow from it
     B, S, H = (Int32(n) for n in q.shape[:3])
     BH = B * H
@@ -127,7 +127,11 @@ def _launch_chain(
         op, _gemm_view(k), a_layout, (128, 128, 128), tiled_mma
     )
     qk_args = (tiled_mma, tma_q, tma_k, hadamard, ut_q, ut_k, q4, k4, q_sfv, k_sfv, gmax)
-    qkp = qk_kernel(*qk_args, S, H, NB, ntiles, lens, rank, with_lens, separate)
+    qk_args += (S, H, NB, ntiles, lens, rank, with_lens, separate)
+    if scale_rule == "max":
+        qkp = qk_kernel(*qk_args)
+    else:
+        qkp = qk_rule_kernel(*qk_args, scale_rule)
     qkp.launch(grid=(qgrid, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
     encode_kernel(
         q_sfv, k_sfv, q_sf, k_sf, gmax, score_scale, BH * NB, v8_scale, min_prod, rank
@@ -137,7 +141,7 @@ def _launch_chain(
 def _make_host(config: tuple) -> Callable:
     """Return the host function that launches the chain of a configuration on its `stream` argument.
 
-    * config: (rank, separate, eig, two_row_sets, rows_mode, pdl).
+    * config: (rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule).
         - rank: (r_q, r_k), the channels of the compensation terms. separate: each term has a basis of its own, ut_q
           (the Q-residual term's) and the one at the address ut_k (else both read ut_q); the eigensolver then writes
           both from the address of ut_q.
@@ -149,6 +153,7 @@ def _make_host(config: tuple) -> Callable:
           rows): the row arguments are [B, rows] or [rows], and the eigensolver maps them into each valid prefix
           (the default draw) or takes them as given.
         - pdl: the launches of the chain follow each other as programmatic dependents.
+        - scale_rule: the rule for the scale of a head block in the Q/K pass (constants.SCALE_RULES).
     * The score prescale log2(e) / sqrt(128) is folded into Q' (QPRE), so the multiplier of the raw scores in log2
       units is the score scale (group scale product / 128) itself, a power of two; the encode launch raises it to at
       least 2^MIN_SCORE_LOG2, the floor of the attention's landing (softmax.py), by shrinking the Q' / K' block scales.
@@ -263,6 +268,7 @@ def run(
     buffers: dict[str, torch.Tensor],
     lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> None:
     """Fill the operands of a call (buffers: the buffers of the call, the layout of this package) from raw BF16 q, k, v.
 
@@ -271,6 +277,7 @@ def run(
     * lens: None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place.
     * comp: the compensation of the call (inputs.Compensation). With a caller's basis the eigensolver is not
       launched and the rows are None, as they are with rank (0, 0).
+    * scale_rule: the rule for the scale of a head block of Q' and K' (constants.SCALE_RULES).
     """
     B, S, H, _ = q.shape
     NB = key_tiles(S)
@@ -309,7 +316,7 @@ def run(
     sizes = (*token_pitches(q, k, v), v_grid, qgrid, egrid, v_counted, nk)
     lens_addr = 0 if lens is None else lens.data_ptr()
     pdl = pdl_enabled()
-    config = (rank, separate, eig, two_row_sets, rows_mode, pdl)
+    config = (rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule)
     values = (gram_weight, rows_k_addr, ut_k_addr, lens_addr)
 
     # the chain compiles per device and configuration (_make_host)

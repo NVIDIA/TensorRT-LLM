@@ -46,14 +46,14 @@ attention(operands, out)                   # BF16 [B, S, H, 128] out
 | `rescale_thresholds(pv)` | The rescale thresholds that the attention of a PV format offers on the current GPU, the default first. |
 | `min_seq_len(pv)` | The shortest sequence of the kernel: one token, or 128 for `"fp8"` on `sm120`. |
 | `workspace_size(batch, seq_len, heads, device, pv, rank, *, bases)` | The bytes of workspace of a call, a small multiple of the bytes of `q`. |
-| `prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens, *, bases, gram_weight, basis)` | The operands of the attention, views into the workspace that hold until it is written again. |
+| `prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens, *, bases, gram_weight, basis, scale_rule)` | The operands of the attention, views into the workspace that hold until it is written again. |
 | `attention(operands, out, *, rescale_threshold)` | `out`, written by the attention kernel. |
 | `sample_rows(seq_len, device, token_tags, rank, tokens, *, rate, min_rows)` | Basis rows for `prepare`: the default draw, or a draw of another rate or minimum, of tagged tokens or within given tokens. |
 
 `workspace_size` and `prepare` raise `ValueError` for a PV format or a rank that the GPU does not offer, for an
-unknown `bases` and for a sequence shorter than `min_seq_len(pv)`; `prepare` also for a `gram_weight` outside [0, 1]
-and for any `gram_weight` with `bases="separate"`; `attention` for a rescale threshold that is not offered. A pair
-(`rank`, `rows`, `basis`) is a tuple or a list of two.
+unknown `bases` and for a sequence shorter than `min_seq_len(pv)`; `prepare` also for a `gram_weight` outside [0, 1],
+for any `gram_weight` with `bases="separate"` and for a `scale_rule` outside `SCALE_RULES`; `attention` for a
+rescale threshold that is not offered. A pair (`rank`, `rows`, `basis`) is a tuple or a list of two.
 
 - **Tensors.** `q`, `k`, `v` and `out` are BF16 tensors of one shape on one device, at 256-byte aligned addresses:
   every allocation is, and a view into one at an offset of a multiple of 128 elements. `out` is contiguous; `q`, `k`
@@ -64,10 +64,10 @@ and for any `gram_weight` with `bases="separate"`; `attention` for a rescale thr
   keep nothing between calls and a call writes every byte it reads, so one buffer serves calls of any shape that
   fits, in any order.
 - **Compilation.** Kernels compile on first use and are cached per device and key. A key holds what changes the
-  generated code: arguments of the call (the rank, the bases kind, the rescale threshold, valid lengths and the
-  form of their rows, a passed basis) and what a family derives from the shape and the SM count. The Gram weight,
-  the row counts and the values of a passed basis are run-time values. Every compilation is logged with its key
-  and time (logger `tensorrt_llm.logger`), and each family lists the parts of a key beside it.
+  generated code: arguments of the call (the rank, the bases kind, the scale rule, the rescale threshold,
+  valid lengths and the form of their rows, a passed basis) and what a family derives from the shape and the SM
+  count. The Gram weight, the row counts and the values of a passed basis are run-time values. Every compilation
+  is logged with its key and time (logger `tensorrt_llm.logger`), and each family lists the parts of a key beside it.
 - **Reproducibility.** A call returns the same bits for the same inputs on one GPU, whatever the workspace held.
   On sm_100a and sm_103a the work units of a last partial wave of the attention (a unit is two 128-row query tiles
   of one head; the wave has fewer units than the GPU has SMs) are split into pieces of the key sequence over the
@@ -132,6 +132,19 @@ attention(operands, out, rescale_threshold=2.0)
   view is only valid while every call on the workspace in between has the same shape, rank and bases and passes a
   basis itself. Nothing detects a stale view. To keep a basis, for instance one per layer on a workspace that the
   layers share, clone it: `basis = operands.basis.clone()`.
+- **Scale of a head block.** An NVFP4 block of 16 values of Q' or K' has one scale, rounded to three mantissa bits.
+  `scale_rule` chooses it for the blocks of the head channels, the 128 rotated channels of each operand
+  (`SCALE_RULES`, `constants.py`). With m the largest magnitude of the block:
+  - `"max"`: m / 6, which puts the largest magnitude on the largest code, 6.
+  - `"band"` (the default): m / 4 where a value of the block has 0.76 m <= |x| < 0.85 m, else m / 6. A value in
+    that band lies between the codes 4 and 6 of the scale m / 6 and near the code 3 of the scale m / 4.
+  - `"search"`: the block is quantized with m / 6 and with m / 4 and keeps the scale with the smaller squared
+    rounding error, m / 6 when they are equal.
+
+  The compensation terms take the residual of the kept scale, and a block of the compensation channels takes
+  m / 6 under every rule. The operands, the workspace and the attention kernels are the same under every rule; the
+  rule is part of the compile key of the preparation. `"band"` adds a test of every head value to the preparation,
+  `"search"` a second quantization of the head channels.
 - **Rescale threshold.** `attention(..., rescale_threshold=T)` takes one of `rescale_thresholds(pv)`: the running
   maximum of a row, its anchor, moves, and the output is rescaled, only when a key tile exceeds it by more than T
   binades (default 4). T trades the reach of P below the anchor against rescales: a lower value keeps weights

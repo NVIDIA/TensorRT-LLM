@@ -21,6 +21,7 @@ and fails it when the kernel package does not import.
 import importlib
 import itertools
 import multiprocessing
+from typing import get_args
 
 import pytest
 import torch
@@ -449,6 +450,28 @@ def test_deco_compensation_fields_follow_the_scores(
     _assert_follows_the_scores(out, q, k, v)
     assert torch.equal(out, _kernels(q, k, v, v_dtype, **kernel_arguments))
     assert not torch.equal(out, _backend(num_heads, deco_recipe(v_dtype)).forward(q, k, v))
+
+
+def test_deco_scale_rules_follow_the_scores(require_deco_kernels, deco_recipe) -> None:
+    """The scale rule of the config reaches the kernels through the backend: each rule gives
+    the output of the kernels under that rule, which follows the scores, and no two rules give
+    the same output. The config names the rules of the kernel package and its default."""
+    device = require_deco_kernels()
+    rules = deco_attention.constants.SCALE_RULES
+    field = DeCoAttentionConfig.model_fields["scale_rule"]
+    assert get_args(field.annotation) == rules
+    assert field.default == deco_attention.constants.DEFAULT_SCALE_RULE
+    num_heads = 2
+    q, k, v = _random_qkv(1, 1024, num_heads, device, q_scale=4.0)
+
+    outs = []
+    for rule in rules:
+        out = _backend(num_heads, deco_recipe(scale_rule=rule)).forward(q, k, v)
+        _assert_follows_the_scores(out, q, k, v)
+        assert torch.equal(out, _kernels(q, k, v, scale_rule=rule))
+        outs.append(out)
+
+    assert not any(torch.equal(a, b) for a, b in itertools.combinations(outs, 2))
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)

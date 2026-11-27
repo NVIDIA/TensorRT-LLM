@@ -64,15 +64,17 @@ def _compile(
     with_lens: bool,
     rank: tuple[int, int],
     separate: bool,
+    scale_rule: str,
 ) -> Callable:
     """Return the host function of a chain compiled for one key, kept in the cache of its kernel package.
 
     * Key: the device; the chain form (fused: the V pass in the basis launch), which _grids takes from the
       eigenproblems of the call against the SM count, so it follows the shape; with_lens (the kernels read valid
-      prefix lengths); rank (the channels of the two terms); separate (each term on a basis of its own).
+      prefix lengths); rank (the channels of the two terms); separate (each term on a basis of its own);
+      scale_rule (the rule for the scale of a head block of Q' and K').
     * A first use of a key compiles (runtime.compiled); the rule of a capture is that of api.py.
     """
-    key = (device.index, fused, with_lens, rank, separate)
+    key = (device.index, fused, with_lens, rank, separate, scale_rule)
 
     def make() -> tuple:
         # the host function, placeholders of its run-time parameters (Int64 addresses, Int32 sizes, Float32
@@ -82,7 +84,16 @@ def _compile(
             for p in inspect.signature(host).parameters.values()
             if p.annotation in (Int64, Int32, Float32)
         ]
-        return host, *args, cute.runtime.make_fake_stream(), fused, with_lens, rank, separate
+        return (
+            host,
+            *args,
+            cute.runtime.make_fake_stream(),
+            fused,
+            with_lens,
+            rank,
+            separate,
+            scale_rule,
+        )
 
     return compiled(cache, key, make)
 
@@ -92,15 +103,16 @@ def make_host(
 ) -> Callable:
     """Return the host function of the chain of a kernel package.
 
-    * Every launch takes the shape at run time; FUSED, LENS, RANK and SEPARATE are the trace-time switches of
-      the function, the key of _compile.
+    * Every launch takes the shape at run time; FUSED, LENS, RANK, SEPARATE and SCALE_RULE are the trace-time
+      switches of the function, the key of _compile.
     * ut_q_p, ut_k_p: the addresses of the basis of the Q-residual term and of that of the K-residual term
       (basis_rows); with bases "shared" the one address, twice.
     * Basis launch (basis_kernel): the eigenproblems of the compensation basis, neig of them (none when the caller
       gave the basis), on the Gram matrices of the sampled q and k tokens; the other CTAs scan V for max|v - vbar|
       and, when the launch has room for it, run the V pass.
     * V pass (v_kernel, v_threads threads), otherwise.
-    * Q'/K' pass: rotation, body and compensation channels in NVFP4, provisional block scales, group maxima.
+    * Q'/K' pass: rotation, body and compensation channels in NVFP4 (the scale of a body block by SCALE_RULE),
+      provisional block scales, group maxima.
     * Encode launch: group scales, the score-scale floor, score_scale, UE4M3 block scales.
     * The host takes four output addresses of the V pass after score_scale_p; the first n_vout go to the kernels.
       k_image = (codes offset, scales offset, pitch): K' goes to tile images, at these offsets from k4_p and ksf_p
@@ -156,6 +168,7 @@ def make_host(
         LENS: cutlass.Constexpr,
         RANK: cutlass.Constexpr,
         SEPARATE: cutlass.Constexpr,
+        SCALE_RULE: cutlass.Constexpr,
     ):
         # LENS: the kernels read the lengths at lens_p in place and take the rows mode; otherwise both are None
         lens_p = lens_p if cutlass.const_expr(LENS) else None
@@ -221,6 +234,7 @@ def make_host(
             tile_pitch=k_pitch,
             rank=RANK,
             separate=SEPARATE,
+            scale_rule=SCALE_RULE,
         ).launch(grid=(nqk_cta, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
         encode_kernel(
             prov_p,
@@ -322,6 +336,7 @@ def run(
     buffers: dict[str, torch.Tensor],
     lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> None:
     """Run the launches of a chain on the current stream: raw BF16 q, k, v [B, S, H, 128] into the buffers of the call.
 
@@ -334,6 +349,8 @@ def run(
     * lens: None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place: every pass
       then takes the tokens of a batch element below its length only.
     * comp: the compensation of the call (inputs.Compensation).
+    * scale_rule: the rule for the scale of an NVFP4 block of the head channels of Q' and K', one of
+      constants.SCALE_RULES; a block of the compensation channels takes that of "max" under every rule.
     """
     B, S, H, _ = q.shape
     T = key_tiles(S)
@@ -341,7 +358,7 @@ def run(
     nsm = num_sms(dev)
     separate = comp.bases == "separate"
     grids = _grids(B, S, H, nsm, comp.rank, separate)
-    fn = _compile(host, cache, dev, grids.fused, lens is not None, comp.rank, separate)
+    fn = _compile(host, cache, dev, grids.fused, lens is not None, comp.rank, separate, scale_rule)
     neig, rows, ut = grids.neig, (comp.rows_q, comp.rows_k), basis(buffers, comp.bases)
     if comp.basis is not None:
         neig, rows, ut = 0, (None, None), comp.basis

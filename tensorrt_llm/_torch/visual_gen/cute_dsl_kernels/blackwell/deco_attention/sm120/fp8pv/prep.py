@@ -59,7 +59,10 @@ def run(
     buffers: dict[str, torch.Tensor],
     lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> None:
     """Fill the operands of the attention from raw q, k, v: Q'/K', score_scale (>= 2^MIN_SCORE_LOG2), smoothed V.
-    lens, comp: as in chain.run."""
-    chain.run(_host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, buffers, lens, comp)
+    lens, comp, scale_rule: as in chain.run."""
+    chain.run(
+        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, buffers, lens, comp, scale_rule
+    )

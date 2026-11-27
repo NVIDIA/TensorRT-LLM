@@ -376,7 +376,7 @@
     },
     "DeCoAttentionConfig": {
       "additionalProperties": false,
-      "description": "DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.\n\nQ/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the\nfirst-order quantization error of the scores; V is smoothed over blocks of keys and\nquantized to FP8 or NVFP4. Self-attention with head dimension 128.\n\n* Compensation channels: ``q_channels`` of the Q-residual term, which compensates the\n  rounding residual of Q, and ``k_channels`` of the K-residual term, which compensates\n  that of K.\n* Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated\n  on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,\n  ``min_sample_rows``).\n* The recipe sets its scaling granularity and smooths V itself: it has no block size,\n  smoothing or VC-Attention options.",
+      "description": "DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.\n\nQ/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the\nfirst-order quantization error of the scores; V is smoothed over blocks of keys and\nquantized to FP8 or NVFP4. Self-attention with head dimension 128.\n\n* Compensation channels: ``q_channels`` of the Q-residual term, which compensates the\n  rounding residual of Q, and ``k_channels`` of the K-residual term, which compensates\n  that of K.\n* Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated\n  on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,\n  ``min_sample_rows``).\n* Quantizer of Q/K: the rule for the scale of an NVFP4 block of the head channels\n  (``scale_rule``).\n* The recipe sets its scaling granularity and smooths V itself: it has no block size,\n  smoothing or VC-Attention options.",
       "properties": {
         "algorithm": {
           "const": "deco_attention",
@@ -477,6 +477,18 @@
           "description": "Q/K quantization format: block-scaled nvfp4.",
           "status": "prototype",
           "title": "Qk Dtype",
+          "type": "string"
+        },
+        "scale_rule": {
+          "default": "band",
+          "description": "Rule for the scale of an NVFP4 block of 16 values of the head channels, the 128 rotated channels of Q and of K. With m the largest magnitude of the block: max takes m / 6, which puts the largest magnitude on the largest code; band takes m / 4 where a value of the block has 0.76 m <= |x| < 0.85 m, else m / 6; search quantizes the block with m / 6 and with m / 4 and keeps the scale with the smaller squared rounding error. A block of the compensation channels takes m / 6 under every rule.",
+          "enum": [
+            "max",
+            "band",
+            "search"
+          ],
+          "status": "prototype",
+          "title": "Scale Rule",
           "type": "string"
         },
         "v_dtype": {

@@ -879,8 +879,8 @@ def _math_warps(st, codes, scales, gmax):
         if kind == 0:
             x, am0, am1 = _prescaled(x, am0, am1)
             st_tmem_16x32bx2_f32_x32_wait(xr, x)
-        sc0, w0, w1, dq0 = quant16_dq_knownmax(x[0:16], am0)
-        sc1, w2, w3, dq1 = quant16_dq_knownmax(x[16:32], am1)
+        sc0, w0, w1, dq0 = quant16_dq_knownmax(x[0:16], am0, st.scale_rule)
+        sc1, w2, w3, dq1 = quant16_dq_knownmax(x[16:32], am1, st.scale_rule)
         mbar_wait_bounded(st.bars + 8 * B_AEMPTY, (i + 1) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
         st_tmem_16x32bx2_f32_x32_wait(st.tm + tl + TM_DQ + n_pair * 64, dq0 + dq1)
@@ -932,6 +932,7 @@ def _qk_body(
     ntiles,
     RANK,
     lens,
+    scale_rule,
 ):
     """Run the Q'/K' pass of the CTA's share of the ntiles tiles: the setup, the role of the thread's warp, the release.
 
@@ -940,6 +941,8 @@ def _qk_body(
       Q-residual term and that of the K-residual term.
     * lens: None, or the global address of the valid prefix lengths: the block scales of the tokens past the length of
       their batch element are then zero and stay out of the maxima, and the CTAs share the live tiles (_live_tiles).
+    * scale_rule: the rule for the scale of an NVFP4 block of the head channels (quant.py); the compensation terms
+      take the residual at that scale, and a block of the compensation channels has the scale of the rule "max".
     """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -1030,6 +1033,7 @@ def _qk_body(
         n_all=n_all,
         B=batch,
         # trace-time constants
+        scale_rule=scale_rule,
         RANK=RANK,
         comp=comp,
         comp_blocks=comp_blocks,
@@ -1151,4 +1155,51 @@ def qk_kernel(
         ntiles,
         RANK,
         lens if LENS else None,
+        "max",
+    )
+
+
+@cute.kernel
+def qk_rule_kernel(
+    tiled_mma: cute.TiledMma,
+    tma_q: cpasync.TmaInfo,
+    tma_k: cpasync.TmaInfo,
+    hadamard: cute.Tensor,
+    ut_q: cute.Tensor,
+    ut_k: Int64,
+    q4: cute.Tensor,
+    k4: cute.Tensor,
+    q_sfv: cute.Tensor,
+    k_sfv: cute.Tensor,
+    gmax: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    ntiles: Int32,
+    lens: Int64,
+    RANK: cutlass.Constexpr,
+    LENS: cutlass.Constexpr,
+    SEPARATE: cutlass.Constexpr,
+    SCALE_RULE: cutlass.Constexpr,
+):
+    """Run the Q'/K' pass (_qk_body) of RANK = (r_q, r_k) with the scale rule SCALE_RULE of the head blocks, "band" or
+    "search" (qk_kernel is the pass of "max"). The other arguments as for qk_kernel."""
+    _qk_body(
+        tiled_mma,
+        tma_q,
+        tma_k,
+        hadamard,
+        (Int64(ut_q.iterator.toint()), ut_k) if SEPARATE else (Int64(ut_q.iterator.toint()),),
+        q4,
+        k4,
+        q_sfv,
+        k_sfv,
+        gmax,
+        S,
+        H,
+        NB,
+        ntiles,
+        RANK,
+        lens if LENS else None,
+        SCALE_RULE,
     )

@@ -15,7 +15,7 @@
 """DeCo-Attention on the tcgen05 targets (B200 sm_100a, GB300 sm_103a, Rubin sm_107a).
 
     workspace_size(b, s, h, device, pv, rank, bases)      # bytes of the caller's workspace for one call
-    prepare(q, k, v, workspace, pv, valid_seq_lens, comp) # BF16 q, k, v [B, S, H, 128] -> the buffers of the call
+    prepare(q, k, v, workspace, pv, ...)                  # BF16 q, k, v [B, S, H, 128] -> the buffers of the call
     attention(buffers, o, pv, rank, ...)                  # the buffers -> BF16 o [B, S, H, 128]
     basis(buffers, pv, bases)                             # the compensation basis of the call
 
@@ -95,10 +95,12 @@ def prepare(
     pv: str,
     valid_seq_lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> dict[str, torch.Tensor]:
     """Carve the buffers of a call from the workspace and fill the operands from raw q, k, v, on the current stream.
 
     * valid_seq_lens, comp: the valid prefix lengths and the compensation of the call (fp8pv.prep.run).
+    * scale_rule: the rule for the scale of a head block of Q' and K' (constants.SCALE_RULES).
     * A caller's basis has the directions of the basis of these buffers, and one that overlaps the bytes of the
       call in the workspace is that basis (runtime.check_caller_basis). Returns the buffers, name -> tensor.
     """
@@ -108,7 +110,7 @@ def prepare(
     buffers = carve(workspace, layout)
     if comp.basis is not None:
         check_caller_basis(comp.basis, kernel.basis(buffers, comp.bases), workspace, layout)
-    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp)
+    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp, scale_rule)
     return buffers
 
 

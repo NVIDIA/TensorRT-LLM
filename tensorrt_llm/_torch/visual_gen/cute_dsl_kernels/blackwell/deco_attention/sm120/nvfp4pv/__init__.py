@@ -60,13 +60,14 @@ def prepare(
     buffers: dict[str, torch.Tensor],
     lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> None:
     """Run the preparation on the buffers of a call (layout): the operands from BF16 q, k, v. Every buffer may hold
     anything on entry; the counters of the basis launch and of the attention's split units, which must be zero when
-    their launches start, are zeroed here. lens, comp: as in prep.run."""
+    their launches start, are zeroed here. lens, comp, scale_rule: as in prep.run."""
     buffers["done"].zero_()
     launch.split_counters(buffers["split"]).zero_()
-    prep.run(q, k, v, buffers, lens, comp)
+    prep.run(q, k, v, buffers, lens, comp, scale_rule)
 
 
 def attention(

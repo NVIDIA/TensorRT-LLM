@@ -91,6 +91,22 @@ def p_prescale_log2(rescale_threshold: float) -> int:
 
 
 E2M1_MAX = 6.0  # the largest E2M1 value
+# The rules for the scale of an NVFP4 block of QK_BLOCK values of the head channels of Q' and K' (prepare:
+# scale_rule). m is the largest magnitude of the block, and a scale is rounded to three mantissa bits:
+#   "max"     m / E2M1_MAX: the largest magnitude lands on the largest code
+#   "band"    m / WIDE_SCALE_MAX where a value of the block has lo <= |x| < hi, with lo = m * SCALE_BAND_LOW and
+#             hi = m * SCALE_BAND_HIGH as rounded FP32 products; else m / E2M1_MAX
+#   "search"  the block is quantized with m / E2M1_MAX and with m / WIDE_SCALE_MAX and keeps the scale with the
+#             smaller FP32 sum of (code * scale - x)^2, m / E2M1_MAX when the sums are equal
+# The compensation terms take the residual of the kept scale; a block of a compensation term takes m / E2M1_MAX
+# under every rule
+SCALE_RULES = ("max", "band", "search")
+# The default of scale_rule
+DEFAULT_SCALE_RULE = "band"
+# The code of the largest magnitude of a block under the wider scale of "band" and "search"
+WIDE_SCALE_MAX = 4.0
+# The band of "band", in units of the largest magnitude of the block
+SCALE_BAND_LOW, SCALE_BAND_HIGH = 0.76, 0.85
 # the V scale is a power of two at or above the largest deviation from the block means over the code range; the block
 # means are stored divided by that scale too, so the deviation maximum also takes |mean| times this factor, which
 # keeps the scaled mean of a block of large equal values (deviation zero) below 2^102 in FP32, with room for the block

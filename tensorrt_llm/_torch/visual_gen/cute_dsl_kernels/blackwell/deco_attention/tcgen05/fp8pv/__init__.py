@@ -71,6 +71,7 @@ def prepare(
     buffers: dict[str, torch.Tensor],
     lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> None:
     """Run the preparation of this kernel on the buffers of a call (layout); the arguments as in prep.run."""
     # every buffer may hold anything on entry; only the arrival counters of a split launch must be zero when the
@@ -78,7 +79,7 @@ def prepare(
     flags = buffers.get("split_flags")
     if flags is not None:
         flags.zero_()
-    prep.run(q, k, v, buffers, lens, comp)
+    prep.run(q, k, v, buffers, lens, comp, scale_rule)
 
 
 def attention(

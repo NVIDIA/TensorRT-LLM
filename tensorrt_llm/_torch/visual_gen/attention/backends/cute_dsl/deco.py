@@ -26,6 +26,8 @@ like any other backend.
   K-residual term, the bases kind with its Gram weight, and the sampling of the tokens the
   bases are estimated on. A layer resolves the channels the config leaves open from the kernel
   package and checks the config against the GPU when it is built.
+* Quantizer of Q and K: ``scale_rule`` of the config is the rule for the scale of an NVFP4
+  block of the head channels.
 * VANILLA calls (unquantized): every other call, that is cross-attention, a causal
   ``attention_mask``, other dtypes or devices, shorter sequences, and every call of a layer whose
   head dimension or K/V head count the kernels do not take.
@@ -52,10 +54,10 @@ like any other backend.
 * CUDA graphs: a capture follows one eager call with the same shape and arguments: that call
   compiles the kernels of the call and builds the sampled rows and the rotation matrix, and
   a first use of any of them under capture raises a ``RuntimeError``. The warm-up of a graph
-  runner is that call. The channels of the two terms, the bases kind, one or two row sets,
-  the presence of a mask and the shape of a call each select kernel variants. A captured
-  call computes its token counts and sampled tokens inside the graph: a replay follows the
-  content of the captured mask and tags tensors.
+  runner is that call. The channels of the two terms, the bases kind, the scale rule, one or
+  two row sets, the presence of a mask and the shape of a call each select kernel variants.
+  A captured call computes its token counts and sampled tokens inside the graph: a replay
+  follows the content of the captured mask and tags tensors.
 """
 
 from typing import Any
@@ -316,6 +318,7 @@ class DeCoAttention(AttentionBackend):
                 bases=config.basis,
                 # The kernels take a Gram weight with shared bases only.
                 gram_weight=config.gram_weight if config.basis == "shared" else None,
+                scale_rule=config.scale_rule,
             )
             return deco_attention.attention(operands, torch.empty_like(q))
 

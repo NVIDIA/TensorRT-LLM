@@ -15,7 +15,7 @@
 """DeCo-Attention for sm_120a (RTX PRO 6000): the kernel family built on the warp-level MMAs (mma.sync).
 
     workspace_size(b, s, h, device, pv, rank, bases)      # bytes of the caller's workspace for one call
-    prepare(q, k, v, workspace, pv, valid_seq_lens, comp) # BF16 q, k, v [B, S, H, 128] -> the buffers of the call
+    prepare(q, k, v, workspace, pv, ...)                  # BF16 q, k, v [B, S, H, 128] -> the buffers of the call
     attention(buffers, o, pv, rank, ...)                  # the buffers -> BF16 o [B, S, H, 128]
     basis(buffers, pv, bases)                             # the compensation basis of the call
 
@@ -111,11 +111,13 @@ def prepare(
     pv: str,
     valid_seq_lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> dict[str, torch.Tensor]:
     """Return the buffers of the call (name -> tensor, views into the workspace), filled from raw BF16 q, k, v.
 
     * valid_seq_lens: batch element b attends its first valid_seq_lens[b] keys; its later query rows are zero in o.
     * comp: the compensation of the call (prep.chain.run).
+    * scale_rule: the rule for the scale of a head block of Q' and K' (prep.chain.run).
     * A caller's basis has the directions of the basis of these buffers, and one that overlaps the bytes of the
       call in the workspace is that basis (runtime.check_caller_basis); the kernels read it in place.
     """
@@ -125,7 +127,7 @@ def prepare(
     buffers = carve(workspace, layout)
     if comp.basis is not None:
         check_caller_basis(comp.basis, chain.basis(buffers, comp.bases), workspace, layout)
-    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp)
+    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp, scale_rule)
     return buffers
 
 

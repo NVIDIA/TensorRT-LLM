@@ -160,6 +160,8 @@ class DeCoAttentionConfig(BaseQuantAttentionConfig):
     * Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated
       on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,
       ``min_sample_rows``).
+    * Quantizer of Q/K: the rule for the scale of an NVFP4 block of the head channels
+      (``scale_rule``).
     * The recipe sets its scaling granularity and smooths V itself: it has no block size,
       smoothing or VC-Attention options.
     """
@@ -254,6 +256,19 @@ class DeCoAttentionConfig(BaseQuantAttentionConfig):
         description=(
             "Fewest sampled tokens per Gram matrix, whatever the sample rate gives. None is "
             "twice the channels of the larger compensation term, at least 64."
+        ),
+    )
+    scale_rule: Literal["max", "band", "search"] = Field(
+        "band",
+        status="prototype",
+        description=(
+            "Rule for the scale of an NVFP4 block of 16 values of the head channels, the 128 "
+            "rotated channels of Q and of K. With m the largest magnitude of the block: max "
+            "takes m / 6, which puts the largest magnitude on the largest code; band takes "
+            "m / 4 where a value of the block has 0.76 m <= |x| < 0.85 m, else m / 6; search "
+            "quantizes the block with m / 6 and with m / 4 and keeps the scale with the smaller "
+            "squared rounding error. A block of the compensation channels takes m / 6 under "
+            "every rule."
         ),
     )
 

@@ -320,6 +320,7 @@ class TestAttentionConfigQuantValidation:
             dict(gram_weight=1.0),
             dict(basis="separate"),
             dict(q_sample_rate=1 / 64, k_sample_rate=1.0, min_sample_rows=256),
+            dict(scale_rule="search"),
         ],
         ids=[
             "defaults",
@@ -330,12 +331,13 @@ class TestAttentionConfigQuantValidation:
             "gram_weight",
             "separate_bases",
             "sampling",
+            "scale_rule",
         ],
     )
     def test_supported_deco_attention_config(self, quant):
         """DeCo-Attention validates on CUTEDSL with nvfp4 Q/K, fp8 or nvfp4 V and its
-        compensation and sampling fields. ``algorithm`` selects its config class from a
-        mapping, as a YAML file gives it, and the config survives a dump, also one that
+        compensation, sampling and scale rule fields. ``algorithm`` selects its config class
+        from a mapping, as a YAML file gives it, and the config survives a dump, also one that
         leaves out the defaults or the fields that were not set."""
         attention = AttentionConfig(
             backend="CUTEDSL", quant_attention_config=DeCoAttentionConfig(**quant)
@@ -399,6 +401,12 @@ class TestAttentionConfigQuantValidation:
                 None,
                 "does not apply to basis='separate'",
             ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", scale_rule="widest"),
+                None,
+                "Input should be 'max', 'band' or 'search'",
+            ),
         ],
         ids=[
             "other_backend",
@@ -408,6 +416,7 @@ class TestAttentionConfigQuantValidation:
             "recipe_fields_with_algorithm",
             "too_many_channels",
             "gram_weight_with_separate",
+            "unknown_scale_rule",
         ],
     )
     def test_deco_attention_rejections(self, backend, quant, sparse, match):
@@ -415,7 +424,8 @@ class TestAttentionConfigQuantValidation:
         composes with a sparse algorithm; an algorithm other than its own is unknown; a config
         without an algorithm takes none of its fields, and its config none of the block size,
         smoothing or VC-Attention fields of the other recipes; the two terms take at most 128
-        compensation channels; the Gram weight belongs to the shared basis."""
+        compensation channels; the Gram weight belongs to the shared basis; a scale rule is one
+        of the three of the kernels."""
         with pytest.raises(ValidationError, match=match):
             AttentionConfig(
                 backend=backend, quant_attention_config=quant, sparse_attention_config=sparse

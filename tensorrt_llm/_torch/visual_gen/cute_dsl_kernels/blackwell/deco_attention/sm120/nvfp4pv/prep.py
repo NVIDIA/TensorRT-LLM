@@ -60,10 +60,13 @@ def run(
     buffers: dict[str, torch.Tensor],
     lens: torch.Tensor | None,
     comp: Compensation,
+    scale_rule: str,
 ) -> None:
     """Fill the operands of the attention kernel from raw BF16 q, k, v [B, S, H, 128], in the buffers of the call.
 
     * Q' (q4, q_sf), score_scale (floored at 2^MIN_SCORE_LOG2), K', V' and the means (img, v4_scale).
-    * lens, comp: as in chain.run.
+    * lens, comp, scale_rule: as in chain.run.
     """
-    chain.run(_host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, buffers, lens, comp)
+    chain.run(
+        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, buffers, lens, comp, scale_rule
+    )

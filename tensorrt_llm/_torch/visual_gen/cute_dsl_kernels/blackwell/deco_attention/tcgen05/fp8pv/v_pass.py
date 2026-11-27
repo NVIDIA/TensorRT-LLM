@@ -22,7 +22,7 @@
   CTA waits for another CTA of its grid, so neither launch needs its whole grid resident.
 * A unit of work is a block of one batch element. A CTA of either launch takes every gdim-th unit from its index
   on, so the encode of a unit runs where its scan ran. A scan that shares its SMs with the eigensolver CTAs takes
-  its work from a counter of the call instead (COUNTED), a unit in pieces of one chunk per thread.
+  its work from a counter of the call instead (counted), a unit in pieces of one chunk per thread.
 """
 
 import cutlass

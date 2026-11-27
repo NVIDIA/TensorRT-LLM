@@ -17,6 +17,8 @@
 * Per tile: the Hadamard rotation, NVFP4 of the 8 body blocks, the projections of q1 (the dequantized body) and dq
   (its quantization residual) on the compensation basis (their A fragments come from the accumulators of the
   rotation), NVFP4 of the compensation blocks.
+* Block scale (_quant_block): a body block takes it by the scale rule of the call (constants.SCALE_RULES), and q1
+  and dq are those of the scale it takes; a compensation block takes that of "max".
 * Compensation channels, rank = (r_q, r_k) directions: the blocks of the Q-residual term (Q: dq B_q, K: k1 B_q),
   the blocks of the K-residual term (Q: q1 B_k, K: dk B_k), then zero blocks up to COMP_CHANNELS. B_q and B_k
   are the leading r_q and r_k directions of the basis of each term (chain.basis_rows): of the one basis
@@ -41,7 +43,16 @@ from cutlass.utils import SmemAllocator
 
 from ...common.expmath import bf16x2, f2u, round_m3, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
-from ...constants import COMP_CHANNELS, E2M1_MAX, QK_CHANNELS, QK_SCALE_ATOMS, QPRE
+from ...constants import (
+    COMP_CHANNELS,
+    E2M1_MAX,
+    QK_CHANNELS,
+    QK_SCALE_ATOMS,
+    QPRE,
+    SCALE_BAND_HIGH,
+    SCALE_BAND_LOW,
+    WIDE_SCALE_MAX,
+)
 from ..ptx.shared import (
     e2m1x2_to_f32x2,
     f32x4_to_e2m1x4,
@@ -88,20 +99,68 @@ def _hd_fragment(hdt, stage_row, j, s, t):
 
 
 @cute.jit
-def _quant_block(x0: Float32, x1: Float32, x2: Float32, x3: Float32):
+def _quant_block(
+    x0: Float32, x1: Float32, x2: Float32, x3: Float32, rule: cutlass.Constexpr, quad=None
+):
     """One 16-channel NVFP4 block spread over a quad (4 values per thread).
-    Returns (code word: low byte = (x1,x0), high byte = (x3,x2); scale; dequantized x0..x3)."""
+
+    * rule: one of constants.SCALE_RULES. With m the largest magnitude of the block, its scale, rounded to
+      three mantissa bits, is
+        - "max": m / E2M1_MAX.
+        - "band": m / WIDE_SCALE_MAX when a magnitude of the block is at least m * SCALE_BAND_LOW and below
+          m * SCALE_BAND_HIGH, the FP32 products; else m / E2M1_MAX.
+        - "search": of m / E2M1_MAX and m / WIDE_SCALE_MAX the one with the smaller sum of
+          (x - code * scale)^2 over the 16 values, m / E2M1_MAX when the sums are equal.
+    * quad: the first lane of the quad, for "band": the threads of the warp vote whether they hold a magnitude
+      in the band, and a block takes the four votes of its quad.
+    * Returns (code word: low byte = (x1,x0), high byte = (x3,x2); scale; dequantized x0..x3).
+    """
     a0, a1, a2, a3 = (cute.math.abs(x) for x in (x0, x1, x2, x3))
     am = cute.arch.fmax(cute.arch.fmax(a0, a1), cute.arch.fmax(a2, a3))
     am = cute.arch.fmax(Float32(0.0), am)
     am = cute.arch.fmax(am, cute.arch.shuffle_sync_bfly(am, offset=1))
     am = cute.arch.fmax(am, cute.arch.shuffle_sync_bfly(am, offset=2))
-    sc = round_m3(am * Float32(1.0 / E2M1_MAX))
-    inv = Float32(cutlass.select_(sc > Float32(1e-30), cute.arch.rcp_approx(sc), Float32(0.0)))
-    cw = f32x4_to_e2m1x4(x0 * inv, x1 * inv, x2 * inv, x3 * inv)
-    d0, d1 = e2m1x2_to_f32x2(cw & Uint32(0xFF))
-    d2, d3 = e2m1x2_to_f32x2(cw >> Uint32(8))
-    return cw, sc, d0 * sc, d1 * sc, d2 * sc, d3 * sc
+    xs = (x0, x1, x2, x3)
+    f_max, f_wide = Float32(1.0 / E2M1_MAX), Float32(1.0 / WIDE_SCALE_MAX)
+    if cutlass.const_expr(rule == "band"):
+        lo = am * Float32(SCALE_BAND_LOW)
+        hi = am * Float32(SCALE_BAND_HIGH)
+        hit = Int32(0)
+        for a in (a0, a1, a2, a3):
+            hit = hit | (Int32(a >= lo) & Int32(a < hi))
+        votes = Uint32(cute.arch.vote_ballot_sync(hit != 0))
+        in_band = ((votes >> Uint32(quad)) & Uint32(0xF)) != Uint32(0)
+        factors = (Float32(cutlass.select_(in_band, f_wide, f_max)),)
+    elif cutlass.const_expr(rule == "search"):
+        factors = (f_max, f_wide)
+    else:
+        factors = (f_max,)
+    for i in cutlass.range_constexpr(len(factors)):
+        sc_i = round_m3(am * factors[i])
+        inv = Float32(
+            cutlass.select_(sc_i > Float32(1e-30), cute.arch.rcp_approx(sc_i), Float32(0.0))
+        )
+        cw_i = f32x4_to_e2m1x4(x0 * inv, x1 * inv, x2 * inv, x3 * inv)
+        v0, v1 = e2m1x2_to_f32x2(cw_i & Uint32(0xFF))
+        v2, v3 = e2m1x2_to_f32x2(cw_i >> Uint32(8))
+        d_i = (v0 * sc_i, v1 * sc_i, v2 * sc_i, v3 * sc_i)
+        if cutlass.const_expr(len(factors) > 1):
+            # the squared error of the block: the thread's four values, then the quad
+            sq = [(xs[e] - d_i[e]) * (xs[e] - d_i[e]) for e in range(4)]
+            err_i = (sq[0] + sq[1]) + (sq[2] + sq[3])
+            err_i = err_i + cute.arch.shuffle_sync_bfly(err_i, offset=1)
+            err_i = err_i + cute.arch.shuffle_sync_bfly(err_i, offset=2)
+        if cutlass.const_expr(i == 0):
+            cw, sc, d = cw_i, sc_i, d_i
+            if cutlass.const_expr(len(factors) > 1):
+                err = err_i
+        else:
+            take = err_i < err
+            cw = Uint32(cutlass.select_(take, cw_i, cw))
+            sc = Float32(cutlass.select_(take, sc_i, sc))
+            d = tuple(Float32(cutlass.select_(take, d_i[e], d[e])) for e in range(4))
+            err = Float32(cutlass.select_(take, err_i, err))
+    return cw, sc, d[0], d[1], d[2], d[3]
 
 
 @cute.jit
@@ -143,17 +202,17 @@ def _stage_rows(rank, separate):
     return (both, 2 * both, both + top) if separate else (0, both, top)
 
 
-def _body_block(bo, x, side, proj, uts, stg, sst, g, t):
+def _body_block(bo, x, side, proj, uts, stg, sst, g, t, rule):
     """Quantize and emit body block bo and accumulate its projections; return the larger of its two block scales.
 
-    * A trace-time helper. x[0..7]: n-tile 0 c0..c3, n-tile 1 c0..c3.
+    * A trace-time helper. x[0..7]: n-tile 0 c0..c3, n-tile 1 c0..c3. rule: that of _quant_block.
     * proj = (body, residual, further), each (accumulators, directions, first row in the U stage).
     * Body and residual: the dequantized body and the residual, on the leading directions that both terms have.
     * Further (its fourth entry: the index of the wider term): the operand that the wider term has on this side,
       on that term's further directions.
     """
-    cw0, sc0, d00, d01, d02, d03 = _quant_block(x[0], x[1], x[4], x[5])
-    cw1, sc1, d10, d11, d12, d13 = _quant_block(x[2], x[3], x[6], x[7])
+    cw0, sc0, d00, d01, d02, d03 = _quant_block(x[0], x[1], x[4], x[5], rule, 4 * g)
+    cw1, sc1, d10, d11, d12, d13 = _quant_block(x[2], x[3], x[6], x[7], rule, 4 * g)
     _emit(stg, sst, g, t, Int32(bo), cw0, cw1, sc0, sc1)
     aq = [bf16x2(d00, d01), bf16x2(d10, d11), bf16x2(d02, d03), bf16x2(d12, d13)]
     ad = [
@@ -278,6 +337,7 @@ def qk_kernel(
     tile_pitch: cutlass.Constexpr = None,
     rank: cutlass.Constexpr,
     separate: cutlass.Constexpr,
+    scale_rule: cutlass.Constexpr,
 ):
     """Run the Q'/K' pass of the CTA's share of the nitems items (side, batch, head, tile).
 
@@ -287,6 +347,8 @@ def qk_kernel(
       without a valid token is left as it is.
     * tile_pitch: None, or K' goes to tile images.
     * rank, separate: the channels of the two compensation terms and whether each has a basis of its own.
+    * scale_rule: the rule for the scale of a body block, one of constants.SCALE_RULES (_quant_block); a
+      compensation block takes that of "max".
     * ut_q_p, ut_k_p: the basis of the Q-residual term and that of the K-residual term, FP32
       [B H][directions][128] with the leading direction last; with bases "shared" the one address, twice.
     """
@@ -448,7 +510,9 @@ def qk_kernel(
                                 yv[(a + hstep) * 8 + pos] = u0 - u1
                 for bo in cutlass.range_constexpr(8):
                     x = [yv[bo * 8 + i] * pre for i in range(8)]
-                    gb = cute.arch.fmax(gb, _body_block(bo, x, side, proj, uts, stg, sst, g, t))
+                    gb = cute.arch.fmax(
+                        gb, _body_block(bo, x, side, proj, uts, stg, sst, g, t, scale_rule)
+                    )
             else:
                 for bo in cutlass.range_constexpr(8):
                     if cutlass.const_expr(hd_rows < 128):
@@ -480,7 +544,9 @@ def qk_kernel(
                             for e in cutlass.range_constexpr(4):
                                 acc[4 * n + e] = r[e]
                     x = [acc[i] * pre for i in range(8)]
-                    gb = cute.arch.fmax(gb, _body_block(bo, x, side, proj, uts, stg, sst, g, t))
+                    gb = cute.arch.fmax(
+                        gb, _body_block(bo, x, side, proj, uts, stg, sst, g, t, scale_rule)
+                    )
             # the projections of the two terms: the Q-residual term has the residual of a Q tile and the body of a K
             # tile, the K-residual term the other one; then the further directions of the wider term
             term = [
@@ -495,8 +561,8 @@ def qk_kernel(
                 ti = int(cb >= rank[0] // 16)
                 nb = 2 * cb - ti * rank[0] // 8
                 v = term[ti][4 * nb : 4 * nb + 8]
-                cw0, sc0, *_ = _quant_block(v[0], v[1], v[4], v[5])
-                cw1, sc1, *_ = _quant_block(v[2], v[3], v[6], v[7])
+                cw0, sc0, *_ = _quant_block(v[0], v[1], v[4], v[5], "max")
+                cw1, sc1, *_ = _quant_block(v[2], v[3], v[6], v[7], "max")
                 gc[ti] = cute.arch.fmax(gc[ti], cute.arch.fmax(sc0, sc1))
                 _emit(stg, sst, g, t, Int32(8 + cb), cw0, cw1, sc0, sc1)
             isk = Int32(side == 1)
