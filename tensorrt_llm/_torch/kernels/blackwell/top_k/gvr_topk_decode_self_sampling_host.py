@@ -139,7 +139,7 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 # ---- device targets ----------------------------------------------------------
-# GVR V2 runs on Hopper (sm_90), datacenter Blackwell (sm_100, sm_103) and Rubin (sm_107): all have
+# GVR V2 runs on Hopper, datacenter Blackwell and Rubin (sm_90/100/103/107), which have
 # thread-block clusters, distributed shared memory and st.async, and the device module
 # compiles for either. The dispatch reads the device as (num_sms, sm_version):
 #   - ``num_sms`` sizes the register-resident waves on every target;
@@ -147,6 +147,12 @@ BLKC = 1024  # CTA size of the clustered register path
 #     148 SMs, Hopper uses its SM count; prefill uses physical counts on Hopper/Rubin;
 #   - ``cluster_fits`` keeps clustered plans to the clusters a Hopper GPU co-schedules.
 SUPPORTED_SM_VERSIONS = (90, 100, 103, 107)
+# BF16 elements per 8-byte PCW load.
+PCW_VECTOR_ELEMENTS = 4
+# Public GVR row alignment in BF16 elements.
+PCW_API_ROW_ELEMENTS = 16 // 2
+# Default PCW dispatch alignment in BF16 elements.
+PCW_DEFAULT_ROW_ELEMENTS = 64
 _BLACKWELL_SM_VERSIONS = (100, 103, 107)
 _BLACKWELL_WAVE_SMS = 148
 # Targets that take the register rungs and compile options below measured on hardware
@@ -2546,6 +2552,43 @@ def _tallws_launcher(
     return ("tallws", launch, pre, ())
 
 
+def _route_fp32_varlen(
+    num_rows: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int,
+    sm_version: int,
+    *,
+    det: bool = False,
+    r_cap: int = 0,
+) -> dict:
+    """Apply Rubin tuning to FP32 variable-length dispatch."""
+    if sm_version == 107 and not det and r_cap == 0:
+        from tensorrt_llm._torch.kernels.rubin.top_k.gvr_topk_rubin_dispatch import (
+            make_plan,
+            select_tuning,
+        )
+
+        tuning = select_tuning(num_rows, n, k, num_sms, sm_version)
+        if tuning is not None:
+            return make_plan(
+                tuning, num_rows, n, npad, k, num_sms, route, route_streaming, route_dynamic
+            )
+    return route(num_rows, n, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
+
+
+class _LowpLauncher(tuple):
+    """Tuple-compatible launcher carrying its actual CUDA cluster requirement."""
+
+    cluster_size: int
+
+    def __new__(cls, launcher: tuple, cluster_size: int) -> "_LowpLauncher":
+        result = super().__new__(cls, launcher)
+        result.cluster_size = cluster_size
+        return result
+
+
 def _varlen_launcher(
     num_rows: int,
     npad: int,
@@ -2562,10 +2605,11 @@ def _varlen_launcher(
     wide_cta_rows: bool = False,
     pdl: bool = False,
     r_cap: int = 0,
+    use_rubin_tuning: bool = True,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher for one logits dtype.
 
-    FP32 picks the family with ``route``; the 16-bit dtypes pick it with ``_route_16bit`` and add
+    FP32 picks the family with ``_route_fp32_varlen``; the 16-bit dtypes pick it with ``_route_16bit`` and add
     their own plans, compile options and tuning scalars (many of them per dtype) and a near-K
     ``complement`` launcher. Batches ``_tallws_gate`` admits run the tall-batch engine. Every
     choice is a function of capture-stable quantities only.
@@ -2586,14 +2630,25 @@ def _varlen_launcher(
         key = (num_rows, npad, k, n_env, next_n, cr, profile) + _varlen_key_flags(
             det, wide_cta_rows, pdl, r_cap
         )
+    if not use_rubin_tuning:
+        key += ("original_route",)
     cache = _varlen_cache_for(dtype)
     hit = cache.get(key)
     if hit is not None:
         return hit
+    lowp_tuning = None
+    cluster_size = 1
     # The device envelope never exceeds the physical row stride. The router
     # needs a k+1 floor to select a family even when every row is short.
     n_kernel = min(n_env, npad)
     n_route = max(n_kernel, k + 1)
+    if low and use_rubin_tuning and sm_version == 107:
+        from tensorrt_llm._torch.kernels.rubin.top_k.gvr_topk_rubin_dispatch import (
+            select_lowp_tuning,
+        )
+
+        lowp_tuning = select_lowp_tuning(num_rows, n_kernel, npad, k, num_sms, sm_version)
+    tuned_lowp_options = sm_version in _TUNED_SM_VERSIONS or lowp_tuning is not None
     cr_shift = 0 if cr == 1 else 2
     if _tallws_gate(num_rows, n_kernel, k, num_sms, sm_version, dtype, det):
         lc = _tallws_launcher(num_rows, npad, k, next_n, cr_shift, num_sms, dtype)
@@ -2614,12 +2669,17 @@ def _varlen_launcher(
                 k, n_kernel, next_n, cr_shift, block_threads=complement_threads, **dtype_options
             )
         lc = ("complement", fn, n_kernel)
+        lc = _LowpLauncher(lc, 1)
         cache[key] = lc
         return lc
     if low:
         plan_free = _route_16bit(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
-        plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
+        router = _route_fp32_varlen if use_rubin_tuning else route
+        plan_free = router(num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
+        # Select host options without changing the compilation target.
+        if plan_free.get("_rubin_blackwell_options", False):
+            sm_version = 100
     if (
         dtype is torch.float16
         and k == 2048
@@ -2698,11 +2758,13 @@ def _varlen_launcher(
         and _REG_CODE_RADIX_FORCE is not False
         and plan_free["kernel"] in ("reg", "reg_clus", "main", "clus")
         and n_kernel > k
-        and sm_version in _TUNED_SM_VERSIONS
+        and tuned_lowp_options
         else None
     )
     if crc is not None:
         crc_blk, crc_vpt, crc_cs, crc_list = crc
+        if lowp_tuning is not None:
+            crc_blk, crc_vpt = lowp_tuning.crc_geometry(crc_blk, crc_vpt, crc_cs)
         crc_blk, crc_vpt, _ = _fit_row_window_16bit(crc_blk, crc_vpt, 1, n_kernel, crc_cs)
         fn = dev.get_compiled__reg(
             (crc_blk, crc_vpt, 1, 1, True, False, False, 1024),
@@ -2720,6 +2782,7 @@ def _varlen_launcher(
         )
         crc_words = 1024 + 512 * crc_cs + (6 * crc_blk * crc_vpt + crc_blk if crc_list else 0)
         lc = ("reg", fn, (n_kernel, 0, 0, 4 * crc_words))
+        lc = _LowpLauncher(lc, crc_cs)
         cache[key] = lc
         return lc
     if plan_free["kernel"] == "reg_clus":
@@ -2821,6 +2884,7 @@ def _varlen_launcher(
             **cluster_options,
         )
         lc = ("reg_clus", fn, n_kernel)
+        cluster_size = int(cluster_tpl[2])
     elif plan_free["kernel"] in ("reg", "regimg"):
         reg_options = dict(dtype_options)
         pcw = False
@@ -2929,8 +2993,9 @@ def _varlen_launcher(
         if low:
             reg_options["cr2"] = bool(
                 dtype is torch.float16
+                and (lowp_tuning is None or lowp_tuning.cr2)
                 and reg_options["code_radix"]
-                and sm_version in _TUNED_SM_VERSIONS
+                and tuned_lowp_options
                 and (
                     n_kernel > 8448
                     or (num_rows > num_sms and not (n_kernel <= 2112 and num_rows <= 2 * num_sms))
@@ -2981,7 +3046,11 @@ def _varlen_launcher(
                 dtype is torch.bfloat16
                 and _REG_CODE_RADIX_FORCE is None
                 and plan_free["kernel"] == "reg"
-                and npad % 64 == 0
+                and (
+                    lowp_tuning.pcw_aligned
+                    if lowp_tuning is not None
+                    else npad % PCW_DEFAULT_ROW_ELEMENTS == 0
+                )
                 and num_rows <= 64
                 and 2 * num_rows <= num_sms
                 and (
@@ -3168,20 +3237,12 @@ def _varlen_launcher(
         if low:
             # FP32's register-path option rules, then the 16-bit overrides
             small_k_resident_16bit = (
-                k == 512
-                and num_rows > num_sms
-                and n_kernel > 4096
-                and sm_version in _TUNED_SM_VERSIONS
+                k == 512 and num_rows > num_sms and n_kernel > 4096 and tuned_lowp_options
             )
             stage_output = num_rows > num_sms and not (
                 k <= 512 and n_kernel <= 2 * k and num_rows <= 2 * num_sms
             )
-            if (
-                k == 2048
-                and n_kernel > k
-                and num_rows <= num_sms
-                and sm_version in _TUNED_SM_VERSIONS
-            ):
+            if k == 2048 and n_kernel > k and num_rows <= num_sms and tuned_lowp_options:
                 stage_output = True
             if (
                 dtype is torch.bfloat16
@@ -3196,7 +3257,7 @@ def _varlen_launcher(
                 and reg_options["code_radix"]
                 and n_kernel > k
                 and num_rows <= num_sms
-                and sm_version in _TUNED_SM_VERSIONS
+                and tuned_lowp_options
             ):
                 stage_output = True
             if reg_parts > 1:
@@ -3220,7 +3281,7 @@ def _varlen_launcher(
                     or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
                 )
                 and n_kernel > k
-                and sm_version in _TUNED_SM_VERSIONS
+                and tuned_lowp_options
                 else None
             )
             if (
@@ -3270,6 +3331,12 @@ def _varlen_launcher(
                 # wave's loads overlap this wave's select. Plans at the 32-register wall (blk * minb
                 # = 2048 threads per SM) keep it off: there it gained nothing (up to 5 % slower).
                 reg_options["succ_la"] = wave * int(plan_free["tpl"][2])
+            pcw_cluster = (
+                pcw
+                and reg_parts > 1
+                and (reg_parts < 8 or reg_parts * num_rows <= 64)
+                and sm_version in _BLACKWELL_SM_VERSIONS
+            )
             fn = dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
                 varlen=True,
@@ -3282,14 +3349,11 @@ def _varlen_launcher(
                 dense_bracket=k <= 512,
                 dense_lower_bound=k > 512 and n_kernel < 2 * k,
                 bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8256 else 1,
-                warp_rank=n_kernel > k and sm_version in _TUNED_SM_VERSIONS,
+                warp_rank=n_kernel > k and tuned_lowp_options,
                 parts=reg_parts,
                 pcw=pcw,
                 # the cluster only co-schedules a row's parts, which pays off on Blackwell only
-                pcw_cluster=pcw
-                and reg_parts > 1
-                and (reg_parts < 8 or reg_parts * num_rows <= 64)
-                and sm_version in _BLACKWELL_SM_VERSIONS,
+                pcw_cluster=pcw_cluster,
                 pcw_bins=512 if (pcw and dtype is torch.bfloat16 and k == 2048) else 1024,
                 **reg_options,
             )
@@ -3319,8 +3383,7 @@ def _varlen_launcher(
                 and num_rows > 2 * num_sms
                 and n_kernel > 4096
             )
-            fn = dev.get_compiled__reg(
-                tuple(plan_free["tpl"]),
+            fp32_options = dict(
                 varlen=True,
                 next_n=next_n,
                 cr_shift=cr_shift,
@@ -3358,6 +3421,9 @@ def _varlen_launcher(
                     and tuple(plan_free["tpl"][:3]) == (256, 5, 4)
                 ),
             )
+            fp32_options.update(plan_free.get("_rubin_options", {}))
+            stage_output = fp32_options["stage_output"]
+            fn = dev.get_compiled__reg(tuple(plan_free["tpl"]), **fp32_options)
         rt_f = plan_free["rt"]
         lc = (
             "reg",
@@ -3372,6 +3438,9 @@ def _varlen_launcher(
                 + 4 * (reg_parts - 1) * tpl_r[7],
             ),
         )
+        if dtype is torch.bfloat16 and reg_parts > 1:
+            if not pcw or pcw_cluster:
+                cluster_size = reg_parts
     elif plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
         clus_options = dict(dtype_options)
@@ -3438,13 +3507,18 @@ def _varlen_launcher(
             (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], e_smp, e_tgt, 0, e_ss2, e_tgt2),
             (tuple(plan_free["tpl"]), compile_kwargs),
         )
+        cluster_size = int(plan_free["tpl"][4])
     else:
         if low:
             plan = _route_streaming_16bit(
                 num_rows, n_route, npad, k, True, dtype, num_sms, sm_version
             )
         else:
-            plan = route_streaming(num_rows, n_route, npad, k, True, num_sms, sm_version)
+            plan = (
+                plan_free
+                if plan_free.get("_rubin_tuning", False)
+                else route_streaming(num_rows, n_route, npad, k, True, num_sms, sm_version)
+            )
         tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
         rt = plan["rt"]
         r_const = rt["R"]
@@ -3479,7 +3553,7 @@ def _varlen_launcher(
                     main_options["regsel"] = True
                 if dtype is torch.bfloat16:
                     main_options["envf"] = True
-                if dtype is torch.bfloat16 and sm_version in _TUNED_SM_VERSIONS:
+                if dtype is torch.bfloat16 and tuned_lowp_options:
                     main_options["warp_rank"] = True
                     # a compile-time K pays off on Hopper from K = 1024
                     if (
@@ -3620,6 +3694,8 @@ def _varlen_launcher(
             and not (16000 < n_kernel <= 16500)
         ):
             aim_base = 7 * k // 4 if (n_env <= 16400 or 65536 < n_env <= 131100) else 2 * k
+        if lowp_tuning is not None and r_const == 1 and lowp_tuning.unsplit_aim is not None:
+            aim_base = lowp_tuning.unsplit_aim
         sfac = split_sfac if r_const > 1 else 64 if k >= 1024 else 32
         sd_en = 1 if k > 1024 and not big else 0
         if dtype is torch.float16:
@@ -3656,6 +3732,17 @@ def _varlen_launcher(
                 and k == 2048
             ):
                 main_options["load_ahead"] = True
+
+        if not low:
+            main_options.update(plan_free.get("_rubin_options", {}))
+            overrides = plan_free.get("_rubin_runtime", {})
+            if "aim_num" in overrides:
+                aim_base = overrides["aim_num"] * k // 2
+            if "amin_num" in overrides:
+                amin = overrides["amin_num"] * k // 2
+            sfac = overrides.get("sfac", sfac)
+            sd_en = overrides.get("sd_en", sd_en)
+            tsh_en = overrides.get("tsh_en", tsh_en)
 
         # TSHG (tpl[6]) is dead under varlen; normalize it out of the compile key.
         fn = dev.get_compiled(
@@ -3698,6 +3785,8 @@ def _varlen_launcher(
             )
         tail = (aim_base, sfac, amin, sd_en, tsh_en)
         lc = ("main", fn, pre, tail)
+    if low:
+        lc = _LowpLauncher(lc, cluster_size)
     cache[key] = lc
     return lc
 

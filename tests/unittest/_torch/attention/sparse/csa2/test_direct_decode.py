@@ -5,8 +5,10 @@ backend's choice between it and the staged FP8 path."""
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.direct_decode import direct_sparse_decode
+from tensorrt_llm._torch.attention.backends.sparse.csa2 import direct_decode
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows, unpack_rows
 
 pytestmark = pytest.mark.skipif(
@@ -110,7 +112,9 @@ def _case(rows, heads, swa_width, main_width, *, mapped, dtype=torch.int64, seed
 
 def _run(case, **kwargs):
     q, swa, si, main, mi, sink, mapping = case
-    return direct_sparse_decode(q, swa, si, main, mi, sink, SCALE, main_mapping=mapping, **kwargs)
+    return direct_decode.direct_sparse_decode(
+        q, swa, si, main, mi, sink, SCALE, main_mapping=mapping, **kwargs
+    )
 
 
 def _reference(case):
@@ -125,17 +129,34 @@ def _assert_close_to_fp32(actual, expected):
     )
 
 
-# 8 query heads per rank (TP8) run as a zero-padded 16-head MMA tile.
-@pytest.mark.parametrize("main_width,heads,rows", [(512, 8, 16), (512, 64, 6), (0, 64, 2)])
+@pytest.mark.parametrize(
+    "main_width,heads,rows", [(512, 8, 16), (0, 8, 2), (512, 64, 6), (0, 64, 2)]
+)
 @torch.inference_mode()
-def test_matches_fp32_reference(rows, heads, main_width):
+def test_matches_fp32_reference(
+    rows: int, heads: int, main_width: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cutlass.cute as cute
+
     case = _case(rows, heads, 128, main_width, mapped=main_width > 0)
     si, mi = case[2], case[4]
     # A row without valid keys attends only the sink: zeros.
     si[-1] = -1
     if mi is not None:
         mi[-1] = -1
-    out = _run(case)
+    compiled_variants = []
+    compile_kernel = cute.compile
+
+    def record_compile(kernel, *args):
+        compiled_variants.append(kernel.keys_as_m)
+        return compile_kernel(kernel, *args)
+
+    monkeypatch.setattr(direct_decode, "_COMPILED", {})
+    with monkeypatch.context() as patch:
+        patch.setattr(cute, "compile", record_compile)
+        out = _run(case)
+    sm107 = torch.cuda.get_device_capability(case[0].device) == (10, 7)
+    assert compiled_variants == [sm107 and heads == 8]
     _assert_close_to_fp32(out, _reference(case))
     assert torch.count_nonzero(out[-1]) == 0
     # Work moved before the dependent wait reads the same inputs.
@@ -170,6 +191,88 @@ def test_graph_replay_follows_new_inputs(rows: int, heads: int) -> None:
     graph.replay()
     torch.cuda.synchronize()
     _assert_close_to_fp32(output, _reference(case))
+
+
+@triton.jit
+def _publish_swa_indices(
+    source, indices, arrivals, overlap, CTAS: tl.constexpr, WIDTH: tl.constexpr
+):
+    tl.extra.cuda.gdc_launch_dependents()
+    start = tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+    )
+    now = start
+    slots = arrivals + tl.arange(0, CTAS)
+    arrived = tl.sum(tl.atomic_add(slots, 0, sem="acquire", scope="gpu"), axis=0)
+    while (arrived < CTAS) & (now - start < 5_000_000):
+        arrived = tl.sum(tl.atomic_add(slots, 0, sem="acquire", scope="gpu"), axis=0)
+        now = tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+        )
+    offsets = tl.arange(0, WIDTH)
+    tl.store(indices + offsets, tl.load(source + offsets))
+    tl.store(overlap, arrived == CTAS)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="requires the SM107 eight-head kernel",
+)
+@torch.inference_mode()
+def test_waits_for_swa_indices(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cutlass.cute as cute
+    from cutlass import Int32, Int64
+
+    from tensorrt_llm._torch.kernels.blackwell import utils
+    from tensorrt_llm._torch.kernels.blackwell.ptx_helpers import _red_release_add
+
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    case = _case(1, 8, 128, 512, mapped=True)
+    swa_indices = case[2]
+    published = swa_indices.clone()
+    ctas = direct_decode.plan_split(swa_indices.shape[1], case[4].shape[1])
+    arrivals = torch.zeros(ctas, device="cuda", dtype=torch.int32)
+    overlap = torch.empty((), device="cuda", dtype=torch.int32)
+    checkpoint_address = arrivals.data_ptr()
+    wait = utils.griddepcontrol_wait
+
+    @cute.jit
+    def checkpoint_then_wait():
+        # Publish the checkpoint only after every thread in this CTA reaches the wait.
+        cute.arch.sync_threads()
+        if cute.arch.thread_idx()[0] == 0:
+            cta = cute.arch.block_idx()[0]
+            _red_release_add(Int64(checkpoint_address) + Int64(cta) * 4, Int32(1))
+        wait()
+
+    def publish() -> None:
+        _publish_swa_indices[(1,)](
+            published, swa_indices, arrivals, overlap, ctas, swa_indices.shape[1], num_warps=1
+        )
+
+    monkeypatch.setattr(utils, "griddepcontrol_wait", checkpoint_then_wait)
+    monkeypatch.setattr(direct_decode, "_kernel_type", direct_decode._kernel_type.__wrapped__)
+    monkeypatch.setattr(direct_decode, "_COMPILED", {})
+
+    swa_indices.fill_(-1)
+    stale = _run(case)
+    publish()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        publish()
+        output = _run(case)
+
+    for _ in range(3):
+        arrivals.zero_()
+        swa_indices.fill_(-1)
+        graph.replay()
+        if overlap.item():
+            assert not torch.equal(output, stale)
+            _assert_close_to_fp32(output, _reference(case))
+            return
+    pytest.skip("CUDA did not schedule all decode CTAs before SWA publication")
 
 
 # ---------------------------------------------------------------------------- backend

@@ -17,7 +17,6 @@ import contextlib
 import copy
 import json
 import os
-import platform
 import secrets
 import tempfile
 from typing import List
@@ -26,7 +25,7 @@ import aiohttp
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.conftest import get_sm_version, llm_models_root, skip_no_hopper
+from defs.conftest import llm_models_root, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
                                get_registered_worker_urls,
                                resolve_server_start_timeout, run_ctx_worker,
@@ -44,21 +43,6 @@ from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
 from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
                                        KvCacheAwareServerState, ServerRole,
                                        block_key_hasher)
-
-
-def get_ucx_tls():
-    """Get UCX_TLS value based on GPU architecture.
-
-    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
-    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
-    for UCX_TLS.
-    """
-    sm = get_sm_version()
-    if sm == 103 and "aarch" in platform.machine().lower():
-        return "cuda_copy,cuda_ipc,sm,self,tcp"
-    if sm < 90:
-        return "^cuda_ipc,ib,gdr_copy"
-    return "^ib,gdr_copy"
 
 
 def build_worker_config(base_config, server_type_config, disagg_cluster):
@@ -583,7 +567,6 @@ def background_workers(llm_venv, config_file: str):
     cwd = llm_venv.get_working_directory()
     os.chdir(cwd)
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
 
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)

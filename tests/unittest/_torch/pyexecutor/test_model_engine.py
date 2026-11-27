@@ -110,6 +110,7 @@ def _install_graph_runner_stub(runner: DecoderRunner, key: KeyType | None = None
         inputs: dict[str, Any],
         position_id_offsets: torch.Tensor | None = None,
         static_inputs_staged: int = 0,
+        pre_replay_staged: bool = False,
     ) -> dict[str, torch.Tensor]:
         stub.replayed_inputs.append(_clone_tensors(inputs))
         return {"logits": torch.zeros((inputs["input_ids"].shape[0], 10), device="cuda")}
