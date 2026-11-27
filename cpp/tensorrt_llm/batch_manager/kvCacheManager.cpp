@@ -1222,7 +1222,9 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
         b->freeLeafBlock();
         if (!b->hasRefs())
         {
-            b->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            // A block without references is already in the eviction queue: take it out first (claimBlock updates the
+            // priority only after erasing the queue entry), then re-queue it at the front of the lowest priority.
+            mEvictionPolicy->claimBlock(b, executor::KvCacheRetentionConfig::kMinRetentionPriority, std::nullopt);
             mEvictionPolicy->releaseBlock(b, /*toFront=*/true);
         }
     }
@@ -2245,7 +2247,11 @@ void WindowBlockManager::truncateBlocks(LlmRequest::VecTokens const& targetToken
         }
         if (numMatchedTokens > numTokensToKeep)
         {
-            matchingBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            if (matchingBlock->hasRefs())
+            {
+                // In use, so it is not in the eviction queue and releaseSubtree() will not touch it.
+                matchingBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            }
             releaseSubtree(matchingBlock);
             break;
         }
