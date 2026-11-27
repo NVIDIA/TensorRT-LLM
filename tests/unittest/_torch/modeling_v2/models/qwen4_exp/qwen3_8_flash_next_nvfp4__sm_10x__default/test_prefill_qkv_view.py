@@ -16,11 +16,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     modeling as M,
 )
 
-_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="runs on a CUDA device")
+# The row-tile pass and the per-row kernel run on the GPUs the family serves (their `ARCHS`).
+_served_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available() or not archs.served(torch.cuda.get_device_capability()),
+    reason=f"the sparse attention kernels run on {archs.served_names()}",
+)
 DEV = "cuda"
 
 TPB, D, RATIO, TOPK = 32, 256, 4, 2048
@@ -99,7 +104,7 @@ def _attend(step, qkv, attn_out, in_place):
     return out
 
 
-@_cuda
+@_served_gpu
 @pytest.mark.parametrize("pool_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 @pytest.mark.parametrize("min_rows", [64, 1 << 20], ids=["row_tile", "per_row"])
 def test_q_view_and_in_place_output_are_bitwise_the_compact_copy(
@@ -117,12 +122,15 @@ def test_q_view_and_in_place_output_are_bitwise_the_compact_copy(
     got = torch.full_like(want, float("nan"))
     out = _attend(step, view, got, in_place=True)
 
+    # Both start as NaN and the inputs are finite with a resident token a row: a row left
+    # unwritten, or a NaN both launches produce, fails here rather than matching bitwise.
+    assert torch.isfinite(want).all() and torch.isfinite(got).all()
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
     # The row-tile pass wrote `attn_out` itself; the per-row kernel returns its own tensor.
     assert (out.data_ptr() == got.data_ptr()) == (min_rows == 64)
 
 
-@_cuda
+@_served_gpu
 def test_the_row_tile_entry_refuses_an_out_it_cannot_write(monkeypatch) -> None:
     from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
         qsa_sparse_gqa_rowtile as op,
