@@ -310,7 +310,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -1085,7 +1085,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -1469,7 +1469,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -1758,7 +1758,7 @@
             }
           ],
           "default": null,
-          "description": "Sampling variants captured as CUDA graphs with one-engine speculative decoding. 'greedy' serves decode batches whose requests all decode greedily; 'advanced' serves batches with a sampled request, one whose temperature, top-k, top-p or min-p does not resolve to greedy decoding (a seed or a penalty alone does not); 'temperature_only' serves sampled batches whose sampled requests set only a temperature, where the target tokens are sampled from vocabulary-sharded logits: MTP-Eagle one-model decode on models with the spec-decode fast paths (today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) with tensor parallelism, without attention DP, relaxed acceptance or watermark_config; or a DSpark draft embedded in the target checkpoint (the DeepSeek-V4 family) with tensor parallelism, or with attention DP and enable_lm_head_tp_in_adp. Both need no rejection sampling or penalties; elsewhere the first capture rejects it. By default every variant the engine supports is captured. Without 'temperature_only', temperature-only batches use 'advanced'. Without 'greedy', greedy batches use the sampled graphs ('temperature_only' if listed, else 'advanced') and still decode greedily, but add sampling-parameter and RNG-state uploads, take the sampled path in eager steps too, can break exact ties differently on 'advanced', and lose the argmax fast paths: with rejection sampling, argmax drafting and its LM-head-TP path, and the vocabulary-sharded target argmax where the model has one (models with the spec-decode fast paths and embedded DSpark drafts keep it by listing 'temperature_only', unless they use rejection sampling; DFlash with tensor parallelism keeps its shard selection without rejection sampling and with advanced_sampling_mode 'no_topk_no_topp'). Without 'advanced', a sampled batch that 'temperature_only' does not serve runs eagerly; under attention DP the whole step then runs eagerly on every rank.",
+          "description": "Sampling variants captured as CUDA graphs with one-engine speculative decoding. 'greedy' serves decode batches whose requests all decode greedily; 'advanced' serves batches with a sampled request, one whose temperature, top-k, top-p or min-p does not resolve to greedy decoding (a seed or a penalty alone does not); 'temperature_only' serves sampled batches whose sampled requests are unseeded and set only a temperature of at least 1e-4, where the target tokens are sampled from vocabulary-sharded logits: MTP-Eagle one-model decode with spec-decode fast paths, or with TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1 and an eligible vocabulary-sharded LM head. Both MTP-Eagle paths require tensor parallelism without attention DP, relaxed acceptance, guided decoding or watermark_config. Embedded DSpark drafts in the target checkpoint (the DeepSeek-V4 family) support this with tensor parallelism, or with attention DP and enable_lm_head_tp_in_adp. Both need no rejection sampling or penalties; elsewhere the first capture rejects it. By default every variant the engine supports is captured. Without 'temperature_only', temperature-only batches use 'advanced'. Without 'greedy', greedy batches use the sampled graphs ('temperature_only' if listed, else 'advanced') and still decode greedily, but add sampling-parameter and RNG-state uploads, take the sampled path in eager steps too, can break exact ties differently on 'advanced', and lose the argmax fast paths: with rejection sampling, argmax drafting and its LM-head-TP path, and the vocabulary-sharded target argmax where the model has one (models with the spec-decode fast paths and embedded DSpark drafts keep it by listing 'temperature_only', unless they use rejection sampling; DFlash with tensor parallelism keeps its shard selection without rejection sampling and with advanced_sampling_mode 'no_topk_no_topp'). Without 'advanced', a sampled batch that 'temperature_only' does not serve runs eagerly; under attention DP the whole step then runs eagerly on every rank.",
           "status": "prototype",
           "title": "Sampling Variants"
         }
@@ -2205,7 +2205,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -2734,7 +2734,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -3063,7 +3063,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -4428,7 +4428,7 @@
             }
           ],
           "default": null,
-          "description": "Maximum number of LoRA adapters that can be loaded simultaneously in GPU memory. Controls device-side LoRA cache size.",
+          "description": "Sizes the device-side LoRA cache for this many adapters at max_lora_rank, taking precedence over peft_cache_config.device_cache_percent when positive. Also sets the number of adapter slots in LoRA CUDA graphs (8 when unset). See the CUDA Graph Adapter Capacity section of the LoRA guide.",
           "title": "Max Loras"
         },
         "overlap_lora_and_base": {
@@ -4584,7 +4584,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -5918,7 +5918,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -6218,7 +6218,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -7269,7 +7269,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -7577,7 +7577,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"
@@ -8233,7 +8233,7 @@
         },
         "enable_penalty": {
           "default": false,
-          "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
+          "description": "If true, enables the occurrence penalties (repetition / presence / frequency), embedding_bias (logit_bias) and bad_words for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these is rejected at admission rather than silently decoded without them.",
           "status": "prototype",
           "title": "Enable Penalty",
           "type": "boolean"

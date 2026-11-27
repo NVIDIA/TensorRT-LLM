@@ -223,7 +223,7 @@ moe_config:
   backend: TRTLLM
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 1
+  max_draft_len: 1
 EOF
 
 trtllm-bench --model <MODEL_ID> \
@@ -243,10 +243,11 @@ trtllm-bench --model <MODEL_ID> \
 The example enables attention DP because it is typically beneficial for high-throughput, large-batch
 workloads. It also uses FP8 KV cache (`kv_cache_config.dtype: fp8`), which is the recommended
 starting point for benchmarking DeepSeek-V4 throughput. For checkpoints with MTP layers, enable MTP
-for benchmarking as well: use `num_nextn_predict_layers: 1` for throughput-oriented runs, and use
-`num_nextn_predict_layers: 3` for low-latency runs. When `enable_attention_dp` is enabled,
+for benchmarking as well: use `max_draft_len: 1` for throughput-oriented runs, and use
+`max_draft_len: 3` for low-latency runs. These values select the maximum number of draft
+tokens; MTP-Eagle reuses the checkpoint's single MTP layer. When `enable_attention_dp` is enabled,
 `--max_batch_size` is the maximum batch size per local rank; use `--concurrency` high enough to
-saturate all ranks. Tune `--max_batch_size`, `--max_num_tokens`, `--concurrency`, MTP depth, and the
+saturate all ranks. Tune `--max_batch_size`, `--max_num_tokens`, `--concurrency`, maximum draft tokens, and the
 KV cache memory fraction for the target ISL/OSL distribution.
 
 

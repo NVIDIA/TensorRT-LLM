@@ -1105,8 +1105,12 @@ class BasePipeline(nn.Module):
     ) -> float:
         """Per-step CFG scale, including two-stage and guidance-interval gating."""
         current = guidance_scale
+        two_stage = guidance_scale_2 is not None and boundary_timestep is not None
+        if not two_stage and guidance_interval is None:
+            # Nothing gates on t: skip .item(), a host sync on every denoise step.
+            return current
         t_scalar = t.item() if t.dim() == 0 else t[0].item()
-        if guidance_scale_2 is not None and boundary_timestep is not None:
+        if two_stage:
             if t_scalar < boundary_timestep:
                 current = guidance_scale_2
         if guidance_interval is not None:

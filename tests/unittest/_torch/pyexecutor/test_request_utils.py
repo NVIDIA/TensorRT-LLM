@@ -16,7 +16,7 @@ import gc
 import pickle
 import sys
 import weakref
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import cloudpickle
@@ -2192,6 +2192,96 @@ def test_owner_prompt_delivery_matches_full_broadcast(mpi_pool_executor) -> None
             assert tokens == prompts[request_id] and prompt_len == len(tokens)
 
 
+@pytest.mark.parametrize(
+    "prompt_lengths, payload_lengths",
+    [
+        ((7, 11, 13), (31,)),
+        ((524_288,) * 2, (1_048_576,)),
+        (
+            (524_289,) * 2,
+            (524_289,) * 2,
+        ),
+        (
+            (1_048_577, 3, 5),
+            (1_048_577, 8),
+        ),
+        ((), ()),
+    ],
+    ids=["packed", "exact-capacity", "capacity-boundary", "oversized-prompt", "empty-owner"],
+)
+def test_owner_prompt_delivery_batches_payloads(
+    prompt_lengths: tuple[int, ...], payload_lengths: tuple[int, ...]
+) -> None:
+    wire = {}
+    payloads = []
+    sent_lengths = []
+
+    class PromptDist:
+        world_size = 2
+        pp_size = 1
+        has_pp = False
+        supports_single_round_broadcast = False
+
+        def __init__(self, rank: int) -> None:
+            self.rank = rank
+
+        def broadcast_int64(
+            self, value: list[int], root: int = 0, prefer_cpu: bool = False
+        ) -> list[int]:
+            if self.rank == root:
+                wire["header"] = list(value)
+            return wire["header"]
+
+        def broadcast(self, value: object, root: int = 0) -> object:
+            if self.rank == root:
+                wire["requests"] = pickle.dumps(value)
+                return value
+            return pickle.loads(wire["requests"])
+
+        def isend(self, value: np.ndarray, dest: int, tag: int) -> SimpleNamespace:
+            assert dest == 1
+            payloads.append(value.copy())
+            sent_lengths.append(value.size)
+            return SimpleNamespace(Wait=lambda: None)
+
+        def recv(self, value: np.ndarray, source: int, tag: int) -> None:
+            assert source == 0
+            payload = payloads.pop(0)
+            assert value.shape == payload.shape
+            np.copyto(value, payload)
+
+    prompts = [
+        (np.arange(length, dtype=np.int32) + index) % 129280
+        for index, length in enumerate(prompt_lengths)
+    ]
+    queued = [
+        RequestQueueItem(index, trtllm.Request(input_token_ids=prompt, max_tokens=8))
+        for index, prompt in enumerate(prompts)
+    ]
+    root = RequestBroadcaster(PromptDist(0), MagicMock(), prompts_to_owners=True)
+    peer = RequestBroadcaster(PromptDist(1), MagicMock(), prompts_to_owners=True)
+    root_items = root.broadcast(queued)
+    peer_items = peer.broadcast([])
+    root.deliver_prompts({0: [], 1: root_items})
+    peer.deliver_prompts({0: [], 1: peer_items})
+    assert sent_lengths == list(payload_lengths)
+    assert not payloads
+    assert len(peer_items) == len(prompts)
+    for item, expected in zip(peer_items, prompts):
+        np.testing.assert_array_equal(item.prompt_token_ids, expected)
+    admitted = merge_requests(
+        peer_items,
+        cp_config={},
+        cp_rank=0,
+        cp_size=1,
+        exclude_last_generation_logits=False,
+        is_disagg=False,
+    )
+    assert len(admitted) == len(prompts)
+    for request, expected in zip(admitted, prompts):
+        np.testing.assert_array_equal(request.get_tokens(0), expected)
+
+
 @pytest.mark.parametrize("beam_width", [1, 2])
 @pytest.mark.parametrize("overlap", [False, True])
 def test_prepared_response_keeps_outputs_and_metadata_stable(
@@ -2243,9 +2333,15 @@ def test_prepared_response_keeps_outputs_and_metadata_stable(
     assert response.result.ctx_first_begin == 0
     assert response.result.ctx_num_chunks == 2
 
-    request.py_result.set_log_probs(
-        [[{5: Logprob(-1.0)}] for _ in range(beam_width)], [-1.0] * beam_width
+    second_probs = [[{5: Logprob(-1.0)}] for _ in range(beam_width)]
+    request.py_result.append_log_probs(second_probs)
+    expected_history = (
+        [first + second for first, second in zip(first_probs, second_probs)]
+        if beam_width > 1
+        else second_probs
     )
+    assert request.py_result.log_probs == expected_history
+    assert request.py_result.cum_log_probs == [-1.5] * beam_width
     request.py_result.append_generation_logits(first_logits + 10)
     request.py_result.append_prompt_logprobs(torch.ones(1, 3, dtype=torch.float64))
     request.py_result.append_additional_context_outputs("hidden", torch.zeros(1, 2))
@@ -2273,6 +2369,111 @@ def test_prepared_response_keeps_outputs_and_metadata_stable(
     assert response.result.per_pos_accepted[0] == 1
     assert response.result.spec_dec_totals == (1, 2)
     assert response.result.ctx_usage == {"prompt_tokens": 3}
+
+
+def test_prepared_response_preserves_excluded_generation_logits() -> None:
+    from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
+
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        return_generation_logits=True,
+        return_logits_device_memory=False,
+        exclude_last_generation_logits=True,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    chunk_a = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+    chunk_b = torch.full((1, 1, 4), 10.0)
+    chunk_c = torch.full((1, 1, 4), 20.0)
+    request.py_result.append_generation_logits(chunk_a)
+    request.py_result.append_generation_logits(chunk_b)
+    response = prepare_response(request)
+    assert response is not None
+
+    request.py_result.append_generation_logits(chunk_c)
+    request.py_result.set_exclude_last_generation_logits(False)
+    torch.testing.assert_close(request.py_result.generation_logits, chunk_c.transpose(0, 1))
+    torch.testing.assert_close(response.result.generation_logits, chunk_a.transpose(0, 1))
+
+
+@pytest.mark.parametrize("output_kind", ["context", "generation"])
+@pytest.mark.parametrize("serializer", [pickle, cloudpickle])
+def test_response_bounds_additional_outputs(output_kind: str, serializer: ModuleType) -> None:
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        additional_outputs=["hidden", "single", "empty"],
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    if output_kind == "context":
+        append = request.py_result.append_additional_context_outputs
+    else:
+        append = request.py_result.append_additional_generation_outputs
+    first = torch.ones(1, 2)
+    append("hidden", first)
+    append("hidden", first * 2)
+    append("single", first)
+    response = request.create_response()
+    assert response is not None
+    snapshot = response.result._py_result
+    assert not hasattr(snapshot, "diff")
+    assert request.py_result.diff is not None
+    if output_kind == "context":
+        assert snapshot._additional_context_outputs is request.py_result._additional_context_outputs
+    else:
+        assert (
+            snapshot._additional_generation_outputs
+            is request.py_result._additional_generation_outputs
+        )
+
+    # Each name has its own boundary, including outputs first populated later.
+    append("hidden", first * 3)
+    append("single", first * 4)
+    append("empty", first * 5)
+    if output_kind == "context":
+        live_outputs = request.py_result._additional_context_outputs
+    else:
+        live_outputs = request.py_result._additional_generation_outputs
+    live_outputs.setdefault("routed_experts", [])
+    append("routed_experts", first * 6)
+    restored = serializer.loads(serializer.dumps(response))
+    assert restored.result._py_result._additional_context_output_lengths is None
+    assert restored.result._py_result._additional_generation_output_lengths is None
+    assert snapshot._additional_context_output_lengths is not None
+    assert snapshot._additional_generation_output_lengths is not None
+    diff = request.py_result.get_diff()
+    chunks = (
+        diff.additional_context_outputs_list
+        if output_kind == "context"
+        else diff.additional_generation_outputs_list
+    )
+    assert len(chunks) == 7
+    for result in (response.result, restored.result):
+        if output_kind == "context":
+            outputs = result.additional_context_outputs
+        else:
+            outputs = result.additional_generation_outputs
+        assert set(outputs) == {"hidden", "single"}
+        torch.testing.assert_close(outputs["hidden"], torch.cat([first, first * 2]))
+        torch.testing.assert_close(outputs["single"], first)
+    if output_kind == "context":
+        stored = restored.result._py_result._additional_context_outputs
+    else:
+        stored = restored.result._py_result._additional_generation_outputs
+    assert {name: len(chunks) for name, chunks in stored.items()} == {
+        "hidden": 2,
+        "single": 1,
+        "empty": 0,
+    }
+    assert not hasattr(restored.result._py_result, "diff")
 
 
 def test_suppressed_response_preserves_pending_logprobs() -> None:

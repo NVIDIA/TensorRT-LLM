@@ -16,9 +16,11 @@
 import asyncio
 import errno
 import json
+import time
 import traceback
 from abc import ABC, abstractmethod
-from contextlib import aclosing
+from contextlib import AbstractAsyncContextManager, aclosing
+from types import TracebackType
 from typing import (
     Any,
     AsyncGenerator,
@@ -72,7 +74,7 @@ from tensorrt_llm.serve.responses_utils import (
     UCompletionResponseOrGenerator,
     get_steady_clock_now_in_seconds,
 )
-from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.router import ReservationNotFoundError, Router
 
 # yapf: enable
 
@@ -199,6 +201,25 @@ class OpenAIClient(ABC):
         """
         ...
 
+    def start_reservation_renewal(
+        self,
+        request: UCompletionRequest,
+        req_id: Optional[int],
+        *,
+        started_at: Optional[float] = None,
+    ) -> Optional[asyncio.Task[None]]:
+        """Start periodic reservation renewal for an already-placed request, if supported."""
+        del request, req_id, started_at
+        return None
+
+    async def stop_reservation_renewal(
+        self,
+        req_id: Optional[int],
+        renew_task: Optional[asyncio.Task[None]] = None,
+    ) -> None:
+        """Stop periodic reservation renewal started via ``start_reservation_renewal``."""
+        del req_id, renew_task
+
     @abstractmethod
     async def check_ready(self) -> Tuple[List[str], List[str]]:
         """Return the list of ready servers and the list of unready servers."""
@@ -259,6 +280,122 @@ def _server_netloc(server_or_url: str) -> str:
     return urlsplit(_server_base_url(server_or_url)).netloc
 
 
+async def _close_entered_request(
+    request: AbstractAsyncContextManager[aiohttp.ClientResponse],
+    response: aiohttp.ClientResponse,
+) -> None:
+    """Close a response obtained right as the caller was cancelled or timed out."""
+    try:
+        await request.__aexit__(asyncio.CancelledError, asyncio.CancelledError(), None)
+    except Exception:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+
+async def _drain_task_preserving_caller_cancel(task: asyncio.Task[Any]) -> bool:
+    """Wait for ``task`` to settle even across repeated caller cancellations.
+
+    Uses ``gather(..., return_exceptions=True)`` under ``shield`` so ``task``'s own
+    ``CancelledError`` is consumed as a result rather than mistaken for caller cancellation.
+    Returns True if the caller task itself was cancelled while draining.
+    """
+    drain = asyncio.ensure_future(asyncio.gather(task, return_exceptions=True))
+    caller_cancelled = False
+    while not drain.done():
+        try:
+            await asyncio.shield(drain)
+        except asyncio.CancelledError:
+            caller_cancelled = True
+    return caller_cancelled
+
+
+async def _drain_enter_task(
+    request: AbstractAsyncContextManager[aiohttp.ClientResponse],
+    enter_task: asyncio.Task[aiohttp.ClientResponse],
+) -> None:
+    """Cancel ``enter_task`` and close any returned response even across repeated cancels."""
+    if not enter_task.done():
+        enter_task.cancel()
+    caller_cancelled = await _drain_task_preserving_caller_cancel(enter_task)
+    if not enter_task.cancelled() and enter_task.exception() is None:
+        close_task = asyncio.create_task(_close_entered_request(request, enter_task.result()))
+        if await _drain_task_preserving_caller_cancel(close_task):
+            caller_cancelled = True
+    if caller_cancelled:
+        raise asyncio.CancelledError()
+
+
+async def _enter_with_wait(
+    request: AbstractAsyncContextManager[aiohttp.ClientResponse],
+    timeout_secs: float,
+) -> aiohttp.ClientResponse:
+    """Python-3.10 fallback for bounding ``request.__aenter__()`` without swallowing cancel."""
+    enter_task = asyncio.create_task(request.__aenter__())
+    try:
+        done, _ = await asyncio.wait({enter_task}, timeout=timeout_secs)
+    except asyncio.CancelledError:
+        await _drain_enter_task(request, enter_task)
+        raise
+    if not done:
+        await _drain_enter_task(request, enter_task)
+        raise asyncio.TimeoutError()
+    return enter_task.result()
+
+
+async def _enter_with_deadline(
+    request: AbstractAsyncContextManager[aiohttp.ClientResponse],
+    timeout_secs: Optional[float],
+) -> aiohttp.ClientResponse:
+    """Enter ``request`` within ``timeout_secs`` while preserving external cancellation.
+
+    Uses ``asyncio.timeout`` directly in the caller task on Python 3.11+ (where
+    ``Task.cancelling()`` separates timeout and caller cancellation), and falls
+    back to ``asyncio.wait`` on Python 3.10 so neither headers arriving nor the
+    deadline firing in the same turn can swallow caller cancellation.
+    """
+    if timeout_secs is None:
+        return await request.__aenter__()
+    if hasattr(asyncio, "timeout"):
+        async with asyncio.timeout(timeout_secs):
+            return await request.__aenter__()
+    return await _enter_with_wait(request, timeout_secs)
+
+
+# Local module bindings for monotonic time and async sleep so unit tests can
+# inject a deterministic clock without altering the event loop's own timers.
+_monotonic = time.monotonic
+_async_sleep = asyncio.sleep
+
+
+class _ResponseStartBound:
+    """Wrap a worker request so that its response must start within a time limit.
+
+    Entering the request covers connecting, sending the request and receiving
+    the response headers, and only entering is bounded; exiting is delegated
+    unchanged.
+    """
+
+    def __init__(
+        self,
+        request: AbstractAsyncContextManager[aiohttp.ClientResponse],
+        timeout_secs: Optional[float],
+    ) -> None:
+        self._request = request
+        self._timeout_secs = timeout_secs
+
+    async def __aenter__(self) -> aiohttp.ClientResponse:
+        return await _enter_with_deadline(self._request, self._timeout_secs)
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        return await self._request.__aexit__(exc_type, exc, tb)
+
+
 class OpenAIHttpClient(OpenAIClient):
     def __init__(
         self,
@@ -277,6 +414,20 @@ class OpenAIHttpClient(OpenAIClient):
         self._router = router
         self._role = role
         self._metrics_collector = ClientMetricsCollector(role)
+        # A non-streamed response arrives whole, so timeout_secs bounds the whole
+        # request. A streamed response lasts as long as the worker keeps
+        # generating, so timeout_secs bounds its silence instead: the wait for the
+        # response to start, which includes connecting and sending the request,
+        # and every wait for data after that. A total bound would cut a long
+        # generation that is still producing tokens.
+        self._non_stream_timeout = aiohttp.ClientTimeout(total=timeout_secs)
+        # Non-positive values disable every stream bound. A negative sock_read
+        # value would otherwise schedule an immediate timeout in aiohttp.
+        stream_timeout_secs = timeout_secs if timeout_secs > 0 else None
+        self._stream_timeout = aiohttp.ClientTimeout(
+            total=None, connect=stream_timeout_secs, sock_read=stream_timeout_secs
+        )
+        self._response_start_timeout_secs = stream_timeout_secs
         self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(
                 limit=0,
@@ -311,6 +462,11 @@ class OpenAIHttpClient(OpenAIClient):
             )
         # Affinity host:port -> steady-clock time it last refused a connection.
         self._refused_affinity_ports: dict[str, float] = {}
+        # Pre-started reservation renewal tasks keyed by req_id until adopted by send_request.
+        self._pending_renewals: dict[int, asyncio.Task[None]] = {}
+        # All live reservation renewal tasks (pending or adopted by active streams).
+        self._active_renewals: set[asyncio.Task[None]] = set()
+        self._closing = False
 
     def _url_server(self, server: str, request: UCompletionRequest) -> str:
         """Server entry to send a request routed to server to, with the scheme of server kept.
@@ -395,6 +551,24 @@ class OpenAIHttpClient(OpenAIClient):
                 )
             return response_type(**await response.json())
 
+    def _post(
+        self,
+        url: str,
+        data: bytes,
+        headers: dict[str, str],
+        timeout: aiohttp.ClientTimeout,
+    ) -> _ResponseStartBound:
+        """POST to a worker, failing if its response has not started within timeout_secs.
+
+        aiohttp starts its sock_read bound only once the request is fully written,
+        so for a streamed response, which has no total bound, this is the bound
+        on a worker that stops reading a large request.
+        """
+        return _ResponseStartBound(
+            self._session.post(url, data=data, headers=headers, timeout=timeout),
+            self._response_start_timeout_secs,
+        )
+
     async def _send_request(
         self,
         endpoint: str,
@@ -404,7 +578,11 @@ class OpenAIHttpClient(OpenAIClient):
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
+        placement_started_at: Optional[float] = None
         if server is None:
+            if self._closing:
+                raise RuntimeError("OpenAIHttpClient is shutting down")
+            placement_started_at = _monotonic()
             if req_id is None:
                 server, _ = await self._router.get_next_server(request)
             else:
@@ -424,6 +602,13 @@ class OpenAIHttpClient(OpenAIClient):
             pinned_dp = request.disaggregated_params
             if pinned_dp is not None:
                 req_id = pinned_dp.disagg_request_id
+        if self._closing:
+            pending_renew = self._pending_renewals.pop(req_id, None) if req_id is not None else None
+            try:
+                await self._stop_reservation_renewal(pending_renew)
+            finally:
+                await self._finish_request(request, success=False, req_id=req_id)
+            raise RuntimeError("OpenAIHttpClient is shutting down")
         url_server = self._url_server(server, request)
         url = f"{_server_base_url(url_server)}/{endpoint}"
         # The routed server's shared port, used if the affinity port refuses.
@@ -435,13 +620,20 @@ class OpenAIHttpClient(OpenAIClient):
         self._metrics_collector.total_requests.inc()
         if request.stream:
             resp_generator = self._stream_with_cleanup(
-                server, url, request, hooks, req_id, fallback_url
+                server,
+                url,
+                request,
+                hooks,
+                req_id,
+                fallback_url,
+                placement_started_at=placement_started_at,
             )
             # Enter its cleanup scope before returning: aclose() on an unstarted
             # async generator would otherwise leave the router reservation live.
             await resp_generator.__anext__()
             return resp_generator
         success = False
+        renew_task = self._pending_renewals.pop(req_id, None) if req_id is not None else None
         try:
             response = None
             async with aclosing(
@@ -458,9 +650,132 @@ class OpenAIHttpClient(OpenAIClient):
             success = True
             return response
         finally:
-            if not success:
-                self._metrics_collector.error_requests.inc()
-            await self._finish_request(request, success=success, req_id=req_id)
+            try:
+                await self._stop_reservation_renewal(renew_task)
+            finally:
+                if not success:
+                    self._metrics_collector.error_requests.inc()
+                await self._finish_request(request, success=success, req_id=req_id)
+
+    def _reservation_renewal_interval_s(self) -> Optional[float]:
+        interval = getattr(self._router, "reservation_renewal_interval_s", None)
+        if isinstance(interval, (int, float)) and not isinstance(interval, bool) and interval > 0:
+            return float(interval)
+        return None
+
+    async def _renew_reservation_loop(
+        self,
+        request: UCompletionRequest,
+        req_id: Optional[int],
+        interval_s: float,
+        started_at: Optional[float] = None,
+    ) -> None:
+        lease_s = interval_s * 3.0
+        lease_anchor = _monotonic() if started_at is None else started_at
+        next_due = lease_anchor + interval_s
+        while True:
+            delay = next_due - _monotonic()
+            if delay > 0:
+                await _async_sleep(delay)
+            attempt_start = _monotonic()
+            remaining = (lease_anchor + lease_s) - attempt_start
+            attempt_timeout = (
+                min(interval_s, remaining * 0.4) if remaining > 0 else min(interval_s * 0.25, 0.5)
+            )
+            try:
+                await self._router.renew_request(request, req_id=req_id, timeout_s=attempt_timeout)
+                # Anchor the next deadline to attempt_start (at or before the
+                # coordinator reset its expiry) so a delayed /renew reply cannot
+                # push the next heartbeat past lease expiration.
+                lease_anchor = attempt_start
+                next_due = attempt_start + interval_s
+            except asyncio.CancelledError:
+                raise
+            except ReservationNotFoundError as e:
+                logger.warning(
+                    f"Stopping {self._role} reservation renewal for req_id={req_id}: {e}"
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Failed to renew {self._role} reservation for req_id={req_id}: {e}")
+                now = _monotonic()
+                remaining_after = (lease_anchor + lease_s) - now
+                backoff = (
+                    min(interval_s * 0.25, remaining_after * 0.25, 0.5)
+                    if remaining_after > 0
+                    else min(interval_s * 0.25, 0.5)
+                )
+                next_due = now + backoff
+
+    def _start_reservation_renewal(
+        self,
+        request: UCompletionRequest,
+        req_id: Optional[int],
+        *,
+        started_at: Optional[float] = None,
+    ) -> Optional[asyncio.Task[None]]:
+        if self._closing:
+            return None
+        interval_s = self._reservation_renewal_interval_s()
+        if interval_s is None:
+            return None
+        task = asyncio.create_task(
+            self._renew_reservation_loop(request, req_id, interval_s, started_at=started_at)
+        )
+        self._active_renewals.add(task)
+        task.add_done_callback(self._active_renewals.discard)
+        return task
+
+    def start_reservation_renewal(
+        self,
+        request: UCompletionRequest,
+        req_id: Optional[int],
+        *,
+        started_at: Optional[float] = None,
+    ) -> Optional[asyncio.Task[None]]:
+        """Start periodic renewal for a pre-reserved request until ``send_request`` adopts it."""
+        if self._closing:
+            return None
+        if req_id is not None:
+            existing = self._pending_renewals.get(req_id)
+            if existing is not None and not existing.done():
+                return existing
+        task = self._start_reservation_renewal(request, req_id, started_at=started_at)
+        if task is not None and req_id is not None:
+            self._pending_renewals[req_id] = task
+        return task
+
+    async def stop_reservation_renewal(
+        self,
+        req_id: Optional[int],
+        renew_task: Optional[asyncio.Task[None]] = None,
+    ) -> None:
+        """Stop and drain a pre-started renewal task if ``send_request`` did not adopt it."""
+        pending = self._pending_renewals.pop(req_id, None) if req_id is not None else None
+        task = pending if pending is not None else renew_task
+        await self._stop_reservation_renewal(task)
+
+    def _take_or_start_reservation_renewal(
+        self,
+        request: UCompletionRequest,
+        req_id: Optional[int],
+        *,
+        started_at: Optional[float] = None,
+    ) -> Optional[asyncio.Task[None]]:
+        if self._closing:
+            return None
+        if req_id is not None:
+            pending = self._pending_renewals.pop(req_id, None)
+            if pending is not None and not pending.done():
+                return pending
+        return self._start_reservation_renewal(request, req_id, started_at=started_at)
+
+    @staticmethod
+    async def _stop_reservation_renewal(renew_task: Optional[asyncio.Task[None]]) -> None:
+        if renew_task is None:
+            return
+        renew_task.cancel()
+        await asyncio.gather(renew_task, return_exceptions=True)
 
     async def _stream_with_cleanup(
         self,
@@ -470,9 +785,15 @@ class OpenAIHttpClient(OpenAIClient):
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
         fallback_url: Optional[str] = None,
+        *,
+        placement_started_at: Optional[float] = None,
     ) -> AsyncGenerator[Any, None]:
         success = False
+        renew_task: Optional[asyncio.Task[None]] = None
         try:
+            renew_task = self._take_or_start_reservation_renewal(
+                request, req_id, started_at=placement_started_at
+            )
             # Consumed by _send_request, before the caller sees this generator.
             yield None
             async with aclosing(
@@ -482,11 +803,14 @@ class OpenAIHttpClient(OpenAIClient):
                     yield chunk
             success = True
         finally:
-            # Own the logical request, including errors before response headers
-            # and cancellation. Individual HTTP attempts must not release it.
-            if not success:
-                self._metrics_collector.error_requests.inc()
-            await self._finish_request(request, success=success, req_id=req_id)
+            try:
+                await self._stop_reservation_renewal(renew_task)
+            finally:
+                # Own the logical request, including errors before response headers
+                # and cancellation. Individual HTTP attempts must not release it.
+                if not success:
+                    self._metrics_collector.error_requests.inc()
+                await self._finish_request(request, success=success, req_id=req_id)
 
     async def _post_with_retry(
         self,
@@ -570,10 +894,11 @@ class OpenAIHttpClient(OpenAIClient):
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
-                async with self._session.post(
+                async with self._post(
                     url,
                     data=body,
                     headers=headers,
+                    timeout=self._stream_timeout if is_stream else self._non_stream_timeout,
                 ) as http_response:
                     response_started = True
                     response_clock = AdjustedSteadyClock()
@@ -849,6 +1174,14 @@ class OpenAIHttpClient(OpenAIClient):
             )
 
     async def shutdown(self) -> None:
+        self._closing = True
+        while self._pending_renewals or self._active_renewals:
+            live_renewals = set(self._pending_renewals.values()) | set(self._active_renewals)
+            self._pending_renewals.clear()
+            for task in live_renewals:
+                task.cancel()
+            await asyncio.gather(*live_renewals, return_exceptions=True)
+            self._active_renewals.difference_update(live_renewals)
         await self._session.close()
 
     async def check_ready(self) -> Tuple[List[str], List[str]]:

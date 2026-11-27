@@ -51,8 +51,8 @@ from tensorrt_llm._torch.kernels.blackwell.top_k import (
 
 if getSMVersion() not in ss_host.SUPPORTED_SM_VERSIONS:
     pytest.skip(
-        "self-sampling GVR kernels target Hopper and datacenter Blackwell/Rubin "
-        "(sm_90/100/103/107) — same gate as the production dispatch; consumer "
+        "self-sampling GVR kernels target Hopper, datacenter Blackwell and Rubin "
+        "(sm_90/100/103/107); consumer "
         "Blackwell (sm_120/121) lacks thread-block clusters",
         allow_module_level=True,
     )
@@ -951,6 +951,8 @@ def test_selfsampling_wave_budget_per_target() -> None:
         assert ss_host.wave_sms(num_sms, 100) == 148
         assert ss_host.wave_sms(num_sms, 103) == 148
         assert ss_host.wave_sms(num_sms, 90) == num_sms
+        assert ss_host.wave_sms(num_sms, 107) == 148
+        assert ss_host._prefill_wave_sms(num_sms, 107) == num_sms
     # one deep single-row slab: a split CTA per SM of the target
     assert ss_host.route(1, 1 << 20, 1 << 20, 1024, 132, 90)["rt"]["R"] == 132
     assert ss_host.route(1, 1 << 20, 1 << 20, 1024, 160, 103)["rt"]["R"] == 148
@@ -3086,15 +3088,16 @@ def test_prefill_warmup_idempotent_and_no_rejit(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=lambda d: _DTYPE_IDS[d])
 def test_prefill_16bit_tier2_staging_follows_row_stride(dtype, monkeypatch):
-    """16-bit launches beyond two waves (the BLK=256 tier-2 engine) stage code16|idx16
+    """16-bit launches beyond two device waves (the BLK=256 tier-2 engine) stage code16|idx16
     words when the row stride fits 16-bit indices and keep the 32-bit staging above 65536.
     Warmup with an envelope whose rows can have a wider stride (65400 columns) compiles both
     engines; each launch below then looks up exactly the engine of its row stride and compiles
     nothing. Windows mix short and long rows, and the wide case selects past column 65535."""
     k = 1024  # leaves test_prefill_warmup_idempotent_and_no_rejit's k=512 key set intact
-    rows = 2 * _device_wave() + 1
+    tier2_start = 2 * _device_wave() + 1
+    rows = tier2_start + 3
     tag = _DTYPE_IDS[dtype]
-    ss_host.warmup_prefill(k, 65400, num_rows_list=(rows,), dtype=dtype)
+    ss_host.warmup_prefill(k, 65400, num_rows_list=(tier2_start,), dtype=dtype)
     for v16 in (True, False):
         assert _prefill_key(2, k, 0, tag, v16=v16) in ss_host._PREFILL_CACHE
     looked = []

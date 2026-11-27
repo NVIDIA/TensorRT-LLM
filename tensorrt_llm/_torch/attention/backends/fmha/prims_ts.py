@@ -382,10 +382,14 @@ class PrimsTSFmha(PhasedFmha):
             return False, "standard attention is not enabled by the performance policy."
         if forward_args.attention_input_type != AttentionInputType.generation_only:
             return False, "only MLA generation is enabled by the performance policy."
-        if get_sm_version() not in (100, 103, 107):
+        # On SM100 and SM103, MLA generation is opt-in (TLLM_FMHA_LIBS=+prims_ts):
+        # its decode kernels compile at startup for every new configuration,
+        # which costs minutes on a cold cache (TRTLLM-18200).
+        if get_sm_version() != 107:
             return (
                 False,
-                "MLA generation is enabled by the performance policy only on SM100/SM103/SM107.",
+                "MLA generation is enabled by the performance policy only on SM107; "
+                "set TLLM_FMHA_LIBS=+prims_ts to select it on SM100/SM103.",
             )
         return True, ""
 

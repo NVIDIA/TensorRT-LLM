@@ -30,6 +30,7 @@ import com.nvidia.bloom.ContainerRuntime
 import com.nvidia.bloom.FailureEvidenceCollector
 import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
@@ -244,6 +245,7 @@ SLURM_MEMORY_LIMIT = "12Gi"
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
+// Whole-core budget shared by pod CPU limits and CPU-only pytest thread limits.
 TESTER_CPU_ONLY_CORES = "2"
 TESTER_CPU_ONLY_MEMORY = "12Gi"
 
@@ -276,12 +278,17 @@ SLURM_INFRA_RETRY_MAX = 1
 // stdout/stderr in the SLURM job log. Keep the concrete terms and their retry
 // policy owned by FailureClassifier.
 SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
+    "slurm-ucx-worker-address",
     "cuda-device-unavailable",
     "cuda-buffer-mapping",
     "nvidia-driver-unavailable",
     "gpu-lost",
     "gpu-ecc-uncorrectable",
     "nvlink-fabric-failure",
+    "ffmpeg-apt-install-failed",
+    "shared-fs-transport-shutdown",
+    "flashinfer-cubin-download-network",
+    "flashinfer-cubin-load-unverified",
 ]
 
 PYTEST_TIMEOUT_EVIDENCE_QUERIES = [
@@ -380,7 +387,7 @@ def getShortenedJenkinsInstanceName() {
 }
 
 def isCbtsStage(String stageName) {
-    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    // The pipeline-level kill switch is propagated by L0_MergeRequest.groovy.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
@@ -388,12 +395,15 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("Perf")) {
         return false
     }
+    if (stageName.contains("-Ray-")) {
+        return false
+    }
     // Skip stages with no product Python coverage: TensorRT (legacy) and CPP (gtest).
     if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
-    // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.
-    if (stageName.contains("_GPUs") || stageName.contains("_Nodes")) {
+    // The context channel is limited to a single node.
+    if (stageName.contains("_Nodes")) {
         return false
     }
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
@@ -633,40 +643,58 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
 
         // Collect coverage before packaging results.
         if (isCbtsStage(stageName)) {
+            boolean interruptionWasActualInsideTimeout = false
             try {
-                CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
-                    def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-                    def cbtsLocalDir = "${stageName}/cbts${postTag}"
-                    def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
-                    sh "mkdir -p ${cbtsLocalDir}"
-                    timeout(time: 5, unit: 'MINUTES') {
-                        // Pack remote coverage and discard empty archives.
-                        Utils.exec(
-                            pipeline,
-                            script: Utils.sshUserCmd(
-                                remote,
-                                "\"cd '${remoteWs}' && sleep 2 && " +
-                                "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
-                                "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
-                            ),
-                            returnStatus: true,
-                            numRetries: 3,
-                        )
-                        def gotArchive = Utils.exec(
-                            pipeline,
-                            script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
-                            returnStatus: true,
-                            numRetries: 3,
-                        ) == 0
-                        if (gotArchive) {
-                            // Aggregation flattens directories; tag retry filenames too.
-                            def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
-                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
-                        } else {
-                            echo "CBTS: no coverage archive retrieved for ${stageName} (no coverage data or transfer skipped)."
+                timeout(time: 5, unit: 'MINUTES') {
+                    try {
+                        CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+                            def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                            def cbtsLocalDir = "${stageName}/cbts${postTag}"
+                            def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
+                            sh "mkdir -p ${cbtsLocalDir}"
+                            def archiveScript = "cd '${remoteWs}' && { sleep 2; " +
+                                "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
+                                "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }"
+                            def archiveScriptB64 = archiveScript.bytes.encodeBase64().toString()
+                            def archiveStatus = Utils.exec(
+                                pipeline,
+                                script: Utils.sshUserCmd(remote, "\"echo ${archiveScriptB64} | base64 -d | bash\""),
+                                returnStatus: true,
+                                numRetries: 3,
+                            )
+                            if (archiveStatus != 0) {
+                                echo "CBTS: no coverage archive created for ${stageName} (remote status ${archiveStatus})."
+                            } else {
+                                def gotArchive = Utils.exec(
+                                    pipeline,
+                                    script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
+                                    returnStatus: true,
+                                    numRetries: 3,
+                                ) == 0
+                                if (gotArchive) {
+                                    // Aggregation flattens directories; tag retry filenames too.
+                                    def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
+                                    sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                                } else {
+                                    echo "CBTS: coverage archive transfer failed for ${stageName}."
+                                }
+                            }
                         }
+                    } catch (FlowInterruptedException e) {
+                        interruptionWasActualInsideTimeout = e.isActualInterruption()
+                        throw e
                     }
                 }
+            } catch (FlowInterruptedException e) {
+                // Jenkins marks this timeout non-actual only after leaving its own block.
+                if (interruptionWasActualInsideTimeout && !e.isActualInterruption() &&
+                    e.causes && e.causes.every { it.class.simpleName == 'ExceededTimeout' }) {
+                    echo "CBTS: coverage pull for ${stageName} timed out; continuing."
+                } else {
+                    throw e
+                }
+            } catch (InterruptedException e) {
+                throw e
             } catch (Exception e) {
                 echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
             }
@@ -835,6 +863,29 @@ def getInfraDryRunPytestTargets(testListPath) {
     return targets
 }
 
+// Only a successful collection that removed a nonempty original shard is a no-op.
+def isIntentionalCbtsEmpty(result) {
+    return result.intentional_empty == true && result.original_count instanceof Number &&
+        result.original_count > 0 && result.selected_count == 0 &&
+        result.removed_count == result.original_count
+}
+
+def reportCbtsEmptyShard(String stageName) {
+    echo "CBTS: ${stageName} has an empty intersection with its original shard; successful no-op"
+    // A distinct skipped control record survives empty-results.xml cleanup and
+    // lets normal junit reporting accept the no-op without allowing missing results.
+    // Match the ordinary runner's container UID when creating result files.
+    sh(label: "Record successful empty CBTS shard", script: """
+mkdir -p '${stageName}'
+cat > '${stageName}/results-cbts-empty.xml' <<'CBTS_XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites><testsuite name="${stageName}" tests="1" failures="0" errors="0" skipped="1">
+<testcase classname="cbts" name="original-shard-empty-intersection"><skipped message="No CBTS-selected cases belong to this original shard"/></testcase>
+</testsuite></testsuites>
+CBTS_XML
+""")
+}
+
 def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collectionLogDir, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
@@ -909,6 +960,14 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collect
     if (stageName.contains("-CPP-") && !isInfraDryRun()) {
         testListCmd += ["${llmSrc}/tests/integration/defs/cpp"]
     }
+    def cbtsResultPath = "${testDBList}.cbts-result.json"
+    def cbtsIntersection = fileExists("${testDBList}.cbts")
+    sh "rm -f ${cbtsResultPath}"
+    if (cbtsIntersection) {
+        testListCmd += ["--cbts-test-list=${testDBList}.cbts",
+                        "--cbts-shard-result=${cbtsResultPath}"]
+    }
+    def intentionalCbtsEmpty = false
     testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
     try {
@@ -943,6 +1002,9 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collect
             return shouldInclude
         }
         echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
+        if (cbtsIntersection && fileExists(cbtsResultPath)) {
+            intentionalCbtsEmpty = isIntentionalCbtsEmpty(readJSON(file: cbtsResultPath))
+        }
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
@@ -1032,7 +1094,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collect
             regular: regularTestList,
             isolate: isolateTestList,
             regularCount: 0,
-            isolateCount: 0
+            isolateCount: 0,
+            cbtsEmptyShard: intentionalCbtsEmpty
         ]
     }
 }
@@ -1044,13 +1107,25 @@ def isValidSlurmJobId(def slurmJobID) {
     return slurmJobID && slurmJobID.toString() ==~ /\d+/
 }
 
-// Cache key formula is mirrored in fat_build_sbatch_body.sh (the only writer) and
-// prepare_container.sh; a divergent key misses the cache silently forever.
-// Hashed on the Jenkins controller so no $()/\${} has to survive SSH quoting.
+// Named after what the fat sqsh bakes in: the commit, the base image, the package
+// (which also tells x86 from SBSA) and the builder script.
+// Every pipeline that tests the same commit therefore reuses one file.
+// Computed only here; the builder and prepare_container.sh receive it as FAT_SQSH_PATH.
 def computeFatSqshPath(String fatSqshDir, String llmTarArtifactPath, String fatBuildScriptLocalPath) {
-    def scriptHash = sh(returnStdout: true, script: "sha256sum ${fatBuildScriptLocalPath} | cut -d' ' -f1 | head -c 8").trim()
-    def hash = sh(returnStdout: true, script: "printf '%s' '${llmTarArtifactPath}|${LLM_DOCKER_IMAGE}|${scriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
-    return [scriptHash: scriptHash, hash: hash, path: "${fatSqshDir}/fat-${hash}.sqsh"]
+    def shortHash = { String text -> sh(returnStdout: true, script: "printf '%s' '${text}' | sha256sum | cut -c1-8").trim() }
+    // The commit the package was built from: L0_MergeRequest passes gitlabCommit with the artifactPath
+    // it built, and artifactCommit overrides it when testing another commit's artifacts (as linuxPkgName).
+    def commit = env.artifactCommit ?: env.gitlabCommit
+    // Without a commit, fall back to the artifact path, which is unique per pipeline.
+    def commitTag = commit ? commit.take(8) : shortHash(llmTarArtifactPath)
+    def imageTag = LLM_DOCKER_IMAGE.contains("@sha256:") ? LLM_DOCKER_IMAGE.split("@sha256:")[1].take(8) : shortHash(LLM_DOCKER_IMAGE)
+    // Pre-merge tests the canonical package and post-merge tests bolted-<package>; both
+    // are the commit's build for that arch, so the BOLT prefix is not part of the name.
+    def packageTag = llmTarArtifactPath.tokenize('/')[-1]
+        .replaceAll(/^bolted-/, '').replaceAll(/\.tar\.gz$/, '').replaceAll(/[^A-Za-z0-9._-]/, '_')
+    def scriptHash = sh(returnStdout: true, script: "sha256sum ${fatBuildScriptLocalPath} | cut -c1-8").trim()
+    def name = "fat-commit-${commitTag}-image-${imageTag}-${packageTag}-script-${scriptHash}"
+    return [name: name, path: "${fatSqshDir}/${name}.sqsh"]
 }
 
 // Shared by the SLURM agent and sbatch flows.
@@ -1061,9 +1136,8 @@ def generateFatBuildSbatchScript(Map args) {
 #SBATCH ${args.fatBuilderArgs}
 export FAT_CONTAINER_DIR="${args.containerDir}"
 export FAT_CONTAINER="${args.container}"
-export FAT_SQSH_DIR="${args.fatSqshDir}"
+export FAT_SQSH_PATH="${args.fatSqshPath}"
 export FAT_LLM_TAR_ARTIFACT_PATH="${args.llmTarArtifactPath}"
-export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
 export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
 export FAT_TAR_NAME="${args.tarName}"
 export FAT_FETCH_HELPER_PATH="${args.fetchHelperPathNode}"
@@ -1077,10 +1151,7 @@ bash "${args.fatBuildBodyPathNode}"
 def generateFatPrepareScript(Map args) {
     return """\
 #!/bin/bash
-export FAT_SQSH_DIR="${args.fatSqshDir}"
-export FAT_LLM_TAR_ARTIFACT_PATH="${args.llmTarArtifactPath}"
-export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
-export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
+export FAT_SQSH_PATH="${args.fatSqshPath}"
 export FAT_BUILD_SBATCH_PATH="${args.fatBuildSbatchPathNode}"
 export FAT_BUILD_LOG_TEMPLATE="${args.fatBuildLogPath}"
 export FAT_ARTIFACTORY_NETRC="${args.artifactoryNetrcPathNode}"
@@ -1143,13 +1214,14 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            // Fat sqsh files are shared across jobs (keyed by package, image and builder script),
-            // so age-prune rather than delete per job; reused ones keep a refreshed mtime.
-            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            // Fat sqsh files are shared across jobs (keyed by commit, image, package and builder
+            // script), so age-prune rather than delete per job; reused ones keep a refreshed mtime.
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +2 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
             // Keep the job workspace (job-output.log etc.) for debugging; the
-            // PruneSlurmOutputs job removes it after the retention period. Drop the
-            // S3 spool and anything holding credentials right away: the launch
+            // PruneSlurmOutputs job in trt-llm-automation-tools (prune-slurm-outputs/)
+            // removes it after the retention period and reads these paths, so keep both
+            // in sync. Drop the S3 spool and anything holding credentials right away: the launch
             // script embeds HF/GitHub tokens and OpenSearch credentials, and the
             // netrc files hold the Artifactory credentials.
             "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh ${jobWorkspace}/artifactory-netrc ${jobWorkspace}/fat-artifactory-netrc || true",
@@ -1206,7 +1278,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +2 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
         ].join(" ; ")
         Utils.exec(
@@ -1369,8 +1441,8 @@ def sweepOrphanedSlurmResources(pipeline) {
 // primary state token -- e.g. "TIMEOUT", "COMPLETED", "FAILED", "NODE_FAIL",
 // "OUT_OF_MEMORY", "CANCELLED" -- or null when it can't be determined.
 //
-// Best-effort: any SSH/sacct error returns null so callers fall back to the
-// duration heuristic rather than failing the stage.
+// Best-effort: SSH/sacct errors return null so callers fall back to the
+// duration heuristic. Pipeline interruptions must still propagate.
 def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID) {
     if (!isValidSlurmJobId(slurmJobID)) {
         return null
@@ -1391,6 +1463,8 @@ def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, S
                 state = out.readLines()[0]?.trim()?.tokenize(' ')?.getAt(0)?.toUpperCase(java.util.Locale.ROOT)
             }
         }
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception e) {
         pipeline.echo("[INFRA-RETRY] Could not query SLURM job ${slurmJobID} state via sacct: ${e.message}")
     }
@@ -1449,6 +1523,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             def scriptPrepareBodyPathNode = "${agentJobWorkspace}/${nodeName}-prepare_container_body.sh"
             def scriptFetchHelperPathNode = "${agentJobWorkspace}/${nodeName}-fetch_build_artifact.sh"
             def fatArtifactoryNetrcPathNode = "${agentJobWorkspace}/fat-artifactory-netrc"
+            // Named once the package is unpacked, since the name hashes its builder script.
+            def fatSqshPath = null
 
             stage("Initialize Test") {
                 println("Selected Cluster: ${cluster.name}")
@@ -1459,6 +1535,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
                     }
                     sh "cd ${llmPath} && tar -zxf ${tarName}"
+                    fatSqshPath = computeFatSqshPath("${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh", llmTarArtifactPath, scriptFatBuildLocalPath).path
 
                     Utils.exec(pipeline, script: "echo 'Script to build fat sqsh inline:' && cat ${scriptFatBuildLocalPath}")
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildLocalPath, scriptFatBuildPathNode, true)
@@ -1470,7 +1547,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         container = LLM_DOCKER_IMAGE
                             .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                     }
-                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${nodeName}-fat_build")
 
@@ -1484,9 +1560,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         fatBuilderArgs: cluster.fatBuilderArgs,
                         containerDir: containerDir,
                         container: container,
-                        fatSqshDir: fatSqshDir,
+                        fatSqshPath: fatSqshPath,
                         llmTarArtifactPath: llmTarArtifactPath,
-                        llmDockerImage: LLM_DOCKER_IMAGE,
                         fatBuildScriptPathNode: scriptFatBuildPathNode,
                         tarName: tarName,
                         fetchHelperPathNode: scriptFetchHelperPathNode,
@@ -1498,10 +1573,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildSbatchPathLocal, scriptFatBuildSbatchPathNode, true)
 
                     def scriptPrepareContent = generateFatPrepareScript(
-                        fatSqshDir: fatSqshDir,
-                        llmTarArtifactPath: llmTarArtifactPath,
-                        llmDockerImage: LLM_DOCKER_IMAGE,
-                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatSqshPath: fatSqshPath,
                         fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
                         fatBuildLogPath: fatBuildLogPath,
                         artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
@@ -1591,11 +1663,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // Run the agent inside the pre-built fat sqsh (TRT-LLM + pip deps baked in).
                 // ENROOT only: a .sqsh path is not a valid image for a Docker runtime.
                 if (cluster.fatBuilderArgs != null && cluster.containerRuntime.toString() == "ENROOT") {
-                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarArtifactPath, scriptFatBuildLocalPath)
-                    def fatHash = fatSqsh.hash
-                    def fatSqshPath = fatSqsh.path
-                    echo "Fat sqsh check: hash=${fatHash} path=${fatSqshPath}"
+                    echo "Fat sqsh check: ${fatSqshPath}"
                     // Simple SSH check: just test the pre-computed literal path.
                     def fatCheckResult = Utils.exec(
                         pipeline,
@@ -1885,38 +1953,19 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
         long executeStartMs = System.currentTimeMillis()
-        // Reclassify a raw test-execution failure against the SLURM job's terminal
-        // state: a walltime kill is a UserFailure (not retryable), while a job still
-        // alive when the monitor lost contact is transient infra (retry on a fresh
-        // node). Kept as a closure so executeLLMTestOnSlurm can apply it INSIDE the
-        // task runner -- that way cacheErrorAndUploadResult suppresses this attempt's
-        // junit for the SAME typed failure the retry loop acts on. Deciding it only
-        // here (after junit already ran) is what left retried-and-passed agent stages
-        // UNSTABLE from an intermediate attempt's results.
-        // Classify each SLURM test-execution failure exactly once. The closure sets
-        // this when it runs (inside the task runner), so the outer catch reclassifies
-        // only failures that never reached it (image pull, node/agent bring-up) --
-        // avoiding a second querySlurmJobState round trip that could reach a different
-        // verdict as elapsed time and the job's state move on.
+        // Classify before junit suppression so reporting and retry use the same
+        // verdict. The allocation normally stays RUNNING until cleanup, so only
+        // timeout state or failure evidence can determine the failure category.
+        // The outer catch handles failures that never reached the task runner.
         boolean slurmFailureClassified = false
         def classifySlurmFailure = { Throwable err ->
             slurmFailureClassified = true
-            // A completed-pytest deterministic failure (tests ran, were re-run via
-            // --reruns, and still failed) is a real test failure, not lost-contact
-            // infra. On the agent path the SLURM allocation outlives pytest, so the
-            // job is still RUNNING here even though pytest already finished -- do NOT
-            // let the job state below relabel it as slurm-job-still-running and retry
-            // it (which masks the failure whenever the retry happens to pass). Key
-            // off the propagated rerun-failure error: it is raised only when reruns
-            // genuinely failed and takes precedence over the timeout path. Do not key
-            // off failed_results.xml -- generateRerunReport writes it from the first
-            // run whenever any rerun occurred, even when the rerun passed or the job
-            // timed out, so it would wrongly suppress a legitimate infra retry. Defer
-            // so the base classifier treats it as a UserFailure (no retry); a monitor-
-            // lost-contact cut raises "terminated unexpectedly" instead and retries.
-            if ((err?.toString() ?: "").contains("still failed after rerun attempts")) {
-                echo "[INFRA-RETRY] ${stageName}: pytest reported deterministic test failure(s); not an infra retry."
+            def classified = FailureClassifier.classify(err, InfraFailure.SLURM)
+            if (classified instanceof PipelineInterruption) {
                 return err
+            }
+            if (err instanceof TrtllmCiException) {
+                return classified
             }
             // Measure elapsed from when the job was first observed RUNNING; fall back
             // to executeStartMs if the RUNNING stamp was never set.
@@ -1943,17 +1992,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     err)
             }
 
-            if (isNonTerminalSlurmState(slurmState)) {
-                return new InfraFailure(
-                    "SLURM job ${slurmJobID} for ${stageName} is still in non-terminal state ${slurmState} " +
-                    "(${elapsedMin}min of ${walltimeMin}min walltime); the monitor lost contact while the job was " +
-                    "alive (transient infra), so this is not a test failure. Original failure: ${err.message}",
-                    err, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
-            }
-
-            echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} terminal state=${slurmState ?: 'unknown'}, " +
-                 "ran ${elapsedMin}min of ${walltimeMin}min walltime; deferring to failure classifier."
-            return err
+            echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} state=${slurmState ?: 'unknown'}, " +
+                 "ran ${elapsedMin}min of ${walltimeMin}min walltime; classifying failure evidence."
+            return classifyFailure(pipeline, err, InfraFailure.SLURM, retryContext)
         }
         try {
             withEnv(["TRTLLM_CI_RUNTIME_IMAGE=${LLM_DOCKER_IMAGE}"]) {
@@ -2024,12 +2065,9 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
-                // Label the failure against the SLURM job's terminal state before
-                // cacheErrorAndUploadResult decides junit suppression, so a monitor-
-                // detected infra failure (e.g. slurm-job-still-running) suppresses this
-                // attempt's results and a passing retry stays green. Pipeline aborts
-                // (FlowInterruptedException) must not be relabeled.
-                if (classifySlurmFailure == null || e.getClass().name.contains("FlowInterruptedException")) {
+                // Classify before result handling; the classifier preserves
+                // interruptions, including those wrapped in another exception.
+                if (classifySlurmFailure == null) {
                     throw e
                 }
                 throw classifySlurmFailure(e)
@@ -2094,6 +2132,10 @@ def getPytestBaseCommandLine(
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
+    if (stageName.startsWith("CPU-")) {
+        extraInternalEnv += " OMP_NUM_THREADS=${TESTER_CPU_ONLY_CORES}"
+        extraInternalEnv += " MKL_NUM_THREADS=${TESTER_CPU_ONLY_CORES}"
+    }
     // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
@@ -2157,7 +2199,7 @@ def getPytestBaseCommandLine(
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
         "-o junit_logging=${jUnitLogging}",
-        // Coverage capture: only CBTS (post-merge) stages instrument, via cbts_plugin / sitecustomize.
+        // Coverage capture: eligible CBTS stages instrument via cbts_plugin / sitecustomize.
         cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
         // Keep an existing report path out of pytest's initial collection-path discovery.
@@ -2597,6 +2639,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
+                // One name for the builder, Prepare Container and the srun prologue.
+                def fatSqshPath = null
+                if (cluster.fatBuilderArgs != null || cluster.containerRuntime.toString() == "ENROOT") {
+                    fatSqshPath = computeFatSqshPath("${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh", llmTarArtifactPath, scriptFatBuildLocalPath).path
+                }
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm profiler environment: \" && cat ${scriptProfilerEnvLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -2639,7 +2686,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         scriptFatBuildPathNode,
                         true
                     )
-                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
 
@@ -2651,9 +2697,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         fatBuilderArgs: cluster.fatBuilderArgs,
                         containerDir: containerDir,
                         container: container,
-                        fatSqshDir: fatSqshDir,
+                        fatSqshPath: fatSqshPath,
                         llmTarArtifactPath: llmTarArtifactPath,
-                        llmDockerImage: LLM_DOCKER_IMAGE,
                         fatBuildScriptPathNode: scriptFatBuildPathNode,
                         tarName: tarName,
                         fetchHelperPathNode: scriptFetchHelperPathNode,
@@ -2713,6 +2758,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pipeline,
                     script: Utils.sshUserCmd(remote, "\"mv -f ${testListPathNode}.tmp ${testListPathNode}\"")
                 )
+
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    Utils.copyFileToRemoteHost(pipeline, remote,
+                        "${testListPathLocal}.cbts", "${testListPathNode}.cbts.tmp")
+                    Utils.exec(pipeline, script: Utils.sshUserCmd(remote,
+                        "\"mv -f ${testListPathNode}.cbts.tmp ${testListPathNode}.cbts\""))
+                }
 
                 if (infraDryRun) {
                     sh "mkdir -p ${llmPath} && : > ${waivesListPathLocal}"
@@ -2846,6 +2898,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--group $splitId",
                     *clusterDurationsArgsNode,
                 ]
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    extraArgs += ["--cbts-test-list=${testListPathNode}.cbts"]
+                }
                 if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
                         "--capture=fd",
@@ -2885,17 +2940,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     // base sqsh (fallback). Base sqsh is shared across jobs by image digest.
                     containerImageArg = "\${enrootImagePath}"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
-                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarArtifactPath, scriptFatBuildLocalPath)
-                    def fatBuildScriptHash = fatSqsh.scriptHash
-                    def fatHash = fatSqsh.hash
-                    def fatSqshPath = fatSqsh.path
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
                     # Fat sqsh: pre-built on CPU node; if present, skip all pip installs.
-                    # Path pre-computed on Jenkins controller (hash=${fatBuildScriptHash}, fatHash=${fatHash}).
+                    # Path pre-computed on Jenkins controller.
                     if [ -f "${fatSqshPath}" ]; then
                         echo "Reusing fat sqsh: ${fatSqshPath} (SKIP_INSTALL=1)"
                         export enrootImagePath="${fatSqshPath}"
@@ -3169,6 +3219,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     waivesListPathNode,
                     coverageConfigFile
                 ]
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    filesToKeepWhenRetry += ["${testListPathNode}.cbts"]
+                }
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     filesToKeepWhenRetry += [
                         s3SecretKeyPathNode
@@ -3185,15 +3238,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // (if needed) and polls until it completes. Run Pytest starts only after
                 // this stage returns, so the fat sqsh is already on disk when the GPU job
                 // starts and the srunPrologue can reuse it (SKIP_INSTALL=1).
-                def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                 def scriptPrepareContent = "#!/bin/bash\nset -euo pipefail\necho 'No fat sqsh builder configured; skipping Prepare Container.'\n"
                 if (cluster.fatBuilderArgs != null) {
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
                     scriptPrepareContent = generateFatPrepareScript(
-                        fatSqshDir: fatSqshDir,
-                        llmTarArtifactPath: llmTarArtifactPath,
-                        llmDockerImage: LLM_DOCKER_IMAGE,
-                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatSqshPath: fatSqshPath,
                         fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
                         fatBuildLogPath: fatBuildLogPath,
                         artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
@@ -3366,11 +3415,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         [[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]
                     )
                     if (diagnosticEvidence.collectionStatus == "MATCHED") {
-                        def finalFailure = new Exception(
-                            "SLURM job submission failed for ${stageName}: ${diagnosticEvidence.matchedMessage}",
-                            submitEx
-                        )
-                        throw FailureClassifier.classify(finalFailure, InfraFailure.SLURM)
+                        throw FailureClassifier.classify(submitEx, InfraFailure.SLURM, diagnosticEvidence)
                     }
                     throw submitEx
                 }
@@ -3777,89 +3822,79 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
-// CBTS Layer 2.5: rename narrowed stages (reuse-safety) and resize their splits to k.
+// Explicit stage selection retains the original pytest-split assignment.
+def preserveCbtsShardScope() {
+    return testFilter[(TEST_STAGE_LIST)] != null || testFilter[(EXTRA_STAGE_LIST)] != null
+}
+
+// Keep config tuples shared with the stage closures so splits can be resized
+// after command-stage selection, without moving work outside the selected scope.
+@Field
+def cbtsStageConfigs = [:]
+
+// Rename narrowed stages for reuse safety; defer split sizing until scope is known.
 def cbtsResizeSplits(configs) {
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts == null || !cbts.cbts_test_db_artifact_path) {
         return configs
     }
-    def kByStage = cbts.affected_stage_split_counts
-    if (!kByStage) {
-        return configs
-    }
-    def resized = [:]
-    configs.each { key, values ->
-        def k = kByStage[key]
-        if (k == null) {
-            resized[key] = values
-            return
+    def kByStage = cbts.affected_stage_split_counts ?: [:]
+    return configs.collectEntries { key, values ->
+        if (!kByStage.containsKey(key)) {
+            return [(key): values]
         }
-        int kk = Math.max(1, k as int)
-        if ((values[2] as int) > kk) {
-            echo "CBTS [${cbts.scope}]: ${key} narrowed -> ${kk} shard(s); dropping group ${values[2]}"
-            return
-        }
-        def v = values.collect()
-        v[3] = kk
-        resized[key + CBTS_STAGE_SUFFIX] = v
+        def stageName = key + CBTS_STAGE_SUFFIX
+        def config = values.collect()
+        cbtsStageConfigs[stageName] = config
+        return [(stageName): config]
     }
-    return resized
 }
 
-// CBTS Layer 2: replace the normal stage set with the selector's affected
-// stages while retaining the baseline sanity and multi-GPU gates.
-def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter) {
+// Groovy's native sort must not call a CPS-transformed key closure.
+@NonCPS
+def sortCbtsStageNames(List names, Map configs) {
+    return names.sort { configs[it][2] as int }
+}
+
+// CBTS can only narrow the stages selected by the command. A null decision
+// leaves that same scope intact, including on selector failure.
+def filterCbtsStageJobs(parallelJobsFiltered, testFilter) {
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts == null) {
         return parallelJobsFiltered
     }
 
-    // cbtsResizeSplits renames only narrowed stages (those in
-    // affected_stage_split_counts) to `-cbts`; affected-but-not-narrowed
-    // stages keep their original name, so match each per its actual key.
     def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
     def narrowed = (cbts.affected_stage_split_counts ?: [:]).keySet()
     def affectedSet = (cbts.affected_stages ?: []).collect {
         (stageSuffix && narrowed.contains(it)) ? (it + stageSuffix) : it
     } as Set
-    def needsSanity = cbts.sanity_required
-    def needsPerfSanity = cbts.perfsanity_required
-    def filtered = parallelJobs.findAll { key, _ ->
-        if (key.contains("-OnDemand-")) {
-            return false
-        }
-        if (key =~ /Post-Merge/) return affectedSet.contains(key)
-        return affectedSet.contains(key) ||
-               (needsSanity && key =~ /PackageSanityCheck/) ||
-               (needsPerfSanity && key =~ /PerfSanity/)
-    }
-    // Preserve baseline auto-triggered stages when coverage replaces the selected stage set.
-    if (cbts.scope == "coverage") {
-        def autoTriggerTags = testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []
-        filtered += parallelJobsFiltered.findAll { key, _ ->
-            autoTriggerTags.any { key.contains(it) }
-        }
-    }
-    if (affectedSet.isEmpty()) {
-        if (filtered.isEmpty()) {
-            echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
-        } else {
-            echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
-                 "${filtered.size()} force-kept stage(s) only"
-        }
-    } else if (filtered) {
-        echo "CBTS [${cbts.scope}]: limiting to ${filtered.size()} stages " +
-             "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
-    } else {
-        echo "CBTS [${cbts.scope}]: empty stage set after filtering"
+    def autoTriggerTags = cbts.scope == "coverage" ? (testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []) : []
+    def filtered = parallelJobsFiltered.findAll { key, _ ->
+        return autoTriggerTags.any { key.contains(it) } || affectedSet.contains(key) ||
+               (cbts.sanity_required && key =~ /PackageSanityCheck/) ||
+               (cbts.enable_multi_gpu && key =~ /\d+_GPUs/)
     }
 
-    // The coverage tier omits multi-GPU; re-add it under the baseline gate.
-    if (cbts.enable_multi_gpu && testFilter[(MULTI_GPU_FILE_CHANGED)]) {
-        filtered += multiGpuJobs
-        echo "CBTS [${cbts.scope}]: multi-GPU file changed → running " +
-             "${multiGpuJobs.size()} multi-GPU stage(s) at baseline"
+    // Full-scope runs can rebalance. Explicit stage selections keep their
+    // original group IDs and split counts, then intersect after pytest-split.
+    def narrowedJobs = filtered.findAll { key, _ ->
+        !preserveCbtsShardScope() && cbtsStageConfigs.containsKey(key)
     }
+    narrowedJobs.keySet().groupBy { it.replaceFirst(/-\d+-cbts$/, "") }.each { _, names ->
+        def ordered = sortCbtsStageNames(names, cbtsStageConfigs)
+        def original = ordered.first() - CBTS_STAGE_SUFFIX
+        int splits = Math.min(ordered.size(), Math.max(1, cbts.affected_stage_split_counts[original] as int))
+        ordered.eachWithIndex { name, index ->
+            if (index >= splits) {
+                filtered.remove(name)
+            } else {
+                cbtsStageConfigs[name][2] = index + 1
+                cbtsStageConfigs[name][3] = splits
+            }
+        }
+    }
+    echo "CBTS [${cbts.scope}]: limiting command-selected scope to ${filtered.size()} stages"
     return filtered
 }
 
@@ -4033,7 +4068,10 @@ def stageMatchesPattern(String key, String pattern) {
 
 // Check if a stage key matches any pattern in the list.
 def stageMatchesAnyPattern(String key, List patterns) {
-    return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
+    def originalKey = key.endsWith(CBTS_STAGE_SUFFIX) ? key - CBTS_STAGE_SUFFIX : key
+    return patterns.any { pattern ->
+        stageMatchesPattern(key, pattern) || stageMatchesPattern(originalKey, pattern)
+    }
 }
 
 // Return the OpenSearch regexp for sibling shards and their CBTS variants.
@@ -5424,6 +5462,30 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     return makoArgs
 }
 
+// Inspect the packaged parser without importing its GPU/runtime dependencies.
+def packagedPytestSupportsCbts(String llmSrc) {
+    return sh(returnStatus: true, script: """
+        python3 - '${llmSrc}/tests/integration/defs/conftest.py' <<'CBTS_SUPPORT_PY'
+import ast
+from pathlib import Path
+import sys
+try:
+    tree = ast.parse(Path(sys.argv[1]).read_text())
+except (OSError, SyntaxError):
+    sys.exit(1)
+options = {
+    arg.value
+    for node in ast.walk(tree)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    and node.func.attr == 'addoption'
+    for arg in node.args
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+}
+sys.exit(0 if {'--cbts-test-list', '--cbts-shard-result'} <= options else 1)
+CBTS_SUPPORT_PY
+    """) == 0
+}
+
 def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null, Map prefetched=null) {
     def makoOpts = preDefinedMakoOpts
 
@@ -5526,6 +5588,13 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
             echo "CBTS [${cbts.scope}]: ${overrideYaml} missing/empty -- falling back to source test-db"
         }
     }
+    def sourceTestDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
+    if (preserveCbtsShardScope() && testDBPath != sourceTestDBPath &&
+            !packagedPytestSupportsCbts(llmSrc)) {
+        echo "CBTS: packaged pytest lacks shard-intersection options; " +
+             "using the original test list and shard assignment for ${stageName}"
+        testDBPath = sourceTestDBPath
+    }
     def testList = "${llmSrc}/${testContext}.txt"
     def testDBQueryCmd = [
         "trt-test-db",
@@ -5540,7 +5609,27 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         "'${makoOpts}'"
     ].join(" ")
 
+    sh "rm -f ${testList}.cbts"
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
+    if (preserveCbtsShardScope() && testDBPath != "${llmSrc}/tests/integration/test_lists/test-db") {
+        // The source tree can belong to the test container's UID. Jenkins
+        // writeFile runs as the agent UID, so create the companion in the same
+        // container as trt-test-db instead of changing workspace permissions.
+        sh(label: "Write CBTS companion in the test container", script: """
+            python3 - '${testList}' '${testList}.cbts' <<'CBTS_PY'
+from pathlib import Path
+import sys
+lines = Path(sys.argv[1]).read_text().splitlines()
+cleaned = [line.replace('ISOLATION,', '').replace(',ISOLATION', '').replace(' ISOLATION', '').strip() for line in lines]
+Path(sys.argv[2]).write_text('\\n'.join(cleaned))
+CBTS_PY
+        """)
+        def sourceQuery = testDBQueryCmd.replace(
+            "-d ${testDBPath}", "-d ${llmSrc}/tests/integration/test_lists/test-db")
+        sh(label: "Render original test list for shard assignment", script: sourceQuery)
+        echo "CBTS: ${stageName} preserves its original shard; filtering cases after pytest-split"
+    }
+
     // Count non-empty lines, not newlines: trt-test-db writes the test names
     // with no trailing newline, so `wc -l` undercounts by one -- it reports 0
     // for a single-test render, which would trip the empty-list guard below
@@ -5550,7 +5639,8 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     // missing file, unreadable, etc.) still aborts the step instead of being
     // silently masked.
     def testCount = sh(returnStdout: true, script: "grep -c . -- ${testList} || test \$? -eq 1").trim()
-    def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
+    def testDBLabel = fileExists("${testList}.cbts") ? "source (CBTS after sharding)" :
+        (testDBPath != sourceTestDBPath ? "CBTS-narrowed [${cbts.scope}]" : "source")
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
     if (testCount == "0") {
@@ -6583,6 +6673,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Process shard test list and create separate files for regular and isolate tests
         def collectionLogDir = "${WORKSPACE}/${stageName}/collection${postTag}"
         def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collectionLogDir, clusterDurationsPath)
+        if (preprocessedLists.cbtsEmptyShard) {
+            reportCbtsEmptyShard(stageName)
+            return
+        }
         def cppTestTarArtifactPath = cppTestArtifactPath(config, stageName)
         if (cppTestTarArtifactPath) {
             def cppTestArchive = "${llmPath}/cpp-tests.tar.gz"
@@ -7683,6 +7777,7 @@ def infraDeferPredicate(def pipeline, Map stageScopes) {
 
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
+    cbtsStageConfigs.clear()
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
     BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
@@ -7760,6 +7855,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
+    fullSet = x86TestConfigs.keySet() as Set
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
@@ -7771,7 +7867,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
     }]]}
-    fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
         "DGX_H100-CPP-1": ["auto:dgx-h100-x1", "l0_h100", 1, 1],
@@ -7841,12 +7936,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2_of_4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
-        "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
+        "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 2],
+        "GR100-PyTorch-Post-Merge-2": ["auto:gr100-x1", "l0_gr100", 2, 2],
         // Single-GPU Rubin PerfSanity post-merge test: a Rubin copy of the B200 Qwen3.8-Flash-Next case, on the same builds
         "GR100-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:gr100-x1", "l0_gr100_perf_sanity", 1, 1],
     ]
-    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
+    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(X86_64_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
         // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
@@ -7884,8 +7980,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
-    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
     fullSet += SBSATestConfigs.keySet()
+    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
 
     SBSASlurmTestConfigs = [
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
@@ -7902,9 +7998,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-2": ["auto:gb300-x4", "l0_gb300", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-3": ["auto:gb300-x4", "l0_gb300", 3, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus", 4, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus", 5, 5, 4, 1, true, false],
     ]
     // PerfSanity post-merge stages end in -k_of_N and run on the official post-merge builds whose
     // BUILD_NUMBER % N == k % N: key models (DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash,
@@ -7937,8 +8035,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         4,
         1, true
     )
-    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
+    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
 
     multiNodesSBSAConfigs = [
         // Each GB200 testcase below uses 8 GPUs and 2 nodes.
@@ -8044,8 +8142,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
-    multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
+    multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
@@ -8544,7 +8642,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     }
 
     parallelJobsFiltered = filterCbtsStageJobs(
-        parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
+        parallelJobsFiltered, testFilter)
 
     // Explicit selectors override both the post-merge perf-sanity skip and the -k_of_N build cadence.
     def postMergeBuildNumber = globalVars[POST_MERGE_BUILD_NUMBER]

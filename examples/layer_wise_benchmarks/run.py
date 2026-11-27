@@ -12,7 +12,7 @@ import nvtx
 import torch
 import yaml
 
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, NvMMHConfig, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture,
@@ -106,6 +106,19 @@ group.add_argument("--enable-autotuner", action="store_true", dest="enable_autot
 group.add_argument("--no-enable-autotuner", action="store_false", dest="enable_autotuner")
 parser.set_defaults(enable_autotuner=None)
 group = parser.add_mutually_exclusive_group()
+group.add_argument(
+    "--enable-autotuner-nvmmh",
+    action="store_true",
+    dest="enable_autotuner_nvmmh",
+    help="Use nvMatmulHeuristics to prune CuTe DSL GEMM/BMM tactics (requires autotuner enabled)",
+)
+group.add_argument(
+    "--no-enable-autotuner-nvmmh",
+    action="store_false",
+    dest="enable_autotuner_nvmmh",
+)
+parser.set_defaults(enable_autotuner_nvmmh=None)
+group = parser.add_mutually_exclusive_group()
 group.add_argument("--use-cuda-graph", action="store_true", dest="use_cuda_graph")
 group.add_argument("--no-use-cuda-graph", action="store_false", dest="use_cuda_graph")
 parser.set_defaults(use_cuda_graph=None)
@@ -183,6 +196,10 @@ if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:
     args.enable_autotuner = True
+if args.enable_autotuner_nvmmh is None:
+    args.enable_autotuner_nvmmh = False
+if args.enable_autotuner_nvmmh and not args.enable_autotuner:
+    parser.error("enable_autotuner_nvmmh requires autotuner to be enabled")
 if args.use_cuda_graph is None:
     args.use_cuda_graph = False
 if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
@@ -341,21 +358,38 @@ else:
 calibrator.maybe_wrap_model(runner.model)
 
 # Autotune
-run_pack = runner.create_run_pack(
-    args.run_type,
-    batch_size=max(args.batch_size_list),
-    request_id_begin=0,
-    seq_len_q=max(args.seq_len_q_list),
-    seq_len_kv_cache=args.seq_len_kv_cache_list[0],
-    kv_cache_manager=kv_cache_manager,
-    attn_workspace=attn_workspace,
-)
 if args.enable_autotuner:
     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
+    AutoTuner.get().nvmmh_config = NvMMHConfig() if args.enable_autotuner_nvmmh else None
+    logger.info(f"Layer-wise benchmarks: Autotuner nvmmh_config={AutoTuner.get().nvmmh_config}")
     AutoTuner.get().setup_distributed_state(mapping)
-    with autotune(cache_path=cache_path):
-        run_pack()
+    # Profile only the buckets the benchmarked shapes map to, not every token-count bucket up
+    # to them as a serving warmup does: those are the buckets the runs below look up, and the
+    # rest of the sweep would only cover shapes this run never executes.
+    with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+        for batch_size, seq_len_q, seq_len_kv_cache in itertools.product(
+            args.batch_size_list, args.seq_len_q_list, args.seq_len_kv_cache_list
+        ):
+            run_pack = runner.create_run_pack(
+                args.run_type,
+                batch_size=batch_size,
+                request_id_begin=0,
+                seq_len_q=seq_len_q,
+                seq_len_kv_cache=seq_len_kv_cache,
+                kv_cache_manager=kv_cache_manager,
+                attn_workspace=attn_workspace,
+            )
+            run_pack()
 else:
+    run_pack = runner.create_run_pack(
+        args.run_type,
+        batch_size=max(args.batch_size_list),
+        request_id_begin=0,
+        seq_len_q=max(args.seq_len_q_list),
+        seq_len_kv_cache=args.seq_len_kv_cache_list[0],
+        kv_cache_manager=kv_cache_manager,
+        attn_workspace=attn_workspace,
+    )
     run_pack()
 
 # Prefill KV cache
