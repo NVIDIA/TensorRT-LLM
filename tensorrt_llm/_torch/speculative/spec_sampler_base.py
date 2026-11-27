@@ -726,8 +726,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         scores = outputs.get(TARGET_LOGPROBS_KEY)
         if not isinstance(scores, torch.Tensor):
             raise ValueError(
-                "this step's forward did not score the emitted tokens: logprobs need the dense target "
-                "logits of a linear, non-ragged verification"
+                "this step's forward did not score the emitted tokens: logprobs need dense, full-vocabulary "
+                "target logits and a linear, non-ragged verification. A model that verifies on vocabulary "
+                "shards (for example with a fused sharded verify), ragged verification windows and tree "
+                "speculation are not supported yet"
             )
         return self._copy_to_host(scores[num_skip : num_skip + len(sampling_requests)])
 
