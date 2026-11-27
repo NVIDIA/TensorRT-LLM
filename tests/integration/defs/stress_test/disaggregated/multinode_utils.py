@@ -4,12 +4,16 @@
 """Bounded coordination for two-node stress tests with one pytest task per node."""
 
 import hashlib
+import json
 import re
 import select
+import shutil
 import socket
+import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 
 
 def _expand_nodelist(nodelist: str) -> list[str]:
@@ -85,6 +89,67 @@ def check_peer(connection: socket.socket) -> None:
     if select.select([connection], [], [], 0)[0]:
         message = connection.recv(1, socket.MSG_PEEK)
         raise RuntimeError(f"Peer task stopped during stress work (message={message!r})")
+
+
+@contextmanager
+def shared_log_directory(rank: int, connection: socket.socket, base: Path) -> Iterator[Path]:
+    """Share one runtime directory on the nodes' shared working filesystem."""
+    previous_timeout = connection.gettimeout()
+    connection.settimeout(300)
+    if rank == 0:
+        base.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(dir=base.resolve()))
+        payload = json.dumps(str(directory)).encode()
+        if len(payload) >= 8192:
+            raise ValueError("Shared log directory path is too long")
+        connection.sendall(payload + b"\n")
+        wait_for_signal(connection, b"L", 300, lambda: None)
+        if not (directory / "node-1.ready").is_file():
+            raise RuntimeError("Both nodes must access the same shared log directory")
+    else:
+        payload = bytearray()
+        while len(payload) < 8192:
+            chunk = connection.recv(1)
+            if not chunk:
+                raise RuntimeError("Coordinator exited before sharing the log directory")
+            if chunk == b"\n":
+                break
+            payload.extend(chunk)
+        else:
+            raise ValueError("Shared log directory path is too long")
+        directory = Path(json.loads(payload))
+        if not directory.is_dir():
+            raise RuntimeError(f"Coordinator log directory is not shared: {directory}")
+        (directory / "node-1.ready").touch()
+        connection.sendall(b"L")
+    connection.settimeout(previous_timeout)
+    try:
+        yield directory
+    finally:
+        (directory / f"node-{rank}.done").touch()
+        if rank == 0 and all((directory / f"node-{node}.done").exists() for node in (0, 1)):
+            shutil.rmtree(directory)
+
+
+def finish_log_writers(
+    rank: int, connection: socket.socket, directory: Path, timeout: float = 300
+) -> None:
+    """Close local writers before archiving, releasing a peer waiting for completion."""
+    try:
+        connection.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    (directory / f"node-{rank}.closed").touch()
+    if rank == 0:
+        deadline = time.monotonic() + timeout
+        while not (directory / "node-1.closed").exists():
+            if time.monotonic() >= deadline:
+                print(
+                    f"Generation log writer did not close; archiving available logs in {directory}",
+                    flush=True,
+                )
+                break
+            time.sleep(0.1)
 
 
 @contextmanager

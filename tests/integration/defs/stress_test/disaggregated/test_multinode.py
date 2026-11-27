@@ -13,10 +13,12 @@ Run the same selected case on both nodes, with LLM_MODELS_ROOT set::
 
 Hardware requirements and worker settings come from each case's YAML.
 Node 0 owns the context worker, frontend and client; node 1 owns the generation
-worker. The nodes need HTTP and NIXL/UCX connectivity.
+worker. The nodes need HTTP and NIXL/UCX connectivity and a shared working
+filesystem for collecting all process logs.
 """
 
 import os
+import re
 import socket
 import time
 from collections import deque
@@ -31,7 +33,14 @@ import pytest
 import yaml
 from defs.conftest import skip_pre_blackwell
 from defs.stress_test.gsm8k import Gsm8kConfig, check_acceptance_length, evaluate_gsm8k_server
-from multinode_utils import check_peer, peer_connection, slurm_topology, wait_for_signal
+from multinode_utils import (
+    check_peer,
+    finish_log_writers,
+    peer_connection,
+    shared_log_directory,
+    slurm_topology,
+    wait_for_signal,
+)
 
 if TYPE_CHECKING:
     from openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
@@ -171,6 +180,7 @@ def disagg_cluster(
 ) -> Iterator[_Cluster]:
     from defs.common import resolve_llm_model_path
     from defs.conftest import get_device_count, get_device_memory, get_sm_version
+    from defs.disaggregated.test_disaggregated import archive_process_logs
     from openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
     from test_common.http_utils import wait_for_endpoint_ready
 
@@ -186,11 +196,20 @@ def disagg_cluster(
     ):
         pytest.skip(f"Each node must satisfy the stress config hardware requirements: {hardware}")
     model_path = resolve_llm_model_path(stress_config.model)
-    artifacts = Path(output_dir) / "disagg-logs" / request.node.name / f"node-{rank}"
+    test_name = re.sub(r"[^A-Za-z0-9._-]+", "_", request.node.name)[:200]
+    artifacts = Path(output_dir) / "disagg-logs" / test_name
     artifacts.mkdir(parents=True, exist_ok=True)
-    with peer_connection(rank, hosts[0], CONTROL_PORT, request.node.nodeid) as connection:
+    with (
+        peer_connection(rank, hosts[0], CONTROL_PORT, request.node.nodeid) as connection,
+        shared_log_directory(rank, connection, Path.cwd() / "disagg-logs") as work_dir,
+    ):
         with ExitStack() as stack:
-            stack.callback(_print_process_logs, artifacts)
+            stack.callback(_print_process_logs, work_dir)
+            if rank == 0:
+                stack.callback(archive_process_logs, str(work_dir), output_dir)
+            stack.callback(
+                finish_log_writers, rank, connection, work_dir, timeouts["peer_completion"]
+            )
             worker = stack.enter_context(
                 RemoteOpenAIServer(
                     model_path,
@@ -200,7 +219,7 @@ def disagg_cluster(
                     rank=0,
                     env=_worker_env(stress_config),
                     extra_config=_worker_config(stress_config, generation=bool(rank)),
-                    log_path=str(artifacts / "worker.log"),
+                    log_path=str(work_dir / ("worker_gen_0.log" if rank else "worker_ctx_0.log")),
                     wait=False,
                 )
             )
@@ -222,7 +241,7 @@ def disagg_cluster(
                         gen_servers=[f"{hosts[1]}:{GEN_PORT}"],
                         port=FRONTEND_PORT,
                         env=_worker_env(stress_config),
-                        log_path=str(artifacts / "frontend.log"),
+                        log_path=str(work_dir / "disagg_server.log"),
                         wait_ready=False,
                         server_start_timeout=timeouts["frontend_startup"],
                     )
