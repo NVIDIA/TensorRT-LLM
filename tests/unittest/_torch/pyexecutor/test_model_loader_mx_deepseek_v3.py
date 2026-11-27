@@ -289,11 +289,18 @@ def test_fp8_kv_b_proj_dequant_uses_global_scale_rows(
 
     # Use CPU block scaling in place of the CUDA kernel. The loader still selects
     # the weight and scale rows and rearranges the three destination projections.
-    def dequant(weight, scales, block_size):
+    def dequant(weight, scales, block_size=128):
         return weight.float() * scales.repeat_interleave(block_size, dim=0)[: weight.size(0)]
 
-    monkeypatch.setattr(torch.Tensor, "cuda", lambda tensor: tensor)
-    monkeypatch.setattr(modeling_deepseekv3_mod, "weight_dequant", dequant)
+    transfer_shapes = []
+
+    def record_transfer(tensor):
+        transfer_shapes.append(tensor.shape)
+        return tensor
+
+    dequantize = MagicMock(wraps=dequant)
+    monkeypatch.setattr(torch.Tensor, "cuda", record_transfer)
+    monkeypatch.setattr(modeling_deepseekv3_mod, "weight_dequant", dequantize)
     weight = (torch.arange(384 * 16).reshape(384, 16) % 7).to(torch.float8_e4m3fn)
     scales = torch.tensor([[1.0], [2.0], [4.0]])
     modeling_deepseekv3_mod.DeepseekV3WeightLoader(model).load_weights(
@@ -307,6 +314,12 @@ def test_fp8_kv_b_proj_dequant_uses_global_scale_rows(
     assert torch.equal(attention.k_b_proj_trans, k.transpose(1, 2))
     attention._bind_v_b_proj_weight.assert_called_once()
     assert torch.equal(attention._bind_v_b_proj_weight.call_args.args[0], v)
+
+    # TP needs two aligned scale blocks; replicated attention needs the full checkpoint.
+    expected_shapes = [(384, 16), (3, 1)] if attention_dp else [(256, 16), (2, 1)]
+    assert transfer_shapes == expected_shapes
+    dequantize.assert_called_once()
+    assert [arg.shape for arg in dequantize.call_args.args[:2]] == expected_shapes
 
 
 def _qualify(model: nn.Module) -> PostTransformQualificationDecision:
