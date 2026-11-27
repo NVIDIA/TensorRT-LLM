@@ -2579,7 +2579,7 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Replay states verify every generation step, so its token is
         # committed after sampling even without drafts.
-        kv_cache_manager = attn_metadata.kv_cache_manager
+        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if (isinstance(kv_cache_manager, MambaHybridCacheManager)
                 and kv_cache_manager.commits_every_generation_step
                 and batch_size > num_contexts):
