@@ -72,6 +72,11 @@ SPARSE_ARENA_ALIGNMENT = 256
 _SPARSE_ARENA_TAIL_UNITS = 128
 # Every arena and Batch index array holds 32-bit entries (int32_t or uint32_t).
 _INDEX_BYTES = 4
+# A lease's validity array holds one byte per entry, a bit for each chunk of its unit.
+_VALIDITY_BYTES = 1
+# Arrays of a step work list: the row, unit ordinal, arena slot and chunk mask of each
+# entry. A restore list is never given masks but has its mask array carved all the same.
+_WORK_LIST_ARRAYS = 4
 # A Batch row holds two watermarks, history length and capacity.
 _BATCH_WATERMARKS_PER_ROW = 2
 # Pinned host memory is mapped in whole pages of this many bytes.
@@ -132,12 +137,16 @@ class SparseArenaShape:
     def lease_metadata_bytes(self) -> int:
         """Bytes of one lease's residency and eviction state.
 
-        One word per entry: the unit it holds and when that unit was last used.
+        One word per entry, holding the unit it holds and when that unit was last used,
+        then one validity byte per entry, naming which of the unit's chunks its cell
+        holds. Each array is aligned on its own.
 
         The reservation only. A step's work lists belong to the Batch, not to a lease:
         they are sized by the batch and reused by whichever requests are seated.
         """
-        return _index_array_bytes(self.entries)
+        return _index_array_bytes(self.entries) + pad_up(
+            _VALIDITY_BYTES * self.entries, SPARSE_ARENA_ALIGNMENT
+        )
 
     @property
     def lease_bytes(self) -> int:
@@ -474,10 +483,10 @@ class SparseBatchShape:
         """Device bytes of a step's work arrays, for the fetch and the write-back both.
 
         Per life cycle and row: one entry per selected unit, a miss count and the unit
-        in flight. Then the two compacted work lists, which carry a row, an ordinal and
-        a slot per entry plus one total per list: one list for the fetch, sized for every
-        row missing its whole selection, and one per layer for the write-back, sized by
-        the step's token budget.
+        in flight. Then the two compacted work lists, which carry a row, an ordinal, a
+        slot and a chunk mask per entry plus one total per list: one list for the fetch,
+        sized for every row missing its whole selection, and one per layer for the
+        write-back, sized by the step's token budget.
         """
         rows = self.max_batch_size
         total = 0
@@ -485,10 +494,10 @@ class SparseBatchShape:
             self.selection_widths, self.layer_counts, self.flush_capacities, strict=True
         ):
             total += rows * (width + 1 + _SPARSE_MAX_FLUSH_UNITS)
-            total += 3 * rows * width + 1
-            total += num_layers * (3 * flush_capacity + 1)
+            total += _WORK_LIST_ARRAYS * rows * width + 1
+            total += num_layers * (_WORK_LIST_ARRAYS * flush_capacity + 1)
             total += rows * num_layers
-        return _INDEX_BYTES * (total + 3 * rows * self.partial_unit_groups)
+        return _INDEX_BYTES * (total + _WORK_LIST_ARRAYS * rows * self.partial_unit_groups)
 
 
 def sparse_batch_shape(
