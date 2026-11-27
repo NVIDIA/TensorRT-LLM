@@ -158,6 +158,40 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(m=5580, k=1152, n=3456, dtype=torch.bfloat16, bias=True, out_dtype=None),
         ),
     ),
+    "spark2_5/spark2_5_dense__sm_10x__default": (
+        Cell(
+            why="spark decode qkv: hidden 2048 -> packed 3072, no bias",
+            spec=dict(m=1, k=2048, n=3072, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="spark decode gate: hidden 2048 -> 8 head logits",
+            spec=dict(m=1, k=2048, n=8, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="spark prefill gate_up: hidden 2048 -> 2*6656",
+            spec=dict(m=2048, k=2048, n=13312, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="spark prefill down: 6656 -> hidden 2048",
+            spec=dict(m=2048, k=6656, n=2048, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="spark 4B decode qkv: hidden 2560 -> packed 6144",
+            spec=dict(m=1, k=2560, n=6144, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="spark 4B decode gate: hidden 2560 -> 16 head logits",
+            spec=dict(m=1, k=2560, n=16, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="spark 4B prefill gate_up: hidden 2560 -> 2*10240",
+            spec=dict(m=2048, k=2560, n=20480, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="spark 4B prefill down: 10240 -> hidden 2560",
+            spec=dict(m=2048, k=10240, n=2560, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

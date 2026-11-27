@@ -509,6 +509,11 @@
 /tests/unittest/_torch/modeling_v2/models/qwen4_exp @Wanli-Jiang
 /tests/integration/defs/accuracy/modeling_v2/qwen4_exp @Wanli-Jiang
 
+# Spark-X2.5/X2.6
+/tensorrt_llm/_torch/modeling_v2/models/spark2_5 @dongjiang1989
+/tests/unittest/_torch/modeling_v2/models/spark2_5 @dongjiang1989
+/tests/integration/defs/accuracy/modeling_v2/spark2_5 @dongjiang1989
+
 # Kimi K3
 /tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl @vsabavat
 /tests/unittest/_torch/modeling_v2/models/kimi_k3_vl @vsabavat

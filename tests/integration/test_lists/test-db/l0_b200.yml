@@ -233,6 +233,12 @@ l0_b200:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_load_chunked_kv_cache_for_mla.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_merge_chunked_attention_for_mla.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_mla_steps.py
+  # Spark2_5 family: the GPU stage runs the family's op tests (the cpu_only
+  # routing/weight-table files are deselected by this stage's marker filter).
+  - unittest/_torch/modeling_v2/models/spark2_5
+  # Skips until the Spark checkpoint is mirrored on CI model storage; see the
+  # test docstring for recording the first reference score.
+  - accuracy/modeling_v2/spark2_5/spark2_5_dense__sm_10x__default/test_accuracy.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_dspark_mla_ops.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_mla_drafter.py
   # The family's attention-residual CUDA against the built-in ops it was copied from, on the targets' SM.
@@ -409,6 +415,7 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
+  - unittest/_torch/modeling/test_modeling_spark.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
   - unittest/_torch/modeling/test_gemma4_assistant.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
