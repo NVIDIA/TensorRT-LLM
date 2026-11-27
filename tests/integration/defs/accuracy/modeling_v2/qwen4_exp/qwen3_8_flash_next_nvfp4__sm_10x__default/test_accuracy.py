@@ -417,10 +417,20 @@ _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attentio
 # at tep4 over FlashInfer's ring replay (`TRTLLM_USE_GDN_FLASHINFER_REPLAY=force`, which fails
 # the build if the ring cannot run); NVFP4 at tep4 with chunked prefill and block reuse off, so
 # the engine leaves its paged-context attention off and the target takes it for the NVFP4 pool.
-# The attention-TP cases run 6 query heads a KV head on each rank.
+# The attention-TP cases run 6 query heads a KV head on each rank. FP8 at dep4 once more with the
+# MoE round trip on the Lamport transport (`TRTLLM_QWEN4_EXP_DP_MOE_COMM=lamport`, SM103 only).
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(lamport=True),
+        id="dep4_fp8_kv_lamport",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103, reason="the Lamport MoE round trip is certified on SM103"
+        ),
+    ),
     pytest.param(
         _TEP4,
         "fp8",
@@ -832,6 +842,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         env = dict(_VALIDATE)
         if variant.get("flashinfer_ring"):
             env["TRTLLM_USE_GDN_FLASHINFER_REPLAY"] = "force"
+        if variant.get("lamport"):
+            env["TRTLLM_QWEN4_EXP_DP_MOE_COMM"] = "lamport"
         key = f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"
         with (
             scoped_env_overrides(env) as rank_env,
