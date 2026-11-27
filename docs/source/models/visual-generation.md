@@ -17,7 +17,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - Quantized attention support: see [VisualGen Quantized Attention](../features/visualgen-quantized-attention.md).
 - Sparse attention support: see [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
-- **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
+- **Step caching** — three runtime caching backends (**TeaCache**, **Cache-DiT** and **SeaCache**) that skip transformer computation on steps where the step-to-step change is small.
 - CPU offloading to reduce peak GPU memory usage.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
@@ -48,6 +48,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
+| `nvidia/Cosmos3-Edge-FP8` | Text-to-Image, Text-to-Video, Image-to-Video (static ModelOpt FP8, W8A8/W8A16 step policy) |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
 | `MiniMaxAI/MiniMax-H3` | Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio) |
@@ -58,26 +59,28 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | Text Encoder TP | SOL-Attn |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
-| **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes |
-| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
-| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
-| **LTX-2.3** | Yes | Yes | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
-| **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
-| **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
-| **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
-| **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
-| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
-| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
-| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | SeaCache | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | Text Encoder TP | SOL-Attn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | Yes | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
+| **LTX-2** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| **LTX-2.3** | Yes | Yes | No | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
+| **FastH3** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
+| **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes\*\* | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
+| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
+| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
+
+\*\* SeaCache on Cosmos3: single-GPU base (non-distilled) checkpoints, multi-frame video generation without audio, action or transfer controls; see [SeaCache](#seacache).
 
 SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
 
@@ -115,7 +118,7 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 
 The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; the video is downloadable via `/content` once `completed`.
 
-`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400; the same switch also rejects a reference sent with `format="path"`, since both ask the server to trust a local filesystem path. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
+`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1` to reject such requests with HTTP 400; a VisualGen server refuses to start if the variable holds any value other than `0`, `1` or empty. The former name `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH` is no longer read: a VisualGen server started with it set to a value other than `0` or empty refuses to start and names the new variable. A reference sent with `format="path"` is the other direction, the server reading a file: it is read only when the server is started with `TRTLLM_MEDIA_ALLOWED_INPUT_DIR=<directory>` and the file is a regular file inside that directory, the same policy `/v1/chat/completions` applies to local media URLs. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
 
 ### Reference Inputs
 
@@ -130,7 +133,7 @@ Conditioning references are supplied through the typed fields `image_reference`,
 
 | `format` | Content | Notes |
 |---|---|---|
-| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. |
+| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. Over HTTP, only a regular file under `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, of at most 200 MiB, and at most 512 MiB across the `path` references of one request; send a larger file as a multipart upload. |
 | `url` | An `http(s)` URL | Fetched on the coordinator through the SSRF-guarded loader. |
 | `base64` | Base64 text | A `data:` URI is also accepted. |
 | `bytes` | Raw `bytes` | Python API only. |
@@ -176,7 +179,7 @@ Tile geometry and blending follow the loaded Diffusers VAE.
 Tensor parallelism shards the DiT attention and gated MLP weights via
 `parallel_config.tp_size`. The text encoder, AdaLN modulation, and media
 input/output projections remain replicated. TP can be combined with Ulysses;
-Ulysses supports VANILLA, FA4, TRTLLM, and FLASHINFER attention. CFG, ring, and Attention2D parallelism
+Ulysses supports VANILLA, FA4, TRTLLM, FLASHINFER, and CUTEDSL with `deco_attention`. CFG, ring, and Attention2D parallelism
 are not supported. See the
 [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
@@ -331,9 +334,9 @@ VisualGen CUDA graphs capture transformer forward calls during denoising and rep
 
 ### Step Caching
 
-Both caching backends are configured through `VisualGenArgs.cache_config`. The backend is selected by the `cache_backend` discriminator field.
+All caching backends are configured through `VisualGenArgs.cache_config`. The backend is selected by the `cache_backend` discriminator field.
 
-FastWan 2.2 is a 3-step distilled model; TeaCache and Cache-DiT are not applicable.
+FastWan 2.2 is a 3-step distilled model; step caching is not applicable.
 
 #### TeaCache
 
@@ -399,6 +402,26 @@ args = VisualGenArgs(
 
 **Wan 2.2 dual-transformer note:** Wan 2.2 uses two expert transformers (high-noise and low-noise stacks). All `CacheDiTConfig` parameters apply to both stacks, except `max_warmup_steps` and `max_cached_steps`: the low-noise stack always uses fixed internal caps (`max_warmup_steps=2`, `max_cached_steps=20`) regardless of user config.
 
+#### SeaCache
+
+[SeaCache](https://arxiv.org/abs/2602.18993) decides per denoising step whether the generator transformer stack must run. It compares spectrally filtered input latents between steps: the filter keeps the content expected to survive denoising at the current noise level. While the accumulated relative change stays below `threshold`, the stack is skipped and its output residual is predicted by linear extrapolation from the last two computed steps (or reused from the only computed step so far). The first `max_warmup_steps` steps (at least one) and the last step are always computed.
+
+```yaml
+cache_config:
+  cache_backend: seacache
+  threshold: 0.25
+  max_warmup_steps: 12
+  max_continuous_cached_steps: 2
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `threshold` | float | `0.25` | Accumulated relative-L1 change of the filtered latents below which a step reuses the cache; larger values skip more steps (more speedup, possible quality loss). |
+| `max_warmup_steps` | int | `12` | Leading denoising steps that always run the full stack; the first step always does. Skipping early, high-noise steps can change the scene's composition. |
+| `max_continuous_cached_steps` | int | `2` | Maximum number of consecutive cached steps before a full step is forced; `-1` removes the limit and `0` disables caching. |
+
+SeaCache is currently available for Cosmos3 base checkpoints on a single GPU. Loading fails with an error when it is combined with multi-GPU parallelism, CUDA graphs, CPU offloading, a checkpoint's per-step precision policy, or a distilled few-step checkpoint. Text-to-image (single-frame) requests and requests with audio, action or transfer controls run uncached. The cached steps are logged after each denoising loop.
+
 ### Sparse Attention
 
 Attention dominates a denoising step at high resolution or long video length. VisualGen ships three sparse attention algorithms, all configured through `attention_config.sparse_attention_config` and all served by the `TRTLLM` and `CUTEDSL` attention backends:
@@ -421,7 +444,7 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
     - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN, LTX-2 and MiniMax-H3 self-attention. MiniMax-H3 async is validated in BF16 only; FP8/NVFP4 combinations remain unvalidated.
 - **Parallel VAE** (`parallel_vae_size: N`): Parallelizes the final VAE decode (constraint: `parallel_vae_size ≤ world_size`). WAN/Cosmos3 shard along a spatial axis; LTX-2, LTX-2.3, and MiniMax-H3 distribute independent tiles.
-- **Context Parallel (CP)** — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (`FA4` or `CUTEDSL`). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = `cp_size · ulysses_size`. The CP degree depends on the implementation below:
+- **Context Parallel (CP)** — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (`FA4`, or `CUTEDSL` without `deco_attention`). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = `cp_size · ulysses_size`. The CP degree depends on the implementation below:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
@@ -506,10 +529,10 @@ Key components:
 |---|---|---|
 | `VisualGen` | `tensorrt_llm/visual_gen/__init__.py` | High-level API: manages workers, `generate()` / `generate_async()` |
 | `DiffusionExecutor` | `visual_gen/executor.py` | Worker process: loads pipeline, processes requests via ZeroMQ |
-| `BasePipeline` | `visual_gen/pipeline.py` | Base class: denoising loop, CFG handling, step caching (TeaCache / Cache-DiT), CUDA graph |
+| `BasePipeline` | `visual_gen/pipeline.py` | Base class: denoising loop, CFG handling, step caching (TeaCache / Cache-DiT / SeaCache), CUDA graph |
 | `AutoPipeline` | `visual_gen/pipeline_registry.py` | Factory: auto-detects model type, selects pipeline class |
 | `PipelineLoader` | `visual_gen/pipeline_loader.py` | Resolves checkpoint, loads config/weights, creates pipeline |
-| `TeaCacheAccelerator` / `CacheDiTAccelerator` | `visual_gen/cache/` | Runtime caching backends (TeaCache, Cache-DiT) wrapping the transformer forward |
+| `TeaCacheAccelerator` / `CacheDiTAccelerator` / `SeaCacheAccelerator` | `visual_gen/cache/` | Runtime caching backends (TeaCache, Cache-DiT, SeaCache) wrapping the transformer forward or its block stack |
 | `WeightLoader` | `visual_gen/checkpoints/` | Loads transformer weights from safetensors/bin |
 
 VisualGen is a parallel inference subsystem within TensorRT-LLM. It shares low-level primitives (`Mapping`, `QuantConfig`, `Linear`, `RMSNorm`, `ZeroMqQueue`, `TrtllmAttention`) but has its own executor, scheduler (diffusers-based), request types, and pipeline architecture separate from the LLM autoregressive decode path.

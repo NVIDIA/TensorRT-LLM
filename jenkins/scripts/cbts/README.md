@@ -8,6 +8,24 @@ run, based on what the PR changed. New rules are added in Python only.
 
 ---
 
+## Groovy CPS regression test
+
+Run the stage-sharding regression from the repository root with Java and a
+test-only classpath containing `groovy-all:2.4.21`, `groovy-cps:1.31`, and
+`guava:11.0.1` (Maven groups `org.codehaus.groovy`, `com.cloudbees`, and
+`com.google.guava`, respectively):
+
+```bash
+java -cp '/path/to/test-jars/*' groovy.ui.GroovyMain \
+    jenkins/scripts/cbts/tests/test_stage_sharding.groovy
+```
+
+The test extracts the production CBTS stage functions and runs them through
+`CpsTransformer` and `Continuable`, including numeric shard ordering, split
+resizing, scope preservation, explicit selectors, and fallback. Ordinary Groovy
+execution does not reproduce CPS closure/sort failures. Pass an optional path to
+an older `L0_Test.groovy` to verify that the same test fails before the fix.
+
 ## Selection tiers
 
 | Tier | Where | Basis |
@@ -50,11 +68,11 @@ Nine rules, registered in `cbts/command/main.py::RULE_CLASSES`:
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `VisualGenRule` | `visualgenonly` | VG source and the exact VG serve schema; public VG/media changes also keep full CPU and shared serving tests, package sanity, and performance sanity; missing required validation forces fallback |
 | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. docs; other suffixes incl. images kept as potential test fixtures) |
-| `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports |
+| `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports |
 | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) |
 | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) |
 | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus registered documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure; see `cbts/rules/README.md` |
+| `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template, developer-assistant, and agent-skill (`skills/`) folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure; see `cbts/rules/README.md` |
 
 See `cbts/rules/README.md` for per-rule logic.
 
@@ -67,7 +85,7 @@ See `cbts/rules/README.md` for per-rule logic.
 | `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
 | `visualgenonly` | `VisualGenRule` fired solo. Internal VG changes select VG test entries; schema changes also retain schema validation. Public VG/media changes additionally retain the complete CPU suite, shared serving integration tests, package sanity, and performance sanity. Missing required validation forces `null` fallback. |
 | `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. docs). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
-| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches modeling_v2 code -- the subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`, each family's native code in its `csrc/` included: one torch-op library per model family) or what the family libraries share (`cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake`); excl. docs, which are a fifth of the Python subtree — every catalog entry carries a contract document. A file in a target (`models/<family>/<target>/`, a directory the family's `routing.py` returns a target class from) selects only that target's unit and accuracy tests; if `routing.py` cannot be read, the whole family counts as family code. Other Python code under `models/<family>/` or `catalog/<category>/` selects its own unit tests plus the tests of every target and every unit test file under `unittest/_torch/modeling_v2/` that imports it, read from the PR head (a deleted or moved module still counts through its importers); family code no target imports selects the whole family in place of its own unit tests, and family native or data files select the whole family. Whole-tree checks always run; shared code selects every modeling_v2 entry. No outward-facing fallback is needed: nothing beyond the resolver module is imported, and no family library is loaded, unless `LLM(modeling_v2=...)` is on; the CPU checks that keep this true run in every scope. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching them falls back to baseline. |
+| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches modeling_v2 code -- the subtree (`tensorrt_llm/_torch/modeling_v2/**`, each family's native code in its `csrc/` included: one torch-op library per model family) or what the family libraries share (`cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake`); excl. docs, which are a fifth of the Python subtree — every catalog entry carries a contract document. A file in a target (`models/<family>/<target>/`, a directory the family's `routing.py` returns a target class from) selects that target's unit and accuracy tests; if `routing.py` cannot be read, the whole family counts as family code. Other Python code under `models/<family>/` or `catalog/<category>/` selects its own unit tests plus the tests of every target and every unit test file under `unittest/_torch/modeling_v2/` that imports it, read from the PR head (a deleted or moved module still counts through its importers); family code no target imports selects the whole family in place of its own unit tests, and family native or data files select the whole family. Explicit M3 family-source associations also retain named communication/MoE target tests across component directories, even when a mirror unit directory exists. Whole-tree checks and the shared FP4 test-helper CPU guard always run; shared code selects every modeling_v2 entry. No outward-facing fallback is needed: nothing beyond the resolver module is imported, and no family library is loaded, unless `LLM(modeling_v2=...)` is on; the CPU checks that keep this true run in every scope. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching them falls back to baseline. |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. docs). Runs `CPU-AgentFlow-UnitTest`. |
 | `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on matching `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
 | `docsonly` | `DocsRule` fired solo: all documentation changes run `CPU-Build_Docs`; changes under `docs/**` also run registered documentation-related CPU tests on matching `CPU-Generic-*` stages. Docs-only orchestration skips the SBSA track, so its resolved ARM stage is not launched. |
@@ -130,7 +148,7 @@ jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH fo
 │   │   │   └── touch_db.py   read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
 │   │   └── collection/    post-merge collection that produces the touch DB (see its README / COLLECTION.md)
 │   └── command/           unified CLI, `python -m cbts.command ...`
-│       ├── main.py        `main` — CLI entry + Selector + SelectionResult + scope combine + trigger-mode filter
+│       ├── main.py        `main` — CLI entry + Selector + SelectionResult + scope combine
 │       ├── dryrun.py       `dryrun` — replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
 │       ├── report_decision.py  `report-decision` — post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
 │       └── coverage/
@@ -192,31 +210,68 @@ integration conftest, helper modules in dirs no YAML mentions).
 
 ## When CBTS activates
 
-CBTS activates on bare `/bot run` and `/bot run --post-merge`. Any
-stage-selection flag (`--stage-list`, `--extra-stage`, `--gpu-type`,
-`--test-backend`, `--skip-test`, `--add-multi-gpu-test`, `--only-multi-gpu-test`,
-`--disable-multi-gpu-test`) makes `getCbtsResult` return null.
+CBTS activates for `/bot run` with any stage-selection or orthogonal flags.
+The command first determines the eligible stage scope (`--stage-list`,
+`--extra-stage`, GPU/backend filters, multi-GPU flags, and `--skip-test`).
+CBTS then selects affected cases and stages within that scope. Sanity and
+coverage-tier multi-GPU stages are retained only if they are in that scope.
+Explicitly selected OnDemand and Post-Merge stages are eligible as well.
 
-`--disable-cbts` is an explicit kill switch: `getCbtsResult` returns null
-before any narrowing, so the pipeline runs the full test set. The opt-out is
-recorded in OpenSearch with `s_cbts_status=disabled`.
+`--disable-cbts` remains the explicit kill switch. Official post-merge jobs
+and infrastructure dry runs retain their existing bypasses. Coverage rollout
+and auto-trigger retention policies remain in effect within the selected scope.
 
-Orthogonal flags (`--reuse-test`, `--disable-reuse-test`, `--debug`,
-`--detailed-log`, `--disable-fail-fast`, `--high-priority`) do not affect CBTS.
+A null decision or selector failure runs the full command-selected scope.
+Fallback never expands to stages outside that scope. Narrowed test-db artifact
+failures likewise use the source test-db within the selected stages.
 
-## Trigger-mode filter
+Stage patterns match original stage names even when narrowed stages have a
+`-cbts` suffix. With `--stage-list` or `--extra-stage`, stages retain their
+original shard IDs and split counts. Pytest collects and splits the full source
+test list using the original durations, then intersects each shard with CBTS's
+selected cases. A successful collection that removes every case from a nonempty
+original shard is a successful no-op. The ordinary/agent runner records a skipped
+CBTS control testcase so normal JUnit reporting still has a result; unexpected
+empty collections and collection failures remain errors. Cases never move
+from an unselected shard into a selected shard.
 
-`pr.post_merge` (carried in INPUT_JSON) selects which stages survive:
+With `reuse_build`, the packaged pytest sources may predate the intersection
+options. Before creating a companion, Jenkins checks option registration in the
+packaged `tests/integration/defs/conftest.py` without importing it. If either
+`--cbts-test-list` or `--cbts-shard-result` is unavailable, the selected stages
+use the original source test list and original shard assignment. No companion
+or new pytest options are passed in either ordinary/agent or native-sbatch runs.
 
-- `post_merge=False` (default for `/bot run`): drop every stage whose name
-  contains `Post-Merge`.
-- `post_merge=True` (`/bot run --post-merge`): keep all affected stages —
-  pre-merge plus `Post-Merge` (Post-Merge runs on top of pre-merge, matching
-  the non-CBTS baseline).
+## Stage scheduling
 
-Applied after rules union; rules see all stages so reasons report the
-pre-filter narrow. `_log_decision_to_stderr` prints the dropped set for
-Jenkins console diagnostics.
+The Python selector returns affected candidates across pre-merge and Post-Merge
+stages without filtering by trigger mode. Jenkins does not pass `post_merge` to
+the selector. Groovy alone applies the command-selected stage scope, including
+explicit `--stage-list` / `--extra-stage` requests and `--post-merge`.
+
+The selector input has no `post_merge` field. VisualGen public API changes still
+require runnable CPU and serving validation among the candidate stages. Dryrun
+also reports all candidates; it has no `--post-merge` selector mode and does not
+simulate downstream scheduling or shard intersections.
+
+### Multi-GPU scope and approval
+
+On bare `/bot run`, the normal pre-merge file-change rules and auto-trigger tags
+first establish the eligible stage scope. CBTS narrows that scope; a Tier 1 hit
+alone no longer adds a multi-GPU stage excluded by the baseline. This differs
+from the old CBTS filter, which selected affected stages from the full inventory.
+The `ci: full pre-merge approved` label authorizes multi-GPU dispatch; it does
+not itself add stages to the scope. Dispatch also requires eligible multi-GPU
+work and the normal single-GPU prerequisite checks.
+
+Tier 2 only narrows single-GPU coverage. Its `enable_multi_gpu=true` means
+“retain baseline multi-GPU work”, not that coverage proved a multi-GPU impact.
+Coverage decisions retain all multi-GPU stages already in the command scope,
+including Post-Merge PerfSanity stages selected by `--post-merge` or an explicit
+stage flag. These run the original case lists without coverage narrowing.
+Post-Merge multi-GPU stages are intentionally not excluded by the retention
+clause. Auto-trigger retention in coverage mode also remains within the command
+scope. Null decisions use the full command-selected baseline.
 
 ## How it's invoked (CI)
 
@@ -235,8 +290,7 @@ INPUT_JSON:
 ```json
 {
   "changed_files": ["tests/..."],
-  "diffs": {"tests/...": "@@ ..."},
-  "post_merge": false
+  "diffs": {"tests/...": "@@ ..."}
 }
 ```
 
@@ -275,11 +329,12 @@ available to downstream `L0_Test-*` pods. To deliver it per stage:
 1. For an applied decision, `getCbtsResult` tars `cbts_test_db/` and uploads it to Artifactory,
    recording the path in `result.cbts_test_db_artifact_path` (rides along
    inside `testFilter`).
-2. `renderTestDB` on the stage agent downloads and extracts that tarball
+2. `renderTestDB` on the stage agent reads that tarball through the read
+   helper (`jenkins/scripts/fetch_build_artifact.sh`) and extracts it
    into `${llmSrc}/${test_db_dir_override}`; trt-test-db then renders from
    the narrowed test-db.
 
-If the upload or the download/extraction fails, the override directory is
+If the upload, the read, or the extraction fails, the override directory is
 absent and `renderTestDB` falls back to the source test-db. Layer 2 still
 applies. For applied decisions, the tarball carries only the narrowed YAMLs,
 so no PR diff text travels between jobs.
@@ -300,8 +355,12 @@ a successful shadow candidate.
 `k = clamp(ceil(est_seconds / 2h), 1, stage.total_splits)` (cap parsed from
 `L0_Test.groovy`). `est_seconds` sums the `.test_durations` cache over the
 stage's kept entries (exact node-id, else subtree-sum, else average — over-counts
-toward the cap, never under-sizes). `launchTestJobs::cbtsResizeSplits` keeps only
-shards `1..k`; pytest-split then balances within them via `least_duration`.
+toward the cap, never under-sizes). Without explicit stage-list/extra-stage
+selection, `filterCbtsStageJobs` keeps at most `k` shards per stage family;
+pytest-split balances the narrowed list within them via `least_duration`.
+Explicit stage selection instead preserves the original shard assignment and
+applies `--cbts-test-list` after splitting. This applies to both ordinary and
+sbatch execution.
 
 `cbtsResizeSplits` also renames each narrowed stage with a `-cbts` suffix so its
 narrowed result is never reused (whole-stage `REUSE_STAGE_LIST` or per-test

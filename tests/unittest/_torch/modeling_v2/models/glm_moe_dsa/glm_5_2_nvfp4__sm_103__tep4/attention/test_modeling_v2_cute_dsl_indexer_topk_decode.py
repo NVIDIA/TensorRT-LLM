@@ -10,10 +10,10 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the vendored CuTe DSL kernel is built for sm_103", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_topk_decode import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_topk_decode import (  # noqa: E402, E501
     build,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_topk_decode import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_topk_decode import (  # noqa: E402, E501
     cute_dsl_indexer_topk_decode as op,
 )
 
@@ -142,6 +142,7 @@ def test_top_k_and_next_n_cannot_be_passed_positionally() -> None:
         dict(next_n=1, max_columns=8192, seq_lens=[3000], width=8192), seed=12
     )
     with pytest.raises(TypeError):
+        # pyrefly: ignore [unexpected-positional-argument]
         op(logits, seq_lens, indices, 1, TOP_K, _compiled(8192, 1))
 
 

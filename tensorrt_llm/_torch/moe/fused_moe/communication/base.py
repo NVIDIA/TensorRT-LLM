@@ -160,6 +160,16 @@ class Communication(ABC):
         """
         return True
 
+    def combine_fuses_addend(self, runtime_max_tokens_per_rank: int, rows: int) -> bool:
+        """Whether this forward's ``combine`` can add an ``addend`` (``[rows, hidden]``, ready
+        after ``addend_ready``) to its output with the rounding of a separate add."""
+        return False
+
+    def carries_unrouted_rows(self) -> bool:
+        """Whether dispatch carries a row whose expert ids are the invalid id (-1) to no expert:
+        every backend's sort skips it, as an unused receive row."""
+        return False
+
     def uses_internal_dispatch_quantization(self) -> bool:
         """Return whether dispatch itself quantizes BF16 activations.
 

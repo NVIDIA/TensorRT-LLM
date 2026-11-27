@@ -15,12 +15,14 @@
 
 import weakref
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, ClassVar, Optional, final
+from typing import TYPE_CHECKING, ClassVar, Hashable, Optional, final
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -37,6 +39,19 @@ class FmhaPhase(str, Enum):
     GENERATION = "generation"
 
 
+@dataclass(frozen=True)
+class FmhaPrewarmConfig:
+    """Resolved static inputs for optional FMHA module initialization."""
+
+    dtype: torch.dtype
+    kv_cache_dtype: DataType
+    tokens_per_block: int
+    extra_tokens_per_block: frozenset[int] = frozenset()
+    context: bool = True
+    generation: bool = True
+    helix: bool = False
+
+
 class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
@@ -50,6 +65,9 @@ class Fmha(ABC):
     # library (``AttentionForwardArgs.kv_append.fold``): the query input is then the raw QKV projection.
     supports_deferred_prologue: ClassVar[bool] = False
     supports_variable_window: ClassVar[bool] = False
+    # Field of the iteration-stats record that carries ``step_stats`` (None: the library keeps no
+    # per-step counters).
+    step_stats_field: ClassVar[Optional[str]] = None
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -60,6 +78,14 @@ class Fmha(ABC):
         if attn is None:
             raise RuntimeError("The owning TrtllmAttention instance has been garbage collected.")
         return attn
+
+    def can_prewarm(self, config: FmhaPrewarmConfig) -> bool:
+        """Whether this layer can use the optional module built by ``prewarm``."""
+        return False
+
+    @staticmethod
+    def prewarm() -> None:
+        """Initialize a library-wide JIT module; libraries without one do nothing."""
 
     @classmethod
     @final
@@ -86,6 +112,39 @@ class Fmha(ABC):
         if getattr(attn, "uses_fp4_mla_attention", False) and not cls.supports_fp4_mla:
             return False
         return cls._is_available(attn)
+
+    @classmethod
+    def plan_step(cls, metadata: "TrtllmAttentionMetadata") -> None:
+        """Per-step host planning, run from ``TrtllmAttentionMetadata.prepare`` for every enabled
+        library that overrides it (``registry.step_planning_fmha_lib_classes``).
+
+        It runs ahead of every forward of the step, so under CUDA graphs it precedes both capture
+        and replay; device tables it refreshes must keep fixed addresses. A library that plans
+        steps disables ``prepare_steady_decode_step``, and the plan state ``is_supported`` reads
+        must be part of ``selection_cache_key``.
+        """
+
+    @classmethod
+    @final
+    def plans_steps(cls) -> bool:
+        """Whether the library overrides ``plan_step``."""
+        return cls.plan_step.__func__ is not Fmha.plan_step.__func__
+
+    @classmethod
+    def selection_cache_key(cls, metadata: "TrtllmAttentionMetadata") -> Hashable:
+        """Per-step plan state ``is_supported`` depends on beyond the batch shape; part of the
+        FMHA selection cache key of a layer that has the library (``FmhaManager``)."""
+        return None
+
+    @classmethod
+    def step_stats(cls, kv_cache_manager: object) -> dict[str, int]:
+        """Cumulative per-step counters of the steps attended on ``kv_cache_manager``'s cache,
+        reported in the iteration-stats record field ``step_stats_field``."""
+        raise NotImplementedError(f"{cls.__name__} keeps no per-step counters.")
+
+    @classmethod
+    def reset_step_stats(cls, kv_cache_manager: object) -> None:
+        """Zero ``step_stats`` of ``kv_cache_manager`` (the executor calls it after warm-up)."""
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:

@@ -26,7 +26,7 @@ from tensorrt_llm.serve.perf_metrics import (
     STEP_METRICS_HEADER,
 )
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 
 
@@ -222,7 +222,9 @@ def test_return_perf_metrics_and_jsonl_dump(
     payload = {
         "model": model_name,
         "prompt": "Reply with one token.",
-        "max_tokens": 1,
+        # The first token comes from the context server. The generation server
+        # runs a step, and reports step metrics, only from the second token on.
+        "max_tokens": 2,
         "temperature": 0.0,
     }
     response = requests.post(

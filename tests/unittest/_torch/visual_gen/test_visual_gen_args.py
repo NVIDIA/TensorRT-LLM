@@ -18,6 +18,7 @@ from tensorrt_llm.visual_gen.args import (
     ParallelConfig,
     QuantAttentionConfig,
     RuntimeLoRAConfig,
+    SeaCacheConfig,
     SkipSoftmaxAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
@@ -307,6 +308,50 @@ class TestAttentionConfigQuantValidation:
                     sparse_attention_config=sparse,
                 )
 
+    @pytest.mark.parametrize("v_dtype", ["fp8", "nvfp4"])
+    def test_supported_quant_config_deco_attention(self, v_dtype):
+        """DeCo-Attention validates on CUTEDSL with nvfp4 Q/K and fp8 or nvfp4 V."""
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4", v_dtype=v_dtype, deco_attention=True
+            ),
+        )
+
+        assert attention.quant_attention_config.deco_attention
+
+    @pytest.mark.parametrize(
+        "backend, quant, sparse, match",
+        [
+            ("TRTLLM", dict(qk_dtype="nvfp4"), None, "deco_attention is a CUTEDSL backend option"),
+            ("CUTEDSL", dict(qk_dtype="mxfp8"), None, "Supported DeCo-Attention recipes"),
+            (
+                "CUTEDSL",
+                dict(qk_dtype="nvfp4", v_block_size=1),
+                None,
+                "Supported DeCo-Attention recipes",
+            ),
+            ("CUTEDSL", dict(qk_dtype="nvfp4", smooth_v=True), None, "are SageAttention options"),
+            (
+                "CUTEDSL",
+                dict(qk_dtype="nvfp4"),
+                VideoSparseAttentionConfig(vsa_sparsity=0.9),
+                "deco_attention does not compose with sparse_attention",
+            ),
+        ],
+        ids=["other_backend", "other_recipe", "block_size", "sage_smoothing", "sparse_attention"],
+    )
+    def test_deco_attention_rejections(self, backend, quant, sparse, match):
+        """DeCo-Attention is CUTEDSL only, takes nvfp4 Q/K with fp8 or nvfp4 V at block sizes 0,
+        and never composes with SageAttention smoothing or a sparse algorithm."""
+        quant = {"deco_attention": True, **quant}
+        with pytest.raises(ValidationError, match=match):
+            AttentionConfig(
+                backend=backend,
+                quant_attention_config=QuantAttentionConfig(**quant),
+                sparse_attention_config=sparse,
+            )
+
     @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
     @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
     def test_smoothing_rejected_without_sage_recipe(self, backend, smoothing):
@@ -511,6 +556,56 @@ class TestVisualGenArgsCacheBackend:
         assert args.cache_backend == "teacache"
         assert isinstance(args.cache_config, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.11
+
+    def test_cache_union_discriminated_seacache(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            cache_config={"cache_backend": "seacache", "threshold": 0.15},
+        )
+        assert args.cache_backend == "seacache"
+        assert isinstance(args.cache_config, SeaCacheConfig)
+        assert args.seacache.threshold == 0.15
+        assert args.seacache.max_continuous_cached_steps == 2
+        assert args.teacache is None and args.cache_dit is None
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"threshold": 0.0},
+            {"threshold": -0.1},
+            {"max_continuous_cached_steps": -2},
+            {"max_warmup_steps": -1},
+            {"thresh": 0.2},
+            # The cap is named like Cache-DiT's; the earlier name is not an alias.
+            {"max_consecutive_cached_steps": 2},
+        ],
+    )
+    def test_seacache_rejects_invalid_values(self, kwargs):
+        with pytest.raises(ValidationError):
+            SeaCacheConfig(**kwargs)
+
+    @pytest.mark.parametrize("cap", [-1, 0, 5])
+    def test_seacache_accepts_unlimited_disabled_and_positive_caps(self, cap):
+        assert SeaCacheConfig(max_continuous_cached_steps=cap).max_continuous_cached_steps == cap
+
+    def test_seacache_config_round_trips(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            cache_config={
+                "cache_backend": "seacache",
+                "max_warmup_steps": 3,
+                "max_continuous_cached_steps": -1,
+            },
+        )
+        dumped = args.model_dump()["cache_config"]
+        assert dumped == {
+            "cache_backend": "seacache",
+            "threshold": 0.25,
+            "max_warmup_steps": 3,
+            "max_continuous_cached_steps": -1,
+        }
+        restored = VisualGenArgs(model="/tmp/model", cache_config=dumped)
+        assert restored.cache_config == args.cache_config
 
     def test_cache_default_is_none(self):
         args = VisualGenArgs(model="/tmp/model")

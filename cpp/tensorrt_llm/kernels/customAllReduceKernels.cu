@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include <cooperative_groups.h>
 #include <cstdint>
+#include <cuda_fp8.h>
 #include <tuple>
 #include <type_traits>
 
@@ -272,11 +273,25 @@ inline __device__ int4 rms_norm(float denom, PackedStruct& vec, PackedStruct& we
     return ret.packed;
 }
 
-template <typename T, bool Bias = false, bool Residual = false, bool Affine = false, bool UseSmem = false>
-__global__ void rms_norm_kernel(AllReduceParams params)
+// The optional per-tensor E4M3 epilogue of rms_norm_kernel (QuantFp8): quant_out [tokens, hidden] and the device
+// scale [1]; each output is scaleMatrixPerTensorVec's, satfinite(FP32(norm) x (1 / scale)).
+struct RmsNormQuantFp8Params
+{
+    __nv_fp8_e4m3* quant_out = nullptr;
+    float const* scale = nullptr;
+};
+
+// Residual add + RMSNorm, one CTA per token. QuantFp8: also the norm's per-tensor E4M3 quantization (BF16 only), so
+// the outputs equal this kernel's norm followed by the static per-tensor quantize bit for bit; WriteNorm: store the
+// norm output (only a QuantFp8 launch may skip it).
+template <typename T, bool Bias = false, bool Residual = false, bool Affine = false, bool UseSmem = false,
+    bool QuantFp8 = false, bool WriteNorm = true>
+__global__ void rms_norm_kernel(AllReduceParams params, RmsNormQuantFp8Params quant)
 {
     static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
     using PackedStruct = typename PackedOn16Bytes<T>::Type;
+    static_assert(WriteNorm || QuantFp8, "a launch without the norm output must quantize");
+    static_assert(!QuantFp8 || std::is_same_v<T, __nv_bfloat16>, "the FP8 epilogue takes BF16");
 
     extern __shared__ uint8_t smem_ptr[];
     T* smem = reinterpret_cast<T*>(smem_ptr);
@@ -289,7 +304,7 @@ __global__ void rms_norm_kernel(AllReduceParams params)
     T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
     T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
 
-    int block_offset = bid * params.fusion_params.hidden_size;
+    size_t block_offset = static_cast<size_t>(bid) * params.fusion_params.hidden_size;
     int thread_offset = tid * kPackedSize;
 
     if constexpr (Residual)
@@ -340,7 +355,26 @@ __global__ void rms_norm_kernel(AllReduceParams params)
             weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
         }
         inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
-        *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
+        if constexpr (WriteNorm)
+        {
+            *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
+        }
+        if constexpr (QuantFp8)
+        {
+            float const factor = 1.0f / quant.scale[0];
+            __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&inter_vec.packed);
+            __nv_fp8x2_storage_t fp8_pairs[kPackedSize / 2];
+#pragma unroll
+            for (int p = 0; p < kPackedSize / 2; ++p)
+            {
+                float2 f2 = __bfloat1622float2(pairs[p]);
+                f2.x *= factor;
+                f2.y *= factor;
+                fp8_pairs[p] = __nv_cvt_float2_to_fp8x2(f2, __NV_SATFINITE, __NV_E4M3);
+            }
+            *reinterpret_cast<uint2*>(quant.quant_out + block_offset + offset)
+                = *reinterpret_cast<uint2 const*>(fp8_pairs);
+        }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();
@@ -431,11 +465,15 @@ __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 p
 #endif
 }
 
-template <typename T, bool Bias = false, bool Residual = false, bool Affine = false>
-void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllReduceFusionOp fusionOp)
+// QuantFp8 / WriteNorm: rms_norm_kernel's FP8 epilogue (into ``quant``) and norm store, for RESIDUAL_RMS_NORM only.
+template <typename T, bool Bias = false, bool Residual = false, bool Affine = false, bool QuantFp8 = false,
+    bool WriteNorm = true>
+void rms_norm_kernel_launcher(
+    AllReduceParams& params, cudaStream_t stream, AllReduceFusionOp fusionOp, RmsNormQuantFp8Params quant = {})
 {
     static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
     TLLM_CHECK(params.fusion_params.hidden_size % kPackedSize == 0);
+    TLLM_CHECK((!QuantFp8 && WriteNorm) || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM);
     if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
     {
         TLLM_CHECK(params.fusion_params.hidden_size <= 8192);
@@ -472,8 +510,8 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllR
 
             if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
-                TLLM_CUDA_CHECK(
-                    cudaLaunchKernelEx(&kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, true>, params));
+                TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig,
+                    rms_norm_kernel<T, Bias, Residual, Affine, true, QuantFp8, WriteNorm>, params, quant));
             }
             else
             { // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
@@ -485,7 +523,8 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllR
         {
             if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
-                rms_norm_kernel<T, Bias, Residual, Affine, true><<<cta_num, cta_size, smem_size, stream>>>(params);
+                rms_norm_kernel<T, Bias, Residual, Affine, true, QuantFp8, WriteNorm>
+                    <<<cta_num, cta_size, smem_size, stream>>>(params, quant);
             }
             else
             { // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
@@ -512,8 +551,8 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllR
 
             if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
-                TLLM_CUDA_CHECK(
-                    cudaLaunchKernelEx(&kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, false>, params));
+                TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig,
+                    rms_norm_kernel<T, Bias, Residual, Affine, false, QuantFp8, WriteNorm>, params, quant));
             }
             else
             { // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
@@ -525,7 +564,8 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllR
         {
             if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
-                rms_norm_kernel<T, Bias, Residual, Affine, false><<<cta_num, cta_size, smem_size, stream>>>(params);
+                rms_norm_kernel<T, Bias, Residual, Affine, false, QuantFp8, WriteNorm>
+                    <<<cta_num, cta_size, smem_size, stream>>>(params, quant);
             }
             else
             { // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
@@ -1342,6 +1382,7 @@ void lamport_initialize_kernel_launcher(void* buffer, size_t size, cudaStream_t 
     int grid_size = (size + 1024 * kPackedSize - 1) / (1024 * kPackedSize);
     lamport_initialize_kernel<T><<<grid_size, block_size, 0, stream>>>(reinterpret_cast<T*>(buffer), size);
 }
+
 }; // namespace reduce_fusion
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false>
@@ -2004,6 +2045,55 @@ void residualRmsNorm(
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
+    sync_check_cuda_error(stream);
+}
+
+bool residualRmsNormQuantFp8Supported(tensorrt_llm::DataType dataType, int hidden_size)
+{
+#ifdef ENABLE_BF16
+    // One 16-byte pack per thread: hidden = 8 x threads, threads a multiple of 32 and at most kMaxCtaSize.
+    return dataType == tensorrt_llm::DataType::kBF16 && hidden_size % (8 * reduce_fusion::details::kWarpSize) == 0
+        && hidden_size / 8 <= reduce_fusion::details::kMaxCtaSize;
+#else
+    return false;
+#endif
+}
+
+void residualRmsNormQuantFp8(kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, void* quant_out,
+    float const* scale, bool write_norm_out, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(residualRmsNormQuantFp8Supported(dataType, params.fusion_params.hidden_size),
+        "residualRmsNormQuantFp8: unsupported dtype / hidden size");
+    TLLM_CHECK_WITH_INFO(params.fusion_params.weight_buffer != nullptr && params.fusion_params.bias_buffer == nullptr,
+        "residualRmsNormQuantFp8: a norm weight and no bias");
+    if (params.elts_total / params.fusion_params.hidden_size == 0)
+    {
+        return;
+    }
+    sync_check_cuda_error(stream);
+#ifdef ENABLE_BF16
+    // rms_norm_kernel with its FP8 epilogue: one CTA per token, one 16-byte pack per thread at these hidden sizes.
+    reduce_fusion::RmsNormQuantFp8Params const quant{reinterpret_cast<__nv_fp8_e4m3*>(quant_out), scale};
+    auto const op = AllReduceFusionOp::RESIDUAL_RMS_NORM;
+    using T = __nv_bfloat16;
+    bool const residual = params.fusion_params.residual_buffer != nullptr;
+    if (residual && write_norm_out)
+    {
+        reduce_fusion::rms_norm_kernel_launcher<T, false, true, true, true, true>(params, stream, op, quant);
+    }
+    else if (residual)
+    {
+        reduce_fusion::rms_norm_kernel_launcher<T, false, true, true, true, false>(params, stream, op, quant);
+    }
+    else if (write_norm_out)
+    {
+        reduce_fusion::rms_norm_kernel_launcher<T, false, false, true, true, true>(params, stream, op, quant);
+    }
+    else
+    {
+        reduce_fusion::rms_norm_kernel_launcher<T, false, false, true, true, false>(params, stream, op, quant);
+    }
+#endif
     sync_check_cuda_error(stream);
 }
 

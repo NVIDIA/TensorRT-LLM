@@ -245,8 +245,9 @@ set(TRTLLM_LINK_LIBS
     fb_gemm_src
     cutlass_src
     cute_dsl_src
-    runtime_src
     compressorKernels_src
+    csa2_sparse_context_src
+    csa2_sparse_decode_src
     fusedSamplingKernels_src
     mhcKernels_src
     ${DECODER_SHARED_TARGET_0}
@@ -301,6 +302,9 @@ set_target_properties(
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
+include(tllm_cutlass_runtime)
+tllm_localize_cutlass_runtime_helpers(${SHARED_TARGET})
+
 # Keep statically linked NVRTC symbols local so they cannot be interposed by a
 # dynamic NVRTC loaded elsewhere in the process.
 if(NOT WIN32 AND NOT NVRTC_DYNAMIC_LINKING)
@@ -315,16 +319,30 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 set(TLLM_FACADE_COMPONENT_TARGETS
     ipc_nvls_memory_src
     tllm_batch_request_info
+    tllm_batch_rnn_cache_routing
     tllm_batch_scheduler
+    tllm_common_cublas
     tllm_common_cuda
+    tllm_common_cuda_architectures
     tllm_common_environment
     tllm_common_error
+    tllm_common_fp8
+    tllm_common_ip
     tllm_common_logging
+    tllm_common_mcast_registry
+    tllm_common_native_memory
+    tllm_common_nccl
+    tllm_common_nccl_comm
+    tllm_common_op_utils
     tllm_common_profiler
+    tllm_common_safetensors
     tllm_context_transfer_consensus
+    tllm_executor_agent_connection
     tllm_executor_agent_name
+    tllm_executor_cache_routing
     tllm_executor_memory_desc
     tllm_executor_serialization
+    tllm_executor_socket_serialization
     tllm_executor_transfer_agent
     tllm_executor_types
     tllm_executor_values
@@ -334,14 +352,20 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_kv_cache_legacy
     tllm_peft_cache
     tllm_runtime_buffers
+    tllm_runtime_debug
     tllm_runtime_distributed
     tllm_runtime_gdr
     tllm_runtime_host_accessible_memory
+    tllm_runtime_ipc
     tllm_runtime_locality
     tllm_runtime_lora
     tllm_runtime_lora_cache
     tllm_runtime_memory
+    tllm_runtime_moe_load_balance
+    tllm_runtime_multicast
+    tllm_runtime_nccl
     tllm_runtime_numpy
+    tllm_runtime_nvls_buffers
     tllm_runtime_topology
     tllm_runtime_utils
     tllm_runtime_worker_pool
@@ -376,19 +400,15 @@ target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 
-# Cyclic dependency of UCX data transceiver on TRT-LLM
 if(TARGET ${UCX_WRAPPER_TARGET})
-  target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
 endif()
 
 if(TARGET ${NIXL_WRAPPER_TARGET})
-  target_link_libraries(${NIXL_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
 endif()
 
 if(TARGET ${MOONCAKE_WRAPPER_TARGET})
-  target_link_libraries(${MOONCAKE_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${MOONCAKE_WRAPPER_TARGET})
 endif()
 

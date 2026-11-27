@@ -42,8 +42,9 @@ enum class CudaArch {
   // Blackwell Ultra
   Sm103a,
 #ifdef TLLM_RUBIN_FEATURES
-  // SM107
-  Sm107a,
+  // SM107. The value is pinned explicitly because the enumerator above is stripped from the
+  // exported header; the prebuilt archives were built with Sm107a == 5.
+  Sm107a = 5,
 #endif // TLLM_RUBIN_FEATURES
 };
 

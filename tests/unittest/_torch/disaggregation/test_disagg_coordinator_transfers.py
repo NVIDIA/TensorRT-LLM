@@ -8,6 +8,8 @@ assertion is about request state, transfer ownership and what the executor
 was asked to do -- not about which internal method was called.
 """
 
+import threading
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,10 +18,16 @@ from coordinator_harness import CoordinatorHarness as _Harness
 from coordinator_harness import TransferRequest as _Request
 from fake_dist import FakeDistGroup
 
+from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.transfer import Receiver
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -161,6 +169,42 @@ def test_fast_completion_of_an_active_request_stages_its_response_first() -> Non
     assert h.effects.terminated == []
     assert h.active == []
     assert not h.in_transfer(req)
+
+
+def test_fast_completion_publishes_current_sampler_counters() -> None:
+    h = _Harness()
+    request = LlmRequest(
+        request_id=1,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=SamplingConfig(1),
+        is_streaming=True,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+        context_phase_params=ContextPhaseParams([4], 1, None, None, None, None),
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    request.py_decoding_iter = 1
+    request.py_draft_tokens = [7, 8]
+    request.py_per_pos_drafted[0] = 2
+    request.py_per_pos_accepted[0] = 1
+    request.py_total_draft_tokens = 2
+    request.py_total_accepted_draft_tokens = 1
+    assert request.decoding_iter == 0
+    h.active.append(request)
+    h.send(request)
+    h.transceiver.finish_send(request)
+
+    h.coordinator.reap_context_sends(0)
+
+    ((request_id, response, terminate_after_publish),) = h.effects.staged_responses
+    assert request_id == request.py_request_id
+    assert terminate_after_publish is request
+    assert response.result.get_result().decoding_iter == 1
+    assert request.draft_tokens == [7, 8]
+    assert response.result.per_pos_drafted[0] == 2
+    assert response.result.per_pos_accepted[0] == 1
+    assert response.result.spec_dec_totals == (1, 2)
 
 
 def test_fast_completion_without_a_response_terminates_immediately() -> None:
@@ -518,6 +562,48 @@ def test_timed_out_requests_under_adp_fail_only_at_the_synced_drain() -> None:
     assert len(h.effects.failed) == 1
 
 
+def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
+    """Failing a cancelled receive ends its in-progress state.
+
+    A receive that completed after its deadline keeps its state.
+    """
+    h = _Harness()
+    cancelled = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+    completed_late = _Request(
+        2,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+    )
+
+    h.coordinator.fail_timed_out([cancelled, completed_late])
+
+    assert cancelled.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert completed_late.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert h.effects.failed == [
+        ("Request 1 timed out", [cancelled], False),
+        ("Request 2 timed out", [completed_late], False),
+    ]
+
+
+def test_fail_timed_out_ends_the_receive_state_before_the_adp_buffer() -> None:
+    """Under multi-rank ADP the state ends when the request is buffered, not at the synced drain."""
+    h = _Harness(enable_attention_dp=True, world_size=2)
+    req = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+
+    h.coordinator.fail_timed_out([req])
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == []
+
+
 def test_fatal_error_during_the_synced_drain_leaves_no_stale_pending_state() -> None:
     """If the executor's error path raises (fatal), the drained requests must
     not be re-failed by the next drain."""
@@ -536,6 +622,91 @@ def test_fatal_error_during_the_synced_drain_leaves_no_stale_pending_state() -> 
 
 
 # -- in-flight cancellation of generation receives ---------------------------
+
+
+@pytest.mark.parametrize("async_receive", [True, False])
+def test_receive_admission_fence_only_fails_the_unpublished_request(
+    monkeypatch, async_receive
+) -> None:
+    monkeypatch.setattr(coordinator_module, "uses_async_gen_transfer", lambda: async_receive)
+    monkeypatch.setattr(transceiver_module, "_chunk_bytes_by_kind", lambda *_: (0, 0))
+    h = _Harness()
+    rejected = _Request(1, is_context_only_request=False, set_kv_cache_transfer_start=Mock())
+    allowed = _Request(
+        2,
+        is_context_only_request=False,
+        set_kv_cache_transfer_start=Mock(),
+        set_kv_cache_size=Mock(),
+    )
+    h.active.extend((rejected, allowed))
+    sender = Mock(_agent_failed=False, _shutdown_requested=False, _admission_lock=threading.Lock())
+    receiver = object.__new__(Receiver)
+    receiver.__dict__.update(
+        _sessions_lock=threading.Lock(),
+        _sessions={},
+        _pre_cancelled_rids={},
+        _shutdown=False,
+        _recovery_sender=weakref.ref(sender),
+        shutdown=Mock(),
+    )
+    node = object.__new__(KvCacheTransceiverV2)
+    node.__dict__.update(
+        _agent_recovery=True,
+        _gen_need_sync=False,
+        _gen_allgather=None,
+        _gen_idle_probe=False,
+        _recv_sessions={},
+        _recv_reqs={},
+        _send_sessions={},
+        _dist=h.dist,
+        _page_table=None,
+        kv_transfer_timeout_ms=None,
+        _create_cache_extent=Mock(return_value=SimpleNamespace(local=None)),
+        _request_kv_bytes=Mock(return_value=0),
+        _need_aux_transfer=Mock(return_value=False),
+        _assert_disagg_history_declared=Mock(),
+        _validate_bridge_req=Mock(return_value=True),
+        _local_agent_ready=lambda: not sender._agent_failed,
+    )
+    node._init_gen_idle_poll(False)
+    h.transceiver.request_and_receive_async = node.request_and_receive_async
+    h.transceiver.request_and_receive_sync = node.request_and_receive_sync
+    h.transceiver.check_gen_transfer_status = node.check_gen_transfer_status
+    h.transceiver.has_inflight_transfer = node.has_inflight_transfer
+
+    def open_source(req):
+        fetches = SimpleNamespace(session=None)
+        session = Mock(
+            _enforce_physical_ownership=False,
+            disagg_request_id=req.py_request_id,
+            status=SessionStatus.TRANSFERRED,
+            transfer_end_time=None,
+            kv_cache_size_bytes=0,
+        )
+        session.wait_complete.return_value = WaitResult.COMPLETED
+        session.kv_write_verified.return_value = True
+        session.is_completed.return_value = True
+
+        def fetch(*args, **kwargs):
+            with sender._admission_lock:
+                sender._agent_failed = req is rejected
+            receiver.setup_session(session)
+            fetches.session = session
+            return Mock()
+
+        session.close.side_effect = lambda: receiver.clear_session(req.py_request_id)
+        fetches.fetch = fetch
+        return fetches
+
+    node._open_peer_source = open_source
+    assert node._local_agent_ready()
+    h.coordinator.receive_gen_init([rejected, allowed])
+
+    assert rejected.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert allowed.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert [requests for _, requests, _ in h.effects.failed] == [[rejected]]
+    assert node._recv_sessions == node._recv_reqs == receiver._sessions == {}
+    assert not node._rank_info_start_failures
 
 
 def _receiving(h: _Harness, rid: int, started_at: float) -> _Request:
@@ -891,6 +1062,7 @@ def test_scheduler_retirement_probe_is_local_and_fresh_under_adp() -> None:
             can_share_inflight_prefix=False,
             tokens_per_block=16,
             _has_cp_helix=False,
+            max_beam_width=1,
             inforward_snapshot_rows=0,
             has_cache_tier_below_gpu=False,
             kv_connector_manager=None,
@@ -913,6 +1085,7 @@ def test_scheduler_retirement_probe_is_local_and_fresh_under_adp() -> None:
         10,
         state_value=LlmRequestState.CONTEXT_INIT.value,
         is_generation_in_progress_state=False,
+        context_current_position=0,
     )
 
     def detect_stall(rank: int) -> None:
@@ -931,16 +1104,16 @@ def test_scheduler_retirement_probe_is_local_and_fresh_under_adp() -> None:
 
     group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
     assert all(h.coordinator.has_retiring_gen_receives for h in ranks)
-    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-        detect_stall(0)
+    detect_stall(0)
+    assert schedulers[0]._failed_requests == [blocked]
     detect_stall(1)
     assert schedulers[1]._stalled_schedules == 0
 
     # Local retirement is equally visible before the fleet snapshot refreshes.
     ranks[1].coordinator._retiring_gen_receives.clear()
     assert all(h.coordinator.has_retiring_gen_receives for h in ranks)
-    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-        detect_stall(1)
+    detect_stall(1)
+    assert schedulers[1]._failed_requests == [blocked]
 
 
 def test_pace_idle_observes_off_list_receive_retirement(monkeypatch: pytest.MonkeyPatch) -> None:

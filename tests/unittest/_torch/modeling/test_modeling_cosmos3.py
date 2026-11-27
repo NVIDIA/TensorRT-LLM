@@ -104,19 +104,10 @@ def test_cosmos3_preserves_prepared_video_frame_count(
     media_io_kwargs = Cosmos3InputProcessor.__new__(
         Cosmos3InputProcessor
     ).get_preferred_media_io_kwargs()
-    assert media_io_kwargs == {
-        "image": {"format": "np"},
-        "video": {"format": "np", "num_frames": -1, "fps": -1},
-    }
+    assert media_io_kwargs == {"video": {"num_frames": -1, "fps": -1}}
 
     monkeypatch.setattr(media_io, "_get_cv2", lambda: _FakeCv2(prepared_frame_count))
-    video_kwargs = media_io_kwargs["video"]
-    decoded_video = media_io._load_video_by_cv2(
-        "prepared-video.mp4",
-        num_frames=video_kwargs["num_frames"],
-        fps=video_kwargs["fps"],
-        format=video_kwargs["format"],
-    )
+    decoded_video = media_io._load_video_by_cv2("prepared-video.mp4", **media_io_kwargs["video"])
 
     assert decoded_video.frames.shape[0] == prepared_frame_count
     assert decoded_video.metadata["frames_indices"] == list(range(prepared_frame_count))

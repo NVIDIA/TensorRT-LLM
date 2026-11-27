@@ -25,9 +25,11 @@ from .chat import (
     PreparedChat,
     arender_chat,
     prepare_chat_request,
+    prompt_tokens_excluded_from_usage,
     render_chat,
     render_chat_for_length,
     render_conversation,
+    render_conversation_with_media,
     tokenize_rendered,
 )
 from .fingerprint import (
@@ -70,9 +72,11 @@ __all__ = [
     "harmony_enabled_for",
     "mount_render_endpoints",
     "prepare_chat_request",
+    "prompt_tokens_excluded_from_usage",
     "render_chat",
     "render_chat_for_length",
     "render_conversation",
+    "render_conversation_with_media",
     "render_endpoints_enabled",
     "tokenize_rendered",
     "worker_resolves_thinking",

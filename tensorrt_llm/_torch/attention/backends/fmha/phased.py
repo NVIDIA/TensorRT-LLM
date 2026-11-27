@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, ClassVar, Optional, cast
 
 import torch
 
@@ -128,12 +128,33 @@ def _leading_rows(t: torch.Tensor, n: int) -> torch.Tensor:
     return t if t.shape[0] == n else t[:n]
 
 
+def _kv_rows(t: torch.Tensor, num_ctx_tokens: int, kv_row_total: int | None) -> torch.Tensor:
+    """Keep a full-KV span; otherwise limit dense input to the context prefix."""
+    if kv_row_total is not None and t.shape[0] == kv_row_total:
+        return t
+    return _leading_rows(t, num_ctx_tokens)
+
+
 class PhasedFmha(Fmha):
     """FMHA helper for paged-KV libraries that split work by request phase."""
 
     REQUIRES_PAGED_KV = True
     # Required by backends that construct tensor views over the KV pool.
     NEEDS_BLOCK_EXTENT = True
+    # Whether the manager may serve the generation rows of a mixed batch with this
+    # library while a phased library that supports the whole batch (e.g. the thop op)
+    # serves the context requests; see ``FmhaManager._select_non_mla``. Opt-in per
+    # library so that the selection of every other library is unchanged.
+    pairs_with_whole_batch_context: ClassVar[bool] = False
+    # Whether the library serves only generation rows that all carry the same number of query
+    # tokens; FmhaManager then keys its selection cache on that (``generation_rows_uniform``).
+    requires_uniform_generation_rows: ClassVar[bool] = False
+
+    def serves_mixed_generation_rows(self, metadata: "TrtllmAttentionMetadata") -> bool:
+        """Per-step choice of a library paired with a whole-batch context library: whether it
+        should serve this mixed batch's generation rows (else the whole-batch library serves
+        the whole batch). Host-side only; called on every layer of a mixed step."""
+        return True
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -161,7 +182,13 @@ class PhasedFmha(Fmha):
             return int(view_bound(local_layer_idx))
 
         if isinstance(kv_cache_manager, KVCacheManagerV2):
-            return int(kv_cache_manager.impl.get_page_index_upper_bound(local_layer_idx, Role.KEY))
+            impl = kv_cache_manager.impl
+            upper_bound = impl.get_page_index_upper_bound(local_layer_idx, Role.KEY)
+            if kv_cache_manager._use_per_layer_page_tables:
+                # Per-layer tables include the layer offset and address the pool root.
+                converter = impl.get_page_index_converter(local_layer_idx, Role.KEY)
+                upper_bound += converter.layer_offset * converter.expansion
+            return int(upper_bound)
         if not isinstance(kv_cache_manager, KVCacheManager):
             raise TypeError(f"Unsupported KV cache manager: {type(kv_cache_manager).__name__}.")
 
@@ -291,6 +318,8 @@ class PhasedFmha(Fmha):
 
         Args:
             q, k, v: The call's inputs [num_tokens, ...], context tokens first; k / v None with fused QKV.
+                MLA calls contain only one phase; expanded context K/V may include a cached prefix
+                or chunk whose row count differs from Q.
             metadata: The context phase is its first num_contexts sequences and num_ctx_tokens tokens.
             forward_args: The call's arguments; its output [num_tokens, ...] is written.
             workspace: The call's attention workspace.
@@ -309,8 +338,20 @@ class PhasedFmha(Fmha):
         phase_input = _leading_rows(q, num_ctx_tokens)
         params.qkv_input = phase_input if forward_args.is_fused_qkv else None
         params.query_input = None if forward_args.is_fused_qkv else phase_input
-        params.key_input = _leading_rows(k, num_ctx_tokens) if k is not None else None
-        params.value_input = _leading_rows(v, num_ctx_tokens) if v is not None else None
+        if self.attn.is_mla_enable:
+            # An expanded MLA prefix or KV chunk can be longer than its Q span.
+            params.key_input = k
+            params.value_input = v
+        else:
+            kv_row_total = (
+                int(metadata.kv_lens_runtime[:num_seqs].sum())
+                if metadata.kv_lens_runtime is not None
+                else None
+            )
+            params.key_input = _kv_rows(k, num_ctx_tokens, kv_row_total) if k is not None else None
+            params.value_input = (
+                _kv_rows(v, num_ctx_tokens, kv_row_total) if v is not None else None
+            )
         params.output = out_tensor if fused_epilogue else _leading_rows(out_tensor, num_ctx_tokens)
         params.sequence_lengths = metadata.kv_lens_cuda_runtime
         params.context_lengths = metadata.prompt_lens_cuda_runtime

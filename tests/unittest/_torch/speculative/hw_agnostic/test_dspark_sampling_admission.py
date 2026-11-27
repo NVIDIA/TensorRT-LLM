@@ -73,7 +73,9 @@ def test_host_sampler_guard_is_group_uniform_before_graph_lookup(enabled, reject
     for local_flag in flags:
         runner = SimpleNamespace()
         runner._dspark_confidence_enabled = enabled
-        runner.mapping = SimpleNamespace(enable_lm_head_tp_in_adp=False, tp_size=len(flags))
+        runner.mapping = SimpleNamespace(
+            enable_attention_dp=False, enable_lm_head_tp_in_adp=False, tp_size=len(flags)
+        )
         exchange = Mock(return_value=torch.tensor([[flag] for flag in flags], dtype=torch.int64))
         runner.dist = SimpleNamespace(tp_allgather_int64=exchange)
         metadata = object.__new__(SpecMetadata)
@@ -142,7 +144,9 @@ def test_invalid_confidence_request_is_excluded_before_activation(processors):
 def test_feature_off_retains_existing_lm_head_tp_group_sync(enabled):
     runner = SimpleNamespace()
     runner._dspark_confidence_enabled = enabled
-    runner.mapping = SimpleNamespace(enable_lm_head_tp_in_adp=True, tp_size=2)
+    runner.mapping = SimpleNamespace(
+        enable_attention_dp=True, enable_lm_head_tp_in_adp=True, tp_size=2
+    )
     exchange = Mock(return_value=torch.tensor([[True], [False]], dtype=torch.int64))
     runner.dist = SimpleNamespace(tp_allgather_int64=exchange)
     metadata = object.__new__(SpecMetadata)

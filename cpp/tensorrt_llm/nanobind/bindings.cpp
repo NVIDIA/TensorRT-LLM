@@ -35,7 +35,6 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
-#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftSupport.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
@@ -171,7 +170,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
-    buildInfo.attr("CFT_COUNTED_WRITES") = nb::bool_(static_cast<bool>(TLLM_CFT_HAS_CUDA_13_4_SUPPORT));
 
     auto const toTuple = [](std::vector<int> const& architectures)
     {

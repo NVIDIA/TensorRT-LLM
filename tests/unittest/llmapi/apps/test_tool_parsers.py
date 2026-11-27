@@ -1096,6 +1096,10 @@ class TestKimiK2StreamingMatchesWholeTextParse:
         assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
+_QWEN3_CALL_BODY = ('{"name": "get_weather", "arguments": {"location": "SF"}}'
+                    '\n</tool_call>')
+
+
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
 
@@ -1516,6 +1520,37 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         # The completed call must also be consumed from the buffer, otherwise the
         # parser stays in the tool-call branch and swallows the rest of the output.
         assert "<tool_call>" not in parser._buffer
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            ["Let me check the weather.<tool_call>", "\n", _QWEN3_CALL_BODY],
+            ["Let me check", " the weather.<tool_call>\n", _QWEN3_CALL_BODY],
+            ["Let me check the weather.<tool_call>\n" + _QWEN3_CALL_BODY],
+        ],
+        ids=["prefix_with_partial_opener", "prefix_with_opener", "one_chunk"],
+    )
+    def test_streaming_keeps_text_sharing_a_chunk_with_the_opener(
+            self, sample_tools, parser, chunks):
+        """Stream text that shares a chunk with the start of a call.
+
+        A multi-token step can deliver the last words before a call together
+        with ``<tool_call>``. They are content, as detect_and_parse reports.
+        """
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
+        results.append(parser.finish(sample_tools))
+
+        content = "".join(r.normal_text for r in results)
+        assert content == "Let me check the weather."
+        assert content == parser.detect_and_parse("".join(chunks),
+                                                  sample_tools).normal_text
+        assert [c.name for r in results for c in r.calls
+                if c.name] == ["get_weather"]
+        arguments = "".join(c.parameters for r in results for c in r.calls)
+        assert json.loads(arguments) == {"location": "SF"}
 
 
 class TestQwen3CoderRequiredTools:
@@ -6416,6 +6451,66 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "undefined_func"
         assert result.calls[0].tool_index == 0
+
+    @staticmethod
+    def _namespaced_tools():
+        """Tools declared inside namespaces; two share the bare name ``status``."""
+        return _make_tools(("functions.exec", None), ("functions.wait", None),
+                           ("a.status", None), ("b.status", None))
+
+    @staticmethod
+    def _parse_logging_warnings(text: str,
+                                tools: list[ChatCompletionToolsParam]):
+        """Parse ``text`` whole; return its calls and the warnings it logged."""
+        from unittest.mock import patch
+
+        with patch("tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger"
+                   ) as mock_logger:
+            result = KimiK3ToolParser().detect_and_parse(text, tools)
+        calls = [(call.tool_index, call.name, call.parameters)
+                 for call in result.calls]
+        warnings = [call.args[0] for call in mock_logger.warning.call_args_list]
+        return calls, warnings
+
+    def test_bare_name_of_namespaced_tool_does_not_warn(self):
+        """A namespaced tool called by its bare name is not an undefined function.
+
+        The call is delivered under the name the model wrote.
+        """
+        text = self._section(
+            self._call("exec", 1, self._argument("cmd", "string", "ls")),
+            self._call("wait", 2, self._argument("seconds", "number", "5")))
+
+        calls, warnings = self._parse_logging_warnings(text,
+                                                       self._namespaced_tools())
+
+        assert calls == [(0, "exec", '{"cmd": "ls"}'),
+                         (1, "wait", '{"seconds": 5}')]
+        assert warnings == []
+
+    @pytest.mark.parametrize(
+        "undeclared",
+        [
+            "undefined_func",
+            # A bare name two declared tools share names neither of them.
+            "status",
+            # A qualifier no declared tool has.
+            "tools.exec",
+        ])
+    def test_call_naming_no_declared_tool_still_warns(self, undeclared):
+        """Only the call that names no declared tool is reported."""
+        text = self._section(
+            self._call("exec", 1, self._argument("cmd", "string", "ls")),
+            self._call(undeclared, 2, self._argument("arg", "string", "x")))
+
+        calls, warnings = self._parse_logging_warnings(text,
+                                                       self._namespaced_tools())
+
+        assert calls == [(0, "exec", '{"cmd": "ls"}'),
+                         (1, undeclared, '{"arg": "x"}')]
+        assert warnings == [
+            f"Model attempted to call undefined function: {undeclared}"
+        ]
 
     def test_supports_structural_tag(self):
         """Reject JSON-schema structural tagging for XTML bodies.

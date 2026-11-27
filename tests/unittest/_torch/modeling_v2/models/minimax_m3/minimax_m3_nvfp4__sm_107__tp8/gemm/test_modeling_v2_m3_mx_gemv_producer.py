@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.mx_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.mx_gemv import (  # noqa: E501
     op as gemv,
 )
 
@@ -47,7 +47,7 @@ def _case(tokens, seed, scale=1.0, bad_slots=False):
     return xq.view(tokens, K), xsf, wq.view(N, K), wsf, slots, quant, norms, rotary, positions
 
 
-def _caches():
+def _caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(PAGES, 2, 1, PAGE, 64, dtype=torch.uint8, device="cuda"),
         torch.zeros(PAGES, 2, 1, PAGE, 8, dtype=torch.uint8, device="cuda"),
@@ -71,15 +71,16 @@ def _chain(case, caches, producer):
     return q, iq
 
 
-def _fused(case, caches):
+def _fused(case, caches: tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
     xq, xsf, wq, wsf, slots, quant, norms, rotary, positions = case
     tokens = xq.shape[0]
     q = torch.zeros(tokens, HEADS_Q, 128, dtype=torch.float8_e4m3fn, device="cuda")
     iq = torch.zeros(tokens, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")
     kv_data, kv_scale, index_k = caches
+    call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = norms
     ok = gemv.m3_mx_gemv_producer(
-        xq, xsf, wq, wsf, q, iq, kv_data, kv_scale, index_k, slots, quant, EPS, *norms, rotary, positions,
-        use_pdl=True,
+        xq, xsf, wq, wsf, q, iq, kv_data, kv_scale, index_k, slots, quant, EPS, call_q_weight,
+        call_k_weight, call_index_q_weight, call_index_k_weight, rotary, positions, use_pdl=True,
     )  # fmt: skip
     assert ok, "the producer GEMV must serve the sparse QKV shape at <= 8 tokens"
     torch.cuda.synchronize()
@@ -139,8 +140,10 @@ def test_producer_gemv_is_deterministic_and_graph_replays() -> None:
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = norms
         gemv.m3_mx_gemv_producer(
-            xq, xsf, wq, wsf, q, iq, *caches, slots, quant, EPS, *norms, rotary, positions, use_pdl=True
+            xq, xsf, wq, wsf, q, iq, *caches, slots, quant, EPS, call_q_weight, call_k_weight,
+            call_index_q_weight, call_index_k_weight, rotary, positions, use_pdl=True,
         )  # fmt: skip
     graph.replay()
     torch.cuda.synchronize()
@@ -161,6 +164,8 @@ def test_declines_outside_its_shape() -> None:
         torch.zeros(16, K, dtype=torch.bfloat16, device="cuda"), True
     )[1]
     caches = _caches()
+    call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = norms
     assert not gemv.m3_mx_gemv_producer(
-        wide, xsf16, wq, wsf, q, iq, *caches, slots, quant, EPS, *norms, rotary, positions
+        wide, xsf16, wq, wsf, q, iq, *caches, slots, quant, EPS, call_q_weight, call_k_weight,
+        call_index_q_weight, call_index_k_weight, rotary, positions,
     )  # fmt: skip

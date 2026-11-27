@@ -6,12 +6,10 @@
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import math
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -29,9 +27,7 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import (
     check_config,
     delivery,
     disagg,
-    divergence,
     gate_cli,
-    gate_records,
     test_results,
 )
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as sg
@@ -39,12 +35,7 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import test_results as tc
 from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
 from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import Check as DeliveryCheck
 from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import DeliveryReport
-from agent_flow.workflows.trtllm_modeling_v2.checks.gate_records import (
-    KIND_STOCK_UNAVAILABLE,
-    GateRecords,
-)
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import (
-    engine_driver,
     reuse_probe,
     serve_driver,
     workload_io,
@@ -56,9 +47,8 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
     resolve_environment,
 )
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
-from agent_flow.workflows.trtllm_modeling_v2.run.execution import handoff as handoff_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
+from agent_flow.workflows.trtllm_modeling_v2.run.validation import test_jobs
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
     target_test_modules_check as target_tests,
@@ -68,7 +58,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
 
-from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _workflow, _write_entry
+from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _write_entry
 
 _gates_TASK = {
     "checkpoint_path": "/ckpt/Qwen3-30B-A3B",
@@ -546,7 +536,7 @@ def test_indirect_entries_must_have_contracts_and_collected_tests(tmp_path, loca
         _write_entry(entry, test)
     else:
         nested.write_text(
-            "from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm import exported as run\n",
+            "from tensorrt_llm._torch.modeling_v2.catalog.norm import exported as run\n",
             encoding="utf-8",
         )
         entry = root / catalog_paths.CATALOG_DIR / "norm/flashinfer_rmsnorm.py"
@@ -581,7 +571,7 @@ def test_family_helper_cannot_hide_sibling_import(tmp_path, absolute):
     sibling.mkdir()
     (sibling / "modeling.py").write_text("class Other: pass\n", encoding="utf-8")
     module = (
-        "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.sibling.modeling"
+        "tensorrt_llm._torch.modeling_v2.models.gpt_oss.sibling.modeling"
         if absolute
         else ".sibling.modeling"
     )
@@ -632,7 +622,7 @@ def _acceptance_gate_env():
     )
 
 
-def _acceptance_gate_driver_output(rates, *, prompts=None, iterations=100):
+def _acceptance_gate_driver_output(rates, *, iterations=100):
     """What the engine driver prints for prompts accepting at ``rates``.
 
     ``iterations`` is every prompt's, or a list with one per prompt.
@@ -644,7 +634,6 @@ def _acceptance_gate_driver_output(rates, *, prompts=None, iterations=100):
         workload_io_line = {
             "index": n,
             "id": f"d{n}",
-            "prompt_sha": (prompts or [f"p{i}" for i in range(len(rates))])[n],
             "tokens": tokens,
             "iterations": steps,
             "token_ids": [],
@@ -652,22 +641,6 @@ def _acceptance_gate_driver_output(rates, *, prompts=None, iterations=100):
         }
         lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(workload_io_line)}")
     return "\n".join(lines) + "\n"
-
-
-def _acceptance_gate_legs(require, off=None):
-    """A runner: the require leg prints ``require``; the off leg ``off`` or cannot load."""
-    seen = []
-
-    def run(command, env=None, timeout=0):
-        seen.append(command)
-        if "TRTLLM_MODELING_V2=off" in command:
-            if off is None:
-                return CommandResult(returncode=1, stderr="Unknown model architecture: X")
-            return CommandResult(returncode=0, stdout=off)
-        return CommandResult(returncode=0, stdout=require)
-
-    run.seen = seen
-    return run
 
 
 def _acceptance_gate_task(**acceptance):
@@ -680,181 +653,56 @@ def _acceptance_gate_task(**acceptance):
 _BASE = [2.6 + 0.5 * math.sin(i) for i in range(32)]
 
 
-@pytest.fixture
-def tree(monkeypatch):
-    """Pin the tree a gate believes it measured, so a baseline can come from another."""
-    current = {"name": "treeA"}
-    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: current["name"])
-    return current
-
-
-def test_a_significant_drop_against_the_previous_tree_fails(tmp_path, tree):
-    records = GateRecords(tmp_path / "r.jsonl")
-    common = dict(
-        task_data=_acceptance_gate_task(), member="tep4", records=records, workdir=tmp_path / "w"
-    )
-    acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(_BASE), _acceptance_gate_driver_output(_BASE)
-        ),
-        **common,
-    )
-    tree["name"] = "treeB"
-    dropped = [r - 0.3 for r in _BASE]
-    result = acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(dropped), _acceptance_gate_driver_output(dropped)
-        ),
-        **common,
-    )
-    assert not result.passed
-    assert "against tree treeA: REGRESSED" in result.detail
-    # A failed verdict is recorded, but is not the next tree's baseline.
-    tree["name"] = "treeC"
-    again = acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(_BASE), _acceptance_gate_driver_output(_BASE)
-        ),
-        **common,
-    )
-    assert again.passed and "against tree treeA" in again.detail
-
-
-_boot_boundaries_TASK = {
-    "checkpoint_path": "/ckpt/Qwen3-30B-A3B",
-    "parallel": "tp1",
-    "trtllm_repo_path": "/repo",
-    "runtime": {
-        "cuda_graph": True,
-        "chunked_prefill": True,
-        "extra_flags": ["--max_seq_len=64", "--max_batch_size=8", "--max_num_tokens=32"],
-    },
-    "accuracy": {
-        "benchmark": "gsm8k",
-        "reference_yaml": "x.yaml",
-        "envelope": {"enabled": True},
-    },
-}
-
-
-def _run_boot(tmp_path, monkeypatch, *, mutate=None, task=None, unit=None, member=None):
-    events = []
-    specs = []
-    active = 0
-
-    class Params:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    class LLM:
-        def __init__(self, **kwargs):
-            events.append(("construct", kwargs))
-            self.tokenizer = SimpleNamespace(
-                apply_chat_template=lambda *args, **kwargs: "chat: " + args[0][0]["content"]
-            )
-
-        def generate_async(self, prompt, params, streaming=False):
-            nonlocal active
-            active += 1
-            events.append(("submit", prompt, params, active))
-            output = SimpleNamespace(
-                prompt_token_ids=(prompt["prompt_token_ids"] if isinstance(prompt, dict) else [1]),
-                cached_tokens=0,
-                outputs=[
-                    SimpleNamespace(
-                        token_ids=list(range(params.max_tokens)),
-                        text="Paris",
-                        finish_reason="length",
-                    )
-                ],
-            )
-
-            def stream():
-                nonlocal active
-                yield output
-                active -= 1
-                events.append(("drain", prompt))
-
-            return stream()
-
-        def shutdown(self):
-            events.append(("shutdown",))
-
-    monkeypatch.setitem(
-        sys.modules,
-        "tensorrt_llm",
-        SimpleNamespace(LLM=LLM, SamplingParams=Params, __file__="/fake"),
-    )
-    monkeypatch.setattr(engine_driver.engine_facts, "emit", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engine_driver.reuse_probe, "probe", lambda *args: events.append(("reuse",)))
+def _acceptance(tmp_path, monkeypatch, rates, *, iterations=100, **acceptance):
+    """The acceptance gate's verdict on a load whose prompts accept at ``rates``."""
+    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: "t")
+    seen = []
 
     def run(command, env=None, timeout=0):
-        words = shlex.split(command)
-        path = words[words.index("--spec") + 1]
-        from pathlib import Path
-
-        specs.append(json.loads(Path(path).read_text()))
-        capture = io.StringIO()
-        with contextlib.redirect_stdout(capture):
-            assert engine_driver.main(["--spec", path]) == 0
-        output = capture.getvalue()
-        if mutate:
-            lines = []
-            for line in output.splitlines():
-                if line.startswith(workload_io.RECORD_MARKER):
-                    record = json.loads(line[len(workload_io.RECORD_MARKER) :])
-                    mutate(record)
-                    if record:
-                        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
-                else:
-                    lines.append(line)
-            output = "\n".join(lines)
+        seen.append(command)
+        output = _acceptance_gate_driver_output(rates, iterations=iterations)
         return CommandResult(returncode=0, stdout=output)
 
-    result = boot_checks.run_boot_gate(
-        _gates_env(),
-        task_data=task or _boot_boundaries_TASK,
+    result = acceptance_checks.run_acceptance_gate(
+        _acceptance_gate_env(),
+        task_data=_acceptance_gate_task(**acceptance),
         runner=run,
-        workdir=tmp_path,
-        unit=unit,
-        member=member,
+        unit="dspark",
+        member="tep4",
+        workdir=tmp_path / "w",
     )
-    return result, specs, events
+    return result, seen
 
 
-def _parted(gap):
-    """Probe0's loaded leg takes another token at step 2, ``gap`` nats behind in both legs."""
-
-    def mutate(record):
-        if record.get("id") != "probe0":
-            return
-        own = 2 if record.get("phase") == "baseline" else 9
-        other = 9 if own == 2 else 2
-        if record.get("phase") == "loaded":
-            record["token_ids"] = [0, 1, 9, 3]
-        rows = [[[t, 0.0, 1]] for t in record["token_ids"]]
-        rows[2] = [[own, -0.1, 1], [other, -0.1 - gap, 2]]
-        record["top_logprobs"] = rows
-
-    return mutate
-
-
-def test_a_probe_that_parts_at_a_near_tie_passes_and_past_the_margin_fails(tmp_path, monkeypatch):
-    result, specs, events = _run_boot(tmp_path, monkeypatch, mutate=_parted(0.05))
+def test_acceptance_is_one_load_held_to_one_and_to_the_declared_floor(tmp_path, monkeypatch):
+    # With no floor declared the verdict stands on 1.0 alone, and says so.
+    result, seen = _acceptance(tmp_path, monkeypatch, _BASE)
     assert result.passed, result.detail
-    assert "near-tie(s) (probe0 step 2: baseline 2, loaded 9, 0.050 apart)" in result.detail
-    # The probes ask the engine for their top log-probs; the fillers do not.
-    probes = [r for p in specs[0]["phases"] for r in p["requests"] if r["id"].startswith("probe")]
-    assert probes and all(r["logprobs"] == boot_checks.BOUNDARY_TOP_K for r in probes)
-    asked = [e[2] for e in events if e[0] == "submit" and getattr(e[2], "logprobs", 0)]
-    assert len(asked) == len(probes)
-    result, _, _ = _run_boot(tmp_path, monkeypatch, mutate=_parted(2.0))
+    assert len(seen) == 1 and "TRTLLM_MODELING_V2=require" in seen[0]
+    assert "held to 1.0 alone" in result.detail and "held to 1.0 alone" in result.warnings[0]
+    # Every draft rejected is the draft path computing the wrong thing.
+    result, _ = _acceptance(tmp_path, monkeypatch, [1.0] * 32)
+    assert not result.passed and "at or below 1.0" in result.detail
+    # A declared floor is met or not; one derived from a measured reference keeps 0.95 of it.
+    floor = {"min_absolute": 1.5, "floor_source": "a measured drafter"}
+    result, _ = _acceptance(tmp_path, monkeypatch, _BASE, dspark=floor)
+    assert result.passed and result.reference == 1.5
+    assert "vs declared floor 1.5000 (from a measured drafter): met" in result.detail
+    result, _ = _acceptance(tmp_path, monkeypatch, _BASE, dspark={"measured_reference": 3.32})
+    assert (
+        not result.passed
+        and "vs declared floor 3.1540 (0.95 x measured reference 3.32): NOT met" in result.detail
+    )
+
+
+def test_a_workload_too_short_to_measure_fails_as_the_workload_not_the_target(
+    tmp_path, monkeypatch
+):
+    # Each request's first iteration is its context step: 4 prompts x 2 leave 4 to count.
+    result, _ = _acceptance(tmp_path, monkeypatch, [2.5] * 4, iterations=2)
     assert not result.passed
-    assert "must agree on 4 tokens" in result.detail
-    assert "past the near-tie margin 0.150" in result.detail
+    assert "workload too short to measure acceptance: 4 generation iteration(s)" in result.detail
+    assert "a property of the workload, not of the target" in result.detail
 
 
 _SNAPSHOTS = {
@@ -891,10 +739,7 @@ _RUNTIME = {
 }
 
 
-_PADDED = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]
-
-
-def _engine_attestation_task(tmp_path: Path, **extra) -> dict:
+def _reuse_task(tmp_path: Path, **extra) -> dict:
     options = tmp_path / "core.llm_api.yaml"
     options.write_text(yaml.safe_dump(_OPTIONS), encoding="utf-8")
     task = {
@@ -909,96 +754,11 @@ def _engine_attestation_task(tmp_path: Path, **extra) -> dict:
     return task
 
 
-def _engine_attestation_env() -> RunEnvironment:
-    return RunEnvironment(kind="local", python="/py", world_size=1, env={})
-
-
-def _engine_config(**changes) -> dict:
-    """What a correctly built core@tp1 engine reports."""
-    config = {
-        "modeling_v2": "require",
-        "block_reuse": True,
-        "mamba_snapshot": {
-            **_SNAPSHOTS,
-            "additional_snapshot_offsets_from_end": [],
-        },
-        "kv_cache_dtype": "auto",
-        "kv_cache_quant": None,
-        "mamba_ssm_cache_dtype": "auto",
-        "mamba_ssm_cache_dtype_resolved": "float32",
-        "cuda_graph": {"batch_sizes": list(_PADDED), "enable_padding": True},
-        "cuda_graph_captured": list(_PADDED),
-        "speculative": None,
-        "max_num_tokens": 8192,
-        "max_batch_size": 128,
-        "max_seq_len": 9216,
-        "chunked_prefill": True,
-        "overlap_scheduler": True,
-        "tp": 1,
-        "pp": 1,
-        "ep": 1,
-        "attention_dp": False,
-    }
-    config.update(changes)
-    return config
-
-
-def _engine_line(config: dict | None = None) -> str:
-    """The engine record a worker-side observer logs for ``config``."""
-    config = _engine_config() if config is None else config
-    record = {
-        "argv": [],
-        "worker": True,
-        "observer": True,
-        "config": config,
-        "sources": dict.fromkeys(config, "worker"),
-        "pools": {"kv_max_tokens": 262144},
-        "memory": {
-            "source": "nvml",
-            "devices": [{"device": "0", "free_mib": 40960.0, "total_mib": 81920.0}],
-        },
-        "errors": {},
-    }
-    return f"{workload_io.ENGINE_MARKER} {json.dumps(record)}\n"
-
-
-def _boot_runner(*outputs: str):
-    seen: list[str] = []
-
-    def run(command, env=None, timeout=0):
-        seen.append(command)
-        return CommandResult(returncode=0, stdout=outputs[min(len(seen), len(outputs)) - 1])
-
-    run.seen = seen  # type: ignore[attr-defined]
-    return run
-
-
-def test_the_acceptance_gate_holds_each_leg_to_its_own_mode(tmp_path):
-    task = _engine_attestation_task(tmp_path, features=["mtp"])
+def test_a_prompt_the_engine_refuses_fails_the_workload_and_the_load_waits_as_declared(tmp_path):
+    task = _reuse_task(tmp_path, features=["mtp"])
     options = {**_OPTIONS, "speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}}
     Path(task["accuracy"]["llm_api_options"]["core"]).write_text(yaml.safe_dump(options))
-    mtp = {"algorithm": "MTP", "max_draft_len": 3}
-    legs = [
-        _engine_line(_engine_config(speculative=mtp)),
-        _engine_line(_engine_config(speculative=mtp, modeling_v2="require")),
-    ]
-    run = _boot_runner(*legs)
-    result = acceptance_checks.run_acceptance_gate(
-        _engine_attestation_env(),
-        task_data=task,
-        runner=run,
-        unit="core",
-        member="tp1",
-        workdir=tmp_path,
-    )
-    assert len(run.seen) == 2 and not result.passed
-    assert result.detail.startswith("the engine of the off leg did not run the declared")
-    assert "modeling_v2: declared off, engine require" in result.detail
-    assert [r["leg"] for r in result.engine] == ["require", "off"]
-
-    # A prompt the engine refuses for its length fails the workload, not the target; a leg
-    # waits as long as the spec gives a slow load.
-    task["accuracy"]["acceptance"] = {**(task["accuracy"].get("acceptance") or {}), "timeout": 3600}
+    task["accuracy"]["acceptance"] = {"timeout": 3600}
     waited = []
 
     def refused(command, env=None, timeout=0):
@@ -1007,87 +767,20 @@ def test_the_acceptance_gate_holds_each_leg_to_its_own_mode(tmp_path):
         return CommandResult(returncode=1, stdout=error)
 
     result = acceptance_checks.run_acceptance_gate(
-        _engine_attestation_env(), task_data=task, runner=refused, unit="core", member="tp1",
+        RunEnvironment(kind="local", python="/py", world_size=1, env={}),
+        task_data=task,
+        runner=refused,
+        unit="core",
+        member="tp1",
         workdir=tmp_path,
-    )  # fmt: skip
+    )
     assert "refused a prompt of 5000 tokens, longer than max_num_tokens 4096" in result.detail
     assert "a property of the workload, not of the target" in result.detail and waited == [3600]
-
-
-_engine_attestation_FAKE_TRTLLM = {
-    "tensorrt_llm/__init__.py": "",
-    "tensorrt_llm/executor/__init__.py": "",
-    "tensorrt_llm/executor/base_worker.py": """
-        import types
-
-
-        class BaseWorker:
-            def __init__(self, llm_args):
-                self.llm_args = llm_args
-                self.rank = 0
-                self.engine = None
-
-            def setup_engine(self):
-                kv = self.llm_args.kv_cache_config
-                state = kv.mamba_state_config
-                # What the model loader does for a hybrid model, here without a word.
-                if not (state.periodic_snapshot_interval
-                        or state.additional_snapshot_offsets_from_start):
-                    kv.enable_block_reuse = False
-                kv.max_gpu_total_bytes = 1 << 30
-                stats = types.SimpleNamespace(max_num_blocks=100, tokens_per_block=32)
-                quant = types.SimpleNamespace(
-                    kv_cache_quant_algo=None, mamba_ssm_cache_dtype="torch.float32")
-                self.engine = types.SimpleNamespace(
-                    model_engine=types.SimpleNamespace(
-                        model=types.SimpleNamespace(
-                            model_config=types.SimpleNamespace(quant_config=quant)),
-                        _cuda_graph_batch_sizes=[1, 2],
-                    ),
-                    kv_cache_manager=types.SimpleNamespace(
-                        enable_block_reuse=kv.enable_block_reuse,
-                        tokens_per_block=32,
-                        get_kv_cache_stats=lambda: stats,
-                    ),
-                )
-    """,
-    "pynvml.py": """
-        import os
-        import types
-
-
-        class NVMLError(Exception):
-            pass
-
-
-        def nvmlInit():
-            pass
-
-
-        def nvmlShutdown():
-            pass
-
-
-        def nvmlDeviceGetCount():
-            return 1
-
-
-        def nvmlDeviceGetHandleByIndex(index):
-            return index
-
-
-        def nvmlDeviceGetMemoryInfo(handle):
-            free = float(os.environ.get("FAKE_FREE_MIB", "40960")) * (1 << 20)
-            return types.SimpleNamespace(free=int(free), total=80 << 30)
-    """,
-}
 
 
 _FAKE_LLM = """
     import os
     import types
-
-    from tensorrt_llm.executor.base_worker import BaseWorker
 
 
     class MambaStateConfig:
@@ -1103,21 +796,11 @@ _FAKE_LLM = """
 
     class KvCacheConfig:
         def __init__(self, **fields):
-            self._stated = set(fields)
             self.enable_block_reuse = fields.get("enable_block_reuse", True)
-            self.dtype = fields.get("dtype", "auto")
-            self.mamba_ssm_cache_dtype = fields.get("mamba_ssm_cache_dtype", "auto")
-            self.free_gpu_memory_fraction = fields.get("free_gpu_memory_fraction", 0.9)
-            self.tokens_per_block = fields.get("tokens_per_block", 32)
             state = fields.get("mamba_state_config") or {}
             if isinstance(state, dict):
                 state = MambaStateConfig(**state)
             self.mamba_state_config = state
-            self.max_gpu_total_bytes = 0
-
-        @property
-        def model_fields_set(self):
-            return self._stated
 
 
     class Tokenizer:
@@ -1149,29 +832,15 @@ _FAKE_LLM = """
 
     class LLM:
         # Resumes a prompt where an earlier one left a recurrent-state snapshot, as a
-        # hybrid engine does; FAKE_REUSE=0 never resumes, FAKE_WORKER=0 sets its worker
-        # up in another process.
+        # hybrid engine does; FAKE_REUSE=0 never resumes.
 
         def __init__(self, model=None, **kw):
             kv = kw.get("kv_cache_config") or KvCacheConfig()
             if isinstance(kv, dict):
                 kv = KvCacheConfig(**kv)
-            parallel = types.SimpleNamespace(
-                tp_size=kw.get("tensor_parallel_size", 1), pp_size=1,
-                moe_ep_size=kw.get("moe_expert_parallel_size") or -1, moe_tp_size=-1,
-                enable_attention_dp=kw.get("enable_attention_dp", False))
-            self.args = types.SimpleNamespace(
-                modeling_v2=kw.get("modeling_v2", "off"), kv_cache_config=kv,
-                cuda_graph_config=kw.get("cuda_graph_config"), speculative_config=None,
-                max_num_tokens=kw.get("max_num_tokens", 8192),
-                max_batch_size=kw.get("max_batch_size", 2048),
-                max_seq_len=kw.get("max_seq_len"),
-                enable_chunked_prefill=kw.get("enable_chunked_prefill", False),
-                disable_overlap_scheduler=False, parallel_config=parallel)
+            self.args = types.SimpleNamespace(kv_cache_config=kv)
             self.tokenizer = Tokenizer()
             self.seen = []
-            if os.environ.get("FAKE_WORKER", "1") == "1":
-                BaseWorker(self.args).setup_engine()
 
         def get_kv_cache_capacity(self):
             return {"maxNumBlocks": 100, "tokensPerBlock": 32, "maxNumTokens": 3200}
@@ -1211,11 +880,9 @@ _FAKE_LLM = """
 def _fake_site(tmp_path: Path) -> tuple[Path, Path]:
     """``(site, repo)``: a fake ``tensorrt_llm`` whose engine reuses, and a tree with its quickstart."""
     site = tmp_path / "site"
-    files = {**_engine_attestation_FAKE_TRTLLM, "tensorrt_llm/__init__.py": _FAKE_LLM}
-    for name, text in files.items():
-        path = site / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(textwrap.dedent(text), encoding="utf-8")
+    path = site / "tensorrt_llm" / "__init__.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(textwrap.dedent(_FAKE_LLM), encoding="utf-8")
     repo = tmp_path / "repo"
     repo.mkdir()
     return site, repo
@@ -1226,142 +893,18 @@ def _real_boot(tmp_path: Path, **env) -> check_result.GateResult:
     environment = RunEnvironment(
         kind="local", python=sys.executable, world_size=1, env={"PYTHONPATH": str(site), **env}
     )
-    task = _engine_attestation_task(tmp_path, trtllm_repo_path=str(repo))
+    task = _reuse_task(tmp_path, trtllm_repo_path=str(repo))
     return boot_checks.run_boot_gate(
         environment, task_data=task, unit="core", member="tp1", workdir=tmp_path / "gates"
     )
 
 
-def test_a_real_boot_fails_on_an_engine_that_reused_nothing(tmp_path):
-    for worker in ("1", "0"):
-        result = _real_boot(tmp_path / worker, FAKE_WORKER=worker, FAKE_REUSE="0")
-        assert not result.passed, result.stdout_tail
-        assert "the engine reused nothing: the reuse probe sent one 320-token prompt" in (
-            result.detail
-        )
-
-
-PARIS = {11: -0.05, 12: -3.2, 13: -4.0}
-
-
-def test_a_flip_inside_the_tie_margin_agrees_and_one_outside_it_is_recorded():
-    tied = {11: -0.70, 12: -0.75}
-    swapped = {11: -0.75, 12: -0.70}
-    assert divergence.first_token_agrees(tied, swapped, 0.15)
-    found = divergence.assess({"p0": PARIS}, {"p0": {12: -0.05, 11: -3.2, 13: -4.0}},
-                              divergence.Bounds())  # fmt: skip
-    assert not found.within and found.top1 == 0.0
-    assert "first token differs" in found.crossed[0]
-    assert 0 < found.max_js <= math.log(2)
-    assert "divergence recorded" in found.describe()
-
-
-def _reference(tmp_path, first_tokens):
-    path = tmp_path / "reference.json"
-    path.write_text(json.dumps({
-        "source": "transformers test", "top_k": 3,
-        "prompts": {"p0": "The capital of France is"},
-        "first_tokens": {"p0": {str(k): v for k, v in first_tokens.items()}},
-    }))  # fmt: skip
-    return {
-        **_gates_TASK,
-        "accuracy": {**_gates_TASK["accuracy"], "reference_logits": {"path": str(path)}},
-    }
-
-
-def _divergence_driver_output(texts, top):
-    lines = []
-    for n, text in enumerate(texts):
-        record = {"index": n, "text": text, "token_ids": [1, 2], "tokens": 2, "iterations": 2}
-        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
-    record = {"index": len(texts), "text": "x", "token_ids": [1], "tokens": 1, "iterations": 1,
-              "top_logprobs": [[[t, lp] for t, lp in top.items()]]}  # fmt: skip
-    lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
-    return "\n".join(lines) + "\n"
-
-
-def test_the_boot_records_a_divergence_and_still_passes(tmp_path):
-    task = _reference(tmp_path, PARIS)
-    texts = ("Paris is the capital", "the way plants make food")
-    run = _gates_recorder(
-        CommandResult(returncode=0, stdout=_divergence_driver_output(texts, PARIS))
-    )
-    result = boot_checks.run_boot_gate(_gates_env(), task_data=task, runner=run, workdir=tmp_path)
-    assert result.passed and not result.warnings
-    assert "against the reference, first tokens agree on 100% of 1 prompt(s)" in result.detail
-    flipped = {12: -0.05, 11: -3.2, 13: -4.0}
-    run = _gates_recorder(
-        CommandResult(returncode=0, stdout=_divergence_driver_output(texts, flipped))
-    )
-    result = boot_checks.run_boot_gate(_gates_env(), task_data=task, runner=run, workdir=tmp_path)
-    assert result.passed, result.detail
-    assert "divergence from the reference recorded" in result.warnings[0]
-    assert "p0 (first token differs" in result.detail
-
-
-def test_an_unreadable_reference_is_unknown_not_a_failure(tmp_path):
-    task = {**_gates_TASK, "accuracy": {**_gates_TASK["accuracy"],
-                                  "reference_logits": {"path": str(tmp_path / "absent.json")}}}  # fmt: skip
-    texts = ("Paris is the capital", "the way plants make food")
-    run = _gates_recorder(
-        CommandResult(returncode=0, stdout=_divergence_driver_output(texts, {})[:-1])
-    )
-    result = boot_checks.run_boot_gate(_gates_env(), task_data=task, runner=run, workdir=tmp_path)
-    assert result.passed and "divergence UNKNOWN" in result.detail
-
-
-_ANCHOR = 92.30
-
-
-_statistical_floor_TASK = {
-    "checkpoint_path": "/ckpt/M",
-    "parallel": "tep4",
-    "trtllm_repo_path": "/repo",
-    "accuracy": {"benchmark": "gsm8k", "reference_yaml": "r.yaml", "tolerance": 5.0},
-}
-
-
-def _verdict(member, measured, reference=_ANCHOR, se=0.734):
-    return check_result.GateResult(
-        name="accuracy[gsm8k]",
-        passed=True,
-        detail="",
-        member=member,
-        measured=measured,
-        reference=reference,
-        se=se,
-    )
-
-
-def test_delivery_refuses_open_findings_first(tmp_path):
-    """Before the delivery report, and as a remediable verdict a relaunch re-enters."""
-    from agent_flow.workflows.trtllm_modeling_v2.run.validation import completion, contract
-
-    wf = _workflow(tmp_path)
-    wf.task_data = {"accuracy": dict(_statistical_floor_TASK["accuracy"])}
-    accuracy_checks.note_systematic_shift(
-        gate_records.records_for(wf.workspace),
-        [_verdict("tep4", 91.0), _verdict("tp4", 91.1)],
-        wf.task_data["accuracy"],
-        "dspark",
-    )
-    closed = []
-    wf._close_run = lambda state, log, verdict: closed.append(verdict)
-    wf._contract = contract.Contract(checks=())
-    wf.environment = SimpleNamespace(world_size=1)
-    wf._target_marker = lambda: ""
-    verdict = contract.evaluate(wf._contract, wf._contract_status(), marker="")
-    assert (
-        completion.run_deliver_phase(
-            wf,
-            SimpleNamespace(units_done=["core"]),
-            None,
-            lambda files: completion.assess(verdict, files=files),
-        )
-        is False
-    )
-    assert closed == ["delivery-failed:findings"]
-    assert "delivery blocked" in wf.journal.path.read_text(encoding="utf-8")
+def test_a_real_boot_fails_only_on_an_engine_that_reused_nothing(tmp_path):
+    reused = _real_boot(tmp_path / "reused")
+    assert reused.passed, reused.detail + reused.stdout_tail
+    result = _real_boot(tmp_path / "nothing", FAKE_REUSE="0")
+    assert not result.passed, result.stdout_tail
+    assert "the engine reused nothing: the reuse probe sent one 320-token prompt" in result.detail
 
 
 def _spec(tmp_path) -> dict:
@@ -1495,23 +1038,6 @@ def test_an_attention_dp_rank_serves_its_share_of_the_global_batch():
     }
 
 
-def test_the_stock_leg_is_asked_once_per_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: "t")
-    task = _acceptance_gate_task(dspark={"min_absolute": 1.5, "floor_source": "a measured drafter"})
-    rates = [2.6 + 0.5 * math.sin(i) for i in range(32)]
-    records = GateRecords(tmp_path / "gate_results.jsonl")
-    common = dict(task_data=task, records=records, unit="dspark", workdir=tmp_path / "w")
-    first = _acceptance_gate_legs(_acceptance_gate_driver_output(rates))
-    ran = acceptance_checks.run_acceptance_gate(_acceptance_gate_env(), runner=first, **common)
-    assert ran.passed, ran.detail
-    assert any("=off" in cmd for cmd in first.seen)
-    assert records.all(KIND_STOCK_UNAVAILABLE)
-    again = _acceptance_gate_legs(_acceptance_gate_driver_output(rates))
-    result = acceptance_checks.run_acceptance_gate(_acceptance_gate_env(), runner=again, **common)
-    assert result.passed and not any("=off" in cmd for cmd in again.seen)
-    assert "not run again" in result.detail
-
-
 class _Delivery:
     def __init__(self, tmp_path: Path, head: str = "c0ffee1234567890"):
         self.task_data = {"trtllm_repo_path": str(tmp_path)}
@@ -1547,8 +1073,8 @@ def test_delivery_runs_the_delivered_tests_at_head_and_holds_on_their_passing(
         results.tests[f"{test}::test_a"] = {"outcome": "passed"}
         return results, 1, 0, ""
 
-    monkeypatch.setattr(regression, "job_runner", lambda workflow, name: (None, None, "python"))
-    monkeypatch.setattr(regression, "record_at", record_at)
+    monkeypatch.setattr(test_jobs, "job_runner", lambda workflow, name: (None, None, "python"))
+    monkeypatch.setattr(test_jobs, "record_at", record_at)
     check = delivered_tests(stage, report, run=True)
     assert check.passed and jobs == [("c0ffee1234567890", [test])]
     heads = iter(["c0ffee1234567890", "a-new-head"])
@@ -1595,25 +1121,6 @@ def _git(repo: Path, *args: str, env: dict | None = None) -> str:
     return done.stdout.strip()
 
 
-def _commit(repo: Path, base: str, changes: dict[str, str], message: str = "change") -> str:
-    """A commit on ``base`` with ``changes``, made without touching the checkout."""
-    index = repo / ".git" / f"index-{abs(hash(message)) % 10**8}"
-    env = {"GIT_INDEX_FILE": str(index)}
-    _git(repo, "read-tree", base, env=env)
-    for path, content in changes.items():
-        blob = subprocess.run(
-            ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
-            input=content,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        _git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=env)
-    tree = _git(repo, "write-tree", env=env)
-    index.unlink(missing_ok=True)
-    return _git(repo, "commit-tree", tree, "-p", base, "-m", message)
-
-
 def _run(command: str) -> tuple[int, str]:
     # pytest-timeout is not a test dependency here.
     done = subprocess.run(
@@ -1622,248 +1129,18 @@ def _run(command: str) -> tuple[int, str]:
     return done.returncode, done.stdout + done.stderr
 
 
-def _regression_repo(root: Path) -> tuple[Path, Path, str]:
-    """A repository whose base commit's ``test_a`` and ``test_b`` are recorded, and the workspace."""
-    repo, workspace = root / "repo", root / "ws"
-    files = {
-        "pkg/__init__.py": "",
-        "pkg/mod.py": "def f():\n    return 1\n",
-        "tests/test_a.py": "from pkg.mod import f\n\n\ndef test_f():\n    assert f() == 1\n",
-        "tests/test_b.py": "def test_alone():\n    assert True\n",
-        "tests/test_broken.py": "def test_broken():\n    assert False, 'broken before the run'\n",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    cache = workspace / tc.CACHE_DIRNAME
-    _run(f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} tests/test_a.py "
-         "tests/test_b.py -- -q -p no:cacheprovider")  # fmt: skip
-    # The last check cleared the base: the next one compares against it.
-    handoff_mod.write(
-        workspace / "tasks",
-        {"task": "regression", "kind": "check", "cleared": base, "written_at": "1"},
-    )
-    return repo, workspace, base
-
-
-def _check(repo: Path, workspace: Path, head: str, root: Path):
-    ran = []
-
-    @contextlib.contextmanager
-    def tree_at(commit):
-        tree = root / f"tree-{commit[:8]}-{len(ran)}"
-        _git(repo, "worktree", "add", "-q", "--detach", str(tree), commit)
-        try:
-            yield tree
-        finally:
-            _git(repo, "worktree", "remove", "--force", str(tree))
-
-    def run_job(command, tree, timeout_s=None):
-        ran.append(command)
-        return _run(command)
-
-    result = regression.run_regression_check(
-        workspace=workspace,
-        repo=repo,
-        head=head,
-        tree_at=tree_at,
-        run_job=run_job,
-        python=sys.executable,
-        name="regression-2",
-        paths=["tests"],
-    )
-    return result, ran
-
-
-@_requires_git
-def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
-    tmp_path, monkeypatch
-):
-    repo, workspace, base = _regression_repo(tmp_path)
-    monkeypatch.setenv("TRTLLM_TEST_CACHE_ENV", "A")
-    first, _ = _check(repo, workspace, base, tmp_path)
-    assert first.verdict == "CLEAN"
-    a = tc.recorded(workspace / tc.CACHE_DIRNAME, base).env_digest
-    monkeypatch.setenv("TRTLLM_TEST_CACHE_ENV", "B")
-    second, ran = _check(repo, workspace, base, tmp_path)
-    assert second.verdict == "CLEAN" and len(ran) == 2
-    assert tc.recorded(workspace / tc.CACHE_DIRNAME, base).env_digest != a
-    results, jobs, code, tail = regression.record_at(
-        base,
+def test_a_failed_environment_probe_returns_no_results(tmp_path):
+    results, jobs, code, tail = test_jobs.record_at(
+        "c0ffee1234567890",
         ["tests/test_a.py"],
-        cache_dir=workspace / tc.CACHE_DIRNAME,
+        cache_dir=tmp_path / "cache",
         out=tmp_path / "failed-probe",
-        tree_at=lambda commit: contextlib.nullcontext(repo),
+        tree_at=lambda commit: contextlib.nullcontext(tmp_path),
         run_job=lambda command, tree, timeout_s=None: (1, "unavailable"),
         python=sys.executable,
     )
     assert not results.env_digest and results.unrun(["tests/test_a.py"])
     assert jobs == 0 and code == 1 and "environment probe failed" in tail
-
-
-@_requires_git
-def test_a_test_that_fails_at_the_base_is_not_run_at_a_later_head(tmp_path):
-    """Kimi-K3's 4-GPU cases time out at the base too: each head paid 54 min for no signal."""
-    repo, workspace, base = _regression_repo(tmp_path)
-    cache = workspace / tc.CACHE_DIRNAME
-    _run(f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} tests/test_broken.py "
-         "-- -q -p no:cacheprovider")  # fmt: skip
-    (repo / "pkg" / "mod.py").write_text(
-        "def f():\n    return 1  # same answer\n", encoding="utf-8"
-    )
-    _git(repo, "commit", "-qam", "shared change")
-    head = _git(repo, "rev-parse", "HEAD")
-
-    result, ran = _check(repo, workspace, head, tmp_path)
-
-    assert result.verdict == "CLEAN", result.failures
-    assert "1 test(s) failing at the base not run" in result.scope
-    at_head = tc.recorded(cache, head)
-    assert at_head.result("tests/test_a.py::test_f").outcome == "passed"
-    assert at_head.result("tests/test_broken.py::test_broken") is None
-    assert len(ran) == 2, "the probe and one test job at the head; nothing at the base"
-
-
-@_requires_git
-def test_a_change_reaches_the_tests_that_import_it_through_other_files(tmp_path):
-    """``catalog/_op.py`` reaches a test through the entry that imports it, or the helper that does."""
-    repo = tmp_path / "repo"
-    catalog, tests = regression.CATALOG_DIR, regression.CATALOG_TESTS_DIR
-    dotted = catalog.replace("/", ".")
-    files = {
-        f"{catalog}/_op.py": "class OpWrapper:\n    pass\n",
-        f"{catalog}/gemm/mm.py": "from .._op import OpWrapper\n",
-        f"{catalog}/norm/rms.py": "X = 1\n",
-        f"{tests}/_validating.py": f"from {dotted}._op import OpWrapper\n",
-        f"{tests}/gemm/test_mm.py": f"from {dotted}.gemm import mm\n",
-        f"{tests}/norm/test_rms.py": f"from _validating import validating\nfrom {dotted}.norm.rms import X\n",
-        f"{tests}/norm/test_untouched.py": f"from {dotted}.norm.rms import X\n",
-        # A rank matrix the test starts by file path, through a launcher it imports.
-        f"{tests}/comm/_rank_job.py": "import subprocess\n",
-        f"{tests}/comm/_mm_matrix.py": f"def body():\n    from {dotted}.gemm import mm\n",
-        f"{tests}/comm/test_mm_matrix.py": "import _rank_job\n",
-        f"{tests}/test_modeling_v2_claims.py": "",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    listed = sorted(p for p in files if "/test_" in p)
-    head = _commit(repo, base, {f"{catalog}/_op.py": "class OpWrapper:\n    x = 1\n"})
-    picked, why = regression.affected_files(repo, base, head, listed)
-    assert picked == [
-        f"{tests}/comm/test_mm_matrix.py",
-        f"{tests}/gemm/test_mm.py",
-        f"{tests}/norm/test_rms.py",
-        f"{tests}/test_modeling_v2_claims.py",
-    ]
-    assert why == "4 of 5 test files reach what changed"
-
-
-@_requires_git
-def test_a_target_init_reaches_its_importers_and_integration_changes_reach_none(tmp_path):
-    """A target's ``__init__.py`` reaches the tests importing its modules, not the package."""
-    repo = tmp_path / "repo"
-    models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
-    dotted = models.replace("/", ".")
-    files = {
-        f"{models}/fam/__init__.py": "",
-        f"{models}/fam/tgt/__init__.py": '"""A target."""\n',
-        f"{models}/fam/tgt/modeling.py": "X = 1\n",
-        f"{models}/other/__init__.py": "",
-        f"{models}/other/tgt/__init__.py": "",
-        f"{models}/other/tgt/modeling.py": "Y = 1\n",
-        f"{tests}/models/fam/tgt/test_modeling.py": f"import {dotted}.fam.tgt.modeling\n",
-        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
-        f"{tests}/test_modeling_v2_claims.py": "",
-        "tests/integration/defs/test_fam.py": "Z = 1\n",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    listed = sorted(p for p in files if p.startswith(tests) and "/test_" in p)
-    head = _commit(
-        repo,
-        base,
-        {
-            f"{models}/fam/tgt/__init__.py": '"""The target."""\n',
-            f"{tests}/models/fam/tgt/__init__.py": "",
-        },
-    )
-    picked, why = regression.affected_files(repo, base, head, listed)
-    assert picked == [
-        f"{tests}/models/fam/tgt/test_modeling.py",
-        f"{tests}/test_modeling_v2_claims.py",
-    ]
-    assert why == "2 of 3 test files reach what changed"
-    only_integration = _commit(repo, head, {"tests/integration/defs/test_fam.py": "Z = 2\n"})
-    picked, why = regression.affected_files(repo, head, only_integration, listed)
-    assert picked == [f"{tests}/test_modeling_v2_claims.py"]
-    assert "no unit test reaches what changed" in why
-    shared = _commit(repo, only_integration, {f"{models}/__init__.py": "W = 1\n"})
-    picked, why = regression.affected_files(repo, only_integration, shared, listed)
-    assert picked == listed and "is shared by the package" in why
-
-
-@_requires_git
-def test_a_target_imported_in_a_function_reaches_its_routing_tests_not_the_package(tmp_path):
-    """``models/__init__`` imports every routing; a routing imports its targets when called."""
-    repo = tmp_path / "repo"
-    models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
-    dotted = models.replace("/", ".")
-    files = {
-        f"{models}/__init__.py": "from .fam import routing\nfrom .other import routing as o\n",
-        f"{models}/fam/__init__.py": "",
-        f"{models}/fam/routing.py": (
-            "import torch\n\n\ndef pick():\n    from .tgt.modeling import Model\n    return Model\n"
-        ),
-        f"{models}/fam/tgt/__init__.py": "",
-        f"{models}/fam/tgt/modeling.py": "class Model:\n    pass\n",
-        f"{models}/other/__init__.py": "",
-        f"{models}/other/routing.py": "X = 1\n",
-        f"{models}/other/tgt/__init__.py": "",
-        f"{models}/other/tgt/modeling.py": "Y = 1\n",
-        f"{tests}/models/fam/test_routing.py": f"from {dotted}.fam import routing\n",
-        f"{tests}/models/fam/tgt/test_modeling.py": f"from {dotted}.fam.tgt.modeling import Model\n",
-        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
-        f"{tests}/test_modeling_v2_claims.py": "",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    listed = sorted(p for p in files if p.startswith(tests) and "/test_" in p)
-    head = _commit(repo, base, {f"{models}/fam/tgt/modeling.py": "class Model:\n    x = 1\n"})
-    picked, why = regression.affected_files(repo, base, head, listed)
-    assert picked == [
-        f"{tests}/models/fam/test_routing.py",
-        f"{tests}/models/fam/tgt/test_modeling.py",
-        f"{tests}/test_modeling_v2_claims.py",
-    ]
-    assert why == "3 of 4 test files reach what changed"
 
 
 @_requires_git
@@ -1892,7 +1169,292 @@ def test_a_module_that_skips_itself_on_import_has_a_result_not_a_hole(tmp_path):
     assert results.unrun(["tests/test_other_arch.py"]) == []
     skip = results.result("tests/test_other_arch.py")
     assert skip.outcome == "skipped" and "sm_100 only" in skip.message
-    report = tc.compare(
-        results, results, ["tests/test_other_arch.py"], ["tests/test_other_arch.py"]
+
+
+def test_a_unit_that_drafts_with_an_earlier_units_drafter_is_held_to_its_floor():
+    resolve = acceptance_checks.resolve_acceptance_floor_spec
+    accuracy = {"acceptance": {"mtp": {"min_absolute": 1.5}}}
+    # `multimodal` comes after `mtp` and runs its drafter: mtp's floor holds it.
+    assert resolve(accuracy, "multimodal", ["mtp", "multimodal"]).value == 1.5
+    assert resolve(accuracy, "multimodal", ["multimodal"]) is None
+    accuracy["acceptance"]["multimodal"] = 1.8
+    assert resolve(accuracy, "multimodal", ["mtp", "multimodal"]).value == 1.8
+
+
+_LAYOUT_PACKAGE = "tensorrt_llm/_torch/modeling_v2"
+_LAYOUT_TESTS = "tests/unittest/_torch/modeling_v2"
+_LAYOUT_TARGET = f"{_LAYOUT_PACKAGE}/models/layout_family/layout_target"
+_SHARED_MOE_ENTRIES = (
+    "fp4_block_scale_moe_runner",
+    "mxe4m3_mxe2m1_block_scale_moe_runner",
+    "noaux_tc_op",
+)
+
+
+@pytest.mark.parametrize("layout", ["moe/ops", "moe"])
+def test_shared_moe_test_layout_paths_and_delivery(tmp_path: Path, layout: str) -> None:
+    name = "fp4_block_scale_moe_runner"
+    source = f"{_LAYOUT_PACKAGE}/catalog/moe/{name}.py"
+    test = f"{_LAYOUT_TESTS}/{layout}/test_modeling_v2_{name}.py"
+    _write_entry(tmp_path / source, tmp_path / test)
+    model = tmp_path / _LAYOUT_TARGET / "modeling.py"
+    model.parent.mkdir(parents=True)
+    model.write_text(
+        f"from tensorrt_llm._torch.modeling_v2.catalog.moe.{name} import Entry\n",
+        encoding="utf-8",
     )
-    assert report.verdict == "CLEAN" and report.not_run == []
+
+    assert catalog_paths.shared_entry_paths(f"moe/{name}", tmp_path) == (source, test)
+    assert catalog_paths.is_entry_file(test, f"moe/{name}")
+    [check] = delivery.check_catalog_tests(tmp_path, [("moe", name)])
+    assert check.passed, check.detail
+    assert check.detail == str(tmp_path / test)
+    checks = delivery._dependency_checks(tmp_path, _LAYOUT_TARGET)
+    assert checks and all(c.passed for c in checks), checks
+    assert any(c.detail == str(tmp_path / test) for c in checks)
+
+
+def test_shared_moe_mixed_layout_resolves_each_entry_separately(tmp_path: Path) -> None:
+    expected: dict[str, str] = {}
+    for index, name in enumerate(_SHARED_MOE_ENTRIES):
+        layout = "moe" if index == 1 else "moe/ops"
+        test = f"{_LAYOUT_TESTS}/{layout}/test_modeling_v2_{name}.py"
+        source = f"{_LAYOUT_PACKAGE}/catalog/moe/{name}.py"
+        _write_entry(tmp_path / source, tmp_path / test)
+        expected[name] = test
+    duplicate = tmp_path / _LAYOUT_TESTS / f"moe/test_modeling_v2_{_SHARED_MOE_ENTRIES[0]}.py"
+    duplicate.write_text("def test_without_cells() -> None:\n    pass\n", encoding="utf-8")
+
+    for name, test in expected.items():
+        assert catalog_paths.shared_entry_paths(f"moe/{name}", tmp_path)[1] == test
+        [check] = delivery.check_catalog_tests(tmp_path, [("moe", name)])
+        assert check.passed and check.detail == str(tmp_path / test), check
+    other_source = f"{_LAYOUT_PACKAGE}/catalog/gemm/dense.py"
+    other_test = f"{_LAYOUT_TESTS}/gemm/test_modeling_v2_dense.py"
+    _write_entry(tmp_path / other_source, tmp_path / other_test)
+    assert catalog_paths.shared_entry_paths("gemm/dense", tmp_path) == (other_source, other_test)
+    assert delivery.check_catalog_tests(tmp_path, [("gemm", "dense")])[0].passed
+
+
+@pytest.mark.parametrize("owner", ["family", "target"])
+@pytest.mark.parametrize("category", ["moe", "comm"])
+@pytest.mark.parametrize("mirrored", [False, True], ids=["category_dir", "ops_dir"])
+def test_model_op_test_layout_preserves_owner_and_category(
+    tmp_path: Path, owner: str, category: str, mirrored: bool
+) -> None:
+    owner_tail = "models/layout_family" + ("/layout_target" if owner == "target" else "")
+    owner_rel = f"{_LAYOUT_PACKAGE}/{owner_tail}"
+    source = f"{owner_rel}/ops/{category}/probe.py"
+    component = f"ops/{category}" if mirrored else category
+    test = f"{_LAYOUT_TESTS}/{owner_tail}/{component}/test_modeling_v2_probe.py"
+    _write_entry(tmp_path / source, tmp_path / test)
+    model = tmp_path / _LAYOUT_TARGET / "modeling.py"
+    model.parent.mkdir(parents=True, exist_ok=True)
+    relative_import = "." if owner == "target" else ".."
+    model.write_text(f"from {relative_import}ops.{category}.probe import Entry\n", encoding="utf-8")
+    item = catalog_paths.QueueItem(n=1, mode="verify", target=f"ops/{category}/probe")
+
+    assert catalog_paths.model_ops_tests_dir(owner_rel) == f"{_LAYOUT_TESTS}/{owner_tail}"
+    assert catalog_paths.entry_paths(item, owner_rel, tmp_path) == (source, test)
+    assert catalog_paths.is_entry_file(test, item.target)
+    [check] = delivery.check_model_op_tests(
+        tmp_path, owner_rel, [(Path(owner_rel).name, category, "probe")]
+    )
+    assert check.passed and check.detail == str(tmp_path / test), check
+    checks = delivery._dependency_checks(tmp_path, _LAYOUT_TARGET)
+    assert checks and all(c.passed for c in checks), checks
+    assert any(c.detail == str(tmp_path / test) for c in checks)
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["target", "shared"])
+@pytest.mark.parametrize("mirrored", [False, True], ids=["category_dir", "ops_dir"])
+def test_op_matrix_layout_retains_collected_launcher_and_rank_body(
+    tmp_path: Path, shared: bool, mirrored: bool
+) -> None:
+    category = "moe" if shared else "comm"
+    if shared:
+        source = f"{_LAYOUT_PACKAGE}/catalog/moe/probe.py"
+        tests = f"{_LAYOUT_TESTS}/moe" + ("/ops" if mirrored else "")
+    else:
+        source = f"{_LAYOUT_TARGET}/ops/comm/probe.py"
+        tests = f"{_LAYOUT_TESTS}/models/layout_family/layout_target/"
+        tests += "ops/comm" if mirrored else "comm"
+    launcher = f"{tests}/test_modeling_v2_probe_op_matrix.py"
+    rank_body = f"{tests}/_probe_op_matrix.py"
+    _write_entry(tmp_path / source, tmp_path / rank_body)
+    (tmp_path / launcher).write_text("def test_matrix() -> None:\n    pass\n", encoding="utf-8")
+
+    if shared:
+        paths = catalog_paths.shared_entry_paths("moe/probe", tmp_path)
+        checks = delivery.check_catalog_tests(tmp_path, [(category, "probe")])
+    else:
+        item = catalog_paths.QueueItem(n=1, mode="verify", target="ops/comm/probe")
+        paths = catalog_paths.entry_paths(item, _LAYOUT_TARGET, tmp_path)
+        checks = delivery.check_model_op_tests(
+            tmp_path, _LAYOUT_TARGET, [("layout_target", category, "probe")]
+        )
+    assert paths == (source, launcher, rank_body)
+    assert len(checks) == 1 and checks[0].passed, checks
+    assert checks[0].detail == str(tmp_path / launcher)
+    assert catalog_paths.is_entry_file(launcher, f"{'moe' if shared else 'ops/comm'}/probe")
+    assert catalog_paths.is_entry_file(rank_body, f"{'moe' if shared else 'ops/comm'}/probe")
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["target", "shared"])
+@pytest.mark.parametrize("defect", ["rank-body-only", "no-cells"])
+def test_new_test_layout_does_not_accept_missing_or_unexercised_tests(
+    tmp_path: Path, shared: bool, defect: str
+) -> None:
+    if shared:
+        source = f"{_LAYOUT_PACKAGE}/catalog/moe/probe.py"
+        tests = f"{_LAYOUT_TESTS}/moe/ops"
+        imported = "tensorrt_llm._torch.modeling_v2.catalog.moe.probe"
+    else:
+        source = f"{_LAYOUT_TARGET}/ops/moe/probe.py"
+        tests = f"{_LAYOUT_TESTS}/models/layout_family/layout_target/ops/moe"
+        imported = ".ops.moe.probe"
+    filename = "_probe_op_matrix.py" if defect == "rank-body-only" else "test_modeling_v2_probe.py"
+    test = tmp_path / tests / filename
+    _write_entry(tmp_path / source, test)
+    if defect == "no-cells":
+        test.write_text("def test_without_cells() -> None:\n    pass\n", encoding="utf-8")
+    model = tmp_path / _LAYOUT_TARGET / "modeling.py"
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_text(f"from {imported} import Entry\n", encoding="utf-8")
+
+    checks = (
+        delivery.check_catalog_tests(tmp_path, [("moe", "probe")])
+        if shared
+        else delivery.check_model_op_tests(
+            tmp_path, _LAYOUT_TARGET, [("layout_target", "moe", "probe")]
+        )
+    )
+    assert len(checks) == 1 and not checks[0].passed, checks
+    expected = "missing:" if defect == "rank-body-only" else "never reads the entry's .CELLS"
+    assert expected in checks[0].detail
+    dependency_failures = [
+        check for check in delivery._dependency_checks(tmp_path, _LAYOUT_TARGET) if not check.passed
+    ]
+    assert len(dependency_failures) == 1, dependency_failures
+    assert expected in dependency_failures[0].detail
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (f"{_LAYOUT_TESTS}/moe/ops/test_modeling_v2_probe.py", True),
+        (f"{_LAYOUT_TESTS}/moe/test_modeling_v2_probe.py", True),
+        (f"{_LAYOUT_TESTS}/gemm/ops/test_modeling_v2_probe.py", False),
+        (
+            f"{_LAYOUT_TESTS}/models/layout_family/layout_target/ops/moe/test_modeling_v2_probe.py",
+            False,
+        ),
+        (
+            f"{_LAYOUT_TESTS}/models/layout_family/layout_target/moe/ops/test_modeling_v2_probe.py",
+            False,
+        ),
+    ],
+)
+def test_shared_moe_entry_file_boundary(path: str, expected: bool) -> None:
+    assert catalog_paths.is_entry_file(path, "moe/probe") is expected
+
+
+@pytest.mark.parametrize("component", ["comm", "ops/comm"])
+def test_new_model_op_uses_existing_component_directory(tmp_path: Path, component: str) -> None:
+    tests = f"{_LAYOUT_TESTS}/models/layout_family/layout_target/{component}"
+    existing = tmp_path / tests / "test_modeling_v2_existing_op_matrix.py"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("def test_existing(): pass\n", encoding="utf-8")
+    item = catalog_paths.QueueItem(n=1, mode="verify", target="ops/comm/new_collective")
+    expected = f"{tests}/test_modeling_v2_new_collective.py"
+    assert catalog_paths.entry_paths(item, _LAYOUT_TARGET, tmp_path)[1] == expected
+    [check] = delivery.check_model_op_tests(
+        tmp_path, _LAYOUT_TARGET, [("layout_target", "comm", "new_collective")]
+    )
+    assert not check.passed and check.detail == f"missing: {expected}"
+    _write_entry(tmp_path / _LAYOUT_TARGET / "ops/comm/new_collective.py", tmp_path / expected)
+    [check] = delivery.check_model_op_tests(
+        tmp_path, _LAYOUT_TARGET, [("layout_target", "comm", "new_collective")]
+    )
+    assert check.passed and check.detail == str(tmp_path / expected)
+
+
+@pytest.mark.parametrize("owner", ["shared", "family", "target"])
+def test_new_moe_entry_uses_contract_directory(tmp_path: Path, owner: str) -> None:
+    name = "new_probe"
+    owner_rel = ""
+    tests_base = _LAYOUT_TESTS
+    if owner != "shared":
+        owner_tail = "models/layout_family" + ("/layout_target" if owner == "target" else "")
+        owner_rel = f"{_LAYOUT_PACKAGE}/{owner_tail}"
+        tests_base = f"{_LAYOUT_TESTS}/{owner_tail}"
+    old_dir = tmp_path / tests_base / "moe"
+    old_dir.mkdir(parents=True)
+    (old_dir / "test_modeling_v2_existing.py").write_text(
+        "def test_existing(): pass\n", encoding="utf-8"
+    )
+    tests_dir = f"{tests_base}/ops/moe" if owner_rel else f"{tests_base}/moe/ops"
+    expected = f"{tests_dir}/test_modeling_v2_{name}.py"
+
+    if owner_rel:
+        source = f"{owner_rel}/ops/moe/{name}.py"
+        item = catalog_paths.QueueItem(n=1, mode="verify", target=f"ops/moe/{name}")
+        paths = catalog_paths.entry_paths(item, owner_rel, tmp_path)
+        [check] = delivery.check_model_op_tests(
+            tmp_path, owner_rel, [(Path(owner_rel).name, "moe", name)]
+        )
+    else:
+        source = f"{_LAYOUT_PACKAGE}/catalog/moe/{name}.py"
+        paths = catalog_paths.shared_entry_paths(f"moe/{name}", tmp_path)
+        [check] = delivery.check_catalog_tests(tmp_path, [("moe", name)])
+    assert paths == (source, expected)
+    assert not check.passed and check.detail == f"missing: {expected}"
+
+    _write_entry(tmp_path / source, tmp_path / expected)
+    if owner_rel:
+        [check] = delivery.check_model_op_tests(
+            tmp_path, owner_rel, [(Path(owner_rel).name, "moe", name)]
+        )
+    else:
+        [check] = delivery.check_catalog_tests(tmp_path, [("moe", name)])
+    assert check.passed and check.detail == str(tmp_path / expected)
+
+
+def test_shared_moe_matrix_variant_keeps_launcher_and_rank_body(tmp_path: Path) -> None:
+    tests = tmp_path / _LAYOUT_TESTS / "moe/ops"
+    tests.mkdir(parents=True)
+    for name in ("test_modeling_v2_probe_op_matrix.py", "_probe_op_matrix.py"):
+        (tests / name).write_text("# Matrix entry.\n", encoding="utf-8")
+    item = catalog_paths.queue_item_from_ref("verify:moe/probe@site", "matrix_probe")
+    assert item is not None and item.variant is not None
+    name = item.variant.rsplit("/", 1)[-1]
+    target_tests = f"{_LAYOUT_TESTS}/models/layout_family/layout_target/ops/moe"
+    (tmp_path / _LAYOUT_TESTS / "models/layout_family/layout_target/moe").mkdir(parents=True)
+    assert catalog_paths.entry_paths(item, _LAYOUT_TARGET, tmp_path) == (
+        f"{_LAYOUT_TARGET}/{item.variant}.py",
+        f"{target_tests}/test_modeling_v2_{name}_op_matrix.py",
+        f"{target_tests}/_{name}_op_matrix.py",
+    )
+
+
+def test_dflash_keeps_the_speculative_config_its_options_declare(tmp_path):
+    task = _reuse_task(tmp_path, features=["dflash"])
+    drafter = {"decoding_type": "DFlash", "max_draft_len": 3, "speculative_model": "/drafter"}
+    Path(task["accuracy"]["llm_api_options"]["core"]).write_text(
+        yaml.safe_dump({**_OPTIONS, "speculative_config": drafter}), encoding="utf-8"
+    )
+    config = check_config.check_configuration(
+        task,
+        RunEnvironment(kind="local", python="/py", world_size=1, env={}),
+        unit="core",
+        features=["dflash"],
+        max_tokens=8,
+        member="tp1",
+    )
+    # Before, a dflash unit fell through to `speculative_config: None`: the engine ran with
+    # no drafter, and the acceptance gate measured nothing it asked for.
+    assert config["llm"]["speculative_config"] == drafter
+    assert check_config.speculation_flags(["dflash"], max_draft_len=3) == [
+        "--spec_decode_algo=DFlash",
+        "--spec_decode_max_draft_len=3",
+    ]

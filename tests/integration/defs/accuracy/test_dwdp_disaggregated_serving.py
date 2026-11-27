@@ -25,7 +25,7 @@ import requests
 import yaml
 
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import get_ucx_tls
+from defs.common import single_host_ucx_env
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
@@ -73,8 +73,9 @@ def launch_dwdp_disaggregated_llm(
     child_env = {
         k: v for k, v in os.environ.items() if not k.startswith(("OMPI_", "PMIX_", "PMI_"))
     }
-    # Override host MPI transport restrictions without changing the parent environment.
-    child_env["UCX_TLS"] = get_ucx_tls()
+    # Every rank and the frontend run on this host. Replace the inherited UCX
+    # settings in the child environment only.
+    child_env.update(single_host_ucx_env())
 
     mpi_cmd = [
         "mpirun",
@@ -225,7 +226,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
             "dwdp_config": {
                 "dwdp_size": 2,
@@ -256,7 +257,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
         }
 
@@ -338,7 +339,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
             "dwdp_config": {
                 "dwdp_size": 2,
@@ -370,7 +371,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
         }
 
@@ -471,7 +472,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
             "dwdp_config": {
                 "dwdp_size": 2,
@@ -506,7 +507,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
         }
 

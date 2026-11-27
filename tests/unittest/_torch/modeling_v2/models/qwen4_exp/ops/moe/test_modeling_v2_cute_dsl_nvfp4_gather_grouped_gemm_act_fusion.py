@@ -14,7 +14,9 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (  # noqa: E501
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (  # noqa: E501
     E2M1,
     E2M1_MAX,
     GATE_UP_GROUP,
@@ -23,10 +25,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.cute
     e4m3_value,
     unswizzle,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (  # noqa: E501
     cute_dsl_nvfp4_gather_grouped_gemm_act_fusion as op,
 )
-from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.utils import ActivationType
 
 __extra_import_path__ = ["../../../.."]
@@ -318,6 +319,12 @@ def _cell_id(cell):
 
 
 # ── the certified cells ───────────────────────────────────────────────────
+
+pytestmark = pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not archs.fast_path("cute_dsl_moe", torch.cuda.get_device_capability()),
+    reason="the CuTe DSL MoE does not run on this GPU",
+)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[_cell_id(c) for c in op.CELLS])

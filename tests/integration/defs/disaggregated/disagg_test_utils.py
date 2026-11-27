@@ -31,6 +31,8 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
+from defs.common import single_host_ucx_env
+from defs.conftest import is_sm_100f
 
 from tensorrt_llm.logger import logger
 
@@ -39,6 +41,47 @@ HEARTBEAT_INTERVAL = 1
 INACTIVE_TIMEOUT = 2
 # Check cluster status with a larger interval than inactive timeout to avoid flaky tests
 CHECK_STATUS_INTERVAL = 3
+
+# Readiness budgets for a disaggregated cluster when the caller passes none.
+# Pipeline parallelism on the SM100 family (SM100/SM103/SM107) enables the
+# CuTe DSL BF16 GEMM/BMM (see TorchLlmArgs.validate_cute_dsl_bf16), whose
+# autotuning JIT-compiles kernels on every rank. With cold caches, readiness of
+# the Qwen3-0.6B PP configurations then takes 350-650s on 4-8 Blackwell or
+# Rubin GPUs. Other GPUs keep the default, so a PP cluster that never comes up
+# there still fails after 300s.
+DEFAULT_SERVER_START_TIMEOUT = 300
+PP_DISAGG_SERVER_START_TIMEOUT = 900
+
+
+def _uses_pipeline_parallelism(config: dict) -> bool:
+    """Whether the context or generation workers of a disagg config run with PP > 1.
+
+    A server section without its own ``pipeline_parallel_size`` inherits the
+    top-level value, as in ``build_worker_config``.
+    """
+    top_level_pp = config.get("pipeline_parallel_size", 1)
+    return any(
+        (config.get(servers) or {}).get("pipeline_parallel_size", top_level_pp) > 1
+        for servers in ("context_servers", "generation_servers")
+    )
+
+
+def resolve_server_start_timeout(
+    config: dict, server_start_timeout: int | None, sm_version: int | None = None
+) -> int:
+    """Return the readiness budget for a disagg config.
+
+    An explicit ``server_start_timeout`` wins. Otherwise a config whose context
+    or generation workers use pipeline parallelism gets
+    ``PP_DISAGG_SERVER_START_TIMEOUT`` on an SM100-family GPU, and every other
+    case gets ``DEFAULT_SERVER_START_TIMEOUT``. ``sm_version`` defaults to the
+    local GPU's.
+    """
+    if server_start_timeout is not None:
+        return server_start_timeout
+    if _uses_pipeline_parallelism(config) and is_sm_100f(sm_version):
+        return PP_DISAGG_SERVER_START_TIMEOUT
+    return DEFAULT_SERVER_START_TIMEOUT
 
 
 class ProcessWrapper:
@@ -105,7 +148,8 @@ def _run_worker(
         work_dir: Working directory for config files
         device: CUDA device ID (-1 for default)
         save_log: Whether to save logs to file
-        env: Environment variables for the subprocess
+        env: Environment variables for the subprocess. single_host_ucx_env()
+            replaces its UCX_TLS and UCX_NET_DEVICES.
         worker_index: Index used for log/config filenames (avoids collisions when
             multiple workers share port=0)
 
@@ -140,6 +184,9 @@ def _run_worker(
         # (nvbugs/6888251). Tests only need the tier to exist, so use 4 KiB
         # pages unless the caller asks for THP.
         env.setdefault("TLLM_KV_CACHE_MANAGER_V2_THP", "0")
+        # Every worker started here serves on localhost, so its UCX peers all
+        # run on this host.
+        env.update(single_host_ucx_env())
         log_file = None
         log_path = None
         # WAR for QA env (pytest --capture=tee-sys): sys.stdout/sys.stderr lack
@@ -291,7 +338,7 @@ async def _wait_for_disagg_server_status(port, ready, min_ctx_workers=-1, min_ge
         return False
 
 
-async def wait_for_disagg_server_ready(port, timeout=300):
+async def wait_for_disagg_server_ready(port, timeout=DEFAULT_SERVER_START_TIMEOUT):
     """Wait for disagg server to be ready."""
 
     @periodic_check(timeout=timeout, interval=3)

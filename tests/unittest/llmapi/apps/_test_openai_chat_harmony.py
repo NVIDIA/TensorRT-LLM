@@ -5,7 +5,7 @@ import openai
 import pytest
 from utils.llm_data import llm_datasets_root
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -231,7 +231,7 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
         stream=True,
         extra_body={"top_k": 1},
     )
-    tool_name: str
+    tool_name: str | None = None
     reasoning_chunks: list[str] = []
     tool_arg_chunks: list[str] = []
     async for chunk in response:

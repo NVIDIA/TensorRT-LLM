@@ -50,6 +50,8 @@ class _FakeGenerator:
             iter_stats_max_iterations=iter_stats_max_iterations,
             enable_iter_perf_stats=enable_iter_perf_stats,
             return_perf_metrics=False,
+            memory_monitor_config=None,
+            num_serve_frontends=1,
         )
         self._executor = SimpleNamespace(resource_governor_queue=None)
         self._stat_batches = deque(stat_batches)
@@ -281,6 +283,7 @@ async def test_finished_read_stays_with_its_scrape_until_the_scrape_resumes():
     def on_read_done(_):
         # Runs once the read has finished and before the first scrape resumes:
         # another scrape arrives, then the first scrape is cancelled.
+        # pyrefly: ignore [unexpected-keyword]
         racing.append(asyncio.Task(server.get_iteration_stats(), loop=loop, eager_start=True))
         first.cancel()
 

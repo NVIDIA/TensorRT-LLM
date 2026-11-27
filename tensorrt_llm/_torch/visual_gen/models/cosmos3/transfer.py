@@ -22,32 +22,7 @@ from tensorrt_llm._torch.visual_gen.triton_kernels import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.media.decoding import decode_video_reference_window
 
-from .defaults import VIDEO_RES_SIZE_INFO
-
-
-def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
-    """Pick the ``resolution`` bucket whose aspect ratio best matches ``h/w``.
-
-    Returns ``(target_w, target_h)`` so a source frame maps onto a supported
-    output size without distorting its aspect ratio.
-    """
-    key = str(resolution)
-    if key not in VIDEO_RES_SIZE_INFO:
-        raise ValueError(
-            f"Unknown Cosmos3 transfer resolution={resolution!r}; "
-            f"expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
-        )
-    input_ratio = h / w
-    best_size = None
-    best_diff = float("inf")
-    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
-        diff = abs(input_ratio - cand_h / cand_w)
-        if diff < best_diff:
-            best_diff = diff
-            best_size = (cand_w, cand_h)
-    assert best_size is not None
-    return best_size
-
+from .defaults import _TRANSFER_DEFAULTS
 
 # ---------------------------------------------------------------------------
 # Transfer sampling + per-control-hint defaults, ported from vllm-omni's
@@ -60,17 +35,6 @@ def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 
 # Chunked-sampling defaults for long-video transfer.
-TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
-    "num_video_frames_per_chunk": 93,  # frames per autoregressive chunk (4k+1 form)
-    "num_conditional_frames": 1,  # overlap frames reused from the previous chunk
-    "max_frames": 5000,  # hard cap on total input frames
-    "show_control_condition": False,  # debug: also emit the control frames
-    "show_input": False,  # debug: also emit the input frames
-    "num_first_chunk_conditional_frames": 0,  # chunk 0 has no prior chunk to condition on
-    "share_vision_temporal_positions": True,  # control tokens reuse the video patches' positions
-    "emphasize_control_in_prompt": True,  # name the active hints in the user prompt
-}
-
 # Appended to the user prompt when ``emphasize_control_in_prompt`` is on, naming
 # the active hint modalities so the model is told which control it is following.
 # The system prompt is left alone, which keeps the text in the training
@@ -81,27 +45,12 @@ CONTROL_DIRECTIVE_TEMPLATE = (
     " signal at every frame."
 )
 
-# Per-hint guidance tuning: text guidance_scale, control_guidance, and flow_shift,
-# chosen empirically per control modality.
-TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
-    "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
-    "blur": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
-    "depth": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
-    "seg": {
-        "guidance_scale": 3.0,
-        "control_guidance": 2.0,
-        "flow_shift": 10.0,
-    },  # leans harder on control
-    # Precomputed control; control-only guidance (text off), 10 fps / 101-frame chunks.
-    "wsm": {
-        "guidance_scale": 1.0,
-        "control_guidance": 3.0,
-        "flow_shift": 10.0,
-        "num_frames": 101,
-        "fps": 10,
-        "num_video_frames_per_chunk": 101,
-    },
-}
+
+def transfer_defaults(hints: Mapping[str, Any]) -> dict[str, Any]:
+    """The default row of a transfer request: the control's own row for a single
+    control, the ``"mixed"`` row for two or more."""
+    return _TRANSFER_DEFAULTS[next(iter(hints)) if len(hints) == 1 else "mixed"]
+
 
 # Canny (lower, upper) hysteresis thresholds per edge-strength preset;
 # higher preset = higher thresholds = sparser edges.
@@ -159,8 +108,6 @@ class Cosmos3TransferConfig:
     control_guidance: float = 1.0
     control_guidance_interval: tuple[float, float] | None = None
     flow_shift: float | None = None
-    # Whether ``flow_shift`` was set by the request rather than a hint preset.
-    flow_shift_explicit: bool = False
     num_video_frames_per_chunk: int = 93
     num_conditional_frames: int = 1
     max_frames: int = 5000
@@ -278,13 +225,10 @@ def resolve_transfer_config(
     # a caller's value from a merged one.
     specified = getattr(req_params, "model_fields_set", frozenset())
 
-    # Stays None unless the caller asked for a value, so the single-hint preset
-    # below can apply. Reading `req_params.guidance_scale` unconditionally would
+    # Stays None unless the caller asked for a value, so the default row below
+    # can apply. Reading `req_params.guidance_scale` unconditionally would
     # capture the executor-merged default and make every request look explicit,
-    # which pins transfer to the generic scale and never reaches the tuned
-    # per-hint presets. With no preset (multi-hint), `_forward_transfer` falls
-    # back to the generic video default -- matching the reference, where the
-    # per-task table applies only to a single hint.
+    # which pins transfer to the generic scale and never reaches the tuned rows.
     guidance_scale_user_set = (
         "guidance_scale" in specified or extra_params.get("guidance_scale", None) is not None
     )
@@ -300,42 +244,41 @@ def resolve_transfer_config(
             _extra_or_default(extra_params, "control_guidance_interval", None)
         ),
         flow_shift=_extra_or_default(extra_params, "flow_shift", None),
-        flow_shift_explicit=extra_params.get("flow_shift") is not None,
         num_video_frames_per_chunk=_extra_or_default(
             extra_params,
             "num_video_frames_per_chunk",
-            TRANSFER_SAMPLE_DEFAULTS["num_video_frames_per_chunk"],
+            _TRANSFER_DEFAULTS["common"]["num_video_frames_per_chunk"],
         ),
         num_conditional_frames=_extra_or_default(
             extra_params,
             "num_conditional_frames",
-            TRANSFER_SAMPLE_DEFAULTS["num_conditional_frames"],
+            _TRANSFER_DEFAULTS["common"]["num_conditional_frames"],
         ),
         max_frames=_extra_or_default(
-            extra_params, "max_frames", TRANSFER_SAMPLE_DEFAULTS["max_frames"]
+            extra_params, "max_frames", _TRANSFER_DEFAULTS["common"]["max_frames"]
         ),
         show_control_condition=_extra_or_default(
             extra_params,
             "show_control_condition",
-            TRANSFER_SAMPLE_DEFAULTS["show_control_condition"],
+            _TRANSFER_DEFAULTS["common"]["show_control_condition"],
         ),
         show_input=_extra_or_default(
-            extra_params, "show_input", TRANSFER_SAMPLE_DEFAULTS["show_input"]
+            extra_params, "show_input", _TRANSFER_DEFAULTS["common"]["show_input"]
         ),
         num_first_chunk_conditional_frames=_extra_or_default(
             extra_params,
             "num_first_chunk_conditional_frames",
-            TRANSFER_SAMPLE_DEFAULTS["num_first_chunk_conditional_frames"],
+            _TRANSFER_DEFAULTS["common"]["num_first_chunk_conditional_frames"],
         ),
         share_vision_temporal_positions=_extra_or_default(
             extra_params,
             "share_vision_temporal_positions",
-            TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"],
+            _TRANSFER_DEFAULTS["common"]["share_vision_temporal_positions"],
         ),
         emphasize_control_in_prompt=_extra_or_default(
             extra_params,
             "emphasize_control_in_prompt",
-            TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"],
+            _TRANSFER_DEFAULTS["common"]["emphasize_control_in_prompt"],
         ),
         # `num_frames` and `frame_rate` are request fields, not extra params, so
         # they are read from `req_params` alone: `extra_params` spellings of them
@@ -349,21 +292,22 @@ def resolve_transfer_config(
         fps=getattr(req_params, "frame_rate", None) if "frame_rate" in specified else None,
     )
 
-    if len(hints) == 1:
-        hint_key = next(iter(hints))
-        for field_name, default_value in TRANSFER_DEFAULTS[hint_key].items():
-            if field_name == "guidance_scale":
-                user_set = guidance_scale_user_set
-            elif field_name == "flow_shift":
-                user_set = extra_params.get("flow_shift", None) is not None
-            elif field_name == "fps":
-                user_set = "frame_rate" in specified
-            elif field_name == "num_frames":
-                user_set = "num_frames" in specified
-            else:
-                user_set = extra_params.get(field_name, None) is not None
-            if not user_set:
-                setattr(config, field_name, default_value)
+    for field_name, default_value in transfer_defaults(hints).items():
+        if field_name == "flow_shift":
+            # ``config.flow_shift`` carries only the caller's value: the pipeline
+            # consults the overrides and the checkpoint scheduler's shift before
+            # this default.
+            continue
+        if field_name == "guidance_scale":
+            user_set = guidance_scale_user_set
+        elif field_name == "fps":
+            user_set = "frame_rate" in specified
+        elif field_name == "num_frames":
+            user_set = "num_frames" in specified
+        else:
+            user_set = extra_params.get(field_name, None) is not None
+        if not user_set:
+            setattr(config, field_name, default_value)
 
     if config.num_video_frames_per_chunk <= 0:
         raise ValueError("Cosmos3 transfer num_video_frames_per_chunk must be positive.")

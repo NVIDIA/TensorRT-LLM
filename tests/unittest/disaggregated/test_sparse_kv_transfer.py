@@ -71,6 +71,11 @@ def _manager(offload: bool) -> Mock:
     impl = SimpleNamespace(
         init_config=SimpleNamespace(tokens_per_block=128, layers=layers),
         layer_grouping=((0, 1),),
+        buffer_grouping=(
+            tuple(
+                SimpleNamespace(layer_id=layer, role=role) for layer in range(2) for role in roles
+            ),
+        ),
         pool_group_descs=[
             SimpleNamespace(
                 pool_group_index=0,
@@ -105,6 +110,7 @@ def _manager(offload: bool) -> Mock:
         mixed_precision_high_layers={},
         get_disagg_role_mapper_kinds=lambda: {Role.ALL: MapperKind.REPLICATED},
         get_disagg_role_layouts=lambda: {},
+        num_locality_domains=1,
     )
 
 
@@ -219,7 +225,11 @@ def test_receiver_dispatches_host_and_device_pool_requests(
     receiver._enforce_physical_ownership = False
     receiver._get_sender_info = Mock(return_value=src)
     receiver._get_session = Mock(
-        return_value=Mock(_sender_endpoints=set(), _enforce_physical_ownership=False)
+        return_value=Mock(
+            _sender_endpoints=set(),
+            _enforce_physical_ownership=False,
+            _publication_lock=threading.Lock(),
+        )
     )
     receiver._request_sender_data = Mock()
     task = SimpleNamespace(

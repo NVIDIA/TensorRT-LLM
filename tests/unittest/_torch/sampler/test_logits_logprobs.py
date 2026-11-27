@@ -232,6 +232,78 @@ def test_generation_with_return_logits(
         assert idx == len(prompts) - 1
 
 
+@force_ampere  # Save H100 resource
+@pytest.mark.parametrize("end_index", [0, 2])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.timeout(120, method="signal")
+@pytest.mark.threadleak(enabled=False)
+def test_generation_logits_of_request_stopped_by_end_id(llm, end_index: int, streaming: bool):
+    """A request that stops on its end id keeps one generation logits row per output token.
+
+    With the overlap scheduler, such a request is still in the next batch, which stores no logits
+    for it, so there is no extra row for exclude_last_generation_logits to drop.
+    """
+    reference = llm.generate(
+        prompts[0], SamplingParams(max_tokens=8, temperature=0.0, end_id=-1)
+    ).outputs[0]
+    end_id = reference.token_ids[end_index]
+    assert end_id not in reference.token_ids[:end_index], "pick an end id the output reaches once"
+    sampling_params = SamplingParams(
+        max_tokens=8, temperature=0.0, end_id=end_id, return_generation_logits=True
+    )
+
+    if streaming:
+        sequence = None
+        rows = 0
+        # The streamed output is updated in place, so check each chunk as it arrives.
+        for output in llm.generate_async(
+            prompts[0], sampling_params=sampling_params, streaming=True
+        ):
+            sequence = output.outputs[0]
+            assert sequence.generation_logits is not None
+            assert sequence.generation_logits.shape[0] == 1
+            assert torch.argmax(sequence.generation_logits, dim=1).tolist() == [
+                sequence.token_ids[-1]
+            ]
+            rows += sequence.generation_logits.shape[0]
+        assert sequence is not None
+        # One row per output token across the chunks, not only one for the last token.
+        assert rows == len(sequence.token_ids)
+    else:
+        sequence = llm.generate(prompts[0], sampling_params=sampling_params).outputs[0]
+        assert sequence.generation_logits is not None
+        assert torch.argmax(sequence.generation_logits, dim=1).tolist() == sequence.token_ids
+
+    assert sequence.token_ids == reference.token_ids[: end_index + 1]
+    assert sequence.finish_reason == "stop"
+
+
+@force_ampere  # Save H100 resource
+@pytest.mark.timeout(120, method="signal")
+@pytest.mark.threadleak(enabled=False)
+def test_generation_logits_of_request_stopped_by_stop_token(llm):
+    """Stop-word trimming drops the stop token's row, and the rows left still match the tokens."""
+    reference = llm.generate(
+        prompts[0], SamplingParams(max_tokens=8, temperature=0.0, end_id=-1)
+    ).outputs[0]
+    stop_token = reference.token_ids[2]
+    assert stop_token not in reference.token_ids[:2], "pick a stop token the output reaches once"
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        temperature=0.0,
+        end_id=-1,
+        stop_token_ids=[stop_token],
+        return_generation_logits=True,
+    )
+
+    sequence = llm.generate(prompts[0], sampling_params=sampling_params).outputs[0]
+
+    assert sequence.token_ids == reference.token_ids[:2]
+    assert sequence.finish_reason == "stop"
+    assert sequence.generation_logits is not None
+    assert torch.argmax(sequence.generation_logits, dim=1).tolist() == sequence.token_ids
+
+
 @pytest.mark.parametrize("logprobs_k", [0, 1, 3], ids=["top_0", "top_1", "top_3"])
 @pytest.mark.parametrize("logprobs_mode", ["raw", "processed"])
 @pytest.mark.threadleak(enabled=False)
@@ -286,6 +358,7 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str, s
                 token_logprobs.items(), key=lambda x: (x[1].logprob, -x[1].rank), reverse=True
             )
 
+            sampled_in_topk = False
             if logprobs_k > 0:
                 sampled_token_rank = token_logprobs[sampled_token_id].rank
                 sampled_in_topk = sampled_token_rank <= logprobs_k
@@ -562,12 +635,12 @@ def test_logprobs_against_logits(
         # The last context logprob dict and the first generation logprob dict should agree on
         # the top-n entries (n = min(prompt_logprobs_k, logprobs_k)) and the sampled token's logprob.
         if prompt_logprobs_k is not None and logprobs_k is not None:
-            last_context_logprob = context_logprobs[-1]
-            first_generation_logprob = generation_logprobs[0]
+            last_context_logprob = output.outputs[0].prompt_logprobs[-1]
+            first_generation_logprob = output.outputs[0].logprobs[0]
             less_prompt_logprobs = prompt_logprobs_k <= logprobs_k
             expected = last_context_logprob if less_prompt_logprobs else first_generation_logprob
             compare = first_generation_logprob if less_prompt_logprobs else last_context_logprob
-            sampled_token_id = generation_tokens[0]
+            sampled_token_id = output.outputs[0].token_ids[0]
             assert sampled_token_id in last_context_logprob, (
                 f"Sampled token {sampled_token_id} is not a valid key in the last entry "
                 f"of the context logprob dict: {list(last_context_logprob.keys())}"
@@ -605,6 +678,69 @@ def test_logprobs_against_logits(
                         f"logprob {compare_logprob} in the other dict for token {token_id}"
                     ),
                 )
+
+
+def _assert_raw_logprobs_match_model_logits(completion) -> None:
+    """Check that each raw logprob is the log-softmax of the model's logits for that step."""
+    expected = torch.log_softmax(completion.generation_logits.to(device="cuda"), dim=-1).cpu()
+    assert len(completion.logprobs) == len(completion.token_ids)
+    for step, token_logprobs in enumerate(completion.logprobs):
+        assert completion.token_ids[step] in token_logprobs
+        for token_id, logprob_obj in token_logprobs.items():
+            torch.testing.assert_close(
+                torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                expected[step, token_id],
+                msg=f"raw logprob {logprob_obj.logprob} of token {token_id} at step {step} "
+                f"does not match the model's {expected[step, token_id].item()}",
+            )
+
+
+@pytest.mark.parametrize(
+    "logit_rewrite",
+    [
+        {"repetition_penalty": 1.3},
+        {"presence_penalty": 1.0, "frequency_penalty": 0.5},
+        {"bad": [" C"]},
+    ],
+    ids=["repetition_penalty", "presence_frequency_penalty", "bad_words"],
+)
+@pytest.mark.threadleak(enabled=False)
+def test_raw_logprobs_ignore_logit_rewrites(logit_rewrite: dict[str, Any], simple_llm: LLM):
+    """Raw logprobs come from the model's logits, before penalties and token bans rewrite them.
+
+    The prompt repeats its tokens, so the penalties and the banned word already change the
+    logits of the first generated token.
+    """
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        logprobs=3,
+        logprobs_mode=LogprobMode.RAW,
+        return_generation_logits=True,
+        **logit_rewrite,
+    )
+    for output in simple_llm.generate(["A B C A B C A B"], sampling_params=sampling_params):
+        _assert_raw_logprobs_match_model_logits(output.outputs[0])
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_raw_logprobs_ignore_logit_rewrites_in_a_mixed_batch(simple_llm: LLM):
+    """In a batch, the logits of each raw-logprob request are kept and put back in its own rows.
+
+    A processed-logprob request with a penalty comes first, so the raw requests' rows do not
+    start at 0, and each request has its own prompt, so a row put back in the wrong place
+    would not match the model's logits.
+    """
+    common = dict(max_tokens=8, logprobs=3, return_generation_logits=True)
+    sampling_params = [
+        SamplingParams(logprobs_mode=LogprobMode.PROCESSED, repetition_penalty=1.3, **common),
+        SamplingParams(logprobs_mode=LogprobMode.RAW, repetition_penalty=1.3, **common),
+        SamplingParams(logprobs_mode=LogprobMode.RAW, **common),
+    ]
+    outputs = simple_llm.generate(
+        ["A B C A B C A B", "1 2 3 1 2 3 1 2", "x y z x y z x y"], sampling_params=sampling_params
+    )
+    for output in outputs[1:]:
+        _assert_raw_logprobs_match_model_logits(output.outputs[0])
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
@@ -920,7 +1056,9 @@ class TestLogsprobsInBatchedSampling:
     VOCAB_SIZE = 123
 
     @staticmethod
-    def _build_test_cases(max_draft_len: int) -> list[tuple[list[SamplingParams], str]]:
+    def _build_test_cases(
+        max_draft_len: int, vocab_size: int
+    ) -> list[tuple[list[SamplingParams], str]]:
         """Return test cases for testing logprobs handling in batched sampling.
 
         Each test case consists of a list of sampling parameters and a human-readable
@@ -1012,19 +1150,18 @@ class TestLogsprobsInBatchedSampling:
 
             # permute all but one sub-batch
             for unperm_sub_batch_idx in range(len(sub_batches)):
-                head = [
+                perm = [
                     params
                     for sub_batch in sub_batches[:unperm_sub_batch_idx]
+                    + sub_batches[(unperm_sub_batch_idx + 1) :]
                     for params in sub_batch
                 ]
-                tail = [
-                    params
-                    for sub_batch in sub_batches[(unperm_sub_batch_idx + 1) :]
-                    for params in sub_batch
-                ]
-                rng.shuffle(head)  # inplace
-                rng.shuffle(tail)  # inplace
-                partially_perm_batch = head + sub_batches[unperm_sub_batch_idx] + tail
+                rng.shuffle(perm)  # inplace
+                split_idx = rng.integers(low=min(1, len(perm) - 1), high=max(1, len(perm)))
+
+                partially_perm_batch = (
+                    perm[:split_idx] + sub_batches[unperm_sub_batch_idx] + perm[split_idx:]
+                )
 
                 partially_perm_label = "partially_permuted_" + "_".join(
                     list(labels[:unperm_sub_batch_idx])
@@ -1091,7 +1228,15 @@ class TestLogsprobsInBatchedSampling:
             (key, value) for key, value in BASE_CASES.items() if key.startswith("single")
         ]
         assert single_configs
-        test_cases += _combine_up_to_3_configs(single_configs)
+        test_cases += [
+            (
+                # Prepending a different sampling strategy to test interplay of batching by strategy
+                # and logprob output.
+                [SamplingParams(temperature=0.7)] * 3 + batch,
+                label,
+            )
+            for batch, label in _combine_up_to_3_configs(single_configs)
+        ]
 
         if include_beam_search:
             # All ordered combinations of up to three configs from the "beam_search" family
@@ -1109,6 +1254,33 @@ class TestLogsprobsInBatchedSampling:
             ]
             assert raw_configs
             test_cases += _combine_up_to_3_configs(raw_configs, allow_single_only=False)
+
+        # Raw logprobs of rows the sampler rewrites before sampling (embedding bias, bad words,
+        # min_length), alone and mixed with requests it leaves alone.
+        logit_rewrites = {
+            "embedding_bias": {
+                "embedding_bias": tuple(enumerate(torch.linspace(-5.0, 5.0, vocab_size).tolist()))
+            },
+            "bad_words": {"bad_token_ids": list(range(0, vocab_size, 2))},
+            "min_length": {"end_id": 5, "min_tokens": 10},
+        }
+        rewritten_configs = []
+        for rewrite_label, rewrite in logit_rewrites.items():
+            configs = [
+                SamplingParams(temperature=0.7, top_k=2, logprobs=params.logprobs, **rewrite)
+                for label, params in BASE_CASES.items()
+                if label.startswith("single-raw")
+            ]
+            assert configs
+            test_cases.append((configs, f"single_raw_rewritten_{rewrite_label}"))
+            rewritten_configs += configs
+        test_cases += _shuffle_mixed_batches(
+            (
+                rewritten_configs,
+                [params for label, params in BASE_CASES.items() if label.startswith("single")],
+            ),
+            ("raw_rewritten", "single"),
+        )
 
         return test_cases
 
@@ -1212,14 +1384,19 @@ class TestLogsprobsInBatchedSampling:
                     logprobs_mode=sampling_params.logprobs_mode,
                     num_logprobs=sampling_params.logprobs or 0,
                     return_log_probs=sampling_params.logprobs is not None,
+                    embedding_bias=sampling_params.embedding_bias,
+                    end_id=sampling_params.end_id,
                 )
                 for sampling_params, seq_slot, draft_len in zip(
                     sampling_params_list, seq_slots, draft_lens, strict=True
                 )
             ]
             # Patch up request state to correctly infer input beam width (inspects req.is_context_init_state)
-            for req in scheduled_requests.generation_requests:
+            for req, sampling_params in zip(
+                scheduled_requests.generation_requests, sampling_params_list
+            ):
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                req.py_bad_words = sampling_params._get_bad_words() or None
             return scheduled_requests
 
     @pytest.fixture(scope="function")
@@ -1461,7 +1638,7 @@ class TestLogsprobsInBatchedSampling:
                 [VOCAB_SIZE],
             )
             for (sampling_params_list, params_label) in _build_test_cases(
-                max_draft_len=max_draft_len
+                max_draft_len=max_draft_len, vocab_size=vocab_size
             )
         ],
     )
@@ -1505,6 +1682,8 @@ class TestLogsprobsInBatchedSampling:
         monkeypatch.setattr(sampler, "_sample_batched_by_strategy", _check_logprobs_capacity)
         sampler.setup_sampler_step(mock_requests)
 
+        # The logits as the sampler receives them; sample_async may rewrite its input in place.
+        reference_outputs = {"logits": model_outputs["logits"].clone()}
         sample_state = sampler.sample_async(
             mock_requests,
             model_outputs,
@@ -1515,7 +1694,7 @@ class TestLogsprobsInBatchedSampling:
 
         self._validate_logprobs(
             mock_requests=mock_requests,
-            model_outputs=model_outputs,
+            model_outputs=reference_outputs,
             sampler=sampler,
         )
 
@@ -1539,7 +1718,7 @@ class TestLogsprobsInBatchedSampling:
             sampler.update_requests(active_state)
             assert active_requests.all_requests()[0].state == LlmRequestState.GENERATION_IN_PROGRESS
             self._validate_logprobs(
-                mock_requests=active_requests, model_outputs=model_outputs, sampler=sampler
+                mock_requests=active_requests, model_outputs=reference_outputs, sampler=sampler
             )
 
 

@@ -636,6 +636,546 @@ def test_a_probe_that_tells_nothing_keeps_the_roles_and_warns_once(
     )
 
 
+def test_strict_single_system_template_merges_developer_into_leading_system(tmp_path, monkeypatch):
+    """Strict templates rejecting a second or non-leading system merge developers into index 0."""
+    strict_template = (
+        "{%- if messages[0].role == 'system' -%}<|system|>{{ messages[0].content }}"
+        "{%- set rest = messages[1:] -%}{%- else -%}{%- set rest = messages -%}{%- endif -%}"
+        "{%- for m in rest -%}"
+        "{%- if m.role == 'system' -%}{{ raise_exception('system role only allowed at index 0') }}"
+        "{%- elif m.role == 'user' -%}<|user|>{{ m.content }}"
+        "{%- elif m.role == 'assistant' -%}<|assistant|>{{ m.content }}"
+        "{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+    )
+    served = _serve(tmp_path, monkeypatch, _JinjaTokenizer(strict_template))
+
+    # Responses API with instructions (leading system) + developer brief
+    resp_prompt = _post_responses(served)
+    assert resp_prompt == f"<|system|>{INSTRUCTIONS}\n\n{BRIEF}<|user|>{QUESTION}<|assistant|>"
+
+    # Chat Completions with system -> user -> late developer -> user
+    late_prompt = _post_chat(
+        served,
+        messages=[
+            {"role": "system", "content": INSTRUCTIONS},
+            {"role": "user", "content": "First."},
+            {"role": "developer", "content": BRIEF},
+            {"role": "user", "content": QUESTION},
+        ],
+    )
+    assert (
+        late_prompt
+        == f"<|system|>{INSTRUCTIONS}\n\n{BRIEF}<|user|>First.\n\n{QUESTION}<|assistant|>"
+    )
+
+    # Chat Completions with no leading system and a late developer
+    lifted_prompt = _post_chat(
+        served,
+        messages=[
+            {"role": "user", "content": "First."},
+            {"role": "developer", "content": BRIEF},
+            {"role": "user", "content": QUESTION},
+        ],
+    )
+    assert lifted_prompt == f"<|system|>{BRIEF}<|user|>First.\n\n{QUESTION}<|assistant|>"
+
+    # Developer before system merges into a single leading system preserving input order
+    dev_first_prompt = _post_chat(
+        served,
+        messages=[
+            {"role": "developer", "content": BRIEF},
+            {"role": "system", "content": INSTRUCTIONS},
+            {"role": "user", "content": QUESTION},
+        ],
+    )
+    assert dev_first_prompt == f"<|system|>{BRIEF}\n\n{INSTRUCTIONS}<|user|>{QUESTION}<|assistant|>"
+
+
+def test_alternating_turn_template_accepting_single_late_system_keeps_developer_in_place(
+    tmp_path, monkeypatch
+):
+    """A template allowing only ONE system anywhere + alternating turns keeps late developer in place."""
+    single_anywhere_template = (
+        "{%- set ns = namespace(last='', sys_count=0) -%}"
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' -%}"
+        "{%- set ns.sys_count = ns.sys_count + 1 -%}"
+        "{%- if ns.sys_count > 1 -%}{{ raise_exception('at most one system') }}{%- endif -%}"
+        "<|system|>{{ m.content }}"
+        "{%- elif m.role == 'user' -%}"
+        "{%- if ns.last == 'user' -%}{{ raise_exception('turns must alternate') }}{%- endif -%}"
+        "{%- set ns.last = 'user' -%}<|user|>{{ m.content }}"
+        "{%- elif m.role == 'assistant' -%}"
+        "{%- if ns.last == 'assistant' -%}{{ raise_exception('turns must alternate') }}{%- endif -%}"
+        "{%- set ns.last = 'assistant' -%}<|assistant|>{{ m.content }}"
+        "{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+    )
+    served = _serve(tmp_path, monkeypatch, _JinjaTokenizer(single_anywhere_template))
+
+    prompt = _post_chat(
+        served,
+        messages=[
+            {"role": "user", "content": "First."},
+            {"role": "assistant", "content": "Reply."},
+            {"role": "developer", "content": BRIEF},
+            {"role": "user", "content": QUESTION},
+        ],
+    )
+    assert (
+        prompt
+        == f"<|user|>First.<|assistant|>Reply.<|system|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+    )
+
+
+def test_template_accepting_leading_multi_system_but_rejecting_late_system(tmp_path, monkeypatch):
+    """A template allowing leading multi-system but rejecting late system merges only late runs."""
+    leading_only_template = (
+        "{%- set ns = namespace(seen_non_sys=false) -%}"
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' -%}"
+        "{%- if ns.seen_non_sys -%}{{ raise_exception('late system forbidden') }}{%- endif -%}"
+        "<|system|>{{ m.content }}"
+        "{%- elif m.role == 'user' -%}{%- set ns.seen_non_sys = true -%}<|user|>{{ m.content }}"
+        "{%- elif m.role == 'assistant' -%}{%- set ns.seen_non_sys = true -%}<|assistant|>{{ m.content }}"
+        "{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+    )
+    served = _serve(tmp_path, monkeypatch, _JinjaTokenizer(leading_only_template))
+
+    # Consecutive leading [system, developer, user] stays two separate leading system blocks
+    leading_prompt = _post_responses(served)
+    assert (
+        leading_prompt
+        == f"<|system|>{INSTRUCTIONS}<|system|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+    )
+
+    # Late developer after user merges into leading system instead of raising
+    late_prompt = _post_chat(
+        served,
+        messages=[
+            {"role": "system", "content": INSTRUCTIONS},
+            {"role": "user", "content": "First."},
+            {"role": "developer", "content": BRIEF},
+            {"role": "user", "content": QUESTION},
+        ],
+    )
+    assert (
+        late_prompt
+        == f"<|system|>{INSTRUCTIONS}\n\n{BRIEF}<|user|>First.\n\n{QUESTION}<|assistant|>"
+    )
+
+    # Developer at index 0 + pre-existing late system also merges on leading-only templates
+    dev_plus_late_sys = _post_chat(
+        served,
+        messages=[
+            {"role": "developer", "content": BRIEF},
+            {"role": "user", "content": "First."},
+            {"role": "assistant", "content": "Reply."},
+            {"role": "system", "content": INSTRUCTIONS},
+            {"role": "user", "content": QUESTION},
+        ],
+    )
+    assert (
+        dev_plus_late_sys
+        == f"<|system|>{BRIEF}\n\n{INSTRUCTIONS}<|user|>First.<|assistant|>Reply.<|user|>{QUESTION}<|assistant|>"
+    )
+
+
+def test_merge_developers_preserves_mm_placeholder_counts_alignment():
+    """Merging developer into leading system keeps mm_placeholder_counts aligned with user turns."""
+    conv = [
+        {"role": "system", "content": INSTRUCTIONS},
+        {"role": "developer", "content": BRIEF},
+        {"role": "user", "content": QUESTION},
+    ]
+    counts = [{}, {}, {"image": 2}]
+    merged_conv, merged_counts = inputs_utils._merge_developers_into_leading_system(conv, counts)
+    assert len(merged_conv) == len(merged_counts) == 2
+    assert merged_conv[0] == {"role": "system", "content": f"{INSTRUCTIONS}\n\n{BRIEF}"}
+    assert merged_conv[1] == {"role": "user", "content": QUESTION}
+    assert merged_counts == [{}, {"image": 2}]
+
+    # Late media-bearing developer after earlier user media stays in place coalesced with the
+    # adjacent user turn so both media order (A then B) and strict user/assistant alternation hold.
+    strict_alt_template = (
+        "{%- set ns = namespace(last='') -%}"
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' -%}"
+        "{%- if not loop.first -%}{{ raise_exception('system only at 0') }}{%- endif -%}"
+        "<|system|>{{ m.content }}"
+        "{%- elif m.role in ['user', 'assistant'] -%}"
+        "{%- if ns.last == m.role -%}{{ raise_exception('turns must alternate') }}{%- endif -%}"
+        "{%- set ns.last = m.role -%}<|{{ m.role }}|>{{ m.content }}"
+        "{%- endif -%}{%- endfor -%}"
+    )
+    mm_conv = [
+        {"role": "user", "content": "<imgA>", "media": ["imgA"]},
+        {"role": "assistant", "content": "Reply."},
+        {"role": "developer", "content": "<imgB>", "media": ["imgB"]},
+        {"role": "user", "content": QUESTION},
+    ]
+    mm_counts = [{"image": 1}, {}, {"image": 1}, {}]
+    kept_conv, kept_counts = inputs_utils._developer_as_system(
+        mm_conv,
+        inputs_utils._template_developer_policy,
+        inputs_utils._template_accepts_late_system,
+        strict_alt_template,
+        mm_placeholder_counts=mm_counts,
+    )
+    assert [m["role"] for m in kept_conv] == ["user", "assistant", "user"]
+    assert kept_conv[2]["content"] == f"<imgB>\n\n{QUESTION}"
+    assert kept_counts == [{"image": 1}, {}, {"image": 1}]
+    rendered, _ = render_jinja_template(
+        conversations=[kept_conv], chat_template=strict_alt_template, add_generation_prompt=False
+    )
+    assert rendered[0] == f"<|user|><imgA><|assistant|>Reply.<|user|><imgB>\n\n{QUESTION}"
+
+    # Late media-bearing developer sandwiched between two users collapses into one user turn
+    sandwich_conv = [
+        {"role": "user", "content": "<imgA>", "media": ["imgA"]},
+        {"role": "developer", "content": "<imgB>", "media": ["imgB"]},
+        {"role": "user", "content": QUESTION},
+    ]
+    sandwich_counts = [{"image": 1}, {"image": 1}, {}]
+    s_conv, s_counts = inputs_utils._developer_as_system(
+        sandwich_conv,
+        inputs_utils._template_developer_policy,
+        inputs_utils._template_accepts_late_system,
+        strict_alt_template,
+        mm_placeholder_counts=sandwich_counts,
+    )
+    assert [m["role"] for m in s_conv] == ["user"]
+    assert s_conv[0]["content"] == f"<imgA>\n\n<imgB>\n\n{QUESTION}"
+    assert s_counts == [{"image": 2}]
+    s_rendered, _ = render_jinja_template(
+        conversations=[s_conv], chat_template=strict_alt_template, add_generation_prompt=False
+    )
+    assert s_rendered[0] == f"<|user|><imgA>\n\n<imgB>\n\n{QUESTION}"
+
+    # Text-only developer lifted from between two users also coalesces adjacent users for strict_alt
+    text_sandwich = [
+        {"role": "user", "content": "A"},
+        {"role": "developer", "content": BRIEF},
+        {"role": "user", "content": QUESTION},
+    ]
+    ts_conv, _ = inputs_utils._developer_as_system(
+        text_sandwich,
+        inputs_utils._template_developer_policy,
+        inputs_utils._template_accepts_late_system,
+        strict_alt_template,
+    )
+    assert [m["role"] for m in ts_conv] == ["system", "user"]
+    ts_rendered, _ = render_jinja_template(
+        conversations=[ts_conv], chat_template=strict_alt_template, add_generation_prompt=False
+    )
+    assert ts_rendered[0] == f"<|system|>{BRIEF}<|user|>A\n\n{QUESTION}"
+
+
+@pytest.mark.parametrize(
+    "system_blocks,user_blocks",
+    [(True, True), (True, False), (False, True)],
+    ids=["both_blocks", "system_blocks_user_str", "system_str_user_blocks"],
+)
+def test_openai_block_content_template_probes_as_blocks(
+    tmp_path, monkeypatch, system_blocks, user_blocks
+):
+    """Templates iterating over block content per role render plain-text chat developer and user."""
+    sys_body = (
+        "<|system|>{%- for p in m.content -%}{%- if p.type == 'text' -%}{{ p.text }}{%- endif -%}{%- endfor -%}"
+        if system_blocks
+        else "{{ '<|system|>' + m.content }}"
+    )
+    user_body = (
+        "<|user|>{%- for p in m.content -%}{%- if p.type == 'text' -%}{{ p.text }}{%- endif -%}{%- endfor -%}"
+        if user_blocks
+        else "{{ '<|user|>' + m.content }}"
+    )
+    block_template = (
+        "{%- for m in messages -%}"
+        f"{{%- if m.role == 'system' -%}}{sys_body}"
+        f"{{%- elif m.role == 'user' -%}}{user_body}"
+        "{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+    )
+    served = _serve(tmp_path, monkeypatch, _JinjaTokenizer(block_template))
+    prompt = _post_chat(served)
+    assert prompt == f"<|system|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+
+
+def test_openai_block_assistant_requires_leading_user_and_keeps_late_system_in_place(
+    tmp_path, monkeypatch
+):
+    """Block-only assistant requiring first non-system=user preserves assistant text and late system."""
+    template = (
+        "{%- set ns = namespace(seen_user=false) -%}"
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' -%}{{ '<|system|>' + m.content }}"
+        "{%- elif m.role == 'user' -%}{%- set ns.seen_user = true -%}{{ '<|user|>' + m.content }}"
+        "{%- elif m.role == 'assistant' -%}"
+        "{%- if not ns.seen_user -%}{{ raise_exception('first non-system must be user') }}{%- endif -%}"
+        "<|assistant|>{%- for p in m.content -%}{%- if p.type == 'text' -%}{{ p.text }}{%- endif -%}{%- endfor -%}"
+        "{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+    )
+    served = _serve(tmp_path, monkeypatch, _JinjaTokenizer(template))
+    prompt = _post_chat(
+        served,
+        messages=[
+            {"role": "user", "content": "First."},
+            {"role": "assistant", "content": "Reply."},
+            {"role": "developer", "content": BRIEF},
+            {"role": "user", "content": QUESTION},
+        ],
+    )
+    assert (
+        prompt
+        == f"<|user|>First.<|assistant|>Reply.<|system|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+    )
+
+
+def test_tools_context_separates_developer_probe_cache(tmp_path, monkeypatch):
+    """A template with distinct behavior for tools=None, tools=[], and non-empty tools keeps all 3."""
+    tools_dependent = (
+        "{%- set ns = namespace(sc=0) -%}"
+        "{%- for m in messages -%}"
+        "{%- if tools and m.role == 'developer' -%}<|developer|>{{ m.content }}"
+        "{%- elif m.role == 'system' -%}"
+        "{%- set ns.sc = ns.sc + 1 -%}"
+        "{%- if tools is none and ns.sc > 1 -%}{{ raise_exception('single system when tools is none') }}{%- endif -%}"
+        "<|system|>{{ m.content }}"
+        "{%- elif m.role == 'user' -%}<|user|>{{ m.content }}"
+        "{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+    )
+    tokenizer = _JinjaTokenizer(tools_dependent)
+    served = _serve(tmp_path, monkeypatch, tokenizer)
+    msgs = [
+        {"role": "system", "content": INSTRUCTIONS},
+        {"role": "developer", "content": BRIEF},
+        {"role": "user", "content": QUESTION},
+    ]
+    # tools=None: strict single system -> merges developer into system
+    assert (
+        _post_chat(served, messages=msgs)
+        == f"<|system|>{INSTRUCTIONS}\n\n{BRIEF}<|user|>{QUESTION}<|assistant|>"
+    )
+    # tools=[]: allows multiple systems, drops developer -> two separate system blocks
+    assert (
+        apply_chat_template(
+            model_type="llama",
+            tokenizer=tokenizer,
+            processor=None,
+            conversation=[dict(m) for m in msgs],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}, {}, {}],
+            tools=[],
+            chat_template=tools_dependent,
+        )
+        == f"<|system|>{INSTRUCTIONS}<|system|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+    )
+    # non-empty tools: renders developer directly -> keeps developer role
+    assert (
+        _post_chat(
+            served,
+            messages=msgs,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ping",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+        == f"<|system|>{INSTRUCTIONS}<|developer|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+    )
+
+
+def test_native_renderer_tools_context_separates_developer_probe_cache(tmp_path, monkeypatch):
+    """A Python native renderer with distinct behavior for None, [], and non-empty tools keeps all 3."""
+
+    class _ToolsDependentNative(_NativeRenderer):
+        def apply_chat_template(
+            self, conversation, tools=None, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self._record(conversation)
+            if tools is None:
+                if sum(1 for m in conversation if m["role"] == "system") > 1:
+                    raise ValueError("single system when tools is None")
+                roles = ("system", "user", "assistant")
+            elif len(tools) == 0:
+                roles = ("system", "user", "assistant")
+            else:
+                roles = ("system", "developer", "user", "assistant")
+            text = "".join(
+                f"<{m['role']}>{m['content']}" for m in conversation if m["role"] in roles
+            )
+            if add_generation_prompt:
+                text += "<assistant>"
+            return self.encode(text) if tokenize else text
+
+    tokenizer = _ToolsDependentNative()
+    served = _serve(tmp_path, monkeypatch, tokenizer)
+    msgs = [
+        {"role": "system", "content": INSTRUCTIONS},
+        {"role": "developer", "content": BRIEF},
+        {"role": "user", "content": QUESTION},
+    ]
+    assert (
+        _post_chat(served, messages=msgs)
+        == f"<system>{INSTRUCTIONS}\n\n{BRIEF}<user>{QUESTION}<assistant>"
+    )
+    assert (
+        apply_chat_template(
+            model_type="llama",
+            tokenizer=tokenizer,
+            processor=None,
+            conversation=[dict(m) for m in msgs],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}, {}, {}],
+            tools=[],
+        )
+        == f"<system>{INSTRUCTIONS}<system>{BRIEF}<user>{QUESTION}<assistant>"
+    )
+    assert (
+        _post_chat(
+            served,
+            messages=msgs,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ping",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+        == f"<system>{INSTRUCTIONS}<developer>{BRIEF}<user>{QUESTION}<assistant>"
+    )
+
+
+def test_add_generation_prompt_flag_separates_probe_cache():
+    """Renderers differing by add_generation_prompt preserve developer content for both True/False."""
+
+    class _GenPromptDependentNative(_NativeRenderer):
+        def apply_chat_template(
+            self, conversation, tools=None, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self._record(conversation)
+            roles = ("system", "developer", "user") if add_generation_prompt else ("system", "user")
+            return "".join(
+                f"<{m['role']}>{m['content']}" for m in conversation if m["role"] in roles
+            )
+
+    msgs = [
+        {"role": "system", "content": INSTRUCTIONS},
+        {"role": "developer", "content": BRIEF},
+        {"role": "user", "content": QUESTION},
+    ]
+    native = _GenPromptDependentNative()
+    assert (
+        apply_chat_template(
+            model_type="llama",
+            tokenizer=native,
+            processor=None,
+            conversation=[dict(m) for m in msgs],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}, {}, {}],
+        )
+        == f"<system>{INSTRUCTIONS}<developer>{BRIEF}<user>{QUESTION}"
+    )
+    assert (
+        apply_chat_template(
+            model_type="llama",
+            tokenizer=native,
+            processor=None,
+            conversation=[dict(m) for m in msgs],
+            add_generation_prompt=False,
+            mm_placeholder_counts=[{}, {}, {}],
+        )
+        == f"<system>{INSTRUCTIONS}<system>{BRIEF}<user>{QUESTION}"
+    )
+
+    jinja_tmpl = (
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' -%}<|system|>{{ m.content }}"
+        "{%- elif add_generation_prompt and m.role == 'developer' -%}<|developer|>{{ m.content }}"
+        "{%- elif m.role == 'user' -%}<|user|>{{ m.content }}"
+        "{%- endif -%}{%- endfor -%}"
+    )
+    jinja_tok = _JinjaTokenizer(jinja_tmpl)
+    assert (
+        apply_chat_template(
+            model_type="llama",
+            tokenizer=jinja_tok,
+            processor=None,
+            conversation=[dict(m) for m in msgs],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}, {}, {}],
+            chat_template=jinja_tmpl,
+        )
+        == f"<|system|>{INSTRUCTIONS}<|developer|>{BRIEF}<|user|>{QUESTION}"
+    )
+    assert (
+        apply_chat_template(
+            model_type="llama",
+            tokenizer=jinja_tok,
+            processor=None,
+            conversation=[dict(m) for m in msgs],
+            add_generation_prompt=False,
+            mm_placeholder_counts=[{}, {}, {}],
+            chat_template=jinja_tmpl,
+        )
+        == f"<|system|>{INSTRUCTIONS}<|system|>{BRIEF}<|user|>{QUESTION}"
+    )
+
+
+def test_template_rendering_developer_only_at_index_zero_rewrites_nonleading_developer(
+    tmp_path, monkeypatch
+):
+    """A template rendering developer only at loop.first rewrites non-leading developer as system."""
+    first_only_dev = (
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' -%}<|system|>{{ m.content }}"
+        "{%- elif loop.first and m.role == 'developer' -%}<|developer|>{{ m.content }}"
+        "{%- elif m.role == 'user' -%}<|user|>{{ m.content }}"
+        "{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+    )
+    served = _serve(tmp_path, monkeypatch, _JinjaTokenizer(first_only_dev))
+
+    # Leading developer at index 0 stays developer unchanged
+    assert _post_chat(served) == f"<|developer|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+
+    # Responses [system(INSTRUCTIONS), developer(BRIEF), user(QUESTION)] rewrites non-leading dev
+    resp_prompt = _post_responses(served)
+    assert (
+        resp_prompt == f"<|system|>{INSTRUCTIONS}<|system|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+    )
+
+    # A template accepting developer before the first user but dropping late developer rewrites late
+    pre_user_dev = (
+        "{%- set ns = namespace(seen_user=false) -%}"
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' -%}<|system|>{{ m.content }}"
+        "{%- elif not ns.seen_user and m.role == 'developer' -%}<|developer|>{{ m.content }}"
+        "{%- elif m.role == 'user' -%}{%- set ns.seen_user = true -%}<|user|>{{ m.content }}"
+        "{%- elif m.role == 'assistant' -%}<|assistant|>{{ m.content }}"
+        "{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+    )
+    served_pre = _serve(tmp_path, monkeypatch, _JinjaTokenizer(pre_user_dev))
+    late_dev_prompt = _post_chat(
+        served_pre,
+        messages=[
+            {"role": "user", "content": "First."},
+            {"role": "assistant", "content": "Reply."},
+            {"role": "developer", "content": BRIEF},
+            {"role": "user", "content": QUESTION},
+        ],
+    )
+    assert (
+        late_dev_prompt
+        == f"<|user|>First.<|assistant|>Reply.<|system|>{BRIEF}<|user|>{QUESTION}<|assistant|>"
+    )
+
+
 def test_kimi_k3_renders_a_developer_message_as_system():
     """The Kimi-K3 checkpoint tokenizer, from LLM_MODELS_ROOT; skipped when it is not there."""
     request = chat_request(
