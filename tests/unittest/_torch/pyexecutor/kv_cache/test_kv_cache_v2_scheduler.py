@@ -6440,6 +6440,20 @@ class TestLongContextDemotionProbe:
         assert ids(out.context_requests) == [1, 2]
         assert self._probes_of(mgr, 0) == self._probes_of(mgr, 2) == 0
 
+    def test_probed_request_is_judged_by_its_remainder_once_started(self):
+        """The probe taken while a request waited is not reused once its prefill
+        has started: a short remainder keeps the request's arrival order."""
+        sched, mgr = self._make(reused={0: 0})
+        long_req = self._req(0, 10_000)
+        assert ids(sched.schedule_request([long_req], set()).context_requests) == [0]
+        assert sched._ctx_demote_probes == {0: 10_000}
+        long_req.context_current_position = 9_600
+        long_req.context_remaining_length = 400
+        long_req.is_first_context_chunk = False
+        out = sched.schedule_request([long_req, self._req(1, 256)], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert self._probes_of(mgr, 0) == 1
+
     def test_waiting_request_is_probed_again(self):
         """A request waiting for a prefix another request prefills is probed
         again once it stops waiting: its first probe predates that prefix."""
