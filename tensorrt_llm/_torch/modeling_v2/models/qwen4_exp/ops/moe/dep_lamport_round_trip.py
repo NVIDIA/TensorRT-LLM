@@ -36,7 +36,12 @@ Two slot protocols, chosen at build (`step`):
 
 * device counter (the GLM kernel's): every launch reads the slot from the state with an acquire
   load, every CTA waits for all of its threads to hold it, and the last CTA to arrive records the
-  slot's vector count and rotates the slot (acq_rel atomic, release stores).
+  slot's vector count and rotates the slot (acq_rel atomic, release stores). A launch re-arms the
+  slot of the launch before it (`_CLEAR_AHEAD`), for as many vectors as that launch's peers wrote
+  there. A peer can be one launch ahead of this rank, never two: its next launch publishes only
+  into the slot after this one, and its write into the re-armed slot belongs to the launch after
+  that, which cannot start before this rank's next launch has published, so after this launch
+  has completed. The next launch's slot is never re-armed while a peer can publish into it.
 * host index (`step=True`): the slot is `(state[1] + launch_index) mod 3`, `launch_index` the
   launch's ordinal on its workspace inside a region the host brackets (`LamportSteps`), baked into
   a captured graph; a 1-thread launch at the end of the region moves `state[1]` by the region's
@@ -71,6 +76,12 @@ from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: Rotating slots, bf16 lanes a vector (16 bytes), and the not-ready marker (bf16 -0.0).
 _PING_PONG = 3
+#: The slot a launch re-arms, after its own: `(slot + _CLEAR_AHEAD) mod 3`, the slot of the launch
+#: before it. Not 1: that is the next launch's slot, which a peer one launch ahead may already be
+#: publishing into, so a re-arm store with nothing ordering it before that publication (a
+#: clear-only thread when the row count shrinks, for one) could erase it and leave this rank's
+#: next launch polling for a vector no peer writes again.
+_CLEAR_AHEAD = 2
 _VEC = 8
 _ALIGN = 16
 _NEG_ZERO = -32768
@@ -254,7 +265,7 @@ def _round_trip_kernel(
         cute.arch.sync_threads()
     signal_i64 = cutlass.Int64(signal_i32)
     ping_slot = signal_i64 % _PING_PONG
-    clear_slot = (signal_i64 + cutlass.Int64(1)) % _PING_PONG
+    clear_slot = (signal_i64 + cutlass.Int64(_CLEAR_AHEAD)) % _PING_PONG
     ping_base = cutlass.Int64(ping_slot) * cutlass.Int64(WORLD_SIZE) * workspace_numel_i64
     clear_base = cutlass.Int64(clear_slot) * cutlass.Int64(WORLD_SIZE) * workspace_numel_i64
 
@@ -263,13 +274,14 @@ def _round_trip_kernel(
     for lane in cutlass.range_constexpr(_VEC):
         neg_zero_vec[lane] = neg_zero_bits.bitcast(cutlass.BFloat16)
 
-    # Re-arm the slot the launch after next uses, for as many vectors as its last user's
-    # peers wrote into it.
+    # Re-arm the previous launch's slot (`_CLEAR_AHEAD`), for as many vectors as its peers wrote
+    # into it: every peer finished writing it before this rank's previous launch completed, and
+    # none writes it again before this rank's next launch has published.
     clear_count_ptr = (
         signal_state.iterator + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX) + cutlass.Int64(clear_slot)
     ).llvm_ptr
     if cutlass.const_expr(STEP):
-        # Written two launches earlier on this workspace, by a completed grid.
+        # Written by the previous launch on this workspace, a completed grid.
         clear_vectors = cute.arch.load(clear_count_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
     else:
         clear_vectors = cute.arch.load(clear_count_ptr, cutlass.Int32, sem="acquire", scope="gpu")
@@ -403,7 +415,7 @@ def _round_trip_kernel(
 
     if cutlass.const_expr(STEP):
         # Every vector was re-armed by its reader: the slot's count is 0, a plain store by CTA 0,
-        # read two launches later by the re-arm pass.
+        # read by the next launch's re-arm pass.
         if bidx + tidx == 0:
             slot_count_ptr = (
                 signal_state.iterator
