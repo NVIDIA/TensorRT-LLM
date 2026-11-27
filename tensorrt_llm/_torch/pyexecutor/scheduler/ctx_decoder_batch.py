@@ -139,6 +139,11 @@ def install_ctx_decoder_batch(executor) -> Optional[CtxDecoderBatcher]:
         return None
     model = getattr(engine.model, "model", None)
     window = getattr(model, "decoder_replay_window", 0)
+    draft = getattr(engine.model, "draft_model", None)
+    supports_final_window = getattr(draft, "supports_final_window_context_replay", None)
+    final_window_draft = callable(supports_final_window) and supports_final_window(
+        scheduler.kv_cache_manager
+    )
     if not (
         executor.dist.tp_size > 1
         and executor.dist.pp_size == 1
@@ -147,7 +152,7 @@ def install_ctx_decoder_batch(executor) -> Optional[CtxDecoderBatcher]:
         and getattr(model, "decoder_replay_split", None) is not None
         and isinstance(window, int)
         and window > 0
-        and engine.spec_config is None
+        and (engine.spec_config is None or final_window_draft)
     ):
         return None
     logger.info(f"Context decoder-tail batching: holds up to {HOLD_MAX_ROWS} rows, window {window}")

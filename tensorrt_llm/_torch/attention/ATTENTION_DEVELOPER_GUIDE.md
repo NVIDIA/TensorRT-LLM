@@ -493,12 +493,17 @@ reuse is enabled (Encoder SWA is `PRIVATE` when reuse is disabled):
 | GLOBAL main/index | KV-source layers; 288-byte main and 68-byte index records sharing physical pages | `REQUIRED` |
 | Encoder SWA | Per layer; 528-byte E4M3 rows | `REQUIRED`, or `OPTIONAL` with Encoder replay |
 | Decoder SWA | Per layer; same row format | `PRIVATE` for eligible bounded replay; ordinary lifecycle for full prefill |
+| Embedded DSpark draft KV | One BF16 key buffer per draft stage in the target manager | `PRIVATE` with decoder bounded replay, `REQUIRED` otherwise |
 | Ratio-two compressor state | Source owners; FP32 partial-group values/scores | Managed with the owner's page lifecycle |
 
 `CSA2TrtllmMetadata.prepare()` publishes owner tables, compression inputs,
 visibility and SWA read/write slots. Live accepted-length updates refresh
 captured buffers in place. Graph clones share reserved index arenas and query
 tiles; eager shape eviction must preserve every graph-owned allocation.
+
+Context workers seed the draft pages from captured target hidden states, and
+generation uses the draft page table. Native transfer carries these pages
+unless remote-tail generation rebuilds the draft KV locally.
 
 #### 3.2.1 Common paged-KV model
 

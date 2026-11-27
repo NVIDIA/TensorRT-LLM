@@ -27,13 +27,18 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy, _introspection
 
 pytestmark = skip_pre_blackwell
 
@@ -46,6 +51,7 @@ def _managers(
     *,
     reuse: bool = False,
     remote_tail: bool = False,
+    draft_stages: int = 0,
 ) -> list[CSA2CacheManager]:
     assert pp == 1  # CSA2 PP remains explicitly unsupported.
     return [
@@ -63,6 +69,20 @@ def _managers(
             layout=layout,
             is_disagg=True,
             bounded_replay_on_generation=remote_tail,
+            layer_specs=[
+                KVCacheLayerSpec(
+                    global_layer_id=len(layout.compress_ratios) + stage,
+                    owner=KVCacheLayerOwner.DRAFT,
+                    dtype=DataType.BF16,
+                    num_kv_heads=1,
+                    head_dim=512,
+                    buffer_roles=(Role.KEY,),
+                    sliding_window_size=129,
+                    reuse_policy=ReusePolicy.PRIVATE,
+                )
+                for stage in range(draft_stages)
+            ]
+            or None,
         )
         for rank in range(tp)
     ]
@@ -192,6 +212,55 @@ def test_csa2_shared_owner_kv_transfer(
     )
 
 
+@pytest.mark.parametrize("ctx_tp,gen_tp", [(1, 2), (2, 1)])
+def test_csa2_shared_draft_kv_handoff(monkeypatch, ctx_tp, gen_tp):
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)
+
+    def verify(**kwargs):
+        _verify(**kwargs)
+        lengths = kwargs["request_lengths"]
+        ctx_managers, gen_managers = kwargs["ctx_managers"], kwargs["gen_managers"]
+        ctx_ids, gen_ids = kwargs["ctx_request_ids"], kwargs["gen_request_ids"]
+        for target in gen_managers:
+            target.compute_batch_page_tables(gen_ids, 0)
+        for row, length in enumerate(lengths):
+            source = ctx_managers[0]
+            for target in gen_managers:
+                for layer in target.draft_layer_ids:
+                    src_pages = source.get_batch_cache_indices([ctx_ids[row]], layer)[0]
+                    dst_pages = target.get_batch_cache_indices([gen_ids[row]], layer)[0]
+                    converted = target.draft_page_table()[row, : len(dst_pages)]
+                    torch.testing.assert_close(
+                        converted,
+                        torch.tensor(dst_pages, dtype=torch.int32, device=converted.device),
+                        rtol=0,
+                        atol=0,
+                    )
+                    src = source.get_buffers(layer, kv_layout="HND")
+                    dst = target.get_buffers(layer, kv_layout="HND")
+                    first = max(0, length + 1 - 129) // TOKENS_PER_BLOCK
+                    end = (length + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+                    for logical in range(first, end):
+                        assert src_pages[logical] >= 0 and dst_pages[logical] >= 0
+                        torch.testing.assert_close(
+                            dst[dst_pages[logical]], src[src_pages[logical]], rtol=0, atol=0
+                        )
+
+    run_kv_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=1,
+        gen_tp=gen_tp,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        update_before_transfer=True,
+        manager_factory=functools.partial(_managers, layout=layout, draft_stages=3),
+        init_fn=_init_csa2_pool_data,
+        verify_fn=verify,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ctx_tp,gen_tp", [(1, 1), (2, 1), (1, 2)])
 @pytest.mark.parametrize(
@@ -220,8 +289,13 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
     replay_window = 140
     layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)
     reuse = policy != "required-no-reuse"
-    ctx_managers = _managers(ctx_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail)
-    gen_managers = _managers(gen_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail)
+    draft_stages = 3 if policy == "hit" and not remote_tail and ctx_tp == gen_tp == 1 else 0
+    ctx_managers = _managers(
+        ctx_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail, draft_stages=draft_stages
+    )
+    gen_managers = _managers(
+        gen_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail, draft_stages=draft_stages
+    )
     ctx_tcs, gen_tcs = [], []
     cached_tokens = 256
     prompt_len = cached_tokens + 1 + (replay_window if remote_tail else 0)
@@ -250,6 +324,11 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
             for logical, page in enumerate(pages[:end]):
                 if page >= 0:
                     data[page].view(torch.uint8).fill_((virtual_layer * 17 + logical + 1) % 251)
+        for stage, layer in enumerate(manager.draft_layer_ids):
+            data = manager.get_buffers(layer, kv_layout="HND")
+            for logical, page in enumerate(manager.get_batch_cache_indices([req_id], layer)[0]):
+                if page >= 0:
+                    data[page].view(torch.uint8).fill_(151 + stage * 17 + logical)
 
     try:
         ctx_req = request(0, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
@@ -303,6 +382,11 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
                         or logical >= cached_tokens // TOKENS_PER_BLOCK
                         or (remote_tail and role == CSA2CacheRole.SWA and layer >= 3)
                     ):
+                        data[page].zero_()
+            for layer in manager.draft_layer_ids:
+                data = manager.get_buffers(layer, kv_layout="HND")
+                for page in manager.get_batch_cache_indices([1], layer)[0]:
+                    if page >= 0:
                         data[page].zero_()
 
         config = CacheTransceiverConfig(
@@ -366,6 +450,22 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
             [1],
             remote_tail_split=3 if remote_tail else None,
         )
+        if draft_stages:
+            source = ctx_managers[0]
+            first = max(0, prompt_len + 1 - 129) // TOKENS_PER_BLOCK
+            end = (prompt_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+            for target in gen_managers:
+                for layer in target.draft_layer_ids:
+                    src_pages = source.get_batch_cache_indices([0], layer)[0]
+                    dst_pages = target.get_batch_cache_indices([1], layer)[0]
+                    src = source.get_buffers(layer, kv_layout="HND")
+                    dst = target.get_buffers(layer, kv_layout="HND")
+                    for logical in range(first, end):
+                        assert src_pages[logical] >= 0 and dst_pages[logical] >= 0
+                        assert torch.count_nonzero(src[src_pages[logical]]) > 0
+                        torch.testing.assert_close(
+                            dst[dst_pages[logical]], src[src_pages[logical]], rtol=0, atol=0
+                        )
     finally:
         for tc in ctx_tcs + gen_tcs:
             tc.shutdown()

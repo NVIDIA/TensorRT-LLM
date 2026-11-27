@@ -1525,14 +1525,16 @@ class KvCacheCreator:
                            self._kv_cache_config)
         if tokens_per_block is None:
             tokens_per_block = self._tokens_per_block
-        if not is_draft and self._should_unify_dflash_kv_cache():
-            extra_kwargs = dict(extra_kwargs)
-            extra_kwargs[
-                "layer_specs"] = self._build_unified_dflash_layer_specs(
-                    kv_cache_config)
-            extra_kwargs.update(
-                shared_draft_block_width=self._unified_drafter_block_width())
         if not is_draft:
+            draft_specs = self._get_embedded_draft_layer_specs()
+            if draft_specs:
+                extra_kwargs["layer_specs"] = draft_specs
+            elif self._should_unify_dflash_kv_cache():
+                extra_kwargs[
+                    "layer_specs"] = self._build_unified_dflash_layer_specs(
+                        kv_cache_config)
+                extra_kwargs["shared_draft_block_width"] = (
+                    self._unified_drafter_block_width())
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
             if derived_windows is not None:
@@ -2091,6 +2093,16 @@ class KvCacheCreator:
                     # A hybrid manager's appended draft layers.
                     num_pool_groups += _get_num_storage_pool_groups(
                         unified_layer_specs, self._tokens_per_block)
+            embedded_draft_specs = self._get_embedded_draft_layer_specs()
+            if (embedded_draft_specs and not self._kv_cache_manager_cls.
+                    draft_layers_share_pool_group(
+                        self._model_engine.model.model_config,
+                        self._mapping,
+                        tokens_per_block=self._tokens_per_block,
+                        spec_config=spec_cfg,
+                        kv_cache_config=self._kv_cache_config,
+                        layer_specs=embedded_draft_specs)):
+                num_pool_groups += 1
         num_cache_blocks *= num_pool_groups
 
         # Dummy context requests use the configured maximum beam width. Scale
@@ -2674,32 +2686,33 @@ class KvCacheCreator:
         # only be in the separate draft KV cache manager.
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
         spec_dec_layer_mask = None
-        if self._should_create_separate_draft_kv_cache():
+        draft_specs = self._get_embedded_draft_layer_specs()
+        if self._should_create_separate_draft_kv_cache() or draft_specs:
             num_target_layers = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        self._check_shared_draft_kv_request()
         unified_layer_specs = None
         shared_draft_block_width = None
-        if self._should_unify_dflash_kv_cache():
-            unified_layer_specs = self._build_unified_dflash_layer_specs(
-                kv_cache_config)
-            shared_draft_block_width = self._unified_drafter_block_width()
-            logger.info(
-                f"{self._unified_drafter_name()}: target and draft KV layers "
-                "share one KV cache manager "
-                f"({len(unified_layer_specs)} layers, disagg={self._is_disagg})."
-            )
-        elif (self._is_disagg and
-              os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in ("1", "auto")):
-            # The request check above only rejects the variable set to 1 with a
-            # drafter that can share; everything else resolves quietly.
-            logger.info(
-                f"TRTLLM_DISAGG_SHARED_DRAFT_KV="
-                f"{os.environ['TRTLLM_DISAGG_SHARED_DRAFT_KV']} resolved to a "
-                f"separate draft KV cache, because {self._dflash_unify_blocker()}."
-            )
+        if not draft_specs:
+            self._check_shared_draft_kv_request()
+            if self._should_unify_dflash_kv_cache():
+                unified_layer_specs = self._build_unified_dflash_layer_specs(
+                    kv_cache_config)
+                shared_draft_block_width = self._unified_drafter_block_width()
+                logger.info(
+                    f"{self._unified_drafter_name()}: target and draft KV layers "
+                    "share one KV cache manager "
+                    f"({len(unified_layer_specs)} layers, disagg={self._is_disagg})."
+                )
+            elif (self._is_disagg
+                  and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+                  in ("1", "auto")):
+                logger.info(
+                    f"TRTLLM_DISAGG_SHARED_DRAFT_KV="
+                    f"{os.environ['TRTLLM_DISAGG_SHARED_DRAFT_KV']} resolved to a "
+                    f"separate draft KV cache, because {self._dflash_unify_blocker()}."
+                )
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=self._model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -2727,7 +2740,7 @@ class KvCacheCreator:
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
-            layer_specs=unified_layer_specs,
+            layer_specs=draft_specs or unified_layer_specs,
             shared_draft_block_width=shared_draft_block_width,
             remote_donor=remote_donor,
         )
@@ -2746,6 +2759,26 @@ class KvCacheCreator:
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
+
+    def _get_embedded_draft_layer_specs(self) -> tuple[KVCacheLayerSpec, ...]:
+        """Describe the context KV read by the embedded CSA2 DSpark drafter."""
+        if getattr(getattr(self, "_sparse_attention_config", None), "algorithm",
+                   None) != "csa2":
+            return ()
+        spec = self._speculative_config
+        if (spec is None or not spec.spec_dec_mode.is_dspark()
+                or not spec.draft_is_embedded_in_target):
+            return ()
+        if not self._is_kv_cache_manager_v2:
+            raise ValueError(
+                "Embedded CSA2 DSpark requires KV cache manager V2")
+        if not self._kv_cache_manager_cls.accepts_appended_draft_layers():
+            raise ValueError(
+                "The target KV cache manager cannot hold draft layers")
+        draft = self._model_engine.model.draft_model
+        first_layer = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
+        return draft.managed_context_layer_specs(first_layer,
+                                                 self._tokens_per_block)
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
@@ -2787,11 +2820,7 @@ class KvCacheCreator:
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
     def _unified_drafter_attention_backend(self) -> Optional[str]:
-        """Resolved block-attention backend of a drafter that reads paged draft KV.
-
-        None for every other drafter. That includes the embedded DSpark draft,
-        whose context lives in a worker-owned rolling window.
-        """
+        """Resolved block-attention backend for DFlash or standalone DSpark."""
         spec_config = self._speculative_config
         spec_dec_mode = spec_config.spec_dec_mode
         if spec_dec_mode.is_dflash():
@@ -2811,9 +2840,8 @@ class KvCacheCreator:
         """The loaded standalone DSpark drafter, whose declarations decide how
         it reads its context, or None.
 
-        DFlash keeps its configured backend. An embedded DSpark draft is not a
-        ``DFlashForCausalLM`` and declares nothing: its context lives in a
-        worker-owned rolling window.
+        DFlash keeps its configured backend. Embedded CSA2 DSpark declares its
+        layers through ``_get_embedded_draft_layer_specs``.
         """
         spec_config = self._speculative_config
         spec_dec_mode = spec_config.spec_dec_mode
@@ -4823,7 +4851,6 @@ def _create_kv_cache_manager(
             head_dim = getattr(config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = hidden_size // num_attention_heads
-
     # Derive per-layer max_attention_window for any model that publishes a
     # mixed sliding/full `layer_types` schedule (Gemma4 hybrid included) so V2
     # creates separate pool groups for sliding vs full-attention layers;

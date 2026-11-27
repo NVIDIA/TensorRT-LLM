@@ -211,18 +211,28 @@ def test_rank_info_represents_cache_element_bytes(
 
 
 @pytest.mark.parametrize(
-    ("shares_draft_layers", "draft_layer_ids", "hosts", "expected", "reshards"),
+    (
+        "shares_draft_layers",
+        "draft_layer_ids",
+        "hosts",
+        "ignored_roles",
+        "draft_roles",
+        "expected",
+        "reshards",
+    ),
     [
-        (False, (), False, 0, False),
+        (False, (), False, (), ("key",), 0, False),
         # Folded MTP/Eagle draft layers have no explicit storage and travel as
         # ordinary layers, so they are not advertised.
-        (False, (36,), False, 0, False),
+        (False, (36,), False, (), ("key",), 0, False),
         # Explicit draft layers: a plain manager's layer specs or the layers a
         # hybrid manager appends.
-        (True, (36, 37), False, 2, False),
+        (True, (36, 37), False, (), ("key",), 2, False),
         # A manager hosting the draft layers reshards them across attention TP.
-        (True, (36, 37), True, 2, True),
-        (False, (36, 37), True, 0, False),
+        (True, (36, 37), True, (), ("key",), 2, True),
+        (False, (36, 37), True, (), ("key",), 0, False),
+        (True, (36, 37), True, ("key",), ("key",), 0, False),
+        (True, (36, 37), True, ("key",), ("key", "value"), 2, True),
     ],
 )
 def test_from_kv_cache_manager_reports_unified_draft_layers(
@@ -230,6 +240,8 @@ def test_from_kv_cache_manager_reports_unified_draft_layers(
     shares_draft_layers: bool,
     draft_layer_ids: tuple,
     hosts: bool,
+    ignored_roles: tuple[str, ...],
+    draft_roles: tuple[str, ...],
     expected: int,
     reshards: bool,
 ) -> None:
@@ -256,6 +268,8 @@ def test_from_kv_cache_manager_reports_unified_draft_layers(
         hosts_unified_draft_layers=hosts,
     )
     manager.get_draft_kv_cache_view = lambda: manager if shares_draft_layers else None
+    manager.get_disagg_ignored_roles = lambda: ignored_roles
+    manager.get_layer_buffer_roles = lambda _: draft_roles
     # The drafter declares an FP8 pool (draft_kv_dtype); the target keeps HALF.
     manager.get_layer_dtype = lambda layer_id: bindings.DataType.FP8
 

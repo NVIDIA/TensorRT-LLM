@@ -32,8 +32,12 @@ from tensorrt_llm.mapping import Mapping
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("enabled", [False, True], ids=["off", "on"])
-def test_decoder_input_preparer_loads_cost_table_for_live_setup(monkeypatch, enabled):
+@pytest.mark.parametrize(
+    "enabled, role",
+    [(False, "generation"), (True, "generation"), (True, "context")],
+    ids=["off", "gen", "ctx"],
+)
+def test_decoder_input_preparer_loads_cost_table_for_live_setup(monkeypatch, enabled, role):
     from tensorrt_llm.version import __version__ as trtllm_version
 
     buffers = SimpleNamespace(
@@ -41,6 +45,8 @@ def test_decoder_input_preparer_loads_cost_table_for_live_setup(monkeypatch, ena
         gather_ids_cuda=torch.empty(1, dtype=torch.int32, device="cpu"),
     )
     spec_config = SimpleNamespace(
+        draft_is_embedded_in_target=True,
+        spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
         enable_confidence_scheduling=enabled,
         enable_fused_confidence_scheduler=False,
         confidence_cost_table_path="costs.json",
@@ -63,23 +69,26 @@ def test_decoder_input_preparer_loads_cost_table_for_live_setup(monkeypatch, ena
     monkeypatch.setattr(torch.cuda, "get_device_name", device_name)
     monkeypatch.setattr(inputs_module, "prefer_pinned", lambda: False)
     monkeypatch.setattr(inputs_module.spec_step_copies, "is_supported", lambda: False)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
+    model = torch.nn.Identity()
 
     preparer = inputs_module.DecoderInputPreparer(
         buffers=buffers,
         config=config,
         mapping=mapping,
         dist=None,
-        model=torch.nn.Identity(),
+        model=model,
         get_runtime_tokens_per_gen_step=lambda _draft_len: 5,
         iter_states={},
         lora=None,
         use_beam_search=False,
         steady_gen_cache_supported=False,
+        dspark_context_worker=role == "context",
     )
 
     assert preparer._buffers is buffers
     assert preparer._gather_ids_buffer.tensor is buffers.gather_ids_cuda
-    if not enabled:
+    if not enabled or role == "context":
         load_table.assert_not_called()
         device_name.assert_not_called()
         assert preparer._dspark_sps_cost_table is None

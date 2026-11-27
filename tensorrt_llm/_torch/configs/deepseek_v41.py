@@ -592,6 +592,17 @@ def disagg_context_decoder_skipping_enabled(bounded_replay_on_generation: bool) 
     )
 
 
+def disagg_context_draft_kv_only_enabled(spec_config) -> bool:
+    """Whether an explicitly designated context worker only seeds embedded DSpark KV."""
+    mode = getattr(spec_config, "spec_dec_mode", None)
+    return (
+        os.environ.get("TRTLLM_DISAGG_ROLE") == "context"
+        and mode is not None
+        and mode.is_dspark()
+        and getattr(spec_config, "draft_is_embedded_in_target", False)
+    )
+
+
 def layout_for_role(
     role: str,
     quantization_config: Optional[Dict[str, Any]] = None,

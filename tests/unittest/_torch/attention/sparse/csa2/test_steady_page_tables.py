@@ -23,6 +23,11 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Trtl
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
@@ -34,6 +39,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 DRAFT_LEN = 5
 BLOCK = 128
@@ -45,8 +51,11 @@ skip_pre_blackwell = pytest.mark.skipif(
 )
 
 
-def _manager(attention_dp, disaggregated, scratch, block=BLOCK):
-    return CSA2CacheManager(
+def _manager(attention_dp, disaggregated, scratch, block=BLOCK, *, draft_stages=0):
+    spec_config = DSparkDecodingConfig(max_draft_len=DRAFT_LEN)
+    if draft_stages:
+        spec_config.__dict__["draft_is_embedded_in_target"] = True
+    manager = CSA2CacheManager(
         KvCacheConfig(
             max_gpu_total_bytes=512 << 20,
             host_cache_size=0,
@@ -65,8 +74,26 @@ def _manager(attention_dp, disaggregated, scratch, block=BLOCK):
         dtype=DataType.BF16,
         vocab_size=8192,
         layout=CSA2Layout((0, 2, 2, 1), (1, 3), (1, 3), window_size=128, index_topk=4),
-        spec_config=DSparkDecodingConfig(max_draft_len=DRAFT_LEN),
+        pretrained_config=SimpleNamespace(sliding_window=128),
+        spec_config=spec_config,
+        layer_specs=[
+            KVCacheLayerSpec(
+                global_layer_id=4 + stage,
+                owner=KVCacheLayerOwner.DRAFT,
+                dtype=DataType.BF16,
+                num_kv_heads=1,
+                head_dim=512,
+                buffer_roles=(Role.KEY,),
+                sliding_window_size=129,
+                reuse_policy=ReusePolicy.PRIVATE,
+            )
+            for stage in range(draft_stages)
+        ]
+        or None,
     )
+    for layer_id in manager.draft_layer_ids:
+        assert manager.get_layer_cache_spec(layer_id).reuse_policy is ReusePolicy.PRIVATE
+    return manager
 
 
 def _metadata(manager):
@@ -168,6 +195,9 @@ def _forward_inputs(metadata, count):
         "block_offsets": metadata.kv_cache_block_offsets[:, :count],
         "positions": metadata.csa2_positions,
     }
+    draft = metadata.kv_cache_manager.draft_page_table()
+    if draft is not None:
+        outputs["draft_pages"] = draft[:count]
     for name in (
         "csa2_global_page_tables",
         "_csa2_swa_page_tables",
@@ -462,7 +492,9 @@ def test_steady_decode_reuses_converted_tables(
 ):
     rng = random.Random(seed)
     conversions = _counted_conversions(monkeypatch)
-    manager = _manager(attention_dp, disaggregated, scratch, block)
+    manager = _manager(
+        attention_dp, disaggregated, scratch, block, draft_stages=3 if attention_dp else 0
+    )
     reusing, converting = _Executor(manager), _Executor(manager)
     active, pending, padding = [], {}, None
     next_id, previous_ids = 1, None
@@ -513,6 +545,16 @@ def test_steady_decode_reuses_converted_tables(
             if tables[2] is not None:
                 assert np.array_equal(tables[2], expected_tables[2])
             _assert_identical(observed, expected, step)
+            if "draft_pages" in observed and transient is None:
+                pages = manager.get_batch_cache_indices(
+                    [batch[0].py_request_id], manager.draft_layer_ids[0]
+                )[0]
+                mapped = next(column for column, page in enumerate(pages) if page >= 0)
+                unmapped = next(
+                    (column for column, page in enumerate(pages) if page < 0), len(pages)
+                )
+                assert observed["draft_pages"][0, mapped].item() == pages[mapped]
+                assert observed["draft_pages"][0, unmapped].item() == -1
             ids = [r.py_request_id for r in batch]
             stats["steps"] += 1
             stats["skipped"] += not converted
@@ -535,6 +577,46 @@ def test_steady_decode_reuses_converted_tables(
     finally:
         for request in [*active, *([padding] if padding else [])]:
             manager.free_resources(request)
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+@torch.inference_mode()
+def test_draft_conversion_keeps_holes_with_scratch_enabled():
+    manager = _manager(False, True, True, 2 * BLOCK, draft_stages=3)
+    try:
+        _admit(manager, 1, 300)
+        params = manager._device_batch_page_params
+        host = params.cpu()
+        draft = manager._draft_page_table_index
+        scratch_table = next(index for index, row in enumerate(host) if row[4] > 0)
+        base = torch.full((int(host[:, 0].max()) + 1, 1, 3), -1, dtype=torch.int32, device="cuda")
+        base[:, :, 0] = 7
+        rows = torch.zeros(1, dtype=torch.int32, device="cuda")
+        ranges = torch.tensor(
+            [[[1, 2]]] * (int(host[:, 3].max()) + 1), dtype=torch.int32, device="cuda"
+        )
+        slots = torch.full((*ranges.shape[:2], 1), 23, dtype=torch.int32, device="cuda")
+        out = torch.empty((len(host), 1, 3), dtype=torch.int32, device="cuda")
+        kernel.convert_page_tables(base, rows, params, out, -1, ranges, slots)
+        assert out[draft, 0, 1].item() == -1
+        assert (
+            out[scratch_table, 0, 1].item() == 23 * host[scratch_table, 1] + host[scratch_table, 2]
+        )
+        _admit(manager, 2, 900)
+        manager.compute_batch_page_tables([1], 0)
+        table = manager.draft_page_table()
+        original = table[0].clone()
+        assert manager.compute_batch_page_tables([1], 0) is None
+        pages = manager.get_batch_cache_indices([2], manager.draft_layer_ids[0])[0]
+        assert len(pages) > manager.kv_cache_map[1].num_blocks
+        # A fallback batch shares the graph-stable table address with the next conversion.
+        with manager.overwrite_draft_page_table(1):
+            table[0, : len(pages)] = torch.tensor(pages, device=table.device, dtype=table.dtype)
+        assert not manager.draft_page_table_prepared([1])
+        assert manager.compute_batch_page_tables([1], 0) is not None
+        torch.testing.assert_close(table[0], original)
+    finally:
         manager.shutdown()
 
 

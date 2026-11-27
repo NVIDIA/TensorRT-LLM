@@ -3337,6 +3337,10 @@ def _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, *,
     for role in ("context_servers", "generation_servers"):
         config[role] = model_kwargs(attention_dp=attention_dp) | {
             "num_instances": 1,
+            "speculative_config": {
+                "decoding_type": "DSpark",
+                "max_draft_len": 5,
+            },
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
@@ -3349,12 +3353,7 @@ def _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, *,
         # keeps the V2 suspend/resume path available without oversubscribing.
         config[role]["kv_cache_config"]["host_cache_size"] = 2 * (1 << 30)
     config["context_servers"].update(cuda_graph_config=None,
-                                     disable_overlap_scheduler=True,
-                                     speculative_config=None)
-    config["generation_servers"]["speculative_config"] = {
-        "decoding_type": "DSpark",
-        "max_draft_len": 5,
-    }
+                                     disable_overlap_scheduler=True)
     config_path = tmp_path / "disagg.yaml"
     config_path.write_text(yaml.safe_dump(config))
     metrics_dir, transfer_dir = str(tmp_path / "metrics"), str(tmp_path /

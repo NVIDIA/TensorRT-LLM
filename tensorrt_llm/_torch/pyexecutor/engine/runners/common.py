@@ -213,6 +213,20 @@ def get_top_level_model(model: Any) -> Any:
     return getattr(top_level_model, "_orig_mod", top_level_model)
 
 
+def get_speculative_model(model: Any) -> Any:
+    """Find the model that owns the embedded speculative worker."""
+    model = getattr(model, "_orig_mod", model)
+    for attribute in ("language_model", "llm"):
+        if hasattr(model, "spec_worker"):
+            break
+        try:
+            model = getattr(model, attribute, model)
+        except NotImplementedError:
+            # Some multimodal wrappers expose their model as `llm` instead.
+            continue
+    return model
+
+
 def get_position_id_offset(model: Any) -> int:
     offset = getattr(get_top_level_model(model), "position_id_offset", 0)
     return 0 if offset is None else int(offset)

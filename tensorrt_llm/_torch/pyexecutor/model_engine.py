@@ -670,6 +670,10 @@ class ModelEngine:
         return isinstance(self._runner, DecoderRunner) and self._runner.steady_mtp_reads_output_rows
 
     @property
+    def _dspark_context_worker(self) -> bool:
+        return isinstance(self._runner, DecoderRunner) and self._runner._dspark_context_worker
+
+    @property
     def _dspark_confidence_enabled(self) -> bool:
         return isinstance(self._runner, DecoderRunner) and self._runner._dspark_confidence_enabled
 

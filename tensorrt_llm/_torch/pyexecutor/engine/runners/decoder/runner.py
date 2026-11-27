@@ -86,7 +86,7 @@ from tensorrt_llm.mapping import Mapping
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...model_call import ModelCaller
 from ...multimodal import MultimodalItemScheduler
-from ..common import make_scheduled_inputs
+from ..common import get_speculative_model, make_scheduled_inputs
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
@@ -186,6 +186,7 @@ class DecoderRunner(ScheduledModelRunner):
     # Whether a batch may keep the greedy tokens a forward sampled in place of the logits. False when the executor
     # runs a guided decoder, which reads the logits of every batch.
     keep_greedy_only_outputs = True
+    _draft_context_preparer = None
 
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
@@ -212,6 +213,14 @@ class DecoderRunner(ScheduledModelRunner):
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self._model = model
+        speculative_model = get_speculative_model(model)
+        worker = getattr(speculative_model, "spec_worker", None)
+        prepare_context = getattr(worker, "prepare_draft_context", None)
+        if prepare_context is not None:
+            self._draft_context_preparer = (
+                prepare_context,
+                speculative_model.draft_model,
+            )
         if config.compile_only_piecewise_graphs:
             assert isinstance(model, DecoderModelForCausalLM), (
                 "compile_only_piecewise_graphs requires DecoderModelForCausalLM"
@@ -404,6 +413,11 @@ class DecoderRunner(ScheduledModelRunner):
             steady_gen_cache_supported=self._steady_gen_cache_supported,
             mm_item_scheduler=mm_item_scheduler,
             host_uploader=self._host_uploader,
+            dspark_context_worker=(
+                self._draft_context_preparer is not None
+                and getattr(self._draft_context_preparer[1], "is_dspark_context_worker", False)
+                is True
+            ),
         )
 
     def _cuda_graphs_kwargs(self) -> dict[str, Any]:
@@ -689,6 +703,12 @@ class DecoderRunner(ScheduledModelRunner):
         is_dummy: bool,
     ) -> Any:
         scheduled_requests = forward_inputs.batch
+        if (
+            getattr(self._inputs, "_dspark_context_worker", False)
+            and not is_dummy
+            and any(not request.is_dummy for request in scheduled_requests.generation_requests)
+        ):
+            raise RuntimeError("A V4.1 DSpark context worker cannot serve generation requests")
         new_tensors_device = forward_inputs.new_tensors_device
         cache_indirection_buffer = forward_inputs.cache_indirection_buffer
         gather_context_logits = forward_inputs.gather_context_logits
@@ -900,6 +920,9 @@ class DecoderRunner(ScheduledModelRunner):
                     is_dummy=is_dummy,
                     gather_context_logits=gather_context_logits,
                 )
+            if enable_spec_decode and self._draft_context_preparer is not None:
+                prepare_context, draft_model = self._draft_context_preparer
+                prepare_context(draft_model, spec_metadata, attn_metadata, resource_manager)
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
             if moe_warmup_placement.active() and not torch.cuda.is_current_stream_capturing():
@@ -1375,6 +1398,10 @@ class DecoderRunner(ScheduledModelRunner):
     # Scheduler-facing state stays on the input owner that stages each layout.
 
     @property
+    def _dspark_context_worker(self) -> bool:
+        return getattr(self._inputs, "_dspark_context_worker", False) is True
+
+    @property
     def _dspark_confidence_enabled(self):
         return self._inputs._dspark_confidence_enabled
 
@@ -1427,4 +1454,4 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _get_spec_worker(self):
         """Return the one-model speculative worker when it is initialized."""
-        return getattr(self._model, "spec_worker", None)
+        return getattr(get_speculative_model(self._model), "spec_worker", None)

@@ -401,6 +401,44 @@ generation_servers:
 A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
 ```
 
+### DeepSeek-V4.1 DSpark context KV
+
+For ordinary native KV transfer, enable the same DSpark configuration on both
+context and generation workers, with KV cache manager V2 and the Python/NIXL
+transceiver:
+
+```yaml
+context_servers:
+  speculative_config: &dspark
+    decoding_type: DSpark
+    max_draft_len: 5
+  cache_transceiver_config: &transceiver
+    backend: NIXL
+    transceiver_runtime: PYTHON
+generation_servers:
+  speculative_config: *dspark
+  cache_transceiver_config: *transceiver
+```
+
+The context worker computes draft KV, and generation reads those pages directly
+from the target's KV cache manager after transfer. With decoder bounded replay,
+the pages are request-private and context rebuilds the retained draft window
+after a prefix hit. With decoder bounded replay disabled, the draft pages
+can participate in prefix reuse.
+
+Launch context ranks with `--server_role context`, or set
+`TRTLLM_DISAGG_ROLE=context` before creating a context worker in Python or when
+launching the ranks separately. Without an MoE load balancer
+(`moe_config.load_balancer`), context workers omit the draft head and MoE weights.
+DeepSeek-V4.1 DSpark does not support confidence scheduling.
+
+With `bounded_replay_on_generation: false` (the default), a generation-only
+DSpark configuration leaves the prompt's draft KV unset. Native transfer rejects
+the mismatched layout at handoff. To migrate, enable the same DSpark configuration
+on both roles or disable it on both, and run the same TensorRT-LLM release on every
+worker. Restart generation workers after updating the context workers because
+generation caches the failed handshake per context endpoint.
+
 ### DeepSeek-V4.1 context decoder weights
 
 Set `bounded_replay_on_generation: true` at the top level of the

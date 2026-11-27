@@ -1240,6 +1240,21 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             and (num_tokens <= MMA_SYNC_MAX_TOKENS or self._mhc_fused_allreduce() is None)
         )
 
+    def _capture_pass_rows(self, residual: torch.Tensor, live: PassRows) -> None:
+        """Capture live decoder rows into this forward's speculative buffer."""
+
+        def capture(states: torch.Tensor) -> None:
+            metadata = live.spec_metadata
+            if not live.rows or metadata is None:
+                return
+            metadata.maybe_capture_hidden_states(
+                self.layer_idx,
+                states[: live.rows].reshape(live.rows, -1),
+                row_indices=live.attn_metadata.csa2_replay_query_rows,
+            )
+
+        eager_on_graph(capture)(residual)
+
     def _mhc_fused_allreduce(self):
         """Workspace for split boundaries that all-reduce the sublayer output in their own launch.
 
@@ -1297,6 +1312,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         precomputed_engram_kv: torch.Tensor | None = None,
         after_attention_callback: Callable[[], None] | None = None,
         unrouted_rows: torch.Tensor | None = None,
+        capture_rows: PassRows | None = None,
         **kwargs,
     ) -> HCState:
         """Run Engram, attention and MoE with lagged mHC coefficients.
@@ -1442,7 +1458,9 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
         capture_done = None
-        if dspark_capture:
+        if capture_rows is not None:
+            self._capture_pass_rows(residual, capture_rows)
+        elif dspark_capture:
             # Capture the post-Engram entry state, not V4's post-MoE state, beside the attention.
             # DSpark averages the mult axis of the flat [N, mult * hidden] stream.
             capture_done = cast("DSparkSpecMetadata", spec_metadata).capture_on_side_stream(
@@ -1602,6 +1620,7 @@ class DeepseekV41Model(DeepseekV4Model):
     # Models built without __init__ (test stubs) run both bounded-replay passes eagerly.
     _decoder_pass_graph: DecoderPassGraph | None = None
     _encoder_pass_graph: EncoderPassGraph | None = None
+    _pass_capture_layer_ids: frozenset[int] = frozenset()
     # This forward's Engram context-overlap decision, taken at its entry.
     _engram_overlap_decision: bool | None = None
     # Models built without __init__ (test stubs) do not overlap the Engram context work.
@@ -1693,6 +1712,13 @@ class DeepseekV41Model(DeepseekV4Model):
         self.disagg_context_only = disagg_context_decoder_skipping_enabled(
             bounded_replay_on_generation
         )
+        if (
+            self.disagg_context_only
+            and getattr(
+                getattr(model_config.spec_config, "spec_dec_mode", None), "is_dspark", lambda: False
+            )()
+        ):
+            raise ValueError("Remote-tail context workers must disable DSpark")
         if self.disagg_context_only and not self.disagg_remote_tail_replay:
             raise ValueError(
                 "Context decoder skipping requires a supported remote-tail replay boundary"
@@ -1718,17 +1744,28 @@ class DeepseekV41Model(DeepseekV4Model):
         # With breakable prefill CUDA graphs, attention DP replays the decoder pass from its
         # own graphs. Everything that could decline a forward is fixed here, so every rank
         # takes the same path.
+        spec = model_config.spec_config
+        capture_layers = () if spec is None else None
+        if (
+            spec is not None
+            and spec.spec_dec_mode.is_dspark()
+            and spec.draft_is_embedded_in_target
+            and spec.target_layer_ids
+            and all(0 <= layer_id < self.num_hidden_layers for layer_id in spec.target_layer_ids)
+        ):
+            capture_layers = tuple(spec.target_layer_ids)
         if (
             model_config.extra_attrs.get("breakable_prefill_cuda_graph", False)
             and mapping.enable_attention_dp
             and self.decoder_replay_split is not None
             and not self.disagg_remote_tail_replay
-            and model_config.spec_config is None
+            and capture_layers is not None
             and all(
                 layer.self_attn.supports_row_split
                 for layer in self.layers[self.decoder_replay_split : self.num_hidden_layers]
             )
         ):
+            self._pass_capture_layer_ids = frozenset(capture_layers)
             pool = PassGraphPool()
             self._decoder_pass_graph = DecoderPassGraph(
                 self._run_decoder_pass, self.decoder_replay_window, pool
@@ -1740,9 +1777,12 @@ class DeepseekV41Model(DeepseekV4Model):
                 routes_padding_nowhere(layer.mlp.experts)
                 for layer in self.layers[: self.decoder_replay_split]
             )
-            self._encoder_pass_graph = EncoderPassGraph(
-                self._run_encoder_pass, max_pad=None if pads_freely else ENCODER_MAX_PAD, pool=pool
-            )
+            if all(layer_id >= self.decoder_replay_split for layer_id in capture_layers):
+                self._encoder_pass_graph = EncoderPassGraph(
+                    self._run_encoder_pass,
+                    max_pad=None if pads_freely else ENCODER_MAX_PAD,
+                    pool=pool,
+                )
 
     def _precompute_engram_kv(
         self, layer_idx: int, embeddings: dict[int, torch.Tensor]
@@ -2515,7 +2555,6 @@ class DeepseekV41Model(DeepseekV4Model):
             return super()._run_replayed_layers(
                 start, attn_metadata, position_ids, input_ids, hc_state, **layer_kwargs
             )
-        # No speculative inputs: the graph exists only without speculative decoding.
         return graph.run(
             bucket,
             attn_metadata,
@@ -2523,6 +2562,7 @@ class DeepseekV41Model(DeepseekV4Model):
             position_ids,
             input_ids,
             image_mask=layer_kwargs.get("image_mask"),
+            spec_metadata=layer_kwargs.get("spec_metadata"),
         )
 
     def _run_decoder_pass(
@@ -2545,6 +2585,7 @@ class DeepseekV41Model(DeepseekV4Model):
                 attn_metadata=attn_metadata,
                 input_ids=input_ids,
                 row_split=row_split,
+                capture_rows=row_split if layer.layer_idx in self._pass_capture_layer_ids else None,
                 unrouted_rows=unrouted_rows,
                 **({"image_mask": image_mask} if image_mask is not None else {}),
             )

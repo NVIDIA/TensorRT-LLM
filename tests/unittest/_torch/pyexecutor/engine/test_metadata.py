@@ -71,11 +71,12 @@ def test_build_attention_metadata_resolves_model_derived_values() -> None:
     )
 
 
-def test_build_attention_metadata_forwards_shared_and_cache_inputs() -> None:
+@pytest.mark.parametrize("shared_cache", [False, True])
+def test_build_attention_metadata_forwards_shared_and_cache_inputs(shared_cache) -> None:
     mapping = object()
     cache_indirection = object()
     kv_cache_manager = object()
-    draft_kv_cache_manager = object()
+    draft_kv_cache_manager = kv_cache_manager if shared_cache else object()
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(),
         sparse_attention_config=None,
@@ -103,7 +104,7 @@ def test_build_attention_metadata_forwards_shared_and_cache_inputs() -> None:
     assert metadata.mapping is mapping
     assert metadata.cache_indirection is cache_indirection
     assert metadata.kv_cache_manager is kv_cache_manager
-    assert metadata.draft_kv_cache_manager is draft_kv_cache_manager
+    assert metadata.draft_kv_cache_manager is (None if shared_cache else draft_kv_cache_manager)
     assert metadata.enable_context_mla_with_cached_kv
     assert metadata.max_num_heads_per_kv == 4
 

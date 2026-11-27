@@ -26,6 +26,9 @@ from .dspark_rmsnorm_rope_custom_op import (
     _DSV4_DSPARK_HEAD_DIM,
     _DSV4_DSPARK_ROPE_DIM,
     _DSV4_DSPARK_WINDOW_SIZE,
+    _compile_dspark_paged_backfill,
+    _compile_dspark_rmsnorm_rope_draft_block,
+    _compile_dspark_rmsnorm_rope_page_write,
     _get_dspark_arch_str,
     cute_dsl_dspark_rmsnorm_rope_cache_write,
     cute_dsl_dspark_rmsnorm_rope_draft_block,
@@ -243,13 +246,7 @@ def fused_dsv4_dspark_attention(
         )
     ):
         raise ValueError("All DSpark attention inputs must be on the same CUDA device")
-    cache_key = (block, heads, page_size, arch_str)
-    compiled = _dspark_attention_kernel_cache.get(cache_key)
-    if compiled is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("DSpark paged attention must run eagerly before graph capture")
-        compiled = _compile_dspark_attention(block, arch_str, page_size, heads)
-        _dspark_attention_kernel_cache[cache_key] = compiled
+    compiled = _get_dspark_attention_kernel(block, heads, page_size, arch_str)
     output = torch.empty_like(q)
     compiled(
         batch,
@@ -377,6 +374,9 @@ def is_fused_dsv4_dspark_attention_supported(
     valid_len: torch.Tensor,
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
+    *,
+    block_tables: torch.Tensor | None = None,
+    window_size: int = _DSV4_DSPARK_WINDOW_SIZE,
 ) -> bool:
     """Return whether tensors can use the fused DSV4 DSpark attention kernel."""
     if _get_dspark_arch_str() is None:
@@ -405,6 +405,8 @@ def is_fused_dsv4_dspark_attention_supported(
         return _log_unsupported(
             f"expected q/kv_cache ranks 4/3, got {q.ndim}/{kv_cache.ndim}", "tensor_ranks"
         )
+    if window_size != _DSV4_DSPARK_WINDOW_SIZE:
+        return _log_unsupported(f"attention window must be 128, got {window_size}", "window_size")
     if q.shape[0] == 0:
         return _log_unsupported("batch must be nonempty", "batch_size")
     if q.shape[1] not in _DSV4_DSPARK_BLOCK_SIZES:
@@ -415,9 +417,13 @@ def is_fused_dsv4_dspark_attention_supported(
             f"got {q.shape[2]} heads and head_dim {q.shape[3]}",
             "q_shape",
         )
-    if kv_cache.shape[1:] != (_DSV4_DSPARK_WINDOW_SIZE, _DSV4_DSPARK_HEAD_DIM):
+    page_sizes = (
+        _DSV4_DSPARK_PAGE_SIZES if block_tables is not None else (_DSV4_DSPARK_WINDOW_SIZE,)
+    )
+    if kv_cache.shape[1] not in page_sizes or kv_cache.shape[2] != _DSV4_DSPARK_HEAD_DIM:
         return _log_unsupported(
-            f"kv_cache must have trailing shape (128, 512), got {tuple(kv_cache.shape[1:])}",
+            f"kv_cache must have page size in {page_sizes} and width 512, "
+            f"got {tuple(kv_cache.shape[1:])}",
             "kv_cache_shape",
         )
     if (
@@ -456,7 +462,62 @@ def is_fused_dsv4_dspark_attention_supported(
     ):
         if not tensor.is_contiguous():
             return _log_unsupported(f"{name} must be contiguous", f"{name}_layout")
+    if block_tables is not None and not (
+        block_tables.ndim == 2
+        and block_tables.shape[0] == q.shape[0]
+        and block_tables.dtype == torch.int32
+        and block_tables.stride(1) == 1
+        and all(
+            t.device == q.device
+            for t in (block_tables, kv_cache, valid_len, attn_sink, inverse_rope_freqs)
+        )
+    ):
+        return _log_unsupported("invalid page-table layout or device", "paged_layout")
     return True
+
+
+def _get_dspark_attention_kernel(
+    block: int, heads: int, page_size: int, arch_str: str
+) -> Callable[..., None]:
+    cache_key = (block, heads, page_size, arch_str)
+    compiled = _dspark_attention_kernel_cache.get(cache_key)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DSpark paged attention must run eagerly before graph capture")
+        compiled = _compile_dspark_attention(block, arch_str, page_size, heads)
+        _dspark_attention_kernel_cache[cache_key] = compiled
+    return compiled
+
+
+def warmup_paged_dspark(
+    device: torch.device,
+    page_size: int,
+    stages: int,
+    eps: float,
+    block_size: int,
+    heads: set[int],
+) -> None:
+    """Compile the paged operators needed by this worker before graph capture."""
+    if page_size not in _DSV4_DSPARK_PAGE_SIZES:
+        return
+    with torch.cuda.device(device):
+        arch = _get_dspark_arch_str()
+        if arch is None:
+            return
+        try:
+            if page_size in (128, 256):
+                _compile_dspark_paged_backfill(stages, page_size, eps, device.index)
+            supported_heads = heads.intersection(_DSV4_DSPARK_SUPPORTED_NUM_HEADS)
+            if supported_heads and block_size in _DSV4_DSPARK_BLOCK_SIZES:
+                _compile_dspark_rmsnorm_rope_page_write(page_size, eps, device.index)
+                _compile_dspark_rmsnorm_rope_draft_block(block_size, eps)
+                for num_heads in sorted(supported_heads):
+                    _get_dspark_attention_kernel(block_size, num_heads, page_size, arch)
+        except RuntimeError as e:
+            logger.warning(
+                "DSpark paged CuTe DSL prewarm failed. The operators will self-JIT on "
+                f"first eager use. {type(e).__name__}: {e}"
+            )
 
 
 def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float, num_heads: int) -> None:

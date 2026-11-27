@@ -443,6 +443,9 @@ def _glue_kernels():
             else:
                 dst = tensor1d(out, dst_base + Int64(width))
             src = tensor1d(base, src_base + Int64(columns))
+            begin = Int32(0)
+            end = Int32(0)
+            scratch_pages = Int32(0)
             if cutlass.const_expr(self.with_scratch):
                 scratch_row = Int64(param_t[table, 3]) * Int64(seqs) + Int64(seq)
                 scratch_pages = Int32(param_t[table, 4])
@@ -461,7 +464,7 @@ def _glue_kernels():
                 if page != bad:
                     value = page * scale + offset
                 if cutlass.const_expr(self.with_scratch):
-                    if (page == bad) & (column >= begin) & (column < end):
+                    if (scratch_pages > 0) & (page == bad) & (column >= begin) & (column < end):
                         total = (column - begin) * scratch_pages
                         slot = Int32(
                             slots[scratch_row * Int64(slot_stride) + Int64(total // scale)]

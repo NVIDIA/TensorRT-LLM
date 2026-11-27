@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import triton_num_compiled
 
 from tensorrt_llm._torch.custom_ops import dspark_attention_custom_op as attention_op
 from tensorrt_llm._torch.custom_ops import dspark_rmsnorm_rope_custom_op as preparation_op
@@ -241,6 +242,18 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         attention_op.fused_dsv4_dspark_attention(**inputs)
 
 
+def _write_reference(cache, main_kv, inputs):
+    cache = cache.clone()
+    for row, (end, capacity) in enumerate(
+        zip(inputs["positions"].tolist(), inputs["capacities"].tolist())
+    ):
+        token = end - 1
+        if 0 <= token < capacity:
+            page = int(inputs["block_tables"][row, token // cache.shape[1]])
+            cache[page, token % cache.shape[1]] = main_kv[row, 0]
+    return cache
+
+
 @pytest.mark.parametrize(
     "heads,block,page_size",
     [(h, b, p) for h in (64, 128) for b in (5, 6) for p in (16, 32, 64, 128, 256)]
@@ -252,9 +265,10 @@ def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
         heads=heads,
         block=block,
         page_size=page_size,
-        positions=[0, 1, 17, 32, 33, 63, 64, 65, 127, 128, 129, 193, 257, 390, 99],
-        valid_lengths=[0, 1, 1, 3, 32, 1, 1, 127, 1, 0, 1, 127, 32, 3, 128],
-        capacities=[512] * 14 + [0],
+        positions=[0, 1, 17, 32, 33, 63, 64, 65, 127, 128, 129, 193, 257, 390, 99]
+        + [149, 191, 213, 300],
+        valid_lengths=[0, 1, 1, 3, 32, 1, 1, 127, 1, 0, 2, 127, 32, 3, 128] + [128] * 4,
+        capacities=[512] * 10 + [128] + [512] * 3 + [0] + [512] * 4,
     )
     original_cache = inputs["kv_pages"].clone()
     expected = _reference(**inputs)
@@ -264,10 +278,16 @@ def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
 
 
 @pytest.mark.parametrize(
-    "heads,page_size,batch_repeats",
-    [(64, 32, 1), (128, 64, 1), (128, 256, 1), (128, 64, 64)],
+    "heads,page_size,batch_repeats,page_write",
+    [
+        pytest.param(64, 32, 1, False, id="64-32-1"),
+        pytest.param(128, 64, 1, False, id="128-64-1"),
+        pytest.param(128, 256, 1, False, id="128-256-1"),
+        pytest.param(128, 64, 64, False, id="128-64-64"),
+        pytest.param(128, 256, 1, True, id="managed_page_write_256"),
+    ],
 )
-def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_repeats):
+def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_repeats, page_write):
     inputs = _make_inputs(
         3,
         heads=heads,
@@ -280,8 +300,21 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
     weight = torch.ones(512, device="cuda", dtype=torch.bfloat16)
     freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
     block_freqs = inputs["inverse_rope_freqs"].view(-1, 32, 2)
+    main_x = torch.randn(batch, 1, 512, device="cuda", dtype=torch.bfloat16) if page_write else None
+    main_freqs = torch.view_as_real(freqs[inputs["positions"]]).contiguous() if page_write else None
 
     def forward():
+        if main_x is not None and main_freqs is not None:
+            preparation_op.cute_dsl_dspark_rmsnorm_rope_page_write(
+                main_x,
+                weight,
+                main_freqs,
+                inputs["kv_pages"],
+                inputs["block_tables"],
+                inputs["positions"],
+                inputs["capacities"],
+                1e-6,
+            )
         draft = preparation_op.cute_dsl_dspark_rmsnorm_rope_draft_block(
             block_x, weight, block_freqs, 1e-6
         )
@@ -291,22 +324,45 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured, draft = forward()
-    for end in (17, 65, 127, 128, 129, 193, 255):
+    ends = (17, 65, 127, 128, 129, 193, 255)
+    if page_write:
+        ends += (256, 257, 383)
+    full_tables = inputs["block_tables"][:2].clone()
+    for end in ends:
         inputs["positions"][:2].copy_(torch.tensor([end, end + 1], device="cuda"))
-        inputs["valid_lengths"].copy_(torch.tensor([127, 1, 128] * batch_repeats, device="cuda"))
-        inputs["block_tables"][:2].copy_(inputs["block_tables"][:2].roll(1, dims=1))
+        lengths = [128 if end >= 256 else 127, 1, 128]
+        inputs["valid_lengths"].copy_(torch.tensor(lengths * batch_repeats, device="cuda"))
+        inputs["block_tables"][:2].copy_(full_tables.roll(end, dims=1))
+        if page_write:
+            # Native PRIVATE tables retain only the live window; capacity is
+            # the addressable table extent, including unmapped columns.
+            for row, position in enumerate((end, end + 1)):
+                first = max(0, position - min(128, lengths[row])) // page_size
+                last = (position + page_size - 1) // page_size
+                inputs["block_tables"][row, :first] = -1
+                inputs["block_tables"][row, last:] = -1
         inputs["kv_pages"].normal_()
         block_x.normal_()
         block_phases = freqs[inputs["positions"][:, None] + 1 + torch.arange(6, device="cuda")]
         inputs["inverse_rope_freqs"].copy_(torch.view_as_real(block_phases))
         expected_block = _norm_rope(block_x, weight, block_phases)
         expected_draft = F.pad(expected_block, (0, 0, 0, 2))
-        # The independent Torch oracle reads the current page table and page data.
-        expected = _reference(**(inputs | {"draft_block": expected_draft}))
         expected_cache = inputs["kv_pages"].clone()
+        if main_x is not None and main_freqs is not None:
+            main_x.normal_()
+            main_freqs.copy_(torch.view_as_real(freqs[inputs["positions"]]))
+            expected_main = _norm_rope(main_x, weight, freqs[inputs["positions"]][:, None])
+            expected_cache = _write_reference(expected_cache, expected_main, inputs)
+        # The independent Torch oracle reads the current page table and page data.
+        expected = _reference(
+            **(inputs | {"kv_pages": expected_cache, "draft_block": expected_draft})
+        )
         graph.replay()
         torch.testing.assert_close(captured, expected, rtol=5e-2, atol=3e-2)
-        torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=0, atol=0)
+        if page_write:
+            torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)
+        else:
+            torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=0, atol=0)
         torch.testing.assert_close(draft, expected_draft, rtol=2e-2, atol=2e-2)
         assert torch.count_nonzero(draft[:, 6:]) == 0
 
@@ -405,6 +461,7 @@ def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
 def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
     preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_clear()
     preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
+    preparation_op._compile_dspark_paged_backfill.cache_clear()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     def unexpected_compile(*args, **kwargs):
@@ -415,9 +472,57 @@ def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
         preparation_op._compile_dspark_rmsnorm_rope_cache_write(1e-6)
     with pytest.raises(RuntimeError, match="draft-block must be warmed up"):
         preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6)
+    with pytest.raises(RuntimeError, match="paged backfill must be warmed up"):
+        preparation_op._compile_dspark_paged_backfill(3, 128, 1e-6, torch.cuda.current_device())
 
 
-def test_preparation_self_jit_covers_dynamic_batches():
+def test_context_page_writer_supports_more_than_65535_tokens():
+    from tensorrt_llm._torch.attention.kernels.dspark import (
+        _write_context_kernel,
+        write_dspark_context,
+    )
+
+    batch, tokens, dim, page_size = 2, 65536, 4, 128
+    values = torch.randn(batch, tokens, dim, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(1, tokens + 1, device="cuda").expand(batch, -1).clone()
+    positions[:, 0] = 0
+    mask = torch.ones_like(positions, dtype=torch.bool)
+    mask[:, 1::17] = False
+    tables = torch.arange(batch * tokens // page_size, device="cuda", dtype=torch.int32).view(
+        batch, -1
+    )
+    tables = F.pad(tables, (0, 1), value=-1)[:, :-1]
+    tables[0, 5] = -1
+    capacities = torch.tensor([tokens, tokens - 5], device="cuda")
+    pool = torch.full((tables.numel(), page_size, dim), -1.0, device="cuda", dtype=values.dtype)
+    expected = pool.clone()
+    logical = (positions - 1).clamp(min=0)
+    pages = tables.gather(1, logical // page_size).long()
+    valid = mask & (positions > 0) & (logical < capacities[:, None]) & (pages >= 0)
+    expected[pages[valid], (logical % page_size)[valid]] = values[valid]
+    write_dspark_context(values, positions, mask, pool, tables, capacities)
+    torch.testing.assert_close(pool, expected, rtol=0, atol=0)
+
+    compiled = triton_num_compiled(_write_context_kernel)
+    for width in (1, 3, 16, 128):
+        updated = -values[1:, :width]
+        write_dspark_context(
+            updated,
+            positions[1:, :width],
+            mask[1:, :width],
+            pool,
+            tables[1:],
+            capacities[1:],
+        )
+        assert triton_num_compiled(_write_context_kernel) == compiled
+        write_mask = valid[1:, :width]
+        expected[pages[1:, :width][write_mask], (logical[1:, :width] % page_size)[write_mask]] = (
+            updated[write_mask]
+        )
+        torch.testing.assert_close(pool, expected, rtol=0, atol=0)
+
+
+def test_preparation_self_jit_covers_dynamic_batches(monkeypatch):
     preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_clear()
     preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
     weight = torch.ones(512, device="cuda", dtype=torch.bfloat16)
@@ -435,17 +540,43 @@ def test_preparation_self_jit_covers_dynamic_batches():
         expected_main = _norm_rope(main, weight, main_freqs)
         expected_cache[slots, start % 128] = expected_main[:, 0]
         expected_block = _norm_rope(block, weight, block_freqs)
+        main_rope = torch.view_as_real(main_freqs).view(batch, 32, 2)
+        block_rope = inputs["inverse_rope_freqs"].view(-1, 32, 2)
+        if batch == 1:
+            supports = preparation_op.is_fused_dspark_attention_preparation_supported
+            tail = (block_rope, inputs["kv_pages"], slots, start)
+            assert supports(
+                main,
+                block,
+                weight,
+                main_rope,
+                *tail,
+                block_tables=inputs["block_tables"],
+                capacities=inputs["capacities"],
+            )
+            assert not supports(
+                main, block, weight, main_rope, *tail, block_tables=inputs["block_tables"]
+            )
+            assert not supports(
+                main,
+                block,
+                weight,
+                F.pad(main_rope, (0, 0, 0, 1)),
+                *tail,
+                block_tables=inputs["block_tables"],
+                capacities=inputs["capacities"],
+            )
         actual_slots, cache_seqs = preparation_op.cute_dsl_dspark_rmsnorm_rope_cache_write(
             main,
             weight,
-            torch.view_as_real(main_freqs).view(batch, 32, 2),
+            main_rope,
             cache,
             slots,
             start,
             1e-6,
         )
         draft = preparation_op.cute_dsl_dspark_rmsnorm_rope_draft_block(
-            block, weight, inputs["inverse_rope_freqs"].view(-1, 32, 2), 1e-6
+            block, weight, block_rope, 1e-6
         )
         torch.testing.assert_close(cache, expected_cache, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(actual_slots, slots.to(torch.int32), rtol=0, atol=0)
@@ -454,6 +585,62 @@ def test_preparation_self_jit_covers_dynamic_batches():
         assert torch.count_nonzero(draft[:, 6:]) == 0
     assert preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_info().misses == 1
     assert preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_info().misses == 1
+    preparation_op._compile_dspark_paged_backfill.cache_clear()
+    compile_kernel = preparation_op.cute.compile
+    compile_devices = []
+
+    def compile_on_device(*args, **kwargs):
+        compile_devices.append(torch.cuda.current_device())
+        return compile_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(preparation_op.cute, "compile", compile_on_device)
+    caller = torch.cuda.current_device()
+    cases = [(caller, 1), (caller, 3)]
+    if torch.cuda.device_count() > 1:
+        cases.append(((caller + 1) % torch.cuda.device_count(), 3))
+    for device, batch in cases:
+        with torch.cuda.device(device):
+            inputs = _make_inputs(
+                batch=batch,
+                page_size=128,
+                capacities=[512] * (batch - 1) + [0] if batch > 1 else [512],
+            )
+            width = min(batch, 2)
+            positions = inputs["positions"][:, None] + torch.arange(width, device="cuda")
+            mask = (inputs["capacities"] > 0)[:, None].expand_as(positions).clone()
+            if width == 2:
+                mask[0, 1] = False
+            kv = torch.randn(batch, width, 3, 512, device="cuda", dtype=torch.bfloat16)
+            norms = torch.randn(3, 512, device="cuda", dtype=kv.dtype)
+            freqs_table = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
+            freqs = freqs_table[positions]
+            normalized = _norm_rope(kv, norms, freqs)
+            pools = [inputs["kv_pages"].clone() for _ in range(3)]
+            expected = list(pools)
+            for frame in range(width):
+                frame_inputs = inputs | {
+                    "positions": positions[:, frame],
+                    "capacities": inputs["capacities"].masked_fill(~mask[:, frame], 0),
+                }
+                expected = [
+                    _write_reference(pool, normalized[:, frame : frame + 1, stage], frame_inputs)
+                    for stage, pool in enumerate(expected)
+                ]
+        preparation_op.cute_dsl_dspark_paged_backfill(
+            kv.flatten(2),
+            norms,
+            torch.view_as_real(freqs_table),
+            mask,
+            positions,
+            inputs["block_tables"].contiguous(),
+            inputs["capacities"],
+            pools,
+            1e-6,
+        )
+        assert torch.cuda.current_device() == caller
+        for actual, reference in zip(pools, expected):
+            torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+    assert sorted(compile_devices) == sorted({device for device, _ in cases})
 
 
 def _norm_rope(x, weight, freqs):
@@ -1110,7 +1297,8 @@ def _tp_weights(tp):
     return full, qkv, shards
 
 
-def test_tp_attention_shards_sum_to_replicated():
+@pytest.mark.parametrize("paged", [False, True], ids=["ring", "paged"])
+def test_tp_attention_shards_sum_to_replicated(paged):
     """The TP head shards of ``dspark_attention_forward_tp`` sum to the replicated BF16 path on
     the exact dequantization of the same FP8 weights, up to BF16 rounding, and every shard
     writes the replicated path's main-KV frame."""
@@ -1132,6 +1320,20 @@ def test_tp_attention_shards_sum_to_replicated():
     slots = torch.arange(batch, device="cuda")
     start_pos = 3000 + 7 * torch.arange(batch, device="cuda")
     valid_len = torch.tensor([100, 128, 3][:batch], device="cuda")
+    page_args = {}
+    if paged:
+        pages_per_request = 2
+        tables = (
+            torch.arange(batch, device="cuda")[:, None] * pages_per_request
+            + torch.arange(32, device="cuda")[None, :] % pages_per_request
+        ).int()
+        window = (
+            torch.randn(
+                batch * pages_per_request, _TP_WINDOW, _TP_HEAD_DIM, generator=gen, device="cuda"
+            )
+            / 2
+        ).bfloat16()
+        page_args = dict(block_tables=tables, capacities=torch.full_like(start_pos, 4096))
     freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 4000, device="cuda")
     rope = _prepare_dspark_attention_rope(start_pos, block, freqs)
     softmax_scale = _TP_HEAD_DIM**-0.5
@@ -1157,6 +1359,7 @@ def test_tp_attention_shards_sum_to_replicated():
         eps=_TP_EPS,
         softmax_scale=softmax_scale,
         **full,
+        **page_args,
     )
 
     rows = batch * block
@@ -1187,6 +1390,7 @@ def test_tp_attention_shards_sum_to_replicated():
             kv_norm_w=full["kv_norm_w"],
             eps=_TP_EPS,
             softmax_scale=softmax_scale,
+            **page_args,
         )
         for attn, wo_a_scale in shards
     ]
@@ -1195,3 +1399,85 @@ def test_tp_attention_shards_sum_to_replicated():
     actual = torch.stack([p.float() for p in partials]).sum(0).bfloat16()
     diff = actual.float() - expected.float()
     assert diff.norm() / expected.float().norm() < 1e-2
+
+
+@pytest.mark.parametrize(
+    "heads,page_size,fused",
+    [(64, 128, True), (128, 256, False)],
+    ids=["cute_dsl_128", "reference_256"],
+)
+def test_managed_dspark_attention_matches_reference(heads, page_size, fused, monkeypatch):
+    block = 5
+    if not fused:
+        monkeypatch.setattr(dspark, "IS_CUTLASS_DSL_AVAILABLE", False)
+    inputs = _make_inputs(
+        17,
+        block=block,
+        heads=heads,
+        page_size=page_size,
+        positions=[1, 33, 129, 390, 0],
+        valid_lengths=[1, 3, 128, 3, 0],
+        capacities=[512, 512, 512, 512, 0],
+    )
+    batch, hidden, rank, groups, o_rank = 5, 64, 64, 8, 32
+
+    def weight(*shape):
+        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    x, main_x = weight(batch, block, hidden), weight(batch, 1, hidden)
+    kwargs = dict(
+        wq_a=weight(rank, hidden),
+        q_norm_w=torch.ones(rank, device="cuda", dtype=x.dtype),
+        wq_b=weight(heads * 512, rank),
+        wkv=weight(512, hidden),
+        kv_norm_w=torch.ones(512, device="cuda", dtype=x.dtype),
+        wo_a=weight(groups * o_rank, heads * 512 // groups),
+        wo_b=weight(hidden, groups * o_rank),
+        attn_sink=inputs["attn_sink"],
+        n_heads=heads,
+        head_dim=512,
+        rope_head_dim=_ROPE_DIM,
+        n_groups=groups,
+        o_lora_rank=o_rank,
+        window_size=128,
+        eps=1e-6,
+        softmax_scale=inputs["softmax_scale"],
+        freqs_cis=dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda"),
+    )
+    positions = inputs["positions"]
+    block_freqs = torch.view_as_complex(inputs["inverse_rope_freqs"])
+    q = F.linear(
+        dspark._rmsnorm(F.linear(x, kwargs["wq_a"]), kwargs["q_norm_w"], 1e-6), kwargs["wq_b"]
+    ).unflatten(-1, (heads, 512))
+    q = _norm_rope(q, torch.ones(512, device="cuda", dtype=x.dtype), block_freqs)
+    main = _norm_rope(
+        F.linear(main_x, kwargs["wkv"]),
+        kwargs["kv_norm_w"],
+        kwargs["freqs_cis"][positions][:, None],
+    )
+    draft = _norm_rope(F.linear(x, kwargs["wkv"]), kwargs["kv_norm_w"], block_freqs)
+    expected_cache = _write_reference(inputs["kv_pages"], main, inputs)
+    output = _reference(**(inputs | {"q": q, "draft_block": draft, "kv_pages": expected_cache}))
+    output = torch.einsum(
+        "bsgd,grd->bsgr",
+        output.reshape(batch, block, groups, -1),
+        kwargs["wo_a"].view(groups, o_rank, -1),
+    )
+    expected = F.linear(output.flatten(2), kwargs["wo_b"])
+    fused_attention = Mock(wraps=torch.ops.trtllm.fused_dsv4_dspark_attention)
+    monkeypatch.setattr(torch.ops.trtllm, "fused_dsv4_dspark_attention", fused_attention)
+    actual = dspark.dspark_attention_forward_batched(
+        x,
+        main_x,
+        positions,
+        inputs["kv_pages"],
+        None,
+        valid_len=inputs["valid_lengths"],
+        block_tables=inputs["block_tables"],
+        capacities=inputs["capacities"],
+        persist=True,
+        **kwargs,
+    )
+    assert fused_attention.called == fused
+    torch.testing.assert_close(actual, expected, rtol=8e-2, atol=1e-2)
+    torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)

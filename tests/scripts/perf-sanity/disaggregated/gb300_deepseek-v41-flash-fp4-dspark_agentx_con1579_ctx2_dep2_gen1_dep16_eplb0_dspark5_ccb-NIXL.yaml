@@ -60,7 +60,7 @@ environment:
   work_dir: <full_path_to_work_dir>
   client_env_var: AGENTX_MAX_CTX=996579 AGENTX_DURATION=1800 AGENTX_WARMUP_PER_LANE=0 AGENTX_TIMEOUT_GRACE=5400 AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
   worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_ARENA_RESERVE=0 OMP_NUM_THREADS=1 TLLM_NUMA_AWARE_WORKER_AFFINITY=1 TRTLLM_PINNED_WEIGHT_STAGING=1
-  ctx_worker_env_var: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_SCALE_LAUNCH_QUEUES=4x TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET=1073741824 TRTLLM_CUTEDSL_FC2_N_TILE_SIZE=256 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51
+  ctx_worker_env_var: TRTLLM_DISAGG_ROLE=context PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_SCALE_LAUNCH_QUEUES=4x TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET=1073741824 TRTLLM_CUTEDSL_FC2_N_TILE_SIZE=256 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51
   gen_worker_env_var: TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
@@ -104,7 +104,7 @@ worker_config:
       transceiver_runtime: PYTHON
     stream_interval: 20
     num_postprocess_workers: 4
-    speculative_config:
+    speculative_config: &dspark
       decoding_type: DSpark
       max_draft_len: 5
       block_size: 5
@@ -142,6 +142,7 @@ worker_config:
       backend: NIXL
       kv_transfer_timeout_ms: 600000
       transceiver_runtime: PYTHON
+    speculative_config: *dspark
     custom_tokenizer: deepseek_v41
     disable_mm_encoder: true
     sparse_attention_config:

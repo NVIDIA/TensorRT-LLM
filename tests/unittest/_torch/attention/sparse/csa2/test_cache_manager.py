@@ -22,6 +22,10 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import _CacheReuseAdapterV2
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -266,6 +270,141 @@ def allocate(manager, request_id, tokens, capacity):
     assert manager._resume_and_restore(request_id, cache)
     assert cache.resize(capacity)
     return cache
+
+
+@skip_pre_blackwell
+def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monkeypatch):
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+        build_page_table_from_manager,
+    )
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import layer_ids_of
+    from tensorrt_llm.llmapi.llm_args import CSA2SparseAttentionConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
+
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    pretrained = PretrainedConfig(
+        model_type="deepseek_v41",
+        hidden_size=512,
+        num_attention_heads=1,
+        num_hidden_layers=2,
+        vocab_size=8192,
+        compress_ratios=[0, 1],
+        kv_source_layer_ids=[1],
+        index_source_layer_ids=[1],
+        candidate_source_layer_id=None,
+        candidate_topk_blocks=2048,
+        candidate_block_size=8,
+        index_topk=512,
+        sliding_window=128,
+    )
+    model_config = ModelConfig(pretrained_config=pretrained)
+    config = KvCacheConfig(
+        max_gpu_total_bytes=64 << 20,
+        host_cache_size=0,
+        enable_block_reuse=True,
+        enable_swa_scratch_reuse=True,
+        dtype="fp8",
+        avg_seq_len=512,
+    )
+    mapping = Mapping()
+    draft_specs = tuple(
+        KVCacheLayerSpec(
+            global_layer_id=2 + stage,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            num_kv_heads=1,
+            head_dim=512,
+            buffer_roles=(Role.KEY,),
+            sliding_window_size=129,
+        )
+        for stage in range(3)
+    )
+    sizing = dict(tokens_per_block=128, spec_config=None, kv_cache_config=config)
+    for bounded_replay in ("0", "1"):
+        with monkeypatch.context() as mode:
+            mode.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", bounded_replay)
+            assert CSA2CacheManager.draft_layers_share_pool_group(
+                model_config, mapping, layer_specs=draft_specs, **sizing
+            ) == (bounded_replay == "1")
+    target_layers, full_tokens = CSA2CacheManager._get_per_request_layer_tokens(
+        model_config, mapping, max_seq_len=1024, **sizing
+    )
+    all_layers, draft_full_tokens = CSA2CacheManager._get_per_request_layer_tokens(
+        model_config, mapping, max_seq_len=1024, layer_specs=draft_specs, **sizing
+    )
+    assert draft_full_tokens == full_tokens
+    assert all_layers[: len(target_layers)] == target_layers
+    draft_layers = all_layers[len(target_layers) :]
+    assert len(draft_layers) == len(draft_specs)
+    assert all(
+        size == 1024 and 128 < retained == intercept < full_tokens
+        for size, retained, intercept in draft_layers
+    )
+
+    manager = _create_kv_cache_manager(
+        model_engine=None,
+        model_config=model_config,
+        kv_cache_manager_cls=CSA2CacheManager,
+        kv_cache_config=config,
+        sparse_attention_config=CSA2SparseAttentionConfig(),
+        spec_config=None,
+        kv_connector_manager=None,
+        tokens_per_block=128,
+        max_seq_len=1024,
+        max_batch_size=1,
+        max_num_tokens=512,
+        mapping=mapping,
+        max_beam_width=1,
+        dtype=torch.bfloat16,
+        layer_specs=draft_specs,
+    )
+    try:
+        assert manager.get_draft_kv_cache_view() is manager
+        assert manager.pp_layers == [0, 1]
+        assert manager.draft_layer_ids == (2, 3, 4)
+        names = layer_ids_of(manager)
+        for layer in manager.draft_layer_ids:
+            assert names[manager.layer_offsets[layer]][1] == layer
+        for group, layers in enumerate(manager.impl.layer_grouping):
+            assert manager.get_disagg_global_layer_ids(group) == [
+                names[int(layer)][0] for layer in layers
+            ]
+        requests = manager.add_dummy_requests(
+            [42], token_nums=[512], draft_kv_cache_manager=manager
+        )
+        assert requests is not None
+        cache = manager.kv_cache_map[42]
+        for layer in manager.draft_layer_ids:
+            assert manager.get_layer_cache_spec(layer).reuse_policy == ReusePolicy.PRIVATE
+            assert manager.get_layer_cache_spec(layer).sliding_window_size == 129
+            buffer = manager.get_buffers(layer, kv_layout="HND")
+            assert buffer.dtype == torch.bfloat16
+            assert tuple(buffer.shape[1:]) == (1, 1, 128, 512)
+            assert len(manager.get_batch_cache_indices([42], layer)[0]) == cache.num_blocks
+
+        def advertised_draft_buffers():
+            table = build_page_table_from_manager(manager)
+            return sum(
+                len(view.buffer_entries)
+                for group in table.layer_groups
+                for view in group.pool_views
+                if Role.KEY in view.pool_role
+            )
+
+        assert advertised_draft_buffers() == len(manager.draft_layer_ids)
+        assert str(Role.KEY) not in manager.page_table_spec().untransferred_roles
+        manager.bounded_replay_on_generation = True
+        assert advertised_draft_buffers() == 0
+        assert str(Role.KEY) in manager.page_table_spec().untransferred_roles
+    finally:
+        for request_id in list(manager.kv_cache_map):
+            manager.free_resources(SimpleNamespace(py_request_id=request_id))
+        manager.shutdown()
 
 
 @skip_pre_blackwell

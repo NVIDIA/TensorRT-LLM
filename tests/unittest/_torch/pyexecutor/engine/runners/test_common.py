@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.engine.runners import (
     DecoderRunner,
     EncoderDecoderRunner,
@@ -18,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
     get_padding_params,
+    get_speculative_model,
     get_top_level_model,
     make_scheduled_inputs,
     pad_input_tokens,
@@ -31,6 +33,15 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_get_speculative_model_falls_back_to_llm() -> None:
+    class MultimodalWrapper(MultimodalModelMixin):
+        llm = SimpleNamespace(spec_worker=object())
+
+    wrapper = MultimodalWrapper()
+    assert get_speculative_model(wrapper) is wrapper.llm
+    assert get_speculative_model(SimpleNamespace(_orig_mod=wrapper)) is wrapper.llm
 
 
 @pytest.mark.parametrize(

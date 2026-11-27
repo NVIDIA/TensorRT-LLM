@@ -359,10 +359,10 @@ Successful replay exit restores both the output row layout and metadata before
 logits selection or drafting. Forward failures propagate without model-side
 metadata rollback; a failed engine execution is not retryable.
 Outputs use the ordinary scatter and logits selection contract. Embedded DSpark also supports Encoder
-recovery and OPTIONAL Encoder pages. Its rolling draft window consumes only the
+recovery and OPTIONAL Encoder pages. Its managed draft pages receive only the
 actual Decoder suffix of each context chunk, including replayed historical rows.
 The target publishes per-context valid capture lengths after replay exit.
-DSpark skips unwritten captures and advances its rolling window's valid length
+DSpark skips unwritten captures and advances its draft window's valid length
 only by captured rows; absolute prompt positions still advance normally.
 All generation verification rows retain their original batch offsets.
 A wider embedded draft window widens the default range for both Decoder replay

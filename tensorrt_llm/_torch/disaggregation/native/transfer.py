@@ -6254,7 +6254,13 @@ class TransferWorker:
             else None
         )
         self._kv_extractor = KVRegionExtractorV1(kvm)
-        self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
+        self._peer_registrar = PeerRegistrar(
+            self._rank_info,
+            self._kv_extractor,
+            requires_embedded_dspark_kv_match=getattr(
+                type(kvm), "requires_embedded_dspark_kv_match", False
+            ),
+        )
 
     def _new_agent(self):
         mapping = self._config.kv_cache_manager.mapping

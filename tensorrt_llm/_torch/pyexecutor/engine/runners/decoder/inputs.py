@@ -93,6 +93,7 @@ from ..common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
     get_position_id_offset,
+    get_speculative_model,
     get_top_level_model,
     pad_input_tokens,
     prepare_multimodal_indices,
@@ -435,6 +436,7 @@ class DecoderInputPreparer:
         mm_item_scheduler: MultimodalItemScheduler | None = None,
         host_uploader: HostUploader | None = None,
         attention_runtime_features: AttentionRuntimeFeatures | None = None,
+        dspark_context_worker: bool = False,
     ) -> None:
         self._buffers = buffers
         self._attention_runtime_features = attention_runtime_features or AttentionRuntimeFeatures()
@@ -487,8 +489,10 @@ class DecoderInputPreparer:
         )
 
         spec_config = self._config.spec_config if self._config is not None else None
+        self._dspark_context_worker = dspark_context_worker
         self._dspark_confidence_enabled = bool(
-            spec_config is not None and getattr(spec_config, "enable_confidence_scheduling", False)
+            not self._dspark_context_worker
+            and getattr(spec_config, "enable_confidence_scheduling", False)
         )
         self._dspark_trims_submitted_tokens = self._dspark_confidence_enabled
         self._dspark_device_windows = bool(
@@ -3374,6 +3378,12 @@ class DecoderInputPreparer:
             spec_metadata.paused_in_place_ids = getattr(
                 scheduled_requests, "paused_in_place_ids", frozenset()
             )
+            if isinstance(spec_metadata, DSparkSpecMetadata):
+                spec_metadata.context_chunking_ids = frozenset(
+                    req.py_request_id
+                    for req in scheduled_requests.context_requests_chunking
+                    if not req.is_dummy
+                )
             spec_metadata.gather_ids = self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
@@ -4068,7 +4078,7 @@ class DecoderInputPreparer:
 
     def _get_spec_worker(self):
         """Return the one-model speculative worker when it is initialized."""
-        return getattr(self.model, "spec_worker", None)
+        return getattr(get_speculative_model(self.model), "spec_worker", None)
 
     def _dspark_tp_rank0_rows(self):
         """Return a hook that swaps this rank's confidence rows for TP rank 0's.

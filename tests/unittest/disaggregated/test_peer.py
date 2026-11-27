@@ -414,12 +414,16 @@ def test_multiple_overlap():
     assert overlap == expected_overlap
 
 
-def _make_peer_registrar(self_rankinfo):
+def _make_peer_registrar(self_rankinfo, *, requires_embedded_dspark_kv_match: bool = False):
     pt = self_rankinfo.page_table or make_page_table(
         kv_heads=self_rankinfo.attention.kv_heads_per_rank
     )
     real_kv_extractor = KVRegionExtractorV1(pt)
-    reg = PeerRegistrar(self_rankinfo, real_kv_extractor)
+    reg = PeerRegistrar(
+        self_rankinfo,
+        real_kv_extractor,
+        requires_embedded_dspark_kv_match=requires_embedded_dspark_kv_match,
+    )
     return reg
 
 
@@ -1907,13 +1911,17 @@ def test_attention_replicated_validation_rejects_missing_index_key_view():
         AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
 
 
-@pytest.mark.parametrize(("local_draft", "peer_draft"), [(0, 0), (1, 1), (1, 0), (0, 1)])
+@pytest.mark.parametrize(
+    "local_draft,peer_draft,embedded_dspark",
+    [(0, 0, False), (1, 1, False), (1, 0, False), (0, 1, False), (3, 0, True), (0, 3, True)],
+    ids=["0-0", "1-1", "1-0", "0-1", "dspark-3-0", "dspark-0-3"],
+)
 def test_peer_registrar_requires_matching_unified_draft_layers(
-    local_draft: int, peer_draft: int
+    local_draft: int, peer_draft: int, embedded_dspark: bool
 ) -> None:
     self_rankinfo = make_rankinfo(instance_name="local")
     self_rankinfo.num_draft_layers = local_draft
-    reg = _make_peer_registrar(self_rankinfo)
+    reg = _make_peer_registrar(self_rankinfo, requires_embedded_dspark_kv_match=embedded_dspark)
     peer_ri = make_rankinfo(
         instance_name="peer",
         instance_rank=1,
@@ -1925,8 +1933,11 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
         with pytest.raises(
             ValueError,
             match=f"draft KV layer count differs.*local={local_draft}, peer={peer_draft}",
-        ):
+        ) as error:
             reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        if embedded_dspark:
+            assert "same DSpark configuration on both workers" in str(error.value)
+            assert "TRTLLM_DISAGG_SHARED_DRAFT_KV" not in str(error.value)
         return
 
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)

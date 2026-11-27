@@ -108,13 +108,14 @@ def _check(rank: int, tp_size: int, strategy: str) -> None:
     rows = torch.arange(12, device="cuda").view(2, 6)
     same_kernel = shared.mnnvl_allreduce is not None
 
-    def inline():
+    def inline(all_rows=False):
         main_x = model.project_captured_rows(captured, rows)
-        kv = mxfp8_lowm_linear(main_x[:, :5].reshape(10, -1), *model._backfill_wkv_fp8)
-        return main_x, kv.view(2, 5, -1)
+        width = 6 if all_rows else 5
+        kv = mxfp8_lowm_linear(main_x[:, :width].reshape(2 * width, -1), *model._backfill_wkv_fp8)
+        return main_x, kv.view(2, width, -1)
 
-    def matches_inline(forked):
-        want = inline()
+    def matches_inline(forked, all_rows=False):
+        want = inline(all_rows)
         if same_kernel:
             return all(torch.equal(a, b) for a, b in zip(forked, want))
         return all(error(a, b) < 1e-2 for a, b in zip(forked, want))
@@ -123,7 +124,10 @@ def _check(rank: int, tp_size: int, strategy: str) -> None:
     # all-reduce on another stream; neither all-reduce disturbs the other. As in the CUDA-graph
     # runner, eager calls release their window outputs, which the owned capture then reuses.
     with discard_nccl_window_tensor_outputs(captured):
-        results = [matches_inline(model.project_backfill_rows(captured, rows))]
+        results = [
+            matches_inline(model.project_backfill_rows(captured, rows, all_rows=all_rows), all_rows)
+            for all_rows in (False, True)
+        ]
     side = torch.cuda.Stream()
     other = torch.randn(6, HIDDEN, generator=gen, device="cuda").bfloat16()
     params = AllReduceParams(

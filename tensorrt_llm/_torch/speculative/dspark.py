@@ -227,6 +227,7 @@ class DSparkSpecMetadata(SpecMetadata):
     # Valid suffix rows per context in the original target batch. None keeps
     # the ordinary full-capture contract; zero means this chunk has no capture.
     context_capture_lens: tuple[int, ...] | None = field(default=None, init=False, repr=False)
+    context_chunking_ids: frozenset[int] = field(default_factory=frozenset, init=False, repr=False)
 
     # Hidden state capture fields
     layers_to_capture: Optional[List[int]] = None
@@ -286,7 +287,7 @@ class DSparkSpecMetadata(SpecMetadata):
         # captured gen forward can index the rolling windows by tensor. Mirrors
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = self._dspark_worker
-        if worker is not None and worker._win_inited:
+        if worker is not None and worker._win_inited and worker._kv_windows is not None:
             req_to_slot = worker._req_to_slot
             # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
             # requests, or disagg seed forwards without a real id) map to the
@@ -463,9 +464,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
     window, refines the per-position logits with the Markov head, and predicts a
     per-position acceptance confidence used by the verification scheduler.
 
-    Unlike DFlash, the draft does NOT use the paged KV cache or mask-token
-    cross-attention: its attention K/V come from the worker-owned rolling window
-    of projected captured context (one ``main_kv`` per decode step, per stage).
+    DeepSeek-V4 stores projected captured context in a worker-owned rolling
+    window. The V4.1 worker stores it in the target's CSA2 draft pages.
     Acceptance of the previous block goes through the unified
     :meth:`SpecWorkerBase.sample_and_accept_draft_tokens` (strict target-verify,
     or rejection sampling for a non-greedy batch), so greedy parity with no-spec
@@ -791,6 +791,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
         table_len = int(getattr(inner_model, "_runtime_position_ceiling", 0) or config_cap)
         self._position_cap = (table_len - 1 - block_size) if table_len else None
 
+    def _allocate_context_storage(
+        self, rows: int, stages: int, window: int, head_dim: int
+    ) -> torch.Tensor | None:
+        return torch.zeros((rows, stages, window, head_dim), dtype=torch.bfloat16, device="cuda")
+
     def _lazy_init(self, draft_model, spec_metadata, attn_metadata=None) -> None:
         block_size = int(draft_model.block_size)
         if block_size != self.max_draft_len:
@@ -838,10 +843,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 CUDA_GRAPH_DUMMY_REQUEST_ID - 2 * (self.max_draft_len + 1) + 1
             )
 
-            self._kv_windows = torch.zeros(
-                (num_rows, num_stages, self._win, head_dim),
-                dtype=torch.bfloat16,
-                device="cuda",
+            self._kv_windows = self._allocate_context_storage(
+                num_rows, num_stages, self._win, head_dim
             )
             self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
             self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
@@ -874,17 +877,20 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 self._build_verify_planner(draft_model, block_size)
             self._free_slots = deque(range(num_slots))
             self._req_to_slot = {}
-            logger.info(
-                f"DSpark: allocated rolling KV windows "
-                f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
-                f"({num_slots} request slots + 1 scratch row)"
-            )
+            if self._kv_windows is not None:
+                logger.info(
+                    f"DSpark: allocated rolling KV windows "
+                    f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
+                    f"({num_slots} request slots + 1 scratch row)"
+                )
+            else:
+                logger.info(f"DSpark: initialized {num_slots} managed-page request slots")
             # Buffer state is complete independently of CuTe DSL prewarming.
             # A failed prewarm must not cause the next forward to recreate the
             # windows or reset the live slot maps.
             self._win_inited = True
 
-        if self._attention_warmup_attempted:
+        if self._kv_windows is None or self._attention_warmup_attempted:
             return
 
         # Prewarm the same self-JIT ops used by production before CUDA graph
@@ -1010,7 +1016,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._ctx_len[slot].zero_()
         self._valid_len[slot].zero_()
         self._position_initialized[slot].zero_()
-        self._kv_windows[slot].zero_()
+        if self._kv_windows is not None:
+            self._kv_windows[slot].zero_()
 
     def _seed_context_windows(
         self,
@@ -1096,6 +1103,27 @@ class DSv4DSparkWorker(SpecWorkerBase):
             draft_len=self.max_draft_len,
             window=self._win,
             position_cap=self._position_cap,
+        )
+
+    def _advance_unprepared_generation_state(
+        self,
+        spec_metadata: DSparkSpecMetadata,
+        slots: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        position_ids: torch.Tensor,
+        gen_start: int,
+        num_rows: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """Advance draft history when acceptance did not prepare it."""
+        qo_indptr = spec_metadata.qo_indptr
+        if spec_metadata.verify_lens is not None and qo_indptr is not None:
+            base = gen_start + qo_indptr[: slots.shape[0]].to(device=slots.device, dtype=torch.long)
+            return self._advance_ragged_generation_state(
+                slots, accepted_tokens, num_accepted_tokens, position_ids, base, num_rows
+            )
+        return self._advance_generation_state(
+            slots, accepted_tokens, num_accepted_tokens, position_ids, gen_start, num_rows
         )
 
     def _advance_ragged_generation_state(
@@ -1276,6 +1304,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             and draft_model.supports_greedy_token_reuse
         )
 
+    def _can_backfill_main_kv(self, draft_model) -> bool:
+        return False
+
     def _fork_backfill_projection(
         self, spec_metadata: "DSparkSpecMetadata", num_tokens: int
     ) -> None:
@@ -1312,7 +1343,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             rows = torch.arange(num_tokens, device=captured.device).view(num_gens, width)
-            main_x, kv = draft_model.project_backfill_rows(captured, rows)
+            if self._can_backfill_main_kv(draft_model):
+                main_x, kv = draft_model.project_backfill_rows(captured, rows, all_rows=True)
+            else:
+                main_x, kv = draft_model.project_backfill_rows(captured, rows)
             done = torch.cuda.Event()
             done.record(side)
         self._prep_fork = (spec_metadata, num_gens, width, main_x, kv, done)
@@ -1400,27 +1434,15 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # target input position; locally-prefilled and existing slots keep their
         # monotonically advanced position.
         if prepared is None:
-            qo_indptr = spec_metadata.qo_indptr
-            if spec_metadata.verify_lens is not None and qo_indptr is not None:
-                # Ragged verification uses the same qo_indptr as the packed input.
-                base = gen_start + qo_indptr[:num_gens].to(device=slots.device, dtype=torch.long)
-                prepared = self._advance_ragged_generation_state(
-                    slots,
-                    accepted_tokens[num_contexts:batch_size],
-                    num_accepted_tokens[num_contexts:batch_size],
-                    position_ids.reshape(-1),
-                    base,
-                    captured.shape[0],
-                )
-            else:
-                prepared = self._advance_generation_state(
-                    slots,
-                    accepted_tokens[num_contexts:batch_size],
-                    num_accepted_tokens[num_contexts:batch_size],
-                    position_ids.reshape(-1),
-                    gen_start,
-                    captured.shape[0],
-                )
+            prepared = self._advance_unprepared_generation_state(
+                spec_metadata,
+                slots,
+                accepted_tokens[num_contexts:batch_size],
+                num_accepted_tokens[num_contexts:batch_size],
+                position_ids.reshape(-1),
+                gen_start,
+                captured.shape[0],
+            )
         bonus, main_rows, start_pos, valid_len, interim_rows, interim_pos, interim_valid = prepared
         # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
         # (everything but the bonus) into the rolling window — same frames as the
@@ -1480,7 +1502,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._ctx_len.clone(),
             self._valid_len.clone(),
             self._position_initialized.clone(),
-            self._kv_windows.clone(),
+            None if self._kv_windows is None else self._kv_windows.clone(),
             # The confidence buffer is persistent state too; warmup scores
             # must not reach the verification planner.
             None if self._confidence_logits is None else self._confidence_logits.clone(),
@@ -1492,7 +1514,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._ctx_len.copy_(ctx_len)
         self._valid_len.copy_(valid_len)
         self._position_initialized.copy_(position_initialized)
-        self._kv_windows.copy_(windows)
+        if windows is not None:
+            self._kv_windows.copy_(windows)
         if confidence is not None:
             self._confidence_logits.copy_(confidence)
         if stamp is not None:

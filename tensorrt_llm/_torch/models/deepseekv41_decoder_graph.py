@@ -45,6 +45,7 @@ from ..utils import make_weak_ref
 
 if TYPE_CHECKING:
     from ..attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from ..speculative.dspark import DSparkSpecMetadata
 
 # Token buckets of the encoder pass. A replay pads every rank to its bucket, and padding rows cost
 # MoE work or EP traffic, so a step with more padding on a rank than ENCODER_MAX_PAD runs eagerly
@@ -68,11 +69,13 @@ class PassRows:
     engram: Optional[dict] = None
     engram_events: Optional[dict] = None
     launch_engram: Optional[Callable[[int], None]] = None
+    spec_metadata: Optional["DSparkSpecMetadata"] = None
 
     def clear(self) -> None:
         """Nothing is live between replays."""
         self.rows, self.attn_metadata, self.all_rank_num_tokens = 0, None, None
         self.engram = self.engram_events = self.launch_engram = None
+        self.spec_metadata = None
 
     @contextmanager
     def live_counts(self) -> Iterator[None]:
@@ -187,6 +190,7 @@ class _PassGraph:
         engram: Optional[dict] = None,
         engram_events: Optional[dict] = None,
         launch_engram: Optional[Callable[[int], None]] = None,
+        spec_metadata: Optional["DSparkSpecMetadata"] = None,
     ) -> HCState:
         """Copy the live inputs into the bucket's static inputs and replay its graph.
 
@@ -213,6 +217,7 @@ class _PassGraph:
         live.rows, live.attn_metadata = attn_metadata.num_tokens, attn_metadata
         live.all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         live.engram, live.engram_events, live.launch_engram = engram, engram_events, launch_engram
+        live.spec_metadata = spec_metadata
         try:
             if image_mask is not None:
                 padded_mask = image_mask.new_zeros(bucket)
@@ -342,6 +347,7 @@ class DecoderPassGraph(_PassGraph):
         position_ids: torch.Tensor,
         input_ids: Optional[torch.Tensor],
         image_mask: Optional[torch.Tensor] = None,
+        spec_metadata: Optional["DSparkSpecMetadata"] = None,
     ) -> HCState:
         """Run the layers for the resolved ``hc_state`` at the shape of ``bucket``."""
         return self._replay(
@@ -349,6 +355,7 @@ class DecoderPassGraph(_PassGraph):
             attn_metadata,
             (hc_state.residual, hc_state.pre_mix, position_ids, input_ids),
             image_mask,
+            spec_metadata=spec_metadata,
         )
 
     def _static_inputs(self, largest, live_inputs):

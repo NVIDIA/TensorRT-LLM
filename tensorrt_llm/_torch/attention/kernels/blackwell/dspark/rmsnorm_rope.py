@@ -615,3 +615,128 @@ class DSparkConcatFP8QuantKernel:
                 )
                 for replica in cutlass.range_constexpr(4):
                     output_scale[scale_offset + replica] = scale_byte
+
+
+class DSparkPagedBackfillKernel(DSparkRMSNormRoPEKernel):
+    """Normalize and rotate accepted tokens directly into each stage's managed pages."""
+
+    def __init__(self, hidden_dim: int, rope_dim: int, eps: float, page_size: int, num_stages: int):
+        super().__init__(hidden_dim, rope_dim, 1, eps, True, True, False)
+        self.page_size = page_size
+        self.num_stages = num_stages
+
+    @cute.jit
+    def __call__(
+        self,
+        kv: cute.Tensor,
+        weight: cute.Tensor,
+        freqs: cute.Tensor,
+        mask: cute.Tensor,
+        positions: cute.Tensor,
+        block_tables: cute.Tensor,
+        capacities: cute.Tensor,
+        pools: tuple,
+        interim: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            kv, weight, freqs, mask, positions, block_tables, capacities, pools, interim
+        ).launch(
+            grid=[mask.shape[0], self.num_stages, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        kv: cute.Tensor,
+        weight: cute.Tensor,
+        freqs: cute.Tensor,
+        mask: cute.Tensor,
+        positions: cute.Tensor,
+        block_tables: cute.Tensor,
+        capacities: cute.Tensor,
+        pools: tuple,
+        interim: cutlass.Int32,
+    ):
+        token, stage, _ = cute.arch.block_idx()
+        if mask[token] != 0:
+            frame = cutlass.Int32(positions[token])
+            position = frame - 1
+            request = token // interim
+            page = cutlass.Int32(-1)
+            if position >= 0 and position < capacities[request]:
+                logical_page = position // self.page_size
+                if logical_page < block_tables.shape[1]:
+                    page = block_tables[request, logical_page]
+            for selected in cutlass.range_constexpr(self.num_stages):
+                if stage == selected:
+                    pool = pools[selected]
+                    if page >= 0 and page < pool.shape[0]:
+                        self.store_normalized_row(
+                            kv,
+                            token * self.num_stages + selected,
+                            weight[selected, None],
+                            freqs,
+                            frame,
+                            pool[page, position % self.page_size, None],
+                        )
+
+
+class DSparkRMSNormRoPEPageWriteKernel(DSparkRMSNormRoPEKernel):
+    """Apply RMSNorm/RoPE and write each valid row directly into its managed page."""
+
+    def __init__(self, hidden_dim: int, rope_dim: int, eps: float, page_size: int):
+        super().__init__(hidden_dim, rope_dim, 1, eps, True, True, False)
+        self.page_size = page_size
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        freqs: cute.Tensor,
+        kv_cache: cute.Tensor,
+        block_tables: cute.Tensor,
+        start_pos: cute.Tensor,
+        capacities: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            x,
+            weight,
+            freqs,
+            kv_cache,
+            block_tables,
+            start_pos,
+            capacities,
+        ).launch(
+            grid=[x.shape[0], 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        freqs: cute.Tensor,
+        kv_cache: cute.Tensor,
+        block_tables: cute.Tensor,
+        start_pos: cute.Tensor,
+        capacities: cute.Tensor,
+    ):
+        row, _, _ = cute.arch.block_idx()
+        position = start_pos[row] - 1
+        page = cutlass.Int32(-1)
+        if position >= 0 and position < capacities[row]:
+            logical_page = position // self.page_size
+            if logical_page < block_tables.shape[1]:
+                page = block_tables[row, logical_page]
+        if page >= 0 and page < kv_cache.shape[0]:
+            cache_pos = position % self.page_size
+            self.store_normalized_row(
+                x, row, weight, freqs, row, kv_cache[cutlass.Int64(page), cache_pos, None]
+            )

@@ -4915,8 +4915,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         DSpark ships in two shapes, and they need different runtime plumbing:
 
         - embedded: the draft is the ``mtp.*`` namespace of the *target*
-          checkpoint, built from full target decoder blocks, and served by
-          ``DSv4DSparkWorker`` with its own rolling captured-context window.
+          checkpoint. The V4 worker uses a rolling captured-context window,
+          and the V4.1 worker uses draft pages in the target's CSA2 KV manager.
         - standalone: the draft is its own checkpoint with a registry-resolved
           backbone, served by ``DFlashWorker`` and its paged draft KV cache.
 
