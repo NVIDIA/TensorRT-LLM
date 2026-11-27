@@ -32,6 +32,7 @@ prologue also reads before its own wait; the caller answers for that.
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
@@ -514,6 +515,31 @@ _FLAT_MAX_RUNS = 64
 _FLAT_WARPS = 4
 #: `early`: the tiles a program prefetches into L2 before its grid-dependency wait.
 _EARLY_PF_TILES = 2
+#: Opt-in (`TRTLLM_QWEN4_EXP_INDEX_EARLY_PF_ROWS=<n>`, read at import; unset or 0: never): an
+#: `early` flat-grid call of more than n rows keeps its early launch and pre-wait tile map but
+#: issues no L2 prefetch (`_EARLY_PF_TILES` -> 0). The prefetch is a hint, so the scores are the
+#: same bits either way. GB300 op benchmark (15 calls a step, contexts 4.8k-221k tokens):
+#: 160 / 192 / 208 / 224 rows, index scores 642 -> 504 / 751 -> 587 / 793 -> 628 / 859 -> 665 us a
+#: step; at 96-128 rows the prefetch pays (+11..+12 us without it), so the cutoff is a row count.
+EARLY_PF_ROWS_ENV = "TRTLLM_QWEN4_EXP_INDEX_EARLY_PF_ROWS"
+
+
+def _early_pf_rows() -> int:
+    """`EARLY_PF_ROWS_ENV`: the row count past which an early flat-grid call prefetches nothing
+    (0 = never). A value that is not a non-negative integer raises."""
+    raw = os.environ.get(EARLY_PF_ROWS_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ValueError(f"{EARLY_PF_ROWS_ENV}={raw!r}: expected a non-negative row count")
+    return value
+
+
+_EARLY_PF_ROWS = _early_pf_rows()
 
 
 @functools.lru_cache(maxsize=None)
@@ -860,7 +886,7 @@ def _qsa_index_scores_flat(
         PROGRAMS=programs,
         ROW_BY_ROW=rows_per_request > 1,
         EARLY=bool(early),
-        PF_TILES=_EARLY_PF_TILES if early else 0,
+        PF_TILES=_EARLY_PF_TILES if early and not 0 < _EARLY_PF_ROWS < rows else 0,
         num_warps=_FLAT_WARPS,
         launch_pdl=bool(early),
     )

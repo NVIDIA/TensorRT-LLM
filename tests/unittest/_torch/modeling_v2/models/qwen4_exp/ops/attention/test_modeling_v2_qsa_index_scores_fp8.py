@@ -202,3 +202,52 @@ def test_early_is_bitwise_the_default_flat_launch(requests, rpr):
         for r in range(out.shape[0]):
             v = (int(args["query_positions"][r]) + 1) // RATIO
             assert torch.equal(out[r, :v], want[r, :v])
+
+
+@pytest.mark.parametrize(
+    "requests, rpr",
+    [
+        (tuple((900 + 7919 * r, 4) for r in range(12)), 4),  # dep verify, 12 runs of 4
+        (tuple((4800 + 4100 * r, 4) for r in range(40)), 4),  # dep4 40 a rank: 160 rows
+        (tuple((5, 4) for _ in range(3)), 4),  # fewer tiles than programs
+    ],
+    ids=["verify12", "verify40", "short"],
+)
+def test_early_without_prefetch_is_bitwise(monkeypatch, requests, rpr):
+    """`TRTLLM_QWEN4_EXP_INDEX_EARLY_PF_ROWS`: the early launch without its L2 prefetch gives the
+    default launch's scores bit for bit (the prefetch is a hint), behind a PDL anchor convert,
+    eager and under graph replay."""
+    spec = _module._scores_spec(requests=requests, rows_per_request=rpr, table=8196)
+    args, bf16_keys, (every, owners) = build(spec, seed=31)
+    want = qsa_index_scores_fp8(**args)
+    plane = args["index_cache"]
+    monkeypatch.setattr(_module, "_EARLY_PF_ROWS", 1)
+
+    def chain():
+        plane.copy_(bf16_keys)
+        index_anchors_to_fp8(plane, args["block_table"], owners, every.long(), TPB, RATIO, True)
+        return qsa_index_scores_fp8(**args, early=True)
+
+    got = chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = chain()
+    graph.replay()
+    torch.cuda.synchronize()
+    for out in (got, captured):
+        for r in range(out.shape[0]):
+            v = (int(args["query_positions"][r]) + 1) // RATIO
+            assert torch.equal(out[r, :v], want[r, :v]), f"row {r}"
+
+
+def test_early_pf_rows_env(monkeypatch):
+    """The switch's parse: unset or 0 is off, a negative or non-integer value raises."""
+    monkeypatch.delenv(_module.EARLY_PF_ROWS_ENV, raising=False)
+    assert _module._early_pf_rows() == 0
+    monkeypatch.setenv(_module.EARLY_PF_ROWS_ENV, "128")
+    assert _module._early_pf_rows() == 128
+    for bad in ("-1", "x", "1.5"):
+        monkeypatch.setenv(_module.EARLY_PF_ROWS_ENV, bad)
+        with pytest.raises(ValueError):
+            _module._early_pf_rows()
