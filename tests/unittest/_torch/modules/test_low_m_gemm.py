@@ -34,7 +34,7 @@ from tensorrt_llm._torch.modules.low_m_gemm import (
     mxfp8_lowm_linear,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
-from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
 
 # ---------------------------------------------------------------------------
 # Skip helpers — apply to tests that need hardware, not to mocked unit tests.
@@ -714,15 +714,16 @@ def test_fp8_lowm_index_query_matches_packed_rope_projection(m):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_blackwell_datacenter(),
-    reason="the shared expert stores the SwiGLU on SM100/SM103",
+    not torch.cuda.is_available() or not (is_blackwell_datacenter() or get_sm_version() == 107),
+    reason="the fused shared expert requires SM100, SM103 or SM107",
 )
 @torch.inference_mode()
-@pytest.mark.parametrize("m", [6])
+@pytest.mark.parametrize("m", [8, 9] if get_sm_version() == 107 else [6])
 def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
     """The full-TP shared-expert piece's gate_up GEMM stores the clamped SwiGLU: the bits of the
     GEMM, the separate SwiGLU launch and the down GEMM, eagerly and in graph replays."""
     from tensorrt_llm._torch.models.modeling_deepseekv4 import full_tp_shared_expert_forward
+    from tensorrt_llm._torch.modules import low_m_gemm
     from tensorrt_llm._torch.modules import swiglu as swiglu_module
 
     monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
@@ -741,17 +742,29 @@ def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
         x.copy_(torch.randn(m, k, device="cuda", generator=g) * scale)
         x[0] *= 16  # past the clamp limit
 
+    mma_options = (True, False) if get_sm_version() == 107 and m <= 8 else None
+
     def separate():
-        gate_up = mxfp8_lowm_linear(x, w13, s13)
-        return mxfp8_lowm_linear(swiglu_module.swiglu(gate_up, swiglu_limit=limit), w2, s2)
+        gate_up = mxfp8_lowm_linear(x, w13, s13, mma_options=mma_options)
+        hidden = swiglu_module.swiglu(gate_up, swiglu_limit=limit)
+        return mxfp8_lowm_linear(hidden, w2, s2, mma_options=mma_options)
 
     def no_swiglu(*args, **kwargs):
         raise AssertionError("the shared expert launched the separate SwiGLU")
 
     def folded():
+        options = []
+
+        def record_mma_options(*args, **kwargs):
+            options.append(kwargs.get("mma_options"))
+            return mxfp8_lowm_linear(*args, **kwargs)
+
         with monkeypatch.context() as patch:
             patch.setattr(swiglu_module, "swiglu", no_swiglu)
-            return full_tp_shared_expert_forward(x, (w13, s13, w2, s2), limit)
+            patch.setattr(low_m_gemm, "mxfp8_lowm_linear", record_mma_options)
+            out = full_tp_shared_expert_forward(x, (w13, s13, w2, s2), limit)
+        assert options == [mma_options, mma_options]
+        return out
 
     new_input(2)
     assert torch.equal(folded(), separate())

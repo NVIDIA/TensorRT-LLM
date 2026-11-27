@@ -409,9 +409,10 @@ Limitations:
 ## Developer utilities
 
 1. Reduce startup time when debugging a model
-   1. Set autotuner cache or disable autotuner
+   1. Set autotuner cache, prune autotuner tactics, or disable autotuner
       1. Set autotuner cache: set the `TLLM_AUTOTUNER_CACHE_PATH=autotuner_cache/cache` environment variable. Use this at your own risk; you may need to delete the cache if `NP` changes or the code changes
-      2. Disable autotuner: add the `--no-enable-autotuner` option
+      2. Prune CuTe DSL GEMM/BMM autotuner sweep with nvMatmulHeuristics: add the `--enable-autotuner-nvmmh` option
+      3. Disable autotuner: add the `--no-enable-autotuner` option
    2. Disable nsys profiling: set the `PROFILE=0` environment variable
 2. Capture more information
    1. Enable GPU metrics: set the `GPU_METRICS=1` environment variable

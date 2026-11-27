@@ -339,6 +339,41 @@ def test_mpi_pool_session_flashinfer_workspace_isolation(
     assert cubin_dirs == {None}
 
 
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+@pytest.mark.parametrize("session_kwargs, expected_mpi_info", [
+    pytest.param({}, None, id="default"),
+    pytest.param({"mpi_info": {
+        "oversubscribe": "true"
+    }}, {"oversubscribe": "true"},
+                 id="caller-info"),
+])
+def test_mpi_pool_session_spawns_with_caller_mpi_info(
+        monkeypatch: pytest.MonkeyPatch, session_kwargs: dict,
+        expected_mpi_info: dict[str, str] | None) -> None:
+    from tensorrt_llm.llmapi import mpi_session
+
+    spawns: list[dict[str, object]] = []
+
+    class RecordingPoolExecutor:
+        """Records the spawn options of the pool instead of spawning workers."""
+
+        def __init__(self, **kwargs: object) -> None:
+            spawns.append(kwargs)
+
+        def shutdown(self, wait: bool = True) -> None:
+            pass
+
+    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", RecordingPoolExecutor)
+
+    session = MpiPoolSession(n_workers=2, **session_kwargs)
+    session.shutdown()
+
+    (spawn, ) = spawns
+    # None leaves mpi4py's default spawn info in place.
+    assert spawn.get("mpi_info") == expected_mpi_info
+
+
 def simple_task(x):
     print(f"** simple_task {x} returns {x * 2}\n", "green")
     res = x * 2
