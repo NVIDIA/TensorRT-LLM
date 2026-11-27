@@ -118,6 +118,10 @@ runs every generation request's `max_draft_len + 1` verify rows:
   (the trunk step's tokens on the first, one row a request on the rest, attention-DP dummy
   requests included) without writing them into the metadata; `_dp_pad_rows` pads this rank's
   rows by them, so every rank issues the same collectives at every draft step.
+* A generation-only draft-extend step past one rank runs the attention core and the tail on
+  each request's continuing row only (`_draft_continue`); every row still writes its K/V and
+  index key. Under attention DP it does so only when the group's counts show every rank
+  generation-only, and its MoE round trip then pads by the group's request counts.
 * A verify step's Gated-DeltaNet rows take the multi-token conv with per-step window snapshots
   and the stock Triton cached replay over the bf16 pool, which commits a full history in the
   kernel below `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests and leaves it to the
@@ -185,6 +189,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmo
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.silu_and_mul_rows import (
     silu_and_mul_rows,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.draft_continue_rows__decode import (  # noqa: E501
+    draft_continue_select,
+    draft_rows_gather,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonical_selection import (
     qsa_canonical_selection,
@@ -289,6 +297,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.verify_step_
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.verify_step_setup import (
     verify_step_setup,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.embed_rows__decode import (
+    embed_rows,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.bf16_gemv_pdl import (
     MAX_ROWS as _GEMV_MAX_ROWS,
@@ -2577,7 +2588,10 @@ def _draft_embedding(input_ids: torch.Tensor, embed_tokens: torch.Tensor) -> tor
     (the in-tree `Embedding` masks such ids for the same reason). Those rows feed nothing the
     step keeps: attention is causal, the worker continues from each request's last accepted
     row, and the next step's first draft call rewrites their cache positions. So a negative
-    id reads row 0 instead of past the table; every valid id embeds as before."""
+    id reads row 0 instead of past the table; every valid id embeds as before. The clamp and
+    the gather are one launch where `embed_rows` takes the ids (bitwise the composed path)."""
+    if input_ids.dim() == 1 and input_ids.is_contiguous():
+        return embed_rows(input_ids, embed_tokens, 1, True)
     return nn.functional.embedding(input_ids.clamp_min(0), embed_tokens)
 
 
@@ -2914,6 +2928,86 @@ def _draft_pad_rows(core, all_rank_num_tokens, rows: int) -> int:
         "trip cannot pad this rank's rows to the group's largest count"
     )
     return core._dp_pad_rows(_DraftRowCounts(list(all_rank_num_tokens)), rows)
+
+
+class _DraftContinue(NamedTuple):
+    """A draft-extend step's continuing rows: `rows` `[gen_seqs]` int64, the QSA row metadata
+    at them, and under attention DP the group's kept-row counts (None under attention TP)."""
+
+    rows: torch.Tensor
+    visible: torch.Tensor
+    seq_lens: torch.Tensor
+    logical: torch.Tensor
+    req_idx: torch.Tensor
+    counts: list | None
+
+
+def _draft_continue(
+    core, md, spec_metadata, all_rank_num_tokens, rows: int, gen_seqs: int, p: int, share: bool
+) -> _DraftContinue | None:
+    """Each request's continuing row of a draft-extend step (`p` rows a request), or None when
+    every row goes on.
+
+    The spec worker continues from row `r * p + num_accepted[r] - 1` of each request; the other
+    rows matter only through the K/V and index keys they write, which every row still writes.
+    Not under IndexShare (its capture keeps every row's selection), nor without the worker's
+    accepted counts. Under attention DP the draft MoE's round trip then holds every rank's
+    request count, so the decision is the group's: taken only when every rank is
+    generation-only with `p` rows a request (`spec_metadata`'s group counts, the same host lists
+    on every rank), never from this rank's batch alone."""
+    accepted = getattr(md, "qsa_mtp_num_accepted", None)
+    if core.one_rank or p <= 1 or share or accepted is None:
+        return None
+    counts = None
+    if core.dp_size > 1:
+        seqs = getattr(spec_metadata, "all_rank_num_seqs", None)
+        gens = getattr(spec_metadata, "all_rank_num_gens", None)
+        if seqs is None or gens is None or all_rank_num_tokens is None:
+            return None
+        counts = [int(c) for c in seqs]
+        if [int(c) for c in gens] != counts or [int(t) for t in all_rank_num_tokens] != [
+            p * c for c in counts
+        ]:
+            return None
+        assert counts[core.dp_rank] == gen_seqs and rows == p * gen_seqs, (
+            f"rank {core.dp_rank} drafts {gen_seqs} requests in {rows} rows, but the group's "
+            f"counts say {counts[core.dp_rank]} requests of {p} rows"
+        )
+    elif rows != p * gen_seqs:
+        return None
+    meta = (
+        md.qsa_visible_blocks[:rows],
+        md.qsa_sequence_lengths[:rows],
+        md.qsa_logical_positions[:rows],
+        md.qsa_req_idx_per_token[:rows],
+    )
+    if accepted.is_contiguous() and all(t.is_contiguous() for t in meta):
+        # The rows and the metadata at them in one launch.
+        cont, meta = draft_continue_select(accepted, gen_seqs, p, meta)
+    else:
+        last = torch.clamp(accepted[:gen_seqs].to(torch.int64) - 1, min=0, max=p - 1)
+        cont = torch.arange(gen_seqs, dtype=torch.int64, device=last.device) * p + last
+        meta = tuple(torch.index_select(t, 0, cont) for t in meta)
+    return _DraftContinue(cont, *meta, counts)
+
+
+def _draft_rows(cont: torch.Tensor, operands: dict) -> dict:
+    """`operands` at rows `cont`: the 2-D ones with unit column stride in one launch
+    (`draft_rows_gather`), any other one with `index_select`. A `[T, h, d]` index query is
+    gathered flat and comes back `[rows, h, d]`."""
+    out, flat = {}, {}
+    for name, t in operands.items():
+        f = t.reshape(t.shape[0], -1) if name == "q_index" else t
+        if f.dim() == 2 and f.stride(1) == 1:
+            flat[name] = f
+        else:
+            out[name] = torch.index_select(t, 0, cont)
+    if flat:
+        out.update(zip(flat, draft_rows_gather(cont, tuple(flat.values()))))
+    if "q_index" in flat:
+        q = operands["q_index"]
+        out["q_index"] = out["q_index"].view(cont.shape[0], *q.shape[1:])
+    return out
 
 
 def _hc_first(core, normed, first, with_inject):
@@ -6569,10 +6663,15 @@ class DecodeTarget:
         # captured verify step).
         coords = torch.transpose(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]), 0, 1)
 
-        h = nn.functional.embedding(input_ids, core.w["embed"])
-        num_tokens = h.shape[0]
-        dt = h.dtype
-        dev = h.device
+        hc_count = core.hc_count
+        if input_ids.dim() == 1 and input_ids.is_contiguous():
+            # The embedding and its copy into every hyper-connection stream in one launch.
+            hc = embed_rows(input_ids, core.w["embed"], hc_count, False)
+        else:
+            hc = torch.cat([nn.functional.embedding(input_ids, core.w["embed"])] * hc_count, -1)
+        num_tokens = hc.shape[0]
+        dt = hc.dtype
+        dev = hc.device
         batch = md.num_seqs
         # Decode CUDA graphs pad with real dummy requests, so they are in the metadata.
         assert num_tokens == md.num_tokens, (
@@ -6678,8 +6777,6 @@ class DecodeTarget:
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
         attn_out = torch.empty([num_tokens, core.q_width], dtype=dt, device=dev)
 
-        hc_count = core.hc_count
-        hc = torch.cat([h] * hc_count, -1)
         layers, S = self._layers, self._stack
         # Each block's output and injection go into the next site's first kernel (`_hc_site`),
         # after an MoE block with its combine (and at one rank its finalize, `fold`); before
@@ -6836,6 +6933,16 @@ class DecodeTarget:
                 pos3,
                 coords,
             )
+        # A draft-extend step goes on past the K/V and index-key writes on each request's
+        # continuing row only (`_draft_continue`); the MoE round trip then pads by the group's
+        # kept-row counts.
+        cont = _draft_continue(
+            core, md, kwargs.get("spec_metadata"), all_rank_num_tokens, rows, gen_seqs, p, share
+        )
+        n = rows
+        if cont is not None:
+            n = gen_seqs
+            pad_rows = _draft_pad_rows(core, cont.counts, n)
         x, mixed, inject = _mtp_front(core, M, embed_tokens, input_ids, hidden_states)
         qkv, gate, k_dst, v_dst = _mtp_qkv(core, M, mixed, pos3)
         q_index = None
@@ -6847,14 +6954,27 @@ class DecodeTarget:
                 draft,
                 (req_idx, logical, block_table, tokens_per_block, pos, coords),
             )
+        # The step's operands at the rows that go on (all of them without `cont`).
+        kept = {"x": x, "inject": inject}
+        if sparse:
+            kept.update(qkv=qkv, gate=gate)
+            if q_index is not None:
+                kept["q_index"] = q_index
+        if cont is not None:
+            kept = _draft_rows(cont.rows, kept)
         if sparse:
             kv = draft.kv
             _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
-            topk_indices = md.qsa_topk_indices[:rows]
-            visible_blocks = md.qsa_visible_blocks[:rows]
-            seq_lens_q = md.qsa_sequence_lengths[:rows]
+            topk_indices = md.qsa_topk_indices[:n]
+            if cont is None:
+                visible_blocks = md.qsa_visible_blocks[:rows]
+                seq_lens_q = md.qsa_sequence_lengths[:rows]
+                q_logical, q_req_idx = logical, req_idx
+            else:
+                visible_blocks, seq_lens_q = cont.visible, cont.seq_lens
+                q_logical, q_req_idx = cont.logical, cont.req_idx
             selected = torch.empty(
-                [rows, core.token_topk + core.compress_ratio - 1],
+                [n, core.token_topk + core.compress_ratio - 1],
                 dtype=torch.int32,
                 device=qkv.device,
             )
@@ -6883,37 +7003,40 @@ class DecodeTarget:
             else:
                 scores = _decode_index_scores(
                     core,
-                    q_index,
+                    kept["q_index"],
                     draft.index_cache,
                     block_table,
-                    logical,
-                    req_idx,
+                    q_logical,
+                    q_req_idx,
                     tokens_per_block,
-                    p,
+                    p if cont is None else 1,
                 )
                 _selection(
                     core,
                     scores,
                     visible_blocks,
-                    logical,
+                    q_logical,
                     seq_lens_q,
                     topk_indices,
-                    md.qsa_topk_row_starts[:rows],
+                    md.qsa_topk_row_starts[:n],
                     selected,
                 )
                 if share:
                     self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
-            q = _packed_q(core, qkv)
+            q = _packed_q(core, kept["qkv"])
+            g = kept["gate"]
             attn = _sparse_gqa_decode(
-                core, kv, q, block_table, selected, req_idx, tokens_per_block, gate, p
-            )
+                core, kv, q, block_table, selected, q_req_idx, tokens_per_block, g,
+                p if cont is None else 1,
+            )  # fmt: skip
             gated = attn is not None
             if not gated:
                 attn = _sparse_gqa(
-                    core, kv, q, block_table, selected, req_idx, tokens_per_block, None
+                    core, kv, q, block_table, selected, q_req_idx, tokens_per_block, None
                 )
-            attn = torch.reshape(attn, [rows, core.q_width])
+            attn = torch.reshape(attn, [n, core.q_width])
         else:
+            g = gate
             gated = False
             attn = thop_attention(
                 q=qkv,
@@ -6929,8 +7052,16 @@ class DecodeTarget:
                 **_CALL_CONSTANTS,
             )
         if not gated:
-            fused_sigmoid_mul_inplace(attn, gate)
-        return _mtp_tail(core, M, x, attn, inject, pad_rows)
+            fused_sigmoid_mul_inplace(attn, g)
+        if cont is not None and not sparse:
+            attn = torch.index_select(attn, 0, cont.rows)
+        out = _mtp_tail(core, M, kept["x"], attn, kept["inject"], pad_rows)
+        if cont is None:
+            return out
+        # The worker reads only the continuing rows; the others are left unwritten.
+        full = out.new_empty([rows, out.shape[1]])
+        full.index_copy_(0, cont.rows, out)
+        return full
 
 
 # ------------------------------------------------------------ the MTP module ---
@@ -7424,10 +7555,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
 ):
     """Qwen3.8-Flash-Next-NVFP4 at tp1, tp2, tep2, dep2, tp4, tep4, dep4, or dep8 across nodes."""
 
-    # At tp1 one-engine speculative decoding takes the engine's fast paths (greedy and
-    # temperature-only sampling CUDA graph variants, the overlap loop on the execution stream,
-    # hoisted position ids, the MTP-Eagle draft loop's step-0 epilogue, the recorded steady
-    # decode-step prepare), validated there; off at every other layout.
+    # With a `speculative_config`, one-engine speculative decoding takes the engine's fast paths
+    # (greedy and temperature-only sampling CUDA graph variants, the overlap loop on the
+    # execution stream, hoisted position ids, the MTP-Eagle draft loop's step-0 epilogue, the
+    # recorded steady decode-step prepare) at every layout, as the FP8 target does.
     spec_decode_fast_paths: bool = False
     runtime_hooks: RuntimeHooks | None = None
     # Keeps a requested NVFP4 KV pool, which the engine otherwise turns into FP8 on sm_107.
@@ -7665,9 +7796,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             # Must match what the resource manager decided: left at `get_spec_worker`'s
             # default, the draft step would be handed a manager that maps no draft layer.
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(self.spec_config)
-            if self.one_rank:
-                self.spec_decode_fast_paths = True
-                self.runtime_hooks = RuntimeHooks(loop_on_execution_stream=True)
+            self.spec_decode_fast_paths = True
+            self.runtime_hooks = RuntimeHooks(loop_on_execution_stream=True)
             self.spec_worker = get_spec_worker(
                 self.spec_config,
                 model_config,
