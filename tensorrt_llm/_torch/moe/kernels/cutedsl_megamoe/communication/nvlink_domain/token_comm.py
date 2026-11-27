@@ -1541,11 +1541,17 @@ class TokenCommNonDeterministic(KernelComponent):
         )
         if self._router.adaptive_route_experts > 0 and not self.reduce_topk_in_kernel:
             quantized = self.combine_format.is_quantized
+            cell_bytes = self.hidden_size * self.combine_format.act_dtype.width // 8
+            sf_bytes = self.combine_sf_hidden_padded * self.combine_format.scale_dtype.width // 8 if quantized else 0
+            if cell_bytes <= 0 or cell_bytes % 8 != 0 or (quantized and (sf_bytes <= 0 or sf_bytes % 8 != 0)):
+                raise ValueError(
+                    f"Adaptive route combine cells must be positive multiples of 8 bytes, got cell={cell_bytes}, sf={sf_bytes}."
+                )
             self._router.dropped_pick_cells = (
                 self.pre_reduced_activation_region,
-                self.hidden_size * self.combine_format.act_dtype.width // 8,
+                cell_bytes,
                 self.pre_reduced_activation_sf_region if quantized else None,
-                self.combine_sf_hidden_padded * self.combine_format.scale_dtype.width // 8 if quantized else 0,
+                sf_bytes,
             )
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
         self._device_workspace = None

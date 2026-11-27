@@ -98,6 +98,20 @@ def _st_relaxed_sys_v2_b64(address: Int64, low: Int64, high: Int64, *, loc=None,
     )
 
 
+@dsl_user_op
+def _st_relaxed_sys_b64(address: Int64, value: Int64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "st.relaxed.sys.global.b64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class AdaptiveRouteMixin:
     """Device code of the adaptive route, mixed into the MegaMoE dispatch routers.
 
@@ -133,12 +147,20 @@ class AdaptiveRouteMixin:
 
     @cute.jit
     def _fill_dropped_pick_cell(self, cell: Int64, nbytes: int, word: Int64) -> None:
-        """Store ``word`` over the ``nbytes`` (a multiple of 16) of the combine cell at ``cell``: the cell of a pick
-        the route drops for a malformed table entry, which no producer writes. A router calls this only in the
-        branch of such a pick, so a well-formed table never runs it."""
+        """Store ``word`` over the ``nbytes`` (a positive multiple of 8) of the combine cell at ``cell``: the cell of
+        a pick the route drops for a malformed table entry, which no producer writes. Uses 16-byte stores when
+        ``nbytes`` is a multiple of 16 and 8-byte stores otherwise (e.g., 4-bit quantized combine with
+        ``hidden_size % 32 != 0``). A router calls this only in the branch of such a pick, so a well-formed table
+        never runs it."""
+        if cutlass.const_expr(nbytes <= 0 or nbytes % 8 != 0):
+            raise ValueError(f"Combine cell byte size must be a positive multiple of 8, got {nbytes}.")
         # A rolled loop: the branch stays a few instructions wherever a router places it.
-        for chunk in cutlass.range(nbytes // 16, unroll=1):
-            _st_relaxed_sys_v2_b64(cell + Int64(chunk) * Int64(16), word, word)
+        if cutlass.const_expr(nbytes % 16 == 0):
+            for chunk in cutlass.range(nbytes // 16, unroll=1):
+                _st_relaxed_sys_v2_b64(cell + Int64(chunk) * Int64(16), word, word)
+        else:
+            for chunk in cutlass.range(nbytes // 8, unroll=1):
+                _st_relaxed_sys_b64(cell + Int64(chunk) * Int64(8), word)
 
     @cute.jit
     def _adaptive_counted_rows(self, adaptive: tuple, cta_idx: Int32, thread_idx: Int32) -> Int32:
@@ -203,10 +225,15 @@ class AdaptiveRouteMixin:
             if index < Int32(self.adaptive_table_entries):
                 staged[index] = entries[round_]
 
+    # When True, a router staging the table to shared memory also stages ``cumulative_shares`` (2E + 2S entries)
+    # so replicated experts' share search reads shared memory instead of global memory.
+    adaptive_stages_shares: ClassVar[bool] = False
+
     @property
     def adaptive_table_entries(self) -> int:
-        """Entries of the table a pick reads unconditionally: ``counts | starts`` per expert, ``slots``."""
-        return 2 * self.adaptive_route_experts + self.expert_count
+        """Entries of the packed route table staged in shared memory: ``counts | starts | slots`` (plus
+        ``cumulative_shares`` when :attr:`adaptive_stages_shares` is True)."""
+        return 2 * self.adaptive_route_experts + (2 if self.adaptive_stages_shares else 1) * self.expert_count
 
     def _adaptive_table_rounds(self, threads: int) -> int:
         return (self.adaptive_table_entries + threads - 1) // threads
@@ -223,17 +250,20 @@ class AdaptiveRouteMixin:
         """The slot of a pick of ``expert`` (a valid id) in token row ``token``: its only copy, or for a replicated
         expert the copy whose cumulative-share range holds the pick's point (module docstring), -1
         for a malformed entry. Tables: ``counts | starts`` per expert, ``slots | cumulative_shares`` per slot;
-        with ``staged``, all but the shares are read from it."""
+        with ``staged``, ``counts | starts | slots`` (and ``cumulative_shares`` when :attr:`adaptive_stages_shares`)
+        are read from shared memory."""
         experts = self.adaptive_route_experts
         slot_count = self.expert_count
+        stage_shares = staged is not None and self.adaptive_stages_shares
         if cutlass.const_expr(staged is not None):
             copies = staged[expert]
             start = staged[Int32(experts) + expert]
         else:
             copies = _ld_nc_s32(tables + Int64(expert) * Int64(4))
             start = _ld_nc_s32(tables + (Int64(experts) + Int64(expert)) * Int64(4))
-        slots_base = tables + Int64(2 * experts) * Int64(4)
-        shares_base = tables + Int64(2 * experts + slot_count) * Int64(4)
+            slots_base = tables + Int64(2 * experts) * Int64(4)
+        if cutlass.const_expr(not stage_shares):
+            shares_base = tables + Int64(2 * experts + slot_count) * Int64(4)
         slot = Int32(-1)
         # No sum of two loaded words: start + copies wraps in Int32 (start = 2^31 - 1 and copies = 1 would pass).
         if (
@@ -249,13 +279,18 @@ class AdaptiveRouteMixin:
                     + cutlass.Uint32(ep_rank) * cutlass.Uint32(self.adaptive_rank_multiplier)
                     + cutlass.Uint32(token) * cutlass.Uint32(self.adaptive_token_multiplier)
                 )
+                if cutlass.const_expr(stage_shares):
+                    shares_start = Int32(2 * experts + slot_count) + start
                 searching = cutlass.Boolean(True)
                 while searching:
                     searching = cutlass.Boolean(False)
                     if k < copies - Int32(1):
-                        bound = cutlass.Uint32(
-                            _ld_nc_s32(shares_base + Int64(start + k) * Int64(4))
-                        )
+                        if cutlass.const_expr(stage_shares):
+                            bound = cutlass.Uint32(staged[shares_start + k])
+                        else:
+                            bound = cutlass.Uint32(
+                                _ld_nc_s32(shares_base + Int64(start + k) * Int64(4))
+                            )
                         # A bound of 2^32 - 1 ends the range: no point passes it.
                         if bound != cutlass.Uint32(0xFFFFFFFF):
                             if point >= bound:
@@ -289,8 +324,8 @@ def validate_adaptive_route_table(row, experts: int, slots: int) -> None:
     only (so no two runs overlap), and an expert's cumulative shares (uint32) do not decrease.
 
     The router only keeps its reads in bounds. A row outside this contract can route two picks of one token to one
-    slot, which the destination pool is not sized for, and a pick it drops for a malformed entry adds nothing to its
-    token's output."""
+    slot, which the destination pool is not sized for, and a pick it drops for a malformed entry is completed as zero
+    so its expert contribution is silently missing from the output."""
     row = [int(value) for value in row]
     if len(row) != 2 * experts + 2 * slots:
         raise ValueError(f"A route table row has 2 * {experts} + 2 * {slots} entries, got {len(row)}.")

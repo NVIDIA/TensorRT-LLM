@@ -521,6 +521,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 self.hidden_size,
                 self.topk,
                 self.combine_format,
+                # With the adaptive route the reduce reads the caller's expert ids and drops picks outside
+                # [0, adaptive_route_experts), as the router does; None: the default reduce reads no ids.
                 num_experts=self.adaptive_route_experts or None,
                 shared_term=self.reduce_shared_output,
             )

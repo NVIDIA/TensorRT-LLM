@@ -451,13 +451,29 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
         self.exchange_stages_topk_indices = True
         self.exchange_stages_topk_scores = self.apply_topk_at_fc1
         self.exchange_count_tables_in_plan = False
+        self.adaptive_stages_shares = False
         self._build_smem_workspace()
         self.exchange_count_tables_in_plan = True
         for stage_indices, stage_scores in ((True, True), (True, False), (False, False)):
             self.exchange_stages_topk_indices = stage_indices
             self.exchange_stages_topk_scores = stage_scores and self.apply_topk_at_fc1
             try:
-                self._smem_workspace = self._build_smem_workspace()
+                self.adaptive_stages_shares = False
+                base_ws = self._build_smem_workspace()
+                if self.adaptive_route_experts > 0:
+                    # Also stage cumulative_shares in SMEM whenever it does not raise peak SMEM above the base layout.
+                    self.adaptive_stages_shares = True
+                    try:
+                        shares_ws = self._build_smem_workspace()
+                    except ValueError:
+                        shares_ws = None
+                    if shares_ws is not None and shares_ws.total_bytes <= base_ws.total_bytes:
+                        self._smem_workspace = shares_ws
+                    else:
+                        self.adaptive_stages_shares = False
+                        self._smem_workspace = base_ws
+                else:
+                    self._smem_workspace = base_ws
                 break
             except ValueError:
                 if not stage_indices:
@@ -1617,16 +1633,9 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
 
         if cutlass.const_expr(self.exchange_stages_topk_indices):
             index_stage = self._smem_workspace.tensor(self.exchange_topk_stage_region, smem_base)
-            if cutlass.const_expr(drop_cells is None):
-                self._canonicalize_wire_indices(index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table)
-            elif drop_cells[1]:
-                # Only the counting CTA runs the copy of the loop that completes dropped picks' cells; the others run
-                # the loop without it.
-                self._canonicalize_wire_indices(
-                    index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table, (drop_cells[0], True)
-                )
-            else:
-                self._canonicalize_wire_indices(index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table)
+            self._canonicalize_wire_indices(
+                index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table, drop_cells
+            )
             # Every thread rewrote its own share of the staged plane; the single thread
             # that copies the plane out reads all of it.
             cute.arch.sync_threads()
@@ -1833,9 +1842,7 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
             if cutlass.Uint32(slot) >= cutlass.Uint32(self.expert_count):
                 slot = Int32(self.invalid_expert_marker)
                 if cutlass.const_expr(drop_cells is not None):
-                    if cutlass.const_expr(drop_cells[1] is True):
-                        self._complete_dropped_pick(drop_cells[0], route)
-                    elif drop_cells[1]:
+                    if drop_cells[1]:
                         self._complete_dropped_pick(drop_cells[0], route)
         return slot
 
@@ -2917,6 +2924,10 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
         # table and the first claim depend only on the helper's prefix tables, so
         # they run ahead of the metadata; only the row sources wait for it.
         sf_tag = self._call_tag(device_workspace)
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            # Pusher CTAs wrote and read pusher_route_table_region through the generic proxy; order those
+            # shared-memory accesses for the async proxy ahead of the CTA barrier before refine reuses the overlay.
+            cute.arch.fence_proxy("async.shared", space="cta")
         iket.range_push("refine.wait_prefix")
         if thread_idx == Int32(0):
             if cutlass.const_expr(self.sf_plain_transport):
