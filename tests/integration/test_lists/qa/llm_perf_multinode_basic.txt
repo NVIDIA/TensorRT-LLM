@@ -49,3 +49,16 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL]
+
+# B200 cases migrated from Post Merge (PR #21010).
+# Qwen3.5-397B FP4 aggregated
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_8k1k]
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_mtp3_8k1k]
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tep4_mtp3_8k1k]
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tp4_8k1k]
+
+# Qwen3.8-Flash-Next FP4 aggregated
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_8_flash_next_fp4_blackwell-qwen3_8_flash_next_fp4_tp1_mtp3_8k1k]
+
+# Gemma4-26B-A4B NVFP4 aggregated
+perf/test_perf_sanity.py::test_e2e[aggr-gemma4_26b_a4b_nvfp4_blackwell-gemma4_26b_a4b_nvfp4_tp1_1k1k]

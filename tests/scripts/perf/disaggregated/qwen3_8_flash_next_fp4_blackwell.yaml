@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3.8-Flash-Next NVFP4 on one B200: TRTLLM MoE, MTP3, PLE table on the host
+# (TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1), 8k/1k. Same engine settings as the
+# 1-GPU accuracy gate TestQwen3_8_Flash_Next_VL::test_nvfp4_1gpu_mtp3_trtllm_ple_offload
+# and the 1-GPU recipe in examples/configs/curated/qwen3.8-flash-next.yaml.
+# The accepted draft length is pinned so throughput does not depend on the
+# random prompts' acceptance rate.
+metadata:
+  model_name: qwen3.8_flash_next_fp4
+  supported_gpus:
+  - B200
+hardware:
+  gpus_per_node: 1
+server_configs:
+  - name: "qwen3_8_flash_next_fp4_tp1_mtp3_8k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3 TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1"
+    model_name: "qwen3.8_flash_next_fp4"
+    tensor_parallel_size: 1
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    max_batch_size: 16
+    max_num_tokens: 8192
+    trust_remote_code: true
+    enable_chunked_prefill: true
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 16
+    kv_cache_config:
+      dtype: auto
+      free_gpu_memory_fraction: 0.5
+      enable_block_reuse: false
+      mamba_ssm_cache_dtype: bfloat16
+    speculative_config:
+      decoding_type: 'MTP'
+      max_draft_len: 3
+    client_configs:
+      - name: "con4_iter10_8k1k"
+        concurrency: 4
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+      - name: "con16_iter10_8k1k"
+        concurrency: 16
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
