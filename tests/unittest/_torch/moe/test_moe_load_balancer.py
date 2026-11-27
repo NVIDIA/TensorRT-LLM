@@ -1024,15 +1024,41 @@ def test_unbacked_slots_back_and_unback():
     assert counters.gpu == before
 
 
+def _moe_weights(quant_algo: QuantAlgo | None = None) -> dict:
+    """Create the weights of one MoE layer as host tensors, as the model loader supplies them."""
+    from _torch.moe.quantize_utils import NVFP4QuantizeUtil
+
+    if quant_algo == QuantAlgo.NVFP4:
+        weights = NVFP4QuantizeUtil(
+            num_experts=_EXPERTS,
+            dtype=torch.bfloat16,
+            intermediate_size=_INTERMEDIATE,
+            hidden_size=_HIDDEN,
+            quant_config=QuantConfig(quant_algo=quant_algo)).create_weights(
+                x_sf_global=torch.tensor(1.0, device="cuda"))
+    else:
+        shapes = {
+            "w1": (_INTERMEDIATE, _HIDDEN),
+            "w3": (_INTERMEDIATE, _HIDDEN),
+            "w2": (_HIDDEN, _INTERMEDIATE)
+        }
+        weights = {
+            f"{expert_id}.{name}.weight":
+            torch.full(shape, expert_id + 1.0, dtype=torch.bfloat16)
+            for expert_id in range(_EXPERTS)
+            for name, shape in shapes.items()
+        }
+    return {name: w.cpu() for name, w in weights.items()}
+
+
 @contextmanager
 def _moe_layer(monkeypatch,
+               weights: dict,
                fault_tolerance: bool,
                meta_init: bool,
                moe_backend: str = "CUTLASS",
                quant_algo: QuantAlgo | None = None) -> Iterator[tuple]:
-    """Load one MoE layer as the model loader does; yield its balancer and module."""
-    from _torch.moe.quantize_utils import NVFP4QuantizeUtil
-
+    """Load one MoE layer from host weights as the model loader does; yield its balancer and module."""
     from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
     from tensorrt_llm._torch.moe.fused_moe import (RenormalizeMoeRoutingMethod,
                                                    create_moe)
@@ -1057,26 +1083,6 @@ def _moe_layer(monkeypatch,
                                quant_config=QuantConfig(quant_algo=quant_algo),
                                moe_backend=moe_backend,
                                moe_load_balancer=eplb_config)
-    if quant_algo == QuantAlgo.NVFP4:
-        weights = NVFP4QuantizeUtil(
-            num_experts=_EXPERTS,
-            dtype=torch.bfloat16,
-            intermediate_size=_INTERMEDIATE,
-            hidden_size=_HIDDEN,
-            quant_config=model_config.quant_config).create_weights(
-                x_sf_global=torch.tensor(1.0, device="cuda"))
-    else:
-        shapes = {
-            "w1": (_INTERMEDIATE, _HIDDEN),
-            "w3": (_INTERMEDIATE, _HIDDEN),
-            "w2": (_HIDDEN, _INTERMEDIATE)
-        }
-        weights = {
-            f"{expert_id}.{name}.weight":
-            torch.full(shape, expert_id + 1.0, dtype=torch.bfloat16)
-            for expert_id in range(_EXPERTS)
-            for name, shape in shapes.items()
-        }
     balancer_cls = MoeLoadBalancer
     if fault_tolerance:
         balancer_cls = functools.partial(FaultTolerantMoeLoadBalancer,
@@ -1118,13 +1124,15 @@ def _load_moe_layer(monkeypatch,
     """
     from tensorrt_llm.bindings import MemoryCounters
 
+    # Create the weights before the measurement, so it counts only the load.
+    weights = _moe_weights(quant_algo)
     counters = MemoryCounters.instance()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     allocated = torch.cuda.memory_allocated()
     unbacked_before = counters.gpu
-    with _moe_layer(monkeypatch, fault_tolerance, meta_init, moe_backend,
-                    quant_algo) as (balancer, moe):
+    with _moe_layer(monkeypatch, weights, fault_tolerance, meta_init,
+                    moe_backend, quant_algo) as (balancer, moe):
         torch.cuda.synchronize()
         unbacked = counters.gpu - unbacked_before
         peak = torch.cuda.max_memory_allocated() - allocated + unbacked
@@ -1182,7 +1190,9 @@ def test_spare_slots_unbacked_while_loading(monkeypatch, meta_init, moe_backend,
 def test_spare_slots_released_on_a_worker_during_forwards(monkeypatch):
     """Release empty spare slots on a worker thread while MoE forwards over active slots run."""
     torch.cuda.set_device(0)
-    with _moe_layer(monkeypatch, fault_tolerance=True,
+    with _moe_layer(monkeypatch,
+                    _moe_weights(),
+                    fault_tolerance=True,
                     meta_init=False) as (balancer, _):
         (layer, ) = balancer.single_layer_load_balancers
         restore = balancer.expert_restore
