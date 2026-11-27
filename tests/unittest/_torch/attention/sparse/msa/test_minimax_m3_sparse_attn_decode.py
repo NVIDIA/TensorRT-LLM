@@ -10,8 +10,11 @@ The PyTorch oracle follows the vLLM reference linked in the file header
 truncated at the query token's own causal extent.
 """
 
+import functools
 import logging
 import os
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -345,6 +348,82 @@ def _run(q, k_paged, v_paged, topk_idx, block_table, seq_lens, decode_query_len,
     return out
 
 
+def _msa_fmha_variants() -> list[tuple]:
+    """The fmha_sm100 kernel variants that the MSA tests in this file launch.
+
+    Each entry holds get_fmha_variant's arguments: (dtype_code, qo_tile_size,
+    single_wg, sparse_mode, page_size, split_kv, pack_factor). sparse_mode 0
+    reads top-k block indexes and 3 is dense attention without max scores.
+    fmha_sm100 packs pack_factor query heads of a KV group into the query
+    length and selects the single-warpgroup kernel when the packed length is at
+    most 64. A sparse plan gives every query its own segment of pack_factor rows.
+    """
+    from fmha_sm100 import jit
+
+    fp8 = jit._dlpack_dtype_code(torch.float8_e4m3fn)
+    variants = []
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        code = jit._dlpack_dtype_code(dtype)
+        # Paged sparse prefill with group 16 (pack 16) and group 1 (pack 1).
+        variants += [
+            (code, 128, True, 0, PAGE_SIZE, False, 16),
+            (code, 128, True, 0, PAGE_SIZE, True, 16),
+            (code, 128, True, 0, PAGE_SIZE, True, 1),
+        ]
+        # Nonpaged prefill of 6 queries: group 16 packs them into 96 rows.
+        for split_kv in (False, True):
+            variants += [
+                (code, 128, False, 3, -1, split_kv, 16),
+                (code, 128, True, 3, -1, split_kv, 1),
+            ]
+    # Paged sparse decode with group 8, used as the Triton kernel's A/B reference.
+    variants.append((fp8, 128, True, 0, PAGE_SIZE, False, 8))
+    return variants
+
+
+def _prewarm_fmha_variant(jit, variant: tuple) -> str:
+    """Build or load one fmha_sm100 variant as a kernel launch would; return its name.
+
+    The variant gets a manager of its own because the shared manager holds one
+    lock across a whole compile, which would serialize the compiles.
+    """
+    jit.FMHAVariantManager().get_variant(*variant)
+    return jit._variant_key_from_runtime(*variant)[0]
+
+
+@pytest.fixture(scope="module")
+def msa_kernels_prewarmed():
+    """Compile the fmha_sm100 kernels the MSA tests use, concurrently.
+
+    fmha_sm100 compiles a missing kernel when it is first launched, one at a
+    time, and a cold variant takes most of a minute in nvcc. Compiling them
+    together here bounds a cold run by the slowest variant rather than their
+    sum. Each compile is an nvcc subprocess, so threads are enough.
+
+    On teardown, warns about any variant the tests loaded that this fixture did
+    not compile, so that _msa_fmha_variants keeps up with the tests.
+    """
+    require_msa_module()
+    from fmha_sm100 import jit
+
+    loaded_before = set(jit._variant_manager._loaded)
+    variants = _msa_fmha_variants()
+    workers = min(len(variants) + 2, len(os.sched_getaffinity(0)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        support = [pool.submit(jit.get_plan_fn), pool.submit(jit.get_reduction_module)]
+        prewarmed = set(pool.map(functools.partial(_prewarm_fmha_variant, jit), variants))
+        for future in support:
+            future.result()
+    yield
+    missed = set(jit._variant_manager._loaded) - loaded_before - prewarmed
+    if missed:
+        warnings.warn(
+            f"fmha_sm100 variants {sorted(missed)} were not prewarmed; add them to "
+            "_msa_fmha_variants so that a cold run compiles them concurrently.",
+            stacklevel=1,
+        )
+
+
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     ("num_kv_heads", "group", "decode_query_len"),
@@ -595,6 +674,7 @@ def test_sparse_decode_bf16_cache_cuda_graph_replay_equals_eager(
 
 
 @skip_not_sm100
+@pytest.mark.usefixtures("msa_kernels_prewarmed")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 def test_msa_prefill_head_major_selector_cuda_graph(dtype: torch.dtype) -> None:
     """A short context must not read a generation token's selector backing."""
@@ -652,6 +732,7 @@ def test_msa_prefill_head_major_selector_cuda_graph(dtype: torch.dtype) -> None:
 
 
 @skip_not_sm100
+@pytest.mark.usefixtures("msa_kernels_prewarmed")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 @pytest.mark.parametrize(
     ("layout", "num_kv_splits", "group"),
@@ -774,12 +855,14 @@ def test_msa_prefill_selector_strides_cuda_graph(
 @pytest.mark.skipif(
     os.environ.get("MSA_VALIDATE_LARGE_OFFSET") != "1", reason="8 GiB boundary validation is opt-in"
 )
+@pytest.mark.usefixtures("msa_kernels_prewarmed")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 def test_msa_prefill_selector_large_offset_cuda_graph(dtype: torch.dtype) -> None:
     test_msa_prefill_selector_strides_cuda_graph(dtype, "large-head-gap", 2, 16)
 
 
 @skip_not_sm100
+@pytest.mark.usefixtures("msa_kernels_prewarmed")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 @pytest.mark.parametrize("group", [1, 16])
 @pytest.mark.parametrize("num_kv_splits", [1, 2])
@@ -849,6 +932,7 @@ def test_msa_nonpaged_original_q_metadata(
 
 
 @skip_not_sm100
+@pytest.mark.usefixtures("msa_kernels_prewarmed")
 def test_sparse_decode_matches_msa_kernel():
     """A/B against the fmha_sm100 sparse GQA path this kernel replaces."""
     from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_sparse_gqa
