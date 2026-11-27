@@ -193,10 +193,15 @@ def finalize_top16_bf16(
     route_indices: cute.Pointer,
     route_weights: cute.Pointer,
     *,
+    side_effects: cutlass.Constexpr[bool] = False,
     loc=None,
     ip=None,
 ):
-    """Finalize one Kimi K3 top-16 vector with wide metadata loads."""
+    """Finalize one Kimi K3 top-16 vector with wide metadata loads.
+
+    ``side_effects`` marks the asm side-effecting, which keeps its loads where they are
+    written (a kernel that does work in front of its grid-dependency wait needs that).
+    """
     addresses = [
         pointer.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
         for pointer in (gemm2_vector, route_indices, route_weights)
@@ -206,7 +211,7 @@ def finalize_top16_bf16(
         addresses,
         _TOP16_BF16_FINALIZE_ASM,
         "=r,=r,=r,=r,l,l,l",
-        has_side_effects=False,
+        has_side_effects=side_effects,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
