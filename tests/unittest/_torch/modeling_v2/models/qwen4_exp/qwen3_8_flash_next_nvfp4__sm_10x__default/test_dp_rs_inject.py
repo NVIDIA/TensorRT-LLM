@@ -336,6 +336,7 @@ def test_build_off_and_ignored(monkeypatch):
 def test_build_keeps_rows_every_rank_holds(monkeypatch):
     monkeypatch.delenv(M.DP_RS_INJECT_ENV, raising=False)
     monkeypatch.delenv(M.DP_RS_INJECT_LAYOUTS_ENV, raising=False)
+    monkeypatch.delenv(M.DP_HICAP_ENV, raising=False)
     # Trunk rows 4 / 8 / 12, draft rows 2..3 below the floor of 4: checked 4, 8, 12.
     peer_bad = [(8, "", "finalize: normed differ", ""), (12, "fused: hc_out differ", "", "")]
     dist = _Dist([[""] * 7, [[(4, "", "", ""), *peer_bad]] + [[]] * 6])
@@ -343,7 +344,7 @@ def test_build_keeps_rows_every_rank_holds(monkeypatch):
     built = M._dp_rs_inject_build(_build_core(monkeypatch), "cuda")
     assert built.rows == frozenset({4, 8}) and built.draft_rows == frozenset()
     assert built.fin_rows == frozenset()  # no route front: no finalize form
-    assert built.rs.layouts == ((1, 304), (2, 608))
+    assert built.rs.layouts == ((1, 304), (2, 304))  # dep8's default `fin` (`DP_HICAP_ENV`)
 
 
 def test_build_compile_failure_on_a_peer_declines_everywhere(monkeypatch):

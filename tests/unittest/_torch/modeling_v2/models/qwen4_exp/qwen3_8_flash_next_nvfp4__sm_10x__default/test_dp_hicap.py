@@ -1,16 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The high-cap row tables (`DP_HICAP_ENV`, off by default).
+"""The high-cap row tables (`DP_HICAP_ENV`; unset, `route` and `fin` at dep8, nothing at dep4).
 
-* The switch: unset / 0 off; 1 / all every part; a comma list of parts; another spelling raises.
+* The switch: unset takes the rank's default parts (dep8: `route`, `fin`; dep4 and no rank: none);
+  0 off; 1 / all every part; a comma list of parts; another spelling (`release` too) raises.
 * `route`: dep8's route front serves up to `_DP_HICAP_ROUTE_MAX_ROWS` gathered rows (dep4 keeps
   `MAX_ROWS`), the fast path's rows follow, the 64-expert window pins tile 64 past 1024 rows (held
   to the runner's listed tactic), and `DP_MOE_OWNK_ENV=all` covers the wider rows. The build
   compiles a row count past `MAX_ROWS` on the fast path only (never the two-token sort), skips it
   where the fast path is off, and drops it, alone, where its check fails.
 * `fin`: the fused reduce-scatter's layouts end at one resident wave.
-* `release`, `head`: dep4's releasing gather and the sharded verify head reach their wider ranges.
-* Off: every table is today's.
+* `head`: the sharded verify head reaches its wider range; dep4's releasing gather keeps its own.
+* Off: every table is the default dispatch's.
 
 The ops are recorders; no kernel runs.
 """
@@ -45,8 +46,8 @@ def _set(monkeypatch, value):
         ("", set()),
         ("0", set()),
         ("off", set()),
-        ("1", {"route", "fin", "release", "head"}),
-        ("all", {"route", "fin", "release", "head"}),
+        ("1", {"route", "fin", "head"}),
+        ("all", {"route", "fin", "head"}),
         ("route", {"route"}),
         ("Route, fin", {"route", "fin"}),
     ],
@@ -56,7 +57,24 @@ def test_parts(monkeypatch, value, expected):
     assert M._dp_hicap() == frozenset(expected)
 
 
-@pytest.mark.parametrize("value", ["2", "routes", "route,tile", ","])
+@pytest.mark.parametrize(
+    "value, dp_size, expected",
+    [
+        (None, 8, {"route", "fin"}),
+        ("", 8, {"route", "fin"}),
+        (None, 4, set()),
+        (None, 1, set()),
+        ("0", 8, set()),
+        ("head", 8, {"head"}),  # a list replaces the default
+        ("1", 4, {"route", "fin", "head"}),
+    ],
+)
+def test_default_parts_by_layout(monkeypatch, value, dp_size, expected):
+    _set(monkeypatch, value)
+    assert M._dp_hicap(SimpleNamespace(dp_size=dp_size)) == frozenset(expected)
+
+
+@pytest.mark.parametrize("value", ["2", "routes", "route,tile", ",", "release", "route,release"])
 def test_parts_reject_another_spelling(monkeypatch, value):
     _set(monkeypatch, value)
     with pytest.raises(ValueError):
@@ -66,9 +84,11 @@ def test_parts_reject_another_spelling(monkeypatch, value):
 @pytest.mark.parametrize(
     "dp_size, local, value, expected",
     [
-        (8, 64, None, 1024),
+        (8, 64, None, 1792),
+        (8, 64, "0", 1024),
         (8, 64, "route", 1792),
-        (8, 64, "fin,release,head", 1024),
+        (8, 64, "fin,head", 1024),
+        (4, 128, None, 1024),
         (4, 128, "1", 1024),  # dep4's caps 40-52 are 640-832 rows: inside MAX_ROWS
         (8, 128, "1", 1024),
     ],
@@ -82,7 +102,8 @@ def test_route_rows(monkeypatch, dp_size, local, value, expected):
 @pytest.mark.parametrize(
     "dp_size, local, rows, value, expected",
     [
-        (8, 64, 1152, None, 0),
+        (8, 64, 1152, "0", 0),
+        (8, 64, 1152, None, 1),
         (8, 64, 1152, "route", 1),
         (8, 64, 1792, "1", 1),
         (8, 64, 1824, "1", 0),
@@ -105,13 +126,14 @@ class _Runner:
         return [list(t) for t in self.valid]
 
 
-W64 = SimpleNamespace(topk=10, hidden=2560, expert_inter=640, local_experts=64)
+W64 = SimpleNamespace(dp_size=8, topk=10, hidden=2560, expert_inter=640, local_experts=64)
 
 
 @pytest.mark.parametrize(
     "rows, valid, value, expected",
     [
-        (1152, [(128, 4)], None, (None, None)),  # today: no tactic past 1024 rows
+        (1152, [(128, 4)], "0", (None, None)),  # off: no tactic past 1024 rows
+        (1152, [(128, 4), (256, 2)], None, ((64, 5), (128, 4))),  # the dep8 default
         (1152, [(128, 4), (256, 2)], "route", ((64, 5), (128, 4))),
         (1792, [(64, 5), (128, 4)], "route", ((64, 5), None)),
         (1824, [(128, 4)], "route", (None, None)),
@@ -124,17 +146,21 @@ def test_w64_tactic(monkeypatch, rows, valid, value, expected):
 
 
 @pytest.mark.parametrize(
-    "ownk, value, expected",
+    "ownk, value, dp_size, expected",
     [
-        ("all", None, (1, 1024)),
-        ("all", "route", (1, 1792)),
-        ("1", "route", (513, 896)),  # the measured default range is not widened
+        ("all", None, None, (1, 1024)),
+        ("all", None, 8, (1, 1792)),  # the dep8 default
+        ("all", "0", 8, (1, 1024)),
+        ("all", None, 4, (1, 1024)),
+        ("all", "route", None, (1, 1792)),
+        ("1", "route", 8, (513, 896)),  # the measured default range is not widened
     ],
 )
-def test_ownk_all_covers_the_wider_rows(monkeypatch, ownk, value, expected):
+def test_ownk_all_covers_the_wider_rows(monkeypatch, ownk, value, dp_size, expected):
     monkeypatch.setenv(M.DP_MOE_OWNK_ENV, ownk)
     _set(monkeypatch, value)
-    assert M._dp_ownk_wanted() == expected
+    core = None if dp_size is None else SimpleNamespace(dp_size=dp_size)
+    assert M._dp_ownk_wanted(core) == expected
 
 
 def _build_core(sizes):
@@ -189,10 +215,11 @@ def _fake_build(monkeypatch, bad_rows=()):
 
 
 @_CUDA
-def test_build_compiles_wide_rows_on_the_fast_path_only(monkeypatch):
+@pytest.mark.parametrize("value", ["route", None])
+def test_build_compiles_wide_rows_on_the_fast_path_only(monkeypatch, value):
     compiles, layers = _fake_build(monkeypatch)
     monkeypatch.delenv(M.DP_ROUTE_FAST2_ENV, raising=False)
-    _set(monkeypatch, "route")
+    _set(monkeypatch, value)
     st = M._route_front_build(_build_core([28, 32, 36, 40, 56, 60]), layers, torch.device("cuda"))
     assert sorted(st.tactics) == [896, 1024, 1152, 1280, 1792]
     assert st.tactics[1152] == (64, 5) and st.refs[1152] == (128, 4)
@@ -223,10 +250,10 @@ def test_build_drops_a_failing_wide_row_count_alone(monkeypatch):
 
 
 @_CUDA
-def test_build_off_is_todays_rows(monkeypatch):
+def test_build_off_is_the_default_dispatch_rows(monkeypatch):
     compiles, layers = _fake_build(monkeypatch)
     monkeypatch.delenv(M.DP_ROUTE_FAST2_ENV, raising=False)
-    _set(monkeypatch, None)
+    _set(monkeypatch, "0")
     st = M._route_front_build(_build_core([32, 36, 40]), layers, torch.device("cuda"))
     assert sorted(st.tactics) == [1024]
     assert max(c[0] for c in compiles) == 1024
@@ -235,7 +262,9 @@ def test_build_off_is_todays_rows(monkeypatch):
 @pytest.mark.parametrize(
     "value, dp_size, expected",
     [
-        (None, 8, ((1, 304), (2, 608))),
+        ("0", 8, ((1, 304), (2, 608))),
+        (None, 8, ((1, 304), (2, 304))),  # the dep8 default
+        (None, 4, ((1, 192), (2, 608))),
         ("fin", 8, ((1, 304), (2, 304))),
         ("fin", 4, ((1, 192), (2, 304))),
         ("route", 4, ((1, 192), (2, 608))),
@@ -289,7 +318,7 @@ def test_fin_layouts_end_at_one_resident_wave(monkeypatch, value, dp_size, expec
     # the recorded build raises: every rank reports it and the switch stays off
     assert M._dp_rs_inject_build(core, torch.device("cpu")) is None
     assert seen["layouts"] == expected
-    if value == "fin":
+    if value == "fin" or (value is None and dp_size == 8):
         # 160 rows a rank: one CTA a row (4 streams), 160 CTAs, resident on 152 SMs
         assert rsi.streams_per_cta(160, 4, expected) == 4
         assert rsi.fin_resident(160, 4, expected, 152)
@@ -298,9 +327,9 @@ def test_fin_layouts_end_at_one_resident_wave(monkeypatch, value, dp_size, expec
         assert not rsi.fin_resident(160, 4, expected, 152)
 
 
-def test_release_and_head_ranges(monkeypatch):
-    assert M._DP_HICAP_RELEASE_ROWS[4] == (16, 1024)
+def test_head_range_and_the_releasing_gather_rows(monkeypatch):
     assert M._DP_HICAP_HEAD_VERIFY == (1, 56)
+    assert not hasattr(M, "_DP_HICAP_RELEASE_ROWS")
     assert M._DP_ROUTER_FRONT_RELEASE_ROWS == {4: (16, 384), 8: (32, 768)}
     assert M._DP_HEAD_SHARD_REQUESTS["verify"] == (1, 32)
 
@@ -318,14 +347,15 @@ class _Nothing:
     [
         # dep4, four rows a request: graph sizes 8 / 40 / 64 -> 128 / 640 / 1024 gathered rows
         (None, 4, {128}),
-        ("release", 4, {128, 640, 1024}),
-        ("route,fin,head", 4, {128}),
+        ("1", 4, {128}),
         # dep8 keeps its own range (32..768: 256 only of 256 / 1280 / 2048)
-        ("release", 8, {256}),
+        (None, 8, {256}),
+        ("1", 8, {256}),
     ],
 )
-def test_release_rows_reach_the_build(monkeypatch, value, dp_size, expected):
-    """`release` widens the releasing gather's rows `_dp_router_front_build` engages (dep4 only)."""
+def test_releasing_gather_rows_are_not_widened(monkeypatch, value, dp_size, expected):
+    """The releasing gather's rows `_dp_router_front_build` engages are its own range whatever
+    `DP_HICAP_ENV` says (the widening it once offered was not taken)."""
     from tensorrt_llm._torch.distributed import communicator
 
     _set(monkeypatch, value)
@@ -370,7 +400,7 @@ def _head_shard_fakes():
     [
         (None, (1, 2, 4, 8, 16, 32), 128),
         ("head", (1, 2, 4, 8, 16, 32, 40, 56), 224),
-        ("route,fin,release", (1, 2, 4, 8, 16, 32), 128),
+        ("route,fin", (1, 2, 4, 8, 16, 32), 128),
     ],
 )
 def test_head_verify_rows_reach_the_build(monkeypatch, value, verify_requests, max_rows):

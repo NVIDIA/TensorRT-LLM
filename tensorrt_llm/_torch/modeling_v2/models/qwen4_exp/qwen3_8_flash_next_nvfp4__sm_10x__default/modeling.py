@@ -1458,10 +1458,11 @@ _ROUTE_FRONT_TACTICS_BASE = ((256, (8, 53)), (512, (16, 32)), (1025, (32, 20)))
 #: listed tactic's (`_route_front_check` against `_route_front_w64_tactic`'s listed reference);
 #: a row count whose check fails keeps the runner's routing.
 _ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (1025, (64, 5)))
-#: Off by default. The high-cap row tables: at a dep4 / dep8 rank the decode forms that today
-#: stop at 1024 gathered rows (32 requests a rank at dep8 MTP-3) or at 128 / 152 rows a rank serve
-#: the CUDA-graph batch sizes past them, up to 56 requests a rank. Comma list of parts, or `1` /
-#: `all` for every part:
+#: The high-cap row tables: at a dep4 / dep8 rank the decode forms that would stop at 1024 gathered
+#: rows (32 requests a rank at dep8 MTP-3) or at 128 / 152 rows a rank serve the CUDA-graph batch
+#: sizes past them, up to 56 requests a rank. Unset, a dep8 rank takes `_DP_HICAP_DEFAULT` (`route`
+#: and `fin`: both bitwise and held by build checks) and a dep4 rank none. `0` turns every part off;
+#: `1` / `all` takes every part at both layouts; a comma list takes exactly those parts:
 #: - `route` (bitwise): dep8's route front and the forms that ride on it (the packed gather's
 #:   routing-only front, the owner top-k gather under `DP_MOE_OWNK_ENV=all`, the fast path, the
 #:   early release and the fused finalize reduce-scatter) at 1025..`_DP_HICAP_ROUTE_MAX_ROWS`
@@ -1473,14 +1474,14 @@ _ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (10
 #:   at one resident wave (`_DP_HICAP_FIN_CTAS`), so from there every stream of a row shares one
 #:   CTA and the grid stays resident (any layout reads the same bytes and computes the same bits).
 #:   Ignored where `DP_RS_INJECT_LAYOUTS_ENV` names the layouts.
-#: - `release` (bitwise): dep4's releasing gather (`DP_ROUTER_FRONT_ENV`) to
-#:   `_DP_HICAP_RELEASE_ROWS` gathered rows; the rows, slots and bytes are the plain gather's.
 #: - `head` (class S, as the head shard itself): the sharded verify head (`DP_HEAD_SHARD_ENV`) to
 #:   `_DP_HICAP_HEAD_VERIFY` requests a rank (the full-vocabulary head and the stock sampler
 #:   past 32 today).
 #: Read once, when the target is built.
 DP_HICAP_ENV = "TRTLLM_QWEN4_EXP_DP_HICAP"
-_DP_HICAP_PARTS = ("route", "fin", "release", "head")
+_DP_HICAP_PARTS = ("route", "fin", "head")
+#: The parts a rank takes with `DP_HICAP_ENV` unset, by attention-DP size.
+_DP_HICAP_DEFAULT = {8: frozenset({"route", "fin"})}
 #: Gathered rows dep8's route front serves under `route`: 56 requests a rank of four rows.
 _DP_HICAP_ROUTE_MAX_ROWS = 1792  # capacity: fixed: the measured caps' last
 #: dep8's tactic past 1024 rows: tile 64 (the runner lists tile 128 and up there, so the build
@@ -1488,17 +1489,19 @@ _DP_HICAP_ROUTE_MAX_ROWS = 1792  # capacity: fixed: the measured caps' last
 _DP_HICAP_TACTICS_W64 = ((_DP_HICAP_ROUTE_MAX_ROWS + 1, (64, 5)),)
 #: CTAs of one resident fused finalize wave on GB300 (`FIN_CTAS_PER_SM` x 152 SMs).
 _DP_HICAP_FIN_CTAS = 304  # capacity: fixed: a dispatch threshold
-#: dep4's releasing gather under `release`: 1..64 requests a rank.
-_DP_HICAP_RELEASE_ROWS = {4: (16, 1024)}  # capacity: fixed: dispatch thresholds
 #: Requests a rank the sharded verify head serves under `head`.
 _DP_HICAP_HEAD_VERIFY = (1, 56)  # capacity: fixed: dispatch thresholds
 
 
-def _dp_hicap() -> frozenset:
-    """`DP_HICAP_ENV`: the parts it names (empty: off); ValueError on another spelling."""
+def _dp_hicap(core=None) -> frozenset:
+    """`DP_HICAP_ENV` at `core`'s rank: the parts it names, `_DP_HICAP_DEFAULT`'s for the rank's
+    attention-DP size where it is unset (none without a core), empty where it is off; ValueError on
+    another spelling."""
     raw = os.environ.get(DP_HICAP_ENV, "")
     value = raw.strip().lower()
-    if not value or value in _SWITCH_OFF:
+    if not value:
+        return _DP_HICAP_DEFAULT.get(getattr(core, "dp_size", 1), frozenset())
+    if value in _SWITCH_OFF:
         return frozenset()
     if value in _SWITCH_ON or value == "all":
         return frozenset(_DP_HICAP_PARTS)
@@ -1517,7 +1520,7 @@ def _dp_hicap_route_rows(core) -> int:
     if (
         core.dp_size == 8
         and core.local_experts == _ROUTE_FRONT_WINDOWS[8]
-        and "route" in _dp_hicap()
+        and "route" in _dp_hicap(core)
     ):
         return _DP_HICAP_ROUTE_MAX_ROWS
     return _ROUTE_FRONT_MAX_ROWS
@@ -3891,7 +3894,7 @@ def _dp_rs_inject_build(core, device) -> "_DpRsInject | None":
         return None
     raw = os.environ.get(DP_RS_INJECT_LAYOUTS_ENV, "").strip()
     layouts = _rs_inject_op.parse_layouts(raw) if raw else _rs_inject_op.LAYOUTS[core.dp_size]
-    if not raw and "fin" in _dp_hicap():
+    if not raw and "fin" in _dp_hicap(core):
         # `DP_HICAP_ENV`'s `fin`: every layout ends at one resident wave, so past it a row's
         # streams share one CTA (the same bits) and the fused finalize stays resident.
         layouts = tuple((spp, min(limit, _DP_HICAP_FIN_CTAS)) for spp, limit in layouts)
@@ -4084,8 +4087,8 @@ class _DpPack:
         self.ownk_rows: frozenset = frozenset()
 
 
-def _dp_ownk_wanted() -> tuple | None:
-    """`DP_MOE_OWNK_ENV` as a `(first, last)` range of gathered rows, None off."""
+def _dp_ownk_wanted(core=None) -> tuple | None:
+    """`DP_MOE_OWNK_ENV` as a `(first, last)` range of gathered rows at `core`'s rank, None off."""
     raw = os.environ.get(DP_MOE_OWNK_ENV, "")
     value = raw.strip().lower()
     if value in _SWITCH_OFF:
@@ -4094,7 +4097,7 @@ def _dp_ownk_wanted() -> tuple | None:
         return _DP_MOE_OWNK_ROWS
     if value == "all":
         # `DP_HICAP_ENV`'s `route`: every row count of the wider route front too.
-        hicap = _DP_HICAP_ROUTE_MAX_ROWS if "route" in _dp_hicap() else 0
+        hicap = _DP_HICAP_ROUTE_MAX_ROWS if "route" in _dp_hicap(core) else 0
         return (1, max(_DP_PACK_MAX_GATHERED, hicap))
     raise ValueError(f"{DP_MOE_OWNK_ENV}={raw!r}: expected unset, 0, 1 or all")
 
@@ -4314,7 +4317,7 @@ def _dp_ownk_build(core, pk: _DpPack, st, device, dist) -> None:
     every row count is checked (`_dp_pack_check(ownk=)`, one collective each) and a row count that
     differs on any rank is dropped on every rank: those keep the packed gather of the logits. Sets
     `pk.ownk` / `pk.ownk_rows`."""
-    want = _dp_ownk_wanted()
+    want = _dp_ownk_wanted(core)
     if want is None:
         return
     trip = core._lamport_trip
@@ -7434,7 +7437,7 @@ def _route_front_w64_tactic(runner, core, rows: int) -> tuple:
         )
     )
     table = _ROUTE_FRONT_TACTICS_W64
-    if rows > _ROUTE_FRONT_MAX_ROWS and "route" in _dp_hicap():
+    if rows > _ROUTE_FRONT_MAX_ROWS and "route" in _dp_hicap(core):
         table = table + _DP_HICAP_TACTICS_W64
     tactic = next((t for below, t in table if rows < below), None)
     if tactic is None or not valid:
@@ -7865,8 +7868,6 @@ def _dp_router_front_build(core, layers, device) -> "_DpRouterFront | None":
     sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
     graph_rows = {per_batch * int(b) for b in sizes}
     lo, hi = _DP_ROUTER_FRONT_RELEASE_ROWS[core.dp_size]
-    if "release" in _dp_hicap() and core.dp_size in _DP_HICAP_RELEASE_ROWS:
-        lo, hi = _DP_HICAP_RELEASE_ROWS[core.dp_size]
     release = frozenset(r for r in graph_rows if lo <= r <= hi)
     lo, hi = _DP_ROUTER_FRONT_ROWS
     rows = frozenset(r for r in graph_rows if lo <= r <= min(hi, _MID_ROWS_MAX))
@@ -13570,7 +13571,7 @@ def _dp_head_shard_build(shell, device):
     want = {}
     for head in heads:
         lo, hi = _DP_HEAD_SHARD_REQUESTS[head]
-        if head == "verify" and "head" in _dp_hicap():
+        if head == "verify" and "head" in _dp_hicap(core):
             lo, hi = _DP_HICAP_HEAD_VERIFY
         scale = per if head == "verify" else 1
         want[head] = frozenset(scale * b for b in sizes if lo <= b <= hi)

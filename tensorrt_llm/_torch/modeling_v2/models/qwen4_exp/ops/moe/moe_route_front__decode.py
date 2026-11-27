@@ -28,7 +28,7 @@ bits. `fast2=2` also loads the second token's logits before the first token is r
 Past `MAX_ROWS` (1025..`WIDE_MAX_ROWS` rows: three or four tokens a warp, three or four token-mask
 words an expert) a launch compiles only on the fast path (`fast2`) or over routed rows (`ids_in`):
 the full per-lane sort routes at most two tokens a warp. `MAX_ROWS` stays the bound the default
-dispatch serves; the target serves the wider rows only behind its own switch (`DP_HICAP_ENV`).
+dispatch serves; the target serves the wider rows at dep8 by default (`DP_HICAP_ENV`).
 
 `route_front_only(..., ids_in=True)` (past `LEAN_MAX_ROWS`) takes rows their owners already
 routed (`IDS_ROW_SLOTS` int16 a row: the experts, then their weight bits, which the attention-DP
