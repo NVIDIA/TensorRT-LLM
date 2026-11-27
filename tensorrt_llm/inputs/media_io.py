@@ -72,6 +72,18 @@ class _DecodedMemoryReservation(Protocol):
 _DecodedMemoryReserver = Callable[[int, int], _DecodedMemoryReservation]
 
 
+class DecodedMemoryBudget(Protocol):
+    """Decoded-memory budget shared by the media loads of one request.
+
+    After `cancel`, `reserve` and the `check_cancelled` of every reservation raise, so
+    decodes still running stop at their next check.
+    """
+
+    def reserve(self, peak_bytes: int, retained_bytes: int) -> _DecodedMemoryReservation: ...
+
+    def cancel(self) -> None: ...
+
+
 def _decoded_video_bytes(video: Any) -> int:
     """Return bytes retained by decoded video frames and optional audio."""
     if not isinstance(video, VideoData):

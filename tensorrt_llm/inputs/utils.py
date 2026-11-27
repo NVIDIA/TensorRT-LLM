@@ -24,7 +24,8 @@ from tensorrt_llm.inputs.chat_template_guard import \
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.data import prompt_inputs
-from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, VideoMediaIO,
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY,
+                                          DecodedMemoryBudget, VideoMediaIO,
                                           _decode_base64_with_limit,
                                           _load_and_convert_image,
                                           _normalize_file_uri,
@@ -362,6 +363,7 @@ class MultimodalDataTracker:
         model_type: str,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+        decoded_memory_budget: Optional[DecodedMemoryBudget] = None,
     ):
         self._model_type = model_type
         self._data = defaultdict[str, list](list)
@@ -381,45 +383,52 @@ class MultimodalDataTracker:
         # Per-request override merged with the server default at media-load
         # time; see `BaseMediaIO.merge_kwargs` in `inputs/media_io.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
+        self._decoded_memory_budget = decoded_memory_budget
 
     @property
     def request_media_io_kwargs(self) -> Optional[Dict[str, Dict[str, Any]]]:
         """Per-request `media_io_kwargs` override, or `None` if not set."""
         return self._request_media_io_kwargs
 
+    @property
+    def decoded_memory_budget(self) -> Optional[DecodedMemoryBudget]:
+        """Budget shared by this request's video decodes, or `None`."""
+        return self._decoded_memory_budget
+
     async def retrieve_all_async(
         self
     ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
         """Retrieve all collected multimodal data and embeddings.
 
-        All coroutines across all modalities (and across _data/_embeddings) are
-        gathered concurrently in a single asyncio.gather call, so e.g. image
-        downloads and video downloads overlap instead of running sequentially.
+        All loads across all modalities (and across _data/_embeddings) run
+        concurrently, so e.g. image downloads and video downloads overlap
+        instead of running sequentially. When one load fails or the caller is
+        cancelled, the other loads and the decoded-memory budget are cancelled
+        before the error propagates.
         """
-
-        async def _retrieve(
-                data: Optional[dict[str,
-                                    list]]) -> Optional[Dict[str, List[Any]]]:
-            if not data:
-                return None
-            pairs = [(modality, item) for modality, items in data.items()
-                     if items for item in items]
-            if not pairs:
-                return None
-            modality_keys, coroutines = zip(*pairs)
-            results = await asyncio.gather(*coroutines)
-            out: dict[str, list] = defaultdict(list)
-            for modality, result in zip(modality_keys, results):
-                out[modality].append(result)
-            return dict(out)
-
-        if not self._data and not self._embeddings:
+        pending = [(bucket, modality, item)
+                   for bucket, data in enumerate((self._data, self._embeddings))
+                   for modality, items in data.items() for item in items]
+        if not pending:
             return None, None
-        # _data and _embeddings also gathered concurrently
         with _time_input_processing("media_load"):
-            data_result, embed_result = await asyncio.gather(
-                _retrieve(self._data), _retrieve(self._embeddings))
-        return data_result, embed_result
+            tasks = [asyncio.ensure_future(item) for _, _, item in pending]
+            try:
+                results = await asyncio.gather(*tasks)
+            except (Exception, asyncio.CancelledError):
+                # gather leaves the other loads running after the first failure.
+                if self._decoded_memory_budget is not None:
+                    self._decoded_memory_budget.cancel()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+        out: tuple[dict[str, list],
+                   dict[str, list]] = (defaultdict(list), defaultdict(list))
+        for (bucket, modality, _), result in zip(pending, results):
+            out[bucket][modality].append(result)
+        data_result, embed_result = out
+        return dict(data_result) or None, dict(embed_result) or None
 
     async def discard_all_async(
         self

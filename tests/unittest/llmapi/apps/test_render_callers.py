@@ -54,6 +54,7 @@ class TestResourceGovernor:
         governor.model_config = SimpleNamespace(model_type=MODEL_TYPE)
         governor.processor = None
         governor.chat_template = chat_template
+        governor.multimodal_server_config = None
         return governor
 
     async def _convert(self, governor, **overrides):

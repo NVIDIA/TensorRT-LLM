@@ -742,6 +742,15 @@ commands:
         is_flag: false
         flags:
         - "--max_num_tokens"
+      media_io_kwargs:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--media_io_kwargs"
       metadata_server_config_file:
         type: str
         default: null

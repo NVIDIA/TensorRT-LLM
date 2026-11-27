@@ -1300,6 +1300,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 harmony_adapter_factory=get_harmony_adapter
                 if self.use_harmony else None,
                 chat_template=self.chat_template,
+                multimodal_server_config=self.multimodal_server_config,
             )
             self.resource_governor.register_routes(self.app)
         else:

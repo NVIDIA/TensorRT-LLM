@@ -858,12 +858,62 @@ def launch_server(
                     launcher_uds_sock.close()
 
 
+_MEDIA_IO_KWARGS_HELP = (
+    "Keyword arguments for media I/O as a JSON string. "
+    "Keys are modality names (\"video\", \"image\", \"audio\") "
+    "whose values are dicts of keyword arguments forwarded to "
+    "the corresponding loader. The keys format and device are unsupported. "
+    "Example: '{\"video\": {\"extract_audio\": true, "
+    "\"num_frames\": 16}}' to enable audio extraction from "
+    "video files. \"video\": {\"max_decoded_frame_bytes\": N} bounds "
+    "the decoded video data of one request: each video's frames at source "
+    "resolution while they are converted (2 bytes per pixel channel), "
+    "summed over the request's videos, plus any audio extracted from "
+    "them. N is a positive integer number of bytes, "
+    "or null for no limit; the default is 8 GiB and requests cannot change "
+    "it. The limit applies to each request, so the worst case on one host "
+    "is about N x --num_serve_frontends x --num_media_load_workers. "
+    "Context servers started by disaggregated_mpi_worker use the default.")
+
+
+def _multimodal_server_config(
+        media_io_kwargs: Optional[str]) -> MultimodalServerConfig:
+    """Parse and check --media_io_kwargs, before the model is loaded."""
+    if media_io_kwargs is None:
+        return MultimodalServerConfig()
+    try:
+        parsed = json.loads(media_io_kwargs)
+    except json.JSONDecodeError as e:
+        raise click.BadParameter(f"invalid JSON: {e}",
+                                 param_hint="--media_io_kwargs") from e
+    if not isinstance(parsed, dict) or not all(
+            kwargs is None or isinstance(kwargs, dict)
+            for kwargs in parsed.values()):
+        raise click.BadParameter(
+            "expected a JSON object that maps each modality to an object of "
+            "loader keyword arguments or null.",
+            param_hint="--media_io_kwargs")
+    parsed = {modality: kwargs or {} for modality, kwargs in parsed.items()}
+    limit = parsed.get("video", {}).get("max_decoded_frame_bytes")
+    if limit is not None and (isinstance(limit, bool)
+                              or not isinstance(limit, int) or limit <= 0):
+        raise click.BadParameter(
+            "video.max_decoded_frame_bytes must be a positive integer number "
+            f"of bytes or null, not {json.dumps(limit)}.",
+            param_hint="--media_io_kwargs")
+    try:
+        return MultimodalServerConfig(media_io_kwargs=parsed)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="--media_io_kwargs") from e
+
+
 def launch_mm_encoder_server(
     host: str,
     port: int,
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
     allow_request_chat_template: bool = False,
+    multimodal_server_config: Optional[MultimodalServerConfig] = None,
 ) -> None:
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
@@ -876,6 +926,7 @@ def launch_mm_encoder_server(
         metadata_server_cfg=metadata_server_cfg,
         tool_parser=None,
         allow_request_chat_template=allow_request_chat_template,
+        multimodal_server_config=multimodal_server_config,
         graceful_shutdown_timeout=mm_encoder.args.
         serve_graceful_shutdown_timeout_s)
     uvloop.run(server(host, port))
@@ -1493,18 +1544,11 @@ def launch_visual_gen_server(
     default=False,
     help="Enable locality domain execution for supported PyTorch backend ops.",
     status="prototype")
-@stability_option(
-    "--media_io_kwargs",
-    type=str,
-    default=None,
-    help="Keyword arguments for media I/O as a JSON string. "
-    "Keys are modality names (\"video\", \"image\", \"audio\") "
-    "whose values are dicts of keyword arguments forwarded to "
-    "the corresponding loader. The keys format and device are unsupported. "
-    "Example: '{\"video\": {\"extract_audio\": true, "
-    "\"num_frames\": 16}}' to enable audio extraction from "
-    "video files.",
-    status="prototype")
+@stability_option("--media_io_kwargs",
+                  type=str,
+                  default=None,
+                  help=_MEDIA_IO_KWARGS_HELP,
+                  status="prototype")
 @stability_option("--video_pruning_rate",
                   type=float,
                   default=None,
@@ -1795,17 +1839,7 @@ def serve(
             "--enable_sleep_mode is only supported by the HTTP "
             "text-generation server.")
 
-    try:
-        media_options = json.loads(
-            media_io_kwargs) if media_io_kwargs is not None else None
-        multimodal_server_config = MultimodalServerConfig(
-            media_io_kwargs=media_options)
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            f"Invalid JSON for media_io_kwargs: {error}") from error
-    except ValueError as error:
-        raise click.BadParameter(str(error),
-                                 param_hint="--media_io_kwargs") from error
+    multimodal_server_config = _multimodal_server_config(media_io_kwargs)
 
     def _serve_llm():
         try:
@@ -2124,6 +2158,11 @@ def serve(
                   default=None,
                   help="Path to metadata server config file",
                   status="prototype")
+@stability_option("--media_io_kwargs",
+                  type=str,
+                  default=None,
+                  help=_MEDIA_IO_KWARGS_HELP,
+                  status="prototype")
 @stability_option(
     "--allow_request_chat_template",
     is_flag=True,
@@ -2150,6 +2189,7 @@ def serve_encoder(
     free_gpu_memory_fraction: float,
     tensor_parallel_size: int,
     metadata_server_config_file: Optional[str],
+    media_io_kwargs: Optional[str],
     allow_request_chat_template: bool,
     telemetry: bool,
 ):
@@ -2158,6 +2198,7 @@ def serve_encoder(
     MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
+    multimodal_server_config = _multimodal_server_config(media_io_kwargs)
 
     if "--extra_encoder_options" in sys.argv:
         logger.warning(
@@ -2209,7 +2250,8 @@ def serve_encoder(
         port,
         encoder_args,
         metadata_server_cfg,
-        allow_request_chat_template=allow_request_chat_template)
+        allow_request_chat_template=allow_request_chat_template,
+        multimodal_server_config=multimodal_server_config)
 
 
 def _prepare_encode_only_llm_args(
