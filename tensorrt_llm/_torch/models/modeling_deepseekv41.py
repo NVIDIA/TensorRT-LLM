@@ -1744,6 +1744,17 @@ class DeepseekV41Model(DeepseekV4Model):
                 self._run_encoder_pass, max_pad=None if pads_freely else ENCODER_MAX_PAD, pool=pool
             )
 
+    def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:
+        """Compile the mHC boundary kernels eager forwards choose by their row count, which a
+        request would otherwise build at the first size that reaches one. ``verify_batches``
+        changes nothing: eager verify batches take the same BF16, non-deferred boundaries."""
+        return sum(
+            hc.prewarm_boundary(max_num_tokens)
+            for layer in self.layers
+            for hc in (getattr(layer, "hc_attn", None), getattr(layer, "hc_ffn", None))
+            if isinstance(hc, mHC)
+        )
+
     def _precompute_engram_kv(
         self, layer_idx: int, embeddings: dict[int, torch.Tensor]
     ) -> dict[int, object]:

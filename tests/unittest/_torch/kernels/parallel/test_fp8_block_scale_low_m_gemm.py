@@ -196,6 +196,25 @@ def test_low_m_cutover_dispatch(monkeypatch):
     assert torch.equal(out, mid)
 
 
+@sm100_only
+def test_precompile_covers_every_row_count() -> None:
+    """After ``precompile``, the GEMM compiles nothing at any row count it serves."""
+    mod = _kernel_module()
+    n, k = 4608, 5120
+    w_fp8, scale = _make_weight(n, k, seed=3)
+    packed = _pack(scale, n, k)
+    max_m = mod.max_m_for(n, k)
+    # Rows on both the low-M kernel and the mid-M path.
+    assert max_m > mod.low_m_max_for(n, k)
+    mod.precompile(n, k, range(1, max_m + 1))
+    caches = (mod._compiled_kernel, mod._compiled_mid_kernel, mod._compiled_quant)
+    misses = [cache.cache_info().misses for cache in caches]
+    for m in range(1, max_m + 1):
+        torch.ops.trtllm.fp8_block_scale_low_m_gemm(_make_activation(m, k, seed=m), w_fp8, packed)
+    torch.cuda.synchronize()
+    assert [cache.cache_info().misses for cache in caches] == misses
+
+
 @pytest.mark.parametrize("n, k", [(7168, 768), (2112, 7168)])
 @pytest.mark.parametrize("m", [1, 14, 64, 200])
 def test_cuda_graph_capture(m, n, k):
@@ -497,6 +516,60 @@ def test_fp8_block_scales_linear_skips_low_m_gemm_on_sm107(monkeypatch):
     monkeypatch.setattr(linear_module, "get_sm_version", lambda: 107)
     linear.post_load_weights()
     assert linear.fp8_low_m_gemm.max_m == 0
+
+
+@sm100_only
+def test_warmup_prewarm_leaves_fp8_linears_nothing_to_compile() -> None:
+    """After the warmup's prewarm, eager forwards of FP8 block-scale linears compile nothing at
+    any row count: a plain ``Linear``, one whose tuned small-M race takes its fewest rows, and a
+    Kimi-K3 FP8 weight-read linear."""
+    from tensorrt_llm._torch.autotuner import autotune
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.linear import Linear, prewarm_fp8_low_m_gemms
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+    mod = _kernel_module()
+
+    def fp8_linear(n: int, k: int, small_m_race: bool) -> Linear:
+        w_pad, scale = _make_weight(n, k, seed=n + k)
+        linear = Linear(
+            k,
+            n,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        ).cuda()
+        linear.use_fp8_small_m_gemm = small_m_race
+        linear.load_weights([{"weight": w_pad[:n].cpu(), "weight_scale": scale.cpu()}])
+        linear.post_load_weights()
+        # Rows on both the low-M kernel and the mid-M path.
+        assert linear.fp8_low_m_gemm.max_m > mod.low_m_max_for(n, k)
+        return linear
+
+    # Shapes no other test runs, so the prewarm compiles their kernels.
+    plain, raced = fp8_linear(640, 1152, False), fp8_linear(768, 1408, True)
+    n, k = 896, 1664
+    w_pad, scale = _make_weight(n, k, seed=n + k)
+    weight_read = _Fp8BlockScaleWeightReadLinear(w_pad[:n].contiguous(), scale.clone(), n)
+    weight_read._weights_transformed = False
+    weight_read.post_load_weights()
+    assert mod.max_m_for(n, k) > mod.low_m_max_for(n, k)
+    with autotune():
+        raced(_make_activation(1, raced.in_features, seed=1))
+    prewarm_fp8_low_m_gemms(
+        torch.nn.ModuleList([plain, raced, weight_read]), None, small_m_race=True
+    )
+    caches = (mod._compiled_kernel, mod._compiled_mid_kernel, mod._compiled_quant)
+    misses = [cache.cache_info().misses for cache in caches]
+    for linear, max_m in (
+        (plain, plain.fp8_low_m_gemm.max_m),
+        (raced, raced.fp8_low_m_gemm.max_m),
+        (weight_read, mod.max_m_for(n, k)),
+    ):
+        for m in range(1, max_m + 1):
+            linear(_make_activation(m, linear.in_features, seed=m))
+    torch.cuda.synchronize()
+    assert [cache.cache_info().misses for cache in caches] == misses
 
 
 @pytest.mark.parametrize("rubin_dsl", [False, True], ids=["stock_dsl", "rubin_dsl"])

@@ -706,17 +706,24 @@ def test_attention_warmup_covers_enabled_request_phases(
         forward_warmup=runner._forward_warmup,
     )
 
+    # As the warmup decides: a capturable guided decoder rules out the generation and mixed
+    # shapes only, so the context shape still compiles the per-query context path.
     can_run_general_warmup = general_warmup and not guided
-    warmup._run_attention_warmup(resources, can_run_general_warmup=can_run_general_warmup)
+    can_run_context_warmup = general_warmup
+    warmup._run_attention_warmup(
+        resources,
+        can_run_general_warmup=can_run_general_warmup,
+        can_run_context_warmup=can_run_context_warmup,
+    )
 
     expected_shapes = []
     if trtllm_backend:
         if not guided and cache_flag is None:
             expected_shapes.append((total_draft_tokens + 1, 1))
-        if can_run_general_warmup:
+        if can_run_context_warmup:
             expected_shapes.append((1, 0))
-            if cache_flag is None:
-                expected_shapes.append((total_draft_tokens + 2, 1))
+        if can_run_general_warmup and cache_flag is None:
+            expected_shapes.append((total_draft_tokens + 2, 1))
     expected_shapes.sort()
     assert sorted(requested) == expected_shapes, "Warmup must cover every enabled request phase"
     assert sorted(forwarded) == expected_shapes, "Every warmup shape must reach execution"
