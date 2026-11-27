@@ -61,6 +61,7 @@ from cbts.rules._helpers import iter_diff_changes, strip_noop_diff_lines
 from cbts.rules.agent_flow import AgentFlowRule
 from cbts.rules.base import PRInputs, Rule, RuleResult, format_reason
 from cbts.rules.docs import DocsRule
+from cbts.rules.import_sanity import ImportSanityRule
 from cbts.rules.modeling_v2 import ModelingV2Rule
 from cbts.rules.openengine import OpenEngineRule
 from cbts.rules.out_of_scope import OutOfScopeRule, is_out_of_scope
@@ -79,6 +80,7 @@ COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("**/*.py",)
 # Classes are used for `--list-needed-diffs` (no need to construct).
 RULE_CLASSES: list[type[Rule]] = [
     PythonFormattingRule,
+    ImportSanityRule,
     WaivesRule,
     TestsDefRule,
     TestListRule,
@@ -99,6 +101,7 @@ def build_rules(
 ) -> list[Rule]:
     return [
         PythonFormattingRule(),
+        ImportSanityRule(repo_root),
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages, repo_root=repo_root),
@@ -230,6 +233,7 @@ def _rule_reason(rule, r) -> dict:
         "source": rule.name,
         "blocks": len(r.block_filters),
         "stages": len(r.affected_stages),
+        **({"files": sorted(r.import_sanity_files)} if r.import_sanity_files else {}),
     }
 
 
@@ -238,6 +242,7 @@ def _rule_reason(rule, r) -> dict:
 _TESTSONLY_FAMILY: frozenset[str] = frozenset(
     {
         "testsonly",
+        "importsanityonly",
         "waiveonly",
         "testdefonly",
         "testlistonly",
@@ -333,8 +338,10 @@ class Selector:
         # rule explicitly claimed files that need no test stages (e.g. QA
         # test-list edits the pre-merge pipeline doesn't consume), so the
         # empty stage set is intentional and gets preserved through to
-        # Groovy Layer 2.
-        if not affected_stages and scope != "noop":
+        # Groovy Layer 2. Import sanity also needs no named stages: the
+        # sanity_required gate retains PackageSanityCheck there.
+        package_sanity = any(r.import_sanity_files and r.sanity_relevant for _, r in pairs)
+        if not affected_stages and scope != "noop" and not package_sanity:
             return SelectionResult(
                 scope=None,
                 reasons=rule_reasons + [{"source": "fallback", "reason": "no_stages_resolved"}],
@@ -344,6 +351,10 @@ class Selector:
         block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         for _, r in pairs:
             for key, prefix_to_waives in r.block_filters.items():
+                # Import changes require the full shared sanity suite even
+                # when another rule selects individual entries from it.
+                if package_sanity and key[0] == "l0_sanity_check":
+                    continue
                 dst = block_filters.setdefault(key, {})
                 for prefix, waives in prefix_to_waives.items():
                     dst.setdefault(prefix, set()).update(waives)

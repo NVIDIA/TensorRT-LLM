@@ -25,6 +25,7 @@ from cbts.coverage.selection.pytest_change_analysis import PytestImpactIndex
 from cbts.coverage.selection.python_change_analysis import (
     ImportTarget,
     PythonChangeFacts,
+    analyze_execution_phases,
     analyze_python_changes,
     import_executed_qualnames,
     qualnames_for_lines,
@@ -85,9 +86,11 @@ class CoverageSelector:
         read_source: Callable[[str], str | None] | None = None,
         external_references: Callable[[str, set[str]], set[str]] | None = None,
         external_reference_paths: Callable[[str, set[str]], dict[str, set[str]]] | None = None,
+        import_sanity_files: set[str] | frozenset[str] = frozenset(),
     ) -> None:
         self.db = db
         self.repo_root = Path(repo_root)
+        self._import_sanity_files = import_sanity_files
         self._worker_sentinel = worker_sentinel
         self._launch_markers = launch_markers
         self._min_funcs = min_funcs
@@ -163,15 +166,28 @@ class CoverageSelector:
                     no_diff,
                     f"unparsable source: {path}",
                 )
-            if not lines:
+            if not lines and path not in self._import_sanity_files:
                 continue  # selection diff has no remaining executable edits
             import_executed = import_executed_qualnames(source)
-            dependencies = analyze_python_changes(
-                source,
-                lines,
-                iter_diff_deleted_post_lines(selection_diff),
-                pre_source=reconstruct_diff_pre_image(source, diff),
-            )
+            if path in self._import_sanity_files:
+                phases = analyze_execution_phases(source, reconstruct_diff_pre_image(source, diff))
+                if phases.limitation:
+                    return (
+                        impacted,
+                        sorted(no_data),
+                        sorted(caller_bounded),
+                        no_diff,
+                        phases.limitation,
+                    )
+                qualnames = phases.runtime_qualnames
+                dependencies = PythonChangeFacts(set(), set(), {})
+            else:
+                dependencies = analyze_python_changes(
+                    source,
+                    lines,
+                    iter_diff_deleted_post_lines(selection_diff),
+                    pre_source=reconstruct_diff_pre_image(source, diff),
+                )
             pytest_reason = self._pytest_impact.decline_reason(
                 path,
                 source,

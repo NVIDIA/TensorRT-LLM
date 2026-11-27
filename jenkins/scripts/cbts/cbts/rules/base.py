@@ -78,6 +78,7 @@ class RuleResult:
     # True (safe default) iff this rule's matched changes might affect perf
     # benchmarks. Set False when matched changes are pure test infra.
     perfsanity_relevant: bool = True
+    import_sanity_files: set[str] = field(default_factory=set)
 
 
 class Rule(ABC):

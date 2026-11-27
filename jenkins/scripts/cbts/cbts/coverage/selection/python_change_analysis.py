@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import sys
 import textwrap
 from dataclasses import dataclass, field
@@ -54,6 +55,99 @@ class PythonChangeFacts:
     new_import_bindings: set[str] = field(default_factory=set)
     new_declaration_bindings: set[str] = field(default_factory=set)
     new_class_bindings: set[str] = field(default_factory=set)
+
+
+@dataclass
+class PythonExecutionImpact:
+    """Syntax-level attribution of import/definition and runtime edits."""
+
+    import_qualnames: set[str] = field(default_factory=set)
+    runtime_qualnames: set[str] = field(default_factory=set)
+    limitation: str = ""
+
+
+def analyze_execution_phases(source: str, pre_source: str | None) -> PythonExecutionImpact:
+    """Classify both source images without following binding consumers or callers."""
+    if pre_source is None:
+        return PythonExecutionImpact(limitation="missing pre-image")
+    try:
+        trees = [ast.parse(pre_source), ast.parse(source)]
+    except SyntaxError:
+        return PythonExecutionImpact(limitation="unparsable execution phases")
+    if ast.dump(trees[0]) == ast.dump(trees[1]):
+        return PythonExecutionImpact()
+    images = [pre_source.splitlines(), source.splitlines()]
+    scopes = [_collect_scopes(tree) for tree in trees]
+    imports = [import_executed_qualnames(image) for image in (pre_source, source)]
+    result = PythonExecutionImpact()
+    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+        a=images[0], b=images[1], autojunk=False
+    ).get_opcodes():
+        if tag == "equal":
+            continue
+        for side, start, end in ((0, old_start, old_end), (1, new_start, new_end)):
+            for line in range(start + 1, end + 1):
+                if not images[side][line - 1].strip() or images[side][line - 1].lstrip().startswith(
+                    "#"
+                ):
+                    continue
+                qualname = _attribute(line, scopes[side])
+                target = (
+                    result.import_qualnames
+                    if qualname in imports[side]
+                    else result.runtime_qualnames
+                )
+                target.add(qualname)
+
+    # A one-line def puts its header and body on the same line. Compare
+    # signatures separately so a default/decorator edit still requires sanity.
+    declarations = []
+    for tree, image_scopes in zip(trees, scopes):
+        nodes = {
+            min([node.lineno, *(d.lineno for d in node.decorator_list)]): node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        declarations.append(
+            {s.qualname: (s, nodes[s.sig_start]) for s in image_scopes if s.sig_start in nodes}
+        )
+
+    def signature(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[str, str, tuple[str, ...], str, tuple[str, ...]]:
+        return (
+            type(node).__name__,
+            ast.dump(node.args),
+            tuple(ast.dump(d) for d in node.decorator_list),
+            ast.dump(node.returns) if node.returns else "",
+            tuple(ast.dump(p) for p in getattr(node, "type_params", [])),
+        )
+
+    for side, image_declarations in enumerate(declarations):
+        for name in image_declarations.keys() - declarations[1 - side].keys():
+            scope, _ = image_declarations[name]
+            target = (
+                result.import_qualnames
+                if scope.sig_attr in imports[side]
+                else result.runtime_qualnames
+            )
+            target.add(scope.sig_attr)
+
+    for name in declarations[0].keys() & declarations[1].keys():
+        old_scope, old = declarations[0][name]
+        new_scope, new = declarations[1][name]
+        if signature(old) == signature(new):
+            continue
+        if [ast.dump(n) for n in old.body] == [ast.dump(n) for n in new.body]:
+            result.runtime_qualnames.discard(name)
+        for side, scope in enumerate((old_scope, new_scope)):
+            target = (
+                result.import_qualnames
+                if scope.sig_attr in imports[side]
+                else result.runtime_qualnames
+            )
+            target.add(scope.sig_attr)
+    return result
 
 
 def _substatements(node: ast.stmt):

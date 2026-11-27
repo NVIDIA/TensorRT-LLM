@@ -31,6 +31,7 @@ an older `L0_Test.groovy` to verify that the same test fails before the fix.
 | Tier | Where | Basis |
 |---|---|---|
 | **1. Rules** | `cbts/rules/` | Path patterns and diffs. Each rule claims the files it understands and narrows to the blocks they affect. |
+| **Import sanity** | `cbts/rules/import_sanity.py` | Import/definition edits retain PackageSanityCheck and its existing `l0_sanity_check` suite. Pure import edits are claimed; mixed files keep their runtime coverage policy. |
 | **2. Coverage** | `cbts/coverage/selection/`, `cbts/coverage/tier.py` | Runs only on what Tier 1 left unclaimed (the *residual*), and only when every residual file is Python with test-attributed records in the touch DB, subject to AST checks for shared pytest state. Maps changed lines to qualnames and removes entries no changed function reaches. Declines to the full run otherwise. See `cbts/coverage/selection/SELECTION.md`. |
 
 The touch DB is produced by the post-merge collection under
@@ -59,10 +60,11 @@ filter chain.
 
 ## Rules
 
-Nine rules, registered in `cbts/command/main.py::RULE_CLASSES`:
+Rules registered in `cbts/command/main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
+| `ImportSanityRule` | `importsanityonly` | Python import/definition edits; retains existing package sanity and leaves mixed-file runtime edits to coverage. |
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
@@ -128,6 +130,7 @@ jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH fo
 │   │   ├── README.md      per-rule logic
 │   │   ├── base.py        Rule ABC + PRInputs + RuleResult
 │   │   ├── _helpers.py    diff iteration + lookup-into-block_filters + stages_by_yaml_stem
+│   │   ├── import_sanity.py
 │   │   ├── waives.py
 │   │   ├── tests_def.py
 │   │   ├── test_list.py
