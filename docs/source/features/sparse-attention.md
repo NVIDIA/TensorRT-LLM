@@ -309,11 +309,15 @@ llm = LLM(
 )
 ```
 
-On supported Blackwell configurations, Guess-Verify-Refine (GVR) can replace
-the regular decode Top-K dispatcher. The current implementation accepts
-`index_topk` values `512`, `1024`, and `2048`, and indexer compression ratios
-`1` and `4`. Unsupported combinations fall back to the production
-insertion/radix Top-K path.
+On supported Blackwell and Rubin configurations, Guess-Verify-Refine (GVR) can replace the regular decode Top-K dispatcher. The current implementation accepts `index_topk` values `512`, `1024`, and `2048`, and indexer compression ratios `1` and `4`. Unsupported combinations fall back to the production insertion/radix Top-K path.
+
+On Rubin (SM107), the self-sampling decode entry applies shape-based tuning for FP32, FP16, and BF16 logits. FP16/BF16 use the native Rubin router and decode wave with tuned register, sampling and launch options. Ordinary allocations use this global path without probing locality ownership or creating domain resources.
+
+The model `TopK` module uses global GVR. To opt into domain execution, construct `PreparedRowTopK` from `tensorrt_llm._torch.kernels.rubin.top_k.gvr_topk_locality` with `co_local=True`. The default skips ownership queries. The logits producer, such as QK GEMM, must write complete padded rows into allocations owned by the corresponding domains. The prepared call verifies ownership, shape and resources before applying the full-batch plan to each domain's rows. Unknown ownership falls back to tuned global GVR. Inspect `mode` to see which path ran.
+
+For multi-token decode, pass `next_n` to `PreparedRowTopK` (default 1). Each request has one uncompressed `kv_lens` entry and occupies `next_n` consecutive rows in both logits and output. If a domain boundary falls inside a request, the prepared call uses global GVR so every row retains its token position.
+
+Use CUDA Graph replay for domain performance. Prepare and warm outside capture, retain the allocations and executor until graph destruction, then call `close()`. Automatic SM partitioning attempts BACKFILL when the remaining SMs can increase aligned budgets in the original proportions. Explicit SM budgets are honored. Callers own any executor they supply. If construction fails and the exception cause is `LocalityCleanupError`, call its `executor.close()` to retry outstanding releases. A failed synchronization during prepared-call cleanup can be retried with `close()`.
 
 ```yaml
 sparse_attention_config:
