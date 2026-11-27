@@ -411,7 +411,10 @@ class MoeRouteFrontKernel:
     the cluster's count vectors; after routing each CTA bulk-copies its counts into every peer's receive buffer
     (instead of the cluster barrier + 8 remote loads) and sums the 8 vectors in slot order, the same integer sums.
     It releases its dependent (FC1) at kernel start: FC1's grid is resident while this kernel runs, and its
-    ``griddepcontrol.wait`` still waits for this grid's completion.
+    ``griddepcontrol.wait`` still waits for this grid's completion. ``lean_wait`` moves that release to right
+    after each CTA's ``griddepcontrol.wait`` (the same bits): FC1's persistent grid, one CTA an SM, then parks on
+    the SMs only once the predecessor has completed, so side-stream kernels launched meanwhile (the shared
+    expert's activation and down projection) are not held off the SMs until FC1 drains.
 
     ``early`` (the default table build, with PDL): the kernel's first statement is ``griddepcontrol.wait``, before
     any global access or branch (the experts' input scale too), and every CTA releases its dependent (FC1) right
@@ -457,6 +460,7 @@ class MoeRouteFrontKernel:
         route_only: bool = False,
         ids_in: bool = False,
         early: bool = False,
+        lean_wait: bool = False,
     ) -> None:
         if ids_in and not route_only:
             raise ValueError("routed rows (ids_in) take the routing-only launch")
@@ -500,6 +504,8 @@ class MoeRouteFrontKernel:
         # The release right after the kernel's first statement, the wait (the lean form releases at
         # its start already).
         self.early = bool(early) and use_pdl and not lean
+        # The lean form's release after the wait instead of at kernel start.
+        self.lean_wait = bool(lean_wait) and use_pdl and lean
         self.quant_clusters = quant_clusters
         self.route_only = route_only
         self.ids_in = ids_in
@@ -584,7 +590,7 @@ class MoeRouteFrontKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         if const_expr(self.lean):
-            if const_expr(self.use_pdl):
+            if const_expr(self.use_pdl and not self.lean_wait):
                 _gdc_launch()
             smem = _SmemAllocator()
             # the word buffer (everything up to o_mbar), then the mbarrier in its own 8-byte allocation; smem_words
@@ -634,6 +640,8 @@ class MoeRouteFrontKernel:
         gs = _ld_f32(gs_ptr)
         if const_expr(self.use_pdl and not self.early):
             _gdc_wait()
+            if const_expr(self.lean_wait):
+                _gdc_launch()
         for p in cutlass.range_constexpr(self.q_passes):
             blk = (p * self.q_ctas + qc) * self.threads + tidx
             if blk < self.blocks:
@@ -929,6 +937,8 @@ class MoeRouteFrontKernel:
         n_tok = cutlass.min(Int32(tpc), Int32(self.num_rows) - t_first)
         if const_expr(self.use_pdl):
             _gdc_wait()
+            if const_expr(self.lean_wait):
+                _gdc_launch()
         cute.arch.sync_threads()
         my_sel = Int32(0)
         my_w = Int32(0)

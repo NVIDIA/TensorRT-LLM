@@ -15,7 +15,11 @@ Up to `LEAN_MAX_ROWS` rows the lean form runs (one cheaper count exchange; it re
 dependent, the runner's FC1, at its start, whose own wait still holds it until this grid
 completes); past them clusters of 16 and the default release, or with `early=True` the release
 right after the launch's wait, which is then its first statement (the same bits; only FC1's
-launch moves).
+launch moves). `LEAN_WAIT_ENV=1` (default off) moves the lean form's release from its start to
+right after its wait, the same bits: FC1's persistent grid (one CTA an SM) then does not hold every
+SM while the predecessor (the packed gather) still runs, so the shared expert's side-stream
+activation and down projection, launched in that window, are not held off the SMs until FC1
+drains (a GB300 trace at dep8, 8 requests a rank: they ran after FC2 in 98 % of layers).
 
 `fast2=True` / `1` (past 512 rows, where a warp routes two tokens) routes each of a warp's two
 tokens on the kernel's one-token fast path instead of both on the full per-lane sort: the same
@@ -37,6 +41,8 @@ expert's tile, which no output depends on.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
@@ -54,6 +60,8 @@ TOP_K = 10
 MAX_ROWS = 1024
 LEAN_MAX_ROWS = 256
 WIDE_MAX_ROWS = 2048
+#: "1": the lean form releases FC1 right after its wait instead of at its start (opt-in, bitwise).
+LEAN_WAIT_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTE_FRONT_LEAN_WAIT"
 _SF_VEC = 16
 
 _COMPILED: dict = {}
@@ -111,12 +119,15 @@ def _key(
     pdl = bool(get_env_enable_pdl())
     # `early` moves only the release past the lean rows, and only with PDL.
     early = bool(early) and pdl and rows > LEAN_MAX_ROWS
+    # `LEAN_WAIT_ENV` moves only the lean rows' release, and only with PDL.
+    lean_wait = pdl and rows <= LEAN_MAX_ROWS and os.environ.get(LEAN_WAIT_ENV, "") == "1"
     return (
         # form 1 keys as `True`, as before form 2 existed
         (rows, hidden, row_stride, num_local, tile, pdl, form if form != 1 else True)
         + (("route",) if route_only else ())
         + (("ids",) if ids_in else ())
         + (("early",) if early else ())
+        + (("leanwait",) if lean_wait else ())
     )
 
 
@@ -179,6 +190,7 @@ def compile_front(
         route_only=route_only,
         ids_in=ids_in,
         early="early" in key,
+        lean_wait="leanwait" in key,
         **config,
     )
     z = cutlass.Int64(0)

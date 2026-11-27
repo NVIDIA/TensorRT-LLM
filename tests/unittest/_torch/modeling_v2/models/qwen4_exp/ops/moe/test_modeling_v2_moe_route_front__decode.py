@@ -16,6 +16,9 @@ activation of a decode MoE block's gathered rows in one launch.
   after the wait) write the same bits as the plain launch; `early` under PDL has exactly one
   `griddepcontrol.wait`, first, with no global access, branch or label above it in the SASS / PTX
   and no `ld.global.nc` anywhere (compiled for the running SM103, no launch).
+* **GPU**: the lean form with `LEAN_WAIT_ENV` (release after the wait) writes the same bits as
+  the lean form's release at start, eagerly and replayed, full launch and routing-only; its PTX
+  releases only after a `griddepcontrol.wait` (the default's releases before any wait).
 * **CPU** (`check_tables` itself): a table built the way the runner reads it passes, and each
   way of breaking it is named; the `ids_in` row layout.
 
@@ -398,3 +401,110 @@ def test_check_tables_rejects_a_route_into_spare_capacity():
     assert int(n_ctas[0]) == 1 and int(n_padded[0]) == 8 and int(e2p[0]) == 0
     e2p[0], p2t[8], cta_expert[1], cta_limit[1] = 8, 0, int(cta_expert[0]), 9
     assert "past the padded rows" in op.check_tables(views, ids, 128, 128, 8)
+
+
+_LEAN_CASES = [
+    (96, 448, 64, 16, False),  # dep8 3 a rank, window 7
+    (96, 448, 64, 16, True),  # the packed gather's routing-only front
+    (128, 64, 64, 16, True),  # dep8 4 a rank
+    (256, 384, 64, 32, True),  # dep8 8 a rank (the lean form's last)
+    (256, 384, 128, 32, False),  # dep4 16 a rank
+    (16, 128, 128, 8, False),  # tep4 4 requests
+]
+
+
+@_GPU
+@pytest.mark.parametrize("rows, offset, local, tile, route_only", _LEAN_CASES)
+def test_lean_wait_is_bitwise_the_lean_launch(monkeypatch, rows, offset, local, tile, route_only):
+    """`LEAN_WAIT_ENV=1` moves only the lean form's FC1 release: the codes, scales, experts, weights
+    and tables equal the default lean launch's, bit for bit, eagerly and replayed from a CUDA graph;
+    the switch keys its own compiled launch (PDL on)."""
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    device = torch.device("cuda")
+    spec = dict(rows=rows, hidden=2560, local_offset=offset, num_local=local, tile=tile)
+    hidden = spec["hidden"]
+    outs = []
+    for flag in ("", "1"):
+        monkeypatch.setenv(op.LEAN_WAIT_ENV, flag)
+        key = op._key(rows, hidden, hidden, local, tile, False, route_only)
+        assert ("leanwait" in key) == (flag == "1"), key
+        assert op.compile_front(rows, hidden, hidden, local, tile, False, route_only)
+        assert op._COMPILED[key] is not None
+        logits, x, global_scale, tables = _operands(spec, 7300 + rows + int(route_only), device)
+        args = (tile, offset, local)
+        if route_only:
+            got = op.route_front_only(logits, tables, *args, hidden)
+        else:
+            got = op.moe_route_front(logits, x, global_scale, tables, *args)
+        # one capture, replayed over fresh logits
+        s_logits = logits.clone()
+        s_tables = tables.clone()
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            if route_only:
+                rep = op.route_front_only(s_logits, s_tables, *args, hidden)
+            else:
+                rep = op.moe_route_front(s_logits, x, global_scale, s_tables, *args)
+        torch.cuda.current_stream().wait_stream(stream)
+        logits2, _, _, _ = _operands(spec, 7400 + rows, device)
+        s_logits.copy_(logits2)
+        graph.replay()
+        torch.cuda.synchronize()
+        outs.append(
+            (
+                [t.clone() for t in got],
+                tables.clone(),
+                [t.clone() for t in rep],
+                s_tables.clone(),
+            )
+        )
+    (a, ta, ra, rta), (b, tb, rb, rtb) = outs
+    for u, v in list(zip(a, b)) + list(zip(ra, rb)):
+        assert torch.equal(u.reshape(-1).view(torch.uint8), v.reshape(-1).view(torch.uint8))
+    assert torch.equal(ta, tb) and torch.equal(rta, rtb)
+    if not route_only:
+        logits, x, global_scale, _ = _operands(spec, 7300 + rows, device)
+        _assert_matches(spec, logits, x, global_scale, tb, b)
+
+
+_COMPILE_LEAN = """
+import os, sys
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import moe_route_front__decode as op
+rows, local, tile, route_only = (int(v) for v in sys.argv[1:5])
+assert op.compile_front(rows, 2560, 2560, local, tile, False, bool(route_only))
+"""
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+    reason="compiles for the running SM103 GPU",
+)
+@pytest.mark.parametrize("rows, local, tile, route_only", [(96, 64, 16, 1), (256, 128, 32, 0)])
+@pytest.mark.parametrize("flag", ["", "1"])
+def test_lean_wait_releases_after_the_wait(tmp_path, rows, local, tile, route_only, flag):
+    """The PTX of the lean launch: with `LEAN_WAIT_ENV=1` every `griddepcontrol.launch_dependents`
+    follows the first `griddepcontrol.wait`; without it the first release precedes every wait (the
+    release at kernel start), so the check can fail."""
+    env = dict(
+        os.environ,
+        CUTE_DSL_KEEP="ptx",
+        CUTE_DSL_DUMP_DIR=str(tmp_path),
+        CUTE_DSL_CACHE_DIR=str(tmp_path / "cache"),
+        CUTE_DSL_DISABLE_FILE_CACHING="1",
+        TRTLLM_ENABLE_PDL="1",
+        TRTLLM_QWEN4_EXP_DP_ROUTE_FRONT_LEAN_WAIT=flag,
+    )
+    args = [str(v) for v in (rows, local, tile, route_only)]
+    subprocess.run([sys.executable, "-c", _COMPILE_LEAN, *args], env=env, check=True, timeout=1800)
+    ptx = glob.glob(str(tmp_path / "*.ptx"))
+    assert len(ptx) == 1, ptx
+    text = open(ptx[0]).read()
+    first_wait = text.find("griddepcontrol.wait")
+    first_rel = text.find("griddepcontrol.launch_dependents")
+    assert first_wait >= 0 and first_rel >= 0
+    if flag == "1":
+        assert first_rel > first_wait
+    else:
+        assert first_rel < first_wait
