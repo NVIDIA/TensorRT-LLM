@@ -56,7 +56,8 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
     draft = SimpleNamespace(
         num_stages=3,
         _attn_params={"head_dim": 512},
-        dspark_model=SimpleNamespace(context_kv_only=True),
+        context_kv_only=True,
+        is_dspark_context_worker=True,
     )
 
     def initialize(*args):
@@ -153,6 +154,8 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
         _free_slots=deque(),
         _scratch_slot=2,
         _win=128,
+        _position_cap=None,
+        max_draft_len=5,
         _ctx_len=torch.tensor([140, 268, 0]),
         _valid_len=torch.tensor([128, 128, 0]),
         _position_initialized=torch.ones(3, dtype=torch.bool),
@@ -180,7 +183,7 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
         worker._batch_to_slot, site=DSparkCopySite.REQUEST_SLOTS
     )
     worker._capacity_upload = device_copy.DeviceCopyBuffer(
-        worker._draft_capacities, site=DSparkCopySite.PAGE_CAPACITIES
+        worker._draft_capacities, site=DSparkCopySite.ROW_TOKEN_CAPACITIES
     )
     worker._assign_slot = DSv41DSparkWorker._assign_slot.__get__(worker)
     monkeypatch.setattr(
@@ -203,7 +206,7 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
     original_copy = device_copy.copy
 
     def fail_page_upload(site, *args, **kwargs):
-        if site is DSparkCopySite.PAGE_VALUES:
+        if site is DSparkCopySite.PAGE_TABLE_ENTRIES:
             raise torch.OutOfMemoryError("draft page upload")
         return original_copy(site, *args, **kwargs)
 
@@ -239,7 +242,7 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
     native = torch.full((3, 8), BAD_PAGE_INDEX, dtype=torch.int32)
     native[0, 1:3] = torch.tensor([21, 22])
     worker._draft_managed_block_tables.copy_(native)
-    worker._draft_kv_manager.draft_page_table_state = lambda: native
+    worker._draft_kv_manager.page_table_conversion_state = lambda: native
     DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
     torch.testing.assert_close(worker._draft_block_tables, native)
     assert worker._draft_capacities.tolist() == [8 * 256, 0, 0]
@@ -257,6 +260,22 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
     assert 43 not in worker._req_to_slot
     assert 44 in worker._req_to_slot
 
+    # A suspended request can resume with host history behind accepted tokens.
+    DSv41DSparkWorker._prepare_page_tables(worker, [43, 44], 0)
+    accepted = torch.tensor([[11, 12, 13]], dtype=torch.int32)
+    position = caches[43].history_length + 3
+    _, _, start, _, _, frames, valid = DSv41DSparkWorker._advance_ragged_generation_state(
+        worker,
+        worker._batch_to_slot[:1],
+        accepted,
+        torch.tensor([3]),
+        torch.arange(position, position + 3),
+        torch.tensor([0]),
+        num_rows=3,
+    )
+    assert start.tolist() == [position + 3]
+    assert frames[valid].tolist() == [position + 1, position + 2]
+
     DSv41DSparkWorker._prepare_page_tables(worker, [42], 1, context_chunking_ids=frozenset({42}))
     slot = worker._req_to_slot[42]
     worker._valid_len[slot].fill_(48)
@@ -269,11 +288,15 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
 
 
 @pytest.mark.parametrize(
-    "chunks,captures",
-    [([100, 80], [100, 80]), ([40, 140], [0, 140])],
-    ids=["chunked", "held-tail"],
+    "chunks,captures,policy",
+    [
+        ([100, 80], [100, 80], ReusePolicy.PRIVATE),
+        ([40, 140], [0, 140], ReusePolicy.PRIVATE),
+        ([180], [180], ReusePolicy.REQUIRED),
+    ],
+    ids=["chunked", "held-tail", "required-reusable"],
 )
-def test_private_context_seed_rebuilds_final_window(chunks, captures):
+def test_context_seed_preserves_draft_pages_for_their_reuse_policy(chunks, captures, policy):
     if captures[0] == 0:
         from tensorrt_llm._torch.pyexecutor.scheduler.ctx_decoder_batch import CtxDecoderBatcher
         from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -315,7 +338,7 @@ def test_private_context_seed_rebuilds_final_window(chunks, captures):
         assert scheduler._ctx_decoder_hold_window == 0
         assert scheduler._num_ctx_decoder_hold_passes == 1
     worker = SimpleNamespace(
-        _draft_reuse_policy=ReusePolicy.PRIVATE,
+        _draft_reuse_policy=policy,
         _draft_kv_manager=SimpleNamespace(enable_block_reuse=True),
         _win=128,
         _req_to_slot={42: 0, 43: 1},
@@ -370,6 +393,7 @@ def test_private_context_seed_rebuilds_final_window(chunks, captures):
             assert worker._valid_len[0] == 0
     assert worker._ctx_len.tolist() == [180, 384, 0]
     assert worker._valid_len.tolist() == [128, 128, 0]
-    assert [written[7, token] for token in range(52, 180)] == list(range(52, 180))
+    first = 0 if policy is ReusePolicy.REQUIRED else 52
+    assert [written[7, token] for token in range(first, 180)] == list(range(first, 180))
     assert [written[31, token] for token in range(128)] == list(range(256, 384))
     assert {page for page, _ in written} == {7, 31}

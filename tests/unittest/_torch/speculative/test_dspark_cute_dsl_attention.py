@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import triton_num_compiled
 
 from tensorrt_llm._torch.custom_ops import dspark_attention_custom_op as attention_op
 from tensorrt_llm._torch.custom_ops import dspark_rmsnorm_rope_custom_op as preparation_op
@@ -264,9 +265,10 @@ def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
         heads=heads,
         block=block,
         page_size=page_size,
-        positions=[0, 1, 17, 32, 33, 63, 64, 65, 127, 128, 129, 193, 257, 390, 99],
-        valid_lengths=[0, 1, 1, 3, 32, 1, 1, 127, 1, 0, 2, 127, 32, 3, 128],
-        capacities=[512] * 10 + [128] + [512] * 3 + [0],
+        positions=[0, 1, 17, 32, 33, 63, 64, 65, 127, 128, 129, 193, 257, 390, 99]
+        + [149, 191, 213, 300],
+        valid_lengths=[0, 1, 1, 3, 32, 1, 1, 127, 1, 0, 2, 127, 32, 3, 128] + [128] * 4,
+        capacities=[512] * 10 + [128] + [512] * 3 + [0] + [512] * 4,
     )
     original_cache = inputs["kv_pages"].clone()
     expected = _reference(**inputs)
@@ -345,7 +347,7 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
         inputs["inverse_rope_freqs"].copy_(torch.view_as_real(block_phases))
         expected_block = _norm_rope(block_x, weight, block_phases)
         expected_draft = F.pad(expected_block, (0, 0, 0, 2))
-        expected_cache = inputs["kv_pages"]
+        expected_cache = inputs["kv_pages"].clone()
         if main_x is not None and main_freqs is not None:
             main_x.normal_()
             main_freqs.copy_(torch.view_as_real(freqs[inputs["positions"]]))
@@ -359,6 +361,8 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
         torch.testing.assert_close(captured, expected, rtol=5e-2, atol=3e-2)
         if page_write:
             torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)
+        else:
+            torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=0, atol=0)
         torch.testing.assert_close(draft, expected_draft, rtol=2e-2, atol=2e-2)
         assert torch.count_nonzero(draft[:, 6:]) == 0
 
@@ -473,7 +477,10 @@ def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
 
 
 def test_context_page_writer_supports_more_than_65535_tokens():
-    from tensorrt_llm._torch.attention.kernels.dspark import write_dspark_context
+    from tensorrt_llm._torch.attention.kernels.dspark import (
+        _write_context_kernel,
+        write_dspark_context,
+    )
 
     batch, tokens, dim, page_size = 2, 65536, 4, 128
     values = torch.randn(batch, tokens, dim, device="cuda", dtype=torch.bfloat16)
@@ -484,6 +491,7 @@ def test_context_page_writer_supports_more_than_65535_tokens():
     tables = torch.arange(batch * tokens // page_size, device="cuda", dtype=torch.int32).view(
         batch, -1
     )
+    tables = F.pad(tables, (0, 1), value=-1)[:, :-1]
     tables[0, 5] = -1
     capacities = torch.tensor([tokens, tokens - 5], device="cuda")
     pool = torch.full((tables.numel(), page_size, dim), -1.0, device="cuda", dtype=values.dtype)
@@ -494,6 +502,24 @@ def test_context_page_writer_supports_more_than_65535_tokens():
     expected[pages[valid], (logical % page_size)[valid]] = values[valid]
     write_dspark_context(values, positions, mask, pool, tables, capacities)
     torch.testing.assert_close(pool, expected, rtol=0, atol=0)
+
+    compiled = triton_num_compiled(_write_context_kernel)
+    for width in (1, 3, 16, 128):
+        updated = -values[1:, :width]
+        write_dspark_context(
+            updated,
+            positions[1:, :width],
+            mask[1:, :width],
+            pool,
+            tables[1:],
+            capacities[1:],
+        )
+        assert triton_num_compiled(_write_context_kernel) == compiled
+        write_mask = valid[1:, :width]
+        expected[pages[1:, :width][write_mask], (logical[1:, :width] % page_size)[write_mask]] = (
+            updated[write_mask]
+        )
+        torch.testing.assert_close(pool, expected, rtol=0, atol=0)
 
 
 def test_preparation_self_jit_covers_dynamic_batches(monkeypatch):

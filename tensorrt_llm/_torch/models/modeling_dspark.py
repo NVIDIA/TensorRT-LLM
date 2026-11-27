@@ -5695,7 +5695,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
             draft_cls = DSv41DSparkForCausalLM
             # The separate draft config clears spec_config to avoid recursion.
             # Select the context implementation from the target's spec config.
-            draft_kwargs["context_kv_only"] = disagg_context_draft_kv_only_enabled(
+            draft_kwargs["is_context_worker"] = disagg_context_draft_kv_only_enabled(
                 model_config.spec_config
             )
         draft = draft_cls(

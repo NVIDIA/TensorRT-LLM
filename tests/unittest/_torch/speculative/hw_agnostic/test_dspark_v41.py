@@ -429,6 +429,11 @@ def test_v41_context_draft_constructs_without_moe(monkeypatch):
     wrapper = DSv41DSparkForCausalLM.__new__(DSv41DSparkForCausalLM)
     nn.Module.__init__(wrapper)
     wrapper.dspark_model, wrapper.config, wrapper.num_stages = model, config, 3
+    wrapper._attn_params = model._attn_params
+    assert wrapper.context_kv_only
+    specs = wrapper.managed_context_layer_specs(20, 128)
+    assert [spec.global_layer_id for spec in specs] == [20, 21, 22]
+    assert all(spec.bytes_per_token() == 1024 and spec.sliding_window_size == 129 for spec in specs)
     weights = {
         "mtp.0.main_proj.weight": torch.arange(1024, dtype=torch.bfloat16).view(32, 32),
         "mtp.0.main_norm.weight": torch.ones(32, dtype=torch.bfloat16),
@@ -892,8 +897,12 @@ def test_v41_explicit_draft_backend_preserves_nvfp4_conversion(monkeypatch):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("role", ["context", "generation"])
-def test_v41_context_draft_uses_target_spec_when_draft_config_clears_it(monkeypatch, role):
+@pytest.mark.parametrize(
+    "role,has_eplb", [("context", False), ("context", True), ("generation", False)]
+)
+def test_v41_context_draft_uses_target_spec_when_draft_config_clears_it(
+    monkeypatch, role, has_eplb
+):
     from tensorrt_llm._torch.models import modeling_dspark_v41
 
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
@@ -905,7 +914,9 @@ def test_v41_context_draft_uses_target_spec_when_draft_config_clears_it(monkeypa
 
     def init_draft(self, *args, draft_model_cls, **kwargs):
         nn.Module.__init__(self)
-        self.dspark_model = SimpleNamespace()
+        self.dspark_model = SimpleNamespace(
+            context_kv_only=getattr(draft_model_cls, "context_kv_only", False)
+        )
         selected_draft(draft_model_cls)
 
     monkeypatch.setattr(modeling_dspark.DSv4DSparkForCausalLM, "__init__", init_draft)
@@ -922,12 +933,11 @@ def test_v41_context_draft_uses_target_spec_when_draft_config_clears_it(monkeypa
     draft = SimpleNamespace(
         pretrained_config=SimpleNamespace(model_type="deepseek_v41"),
         spec_config=None,
-        moe_load_balancer=None,
+        moe_load_balancer=object() if has_eplb else None,
     )
-    modeling_dspark._build_dspark_draft(target, draft, None, SimpleNamespace())
-    expected = (
-        modeling_dspark_v41._DSv41DSparkContextDraftModel
-        if role == "context"
-        else DSv41DSparkDraftModel
-    )
+    wrapper = modeling_dspark._build_dspark_draft(target, draft, None, SimpleNamespace())
+    slim = role == "context" and not has_eplb
+    expected = modeling_dspark_v41._DSv41DSparkContextDraftModel if slim else DSv41DSparkDraftModel
     selected_draft.assert_called_once_with(expected)
+    assert wrapper.is_dspark_context_worker is (role == "context")
+    assert wrapper.context_kv_only is slim

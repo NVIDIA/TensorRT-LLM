@@ -136,8 +136,6 @@ class DummyRequestFactory:
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
-        if draft_kv_cache_manager is kv_cache_manager:
-            draft_kv_cache_manager = None
 
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER
@@ -338,8 +336,6 @@ class DummyRequestFactory:
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
-        if draft_kv_cache_manager is kv_cache_manager:
-            draft_kv_cache_manager = None
 
         available_blocks = kv_cache_manager.get_num_free_blocks() // self._config.max_beam_width
         if available_blocks < batch_size:
@@ -499,8 +495,6 @@ class DummyRequestFactory:
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
-        if draft_kv_cache_manager is kv_cache_manager:
-            draft_kv_cache_manager = None
 
         def free_warmup_requests() -> None:
             for r in requests:
@@ -611,8 +605,6 @@ class DummyRequestFactory:
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
-        if draft_kv_cache_manager is kv_cache_manager:
-            draft_kv_cache_manager = None
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER
         )

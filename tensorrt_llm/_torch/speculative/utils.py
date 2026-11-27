@@ -823,12 +823,9 @@ def get_spec_worker(spec_config,
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
-    # DSpark splits by deployment form, mirroring the draft-model side. The
-    # embedded DeepSeek-V4-Pro draft needs DSv4DSparkWorker, whose rolling-window
-    # plumbing reads V4-draft-only attributes (num_stages, write_context_windows,
-    # forward_batched). A standalone drafter is DFlash lineage and is served by
-    # DSparkWorker, which adds only the Markov bias and the shift_label
-    # slot convention on top of DFlashWorker.
+    # Embedded DSpark uses captured target hidden states with V4 rolling
+    # windows or V4.1 CSA2 draft pages. Standalone DSpark extends DFlashWorker
+    # with the Markov bias and shift_label slot convention.
     if spec_dec_mode.is_dspark():
         if spec_config.draft_is_embedded_in_target:
             if spec_config.use_ancestral_draft_sampling:

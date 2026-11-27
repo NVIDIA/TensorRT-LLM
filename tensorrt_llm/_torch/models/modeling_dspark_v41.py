@@ -14,9 +14,9 @@
 # limitations under the License.
 """Embedded DeepSeek-V4.1 DSpark drafter.
 
-The worker owns separate per-stage sliding-window context KV. It seeds those
-windows from target layer-entry captures and back-fills all accepted positions;
-the draft block attends non-causally to its own positions. V4.1 differs from V4
+The CSA2 manager owns the per-stage draft KV pages. The worker seeds those
+pages from target layer-entry captures and back-fills accepted positions.
+The draft block attends non-causally to its own positions. V4.1 differs from V4
 in the lagged mHC input mix, absence of an HC head and query-head RMSNorm, smaller
 draft expert bank, and the checkpoint's 32-by-32 FP8 dense scale granularity.
 """
@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
@@ -49,6 +50,7 @@ from .modeling_dspark import DSv4DSparkBlock, DSv4DSparkDraftModel, DSv4DSparkFo
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+    from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheLayerSpec
 
 _STAGE_KEY = re.compile(r"^mtp\.(\d+)\.(.+)$")
 
@@ -526,6 +528,11 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
 
     draft_model_cls = DSv41DSparkDraftModel
 
+    @property
+    def context_kv_only(self) -> bool:
+        """Whether the draft model holds only the weights needed to seed context KV."""
+        return getattr(self.dspark_model, "context_kv_only", False) is True
+
     def supports_final_window_context_replay(self, manager) -> bool:
         """Draft KV can be rebuilt from the final capture for request-private layers."""
         layers = manager.draft_layer_ids
@@ -538,16 +545,49 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
         """Whether the V4.1 draft attention reads context from pages of this size."""
         return tokens_per_block in (128, 256)
 
-    def __init__(self, draft_config, *args, context_kv_only=False, **kwargs):
+    def managed_context_layer_specs(
+        self, first_layer: int, tokens_per_block: int
+    ) -> tuple["KVCacheLayerSpec", ...]:
+        """Declare each stage's appended KV layer after the target's layers.
+
+        Args:
+            first_layer: First global layer ID available to the drafter.
+            tokens_per_block: Page size of the target's KV cache manager.
+        """
+        if not self.reads_managed_ctx_pages(tokens_per_block):
+            raise ValueError("The embedded drafter cannot read context pages of this size")
+        from ..pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            KVCacheLayerOwner,
+            KVCacheLayerSpec,
+            Role,
+        )
+
+        return tuple(
+            KVCacheLayerSpec(
+                global_layer_id=first_layer + stage,
+                owner=KVCacheLayerOwner.DRAFT,
+                dtype=DataType.BF16,
+                num_kv_heads=1,
+                head_dim=int(self._attn_params["head_dim"]),
+                buffer_roles=(Role.KEY,),
+                sliding_window_size=int(self._attn_params["window_size"]) + 1,
+            )
+            for stage in range(self.num_stages)
+        )
+
+    def __init__(
+        self, draft_config: ModelConfig, *args, is_context_worker: bool = False, **kwargs
+    ) -> None:
         draft_model_cls = (
             _DSv41DSparkContextDraftModel
-            if context_kv_only and getattr(draft_config, "moe_load_balancer", None) is None
+            if is_context_worker and getattr(draft_config, "moe_load_balancer", None) is None
             else self.draft_model_cls
         )
         super().__init__(draft_config, *args, draft_model_cls=draft_model_cls, **kwargs)
+        self.is_dspark_context_worker = is_context_worker
 
     def load_weights(self, weights: dict[str, torch.Tensor], weight_mapper=None, **kwargs) -> None:
-        context_kv_only = getattr(self.dspark_model, "context_kv_only", False)
+        context_kv_only = self.context_kv_only
         if context_kv_only:
             names = {"mtp.0.main_proj.weight", "mtp.0.main_proj.scale", "mtp.0.main_norm.weight"}
             required = {"mtp.0.main_proj.weight", "mtp.0.main_norm.weight"}

@@ -476,7 +476,9 @@ def is_fused_dsv4_dspark_attention_supported(
     return True
 
 
-def _get_dspark_attention_kernel(block, heads, page_size, arch_str):
+def _get_dspark_attention_kernel(
+    block: int, heads: int, page_size: int, arch_str: str
+) -> Callable[..., None]:
     cache_key = (block, heads, page_size, arch_str)
     compiled = _dspark_attention_kernel_cache.get(cache_key)
     if compiled is None:

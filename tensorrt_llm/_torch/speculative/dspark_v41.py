@@ -3,6 +3,7 @@
 """Embedded DSpark over the CSA2 manager's explicit draft layers."""
 
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -10,25 +11,29 @@ import torch.nn.functional as F
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, ReusePolicy
 
-from ..configs.deepseek_v41 import disagg_context_draft_kv_only_enabled
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..modules.multi_stream_utils import private_stream
 from ..pyexecutor import device_copy
 from .dspark import DSparkSpecMetadata, DSv4DSparkWorker
 
+if TYPE_CHECKING:
+    from ..attention.backends.interface import AttentionMetadata
+    from ..models.modeling_dspark_v41 import DSv41DSparkForCausalLM
+    from ..pyexecutor.resource_manager import ResourceManager
+
 
 class DSparkCopySite(device_copy.CopySiteEnum):
-    PAGE_INDICES = ("dspark.page_indices", device_copy.Direction.H2D)
-    PAGE_VALUES = ("dspark.page_values", device_copy.Direction.H2D)
+    PAGE_TABLE_OFFSETS = ("dspark.page_table_offsets", device_copy.Direction.H2D)
+    PAGE_TABLE_ENTRIES = ("dspark.page_table_entries", device_copy.Direction.H2D)
     REQUEST_SLOTS = ("dspark.request_slots", device_copy.Direction.H2D)
-    PAGE_CAPACITIES = ("dspark.page_capacities", device_copy.Direction.H2D)
+    ROW_TOKEN_CAPACITIES = ("dspark.row_token_capacities", device_copy.Direction.H2D)
 
 
 class DSv41DSparkWorker(DSv4DSparkWorker):
+    """Seed and consume embedded draft KV owned by the CSA2 cache manager."""
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if disagg_context_draft_kv_only_enabled(self.spec_config):
-            self.return_confidence = False
         self._context_kv_only = False
         self._draft_kv_manager = None
         self._draft_kv_buffers = ()
@@ -60,12 +65,24 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         )
 
     def prepare_draft_context(
-        self, draft_model, spec_metadata, attn_metadata, resource_manager
+        self,
+        draft_model: "DSv41DSparkForCausalLM",
+        spec_metadata: DSparkSpecMetadata | None,
+        attn_metadata: "AttentionMetadata",
+        resource_manager: "ResourceManager",
     ) -> None:
+        """Bind the draft cache and publish page tables for this target step.
+
+        Args:
+            draft_model: Embedded drafter that reads the managed pages.
+            spec_metadata: Current step's requests and capture state.
+            attn_metadata: Target metadata defining the context and generation rows.
+            resource_manager: Resolver for the target's KV cache manager.
+        """
         if spec_metadata is None:
             return
-        self._context_kv_only = getattr(draft_model.dspark_model, "context_kv_only", False)
-        if self._context_kv_only:
+        self._context_kv_only = draft_model.context_kv_only
+        if draft_model.is_dspark_context_worker:
             # Confidence calibration and verification planning belong to GEN.
             self.return_confidence = False
         self._lazy_init(draft_model, spec_metadata, attn_metadata)
@@ -117,7 +134,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             )
             self._capacity_upload = device_copy.DeviceCopyBuffer(
                 self._draft_capacities,
-                site=DSparkCopySite.PAGE_CAPACITIES,
+                site=DSparkCopySite.ROW_TOKEN_CAPACITIES,
                 pin_memory=prefer_pinned(),
             )
             self._host_slots = torch.empty(shape[0], dtype=torch.long, device="cpu")
@@ -211,7 +228,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         if self._draft_block_tables is not table:
             self._draft_block_tables = table
             self._table_slots = None
-        batch_state = manager.draft_page_table_state() if managed else None
+        batch_state = manager.page_table_conversion_state() if managed else None
         batch_snapshot = (
             (batch_state, tuple(request_ids), paused_in_place_ids)
             if batch_state is not None
@@ -330,7 +347,9 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                     length = 0
                 self._ctx_len[slot].fill_(position)
                 self._valid_len[slot].fill_(length)
-                self._position_initialized[slot].fill_(True)
+                # Cache history can lag when overlap suspends a request before
+                # its resource update. Fresh GEN slots use this step's positions.
+                self._position_initialized[slot].fill_(row < num_contexts)
                 self._managed_residency[rid] = cache
         # Generation preparation resets scratch state inside the graph before
         # consuming it. Context seeding still needs the eager reset.
@@ -384,9 +403,11 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             values_device = self._draft_updates_device[:count]
             try:
                 device_copy.copy(
-                    DSparkCopySite.PAGE_INDICES, indices_device, host["indices"][:count]
+                    DSparkCopySite.PAGE_TABLE_OFFSETS, indices_device, host["indices"][:count]
                 )
-                device_copy.copy(DSparkCopySite.PAGE_VALUES, values_device, host["values"][:count])
+                device_copy.copy(
+                    DSparkCopySite.PAGE_TABLE_ENTRIES, values_device, host["values"][:count]
+                )
                 self._draft_table_storage.view(-1).index_copy_(0, indices_device, values_device)
             finally:
                 host["event"].record()
@@ -602,26 +623,15 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         gen_start = attn_metadata.num_ctx_tokens
         slots = self._batch_to_slot[num_contexts:batch_size]
         if prepared is None:
-            qo_indptr = spec_metadata.qo_indptr
-            if spec_metadata.verify_lens is not None and qo_indptr is not None:
-                base = gen_start + qo_indptr[:num_gens].to(device=slots.device, dtype=torch.long)
-                prepared = self._advance_ragged_generation_state(
-                    slots,
-                    accepted_tokens[num_contexts:batch_size],
-                    num_accepted_tokens[num_contexts:batch_size],
-                    position_ids.reshape(-1),
-                    base,
-                    captured.shape[0],
-                )
-            else:
-                prepared = self._advance_generation_state(
-                    slots,
-                    accepted_tokens[num_contexts:batch_size],
-                    num_accepted_tokens[num_contexts:batch_size],
-                    position_ids.reshape(-1),
-                    gen_start,
-                    captured.shape[0],
-                )
+            prepared = self._advance_unprepared_generation_state(
+                spec_metadata,
+                slots,
+                accepted_tokens[num_contexts:batch_size],
+                num_accepted_tokens[num_contexts:batch_size],
+                position_ids.reshape(-1),
+                gen_start,
+                captured.shape[0],
+            )
         bonus, main_rows, start_pos, valid_len, interim_rows, interim_pos, interim_valid = prepared
         K = interim_rows.shape[1]
         fork = self._take_prep_fork(

@@ -217,8 +217,13 @@ def get_speculative_model(model: Any) -> Any:
     """Find the model that owns the embedded speculative worker."""
     model = getattr(model, "_orig_mod", model)
     for attribute in ("language_model", "llm"):
-        if not hasattr(model, "spec_worker"):
+        if hasattr(model, "spec_worker"):
+            break
+        try:
             model = getattr(model, attribute, model)
+        except NotImplementedError:
+            # Some multimodal wrappers expose their model as `llm` instead.
+            continue
     return model
 
 

@@ -302,17 +302,55 @@ def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monke
         index_topk=512,
         sliding_window=128,
     )
+    model_config = ModelConfig(pretrained_config=pretrained)
+    config = KvCacheConfig(
+        max_gpu_total_bytes=64 << 20,
+        host_cache_size=0,
+        enable_block_reuse=True,
+        enable_swa_scratch_reuse=True,
+        dtype="fp8",
+        avg_seq_len=512,
+    )
+    mapping = Mapping()
+    draft_specs = tuple(
+        KVCacheLayerSpec(
+            global_layer_id=2 + stage,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            num_kv_heads=1,
+            head_dim=512,
+            buffer_roles=(Role.KEY,),
+            sliding_window_size=129,
+        )
+        for stage in range(3)
+    )
+    sizing = dict(tokens_per_block=128, spec_config=None, kv_cache_config=config)
+    for bounded_replay in ("0", "1"):
+        with monkeypatch.context() as mode:
+            mode.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", bounded_replay)
+            assert CSA2CacheManager.draft_layers_share_pool_group(
+                model_config, mapping, layer_specs=draft_specs, **sizing
+            ) == (bounded_replay == "1")
+    target_layers, full_tokens = CSA2CacheManager._get_per_request_layer_tokens(
+        model_config, mapping, max_seq_len=1024, **sizing
+    )
+    all_layers, draft_full_tokens = CSA2CacheManager._get_per_request_layer_tokens(
+        model_config, mapping, max_seq_len=1024, layer_specs=draft_specs, **sizing
+    )
+    assert draft_full_tokens == full_tokens
+    assert all_layers[: len(target_layers)] == target_layers
+    draft_layers = all_layers[len(target_layers) :]
+    assert len(draft_layers) == len(draft_specs)
+    assert all(
+        size == 1024 and 128 < retained == intercept < full_tokens
+        for size, retained, intercept in draft_layers
+    )
+
     manager = _create_kv_cache_manager(
         model_engine=None,
-        model_config=ModelConfig(pretrained_config=pretrained),
+        model_config=model_config,
         kv_cache_manager_cls=CSA2CacheManager,
-        kv_cache_config=KvCacheConfig(
-            max_gpu_total_bytes=64 << 20,
-            host_cache_size=0,
-            enable_block_reuse=True,
-            enable_swa_scratch_reuse=True,
-            dtype="fp8",
-        ),
+        kv_cache_config=config,
         sparse_attention_config=CSA2SparseAttentionConfig(),
         spec_config=None,
         kv_connector_manager=None,
@@ -320,21 +358,10 @@ def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monke
         max_seq_len=1024,
         max_batch_size=1,
         max_num_tokens=512,
-        mapping=Mapping(),
+        mapping=mapping,
         max_beam_width=1,
         dtype=torch.bfloat16,
-        layer_specs=[
-            KVCacheLayerSpec(
-                global_layer_id=2 + stage,
-                owner=KVCacheLayerOwner.DRAFT,
-                dtype=DataType.BF16,
-                num_kv_heads=1,
-                head_dim=512,
-                buffer_roles=(Role.KEY,),
-                sliding_window_size=129,
-            )
-            for stage in range(3)
-        ],
+        layer_specs=draft_specs,
     )
     try:
         assert manager.get_draft_kv_cache_view() is manager

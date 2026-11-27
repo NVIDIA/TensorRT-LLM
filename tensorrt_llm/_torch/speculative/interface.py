@@ -215,12 +215,8 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     if (spec_config.spec_dec_mode.is_dflash()
             and spec_config.attention_backend in ("VANILLA", "FA4")):
         return False
-    # The embedded DSpark draft owns a dedicated rolling-window cache in
-    # DSv4DSparkWorker and never reads the paged draft KV cache that attention
-    # metadata manages. A standalone DSpark drafter runs on DSparkWorker
-    # (DFlash lineage), which does read it, so it keeps the default -- hence a
-    # form check, not a mode check
-    # (see DSparkDecodingConfig.draft_is_embedded_in_target).
+    # Embedded DSpark uses worker-owned windows on V4 and target-owned pages
+    # on V4.1. Standalone DSpark uses the DFlash-style draft cache.
     if (spec_config.spec_dec_mode.is_dspark()
             and spec_config.draft_is_embedded_in_target):
         return False

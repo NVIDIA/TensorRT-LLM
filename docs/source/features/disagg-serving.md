@@ -412,17 +412,32 @@ context_servers:
   speculative_config: &dspark
     decoding_type: DSpark
     max_draft_len: 5
+  cache_transceiver_config: &transceiver
+    backend: NIXL
+    transceiver_runtime: PYTHON
 generation_servers:
   speculative_config: *dspark
+  cache_transceiver_config: *transceiver
 ```
 
-The context worker computes draft KV and transfers it in request-private pages
-owned by the target's KV cache manager. A reused context prefix rebuilds the
-draft's retained suffix. Generation reads these pages directly. With no load
-balancer configured, the context worker also omits the draft head and MoE
-weights. This profile uses `bounded_replay_on_generation: false`, the default.
-Confidence scheduling, including any `confidence_cost_table_path`, is used
-only by the generation worker. Use a cost table for that worker's topology.
+The context worker computes draft KV, and generation reads those pages directly
+from the target's KV cache manager after transfer. With decoder bounded replay,
+the pages are request-private and context rebuilds the retained draft window
+after a prefix hit. With decoder bounded replay disabled, the draft pages
+can participate in prefix reuse.
+
+Launch context ranks with `--server_role context`, or set
+`TRTLLM_DISAGG_ROLE=context` before creating a context worker in Python or when
+launching the ranks separately. Without an MoE load balancer
+(`moe_config.load_balancer`), context workers omit the draft head and MoE weights.
+DeepSeek-V4.1 DSpark does not support confidence scheduling.
+
+With `bounded_replay_on_generation: false` (the default), a generation-only
+DSpark configuration leaves the prompt's draft KV unset. Native transfer rejects
+the mismatched layout at handoff. To migrate, enable the same DSpark configuration
+on both roles or disable it on both, and run the same TensorRT-LLM release on every
+worker. Restart generation workers after updating the context workers because
+generation caches the failed handshake per context endpoint.
 
 ### DeepSeek-V4.1 context decoder weights
 

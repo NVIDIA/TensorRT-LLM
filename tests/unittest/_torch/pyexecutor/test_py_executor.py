@@ -502,6 +502,50 @@ def test_context_model_without_decoder_rejects_non_context_requests(
         PyExecutor._configure_csa2_remote_tail(executor, request)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("request_type", "max_new_tokens", "overlap", "rejected"),
+    [
+        (LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY, 1, False, True),
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, 2, False, True),
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, 1, True, False),
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY, 2, True, True),
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY, 2, False, False),
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY, 1, True, False),
+    ],
+)
+def test_dspark_context_worker_rejects_requests_that_would_decode(
+    request_type: LlmRequestType, max_new_tokens: int, overlap: bool, rejected: bool
+) -> None:
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(_dspark_context_worker=True),
+        disable_overlap_scheduler=not overlap,
+        _configure_csa2_remote_tail=Mock(),
+        _is_kv_manager_v2=True,
+        kv_cache_transceiver=None,
+        max_beam_width=1,
+        _validate_token_id_range=Mock(),
+        _validate_embedding_bias=Mock(),
+        _validate_request_budget=Mock(),
+        sampler=Mock(),
+    )
+    request = LlmRequest(
+        request_id=41,
+        max_new_tokens=max_new_tokens,
+        input_tokens=[1, 2, 3],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+        llm_request_type=request_type,
+    )
+    if rejected:
+        with pytest.raises(ValueError, match="DSpark context worker cannot run decode"):
+            PyExecutor._validate_request(executor, request)
+        executor.sampler.validate_request.assert_not_called()
+    else:
+        PyExecutor._validate_request(executor, request)
+        executor.sampler.validate_request.assert_called_once_with(request)
+
+
 @pytest.mark.parametrize("is_warmup", [False, True])
 @pytest.mark.parametrize("has_transceiver", [False, True])
 def test_context_model_capacity_profile_uses_real_dummy_requests(

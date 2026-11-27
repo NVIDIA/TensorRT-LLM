@@ -154,6 +154,7 @@ def _validate_context_swa_layer_limit(limit: int | None, num_layers: int) -> Non
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SpeculativeConfig
     from tensorrt_llm.mapping import Mapping
 
@@ -330,6 +331,7 @@ class CSA2CacheManager(KVCacheManagerV2):
     _gpu_tier_quota: int | None = None
 
     _draft_layer_specs: tuple[KVCacheLayerSpec, ...] = ()
+    requires_embedded_dspark_kv_match = True
 
     @classmethod
     def accepts_appended_draft_layers(cls) -> bool:
@@ -887,18 +889,19 @@ class CSA2CacheManager(KVCacheManagerV2):
     @classmethod
     def _get_per_request_layer_tokens(
         cls,
-        model_config,
-        mapping,
-        num_layers=None,
+        model_config: ModelConfig,
+        mapping: Mapping,
+        num_layers: int | None = None,
         *,
-        tokens_per_block,
-        kv_cache_config=None,
-        max_seq_len=None,
-        spec_config=None,
-        is_draft=False,
-        layer_specs=None,
-        shared_draft_block_width=None,
-    ):
+        tokens_per_block: int,
+        kv_cache_config: KvCacheConfig | None = None,
+        max_seq_len: int | None = None,
+        spec_config: SpeculativeConfig | None = None,
+        is_draft: bool = False,
+        layer_specs: Sequence[KVCacheLayerSpec] | None = None,
+        shared_draft_block_width: int | None = None,
+    ) -> tuple[list[tuple[int, int, int]], int] | None:
+        """Size one request's retained packed target and appended draft layers."""
         if not max_seq_len or max_seq_len < 0:
             return None
         sizes, windows, _ = cls._cache_sizing_components(
@@ -1555,8 +1558,12 @@ class CSA2CacheManager(KVCacheManagerV2):
         return batch is not None and batch[0] == tuple(request_ids)
 
     @contextmanager
-    def overwrite_draft_page_table(self, rows: int):
-        """Allow a fallback write at the address captured by generation graphs."""
+    def overwrite_draft_page_table(self, rows: int) -> Iterator[None]:
+        """Allow a fallback write at the address captured by generation graphs.
+
+        Args:
+            rows: Number of leading batch rows the caller may replace.
+        """
         # The next conversion must clear all columns the fallback could have written.
         self._table_live[:rows] = self._draft_page_table.shape[1]
         self._batch_conversion_inputs = None
@@ -1569,7 +1576,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             self._base_rows_read[self._base_rows_slot].record(stream)
             self._page_tables_stream = stream
 
-    def draft_page_table_state(self) -> object | None:
+    def page_table_conversion_state(self) -> object | None:
         """Opaque generation snapshot, retained while all conversion inputs match.
 
         A new snapshot invalidates consumers' row metadata after page changes,
@@ -1972,8 +1979,8 @@ class CSA2CacheManager(KVCacheManagerV2):
             **{role.role: MapperKind.REPLICATED for role in CSA2CacheRole},
         }
 
-    def get_disagg_ignored_roles(self):
-        # Remote-tail generation rebuilds draft KV from target hidden states.
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        """Exclude draft KV that remote-tail generation rebuilds locally."""
         return frozenset((Role.KEY,)) if self.bounded_replay_on_generation else frozenset()
 
     def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole):
@@ -2093,16 +2100,16 @@ class CSA2CacheManager(KVCacheManagerV2):
     @classmethod
     def _cache_sizing_components(
         cls,
-        model_config,
-        mapping,
+        model_config: ModelConfig,
+        mapping: Mapping,
         *,
-        tokens_per_block,
-        max_num_tokens=0,
-        spec_config=None,
-        kv_cache_config=None,
-        num_layers=None,
-        layer_specs=None,
-    ):
+        tokens_per_block: int,
+        max_num_tokens: int = 0,
+        spec_config: SpeculativeConfig | None = None,
+        kv_cache_config: KvCacheConfig | None = None,
+        num_layers: int | None = None,
+        layer_specs: Sequence[KVCacheLayerSpec] | None = None,
+    ) -> tuple[list[int], list[int | None], list[int]]:
         """Return physical bytes per token, retention windows, and reuse policies."""
         layout = CSA2Layout.from_hf_config(model_config.pretrained_config)
         if mapping.pp_size != 1 or mapping.cp_size != 1:
@@ -2166,7 +2173,14 @@ class CSA2CacheManager(KVCacheManagerV2):
 
     @classmethod
     def draft_layers_share_pool_group(
-        cls, model_config, mapping, *, tokens_per_block, spec_config, kv_cache_config, layer_specs
+        cls,
+        model_config: ModelConfig,
+        mapping: Mapping,
+        *,
+        tokens_per_block: int,
+        spec_config: SpeculativeConfig | None,
+        kv_cache_config: KvCacheConfig,
+        layer_specs: Sequence[KVCacheLayerSpec],
     ) -> bool:
         """Whether appended layers join existing target lifecycles in the profiling cache."""
         _, windows, policies = cls._cache_sizing_components(

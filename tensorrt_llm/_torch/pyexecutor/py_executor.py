@@ -9121,6 +9121,17 @@ class PyExecutor:
     def _validate_request(self, request: LlmRequest) -> None:
         request.raise_if_validation_failed()
 
+        if getattr(self.model_engine, "_dspark_context_worker", False) is True:
+            # Overlap can schedule another step before the context KV is sent.
+            if (request.is_generation_only_request
+                    or (request.max_new_tokens > 1 and
+                        (not request.is_context_only_request
+                         or not self.disable_overlap_scheduler))):
+                raise ValueError(
+                    "A DeepSeek-V4.1 DSpark context worker cannot run decode. "
+                    "Send generation requests through the disaggregated server."
+                )
+
         if getattr(self, "_decode_only",
                    False) and not request.is_generation_only_request:
             raise ValueError(

@@ -52,7 +52,10 @@ skip_pre_blackwell = pytest.mark.skipif(
 
 
 def _manager(attention_dp, disaggregated, scratch, block=BLOCK, *, draft_stages=0):
-    return CSA2CacheManager(
+    spec_config = DSparkDecodingConfig(max_draft_len=DRAFT_LEN)
+    if draft_stages:
+        spec_config.__dict__["draft_is_embedded_in_target"] = True
+    manager = CSA2CacheManager(
         KvCacheConfig(
             max_gpu_total_bytes=512 << 20,
             host_cache_size=0,
@@ -71,7 +74,8 @@ def _manager(attention_dp, disaggregated, scratch, block=BLOCK, *, draft_stages=
         dtype=DataType.BF16,
         vocab_size=8192,
         layout=CSA2Layout((0, 2, 2, 1), (1, 3), (1, 3), window_size=128, index_topk=4),
-        spec_config=DSparkDecodingConfig(max_draft_len=DRAFT_LEN),
+        pretrained_config=SimpleNamespace(sliding_window=128),
+        spec_config=spec_config,
         layer_specs=[
             KVCacheLayerSpec(
                 global_layer_id=4 + stage,
@@ -87,6 +91,9 @@ def _manager(attention_dp, disaggregated, scratch, block=BLOCK, *, draft_stages=
         ]
         or None,
     )
+    for layer_id in manager.draft_layer_ids:
+        assert manager.get_layer_cache_spec(layer_id).reuse_policy is ReusePolicy.PRIVATE
+    return manager
 
 
 def _metadata(manager):

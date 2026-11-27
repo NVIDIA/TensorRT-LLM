@@ -413,6 +413,11 @@ class DecoderRunner(ScheduledModelRunner):
             steady_gen_cache_supported=self._steady_gen_cache_supported,
             mm_item_scheduler=mm_item_scheduler,
             host_uploader=self._host_uploader,
+            dspark_context_worker=(
+                self._draft_context_preparer is not None
+                and getattr(self._draft_context_preparer[1], "is_dspark_context_worker", False)
+                is True
+            ),
         )
 
     def _cuda_graphs_kwargs(self) -> dict[str, Any]:
@@ -1391,6 +1396,10 @@ class DecoderRunner(ScheduledModelRunner):
         return {**outputs, "logits": outputs["logits"][:0]}
 
     # Scheduler-facing state stays on the input owner that stages each layout.
+
+    @property
+    def _dspark_context_worker(self) -> bool:
+        return getattr(self._inputs, "_dspark_context_worker", False) is True
 
     @property
     def _dspark_confidence_enabled(self):

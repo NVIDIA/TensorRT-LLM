@@ -71,7 +71,6 @@ def test_decoder_input_preparer_loads_cost_table_for_live_setup(monkeypatch, ena
     monkeypatch.setattr(inputs_module.spec_step_copies, "is_supported", lambda: False)
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
     model = torch.nn.Identity()
-    model.config = SimpleNamespace(model_type="deepseek_v41")
 
     preparer = inputs_module.DecoderInputPreparer(
         buffers=buffers,
@@ -84,6 +83,7 @@ def test_decoder_input_preparer_loads_cost_table_for_live_setup(monkeypatch, ena
         lora=None,
         use_beam_search=False,
         steady_gen_cache_supported=False,
+        dspark_context_worker=role == "context",
     )
 
     assert preparer._buffers is buffers

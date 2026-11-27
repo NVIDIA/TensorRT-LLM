@@ -464,9 +464,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
     window, refines the per-position logits with the Markov head, and predicts a
     per-position acceptance confidence used by the verification scheduler.
 
-    Unlike DFlash, the draft does NOT use the paged KV cache or mask-token
-    cross-attention: its attention K/V come from the worker-owned rolling window
-    of projected captured context (one ``main_kv`` per decode step, per stage).
+    DeepSeek-V4 stores projected captured context in a worker-owned rolling
+    window. The V4.1 worker stores it in the target's CSA2 draft pages.
     Acceptance of the previous block goes through the unified
     :meth:`SpecWorkerBase.sample_and_accept_draft_tokens` (strict target-verify,
     or rejection sampling for a non-greedy batch), so greedy parity with no-spec
@@ -792,7 +791,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         table_len = int(getattr(inner_model, "_runtime_position_ceiling", 0) or config_cap)
         self._position_cap = (table_len - 1 - block_size) if table_len else None
 
-    def _allocate_context_storage(self, rows, stages, window, head_dim):
+    def _allocate_context_storage(
+        self, rows: int, stages: int, window: int, head_dim: int
+    ) -> torch.Tensor | None:
         return torch.zeros((rows, stages, window, head_dim), dtype=torch.bfloat16, device="cuda")
 
     def _lazy_init(self, draft_model, spec_metadata, attn_metadata=None) -> None:
@@ -1104,6 +1105,27 @@ class DSv4DSparkWorker(SpecWorkerBase):
             position_cap=self._position_cap,
         )
 
+    def _advance_unprepared_generation_state(
+        self,
+        spec_metadata: DSparkSpecMetadata,
+        slots: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        position_ids: torch.Tensor,
+        gen_start: int,
+        num_rows: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """Advance draft history when acceptance did not prepare it."""
+        qo_indptr = spec_metadata.qo_indptr
+        if spec_metadata.verify_lens is not None and qo_indptr is not None:
+            base = gen_start + qo_indptr[: slots.shape[0]].to(device=slots.device, dtype=torch.long)
+            return self._advance_ragged_generation_state(
+                slots, accepted_tokens, num_accepted_tokens, position_ids, base, num_rows
+            )
+        return self._advance_generation_state(
+            slots, accepted_tokens, num_accepted_tokens, position_ids, gen_start, num_rows
+        )
+
     def _advance_ragged_generation_state(
         self,
         slots: torch.Tensor,
@@ -1412,27 +1434,15 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # target input position; locally-prefilled and existing slots keep their
         # monotonically advanced position.
         if prepared is None:
-            qo_indptr = spec_metadata.qo_indptr
-            if spec_metadata.verify_lens is not None and qo_indptr is not None:
-                # Ragged verification uses the same qo_indptr as the packed input.
-                base = gen_start + qo_indptr[:num_gens].to(device=slots.device, dtype=torch.long)
-                prepared = self._advance_ragged_generation_state(
-                    slots,
-                    accepted_tokens[num_contexts:batch_size],
-                    num_accepted_tokens[num_contexts:batch_size],
-                    position_ids.reshape(-1),
-                    base,
-                    captured.shape[0],
-                )
-            else:
-                prepared = self._advance_generation_state(
-                    slots,
-                    accepted_tokens[num_contexts:batch_size],
-                    num_accepted_tokens[num_contexts:batch_size],
-                    position_ids.reshape(-1),
-                    gen_start,
-                    captured.shape[0],
-                )
+            prepared = self._advance_unprepared_generation_state(
+                spec_metadata,
+                slots,
+                accepted_tokens[num_contexts:batch_size],
+                num_accepted_tokens[num_contexts:batch_size],
+                position_ids.reshape(-1),
+                gen_start,
+                captured.shape[0],
+            )
         bonus, main_rows, start_pos, valid_len, interim_rows, interim_pos, interim_valid = prepared
         # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
         # (everything but the bonus) into the rolling window — same frames as the

@@ -66,8 +66,15 @@ class PeerRegistrar:
         CacheKind.STATE: MambaPolicy,
     }
 
-    def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
+    def __init__(
+        self,
+        self_rank_info: RankInfo,
+        self_extractor: KVRegionExtractorV1,
+        *,
+        requires_embedded_dspark_kv_match: bool = False,
+    ) -> None:
         self._ri = self_rank_info
+        self._requires_embedded_dspark_kv_match = requires_embedded_dspark_kv_match
         self._policies: Dict[CacheKind, Union[AttentionPolicy, MambaPolicy]] = {}
         self._peer_ri_cache: Dict[str, RankInfo] = {}
         self._kv_map_cache: Dict[
@@ -186,10 +193,19 @@ class PeerRegistrar:
             # The layer-count tolerance in _check_peer_compatible would transfer
             # only the target layers and leave the drafter's prompt KV unset on
             # the receiver.
-            raise ValueError(
+            mismatch = (
                 "PeerRegistrar: unified draft KV layer count differs "
-                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
-                "both peers must use the same speculative decoding KV cache layout: "
+                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}). "
+            )
+            if self._requires_embedded_dspark_kv_match:
+                raise ValueError(
+                    mismatch
+                    + "DeepSeek-V4.1 keeps embedded DSpark KV in the target's KV cache manager. "
+                    "Enable the same DSpark configuration on both workers or disable it on both. "
+                    "Run the same TensorRT-LLM release on every worker."
+                )
+            raise ValueError(
+                mismatch + "Both peers must use the same speculative decoding KV cache layout: "
                 "give both workers the same speculative_config and set "
                 "TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both "
                 "(TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on every worker keeps a separate draft "

@@ -8,7 +8,10 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["M"],
+    do_not_specialize_on_alignment=["M", "positions", "mask", "tables", "capacities"],
+)
 def _write_context_kernel(
     values,
     positions,
@@ -16,7 +19,7 @@ def _write_context_kernel(
     pool,
     tables,
     capacities,
-    M: tl.constexpr,
+    M,
     D: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
@@ -24,8 +27,8 @@ def _write_context_kernel(
     PAGE_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0) // M
-    token = tl.program_id(0) % M
+    token = tl.program_id(0)
+    row = tl.program_id(1)
     d = tl.arange(0, BLOCK)
     # RoPE uses frame p + 1; the managed cache stores logical token p.
     position = tl.load(positions + row * M + token) - 1
@@ -53,7 +56,7 @@ def write_dspark_context(
     batch, tokens, head_dim = values.shape
     if batch == 0 or tokens == 0:
         return
-    _write_context_kernel[(batch * tokens,)](
+    _write_context_kernel[(tokens, batch)](
         values.contiguous(),
         positions.contiguous(),
         mask.contiguous(),
