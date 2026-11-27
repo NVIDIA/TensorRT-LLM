@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import sys
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -859,6 +860,112 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
     graph.replay()
     torch.testing.assert_close(graph_output, native(replay_x), rtol=2e-2, atol=2e-2)
 
+    tuner._profile_single_kernel.assert_not_called()
+
+
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available(),
+    reason="MXFP8xMXFP8 GEMM op not compiled or not SM100 family",
+)
+def test_mxfp8_decode_graph_pass_times_every_row_count_once_across_ranks(monkeypatch):
+    """In a decode-graph warmup pass the GEMM calls of every row count are timed at the pass's
+    end: the two ranks of a group time each (rows, tactic) once between them, a swap-AB tile's on
+    one rank (its kernel is the same at every row count), and the capture finds every winner."""
+    from flashinfer.autotuner import AutoTuner as FlashInferAutoTuner
+
+    if not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+        pytest.skip("FlashInfer CuTeDSL MXFP8 kernels are not available")
+
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    torch.manual_seed(0)
+    out_f, in_f, rows = 256, 512, (1, 8, 32)
+    weight = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    weight_e4m3, weight_scale = quant_bf16_to_mxfp8(weight, 32)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    weights = [{"weight": weight_e4m3, "weight_scale_inv": weight_scale}]
+    native, tuned = (
+        Linear(
+            in_features=in_f,
+            out_features=out_f,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=quant_config,
+        ).cuda()
+        for _ in range(2)
+    )
+    native.load_weights(weights)
+    tuned.load_weights(weights)
+    method = tuned.quant_method
+    assert isinstance(method, MXFP8LinearMethod)
+    assert method.enable_flashinfer_auto()
+    method.tune_mxfp8_backends = True
+    monkeypatch.setattr(
+        FlashInferAutoTuner.get(), "choose_one", Mock(side_effect=AssertionError("Nested tuning"))
+    )
+    xs = {m: torch.randn(m, in_f, dtype=torch.bfloat16, device="cuda") for m in rows}
+
+    gathered = {}
+
+    class SequentialDist:
+        """A rank's n-th all-gather returns the n-th objects of the ranks run so far."""
+
+        def __init__(self, rank):
+            self.rank = rank
+
+        def tp_cp_allgather(self, obj):
+            calls = gathered.setdefault(self.rank, [])
+            calls.append(obj)
+            n = len(calls) - 1
+            return [gathered[r][n] for r in sorted(gathered) if len(gathered[r]) > n]
+
+    profiled = []
+    for rank in range(2):
+        tuner = AutoTuner()
+        tuner.setup_distributed_state(
+            Mapping(world_size=2, rank=rank, tp_size=2), dist=SequentialDist(rank)
+        )
+        monkeypatch.setattr(AutoTuner, "_instance", tuner)
+        profile = tuner._profile_single_kernel
+
+        def record_profile(*, runner, inputs, tactic, rank=rank, profile=profile, **kwargs):
+            if isinstance(runner, MXFP8GemmUnifiedRunner):
+                profiled.append((rank, inputs[0].shape[0], tactic))
+            return profile(runner=runner, inputs=inputs, tactic=tactic, **kwargs)
+
+        monkeypatch.setattr(tuner, "_profile_single_kernel", record_profile)
+        with flashinfer_mxfp8_autotune(), tuner.tuning_pass("test"):
+            for m in rows:
+                tuned(xs[m])
+            # The GEMM calls of the pass time nothing.
+            assert not [entry for entry in profiled if entry[0] == rank]
+        assert len(gathered[rank]) == 2  # The agreement and the merge.
+
+    # Between them the ranks timed every (rows, tactic) once, a swap-AB tile on one rank.
+    counts = Counter((m, tactic) for _, m, tactic in profiled)
+    assert {m for m, _ in counts} == set(rows) and set(counts.values()) == {1}, counts
+    swap_ab = {tactic for _, _, tactic in profiled if tactic[0] == "cutedsl_swap_ab"}
+    assert swap_ab, profiled
+    for tactic in swap_ab:
+        assert len({rank for rank, _, timed in profiled if timed == tactic}) == 1, tactic
+    runner = MXFP8GemmUnifiedRunner(torch.bfloat16)
+    assert runner.build_key([], None, ("trtllm_cutlass", 0)) is None
+    assert runner.build_key([], None, ("flashinfer_cutlass", 0)) is None
+
+    # The capture finds the winners the last rank merged, and compiled.
+    monkeypatch.setattr(
+        tuner, "_profile_single_kernel", Mock(side_effect=AssertionError("Unexpected retuning"))
+    )
+    for m in rows:
+        static_x = xs[m].clone()
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            with flashinfer_mxfp8_decode_graph_capture():
+                graph_output = tuned(static_x)
+        replay_x = torch.randn_like(xs[m])
+        static_x.copy_(replay_x)
+        graph.replay()
+        torch.testing.assert_close(graph_output, native(replay_x), rtol=2e-2, atol=2e-2)
     tuner._profile_single_kernel.assert_not_called()
 
 

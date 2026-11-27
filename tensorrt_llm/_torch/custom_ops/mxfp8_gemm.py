@@ -24,6 +24,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..modules.mxfp8_swapab import _TILE_CONFIGS as _SWAPAB_TILES
 from ..modules.mxfp8_swapab import MXFP8SwapABGemmRunner
 
 MXFP8_DEFAULT_BACKENDS = (
@@ -298,10 +299,12 @@ class Sm107MXFP8GemmRunner(TunableRunner):
 class MXFP8GemmUnifiedRunner(TunableRunner):
     """Compare explicit FlashInfer, CUTLASS, Swap-AB and SM107 tactics in one tuner."""
 
-    # Graph warmup visits each capture shape; cache and profiling use that exact M. The ranks of
-    # the tuning group time a share of the tactics each, and compile each FlashInfer CuTe DSL kernel
-    # once when they share JIT builds (share_library_kernel_caches). The swap-AB CuTe DSL tiles
-    # stay in mxfp8_swapab's cache: every rank that runs one compiles it.
+    # Graph warmup visits each capture shape; cache and profiling use that exact M. The warmup-only
+    # pass leaves every shape's profile to its end, where the ranks of the tuning group time one
+    # plan of them all (AutoTuner.tuning_pass), the items of a kernel on one rank (build_key).
+    # FlashInfer's CuTe DSL kernels compile once when the ranks share JIT builds
+    # (share_library_kernel_caches); a swap-AB CuTe DSL tile stays in mxfp8_swapab's cache,
+    # compiled by every rank that runs it.
     tuning_config = TuningConfig(
         cold_l2_flush_bytes=_COLD_L2_FLUSH_BYTES,
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
@@ -354,6 +357,21 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
             for backend, runner in self.runners.items()
             for tactic in runner.get_valid_tactics(inputs, profile)
         ]
+
+    def build_key(self, inputs: list[torch.Tensor], profile: OptimizationProfile, tactic, **kwargs):
+        """The kernel a tactic compiles, the same for every shape: a swap-AB tile (its cache keys
+        it by tiler and cluster) or a FlashInfer CuTe DSL config. None for the CUTLASS backends,
+        which ship compiled."""
+        if not isinstance(tactic, tuple):
+            return super().build_key(inputs, profile, tactic, **kwargs)
+        backend, sub_tactic = tactic
+        if backend in ("flashinfer_cutlass", "trtllm_cutlass"):
+            return None
+        if backend == "cutedsl_swap_ab":
+            return ("mxfp8_swapab", _SWAPAB_TILES[sub_tactic], self.output_dtype)
+        if backend == "flashinfer_cute_dsl":
+            return ("flashinfer.mm_mxfp8.cute_dsl", repr(sub_tactic), self.output_dtype)
+        return super().build_key(inputs, profile, tactic, **kwargs)
 
     def forward(self, inputs: list[torch.Tensor], tactic=-1) -> torch.Tensor:
         if tactic == -1:
