@@ -245,7 +245,7 @@ configured environment variable takes precedence.
 | `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/tensorrt_llm/flashinfer/rank-N` in MPI workers (see below), `$HOME/.cache/flashinfer` otherwise | `flashinfer/rank-N` in MPI workers, `flashinfer` otherwise |
 | `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
 | `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
-| `TLLM_JIT_SHARE_DIR` | Disabled | Not set (one directory per launch, see below) |
+| `TLLM_JIT_SHARE_DIR` | Not set: `/tmp/tllm-jit-<uid>/<launch>` for a launch of several processes per node (see below) | Not set (one directory per launch, see below) |
 | `TRTLLM_DG_CACHE_DIR` | Disabled | `trtllm_deep_gemm` |
 | `CUDA_CACHE_PATH` | `$HOME/.nv/ComputeCache` | `cuda` |
 
@@ -295,6 +295,25 @@ ignores the setting with a warning. A process waits for another process's build
 at most `TLLM_JIT_SHARE_WAIT_S` seconds (default 60) and then builds the kernel
 itself, as it does whenever the directory cannot be used.
 `TLLM_JIT_SHARE_LOG=1` records each kernel in `<TLLM_JIT_SHARE_DIR>/log`.
+
+Without `TLLM_JIT_SHARE_DIR`, the processes of a launch that run on one node share their
+builds this way by default, through `/tmp/tllm-jit-<uid>/<launch>` on the node's local disk.
+This applies to a launch of several processes per node that its launcher names: a PMIx
+namespace, a Slurm job step, a torchrun run (`--rdzv_id` or `--standalone`), or a DWDP
+rendezvous. That directory leaves DeepGEMM's disk cache where it is, and launch directories
+whose processes have all exited are removed after six hours.
+`TLLM_JIT_SHARE_DEFAULT=0` turns the default directory off. Where it cannot be used (another
+user can write to `/tmp/tllm-jit-<uid>`, or no launcher names the launch), each process builds
+its kernels itself and logs why once.
+
+During the memory-profiling warmup, ops that opt in build their JIT kernels ahead, in
+parallel, on worker processes of each rank (KernelBuilder). The workers start only while the
+rank's GPU keeps 8 GiB free, and stop when the warmup ends.
+`TLLM_KERNEL_BUILDER_WORKERS` caps the workers of a rank (default: its share of the CPUs, up
+to 8). A worker that does not reply to a build within `TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S`
+seconds (default 900; `0` waits without a limit) is stopped, and that kernel builds where it is
+first used. `TLLM_KERNEL_BUILDER=0` starts no worker and turns the default sharing directory off:
+every kernel then builds where it is first used.
 
 Note that, when `TRTLLM_CACHE_DIR` is set, the FlashInfer workspace isolation
 mechanism described below still applies. This will prevent race conditions

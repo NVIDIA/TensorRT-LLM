@@ -43,6 +43,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ....build_pool import process_built
+from ....kernel_builder import KernelBuilder
 from ....kernels.blackwell.utils import TRTLLM_ENABLE_PDL
 from . import raw_ptx as ptx
 
@@ -349,7 +351,7 @@ class KimiK3RouterLogitsKernel:
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
+@process_built("kimi_k3_router_logits")
 def _compiled(use_pdl: bool = TRTLLM_ENABLE_PDL) -> object:
     """The kernel compiled for ``use_pdl`` (cached per variant)."""
     kernel = KimiK3RouterLogitsKernel(use_pdl)
@@ -407,7 +409,7 @@ def run_router_logits(
 
     Inputs as :func:`can_run` accepts them; they are not re-validated.
     """
-    _compiled(use_pdl=TRTLLM_ENABLE_PDL)(
+    _compiled(TRTLLM_ENABLE_PDL)(
         make_ptr(cutlass.BFloat16, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         Int64(hidden_states.data_ptr()),
         Int32(hidden_states.shape[0]),
@@ -421,8 +423,7 @@ def precompile(use_pdl: bool = TRTLLM_ENABLE_PDL) -> int:
     compiled (0 when the device is not one the kernel serves)."""
     if not _is_supported_device(torch.cuda.current_device()):
         return 0
-    _compiled(use_pdl=use_pdl)
-    return 1
+    return KernelBuilder.get().build_kernels([(_compiled, (use_pdl,))])
 
 
 __all__ = [

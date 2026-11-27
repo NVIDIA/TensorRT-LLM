@@ -958,7 +958,9 @@ class DecoderCudaGraphs:
                     )
 
                     # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
-                    # Tune every generation graph shape during the warmup-only pass.
+                    # Tune every generation graph shape during the warmup-only pass: its
+                    # outputs are discarded, so the PARALLEL ops' profiles of every shape are
+                    # timed together at its end (AutoTuner.tuning_pass).
                     # Keep piecewise context/prefill capture on the native backend.
                     flashinfer_methods = self._flashinfer_mxfp8_autotune_methods()
                     flashinfer_autotune_context = (
@@ -972,6 +974,9 @@ class DecoderCudaGraphs:
                         cuda_graph_gemm_tuning(
                             tune=is_warmup_only, world_size=self.mapping.world_size
                         ),
+                        AutoTuner.get().tuning_pass("decode-graph warmup")
+                        if is_warmup_only
+                        else contextlib.nullcontext(),
                     ):
                         self._capture_generation_cuda_graphs(resource_manager)
                     if (
@@ -990,7 +995,8 @@ class DecoderCudaGraphs:
                             _MXFP8_GEMM_AUTOTUNED_OP,
                         )
 
-                        # Every rank captures the GEMM kernels most ranks tuned.
+                        # Every rank captures the same tactics: the vote settles the quantizer
+                        # and the GEMM profiles only some ranks tuned (see agree_mxfp8_tactics).
                         agree_mxfp8_tactics(_MXFP8_GEMM_AUTOTUNED_OP)
                         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
                         if cache_path:

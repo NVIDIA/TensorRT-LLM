@@ -14,13 +14,16 @@
 # limitations under the License.
 
 import sys
+from collections import Counter
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+import tensorrt_llm._jit_share as jit_share
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops as flashinfer_ops_module
 import tensorrt_llm._torch.custom_ops.mxfp8_gemm as mxfp8_gemm_module
 import tensorrt_llm._torch.custom_ops.torch_custom_ops as custom_ops_module
@@ -860,6 +863,112 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
     tuner._profile_single_kernel.assert_not_called()
 
 
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available(),
+    reason="MXFP8xMXFP8 GEMM op not compiled or not SM100 family",
+)
+def test_mxfp8_decode_graph_pass_times_every_row_count_once_across_ranks(monkeypatch):
+    """In a decode-graph warmup pass the GEMM calls of every row count are timed at the pass's
+    end: the two ranks of a group time each (rows, tactic) once between them, a swap-AB tile's on
+    one rank (its kernel is the same at every row count), and the capture finds every winner."""
+    from flashinfer.autotuner import AutoTuner as FlashInferAutoTuner
+
+    if not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+        pytest.skip("FlashInfer CuTeDSL MXFP8 kernels are not available")
+
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    torch.manual_seed(0)
+    out_f, in_f, rows = 256, 512, (1, 8, 32)
+    weight = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    weight_e4m3, weight_scale = quant_bf16_to_mxfp8(weight, 32)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    weights = [{"weight": weight_e4m3, "weight_scale_inv": weight_scale}]
+    native, tuned = (
+        Linear(
+            in_features=in_f,
+            out_features=out_f,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=quant_config,
+        ).cuda()
+        for _ in range(2)
+    )
+    native.load_weights(weights)
+    tuned.load_weights(weights)
+    method = tuned.quant_method
+    assert isinstance(method, MXFP8LinearMethod)
+    assert method.enable_flashinfer_auto()
+    method.tune_mxfp8_backends = True
+    monkeypatch.setattr(
+        FlashInferAutoTuner.get(), "choose_one", Mock(side_effect=AssertionError("Nested tuning"))
+    )
+    xs = {m: torch.randn(m, in_f, dtype=torch.bfloat16, device="cuda") for m in rows}
+
+    gathered = {}
+
+    class SequentialDist:
+        """A rank's n-th all-gather returns the n-th objects of the ranks run so far."""
+
+        def __init__(self, rank):
+            self.rank = rank
+
+        def tp_cp_allgather(self, obj):
+            calls = gathered.setdefault(self.rank, [])
+            calls.append(obj)
+            n = len(calls) - 1
+            return [gathered[r][n] for r in sorted(gathered) if len(gathered[r]) > n]
+
+    profiled = []
+    for rank in range(2):
+        tuner = AutoTuner()
+        tuner.setup_distributed_state(
+            Mapping(world_size=2, rank=rank, tp_size=2), dist=SequentialDist(rank)
+        )
+        monkeypatch.setattr(AutoTuner, "_instance", tuner)
+        profile = tuner._profile_single_kernel
+
+        def record_profile(*, runner, inputs, tactic, rank=rank, profile=profile, **kwargs):
+            if isinstance(runner, MXFP8GemmUnifiedRunner):
+                profiled.append((rank, inputs[0].shape[0], tactic))
+            return profile(runner=runner, inputs=inputs, tactic=tactic, **kwargs)
+
+        monkeypatch.setattr(tuner, "_profile_single_kernel", record_profile)
+        with flashinfer_mxfp8_autotune(), tuner.tuning_pass("test"):
+            for m in rows:
+                tuned(xs[m])
+            # The GEMM calls of the pass time nothing.
+            assert not [entry for entry in profiled if entry[0] == rank]
+        assert len(gathered[rank]) == 2  # The agreement and the merge.
+
+    # Between them the ranks timed every (rows, tactic) once, a swap-AB tile on one rank.
+    counts = Counter((m, tactic) for _, m, tactic in profiled)
+    assert {m for m, _ in counts} == set(rows) and set(counts.values()) == {1}, counts
+    swap_ab = {tactic for _, _, tactic in profiled if tactic[0] == "cutedsl_swap_ab"}
+    assert swap_ab, profiled
+    for tactic in swap_ab:
+        assert len({rank for rank, _, timed in profiled if timed == tactic}) == 1, tactic
+    runner = MXFP8GemmUnifiedRunner(torch.bfloat16)
+    assert runner.build_key([], None, ("trtllm_cutlass", 0)) is None
+    assert runner.build_key([], None, ("flashinfer_cutlass", 0)) is None
+
+    # The capture finds the winners the last rank merged, and compiled.
+    monkeypatch.setattr(
+        tuner, "_profile_single_kernel", Mock(side_effect=AssertionError("Unexpected retuning"))
+    )
+    for m in rows:
+        static_x = xs[m].clone()
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            with flashinfer_mxfp8_decode_graph_capture():
+                graph_output = tuned(static_x)
+        replay_x = torch.randn_like(xs[m])
+        static_x.copy_(replay_x)
+        graph.replay()
+        torch.testing.assert_close(graph_output, native(replay_x), rtol=2e-2, atol=2e-2)
+    tuner._profile_single_kernel.assert_not_called()
+
+
 def _even_rows(rows: int, rank: int, tp_size: int) -> tuple[int, int]:
     """Row range of `rank` when `rows` are split evenly over `tp_size` ranks."""
     return rank * rows // tp_size, (rank + 1) * rows // tp_size
@@ -1183,6 +1292,104 @@ def test_mxfp8_loaded_tactic_primes_before_graph_capture(
     graph.replay()
     torch.testing.assert_close(captured, runner(inputs, tactic=tactic), atol=0, rtol=0)
     reloaded._profile_single_kernel.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_mxfp8_kernels_are_named_by_cluster_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FlashInfer keys a CuTe DSL MXFP8 kernel by device index and compiles it for the max active
+    clusters of its launch cluster, which the GPU and the SMs sm_reserve() keeps out decide. Its
+    shared name holds that count instead of the device index: processes with another count do
+    not share it, a key of another layout stays in the process, and a kernel compiled or exported
+    for another count is neither exported nor loaded."""
+    clusters = {1: 148, 2: 74}
+    # The counts FlashInfer's cached get_max_active_clusters gives, without a GPU.
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.cute_dsl.utils",
+        SimpleNamespace(get_max_active_clusters=lambda size: clusters[size]),
+    )
+    exported = []
+    monkeypatch.setattr(
+        jit_share, "_export_kernel", lambda kernel, *paths, extra=None: exported.append(extra)
+    )
+    monkeypatch.setattr(jit_share, "_exported_extra", lambda meta: 148)
+    monkeypatch.setattr(jit_share, "_load_kernel", lambda obj, name, meta: "kernel")
+    cache = mxfp8_gemm_module._FlashInferKernelCache("owner")
+    key = (32, (128, 64), (1, 1), True, False, True, torch.bfloat16, 1)
+    name = cache._shared_text((0, key))
+    assert name is not None
+    assert cache._shared_text((1, key)) == name
+    assert cache._shared_text((0, (*key[:2], (2, 1), *key[3:]))) not in (None, name)
+    assert cache._shared_text(key) is None
+    assert cache._shared_text((0, key[:-1])) is None
+    cache._export((0, key), ("kernel", 148), "obj", "name", "meta")
+    assert exported == [148]
+    assert cache._load((0, key), "obj", "name", "meta") == ("kernel", 148)
+
+    clusters[1] = 140  # 8 SMs reserved
+    assert cache._shared_text((0, key)) not in (None, name)
+    with pytest.raises(ValueError):
+        cache._export((0, key), ("kernel", 148), "obj", "name", "meta")
+    with pytest.raises(ValueError):
+        cache._load((0, key), "obj", "name", "meta")
+    assert exported == [148]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Needs SM100/SM103 and FlashInfer's CuTeDSL MXFP8 kernels",
+)
+@torch.inference_mode()
+def test_mxfp8_flashinfer_cute_dsl_kernels_are_shared(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With shared JIT builds, tuning the MXFP8 GEMM shares FlashInfer's CuTe DSL kernel cache: the
+    kernel one process compiled is exported to the share directory with its cluster count, and
+    another process (a new tuner and FlashInfer cache here) loads both instead of compiling it.
+    The loaded kernel gives the same bits."""
+    from flashinfer.gemm import gemm_base
+
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(jit_share._LOG_ENV, "1")
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    all_tactics = MXFP8GemmUnifiedRunner.get_valid_tactics
+    # One tactic: one kernel to compile, then to load.
+    monkeypatch.setattr(
+        MXFP8GemmUnifiedRunner,
+        "get_valid_tactics",
+        lambda self, *args, **kwargs: all_tactics(self, *args, **kwargs)[:1],
+    )
+    inputs = _mxfp8_swapab_inputs(32, 256, 512)
+
+    def tune_in_a_new_process() -> tuple[torch.Tensor, dict]:
+        monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+        # FlashInfer's own cache, which tuning replaces by a shared one; the monkeypatch puts the
+        # original back after the test.
+        monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", {})
+        out = custom_ops_module.mxfp8_gemm_autotuned(
+            *inputs, torch.bfloat16, ("flashinfer_cute_dsl",), tune=True
+        )
+        cache = gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE
+        assert isinstance(cache, jit_share.SharedKernelCache)
+        return out, {key: value[1] for key, value in cache.items()}
+
+    compiled, compiled_clusters = tune_in_a_new_process()
+    loaded, loaded_clusters = tune_in_a_new_process()
+    torch.cuda.synchronize()
+    actions = [
+        line.split()[2]
+        for log in (tmp_path / "log").glob("*.txt")
+        for line in log.read_text().splitlines()
+    ]
+    assert actions == ["cute-built", "cute-loaded"], actions
+    ((key, clusters),) = compiled_clusters.items()
+    assert loaded_clusters == compiled_clusters
+    assert clusters == mxfp8_gemm_module._max_active_clusters(key[1])
+    assert torch.equal(loaded, compiled)
 
 
 @pytest.mark.skipif(
