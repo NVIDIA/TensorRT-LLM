@@ -2059,7 +2059,10 @@ def test_peer_registrar_accepts_hosted_draft_layers_across_tp_and_attention_dp(
 @pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
 def test_bounce_receive_windows_partition_a_shared_slot_by_writer(mapper_kind):
     from tensorrt_llm._torch.disaggregation.native.extent import Chunk, TokenRange
-    from tensorrt_llm._torch.disaggregation.native.transfer import _BounceWriterProjection
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        _BounceReceiveSlice,
+        _BounceWriterProjection,
+    )
 
     local = make_rankinfo(
         instance_name="gen",
@@ -2078,6 +2081,7 @@ def test_bounce_receive_windows_partition_a_shared_slot_by_writer(mapper_kind):
     )
     destination = KVRegionExtractorV1(local.page_table)
     all_bytes = set()
+    receive_slice = _BounceReceiveSlice(extent, local)
     for rank in range(4):
         writer = make_rankinfo(
             instance_name="ctx",
@@ -2093,7 +2097,7 @@ def test_bounce_receive_windows_partition_a_shared_slot_by_writer(mapper_kind):
         registrar = PeerRegistrar(layout, KVRegionExtractorV1(layout.page_table))
         registrar.register(local.instance_name, local.instance_rank, local)
         projection = _BounceWriterProjection(registrar, local, destination, "writer-endpoint")
-        descs = projection.destinations(extent).descs
+        descs = projection.destinations(receive_slice).descs
         writer_bytes = {byte for desc in descs for byte in range(desc.addr, desc.addr + desc.len)}
         assert len(writer_bytes) == 32
         assert not (all_bytes & writer_bytes)
@@ -2101,3 +2105,31 @@ def test_bounce_receive_windows_partition_a_shared_slot_by_writer(mapper_kind):
     pool = local.page_table.pool_groups[0].pools[0]
     base = pool.base_address + 3 * pool.slot_stride_bytes
     assert all_bytes == set(range(base, base + pool.slot_bytes))
+
+
+@pytest.mark.parametrize("kind", [CacheKind.PAGED, CacheKind.STATE])
+@pytest.mark.parametrize("helix", [False, True])
+def test_bounce_slot_selection_preserves_holes_and_page_intersections(kind, helix):
+    from tensorrt_llm._torch.disaggregation.native.extent import Chunk, TokenRange
+    from tensorrt_llm._torch.disaggregation.native.transfer import _BounceReceiveSlice
+
+    tpb = 8
+    page_table = make_page_table()
+    page_table.tokens_per_block = tpb
+    local = make_rankinfo(cp_size=3, cp_rank=1, tokens_per_block=tpb, page_table=page_table)
+    groups = [np.array([5, -1, 2, 9, 1], dtype=np.int64), np.array([2], dtype=np.int64)]
+    kinds = [CacheKind.PAGED, CacheKind.STATE]
+    group = kinds.index(kind)
+    for start, end in [(0, 8), (8, 24), (15, 65), (80, 112), (112, 128)]:
+        chunk = Chunk(groups, kinds, TokenRange(start, end), is_last=True)
+        receive_slice = _BounceReceiveSlice(chunk, local)
+        selected, ordinals, largest = receive_slice.slots_for(group, helix)
+        expected = []
+        for i, slot in enumerate(groups[group]):
+            ordinal = i * local.cp_size + local.cp_rank if helix and kind == CacheKind.PAGED else i
+            intersects = (ordinal + 1) * tpb > start and ordinal * tpb < end
+            if slot >= 0 and (kind == CacheKind.STATE or intersects):
+                expected.append((slot, ordinal))
+        assert selected.tolist() == [slot for slot, _ in expected]
+        assert ordinals.tolist() == [ordinal for _, ordinal in expected]
+        assert largest == max(selected, default=-1)

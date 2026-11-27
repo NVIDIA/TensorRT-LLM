@@ -3201,6 +3201,45 @@ class KVRecvTask(_LogicalTask):
         )
 
 
+class _BounceReceiveSlice:
+    """Reuse slot selection across writers without sharing their authorized byte ranges."""
+
+    def __init__(self, chunk: Chunk, local: RankInfo):
+        self.chunk = chunk
+        self.local = local
+        self._groups: dict[tuple[int, bool], tuple[np.ndarray, np.ndarray, int]] = {}
+
+    def slots_for(self, group: int, helix_stride: bool) -> tuple[np.ndarray, np.ndarray, int]:
+        key = (group, helix_stride)
+        if key in self._groups:
+            return self._groups[key]
+        slots = self.chunk.block_ids_per_layer_groups[group]
+        page_table = self.local.page_table
+        assert page_table is not None
+        first = 0
+        stride = 1
+        offset = 0
+        if page_table.layer_groups[group].kind != CacheKind.STATE:
+            tpb = page_table.tokens_per_block
+            first = self.chunk.token_range.start // tpb
+            stop = (self.chunk.token_range.end + tpb - 1) // tpb
+            if helix_stride:
+                stride, offset = self.local.cp_size, self.local.cp_rank
+                first = (first - offset + stride - 1) // stride
+                stop = (stop - offset + stride - 1) // stride
+            first = max(0, first)
+            slots = slots[first : max(0, stop)]
+        ordinals = np.flatnonzero(slots >= 0)
+        selected = slots if len(ordinals) == len(slots) else slots[ordinals]
+        selected = selected.astype(np.int64, copy=False)
+        global_ordinals = ordinals
+        if first or stride != 1:
+            global_ordinals = (ordinals + first) * stride + offset
+        result = selected, global_ordinals, int(selected.max(initial=-1))
+        self._groups[key] = result
+        return result
+
+
 class _BounceWriterProjection:
     """Receiver-side destination geometry for a single registered writer rank."""
 
@@ -3259,35 +3298,24 @@ class _BounceWriterProjection:
                 ],
             )
 
-    def destinations(self, chunk: Chunk) -> MemoryDescs:
+    def destinations(self, receive_slice: _BounceReceiveSlice) -> MemoryDescs:
+        chunk = receive_slice.chunk
         addresses = []
         lengths = []
         tpb = self.destination.page_table.tokens_per_block
         if len(chunk.block_ids_per_layer_groups) != len(self.destination.page_table.layer_groups):
             raise ValueError("Receive slice does not match the local layer groups")
+        helix_stride = self.local.cp_size > 1 and self.writer.self_rank_info.cp_size == 1
         for view_key in self.templates.keys() | self.rings.keys():
             if view_key in chunk.excluded_pool_views:
                 continue
             group, view = view_key
-            slots = chunk.block_ids_per_layer_groups[group]
-            ordinals = np.flatnonzero(slots >= 0)
-            if not ordinals.size:
-                continue
-            if self.destination.page_table.layer_groups[group].kind != CacheKind.STATE:
-                global_ordinals = ordinals
-                if self.local.cp_size > 1 and self.writer.self_rank_info.cp_size == 1:
-                    global_ordinals = ordinals * self.local.cp_size + self.local.cp_rank
-                keep = ((global_ordinals + 1) * tpb > chunk.token_range.start) & (
-                    global_ordinals * tpb < chunk.token_range.end
-                )
-                ordinals = ordinals[keep]
-                global_ordinals = global_ordinals[keep]
-            selected = slots[ordinals].astype(np.int64, copy=False)
+            selected, global_ordinals, max_slot = receive_slice.slots_for(group, helix_stride)
             if not selected.size:
                 continue
             if view_key in self.rings:
                 mapper, pool = self.rings[view_key]
-                if selected.max() >= pool.num_slots:
+                if max_slot >= pool.num_slots:
                     raise ValueError("Receive slot exceeds the local pool")
                 dst_ptrs = self.destination.extract(selected, group, view).memory.ptrs
                 mapped = mapper.map_positions(
@@ -3306,19 +3334,21 @@ class _BounceWriterProjection:
                         )
                 continue
             pool, pieces = self.templates[view_key]
-            if selected.max() >= pool.num_slots:
+            if max_slot >= pool.num_slots:
                 raise ValueError("Receive slot exceeds the local pool")
             bases = pool.base_address + selected * pool.slot_stride_bytes
             for offsets, width in pieces:
                 ptrs = (bases[:, None] + offsets).ravel()
                 addresses.append(ptrs)
                 lengths.append(np.full(ptrs.size, width, dtype=np.int64))
-        empty = np.empty(0, dtype=np.int64)
+        if len(addresses) == 1:
+            ptrs, sizes = addresses[0], lengths[0]
+        elif addresses:
+            ptrs, sizes = np.concatenate(addresses), np.concatenate(lengths)
+        else:
+            ptrs = sizes = np.empty(0, dtype=np.int64)
         return MemoryDescs.from_arrays_uniform_device(
-            MemoryType.VRAM,
-            np.concatenate(addresses) if addresses else empty,
-            np.concatenate(lengths) if lengths else empty,
-            self.local.device_id,
+            MemoryType.VRAM, ptrs, sizes, self.local.device_id
         )
 
 
@@ -3614,11 +3644,12 @@ class Receiver(ReceiverBase):
                 try:
                     endpoint = self._extract_info_endpoint(params)
                     projections = self._bounce_writer_projections[endpoint]
+                    receive_slice = _BounceReceiveSlice(task._chunk, self._registrar.self_rank_info)
                     for rank in task._kv_result_report_tokens:
                         projection = projections.get(rank)
                         if projection is None:
                             continue  # This writer did not advertise the bounce transport.
-                        destinations = projection.destinations(task._chunk)
+                        destinations = projection.destinations(receive_slice)
                         key = secrets.token_bytes(16)
                         self._agent.register_bounce_window(
                             peer_infos.instance_name + str(rank),
