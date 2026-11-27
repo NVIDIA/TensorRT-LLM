@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Iterable
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -3529,6 +3530,14 @@ def _compiled_mid_kernel(
     return cute.compile(kernel, *head, _dummy_ptr(cutlass.BFloat16), *tail)
 
 
+def _mid_kernels(n: int, k: int, tactic: MidMTactic, use_pdl: bool, nvfp4_out: bool) -> tuple:
+    """The compiled MXFP8 quantization and mid-M GEMM kernels ``tactic`` launches."""
+    return (
+        _compiled_quant(k, _sf_blocks(tactic.mma_n), use_pdl),
+        _compiled_mid_kernel(n, k, tactic, use_pdl, nvfp4_out),
+    )
+
+
 def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool, nvfp4=None) -> None:
     """The mid-M path into ``out`` (BF16), or with ``nvfp4 = (scales, global_sf)`` its NVFP4
     output (``out`` the codes)."""
@@ -3538,14 +3547,14 @@ def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool, nvfp4=None) 
     xq = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
     xs = torch.empty((k // CTA_K) * sf_blocks * 512, dtype=torch.uint8, device=x.device)
     stream = _current_stream(x.device)
-    _compiled_quant(k, sf_blocks, use_pdl)(
+    quant, gemm = _mid_kernels(n, k, tactic, use_pdl, nvfp4 is not None)
+    quant(
         _gmem_ptr(cutlass.BFloat16, x),
         _gmem_ptr(cutlass.Float8E4M3FN, xq),
         _gmem_ptr(cutlass.Uint8, xs),
         Int32(m),
         stream,
     )
-    gemm = _compiled_mid_kernel(n, k, tactic, use_pdl, nvfp4 is not None)
     operands = (
         _gmem_ptr(cutlass.Float8E4M3FN, w),
         _gmem_ptr(cutlass.Float8E4M3FN, xq),
@@ -3600,6 +3609,39 @@ def precompile_prequantized(n: int, k: int, max_m: int) -> int:
     for tactic in tactics:
         _compiled_mid_kernel(n, k, tactic, TRTLLM_ENABLE_PDL, False, fold_weight_scale=True)
     return len(tactics)
+
+
+def _bf16_tactic(m: int, n: int, k: int) -> "LowMTactic | MidMTactic":
+    """The default tactic of the BF16-output GEMM without a gate: the low-M kernel's up to
+    ``low_m_max_for(N, K)`` rows, the mid-M path's above."""
+    if m <= low_m_max_for(n, k):
+        return default_tactic(m, n, k)
+    return default_mid_tactic(m, n, k)
+
+
+def _bf16_kernels(
+    n: int,
+    k: int,
+    tactic: "LowMTactic | MidMTactic",
+    use_pdl: bool,
+    gated: bool = False,
+    sigmoid: bool = False,
+) -> tuple:
+    """The compiled kernels the BF16-output GEMM launches at ``tactic``."""
+    if isinstance(tactic, MidMTactic):
+        return _mid_kernels(n, k, tactic, use_pdl, False)
+    return (_compiled_kernel(n, k, tactic, use_pdl, gated, sigmoid),)
+
+
+def precompile(n: int, k: int, rows: Iterable[int]) -> int:
+    """JIT-compile the kernels ``trtllm::fp8_block_scale_low_m_gemm`` launches without a gate or
+    sigmoid for an ``[N, K]`` weight at these row counts; returns how many were not compiled yet."""
+    caches = (_compiled_kernel, _compiled_mid_kernel, _compiled_quant)
+    before = sum(cache.cache_info().misses for cache in caches)
+    max_m = max_m_for(n, k)
+    for tactic in {_bf16_tactic(m, n, k) for m in rows if 1 <= m <= max_m}:
+        _bf16_kernels(n, k, tactic, TRTLLM_ENABLE_PDL)
+    return sum(cache.cache_info().misses for cache in caches) - before
 
 
 def run_low_m_gemm_prequantized(
@@ -3683,12 +3725,7 @@ def run_low_m_gemm(
     if variant and m > low_m_max_for(n, k):
         raise ValueError(f"the gated / sigmoid GEMM serves M <= {low_m_max_for(n, k)}, got {m}")
     if tactic is None:
-        if gate is not None:
-            tactic = gated_tactic(m, n, k)
-        elif m <= low_m_max_for(n, k):
-            tactic = default_tactic(m, n, k)
-        else:
-            tactic = default_mid_tactic(m, n, k)
+        tactic = gated_tactic(m, n, k) if gate is not None else _bf16_tactic(m, n, k)
     if m > tactic.mma_n:
         raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
     if isinstance(tactic, MidMTactic):
@@ -3696,7 +3733,7 @@ def run_low_m_gemm(
             raise ValueError("the gated / sigmoid GEMM needs a low-M tactic")
         _run_mid(x, w, w_scale, out, tactic, use_pdl)
         return out
-    compiled = _compiled_kernel(n, k, tactic, use_pdl, gate is not None, sigmoid)
+    (compiled,) = _bf16_kernels(n, k, tactic, use_pdl, gate is not None, sigmoid)
     gate_args = ()
     if gate is not None:
         gate_args = (_gmem_ptr(cutlass.BFloat16, gate), Int32(gate.stride(0)))
@@ -3717,9 +3754,7 @@ def _nvfp4_default_tactic(m: int, n: int, k: int) -> "LowMTactic | MidMTactic":
     tactic = nvfp4_out_tactic(m, n, k)
     if tactic is not None:
         return tactic
-    if m <= low_m_max_for(n, k):
-        return default_tactic(m, n, k)
-    return default_mid_tactic(m, n, k)
+    return _bf16_tactic(m, n, k)
 
 
 def run_low_m_gemm_nvfp4(
@@ -3932,6 +3967,7 @@ __all__ = [
     "run_low_m_gemm",
     "run_low_m_gemm_nvfp4",
     "run_low_m_gemm_prequantized",
+    "precompile",
     "precompile_prequantized",
     "split_tactic",
     "ue8m0_of_amax",

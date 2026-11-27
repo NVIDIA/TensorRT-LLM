@@ -2140,13 +2140,18 @@ def _reference_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     return torch.sum(pre_mix.reshape(*x.shape[:-1], 1) * x.float(), dim=-2).to(x.dtype)
 
 
-def _build_mhc(hidden_size: int = V41_HIDDEN_SIZE, seed: int = 0, single_pass: bool = False) -> mHC:
+def _build_mhc(
+    hidden_size: int = V41_HIDDEN_SIZE,
+    seed: int = 0,
+    single_pass: bool = False,
+    sinkhorn_iters: int = V41_SINKHORN_ITERS,
+) -> mHC:
     """An mHC with V4.1 hyperparameters and small, well-conditioned weights."""
     torch.manual_seed(seed)
     module = mHC(
         mult=V41_HC_MULT,
         hidden_size=hidden_size,
-        sinkhorn_iters=V41_SINKHORN_ITERS,
+        sinkhorn_iters=sinkhorn_iters,
         dtype=torch.bfloat16,
         eps=V41_HC_EPS,
         norm_eps=V41_RMS_NORM_EPS,
@@ -2640,6 +2645,40 @@ def test_single_pass_boundary_weight_follows_weight_updates():
     loaded = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=5)
     module.load_state_dict(loaded.state_dict())
     assert_matches(loaded)
+
+
+@skip_pre_blackwell
+@requires_cuda
+def test_prewarm_boundary_covers_every_eager_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After ``prewarm_boundary``, eager lagged boundaries of every tile and of the stream path
+    compile nothing."""
+    from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_boundary
+
+    # The deterministic fallback skips the prewarm and these kernels alike.
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "0")
+    # A Sinkhorn count no other test builds, so the prewarm itself compiles the tile kernels.
+    sinkhorn_iters = V41_SINKHORN_ITERS + 1
+    module = _build_mhc(
+        V41_REAL_HIDDEN_SIZE, seed=2, single_pass=True, sinkhorn_iters=sinkhorn_iters
+    )
+    if module._boundary_weight is None:
+        pytest.skip("the single-pass mHC boundary needs SM100/SM103 and the CuTe DSL")
+    module.prewarm_boundary(1023)
+    sizes = (1, 98, 99, 126, 127, 147, 148, 168, 169, 196, 197, 1023)
+    assert all(
+        mhc_boundary.compiled(V41_REAL_HIDDEN_SIZE, with_post, sinkhorn_iters, tokens)
+        for tokens in sizes
+        for with_post in (False, True)
+    )
+    compiled = set(mhc_boundary._COMPILED)
+    norm_w = torch.ones(V41_REAL_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    for tokens in sizes:
+        residual = _residual(tokens, V41_REAL_HIDDEN_SIZE, seed=1)
+        x_prev = residual[:, 0, :].contiguous()
+        pre, post, comb = module.hc_coeffs(residual)
+        module.fused_hc_lagged(x_prev, residual, post, comb, pre, norm_weight=norm_w, norm_eps=1e-6)
+        module.pre_mapping_lagged(residual, pre, norm_weight=norm_w, norm_eps=1e-6)
+    assert mhc_boundary._COMPILED == compiled
 
 
 @skip_pre_blackwell

@@ -272,6 +272,22 @@ class WarmupAgreement:
             )
 
 
+def _eager_gemm_max_rows(config: DecoderRunnerConfig, mapping: Mapping) -> int | None:
+    """Most rows an eager GEMM runs, or None where a drafter may run any number.
+
+    Without a drafter that computes, no GEMM has more rows than a step's tokens, which attention
+    DP gathers over the TP group; NGram drafts are prefix lookups. Any other drafter, a
+    user-provided one included, can run more rows than its target verifies.
+    """
+    spec_config = config.spec_config
+    if spec_config is not None and not spec_config.spec_dec_mode.is_ngram():
+        return None
+    max_rows = config.max_num_tokens
+    if mapping.enable_attention_dp:
+        max_rows *= mapping.tp_size
+    return max_rows
+
+
 class DecoderWarmup:
     """Warms up decoder execution before serving.
 
@@ -520,7 +536,9 @@ class DecoderWarmup:
                 self._torch_compile_bypass(),
             ):
                 self._run_attention_warmup(
-                    resource_manager, can_run_general_warmup and not generation_only
+                    resource_manager,
+                    can_run_general_warmup and not generation_only,
+                    can_run_context_warmup and not generation_only,
                 )
 
         if can_run_context_warmup:
@@ -593,6 +611,8 @@ class DecoderWarmup:
             torch.cuda.empty_cache()
         with self._warmup_timer.phase("lowm_mma_row_buckets"):
             self._prewarm_lowm_mma_row_buckets()
+        with self._warmup_timer.phase("fp8_low_m_gemms"):
+            self._prewarm_fp8_low_m_gemms()
         with self._warmup_timer.phase("cuda_graph_capture"):
             # KV-cache estimation always uses both passes, so the KV-cache size ignores the switch.
             self._graphs.warmup_and_capture(
@@ -975,25 +995,19 @@ class DecoderWarmup:
         Eager forwards run these GEMMs on their row count rounded up to a bucket
         (``low_m_gemm._MMA_ROW_BUCKETS``), and the warmup forwards reach only the buckets of their
         own row counts. Runs before CUDA graph capture, so that a capture outside the decode graphs
-        finds its buckets compiled. Without a drafter that computes, no such GEMM has more rows than
-        a step's tokens, which attention DP gathers over the TP group, so the buckets stop at the one
-        that holds them; NGram drafts are prefix lookups. Any other drafter, a user-provided one
-        included, can run more rows than its target verifies, so with one every bucket compiles. The
-        TP group is held until its slowest rank has finished: the GEMMs a rank ran eagerly, and so
-        its compiles, can differ between ranks.
+        finds its buckets compiled. The buckets stop at the one that holds
+        ``_eager_gemm_max_rows`` (all of them without a bound). The TP group is held until its
+        slowest rank has finished: the GEMMs a rank ran eagerly, and so its compiles, can differ
+        between ranks.
         """
         from tensorrt_llm._torch.modules.low_m_gemm import prewarm_mma_row_buckets
 
         start = time.perf_counter()
         compiled = gemms = 0
         try:
-            spec_config = self._config.spec_config
-            max_rows = None
-            if spec_config is None or spec_config.spec_dec_mode.is_ngram():
-                max_rows = self._config.max_num_tokens
-                if self.mapping.enable_attention_dp:
-                    max_rows *= self.mapping.tp_size
-            compiled, gemms = prewarm_mma_row_buckets(max_rows)
+            compiled, gemms = prewarm_mma_row_buckets(
+                _eager_gemm_max_rows(self._config, self.mapping)
+            )
         except Exception as e:
             # A prewarm miss only defers a compile to the first call that needs it, so it must not
             # fail startup; the rank still meets its peers below.
@@ -1006,6 +1020,41 @@ class DecoderWarmup:
         if compiled:
             logger.info(
                 f"Low-M MMA GEMM row-bucket prewarm complete ({compiled} kernels for {gemms} GEMMs, "
+                f"{time.perf_counter() - start:.1f} s)"
+            )
+
+    def _prewarm_fp8_low_m_gemms(self) -> None:
+        """Compile the FP8 block-scale low/mid-M GEMM kernels eager forwards of the model's
+        linears run, then barrier.
+
+        ``trtllm::fp8_block_scale_low_m_gemm`` compiles a kernel per tactic, which it picks by the
+        row count, on the first call that needs it, and the warmup forwards reach few row counts.
+        Rows stop at ``_eager_gemm_max_rows``. Runs after the autotuner: rows a linear's tuned
+        small-M race takes never reach this GEMM unless torch.compile traces the forward. The TP
+        group is held until its slowest rank has finished.
+        """
+        from tensorrt_llm._torch.modules.linear import prewarm_fp8_low_m_gemms
+
+        start = time.perf_counter()
+        compiled = shapes = 0
+        try:
+            compiled, shapes = prewarm_fp8_low_m_gemms(
+                self.model,
+                _eager_gemm_max_rows(self._config, self.mapping),
+                small_m_race=not self._config.torch_compile_enabled,
+            )
+        except Exception as e:
+            # A prewarm miss only defers a compile to the first call that needs it, so it must not
+            # fail startup; the rank still meets its peers below.
+            logger.warning(f"FP8 low-M GEMM prewarm stopped. {type(e).__name__}: {e}")
+        if self.dist is not None:
+            if self.mapping.cp_size > 1:
+                self.dist.tp_cp_allgather(1)
+            elif self.mapping.tp_size > 1:
+                self.dist.tp_allgather(1)
+        if compiled:
+            logger.info(
+                f"FP8 low-M GEMM prewarm complete ({compiled} kernels for {shapes} weight shapes, "
                 f"{time.perf_counter() - start:.1f} s)"
             )
 
@@ -1199,10 +1248,20 @@ class DecoderWarmup:
                         )
 
     def _run_attention_warmup(
-        self, resource_manager: ResourceManager, can_run_general_warmup: bool = True
+        self,
+        resource_manager: ResourceManager,
+        can_run_general_warmup: bool = True,
+        can_run_context_warmup: bool | None = None,
     ) -> None:
+        """Compile the attention kernels each enabled batch shape takes on its first forward.
+
+        A capturable guided decoder rules out the generation and mixed shapes only; the context shape
+        follows ``can_run_context_warmup`` (default: ``can_run_general_warmup``).
+        """
         if not issubclass(self._config.attention_backend.Metadata, TrtllmAttentionMetadata):
             return
+        if can_run_context_warmup is None:
+            can_run_context_warmup = can_run_general_warmup
 
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
@@ -1220,14 +1279,14 @@ class DecoderWarmup:
         else:
             logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Gen kernels")
 
-        if can_run_general_warmup:
+        if can_run_context_warmup:
             warmup_requests_configs.append((1, 0))  # one context token
         else:
             logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Ctx kernels")
 
         # Kimi K3 / Kimi Linear are warmed by ``_run_mamba_hybrid_warmup``, not
-        # here: they always run on a ``MambaHybridCacheManager``, so
-        # ``can_run_general_warmup`` is False and the configs above never run.
+        # here: they always run on a ``MambaHybridCacheManager``, so neither
+        # warmup flag is set and the context and mixed configs never run.
 
         if self.guided_decoder is None and supports_generation and can_run_general_warmup:
             # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to

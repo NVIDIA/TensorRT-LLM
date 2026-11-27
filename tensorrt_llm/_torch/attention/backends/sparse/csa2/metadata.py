@@ -803,9 +803,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             capturing = torch.cuda.is_current_stream_capturing()
         if context_lengths and (self.is_cuda_graph or capturing):
             context_lengths = []
+        # The FMHA JIT warmup takes the per-query native path of short chunks after a long prefix,
+        # so its staging and context kernels build at startup rather than in a served request.
         shared_plan = (
             self._shared_context_plan(q, extra_width, layer_idx)
-            if context_lengths and query_start == 0
+            if context_lengths and query_start == 0 and not self.trtllm_gen_jit_warmup
             else None
         )
         shared_rows = (

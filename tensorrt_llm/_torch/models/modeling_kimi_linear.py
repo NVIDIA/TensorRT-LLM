@@ -1154,6 +1154,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         self._nvfp4_out_max_m = 0
 
     @property
+    def fp8_low_m_gemm(self) -> Fp8BlockScaleLowMGemmRange:
+        """The rows the low-M GEMM serves, under ``Linear``'s name, so the warmup prewarms them."""
+        return self._low_m
+
+    @property
     def has_fp8_qdq(self) -> bool:
         """Match the ``Linear`` interface consumed by ``GatedMLP``."""
         return False

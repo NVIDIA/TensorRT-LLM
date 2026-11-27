@@ -263,6 +263,55 @@ def _set_weight_scale_block128(module: Linear,
                                persistent=False)
 
 
+def _fp8_low_m_gemm_rows(module: Linear, max_rows: Optional[int],
+                         small_m_race: bool) -> List[int]:
+    """Row counts up to ``max_rows`` (None: all) at which an eager forward of ``module`` runs
+    ``trtllm::fp8_block_scale_low_m_gemm``; with ``small_m_race``, less those its tuned small-M
+    race takes."""
+    last = module.fp8_low_m_gemm.max_m
+    if max_rows is not None:
+        last = min(last, max_rows)
+    rows = range(1, last + 1)
+    block_scale = getattr(module, "weight_scale_block128", None)
+    if not small_m_race or block_scale is None or last < 1:
+        return list(rows)
+    # The race decides on the shape of the contiguous BF16 rows, the only rows this GEMM takes.
+    probe = torch.empty((last, module.weight.shape[1]),
+                        dtype=torch.bfloat16,
+                        device=module.weight.device)
+    return [
+        m for m in rows if not _fp8_block_scale_small_m_tuned(
+            probe[:m], module.weight, module.weight_scale, block_scale)
+    ]
+
+
+def prewarm_fp8_low_m_gemms(model: nn.Module, max_rows: Optional[int],
+                            small_m_race: bool) -> Tuple[int, int]:
+    """Compile the ``trtllm::fp8_block_scale_low_m_gemm`` kernels that eager forwards of the FP8
+    block-scale linears in ``model`` run at up to ``max_rows`` rows (None: their whole range);
+    returns how many were not compiled yet and for how many weight shapes.
+
+    ``small_m_race``: the forwards are tuned and not traced, so the rows a small-M race takes never
+    reach this GEMM.
+    """
+    rows: Dict[Tuple[int, int], set] = {}
+    for module in model.modules():
+        low_m = getattr(module, "fp8_low_m_gemm", None)
+        if (isinstance(low_m, Fp8BlockScaleLowMGemmRange) and low_m.max_m > 0
+                and getattr(module, "weight", None) is not None):
+            module_rows = _fp8_low_m_gemm_rows(module, max_rows, small_m_race)
+            if module_rows:
+                rows.setdefault(tuple(module.weight.shape),
+                                set()).update(module_rows)
+    if not rows:
+        return 0, 0
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+    compiled = sum(
+        fp8_block_scale_low_m_gemm.precompile(n, k, shape_rows)
+        for (n, k), shape_rows in sorted(rows.items()))
+    return compiled, len(rows)
+
+
 # Prefill-sized MXFP8 GEMMs of opted-in modules run on the SM107 CuTe DSL GEMM, which is faster
 # there than the CUTLASS MXFP8 kernels.
 _MXFP8_PREFILL_MIN_ROWS_SM107 = 1024

@@ -320,6 +320,16 @@ class mHC(nn.Module):
         super()._load_from_state_dict(*args, **kwargs)
         self.cache_derived_state()
 
+    def prewarm_boundary(self, max_tokens: int) -> int:
+        """Compile the CuTe DSL kernels of :meth:`_single_pass_boundary` for eager boundaries of up
+        to ``max_tokens`` tokens; returns how many were not compiled yet."""
+        if self._boundary_weight is None or os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+            return 0
+        kernel = _boundary_kernel(self.fn.device, self.hidden_size)
+        if kernel is None:
+            return 0
+        return kernel.prewarm(self.hidden_size, self.sinkhorn_iters, max_tokens)
+
     def _single_pass_boundary(
         self,
         x_prev: Optional[torch.Tensor],
@@ -349,7 +359,8 @@ class mHC(nn.Module):
         kernel = _boundary_kernel(residual.device, self.hidden_size)
         tokens = residual.shape[0]
         deferred = do_multi_stream()
-        if not 0 < tokens <= (1023 if x_prev is not None else 4096) or (
+        limit = kernel.POST_UPDATE_MAX_TOKENS if x_prev is not None else kernel.COLLAPSE_MAX_TOKENS
+        if not 0 < tokens <= limit or (
             torch.cuda.is_current_stream_capturing()
             and not kernel.compiled(
                 self.hidden_size, x_prev is not None, self.sinkhorn_iters, tokens, deferred, mxfp8

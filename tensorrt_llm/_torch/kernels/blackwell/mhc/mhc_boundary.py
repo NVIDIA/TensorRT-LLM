@@ -41,6 +41,8 @@ TILE = 28
 # Seven 16-CTA clusters with this kernel's shared memory are co-resident on GB300: one wave of tiles.
 CLUSTERS = 7
 MAX_TOKENS = CLUSTERS * TILE
+# Largest lagged boundaries the CuTe DSL kernels take: with a post update, and a collapse alone.
+POST_UPDATE_MAX_TOKENS, COLLAPSE_MAX_TOKENS = 1023, 4096
 # Tile sizes the single-pass kernel is compiled for; a batch takes the smallest that fills one wave.
 TILES = (14, 18, 21, 24, TILE)
 STREAM_WARPS = 12
@@ -2417,6 +2419,33 @@ def _compile_nvfp4_fp8_quantize(hidden: int):
     return fn
 
 
+def _boundary_kernels(
+    hidden: int, with_post: bool, sinkhorn_iters: int, mxfp8: bool, tokens: int, device_index: int
+) -> tuple:
+    """The compiled kernels :func:`mhc_boundary` runs for ``tokens``: the single-pass kernel up to
+    ``MAX_TOKENS``, the stream and finalize kernels above."""
+    if tokens <= MAX_TOKENS:
+        return (_compile_tile(hidden, with_post, sinkhorn_iters, mxfp8, boundary_tile(tokens)),)
+    return (
+        _compile_stream(hidden, with_post, _stream_ctas(device_index)),
+        _compile_finalize(hidden, sinkhorn_iters),
+    )
+
+
+def prewarm(hidden: int, sinkhorn_iters: int, max_tokens: int) -> int:
+    """Compile the kernels :func:`mhc_boundary` runs for an eager boundary (BF16 ``layer_input``) of
+    up to ``max_tokens`` tokens, with and without a post update; returns how many were not compiled
+    yet."""
+    before = len(_COMPILED)
+    device_index = torch.cuda.current_device()
+    for with_post in (False, True):
+        limit = min(max_tokens, POST_UPDATE_MAX_TOKENS if with_post else COLLAPSE_MAX_TOKENS)
+        # Every size past MAX_TOKENS runs the same kernels.
+        for tokens in range(1, min(limit, MAX_TOKENS + 1) + 1):
+            _boundary_kernels(hidden, with_post, sinkhorn_iters, False, tokens, device_index)
+    return len(_COMPILED) - before
+
+
 def mhc_boundary(
     x_prev,
     residual_prev,
@@ -2463,13 +2492,15 @@ def mhc_boundary(
         weight,
     )
     layer_input_mxfp8 = None
+    kernels = _boundary_kernels(hidden, with_post, sinkhorn_iters, mxfp8, tokens, dev.index)
     if tokens <= MAX_TOKENS:
         if mxfp8:
             layer_input_mxfp8 = (
                 torch.empty(tokens, hidden, dtype=torch.float8_e4m3fn, device=dev),
                 torch.empty(pad_up(tokens, 128) * hidden // 32, dtype=torch.uint8, device=dev),
             )
-        _compile_tile(hidden, with_post, sinkhorn_iters, mxfp8, boundary_tile(tokens))(
+        (single_pass,) = kernels
+        single_pass(
             *activations,
             scale,
             base,
@@ -2488,11 +2519,10 @@ def mhc_boundary(
             norm_eps,
         )
     else:
+        stream, finalize = kernels
         partials = torch.empty(tokens, CLUSTER, PART, dtype=torch.float32, device=dev)
-        _compile_stream(hidden, with_post, _stream_ctas(dev.index))(
-            *activations, residual_cur, layer_input, partials
-        )
-        _compile_finalize(hidden, sinkhorn_iters)(
+        stream(*activations, residual_cur, layer_input, partials)
+        finalize(
             partials,
             scale,
             base,
