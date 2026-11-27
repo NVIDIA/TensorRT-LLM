@@ -81,7 +81,7 @@ def test_the_codec_state_names_every_attention_layer(monkeypatch):
     """The native adapter reads `codec_state.layer_ids` (the layers whose lifecycles it routes to
     the provider) when the codec is created: every attention layer, the one holding the side planes
     and the others. Without it the context servers died at KV cache creation
-    (`'_CodecState' object has no attribute 'layer_ids'`, full-stack3 F1 GSM8K gate)."""
+    (`'_CodecState' object has no attribute 'layer_ids'`, in a disaggregated GSM8K run)."""
     import tensorrt_llm.runtime.kv_cache_manager_v2 as kvm
     from tensorrt_llm.bindings.internal import kv_cache_compression as native
 

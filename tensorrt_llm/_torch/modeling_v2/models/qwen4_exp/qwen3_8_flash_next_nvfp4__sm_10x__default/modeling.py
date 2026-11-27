@@ -896,8 +896,8 @@ _INDEX_SCORES_PDL = get_env_enable_pdl()
 _INDEX_GROUP_MIN_ROWS = 17  # capacity: fixed: a dispatch threshold, not a buffer size
 #: - At a tep4 rank under `TEP_FAST_DECODE_ENV`, further row counts that score over request
 #:   groups: 2 requests of four verify rows, where the grouped kernel (2 tiles a program at 2
-#:   groups) beat the visible-split one (gen_d38 tepidxgrp, 848913; 0 of 209M scores differ
-#:   between them, 849000). 4 rows keep one request's own kernel; 12 and 16 the visible split.
+#:   groups) beat the visible-split one (GB300 tep4; 0 of 209M scores differ between them).
+#:   4 rows keep one request's own kernel; 12 and 16 the visible split.
 _TEP_INDEX_GROUP_ROWS = frozenset({8})  # capacity: fixed: a dispatch table
 #: Off by default (opt-in: reads the index plane before the PDL wait, which is only right as long
 #: as its predecessor writes no other index slot than the ones read again after it). At a tep4
@@ -907,7 +907,7 @@ _TEP_INDEX_GROUP_ROWS = frozenset({8})  # capacity: fixed: a dispatch table
 #: request's pages and keys read before `griddepcontrol.wait` and the anchors from the request's
 #: smallest position minus one compressed block (all the prologue's index store and compression
 #: can write) read again after it. Bitwise the request-group kernel's scores, which are the
-#: visible-split kernel's at these rows (0 of 209M scores differ, 849000). Read once, when the
+#: visible-split kernel's at these rows (0 of 209M scores differ). Read once, when the
 #: target is built; set where it cannot apply it warns and does nothing.
 TEP_INDEX_PREFETCH_ENV = "TRTLLM_QWEN4_EXP_TEP_INDEX_PREFETCH"
 #: Rows that take it: 1 and 2 requests of four verify rows (GB300 tep4: -0.020 / -0.022 ms a step
@@ -941,8 +941,8 @@ DP_GQA_MIN_REQUESTS_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"
 #: (`_index_scores`; a context call past 256 rows on the ctx-tile kernel). The plane keeps its
 #: size and layout, so the cache manager and the KV transfer are unchanged, but a context worker
 #: and the generation workers it hands requests to must all set it (the anchors travel as
-#: written). Part of the DLSim recipe the AgentX front follows (every dep4 / dep8 point ran it,
-#: CTX and GEN): GB300 dep4, the index-score kernels of a step 2.19 -> 1.82 ms at 96 requests a
+#: written). Measured with it on every CTX and GEN worker of the dep4 / dep8 AgentX deployments:
+#: GB300 dep4, the index-score kernels of a step 2.19 -> 1.82 ms at 96 requests a
 #: rank, a 16384-row context step's scores 14.9 -> 9.5 ms; GSM8K 95.91 / 95.98; the AgentX
 #: top-2048 block overlap with bf16 keys p50 0.976. Read once, when the core is built, at every
 #: layout.
@@ -953,8 +953,8 @@ INDEX_KEY_FP8_ENV = "TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"
 #: marks the groups it pooled (`qsa_cold_index_mark`, bytes 128-143 of the anchor slot, dead under
 #: e4m3 anchors), and the KV cache manager stores the attention pages that leave the GPU without
 #: the index bytes no kernel reads again (`qsa_cold_pages`): a page 532,864 -> 462,848 B. Every
-#: byte a kernel reads comes back bitwise. Measured: +1.6% context requests/s on the dep4 x 2
-#: front's context servers (843758), more where restores from disk dominate. Read once, when the
+#: byte a kernel reads comes back bitwise. Measured: +1.6% context requests/s on the context
+#: servers of a dep4 x 2 deployment, more where restores from disk dominate. Read once, when the
 #: core is built (the marks) and when the shell is built (the codec).
 CTX_COLDIDX_ENV = "TRTLLM_QWEN4_EXP_CTX_COLDIDX"
 #: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=<n>` (n in
@@ -10339,8 +10339,8 @@ class SpeculativeRollback:
 #: metadata advances by its steady decode step (`RuntimeHooks.qsa.steady_decode`): no prompt /
 #: KV-length uploads, the block offsets copied and unscaled only when the KV manager's block-table
 #: key changed. The world-8 group is the same rule (one attention-DP group of the row table's
-#: size), not a separate switch. Measured as dpstepedge, on an earlier attention-DP form of the
-#: engine's prepare: dep4 -0.022..-0.050 ms a step (gen_d37), dep8 graph 12 -0.006 (856505),
+#: size), not a separate switch. Measured on an earlier attention-DP form of the
+#: engine's prepare: dep4 -0.022..-0.050 ms a step, dep8 graph 12 -0.006,
 #: 98.7% of decode-only graph steps staged at dep8. `0`: the full pass on every step.
 DP_STEPEDGE_ENV = "TRTLLM_QWEN4_EXP_DP_STEPEDGE"
 #: Switch, on by default where `DP_STEPEDGE_ENV` engages (bitwise): the replay-gap cuts of the
@@ -10348,16 +10348,16 @@ DP_STEPEDGE_ENV = "TRTLLM_QWEN4_EXP_DP_STEPEDGE"
 #: (the replayed forward rewrites all four of its outputs before any reader: the overlap
 #: scheduler's KV-length correction and `on_update_kv_lens`, or the decode prologue), and a
 #: changed block table is copied and unscaled in one Triton launch (`triton_qsa_copy_block_offsets`,
-#: the native copy's stores) where the KV manager's copy is the plain one. Measured as rgap on
-#: dpse: dep4 -0.013..-0.021 ms at graphs 5-7 (856480), dep8 about -0.011 at graphs 8-10 and
-#: -0.013 at 12 (856505). `0`: the steady step launches the mapping and the native copy.
+#: the native copy's stores) where the KV manager's copy is the plain one. Measured on top of
+#: `DP_STEPEDGE_ENV`: dep4 -0.013..-0.021 ms at graphs 5-7, dep8 about -0.011 at graphs 8-10 and
+#: -0.013 at 12. `0`: the steady step launches the mapping and the native copy.
 DP_RGAP_ENV = "TRTLLM_QWEN4_EXP_DP_RGAP"
 #: Switch, on by default (bitwise; a row table): at a tep4 rank on SM103 (`_tep4_layout`) the QSA
 #: metadata of the engine's steady one-model MTP decode prepare advances by its steady decode
 #: step (`RuntimeHooks.qsa.steady_decode`) instead of its full `prepare()`: no prompt / KV-length
 #: uploads, the block offsets copied and unscaled only when the block-table key changed. That is
-#: the QSA half of the measured TEP stepedge (gen_d28: window 82.5 -> 26.1 us, host p50
-#: -0.039..-0.050 ms at 1-4 requests, E2E x 571.4 -> 578.0 and 657.9 -> 662.3); its other half,
+#: the QSA half of the measured tep4 steady step (the gap between replays 82.5 -> 26.1 us, host
+#: p50 -0.039..-0.050 ms at 1-4 requests, P90 interactivity +0.7..+1.2% end to end); its other half,
 #: the one-launch input stager, is the engine's at every one-group layout already. `0`: the
 #: metadata's full prepare() on staged steps.
 TEP_STEPEDGE_ENV = "TRTLLM_QWEN4_EXP_TEP_STEPEDGE"

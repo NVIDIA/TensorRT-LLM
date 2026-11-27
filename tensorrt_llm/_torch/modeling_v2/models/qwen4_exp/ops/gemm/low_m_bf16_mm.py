@@ -108,7 +108,7 @@ _TABLE: dict[tuple[int, int], tuple[tuple[int, tuple], ...]] = {
 
 #: Rows a caller may move off cuBLAS on request (`wide`), past `_TABLE`'s bounds: a tep4 rank's
 #: decode projections at 9-16 rows (three or four requests of four verify rows), on split-K with
-#: the tactic measured at 16 rows (GB300, graph replay, PDL on; gen_d53 micro, -0.08 ms a step at
+#: the tactic measured at 16 rows (GB300, graph replay, PDL on; micro, -0.08 ms a step at
 #: 3-4 requests with the rest of its set). Same precision as every branch; asked for because those
 #: rows ran on cuBLAS before (another summation order).
 WIDE_MAX_ROWS = 16
