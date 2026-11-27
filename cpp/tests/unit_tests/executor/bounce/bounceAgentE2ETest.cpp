@@ -31,7 +31,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -176,6 +178,57 @@ TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)
     {
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
+}
+
+TEST(BounceAgentE2E, WindowsFollowDestinationRegistrationLifetime)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    constexpr std::size_t bytes = 4096;
+    void* allocation{};
+    ASSERT_EQ(cudaMalloc(&allocation, 2 * bytes), cudaSuccess);
+    std::unique_ptr<void, decltype(&cudaFree)> buffer{allocation, cudaFree};
+    std::string skipMsg;
+    auto agent = tryMakeAgent(makeBounceConfig("windowOwner"), skipMsg);
+    if (!agent)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+
+    auto* base = static_cast<std::uint8_t*>(buffer.get());
+    kvc::MemoryDescs first{kvc::MemoryType::kVRAM, {{base, bytes, 0}}};
+    kvc::MemoryDescs second{kvc::MemoryType::kVRAM, {{base + bytes, bytes, 0}}};
+    kvc::MemoryDescs both{kvc::MemoryType::kVRAM, {{base, 2 * bytes, 0}}};
+    auto const endpoint = agent->getBounceEndpoint();
+    auto const firstKey = bounce_test::testWindowKey();
+    auto const secondKey = bounce_test::testWindowKey();
+    auto const bothKey = bounce_test::testWindowKey();
+    auto publish = [&](std::string const& key, kvc::MemoryDescs const& ranges)
+    { agent->registerBounceWindow("writer", endpoint, key, ranges); };
+
+    // A fresh memory registration releases the previous window ID for reissue.
+    publish(firstKey, first);
+    agent->registerMemory(first);
+    ASSERT_NO_THROW(publish(firstKey, first));
+
+    agent->registerMemory(second);
+    publish(secondKey, second);
+    publish(bothKey, both);
+    EXPECT_THROW(publish(firstKey, first), std::invalid_argument);
+    agent->registerMemory(first);
+    EXPECT_THROW(publish(firstKey, first), std::invalid_argument);
+    EXPECT_THROW(publish(bothKey, both), std::invalid_argument);
+
+    agent->deregisterMemory(first);
+    agent->deregisterMemory(first);
+    agent->registerMemory(first);
+    EXPECT_NO_THROW(publish(firstKey, first));
+    EXPECT_NO_THROW(publish(bothKey, both));
+    EXPECT_THROW(publish(secondKey, second), std::invalid_argument);
+    agent->deregisterMemory(first);
+    agent->deregisterMemory(second);
 }
 
 TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)

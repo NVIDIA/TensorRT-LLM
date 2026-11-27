@@ -1005,7 +1005,22 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
         std::unique_lock regionLock(mLocalRegionMutex);
         for (auto const& desc : descs.getDescs())
         {
-            mScatterDestinations[desc.getAddr()] = {desc.getLen(), desc.getDeviceId()};
+            auto const address = desc.getAddr();
+            auto const registration = std::pair{desc.getLen(), desc.getDeviceId()};
+            auto const current = mScatterDestinations.find(address);
+            if (current != mScatterDestinations.end() && current->second == registration)
+            {
+                continue;
+            }
+            if (mBounce)
+            {
+                // Previously issued windows must not acquire bytes from a new registration.
+                auto const bytes = current == mScatterDestinations.end()
+                    ? desc.getLen()
+                    : std::max(desc.getLen(), current->second.first);
+                mBounce->transport->receiveWindows().removeIntersecting(address, bytes);
+            }
+            mScatterDestinations[address] = registration;
         }
     }
 #endif
@@ -1034,9 +1049,14 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
         {
             mLocalVramRegionInfo.erase(desc.getAddr());
 #ifdef TLLM_BOUNCE_V2
-            if (mScatterDestinations.erase(desc.getAddr()) && mBounce)
+            auto const registration = mScatterDestinations.find(desc.getAddr());
+            if (registration != mScatterDestinations.end())
             {
-                mBounce->transport->receiveWindows().removeIntersecting(desc.getAddr(), desc.getLen());
+                if (mBounce)
+                {
+                    mBounce->transport->receiveWindows().removeIntersecting(desc.getAddr(), registration->second.first);
+                }
+                mScatterDestinations.erase(registration);
             }
 #endif
         }
