@@ -303,12 +303,14 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sampler_force_async_worker` | `bool` | `value` |  |
 | `scheduler_config.capacity_scheduler_policy` | `enum[CapacitySchedulerPolicy]` | `categorical` | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `enum[ContextChunkingPolicy]\|none` | `categorical` | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
+| `scheduler_config.context_demote_probe` | `bool` | `value` |  |
 | `scheduler_config.context_scheduling_policy` | `enum[ContextSchedulingPolicy]` | `categorical` | `fcfs`, `shortest_uncached_first` |
 | `scheduler_config.context_starvation_iterations` | `int\|none` | `value` |  |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `int` | `value` |  |
 | `scheduler_config.dynamic_batch_config.enable_batch_size_tuning` | `bool` | `value` |  |
 | `scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning` | `bool` | `value` |  |
 | `scheduler_config.enable_prefix_aware_scheduling` | `bool` | `value` |  |
+| `scheduler_config.gen_handoff_seat` | `bool` | `value` |  |
 | `scheduler_config.gen_preemption.target_output_tps` | `float\|none` | `value` |  |
 | `scheduler_config.gen_preemption.tpot_budget` | `float\|none` | `value` |  |
 | `scheduler_config.max_gen_init_admissions_per_pass` | `int\|none` | `value` |  |
