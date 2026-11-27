@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Callable, Optional
 
 from fastapi import HTTPException
@@ -412,123 +413,170 @@ class OpenAIDisaggregatedService(OpenAIService):
             hooks.on_disagg_request_id(disagg_request_id)
         reply_named = _name_responses_reply(request, disagg_request_id)
         # reserve a gen_server if conditional disagg is needed
+        gen_placement_started_at = time.monotonic()
         gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
         # Context retries may replace disagg_request_id for the KV-transfer
         # handshake. Keep the ID used to reserve the generation server separate
         # so its coordinator-side load is released under the original key.
         gen_reservation_id = disagg_request_id if gen_server else None
-        benchmark_gen_only = await self._check_gen_only_disagg(request)
-        need_ctx = need_ctx and not benchmark_gen_only
-        ctx_response = None
-        gen_req = request
-        length_ticket = None
-        if need_ctx:
-            try:
-                # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
-                # orchestrator/fleet (accept queue + event loop + pipeline).
-                if hooks:
-                    hooks.on_ctx_dispatch(request)
-                ctx_req = self._get_ctx_request(request, disagg_request_id)
-                # ctx generator is empty
-                ctx_server, _ = await self._ctx_router.get_next_server(
-                    ctx_req, exclude_server=gen_server, req_id=disagg_request_id
-                )
-                ctx_response = await self._ctx_client.send_request(
-                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
-                )
-                await self._verify_ctx_response(ctx_response)
-                ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
-                    0
-                ].disaggregated_params
-                effective_disagg_id = (
-                    ctx_response_disagg_params.disagg_request_id
-                    if ctx_response_disagg_params.disagg_request_id is not None
-                    else (
-                        ctx_req.disaggregated_params.disagg_request_id
-                        if ctx_req.disaggregated_params is not None
-                        else None
-                    )
-                )
-                if effective_disagg_id is not None:
-                    disagg_request_id = effective_disagg_id
+        gen_reservation_owned = bool(gen_server)
+        gen_renew_task = (
+            self._gen_client.start_reservation_renewal(
+                request, gen_reservation_id, started_at=gen_placement_started_at
+            )
+            if gen_server and gen_reservation_id is not None
+            else None
+        )
+        try:
+            benchmark_gen_only = await self._check_gen_only_disagg(request)
+            need_ctx = need_ctx and not benchmark_gen_only
+            ctx_response = None
+            gen_req = request
+            length_ticket = None
+            if need_ctx:
+                try:
+                    # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
+                    # orchestrator/fleet (accept queue + event loop + pipeline).
                     if hooks:
-                        hooks.on_disagg_request_id(disagg_request_id)
-                    if reply_named:
-                        # A retried context request has a new disaggregated
-                        # request id, which the perf metrics record from then
-                        # on. The reply follows it, so the generation worker
-                        # is sent the new name; without a retry the name stays
-                        # as it is.
-                        rename_responses_reply(request, disagg_request_id)
-                gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
-                if self._output_length_priority is not None:
-                    # Before the generation placement, which orders by the priority it sets
-                    # (or, in a fleet, predicts it in the same /select).
-                    length_ticket = await self._output_length_priority.assign(
-                        gen_req, placed_later=not gen_server
+                        hooks.on_ctx_dispatch(request)
+                    ctx_req = self._get_ctx_request(request, disagg_request_id)
+                    # ctx generator is empty
+                    ctx_server, _ = await self._ctx_router.get_next_server(
+                        ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                     )
-            except Exception:
-                if gen_server:
+                    ctx_response = await self._ctx_client.send_request(
+                        ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
+                    )
+                    await self._verify_ctx_response(ctx_response)
+                    ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
+                        0
+                    ].disaggregated_params
+                    effective_disagg_id = (
+                        ctx_response_disagg_params.disagg_request_id
+                        if ctx_response_disagg_params.disagg_request_id is not None
+                        else (
+                            ctx_req.disaggregated_params.disagg_request_id
+                            if ctx_req.disaggregated_params is not None
+                            else None
+                        )
+                    )
+                    if effective_disagg_id is not None:
+                        disagg_request_id = effective_disagg_id
+                        if hooks:
+                            hooks.on_disagg_request_id(disagg_request_id)
+                        if reply_named:
+                            # A retried context request has a new disaggregated
+                            # request id, which the perf metrics record from then
+                            # on. The reply follows it, so the generation worker
+                            # is sent the new name; without a retry the name stays
+                            # as it is.
+                            rename_responses_reply(request, disagg_request_id)
+                    gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+                    if self._output_length_priority is not None:
+                        # Before the generation placement, which orders by the priority it sets
+                        # (or, in a fleet, predicts it in the same /select).
+                        length_ticket = await self._output_length_priority.assign(
+                            gen_req, placed_later=not gen_server
+                        )
+                except BaseException:
+                    if gen_reservation_owned:
+                        gen_reservation_owned = False
+                        try:
+                            await self._gen_client.stop_reservation_renewal(
+                                gen_reservation_id, gen_renew_task
+                            )
+                        finally:
+                            await self._gen_router.finish_request(
+                                request, success=False, req_id=gen_reservation_id
+                            )
+                        gen_renew_task = None
+                    raise
+            else:
+                # When need_ctx=False the gen server handles full generation and
+                # must not see client-supplied disaggregated handoff params. The
+                # benchmark-only path above is the only trusted source here.
+                if not benchmark_gen_only:
+                    gen_req = request.model_copy(update={"disaggregated_params": None})
+                if self._output_length_priority is not None:
+                    # No context phase, so no prompt length to predict from; a priority the
+                    # client sent must not go ahead of the predicted ones.
+                    self._output_length_priority.assign_prior(gen_req)
+            self._strip_gen_subagent_affinity(gen_req)
+            if ctx_response is None or self._need_gen(ctx_response):
+                try:
+                    if not gen_server:
+                        if ctx_response is not None:
+                            # A pooled generation router ages the request from its arrival and
+                            # bounds its wait by the context servers' KV transfer timeout, which
+                            # runs from here. Stamped again below to include this wait.
+                            self._stamp_orig_elapsed(gen_req, arrival_time)
+                        gen_placement_started_at = time.monotonic()
+                        gen_server, gen_route_info = await self._gen_router.get_next_server(
+                            gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+                        )
+                        gen_reservation_id = disagg_request_id
+                        gen_reservation_owned = True
+                        if gen_req.stream:
+                            gen_renew_task = self._gen_client.start_reservation_renewal(
+                                gen_req, gen_reservation_id, started_at=gen_placement_started_at
+                            )
+                        if length_ticket is not None:
+                            self._output_length_priority.placed(
+                                length_ticket, gen_req, gen_route_info
+                            )
+                    self._stamp_orig_elapsed(gen_req, arrival_time)
+                    # Hand reservation and renewal ownership to _gen_client.send_request.
+                    gen_reservation_owned = False
+                    gen_renew_task = None
+                    gen_response = await self._gen_client.send_request(
+                        gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
+                    )
+                except BaseException:
+                    if length_ticket is not None:
+                        # No reply will come: the coordinator drops the request's prediction row.
+                        self._output_length_priority.abandon(length_ticket)
+                    raise
+                if length_ticket is not None:
+                    gen_response = self._output_length_priority.track(gen_response, length_ticket)
+                return gen_response
+            else:
+                if reply_named:
+                    # The context worker answered under the name it was sent,
+                    # which a retried context request leaves behind.
+                    ctx_response.id = request.request_id
+                if length_ticket is not None:
+                    self._output_length_priority.track(ctx_response, length_ticket)
+                if gen_reservation_owned:
+                    gen_reservation_owned = False
+                    try:
+                        await self._gen_client.stop_reservation_renewal(
+                            gen_reservation_id, gen_renew_task
+                        )
+                    finally:
+                        await self._gen_router.finish_request(request, req_id=gen_reservation_id)
+                    gen_renew_task = None
+                if hooks:
+                    hooks.on_resp_done("", request, ctx_response)
+                if request.stream:
+                    # ctx client will never return a generator when streaming is requested
+                    # make up for this by returning a done generator
+                    if isinstance(ctx_response, ResponsesResponse):
+                        # Responses has no "[DONE]"; replay the finished response.
+                        return responses_done_generator(ctx_response)
+                    return done_generator()
+                return ctx_response
+        except BaseException:
+            if gen_reservation_owned:
+                gen_reservation_owned = False
+                try:
+                    await self._gen_client.stop_reservation_renewal(
+                        gen_reservation_id, gen_renew_task
+                    )
+                finally:
                     await self._gen_router.finish_request(
                         request, success=False, req_id=gen_reservation_id
                     )
-                raise
-        else:
-            # When need_ctx=False the gen server handles full generation and
-            # must not see client-supplied disaggregated handoff params. The
-            # benchmark-only path above is the only trusted source here.
-            if not benchmark_gen_only:
-                gen_req = request.model_copy(update={"disaggregated_params": None})
-            if self._output_length_priority is not None:
-                # No context phase, so no prompt length to predict from; a priority the
-                # client sent must not go ahead of the predicted ones.
-                self._output_length_priority.assign_prior(gen_req)
-        self._strip_gen_subagent_affinity(gen_req)
-        if ctx_response is None or self._need_gen(ctx_response):
-            try:
-                if not gen_server:
-                    if ctx_response is not None:
-                        # A pooled generation router ages the request from its arrival and
-                        # bounds its wait by the context servers' KV transfer timeout, which
-                        # runs from here. Stamped again below to include this wait.
-                        self._stamp_orig_elapsed(gen_req, arrival_time)
-                    gen_server, gen_route_info = await self._gen_router.get_next_server(
-                        gen_req, exclude_server=ctx_server, req_id=disagg_request_id
-                    )
-                    gen_reservation_id = disagg_request_id
-                    if length_ticket is not None:
-                        self._output_length_priority.placed(length_ticket, gen_req, gen_route_info)
-                self._stamp_orig_elapsed(gen_req, arrival_time)
-                gen_response = await self._gen_client.send_request(
-                    gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
-                )
-            except BaseException:
-                if length_ticket is not None:
-                    # No reply will come: the coordinator drops the request's prediction row.
-                    self._output_length_priority.abandon(length_ticket)
-                raise
-            if length_ticket is not None:
-                gen_response = self._output_length_priority.track(gen_response, length_ticket)
-            return gen_response
-        else:
-            if reply_named:
-                # The context worker answered under the name it was sent,
-                # which a retried context request leaves behind.
-                ctx_response.id = request.request_id
-            if length_ticket is not None:
-                self._output_length_priority.track(ctx_response, length_ticket)
-            if gen_server:
-                await self._gen_router.finish_request(request, req_id=gen_reservation_id)
-            if hooks:
-                hooks.on_resp_done("", request, ctx_response)
-            if request.stream:
-                # ctx client will never return a generator when streaming is requested
-                # make up for this by returning a done generator
-                if isinstance(ctx_response, ResponsesResponse):
-                    # Responses has no "[DONE]"; replay the finished response.
-                    return responses_done_generator(ctx_response)
-                return done_generator()
-            return ctx_response
+            raise
 
     @staticmethod
     def _get_arrival_time(hooks: Optional[ResponseHooks]) -> float:

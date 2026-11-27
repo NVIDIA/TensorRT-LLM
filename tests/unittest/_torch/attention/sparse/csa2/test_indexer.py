@@ -225,6 +225,88 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
             torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 GVR selection",
+)
+@torch.inference_mode()
+def test_sm107_capped_gvr_masks_holes_during_graph_replay(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import INDEX_PAGE_ROWS
+
+    width = 132096
+    rows, top_k = 2, 512
+    layout = CSA2Layout((1,), (0,), (0,), index_topk=top_k)
+    indexer = CSA2Indexer(
+        layout, 0, 8, 128, CSA2Params(enable_heuristic_topk=True, use_cute_dsl_topk=False)
+    )
+    assert indexer.top_k.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+    metadata = CSA2TrtllmMetadata(max_num_requests=rows, max_num_tokens=rows)
+    metadata.mapping = Mapping(world_size=8, tp_size=8, rank=0)
+    valid = torch.ones(rows, width // INDEX_PAGE_ROWS, device="cuda", dtype=torch.bool)
+    visible = torch.tensor([width, 1024], device="cuda", dtype=torch.int32)
+    metadata.csa2_indexer_valid_pages = valid
+    metadata.csa2_indexer_visible_lengths = visible
+    metadata.csa2_indexer_radix_aux_indices = None
+    metadata.csa2_indexer_radix_aux_logits = None
+    logits = torch.arange(width, device="cuda", dtype=torch.float32).repeat(rows, 1)
+    output = torch.empty(rows, top_k, device="cuda", dtype=torch.int32)
+    select = indexer.select_prepared_scores
+
+    selection_captures = []
+
+    def checked_select(*args, **kwargs):
+        assert kwargs["gvr_r_cap"] == 4
+        assert not kwargs["gvr_pdl"]
+        assert kwargs["gvr_finalize"] is not None
+        result = select(*args, **kwargs)
+        assert kwargs["gvr_finalize"]["done"], "the cluster launch must finalize its own output"
+        selection_captures.append(torch.cuda.is_current_stream_capturing())
+        return result
+
+    monkeypatch.setattr(indexer, "select_prepared_scores", checked_select)
+
+    def run():
+        indexer._select_paged_logits(metadata, logits.clone(), None, output, None)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    assert selection_captures == [False, True]
+
+    columns = torch.arange(width, device="cuda")
+
+    def check_replay():
+        graph.replay()
+        valid_columns = valid[:, columns // INDEX_PAGE_ROWS] & (columns < visible[:, None])
+        expected = torch.full_like(output, -1, dtype=torch.long)
+        for row, mask in enumerate(valid_columns):
+            valid_indices = columns[mask]
+            count = min(top_k, valid_indices.numel())
+            selected = logits[row, valid_indices].topk(count).indices
+            expected[row, :count] = valid_indices[selected].sort().values
+        torch.testing.assert_close(output.long(), expected)
+
+    # Keep scores fixed. Each metadata update removes columns from the previous Top-K.
+    full_lengths = visible.new_tensor([width - 17, 768])
+    visible.copy_(full_lengths)
+    check_replay()
+    valid[0, -2:] = False
+    valid[1, 10] = False
+    check_replay()
+
+    visible.copy_(visible.new_tensor([0, top_k - 1]))
+    check_replay()
+
+    # Refill the output before shortening a row by invalidating pages alone.
+    visible.copy_(full_lengths)
+    check_replay()
+    valid[1].fill_(False)
+    valid[1, 1] = True
+    check_replay()
+
+
 def _reference_candidate_mask(
     logits: torch.Tensor,
     compress_lens: torch.Tensor,

@@ -14,12 +14,15 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_reporting.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_prefill_fullgraph.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_dspark_worker_hooks.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_switches.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_modeling_v2_spec_tail_contracts.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/kernels/gemm/test_modeling_v2_m3_lowm_splitk_sync.py
   # MiniMax-M3 family code shared with MiniMax-M3.1-Flash: the CuTe DSL object cache, the draft prob1 worker and
   # the MSA backend's host logic.
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_cute_aot.py
@@ -355,6 +358,7 @@ l0_cpu:
   - unittest/executor/test_stop_word_streaming_text.py
   - unittest/executor/test_ray_stub.py
   - unittest/executor/test_generation_request_array_prompt.py
+  - unittest/executor/test_postproc_worker_request_end.py
   - unittest/executor/test_llm_result_unpickle.py
   - unittest/executor/test_undelivered_exports.py
   - unittest/grpc/openengine/test_coordinator.py
@@ -444,7 +448,7 @@ l0_cpu:
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_kv_hints.py
   - unittest/llmapi/test_llm_args.py
-  - unittest/llmapi/test_llm.py::test_startup_metrics_by_server_info
+  - unittest/llmapi/test_llm_serving.py
   - unittest/llmapi/test_gms_args.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
@@ -476,6 +480,8 @@ l0_cpu:
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
   - unittest/llmapi/test_serve_tokenization_owners.py
   - unittest/llmapi/test_serve_num_frontends_default.py
+  - unittest/llmapi/test_serve_cli_net.py
+  - unittest/llmapi/test_serve_cli_wiring.py
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
@@ -502,4 +508,5 @@ l0_cpu:
   - unittest/utils/test_logger.py
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
+  - unittest/utils/test_frame_stack_reserve.py
   - unittest/visual_gen/test_output.py

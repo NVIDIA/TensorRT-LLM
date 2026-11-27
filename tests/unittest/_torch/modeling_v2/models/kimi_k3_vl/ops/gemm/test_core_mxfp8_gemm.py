@@ -168,8 +168,11 @@ def test_op_tunes_k3_runner_and_matches_main_untuned(monkeypatch):
 
 def test_runner_does_not_share_main_cache_entries():
     _, mxfp8_gemm, cdo = _mods()
-    got = mxfp8_gemm.K3MXFP8RubinRunner(output_dtype=torch.bfloat16).unique_id()
-    want = cdo.CuteDSLKimiK3MXFP8RubinLinear(output_dtype=torch.bfloat16).unique_id()
+    k3_runner = mxfp8_gemm.K3MXFP8RubinRunner(output_dtype=torch.bfloat16)
+    main_runner = cdo.CuteDSLKimiK3MXFP8RubinLinear(output_dtype=torch.bfloat16)
+    assert k3_runner.unique_id() != main_runner.unique_id()
+    got = k3_runner.unique_id()
+    want = cdo.CuteDSLKimiK3MXFP8RubinLinear.unique_id(k3_runner)
     assert got == want + (("split_k", (1,)),)
 
 

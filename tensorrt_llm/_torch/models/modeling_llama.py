@@ -1496,9 +1496,9 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
 
         if mm_data and mm_data.get("image"):
             images = mm_data["image"]
-            img_type = type(mm_data["image"][0])
-            do_rescale = (img_type == Image)
-            assert all(isinstance(img, img_type) for img in mm_data["image"])
+            do_rescale = isinstance(images[0], Image)
+            img_type = Image if do_rescale else type(images[0])
+            assert all(isinstance(img, img_type) for img in images)
 
         truncate_kwargs = {}
         if sampling_params.truncate_prompt_tokens is not None:
