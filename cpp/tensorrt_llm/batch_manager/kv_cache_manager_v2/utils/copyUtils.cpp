@@ -25,6 +25,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -35,6 +36,7 @@
 #include <new>
 #include <pthread.h>
 #include <set>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -1013,6 +1015,17 @@ public:
         return started;
     }
 
+    //! At most \p maxWriters workers run write pieces (required writes, write-behind flushes, write-through copies)
+    //! at once; the others are kept for reads. 0: no limit.
+    void setMaxWriters(size_t maxWriters)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mMaxWriters = maxWriters == 0 ? std::numeric_limits<size_t>::max() : maxWriters;
+        }
+        mCv.notify_all();
+    }
+
     void delayBackground(std::chrono::steady_clock::duration delay)
     {
         {
@@ -1157,9 +1170,16 @@ private:
         return !mBackground.empty() && now - mBackground.front().queued >= mBackgroundDelay;
     }
 
+    // A worker may start a write piece while fewer than mMaxWriters run one.
+    [[nodiscard]] bool canStartWrite() const noexcept
+    {
+        return mWritersRunning < mMaxWriters;
+    }
+
     [[nodiscard]] bool hasWork(std::chrono::steady_clock::time_point now) const noexcept
     {
-        return !mStage.empty() || !mReads.empty() || !mWrites.empty() || flushReady(now) || backgroundReady(now);
+        return !mStage.empty() || !mReads.empty()
+            || (canStartWrite() && (!mWrites.empty() || flushReady(now) || backgroundReady(now)));
     }
 
     // Called with mMutex held and hasWork(now).
@@ -1169,6 +1189,11 @@ private:
         if (!mStage.empty())
         {
             return mStage;
+        }
+        if (!canStartWrite())
+        {
+            // hasWork(now): with no write allowed, reads are waiting.
+            return mReads;
         }
         bool const readsWaiting = !mReads.empty();
         // Flushes free staging; they are served like required writes, the older of the two queues first.
@@ -1203,12 +1228,14 @@ private:
         for (;;)
         {
             Piece piece;
+            bool isWrite = false;
             {
                 std::unique_lock<std::mutex> lock(mMutex);
                 auto now = std::chrono::steady_clock::now();
                 while (!hasWork(now))
                 {
-                    if (mBackground.empty() && mFlush.empty())
+                    // Writes held back by mMaxWriters wait for a writer to finish (writerDone notifies).
+                    if ((mBackground.empty() && mFlush.empty()) || !canStartWrite())
                     {
                         mCv.wait(lock);
                     }
@@ -1229,38 +1256,61 @@ private:
                     now = std::chrono::steady_clock::now();
                 }
                 auto& queue = nextQueue(now);
+                isWrite = &queue != &mStage && &queue != &mReads;
+                if (isWrite)
+                {
+                    ++mWritersRunning;
+                }
                 piece = std::move(queue.front());
                 queue.pop_front();
             }
-            if (piece.page)
+            runOne(std::move(piece));
+            if (isWrite)
             {
-                runFlush(std::move(piece));
-                continue;
+                writerDone();
             }
-            DiskTransfer& transfer = *piece.transfer;
-            if (transfer.staged)
-            {
-                stagePage(transfer, piece.task);
-                if (transfer.remaining.fetch_sub(1) == 1)
-                {
-                    transfer.finish();
-                    transfer.remaining.notify_all();
-                }
-                pieceDone();
-                continue;
-            }
-            // Once a piece has failed, the transfer has failed: skip the syscalls of its remaining pieces.
-            if (!transfer.runPieceUnlessFailed(piece.task, piece.offset, piece.length))
-            {
-                transfer.ok.store(false);
-            }
+        }
+    }
+
+    void runOne(Piece piece) noexcept
+    {
+        if (piece.page)
+        {
+            runFlush(std::move(piece));
+            return;
+        }
+        DiskTransfer& transfer = *piece.transfer;
+        if (transfer.staged)
+        {
+            stagePage(transfer, piece.task);
             if (transfer.remaining.fetch_sub(1) == 1)
             {
                 transfer.finish();
                 transfer.remaining.notify_all();
             }
             pieceDone();
+            return;
         }
+        // Once a piece has failed, the transfer has failed: skip the syscalls of its remaining pieces.
+        if (!transfer.runPieceUnlessFailed(piece.task, piece.offset, piece.length))
+        {
+            transfer.ok.store(false);
+        }
+        if (transfer.remaining.fetch_sub(1) == 1)
+        {
+            transfer.finish();
+            transfer.remaining.notify_all();
+        }
+        pieceDone();
+    }
+
+    void writerDone()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            --mWritersRunning;
+        }
+        mCv.notify_one(); // a write held back by mMaxWriters may start now
     }
 
     void pieceDone()
@@ -1343,6 +1393,8 @@ private:
     std::condition_variable mIdleCv;
     size_t mInFlight = 0;                                    // pieces queued or running
     bool mServedAgedPiece = false;                           // the last piece jumped the queue while reads were waiting
+    size_t mMaxWriters = std::numeric_limits<size_t>::max(); // workers that may run write pieces at once
+    size_t mWritersRunning = 0;                              // workers running a write piece
     std::chrono::steady_clock::duration mBackgroundDelay{0}; // testing only: delayBackgroundDiskWritesForTesting
     std::chrono::steady_clock::duration mFlushDelay{0};      // testing only: delayDiskWriteBehindFlushesForTesting
     std::deque<Piece> mStage;                                // write-behind: copy a page into staging
@@ -1673,8 +1725,19 @@ void configureAsyncDiskIo(size_t numThreads) noexcept
         TLLM_LOG_WARNING("[kvCacheManagerV2Utils] no disk I/O thread started; using synchronous disk I/O");
         return;
     }
+    // Write pieces may take at most half of the workers. A buffered write can block for milliseconds (the file's
+    // inode lock, dirty-page throttling, page reclaim) while a read from the page cache takes tens of microseconds, so
+    // with no limit a write backlog (write-behind, write-through) parks every worker in a write and restores read at
+    // the rate writes complete. TLLM_KV_DISK_IO_MAX_WRITE_THREADS overrides the limit; 0 removes it.
+    size_t maxWriters = std::max<size_t>(1, started / 2);
+    if (char const* env = std::getenv("TLLM_KV_DISK_IO_MAX_WRITE_THREADS"); env != nullptr && *env != '\0')
+    {
+        maxWriters = static_cast<size_t>(std::strtoull(env, nullptr, 10));
+    }
+    pool->setMaxWriters(maxWriters);
     gAsyncDiskIoThreads.store(started, std::memory_order_release);
-    TLLM_LOG_INFO("[kvCacheManagerV2Utils] async disk I/O: threads=%zu", started);
+    TLLM_LOG_INFO("[kvCacheManagerV2Utils] async disk I/O: threads=%zu, write threads at most %s", started,
+        maxWriters == 0 ? "unlimited" : std::to_string(maxWriters).c_str());
 }
 
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept
