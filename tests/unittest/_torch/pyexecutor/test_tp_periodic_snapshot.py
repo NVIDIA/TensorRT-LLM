@@ -119,6 +119,7 @@ class _Manager:
         self._periodic_snapshot_model_support = True
         self._supports_periodic_snapshots = True
         self._periodic_snapshot_supports_tp = True
+        self._periodic_snapshot_supports_mixed_decode = True
         self.enable_block_reuse = True
         self.is_draft = False
 
@@ -189,6 +190,23 @@ def test_two_ranks_extend_the_same_scheduled_context():
         (1024, (256, 512, 768)),
         (1024, (256, 512, 768)),
     ]
+
+
+@pytest.mark.cpu_only
+def test_two_ranks_keep_mixed_baseline_if_one_rank_disallows_periodic_decode():
+    requests = [_Context(), _Context()]
+    batches = [ScheduledRequests(), ScheduledRequests()]
+    managers = [_Manager(), _Manager()]
+    managers[1]._periodic_snapshot_supports_mixed_decode = False
+    for batch, request in zip(batches, requests):
+        batch.append_context_request(request)
+        batch.append_generation_request(SimpleNamespace(py_request_id=5, py_beam_width=1))
+
+    _run_pair(batches, managers)
+
+    assert [request.context_chunk_size for request in requests] == [256, 256]
+    assert not any(batch.periodic_snapshot_tp for batch in batches)
+    assert all(manager.reservation is None for manager in managers)
 
 
 @pytest.mark.cpu_only
@@ -379,6 +397,7 @@ def _make_executor(dist, batch, request, manager, wrapped, mm_active, mm_model=F
     ex._pad_attention_dp_dummy_request = Mock()
     ex._pad_empty_attention_dp_batch = Mock()
     ex._prefetch_for_context_requests = Mock()
+    ex._reset_scheduler_failure_state()
     caps_at_schedule = []
 
     def schedule():
@@ -1188,6 +1207,64 @@ def test_executor_coordinates_periodic_snapshots_with_scheduler(
     del manager
     gc.collect()
     assert all(ref() is None for ref in cache_refs)
+
+
+@pytest.mark.cpu_only
+def test_executor_backs_off_snapshot_budget_after_one_rank_refuses_resources():
+    managers = [_Manager(), _Manager(reservation_ok=False)]
+    managers[1]._periodic_snapshot_supports_mixed_decode = False
+    exchange = _Exchange()
+    results = [[], []]
+    errors = []
+
+    def run(rank):
+        try:
+            manager = managers[rank]
+            executor, scheduler, _ = _make_executor(
+                exchange.for_rank(rank), ScheduledRequests(), _Context(), manager, False, False
+            )
+
+            def schedule():
+                assert scheduler.periodic_snapshot_tp_mixed_decode_supported is False
+                batch = ScheduledRequests()
+                if step == 1:
+                    batch.append_generation_request(
+                        SimpleNamespace(
+                            py_request_id=21, py_beam_width=1, is_attention_dp_dummy=False
+                        )
+                    )
+                    return batch, [], batch.batch_size
+                batch.append_context_request(_Context())
+                if not scheduler.periodic_snapshot_tp_enabled:
+                    later = _Context()
+                    later.py_request_id = 11
+                    batch.append_context_request(later)
+                return batch, [], batch.batch_size
+
+            executor._schedule = schedule
+            for step in range(4):
+                if step == 3:
+                    manager.reservation_ok = True
+                batch, _ = executor._prepare_and_schedule_batch()
+                results[rank].append(
+                    (
+                        batch.num_context_requests,
+                        batch.context_requests[0].context_chunk_size
+                        if batch.context_requests
+                        else 0,
+                    )
+                )
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=run, args=(rank,)) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert not errors
+    assert results == [[(1, 256), (0, 0), (2, 256), (1, 1024)]] * 2
 
 
 @pytest.mark.cpu_only

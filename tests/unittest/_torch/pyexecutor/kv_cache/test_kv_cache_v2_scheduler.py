@@ -4434,7 +4434,13 @@ class TestChunkedContext:
         assert sched.periodic_snapshot_extra_budget == 768
         mgr.reserve_periodic_snapshots.assert_not_called()
 
-    def test_tp_periodic_snapshots_preserve_budget_for_one_context_with_decode(self):
+    @pytest.mark.parametrize(
+        "mixed_decode_supported, draft_tokens, expected_contexts",
+        [(True, 0, [0]), (False, 0, [0, 1]), (True, 3, [0, 1])],
+    )
+    def test_tp_periodic_budget_with_decode(
+        self, mixed_decode_supported, draft_tokens, expected_contexts
+    ):
         mgr = make_kv_cache_manager(tokens_per_block=64)
         mgr.periodic_snapshot_capacity = 4
         mgr.periodic_snapshot_requires_consensus = True
@@ -4447,6 +4453,7 @@ class TestChunkedContext:
             mgr, max_num_tokens=1025, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
         )
         sched.periodic_snapshot_tp_enabled = True
+        sched.periodic_snapshot_tp_mixed_decode_supported = mixed_decode_supported
         contexts = [
             make_ctx_request(i, context_remaining_length=2048, is_last_context_chunk=False)
             for i in range(2)
@@ -4456,12 +4463,15 @@ class TestChunkedContext:
             context.is_dummy_request = False
             context.py_multimodal_data = None
 
-        out = sched.schedule_request([*contexts, make_gen_request(2)], set())
+        decode = make_gen_request(2, num_draft_tokens=draft_tokens)
+        out = sched.schedule_request([*contexts, decode], set())
 
         assert ids(out.generation_requests) == [2]
-        assert ids(out.context_requests) == [0]
+        assert ids(out.context_requests) == expected_contexts
         assert contexts[0].context_chunk_size == 256
-        assert sched.periodic_snapshot_extra_budget == 768
+        assert sched.periodic_snapshot_extra_budget == 1024 - draft_tokens - 256 * len(
+            expected_contexts
+        )
         mgr.reserve_periodic_snapshots.assert_not_called()
 
     def test_tp_periodic_snapshots_leave_budget_after_nonperiodic_boundary(self):
@@ -4506,10 +4516,11 @@ class TestChunkedContext:
 
         out = sched.schedule_request([context, following], set())
 
-        # The leftover 32 tokens can only extend the first context to an explicit boundary.
-        assert ids(out.context_requests) == ([0, 1] if next_boundary is None else [0])
+        # A later nonperiodic point can be discovered by one rank only.
+        # It cannot determine how many requests enter the baseline batch.
+        assert ids(out.context_requests) == [0, 1]
         assert context.context_chunk_size == 256
-        assert sched.periodic_snapshot_extra_budget == (0 if next_boundary is None else 32)
+        assert sched.periodic_snapshot_extra_budget == 0
 
     def test_tp_periodic_snapshots_do_not_hold_budget_for_a_short_final_tail(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)

@@ -7,6 +7,22 @@ from typing import TYPE_CHECKING, NamedTuple, Sequence
 if TYPE_CHECKING:
     import torch
 
+    from ...llm_request import LlmRequest
+
+
+def periodic_snapshot_allows_decode(
+    generation_requests: Sequence["LlmRequest"], mixed_decode_supported: bool
+) -> bool:
+    """Whether the batch can hold periodic checkpoints alongside its decode rows."""
+    return not generation_requests or (
+        mixed_decode_supported
+        and all(
+            not getattr(request, "num_draft_tokens", 0)
+            and not getattr(request, "py_draft_tokens", None)
+            for request in generation_requests
+        )
+    )
+
 
 class SnapshotChunkPlan(NamedTuple):
     end: int

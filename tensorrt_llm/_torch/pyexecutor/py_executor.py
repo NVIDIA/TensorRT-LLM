@@ -1310,6 +1310,7 @@ class PyExecutor:
         self._finish_periodic_snapshots = (self._is_kv_manager_v2 and getattr(
             self.kv_cache_manager, "periodic_snapshot_capacity", 0) > 0)
         self._periodic_snapshot_tp_used = False
+        self._periodic_tp_backoff = False
         self._periodic_tp_failure_group: PeriodicSnapshotFailureGroup | None = None
         self._periodic_tp_fatal_watchdog: RankCrashKillWatchdog | None = None
         self._periodic_tp_fatal_responses_done = False
@@ -6507,11 +6508,16 @@ class PyExecutor:
                         int(mm_capable),
                         int(enabled and PeriodicSnapshotFailureGroup.supported(
                             self.dist)),
+                        int(enabled and
+                            manager._periodic_snapshot_supports_mixed_decode),
                     ])
                 except Exception:
                     self._periodic_snapshot_tp_used = True
                     raise
                 self._periodic_tp_enabled = all(row[0] for row in rank_support)
+                self._periodic_tp_mixed_decode_supported = all(
+                    row[3] for row in rank_support)
+                self._periodic_tp_backoff = False
                 if (self._periodic_tp_enabled
                         and all(row[2] for row in rank_support) and getattr(
                             self, "_periodic_tp_failure_group", None) is None):
@@ -6536,16 +6542,23 @@ class PyExecutor:
                     votes = self.dist.tp_allgather_int64(
                         [int(enabled and not mm_active)])
                     periodic_tp_enabled = all(row[0] for row in votes)
+            attempt_expansion = periodic_tp_enabled and not self._periodic_tp_backoff
             if supported_scheduler:
-                scheduler.periodic_snapshot_tp_enabled = periodic_tp_enabled
+                scheduler.periodic_snapshot_tp_enabled = attempt_expansion
+                scheduler.periodic_snapshot_tp_mixed_decode_supported = (
+                    self._periodic_tp_mixed_decode_supported)
             if periodic_tp_enabled:
-                periodic_tp_context = (manager, scheduler, enabled)
+                # After a rank-agreed resource refusal, leave enough room
+                # for ordinary scheduling on the next pass that has prefill.
+                # Keep baseline comparisons even while expansion is disabled.
+                periodic_tp_context = (manager, scheduler, enabled
+                                       and attempt_expansion)
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
         )
         if periodic_tp_context is not None:
             manager, scheduler, enabled = periodic_tp_context
-            coordinate_periodic_snapshot(
+            resource_refused = coordinate_periodic_snapshot(
                 scheduled_batch,
                 manager,
                 self.dist,
@@ -6554,6 +6567,8 @@ class PyExecutor:
                 chunk_unit_size=scheduler.chunk_unit_size,
                 enabled=enabled,
             )
+            if scheduled_batch.context_requests:
+                self._periodic_tp_backoff = resource_refused
         if getattr(self, "_check_helix_schedule", False):
             self._check_helix_schedule_consistency(scheduled_batch)
         self._fail_scheduler_requests(scheduled_batch)

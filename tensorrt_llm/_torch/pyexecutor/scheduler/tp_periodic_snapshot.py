@@ -4,7 +4,10 @@
 
 from typing import TYPE_CHECKING
 
-from ..kv_cache.mamba_cache_manager.multi_snapshot import plan_periodic_snapshot_chunk
+from ..kv_cache.mamba_cache_manager.multi_snapshot import (
+    periodic_snapshot_allows_decode,
+    plan_periodic_snapshot_chunk,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
@@ -24,11 +27,12 @@ def coordinate_periodic_snapshot(
     max_context_length: int | None,
     chunk_unit_size: int,
     enabled: bool = True,
-) -> None:
+) -> bool:
     """Expand one context only after every TP rank agrees and reserves resources.
 
-    All ranks in the TP group must call this once per scheduling pass. A failed
-    reservation returns the scheduled batch only after every rank cleans up.
+    All ranks in the TP group must call this once per scheduling pass. Return
+    True on ordinary resource refusal, after every rank has cleaned up, so
+    the next pass containing prefill can schedule without holding expansion budget.
     """
     batch.periodic_snapshot_tp = False
     contexts = batch.context_requests
@@ -84,7 +88,9 @@ def coordinate_periodic_snapshot(
             and req.py_mamba_inforward_snapshot_point is None
             and manager.context_replay_tokens(req) is None
             and not any(start < point < baseline_end for point in points)
-            and all(getattr(item, "num_draft_tokens", 0) == 0 for item in batch.generation_requests)
+            and periodic_snapshot_allows_decode(
+                batch.generation_requests, manager._periodic_snapshot_supports_mixed_decode
+            )
         ):
             identity = (
                 points,
@@ -100,16 +106,16 @@ def coordinate_periodic_snapshot(
         raise RuntimeError("TP baseline batches differ before periodic snapshot agreement")
     proposals = [item[1] for item in exchanged]
     if any(item is None for item in proposals):
-        return
+        return False
     if any(item[0] != proposals[0][0] for item in proposals):
-        return
+        return False
 
     req = contexts[0]
     start = req.context_current_position
     interval = manager.kv_cache_config.mamba_state_config.periodic_snapshot_interval
     capacity = min(item[1] for item in proposals)
     if capacity < 2:
-        return
+        return False
     available = min(
         req.context_remaining_length if item[2] is None else item[2] for item in proposals
     )
@@ -137,7 +143,7 @@ def coordinate_periodic_snapshot(
             capacity - 1,
         )
     if plan.end <= start + req.context_chunk_size or not plan.points:
-        return
+        return False
 
     cache = manager.kv_cache_map[req.py_request_id]
     baseline_capacity = cache.capacity
@@ -185,7 +191,7 @@ def coordinate_periodic_snapshot(
             ) from cleanup_exception
         if error_detail is not None:
             raise RuntimeError(f"Periodic snapshot reservation failed on a TP rank: {error_detail}")
-        return
+        return True
 
     commit_error = None
     commit_exception = None
@@ -219,6 +225,7 @@ def coordinate_periodic_snapshot(
             f"Periodic snapshot commit failed on a TP rank: {error_detail}"
         ) from commit_exception
     batch.periodic_snapshot_tp = True
+    return False
 
 
 def finish_periodic_snapshots_tp(

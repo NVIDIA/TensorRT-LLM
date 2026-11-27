@@ -27,7 +27,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
 from ...disaggregation import diagnostics as disagg_diagnostics
-from ..kv_cache.mamba_cache_manager.multi_snapshot import plan_periodic_snapshot_chunk
+from ..kv_cache.mamba_cache_manager.multi_snapshot import (
+    periodic_snapshot_allows_decode,
+    plan_periodic_snapshot_chunk,
+)
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -234,6 +237,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_num_tokens = max_num_tokens
         self._stalled_schedules = 0
         self.periodic_snapshot_tp_enabled = False
+        self.periodic_snapshot_tp_mixed_decode_supported = False
         self.periodic_snapshot_extra_budget = 0
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
@@ -1024,6 +1028,22 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Only context-only batches take Mamba snapshots inside the forward.
         self._inforward_snapshot_rows_left = 0 if scheduled_gen else self._inforward_snapshot_rows
         self._periodic_snapshot_request_id = None
+        periodic_batch_eligible = (
+            bool(pending_ctx)
+            and self.kv_cache_manager.periodic_snapshot_capacity > 1
+            and (
+                not scheduled_gen
+                or (
+                    not self.kv_cache_manager.is_speculative()
+                    and periodic_snapshot_allows_decode(
+                        scheduled_gen,
+                        self.periodic_snapshot_tp_mixed_decode_supported
+                        if self.periodic_snapshot_tp_enabled
+                        else self.kv_cache_manager._periodic_snapshot_supports_mixed_decode,
+                    )
+                )
+            )
+        )
         first_chunk_contributors: dict = {}
         context_init_ids = (
             {
@@ -1167,26 +1187,20 @@ class KVCacheV2Scheduler(RequestScheduler):
                     scheduled_encoder.append(req)
                     budget.commit(req, tokens, peft_pages)
                 else:
+                    # An expanded chunk ends this pass; let starved requests
+                    # consume their held shares first.
+                    allow_periodic_snapshot = (
+                        periodic_batch_eligible
+                        and not starved_ctx
+                        and not (scheduled_ctx or scheduled_encoder)
+                    )
                     try:
                         action, tokens, chunking_flag = self._try_schedule_context(
                             req,
                             budget,
                             preempt_for_pages,
                             token_cap,
-                            # An expanded chunk ends this pass; let starved requests
-                            # consume their held shares first.
-                            allow_periodic_snapshot=(
-                                not starved_ctx
-                                and not (scheduled_ctx or scheduled_encoder)
-                                and (
-                                    not scheduled_gen
-                                    or (
-                                        self.kv_cache_manager.periodic_snapshot_capacity > 1
-                                        and self.kv_cache_manager._periodic_snapshot_supports_mixed_decode
-                                        and not self.kv_cache_manager.is_speculative()
-                                    )
-                                )
-                            ),
+                            allow_periodic_snapshot=allow_periodic_snapshot,
                         )
                     except RemoteMemError as error:
                         # Raised by its cache's resume, before anything was taken for it.
@@ -1214,8 +1228,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     tp_expansion_candidate = False
                     if (
                         self.periodic_snapshot_tp_enabled
-                        and len(scheduled_ctx) == 1
-                        and not scheduled_encoder
+                        and allow_periodic_snapshot
                         and not req.is_last_context_chunk
                     ):
                         interval = self.kv_cache_manager.kv_cache_config.mamba_state_config.periodic_snapshot_interval
@@ -1229,7 +1242,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                             and end == start + interval
                             and end in req.expect_snapshot_points
                             and not any(start < point < end for point in req.expect_snapshot_points)
-                            and self._tp_periodic_snapshot_can_extend(req, budget.remaining_tokens)
+                            and self._tp_periodic_snapshot_can_extend(
+                                req, budget.remaining_tokens, interval
+                            )
                         )
                     if (
                         self._periodic_snapshot_request_id == req.py_request_id
@@ -1795,7 +1810,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def _tp_periodic_snapshot_can_extend(
-        self, req: LlmRequest, remaining_tokens: int | None
+        self, req: LlmRequest, remaining_tokens: int | None, interval: int
     ) -> bool:
         """Whether the leftover budget reaches a legal end beyond the baseline chunk."""
         chunk_size = req.context_chunk_size
@@ -1806,17 +1821,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             desired = min(desired, self.max_context_length)
         if desired <= chunk_size:
             return False
-        # The coordinator can end at a checkpoint, at the prompt end, or
-        # at a full chunk unit. Use logical limits only, so ranks with
-        # different free cache capacity still schedule the same baseline.
-        start = req.context_current_position
+        # Future branch points are discovered from each rank's own cache.
+        # Leave them to the post-schedule proposal check so they cannot make
+        # one rank hold budget that its peers spend on other requests.
         return (
-            start + desired == req.prompt_len
+            req.context_current_position + desired == req.prompt_len
             or desired // self.chunk_unit_size > chunk_size // self.chunk_unit_size
-            or any(
-                start + chunk_size < point <= start + desired
-                for point in req.expect_snapshot_points
-            )
+            or desired >= chunk_size + interval
         )
 
     def _try_schedule_context_full(
