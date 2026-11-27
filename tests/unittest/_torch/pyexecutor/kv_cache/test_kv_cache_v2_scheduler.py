@@ -1324,7 +1324,12 @@ class TestKVCacheFailuresGen:
     def test_wait_restarts_after_the_request_is_torn_down(
         self, gpu_only: bool, deferred: bool
     ) -> None:
-        """A request torn down while it waits starts a fresh wait once it is back."""
+        """A request torn down while it waits starts a fresh wait once it is back.
+
+        Suspension makes the mock cache inactive in either pool, but does not
+        make the allocation fit. The future victim sits out a first-generation
+        pass, without taking the waiter's slot, before the requester returns.
+        """
         fits = {0}
         freed_request_ids = set()
 
@@ -1336,6 +1341,11 @@ class TestKVCacheFailuresGen:
             can_evict=not gpu_only,
             has_cache_tier_below_gpu=not gpu_only,
         )
+
+        def suspend_fn(req: Mock) -> None:
+            mgr.kv_cache_map[req.py_request_id].is_active = False
+
+        mgr.suspend_request.side_effect = suspend_fn
         mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
         deferred_request_ids = defer_preemption(mgr, 1) if deferred else set()
         with patch.dict("os.environ", {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": "1"}):
@@ -1358,7 +1368,13 @@ class TestKVCacheFailuresGen:
             deferred_request_ids.clear()
         mgr.free_resources.assert_called_once_with(reqs[1])
 
+        out = sched.schedule_request([reqs[2]], set())
+        assert out.generation_requests == []
+        assert ids(out.paused_requests) == [99]
+        assert out.recompute_paused_requests == []
+
         # Blocked again once it is back, 1 waits instead of tearing down 99.
+        mgr.kv_cache_map[1].is_active = True
         fits.add(0)
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
