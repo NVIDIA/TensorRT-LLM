@@ -11,6 +11,7 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     ExpertStatistics,
     RouteTables,
     build_route_tables,
+    check_route_row,
     statistics_buffers,
 )
 
@@ -84,6 +85,44 @@ def test_build_route_tables():
     assert build_route_tables(layout, shares, 4, 6).cumulative_shares[0] == 3 << 30
     with pytest.raises(ValueError, match="no copy"):
         build_route_tables([0, 1, 2, 0, 1, 2], None, 4, 6)
+    # A layout one slot shorter than the slots leaves a table entry without its slot: the routers would drop
+    # picks, so the table every launch reads is refused where it is built.
+    with pytest.raises(ValueError, match="route table row"):
+        build_route_tables([0, 1, 2, 3, 2], None, 4, 6)
+
+
+@pytest.mark.cpu_only
+def test_check_route_row_judges_every_row_as_the_kernels_validator():
+    """build_route_tables' check gives the kernels' validator's verdict and message on random tables,
+    each mutated in one entry, random rows and rows of the wrong length."""
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain import (
+        adaptive_route,
+    )
+
+    def verdict(check, row, experts, slots):
+        try:
+            check(row, experts, slots)
+        except ValueError as error:
+            return str(error)
+
+    kernels_check = adaptive_route.validate_adaptive_route_table
+    rng, accepted = random.Random(0), []
+    for _ in range(400):
+        experts, ep_size = rng.choice([(4, 1), (8, 2), (16, 4)])
+        slots = experts + ep_size * rng.randrange(3)
+        shares = [rng.random() for _ in range(slots)]
+        layout = _random_layout(rng, experts, slots, ep_size)
+        row = build_route_tables(layout, shares, experts, slots).packed()
+        rows = [row, [rng.randrange(-2, slots + 2) for _ in row], row[:-1], row + [0]]
+        for i in rng.sample(range(len(row)), 8):
+            values = [-1, 0, 1, slots - 1, slots, row[i] - 1, row[i] + 1, -(1 << 31)]
+            rows.append(row[:i] + [rng.choice(values)] + row[i + 1 :])
+        for candidate in rows:
+            ours = verdict(check_route_row, candidate, experts, slots)
+            assert ours == verdict(kernels_check, candidate, experts, slots)
+            accepted.append(ours is None)
+    assert 400 < sum(accepted) < len(accepted) - 1600
 
 
 @needs_gpu

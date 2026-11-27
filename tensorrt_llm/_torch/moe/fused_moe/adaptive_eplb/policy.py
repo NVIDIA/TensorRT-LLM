@@ -612,7 +612,39 @@ def build_route_tables(
             acc += weights[k]
             bound = min(max(int(acc / total * 4294967296.0 + 0.5), bound), _UINT32_MAX)
             cumulative_shares[start + k] = bound
-    return RouteTables(counts, starts, slots, cumulative_shares)
+    tables = RouteTables(counts, starts, slots, cumulative_shares)
+    # Every route table a launch reads is built here; the dispatch routers drop the picks of a malformed one.
+    check_route_row(tables.packed(), num_experts, num_slots)
+    return tables
+
+
+def check_route_row(row: Sequence[int], experts: int, slots: int) -> None:
+    """Raise ValueError unless a packed route table ``row`` is one the MegaMoE dispatch routers route
+    as written, by the rules of the kernels' ``validate_adaptive_route_table``: every expert has a run of
+    copies inside the slots, every routed slot is in range and under one expert, and an expert's
+    cumulative shares (uint32) do not decrease."""
+    row = [int(value) for value in row]
+    if len(row) != 2 * experts + 2 * slots:
+        raise ValueError(
+            f"A route table row has 2 * {experts} + 2 * {slots} entries, got {len(row)}."
+        )
+    counts, starts, slot_ids = row[:experts], row[experts : 2 * experts], row[2 * experts :][:slots]
+    bounds = [value & _UINT32_MAX for value in row[2 * experts + slots :]]
+    owner: dict[int, int] = {}
+    for expert, (copies, start) in enumerate(zip(counts, starts)):
+        if copies <= 0 or start < 0 or start + copies > slots:
+            raise ValueError(
+                f"Expert {expert}: {copies} copies from {start} is not a run inside the {slots} slots."
+            )
+        for slot in slot_ids[start : start + copies]:
+            if not 0 <= slot < slots:
+                raise ValueError(f"Expert {expert} routes to slot {slot}, outside [0, {slots}).")
+            if slot in owner:
+                raise ValueError(f"Slot {slot} is under experts {owner[slot]} and {expert}.")
+            owner[slot] = expert
+        run = bounds[start : start + copies - 1]
+        if any(later < earlier for earlier, later in zip(run, run[1:])):
+            raise ValueError(f"Expert {expert}: the cumulative shares decrease.")
 
 
 def statistics_buffers(layers: int, num_experts: int, device: torch.device | str) -> dict:
