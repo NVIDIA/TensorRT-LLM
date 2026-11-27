@@ -73,7 +73,8 @@ projections and heads (`_ONE_RANK_SWITCHES`: `_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP
 **tep4.** A rank of attention TP4 with 128-expert windows takes some of those forms at its shard
 for a captured generation-only step (`tep_fast`, `TEP_FAST_DECODE_ENV`, on by default): the
 decode hyper-connection sites' rows pairs (`hc_decode_pairs`), the CuTe split-K sparse GQA over
-its e4m3 KV head, and the MoE route front over its own rows.
+its e4m3 KV head, and the MoE route front over its own rows. With `TEP_FINAR_ENV` (opt-in) such a
+MoE block's finalize and TP all-reduce are one Lamport launch (`ops/moe/tep_finalize_allreduce`).
 
 **QSA sparse attention.** The index plane is maintained on every step so a request can
 cross `dense_seq_len_threshold` later without rebuilding its prefix; above it the sparse
@@ -393,6 +394,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gat
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (
     qwen4_exp_post_inject,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import (
+    tep_finalize_allreduce as _TEP_FINAR,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (  # noqa: E501
     cute_dsl_nvfp4_gather_grouped_gemm_act_fusion,
 )
@@ -456,6 +460,12 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.mtp_moe_combine_in
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
     renorm_moe_routing_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.tep_finalize_allreduce import (
+    build as tep_finar_build,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.tep_finalize_allreduce import (
+    tep_finalize_allreduce,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.flashinfer_gemma_rmsnorm import (
     flashinfer_gemma_rmsnorm,
@@ -1109,6 +1119,31 @@ def _tep_fast_decode(core) -> bool:
     return on and tep4
 
 
+#: Off by default (a Lamport transport: race-risk, opt-in). At a tep4 rank whose trunk MoE takes
+#: the route front (`TEP_FAST_DECODE_ENV`), each captured block of up to
+#: `tep_finalize_allreduce.MAX_ROWS` rows enters the runner without its finalize, and one launch
+#: (`ops/moe/tep_finalize_allreduce`) forms the finalize and the TP all-reduce over symmetric
+#: memory instead of the runner's finalize and `core.tp_sum`: the finalize's slot-order fp32
+#: expression, then the one-shot sum in fp32 in rank order, one bf16 rounding each; a -0.0 lane
+#: of a rank's partial travels as +0.0. Its slot is the block's layer index mod 3, baked into
+#: the captured graph. `1` releases the launch's dependents after its publish, `early` right
+#: after its PDL wait. The build checks every row count against the reference on every rank and
+#: raises on every rank if one fails. Read once, when the target is built; set where it cannot
+#: apply (another layout, no route front, a group across nodes) it warns and does nothing.
+TEP_FINAR_ENV = "TRTLLM_QWEN4_EXP_TEP_FINAR"
+
+
+def _tep_finar_mode() -> str:
+    """`TEP_FINAR_ENV`: "" (unset, empty, 0), "publish" (1) or "early"; ValueError otherwise."""
+    raw = os.environ.get(TEP_FINAR_ENV, "")
+    value = raw.strip().lower()
+    if value in ("", "0"):
+        return ""
+    if value in ("1", "early"):
+        return "publish" if value == "1" else "early"
+    raise ValueError(f"{TEP_FINAR_ENV}={raw!r}: expected 0, 1 or early")
+
+
 def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: int) -> bool:
     """Whether the trunk keeps the CuteDSL-layout expert copy: at one rank only (every expert
     is local, the layout the CuteDSL MoE is certified at), only under trtllm-gen, only when a
@@ -1525,6 +1560,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._decode: "DecodeTarget | None" = None
         # The decode MoE's route front (`DP_ROUTE_FRONT_ENV`), built with the targets.
         self._route_front: _RouteFront | None = None
+        # The tep4 MoE finalize + all-reduce launch (`TEP_FINAR_ENV`), built once after it.
+        self._tep_finar: _TepFinar | None = None
         # Everything derived from the KV cache manager (`_bind_cache_manager`).
         self._bound: _Bound | None = None
         self._binds = 0
@@ -1683,6 +1720,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             if device.type == "cuda"
             else None
         )
+        # Collective; once a load (the post-load walk reaches this hook again).
+        if self._tep_finar is None and device.type == "cuda":
+            self._tep_finar = _tep_finar_build(self, device)
 
     def _build_draft_one_rank(self, device) -> None:
         """At one rank the draft layer's operands for `DecodeTarget._mtp_layer`: the fused
@@ -3576,6 +3616,173 @@ def _route_front_experts(core, st: _RouteFront, x, L: _LayerWeights, fp4=None):
     return _route_front_run(core, st, x, L, layer, _decode_router(x, L.router), fp4)[0]
 
 
+class _TepFinar:
+    """What `TEP_FINAR_ENV` built (`_tep_finar_build`): the rank's workspace and launch (`op`),
+    the row counts it serves, the trunk MoE launches a step, and the layer of the last launch
+    (host side, to hold the slot sequence)."""
+
+    def __init__(self, op, rows: tuple, layers: int) -> None:
+        self.op = op
+        self.rows = rows
+        self.layers = layers
+        self.prev: int | None = None
+
+
+def _tep_finar_selfcheck(core, op, device, rows: int, slot: int) -> tuple:
+    """One eager launch at `rows` rows on synthetic window outputs (slots of other ranks'
+    windows, a row with no local slot, -0.0 lanes, values over 2^-12..2^8) against the entry's
+    reference over every rank's operands. `(ok, lanes that differ from the runner's finalize +
+    core.tp_sum)`: the second is reported, not required (the engine's all-reduce strategy may sum
+    in another order)."""
+    import torch.distributed as dist
+
+    world, rank = _TEP_FINAR.WORLD, core.mapping.tp_rank
+    g = torch.Generator(device="cpu").manual_seed(9100 + 97 * rows + rank)
+    owner = (torch.arange(rows).unsqueeze(1) * 3 + torch.arange(core.topk).unsqueeze(0)) % world
+    owner[0] = (rank + 1) % world
+    mine = owner == rank
+    count = int(mine.sum())
+    perm = torch.full([rows, core.topk], -1, dtype=torch.int32)
+    perm[mine] = torch.randperm(count + 3, generator=g)[:count].to(torch.int32)
+    scale = torch.exp2(torch.randint(-12, 9, [count + 3, 1], generator=g).float())
+    fc2 = (torch.randn([count + 3, core.hidden], generator=g) * scale).to(torch.bfloat16)
+    fc2[:, ::37] = -0.0
+    wts = (torch.rand([rows, core.topk], generator=g) * 0.5 + 0.01).to(torch.bfloat16)
+    fc2, wts, perm = fc2.to(device), wts.to(device), perm.to(device)
+    got = op(fc2, wts, perm, rows, slot)
+    mine_ops = (fc2, wts, perm)
+    everyone = [None] * world
+    dist.all_gather_object(everyone, tuple(t.cpu() for t in mine_ops))
+    want = tep_finalize_allreduce.reference([tuple(t.to(device) for t in ops) for ops in everyone])
+    stock = core.tp_sum(_tep_finar_local(fc2, wts, perm))
+    torch.cuda.synchronize(device)
+    ok = tuple(got.shape) == (rows, core.hidden) and torch.equal(got, want)
+    return ok, int((got != stock).sum())
+
+
+def _tep_finar_local(fc2, wts, perm) -> torch.Tensor:
+    """The runner's finalize of one rank's window, emulated exactly (fp32, slot order)."""
+    acc = torch.zeros((perm.shape[0], fc2.shape[1]), dtype=torch.float32, device=fc2.device)
+    for k in range(perm.shape[1]):
+        idx = perm[:, k].long()
+        rows = fc2[idx.clamp_min(0)].float()
+        acc = torch.where((idx >= 0)[:, None], acc + wts[:, k : k + 1].float() * rows, acc)
+    return acc.to(torch.bfloat16)
+
+
+def _tep_finar_rows(core, device) -> tuple:
+    """The row counts the fused launch may serve: those up to `tep_finalize_allreduce.MAX_ROWS`
+    that the route front serves on EVERY rank of the group. Each rank builds and checks its route
+    front over its own window, so one rank can lack a row count, or the whole front, that the
+    others have; a block that took the fused launch on some ranks and `core.tp_sum` on another
+    would leave both waiting. One `core.tp_sum` of 0 / 1 flags (exact: small integers) agrees on
+    the intersection. Collective: every rank of the group calls it."""
+    st = core._route_front
+    mine = ()
+    if st is not None and len(st.layers) % _TEP_FINAR.SLOTS == 0:
+        mine = tuple(r for r in sorted(st.tactics) if r <= _TEP_FINAR.MAX_ROWS)
+    flags = torch.zeros([_TEP_FINAR.MAX_ROWS, core.hidden], dtype=torch.bfloat16, device=device)
+    for r in mine:
+        flags[0, r - 1] = 1.0
+    total = core.tp_sum(flags)[0, : _TEP_FINAR.MAX_ROWS].float().cpu()
+    return tuple(
+        r for r in range(1, _TEP_FINAR.MAX_ROWS + 1) if int(total[r - 1]) == _TEP_FINAR.WORLD
+    )
+
+
+def _tep_finar_build(core, device) -> "_TepFinar | None":
+    """`TEP_FINAR_ENV` at build, after the route front: None where it is off or cannot apply
+    (one warning, on every rank alike); else the workspace over the 4-rank torch group
+    (bootstrapped under MPI as the attention-DP Lamport transport is), every row count the
+    ranks agree on (`_tep_finar_rows`) checked eagerly on every rank, and the ranks' verdicts
+    reduced: a failure on any rank raises on every rank, since a rank cannot keep the stock sum
+    alone."""
+    mode = _tep_finar_mode()
+    if not mode:
+        return None
+    # Host values every rank of the group shares: the ranks decline together.
+    why = None
+    if not core.tep_fast:
+        why = f"it needs a tep4 rank with {TEP_FAST_DECODE_ENV} on"
+    elif core.mapping.is_multi_node():
+        why = "the TP group spans nodes"
+    elif (core.hidden, core.topk) != (_TEP_FINAR.HIDDEN, _TEP_FINAR.TOP_K):
+        why = f"hidden {core.hidden}, top-{core.topk}"
+    if why is None:
+        rows = _tep_finar_rows(core, device)
+        if not rows:
+            why = (
+                f"the tep4 route front (SM103, CUDA graphs of 1-4 requests, MoE layers a "
+                f"multiple of {_TEP_FINAR.SLOTS}) serves no row count up to "
+                f"{_TEP_FINAR.MAX_ROWS} on every rank"
+            )
+    if why is not None:
+        logger.warning(f"{TEP_FINAR_ENV} is set but ignored: {why}")
+        return None
+    st = core._route_front
+    import torch.distributed as dist
+
+    from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
+
+    rank = core.mapping.tp_rank
+    ensure_cutedsl_torch_distributed(_TEP_FINAR.WORLD)
+    if not dist.is_initialized() or dist.get_world_size() != _TEP_FINAR.WORLD:
+        raise RuntimeError(f"{TEP_FINAR_ENV} found no {_TEP_FINAR.WORLD}-rank torch group")
+    if dist.get_rank() != rank:
+        raise RuntimeError(f"{TEP_FINAR_ENV}: the torch WORLD rank order differs from the TP one")
+    with torch.cuda.device(device):
+        op = tep_finar_build(rank, get_env_enable_pdl(), early=mode == "early")
+        verdicts = [
+            _tep_finar_selfcheck(core, op, device, r, i % _TEP_FINAR.SLOTS)
+            for i, r in enumerate(rows)
+        ]
+        ok = torch.tensor([int(all(v[0] for v in verdicts))], dtype=torch.int32, device=device)
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+    if not int(ok.item()):
+        raise RuntimeError(
+            f"{TEP_FINAR_ENV}: the fused finalize all-reduce failed its build check on a rank "
+            f"(this rank, rows {list(rows)}: {[v[0] for v in verdicts]}); unset the switch"
+        )
+    logger.info(
+        f"MoE finalize all-reduce ({TEP_FINAR_ENV}={mode}): rank {rank} of {_TEP_FINAR.WORLD}, "
+        f"rows {list(rows)}, {op.workspace_bytes / (1 << 20):.2f} MiB, lanes that differ from "
+        f"the runner's finalize + tp_sum at the build check {[v[1] for v in verdicts]}"
+    )
+    return _TepFinar(op, rows, len(st.layers))
+
+
+def _tep_finar_routed(core, fin: _TepFinar, x, L: _LayerWeights, fp4, router_mm):
+    """A tep4 captured block's routed experts summed over the group in one launch (the route
+    front, the runner without its finalize, `tep_finalize_allreduce`), or None where the block
+    keeps the route front's finalized path and `core.tp_sum` (another row count, an eager step).
+    Host values only, the same on every rank (`fin.rows` the row counts every rank's route
+    front serves)."""
+    st = core._route_front
+    rows = x.shape[0]
+    layer = st.layers.get(L.fc1_w.data_ptr())
+    if not (
+        rows in fin.rows
+        and rows in st.tactics
+        and layer is not None
+        and fp4 is not None
+        and router_mm is _decode_router
+        and torch.cuda.is_current_stream_capturing()
+        and x.stride(1) == 1
+        and x.stride(0) == core.hidden
+    ):
+        return None
+    if fin.prev is not None and layer != (fin.prev + 1) % fin.layers:
+        raise RuntimeError(
+            f"{TEP_FINAR_ENV}: MoE layer {layer} follows layer {fin.prev}; three consecutive "
+            "launches must take three slots"
+        )
+    fin.prev = layer
+    logits = _decode_router(x, L.router)
+    fc2, _, _, _, wts = _route_front_run(core, st, x, L, layer, logits, fp4, finalize=False)
+    perm = st.views[rows][layer][0].view(rows, core.topk)
+    return tep_finalize_allreduce(fc2, wts, perm, rows, layer % _TEP_FINAR.SLOTS, fin.op)
+
+
 def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) -> torch.Tensor:
     """This rank's partial of the routed experts over every row of `x`: the router logits
     over the whole routing space, and the trtllm-gen runner over this rank's expert window
@@ -3804,9 +4011,13 @@ def _moe_block(
     side.wait_stream(main)
     with torch.cuda.stream(side):
         shared, gate_logits = _shared_expert(core, x, L, decode_gemm)
-    routed = core.expert_sum(
-        lambda rows: _routed_experts(core, rows, L, fp4, router_mm), x, pad_rows
-    )
+    routed = None
+    if getattr(core, "_tep_finar", None) is not None:
+        routed = _tep_finar_routed(core, core._tep_finar, x, L, fp4, router_mm)
+    if routed is None:
+        routed = core.expert_sum(
+            lambda rows: _routed_experts(core, rows, L, fp4, router_mm), x, pad_rows
+        )
     main.wait_stream(side)
     return routed, gate_logits, shared
 
