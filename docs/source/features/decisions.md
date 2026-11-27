@@ -4,18 +4,16 @@ The generation service and the PPLX-Decider v1.1 embedding service answer typed 
 
 ## Supported text profile
 
-| Capability | TypeSafe System One | OpenAI Decisions |
-| --- | --- | --- |
-| Shared input | Text, JSON object or array in `state` | Text or ordered user messages with text content in `input` |
-| Questions and answers | One or more questions keyed by ID. Answers use the same keys. | 1–64 questions. Answers follow request order. |
-| Question types | `noul`, `choice`, `score` (1–10 levels) | `predicate`, `choice`, `score` (2–10 levels) |
-| Choice candidates on Qwen3.5-35B-A3B | 1–255, subject to distinct single-token labels | 2–26 |
-| Choice candidates on PPLX-Decider v1.1-27B | 1–255 | 2–255 |
-| Outside this text profile | Images, multipart assets, `box`, compressed uploads | Images, `input_json`, tool histories, per-question refusal, explicit cache controls, framework-specific decision formats |
+| Endpoint | Shared input | Question types | Answers |
+| --- | --- | --- | --- |
+| `/v1/systemone` | Text, JSON object or array | `noul`, `choice`, `score` (1–10 levels) | Keyed by question ID |
+| `/v1/decisions` | Text or user messages with text content | `predicate`, `choice`, `score` (2–10 levels) | In request order, 1–64 questions |
 
 ## TypeSafe System One
 
-`POST /v1/systemone` accepts the served model ID and the SDK aliases `jev-latest` and `jev-preview`. Each refers to the loaded model. A `noul` returns the probability of yes. A `choice` returns the winning key and candidate probabilities. A `score` returns the expected zero-based level index, the probabilities and a legend. Choice and score include confidence computed from the candidate distribution. [System One API reference](https://docs.typesafe.ai/api/system-one) · [TypeSafe confidence definitions](https://docs.typesafe.ai/confidence)
+The TypeSafe Python SDK sends `model="jev-latest"` by default. On this endpoint, TRT-LLM accepts that name and `jev-preview` so existing clients can keep their model setting. For example, if this instance serves Qwen, both names use Qwen. You can also pass the served model ID directly.
+
+A `noul` returns the probability of yes. A `choice` returns the winning key and candidate probabilities. A `score` returns the expected zero-based level index, the probabilities and a legend. Choice and score include confidence computed from the candidate distribution. [System One API reference](https://docs.typesafe.ai/api/system-one) · [TypeSafe confidence definitions](https://docs.typesafe.ai/confidence)
 
 ```bash
 curl -fsS http://localhost:8000/v1/systemone \
@@ -62,5 +60,7 @@ The probability is in `answers[0].probability`. OpenAI Python SDK 3.26.0 and lat
 ## Model execution and limits
 
 Qwen3.5-35B-A3B runs with `trtllm-serve serve MODEL`. The service reads the next-token logits for the specified answer labels. PPLX-Decider v1.1-27B runs on one GPU with `trtllm-serve embeddings MODEL`. Its trained prompt, ordered answer codes, last-position classification head and checkpoint temperature determine each distribution. Both services enforce the configured model context length.
+
+System One accepts 1–255 choices. On Qwen, each answer label must encode as a distinct single token. OpenAI Decisions accepts 2–26 choices on Qwen and 2–255 on PPLX. The text profile excludes media, `box`, `input_json`, tool histories, per-question refusal and explicit cache controls.
 
 Usage sums the prompt and output tokens consumed by each question. PPLX reads consume zero output tokens. OpenAI `cached_tokens` sums generation executor hits, and `cache_write_tokens` is zero because the executor does not report prefix writes. Generation choice and score confidence multiply the winning probability by the vocabulary mass on the candidates. PPLX scores the candidates directly.
