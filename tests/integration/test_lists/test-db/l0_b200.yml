@@ -430,10 +430,9 @@ l0_b200:
   - unittest/_torch/modeling/test_musespark_open_moe_finalize.py
   - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
   - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
-  - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
+  # The single-GPU layer-wise benchmark cases in one entry, so they share one inner pytest
+  # session and its nsys capability check instead of paying for both per case.
+  - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1] unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1] unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1] unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests -k "not RemoteInPlaceOfDisk"
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
