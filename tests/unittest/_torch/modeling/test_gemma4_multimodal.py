@@ -382,6 +382,32 @@ def test_prepared_gemma4_implicit_positions_match_processor(processor_class, sid
 
 
 @pytest.mark.cpu_only
+def test_prepared_gemma4_video_admission_requires_frame_counts():
+    model = _Gemma4EncoderCacheHarness()
+    one_frame_each = _make_keyed_video_param([[1] * 8, [2] * 8])
+    model.validate_multimodal_request_data(one_frame_each.multimodal_data)
+
+    video = {"pixel_values": torch.zeros(3, 18, 1), "num_frames": [1, 2]}
+    data = {"video": video}
+    param = _with_item_metadata(data, _make_item_input_processor())
+
+    counts = video.pop("num_frames")
+    model.validate_multimodal_request_data(data)  # Recorded partitions still describe both videos.
+    param.item_metadata.input_partitions.clear()
+    with pytest.raises(
+        ValueError, match="3 frames for 2 videos.*Pass per-video frame counts in num_frames"
+    ):
+        model.validate_multimodal_request_data(data)
+
+    video["num_frames"] = counts
+    model.validate_multimodal_request_data(data)
+    outputs = model.forward_multimodal_encoder_items(
+        model.prepare_multimodal_encoder_inputs([(param, 0), (param, 1)])
+    )
+    assert [len(output) for output in outputs] == [2, 4]
+
+
+@pytest.mark.cpu_only
 def test_prepared_gemma4_shape_groups_preserve_order_and_dtype():
     tower = mock.Mock(side_effect=lambda pixel_values, **_: pixel_values.flatten(0, 1))
     model = SimpleNamespace(_get_image_features=tower, vision_tower=None)

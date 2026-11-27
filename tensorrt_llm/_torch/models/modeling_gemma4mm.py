@@ -52,6 +52,7 @@ from ...inputs.multimodal import (
     MultimodalItemMetadata,
     MultimodalItemPartition,
     MultimodalParams,
+    get_multimodal_item_metadata,
 )
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -1109,6 +1110,24 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             "video.image_position_ids",
             "audio.audio_features",
         ]
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        video = mm_data.get("video")
+        if not isinstance(video, dict) or video.get("num_frames") is not None:
+            return
+        pixels = video.get("pixel_values")
+        metadata = get_multimodal_item_metadata(mm_data)
+        if not isinstance(pixels, torch.Tensor) or pixels.ndim == 0 or metadata is None:
+            return
+        partition = metadata.input_partitions.get("video", {}).get("pixel_values")
+        if partition is not None and partition.item_lengths is not None:
+            return
+        num_videos = sum(modality == "video" for modality, _ in metadata.item_refs)
+        if pixels.shape[0] > num_videos:
+            raise ValueError(
+                f"Gemma4 received {pixels.shape[0]} frames for {num_videos} videos. "
+                "Pass per-video frame counts in num_frames, as the Gemma4 processor does."
+            )
 
     # TODO(TRTLLM-14981): Implement finer-grained caching for videos.
     @classmethod
