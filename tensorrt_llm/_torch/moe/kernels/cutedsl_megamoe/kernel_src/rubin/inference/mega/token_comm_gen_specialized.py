@@ -312,6 +312,21 @@ class GenphaseTokenComm(KernelComponent):
     # Route words carry (local expert << 16 | offset in the source segment); this
     # marker, above any packed word, is a route the destination does not own.
     route_word_invalid: ClassVar[int] = 0x7FFFFFFF
+    # Processing order. The non-empty experts among local experts 0 .. pinned_expert_count-1 take the first slots in
+    # index order, the rest follow by descending load. The FC12 kernel prefetches the pinned experts' FC1 weights at
+    # its start, before the sizes exist, so the first claim wave streams from L2 instead of waiting for the dispatch.
+    # Both ranking paths (in-warp and histogram) pin.
+    pinned_expert_count: ClassVar[int] = 1
+    # Above this max_tokens_per_rank the start prefetch cost more than it saved (A/B: t32 +1.2%, t128 +0.9%, t512
+    # -1.7%), so the pinning (and the FC12 start prefetch, which follows `pins_experts`) is off there.
+    pin_max_tokens_per_rank: ClassVar[int] = 128
+
+    @property
+    def pins_experts(self) -> int:
+        """Experts pinned to the first slots for this build (0 = plain descending load)."""
+        if self.max_tokens_per_rank > self.pin_max_tokens_per_rank:
+            return 0
+        return min(self.pinned_expert_count, self.local_expert_bucket_count)
     helper_count_matrix_region: ClassVar[str] = "genphase.token_comm.smem.helper_count_matrix"
     helper_totals_region: ClassVar[str] = "genphase.token_comm.smem.helper_totals"
     helper_scan_input_region: ClassVar[str] = "genphase.token_comm.smem.helper_scan_input"
@@ -395,6 +410,10 @@ class GenphaseTokenComm(KernelComponent):
         # Scale factors as a bulk-copied plane gated by a flag (the refine then waits for the metadata
         # and the flag) instead of tagged LL words; faster where the SF rows are wide and the token count high.
         self.sf_plain_transport = impl_desc.get("sf_plain_transport", False)
+        # Standalone-reduce builds: the cross-rank ready counters are never reset (alternating slots, see
+        # ``ready_counter_slot``). In-kernel-reduce builds keep the original protocol: the counters are in the
+        # tail-reset span and the pushers wait for every rank's done signal (``wait_previous_done``) before adding.
+        self.ready_counters_never_reset = not impl_desc.get("reduce_topk_in_kernel", False)
 
         self._validate_configuration()
         # The exchange stages the caller's whole top-k plane (and scores) in SMEM next
@@ -463,22 +482,13 @@ class GenphaseTokenComm(KernelComponent):
             raise ValueError(f"{self.quant_kind} requires hidden_size divisible by {elements_per_sf_atom}.")
 
         # The caller's top-k plane is exactly `routes_per_rank` elements with no
-        # slack, so the bulk copy that stages it has to land on that boundary
-        # rather than rounding up into memory we do not own.
-        topk_plane_bytes = self.routes_per_rank * int(self.topk_index_dtype.width) // 8
-        if topk_plane_bytes % 16 != 0:
-            raise ValueError(
-                f"max_tokens_per_rank * topk * sizeof({self.topk_index_dtype}) must be a multiple of 16 bytes, "
-                f"got {topk_plane_bytes}."
-            )
+        # slack. A plane whose byte count is a multiple of 16 is staged with one
+        # bulk copy; a smaller one (max_tokens_per_rank 1 with top-k 6 or 10: 24 or
+        # 40 bytes) is staged with plain loads, see `_stage_plane_plain`, instead of
+        # rounding the bulk copy up into memory we do not own.
         if self.routes_per_rank > 65536:
             raise ValueError(
                 f"{self.routes_per_rank} routes per rank exceed the 16-bit offset field of the route words."
-            )
-        if self.apply_topk_at_fc1 and (self.routes_per_rank * 4) % 16 != 0:
-            raise ValueError(
-                f"max_tokens_per_rank * topk * 4 must be a multiple of 16 bytes for the score plane, "
-                f"got {self.routes_per_rank * 4}."
             )
         # Each refine group claims and finishes blocks on its own, so it must own
         # whole warps: the group's named barrier id is warp-uniform only if no warp
@@ -775,6 +785,31 @@ class GenphaseTokenComm(KernelComponent):
         """One publication per source rank: its single publisher covers all its data pushers."""
         return self.world_size
 
+    # The cross-rank ready counters are never reset. Call ``epoch`` counts in slot ``epoch & 1``; the first
+    # use of a slot counts up from 0 to the target, the next use (two calls later) counts back down from the
+    # target to 0, and so on. A reader therefore waits for ``counter == target`` with a per-call target.
+    @cute.jit
+    def ready_counter_slot(self, epoch: Int32) -> Int32:
+        if cutlass.const_expr(not self.ready_counters_never_reset):
+            return Int32(0)
+        return epoch & Int32(1)
+
+    @cute.jit
+    def ready_counter_delta(self, epoch: Int32) -> Int32:
+        """+1 when bit 1 of the epoch is clear (count up), -1 when it is set (count down)."""
+        delta = Int32(1)
+        if cutlass.const_expr(self.ready_counters_never_reset):
+            if ((epoch >> Int32(1)) & Int32(1)) != Int32(0):
+                delta = Int32(-1)
+        return delta
+
+    @cute.jit
+    def ready_counter_target(self, epoch: Int32, publications: int) -> Int32:
+        """``publications`` when counting up, 0 when counting down."""
+        if cutlass.const_expr(not self.ready_counters_never_reset):
+            return Int32(publications)
+        return Int32(publications) * ((self.ready_counter_delta(epoch) + Int32(1)) >> Int32(1))
+
     # ------------------------------------------------------------------
     # GMEM workspace
     # ------------------------------------------------------------------
@@ -782,17 +817,27 @@ class GenphaseTokenComm(KernelComponent):
     def register_device_workspace(self, workspace: DeviceWorkspace) -> None:
         """Declare every region this component reads or writes.
 
-        Ready counters are ``tail_reset`` so exactly the leading span can be
+        Rank-local ready counters are ``tail_reset`` so exactly the leading span can be
         zeroed between launches. This component never resets from inside: it exits
-        while the dependent main kernel is still consuming ``token_data_ready``,
-        so clearing counters here would strand any CTA that had not yet observed
-        them. The reset therefore belongs to whoever outlives it -- normally the
-        main kernel's tail: its last arriving CTA zeroes the span once every local
-        CTA has arrived, then advances the epoch and signals every rank; the next
-        call's communication kernel waits for the epoch at entry and its pushers
-        for every rank's signal before writing into a peer, so no rank's next
-        dispatch can touch a half-cleared workspace. A launch without that main
-        kernel (a standalone test) has to zero on the host instead.
+        while the dependent main kernel is still consuming them, so clearing counters
+        here would strand any CTA that had not yet observed them. The reset therefore
+        belongs to whoever outlives it -- the main kernel's tail: its last arriving CTA
+        zeroes the span once every local CTA has arrived, then advances the epoch; the
+        next call's communication kernel waits for the epoch at entry.
+
+        The two cross-rank counters (``token_data_ready``, ``token_sf_plain_ready``) are
+        written by peers, so they are NOT reset: each has two slots, call ``e`` counts in
+        slot ``e & 1``, up from 0 to its target when bit 1 of ``e`` is clear and down from
+        that target to 0 when it is set (see ``ready_counter_slot``). A slot is next used by
+        call ``e + 2``, and a peer can only publish for ``e + 2`` after this rank has
+        published for ``e + 1`` (every rank publishes to every peer, unconditionally), which
+        is after this rank's tail of call ``e``. No reset means nothing for a peer to wait for.
+        A launch without the main kernel (a standalone test) does not advance the epoch, so it
+        has to zero both counters on the host between launches.
+
+        In-kernel-reduce builds (``reduce_topk_in_kernel``) keep the original protocol instead: both counters
+        are ``tail_reset`` and the pushers wait for every rank's done signal before adding. There the tail
+        runs a cross-rank barrier anyway, so the scheme would save nothing.
         """
         self._register_symmetric_regions(workspace)
         self._register_local_regions(workspace)
@@ -846,7 +891,17 @@ class GenphaseTokenComm(KernelComponent):
                 byte_alignment=128,
             )
         for region_name in (self.token_data_ready_region, self.token_sf_plain_ready_region):
-            workspace.register(region_name, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
+            if self.ready_counters_never_reset:
+                workspace.register(
+                    region_name,
+                    cutlass.Int32,
+                    (2,),
+                    buffer_space="shared",
+                    byte_alignment=16,
+                    reset="zero_on_first_allocate",
+                )
+            else:
+                workspace.register(region_name, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
         # Scale-factor rows as LL words, indexed like the plain planes.
         if not self.sf_plain_transport:
             sf_ll_rank_words = self.max_tokens_per_rank * self.sf_ll_row_words
@@ -1434,10 +1489,14 @@ class GenphaseTokenComm(KernelComponent):
 
         index_plane_bytes = self.routes_per_rank * int(self.topk_index_dtype.width) // 8
         score_plane_bytes = self.routes_per_rank * 4
+        # A plane is bulk-copied only when its byte count is a multiple of 16 (the
+        # bulk-copy granule); otherwise its few elements are loaded by the threads.
+        bulk_indices = self.exchange_stages_topk_indices and index_plane_bytes % 16 == 0
+        bulk_scores = self.exchange_stages_topk_scores and score_plane_bytes % 16 == 0
         staged_bytes = 0
-        if cutlass.const_expr(self.exchange_stages_topk_indices):
+        if cutlass.const_expr(bulk_indices):
             staged_bytes += index_plane_bytes
-        if cutlass.const_expr(self.exchange_stages_topk_scores):
+        if cutlass.const_expr(bulk_scores):
             staged_bytes += score_plane_bytes
 
         if cutlass.const_expr(staged_bytes > 0):
@@ -1448,13 +1507,25 @@ class GenphaseTokenComm(KernelComponent):
 
             if thread_idx == Int32(0):
                 cute.arch.mbarrier_arrive_and_expect_tx(load_mbarrier, Int32(staged_bytes))
-                if cutlass.const_expr(self.exchange_stages_topk_indices):
+                if cutlass.const_expr(bulk_indices):
                     index_stage = self._smem_workspace.tensor(self.exchange_topk_stage_region, smem_base)
                     tma_load_1d(index_stage.iterator, topk_indices.iterator, load_mbarrier, Int32(index_plane_bytes))
-                if cutlass.const_expr(self.exchange_stages_topk_scores):
+                if cutlass.const_expr(bulk_scores):
                     score_stage = self._smem_workspace.tensor(self.exchange_score_stage_region, smem_base)
                     tma_load_1d(score_stage.iterator, topk_scores.iterator, load_mbarrier, Int32(score_plane_bytes))
             cute.arch.mbarrier_wait(load_mbarrier, 0)
+        if cutlass.const_expr(self.exchange_stages_topk_indices and not bulk_indices):
+            self._stage_plane_plain(
+                self._smem_workspace.tensor(self.exchange_topk_stage_region, smem_base), topk_indices, thread_idx
+            )
+        if cutlass.const_expr(self.exchange_stages_topk_scores and not bulk_scores):
+            self._stage_plane_plain(
+                self._smem_workspace.tensor(self.exchange_score_stage_region, smem_base), topk_scores, thread_idx
+            )
+        if cutlass.const_expr(
+            (self.exchange_stages_topk_indices and not bulk_indices) or (self.exchange_stages_topk_scores and not bulk_scores)
+        ):
+            cute.arch.sync_threads()
 
         if cutlass.const_expr(self.exchange_stages_topk_indices):
             index_stage = self._smem_workspace.tensor(self.exchange_topk_stage_region, smem_base)
@@ -1599,6 +1670,19 @@ class GenphaseTokenComm(KernelComponent):
         return cute.make_tensor(
             cute.recast_ptr(index_stage.iterator, dtype=cutlass.Int32), cute.make_layout((self.topk_slab_elements,))
         )
+
+    @cute.jit
+    def _stage_plane_plain(self, stage: cute.Tensor, plane: cute.Tensor, thread_idx: Int32) -> None:
+        """Copy the caller's `routes_per_rank`-element plane into its staging slab with plain loads.
+
+        For planes whose byte count is not a bulk-copy granule (multiple of 16 bytes); the
+        slab's padding elements are left as they are, nothing reads them.
+        """
+        source = cute.make_tensor(plane.iterator, cute.make_layout((self.routes_per_rank,)))
+        for plane_round in cutlass.range_constexpr(ceil_div(self.routes_per_rank, self.threads_per_cta)):
+            route = Int32(plane_round * self.threads_per_cta) + thread_idx
+            if route < Int32(self.routes_per_rank):
+                stage[route] = source[route]
 
     @cute.jit
     def _canonicalize_wire_indices(self, index_stage: cute.Tensor, thread_idx: Int32) -> None:
@@ -1767,12 +1851,15 @@ class GenphaseTokenComm(KernelComponent):
             iket.range_pop()
             if cutlass.const_expr(self.sf_plain_transport):
                 iket.range_push("pusher.publish")
+                previous_done = Int32(0)
+                if cutlass.const_expr(not self.ready_counters_never_reset):
+                    previous_done = self._tail.previous_done_observation(device_workspace)
                 self._publish_payload_flags(
                     device_workspace,
                     peer_rank_ptr_mapper,
                     thread_idx,
                     self.token_sf_plain_ready_region,
-                    self._tail.previous_done_observation(device_workspace),
+                    previous_done,
                 )
                 iket.range_pop()
             if pusher_idx == Int32(0):
@@ -2001,7 +2088,9 @@ class GenphaseTokenComm(KernelComponent):
         Causality: bulk writes -> wait_group -> release.gpu (pusher) -> acquire.gpu
         (here) -> fence.sys -> flag, so a peer that acquires the flag sees the rows.
         """
-        previous_done = self._tail.previous_done_observation(device_workspace)
+        previous_done = Int32(0)
+        if cutlass.const_expr(not self.ready_counters_never_reset):
+            previous_done = self._tail.previous_done_observation(device_workspace)
         if lane_idx == Int32(0):
             spin_wait(
                 device_workspace.ptr(self.pushers_done_region),
@@ -2011,13 +2100,21 @@ class GenphaseTokenComm(KernelComponent):
             cute.arch.fence_acq_rel_sys()
         cute.arch.sync_warp()
         if lane_idx < Int32(self.world_size):
-            # The flag counters are in the peers' tail-reset span: a peer must have
-            # reset them for the previous call before this call's increments land.
-            self._tail.wait_previous_done(device_workspace, previous_done)
+            # Never reset (standalone reduce): nothing to wait for, this call's slot and direction come from the
+            # epoch. In-kernel reduce: the counters are in the peers' tail-reset span, so a peer must have reset
+            # them for the previous call before this call's increments land.
+            epoch = Int32(0)
+            if cutlass.const_expr(self.ready_counters_never_reset):
+                epoch = self._tail.read_epoch(device_workspace)
+            else:
+                self._tail.wait_previous_done(device_workspace, previous_done)
             counter_address = device_workspace.ptr(self.token_data_ready_region).toint()
             # Lane l signals peers l, l + 32, ...: every rank gets its flag for any world size.
             for peer in cutlass.range(lane_idx, self.world_size, 32):
-                red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(counter_address, peer, Int64(0)), Int32(1))
+                red_add_relaxed_sys_s32(
+                    peer_rank_ptr_mapper.map(counter_address, peer, Int64(self.ready_counter_slot(epoch) * Int32(4))),
+                    self.ready_counter_delta(epoch),
+                )
 
     @cute.jit
     def _publish_payload_flags(
@@ -2045,11 +2142,16 @@ class GenphaseTokenComm(KernelComponent):
             cute.arch.fence_acq_rel_sys()
         cute.arch.sync_threads()
         if thread_idx < Int32(self.world_size):
-            # The flag counters are in the peers' tail-reset span: a peer must have
-            # reset them for the previous call before this call's increments land.
-            self._tail.wait_previous_done(device_workspace, previous_done)
+            epoch = Int32(0)
+            if cutlass.const_expr(self.ready_counters_never_reset):
+                epoch = self._tail.read_epoch(device_workspace)
+            else:
+                self._tail.wait_previous_done(device_workspace, previous_done)
             counter_address = device_workspace.ptr(region_name).toint()
-            red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(counter_address, thread_idx, Int64(0)), Int32(1))
+            red_add_relaxed_sys_s32(
+                peer_rank_ptr_mapper.map(counter_address, thread_idx, Int64(self.ready_counter_slot(epoch) * Int32(4))),
+                self.ready_counter_delta(epoch),
+            )
 
     @cute.jit
     def _run_sort(
@@ -2383,10 +2485,16 @@ class GenphaseTokenComm(KernelComponent):
             own_load = Int32(0)
             if lane_idx < Int32(self.local_expert_bucket_count):
                 own_load = totals[lane_idx]
+            # Rank key: the load, except that pinned non-empty experts outrank every load and keep index order among
+            # themselves; empty experts stay last either way.
+            own_key = own_load
+            if cutlass.const_expr(self.pins_experts > 0):
+                if (own_load > Int32(0)) & (lane_idx < Int32(self.pins_experts)):
+                    own_key = Int32(0x40000000) - lane_idx
             slot = Int32(0)
             for other in cutlass.range_constexpr(self.local_expert_bucket_count):
-                other_load = Int32(cute.arch.shuffle_sync(own_load, Int32(other)))
-                if (other_load > own_load) | ((other_load == own_load) & (Int32(other) < lane_idx)):
+                other_key = Int32(cute.arch.shuffle_sync(own_key, Int32(other)))
+                if (other_key > own_key) | ((other_key == own_key) & (Int32(other) < lane_idx)):
                     slot = slot + Int32(1)
             if lane_idx < Int32(self.local_expert_bucket_count):
                 self._place_expert_at_slot(device_workspace, smem_base, slot, lane_idx, own_load)
@@ -2427,18 +2535,36 @@ class GenphaseTokenComm(KernelComponent):
         # Key and within-bin index stay in registers across the scan rather than
         # being recomputed after it. Rounds past the bucket count still get a
         # defined key so that no register is read on a path that never wrote it.
+        # Pinned experts (index < pins, non-empty) take slots 0 .. pinned_total-1 in index order and stay out of the
+        # bins; every binned slot is shifted by pinned_total.
+        pins = self.pins_experts
+        pinned_total = Int32(0)
+        for pinned in cutlass.range_constexpr(pins):
+            if totals[pinned] > Int32(0):
+                pinned_total = pinned_total + Int32(1)
         for bucket_round in cutlass.range_constexpr(bucket_rounds):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             keys[bucket_round] = Int32(0)
             offsets_in_bin[bucket_round] = Int32(0)
             if bucket < Int32(self.local_expert_bucket_count):
-                # No histogram spans the exact counts, so the bin is the binade;
-                # inverting it is what makes the prefix below descend.
-                binade = Int32(32) - Int32(cute.arch.clz(totals[bucket]))
-                keys[bucket_round] = Int32(self.load_bin_count - 1) - binade
-                offsets_in_bin[bucket_round] = Int32(
-                    cute.arch.atomic_add(load_bins.iterator + keys[bucket_round], Int32(1), sem="relaxed", scope="cta")
-                )
+                is_pinned = cutlass.Boolean(False)
+                if cutlass.const_expr(pins > 0):
+                    is_pinned = (bucket < Int32(pins)) & (totals[bucket] > Int32(0))
+                if is_pinned:
+                    keys[bucket_round] = Int32(-1)
+                    pinned_rank = Int32(0)
+                    for earlier in cutlass.range_constexpr(pins):
+                        if (Int32(earlier) < bucket) & (totals[earlier] > Int32(0)):
+                            pinned_rank = pinned_rank + Int32(1)
+                    offsets_in_bin[bucket_round] = pinned_rank
+                else:
+                    # No histogram spans the exact counts, so the bin is the binade;
+                    # inverting it is what makes the prefix below descend.
+                    binade = Int32(32) - Int32(cute.arch.clz(totals[bucket]))
+                    keys[bucket_round] = Int32(self.load_bin_count - 1) - binade
+                    offsets_in_bin[bucket_round] = Int32(
+                        cute.arch.atomic_add(load_bins.iterator + keys[bucket_round], Int32(1), sem="relaxed", scope="cta")
+                    )
         cute.arch.sync_threads()
 
         # The bin count is exactly a warp, so the populations become slot bases in
@@ -2453,7 +2579,9 @@ class GenphaseTokenComm(KernelComponent):
         for bucket_round in cutlass.range_constexpr(bucket_rounds):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.local_expert_bucket_count):
-                slot = load_bins[keys[bucket_round]] + offsets_in_bin[bucket_round]
+                slot = offsets_in_bin[bucket_round]
+                if keys[bucket_round] >= Int32(0):
+                    slot = pinned_total + load_bins[keys[bucket_round]] + offsets_in_bin[bucket_round]
                 self._place_expert_at_slot(device_workspace, smem_base, slot, bucket, totals[bucket])
         cute.arch.sync_threads()
 
@@ -2635,9 +2763,13 @@ class GenphaseTokenComm(KernelComponent):
             )
             iket.range_push("refine.wait_sf")
             if thread_idx == Int32(0):
+                epoch = Int32(0)
+                if cutlass.const_expr(self.ready_counters_never_reset):
+                    epoch = self._tail.read_epoch(device_workspace)
+                sf_target = self.ready_counter_target(epoch, self.sf_ready_target)
                 spin_wait(
-                    device_workspace.ptr(self.token_sf_plain_ready_region),
-                    lambda value: value == Int32(self.sf_ready_target),
+                    device_workspace.ptr(self.token_sf_plain_ready_region) + self.ready_counter_slot(epoch),
+                    lambda value: value == sf_target,
                     scope="sys",
                 )
             cute.arch.sync_threads()

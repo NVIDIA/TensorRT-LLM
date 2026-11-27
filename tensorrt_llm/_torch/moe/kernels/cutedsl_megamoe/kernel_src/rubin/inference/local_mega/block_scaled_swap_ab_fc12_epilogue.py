@@ -16,6 +16,7 @@ from cutlass.cutlass_dsl import Int64
 from .....api import ImplDesc, OptionalRequirement, ProblemDesc
 from .....helpers.cute_py_helpers import tcgen05_block_scaled_acc_dtype
 from .....helpers.flag_batch import make_flag_batch_tracker
+from .....helpers.ptx_helpers import red_add_relaxed_gpu_s32
 from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
 from .....quant_def import QuantKind
 from ....function_mapping import FunctionMapping
@@ -72,6 +73,7 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
             self.swiglu_alpha = float(self.swiglu_alpha)
             self.swiglu_beta = float(self.swiglu_beta)
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
+        self.use_tanh_sigmoid = problem_desc.get("use_tanh_sigmoid", False)
         # quick_geglu is Blackwell-only so far; refuse rather than silently computing SwiGLU.
         if problem_desc.get("gate_activation") not in (None, "swiglu"):
             raise NotImplementedError(
@@ -188,6 +190,7 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
         tidx: cutlass.Int32,
         routing_metadata: cute.Tensor,
         optional_epi_args: Optional[GatedActEpilogueArgs] = None,
+        ring_retire_counter: Optional[cute.Tensor] = None,  # ring workspace: the per-block retire counter
     ):
         if cutlass.const_expr(not smem_workspace.finalized):
             raise RuntimeError("SwapABGatedActEpilogue.run requires a finalized SmemWorkspace.")
@@ -226,6 +229,7 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
             fc2_output,
             routing_metadata,
             optional_epi_args,
+            ring_retire_counter=ring_retire_counter,
         )
 
         acc_consumer_state = pipeline.make_pipeline_state(
@@ -282,8 +286,12 @@ class SwapABFc2Epilogue(_SharedSwapABFc2Epilogue):
         fc2_output: cute.Tensor,
         routing_metadata: cute.Tensor,
         optional_epi_args: GatedActEpilogueArgs,
+        ring_retire_counter: Optional[cute.Tensor] = None,
     ):
         self.base = base
+        # Ring workspace of the kernel: the per-block retire counter, to which _on_accumulator_complete adds the
+        # FC2 tiles that no longer read a block. None without a ring.
+        self.ring_retire_counter = ring_retire_counter
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         self.warp_idx = self.tidx // 32
         self.lane_idx = self.tidx % 32
@@ -328,6 +336,25 @@ class SwapABFc2Epilogue(_SharedSwapABFc2Epilogue):
             Int64(0),
             True,
         )
+
+    @cute.jit
+    def _on_accumulator_complete(self, work_tile_info: SwapAbFc12WorkTileInfo) -> None:
+        """Ring workspace: count this in-bound FC2 tile for its token block.
+
+        The tile's accumulator is complete: its MMAs are done, so it no longer reads the block's FC1-output
+        rows. When every in-bound FC2 tile of the block has counted, the block is retired and token_in may write
+        the next block of its ring slot. Thread 0 of the CTA counts; the epilogue is one warpgroup, so a CTA has
+        one such thread. The add is relaxed: it makes no write of this thread visible. Nothing is traced without
+        a bound counter. The epilogue counts here because the MMA warp of this kernel has no uniform register
+        left for a count.
+        """
+        if cutlass.const_expr(self.ring_retire_counter is not None):
+            publishes = (
+                work_tile_info.tile_m_idx * cutlass.Int32(self.cta_tile_m) < cutlass.Int32(self.fc2_output.shape[2])
+            ) & (self.tidx == cutlass.Int32(0))
+            if publishes:
+                block = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+                red_add_relaxed_gpu_s32(self.ring_retire_counter.iterator + block, cutlass.Int32(1))
 
     @cute.jit
     def _make_output_router(self, work_tile_info: SwapAbFc12WorkTileInfo) -> "Fc2OutputRouter":

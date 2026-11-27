@@ -477,6 +477,7 @@ class _OneRoundRouter(KernelComponent):
         peer_rank_ptr_mapper_host,
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         """Launch the push + sort grid. Not PDL: it starts after its predecessor completed, so it may read the
         staged top-k and activation at entry; it releases the MoE kernel at entry like the metadata-push router."""
@@ -490,6 +491,7 @@ class _OneRoundRouter(KernelComponent):
             shared_workspace,
             peer_rank_ptr_mapper_host.make_device_object(),
             device_workspace,
+            tmp_buffer,
         )
         kernel.launch(
             grid=[self.one_round_cta_count, 1, 1],
@@ -510,6 +512,7 @@ class _OneRoundRouter(KernelComponent):
         shared_workspace: cute.Pointer,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         device_workspace: DeviceWorkspace,
+        tmp_buffer: Optional[cute.Pointer],
     ) -> None:
         cute.arch.griddepcontrol_launch_dependents()
         thread_idx, _, _ = cute.arch.thread_idx()
@@ -519,7 +522,7 @@ class _OneRoundRouter(KernelComponent):
 
         storage = cutlass.utils.SmemAllocator().allocate(self._smem_workspace.storage_class())
         smem_base = storage.buffer.data_ptr()
-        device_workspace.assign_device_members(local_workspace, shared_workspace)
+        device_workspace.assign_device_members(local_workspace, shared_workspace, tmp_buffer)
 
         self._push(
             topk_indices,

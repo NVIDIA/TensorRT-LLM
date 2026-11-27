@@ -155,13 +155,14 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 #                         # SM107 generation-phase kernel only, ("decode", optional FC1 lead >= 0)
 #    work_id_mode,        # "grid_stride" | "atomic_counter"
 #    token_back_mode,     # "epi_warps" | "standalone_warps" | "reuse_dispatch_warps"
+#                         # | "hybrid_warps" (combine_dedup only)
 #    use_bulk_fc2_store,  # bool (epi -> peer UBLK; non-epi -> local TMA)
 #    fc2_tma_stages,      # optional staged-bulk depth
-#    flag_batch,          # int >= 1 (standalone_warps requires == 1)
+#    flag_batch,          # int >= 1 (standalone_warps without dedup requires == 1)
 #    epi_flag_batch,      # (int, int) fc1/fc2 done-counter publish batch
 #    token_back_ready_granularity,  # "expert" | "token_tile"
 #    combine_dedup)       # bool: one reduced FC2 row per destination rank
-#                         # (SM107 generic kernel only; never a gen-phase bucket)
+#                         # (generic kernel only; never an SM107 gen-phase bucket)
 #
 # Derived / out-of-tuple:
 #   use_2cta_instrs      = (mma_tiler_mnk[0] == 256), derived in _build_kernel.
@@ -690,6 +691,96 @@ _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS: dict[Tuple, Tuple] = {
     for key in _SM103_DSV41_FLASH_DEFAULT_TACTICS
 }
 
+
+def _sm100_dsv4_ep4_problem_key(
+    hidden_size: int, intermediate_size: int, max_tokens_per_rank: int
+) -> Tuple:
+    """Runner key of a DeepSeek-V4 MoE (384 experts, top-6, SwiGLU clamp 10) at EP4 on SM100."""
+    return (
+        100,
+        4,
+        6,
+        96,
+        hidden_size,
+        intermediate_size,
+        2 * intermediate_size,
+        max_tokens_per_rank,
+        str(torch.bfloat16),
+        True,
+        10.0,
+        None,
+        None,
+        False,
+        "bf16",
+        None,
+        None,
+        0,
+    )
+
+
+def _sm100_phase_interleave_tactic(
+    mma_tiler: Tuple[int, int, int],
+    schedule_hint: Optional[int],
+    fc2_tma_stages: int,
+    flag_batch: int,
+    epi_flag_batch: Tuple[int, int],
+    token_back_mode: str,
+) -> Tuple:
+    """Cluster-4 (fallback 2) phase-interleaved tactic; a combine-warp token-back mode dedups."""
+    return (
+        list(mma_tiler),
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", schedule_hint),
+        "atomic_counter",
+        token_back_mode,
+        True,
+        fc2_tma_stages,
+        flag_batch,
+        epi_flag_batch,
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        token_back_mode != "epi_warps",  # nosec B105 -- token-back mode name, not a credential
+    )
+
+
+# Static defaults for DeepSeek-V4-Pro and DeepSeek-V4.1-Flash at EP4 on GB200 (SM100), from the
+# upstream GB200 prefill tables, kept only for the buckets measured faster than the token-bucket
+# default. (hidden, intermediate) -> max_tokens_per_rank -> (tile, hint, fc2_tma_stages, flag_batch,
+# epi_flag_batch, token_back_mode); a combine-warp token-back mode marks a combine-dedup entry.
+_SM100_DSV4_EP4_TACTIC_FIELDS: dict[Tuple[int, int], dict[int, Tuple]] = {
+    (7168, 3072): {
+        4096: ((256, 256, 256), None, 1, 4, (1, 1), "epi_warps"),
+        8192: ((256, 256, 256), 3, 1, 1, (2, 4), "epi_warps"),
+        16384: ((256, 256, 256), 3, 1, 4, (2, 4), "epi_warps"),
+        32768: ((256, 256, 256), None, 1, 4, (1, 4), "epi_warps"),
+    },
+    (5120, 2304): {
+        2048: ((256, 128, 256), 3, 1, 1, (2, 4), "epi_warps"),
+        4096: ((256, 256, 256), 2, 1, 1, (1, 4), "epi_warps"),
+        8192: ((256, 256, 256), 3, 1, 2, (1, 4), "epi_warps"),
+        16384: ((256, 256, 256), 3, 1, 2, (1, 1), "epi_warps"),
+        32768: ((256, 256, 256), 3, 1, 4, (1, 2), "standalone_warps"),
+    },
+}
+
+# Combine dedup cannot run with the fused shared expert (the kernel refuses it), so each dedup entry
+# also has a plain (epi_warps) form in _SM100_DSV4_EP4_DEFAULT_TACTICS for that runner and for sizing.
+_SM100_DSV4_EP4_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
+    _sm100_dsv4_ep4_problem_key(hidden, intermediate, max_tokens_per_rank): (
+        _sm100_phase_interleave_tactic(*fields[:5], "epi_warps")
+    )
+    for (hidden, intermediate), buckets in _SM100_DSV4_EP4_TACTIC_FIELDS.items()
+    for max_tokens_per_rank, fields in buckets.items()
+}
+_SM100_DSV4_EP4_COMBINE_DEDUP_TACTICS: dict[Tuple, Tuple] = {
+    _sm100_dsv4_ep4_problem_key(hidden, intermediate, max_tokens_per_rank): (
+        _sm100_phase_interleave_tactic(*fields)
+    )
+    for (hidden, intermediate), buckets in _SM100_DSV4_EP4_TACTIC_FIELDS.items()
+    for max_tokens_per_rank, fields in buckets.items()
+    if fields[5] != "epi_warps"  # nosec B105 -- token-back mode name, not a credential
+}
+
 # The evict-first L2 hint on the expert-weight TMA loads pays while each weight tile is streamed
 # about once: through a mean of 96 received rows per expert (DEP32 at 192 tokens per rank), within
 # one 128-row token tile; with more rows, hot experts re-read their weights across token tiles.
@@ -708,51 +799,6 @@ def _megamoe_weight_evict_first(
         and received_rows <= _WEIGHT_EVICT_FIRST_MAX_ROWS_PER_EXPERT * num_experts_per_rank
         and received_rows <= _WEIGHT_EVICT_FIRST_MAX_ROWS_PER_RANK
     )
-
-
-# Static default for the SM107 Kimi K3 NVFP4 generation-phase shape at EP4. The full runner
-# key matches only a runner whose max_tokens_per_rank is exactly 512 (the 512 rung of the
-# default ladder); a per-rank cap of 385-511 keeps the generic table because it was not
-# measured. With this tactic the 128, 192, 256, 384 and 1024 buckets measured no faster
-# than the generic table; 32 and 64 were not measured. K3 applies top-k after FC2, and the
-# full key keeps this tactic from reaching other shapes, EP sizes, combine formats,
-# helper-expert counts or top-k placements.
-_SM107_KIMI_K3_GENPHASE_TACTICS: dict[Tuple, Tuple] = {
-    (
-        107,
-        4,
-        16,
-        896 // 4,
-        3584,
-        3072,
-        6144,
-        max_tokens_per_rank,
-        str(torch.bfloat16),
-        False,
-        None,
-        4.0,
-        25.0,
-        False,
-        "bf16",
-        None,
-        None,
-        0,
-    ): (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("phase_interleave", phase_hint),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        epi_flag_batch,
-    )
-    for max_tokens_per_rank, (phase_hint, epi_flag_batch) in {
-        512: (16, (2, 2)),
-    }.items()
-}
 
 
 # ---------------------------------------------------------------------------
@@ -836,12 +882,19 @@ _MEGAMOE_NVFP4_COMBINE_BULK_TACTIC: Tuple = (
     (2, 1),
 )
 
+# Generation-phase kernel tactics per max_tokens_per_rank bucket. The kernel runs the decode
+# scheduler only: ("decode", L) claims FC1 tiles up to L token blocks ahead of FC2 (None: every FC1
+# tile of a stream before its FC2 tiles; 65535 keeps that order on one shared counter). Each entry
+# was picked on VR200 at EP4 (DSv4-Pro and Kimi K3, balanced and power-law routing) as the decode
+# tactic whose worst case across those four was best; all are within 1% of the phase_interleave
+# table they replace, and DSv4-Pro gains 1-4% at 128-512. N64 tiles are absent: TRT-LLM launches
+# them on a (2, 1) cluster, which the generation-phase kernel refuses.
 _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
     32: (
         [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", None),
         "atomic_counter",
         "epi_warps",
         True,
@@ -853,79 +906,80 @@ _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
         [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 22),
         "atomic_counter",
         "epi_warps",
         True,
         1,
         1,
-        (1, 4),
+        (2, 2),
     ),
     128: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 27),
         "atomic_counter",
         "epi_warps",
         True,
         1,
         1,
-        (1, 4),
+        (1, 1),
     ),
     192: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 65535),
         "atomic_counter",
         "epi_warps",
         True,
         1,
         1,
-        (1, 4),
+        (4, 4),
     ),
     256: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 65535),
         "atomic_counter",
         "epi_warps",
         True,
         1,
         1,
-        (1, 1),
+        (4, 4),
     ),
+    # 384: re-tuned on the decode-only kernel, where this entry beats N256 / lead 45 by 1-2%.
     384: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 91),
         "atomic_counter",
         "epi_warps",
         True,
-        2,
         1,
-        (1, 1),
+        1,
+        (2, 4),
     ),
     512: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 91),
         "atomic_counter",
         "epi_warps",
         True,
-        2,
         1,
-        (1, 4),
+        1,
+        (2, 4),
     ),
     1024: (
         [256, 256, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", None),
+        ("decode", 14),
         "atomic_counter",
         "epi_warps",
         True,
@@ -1009,6 +1063,8 @@ def _shape_tuned_megamoe_tactic(problem_key: Tuple) -> Optional[Tuple]:
     if tactic is None:
         tactic = _SM107_DSV41_FLASH_DEFAULT_TACTICS.get(problem_key)
     if tactic is None:
+        tactic = _SM100_DSV4_EP4_DEFAULT_TACTICS.get(problem_key)
+    if tactic is None:
         rows_per_expert = problem_key[7] * problem_key[2] / problem_key[3]
         table = (
             _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS
@@ -1028,7 +1084,6 @@ def _default_megamoe_tactic_for_problem(
     in_kernel_fc2_reduce: bool,
     combine_format: str,
     shape_tuned_tactic: Optional[Tuple] = None,
-    genphase_shape_tuned_tactic: Optional[Tuple] = None,
 ) -> Tuple:
     if combine_format != "bf16":
         if sm_version == 107:
@@ -1046,8 +1101,6 @@ def _default_megamoe_tactic_for_problem(
         )
         if in_kernel_fc2_reduce != expected_in_kernel_fc2_reduce:
             return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
-        if genphase_shape_tuned_tactic is not None:
-            return _unpack_tactic(genphase_shape_tuned_tactic)
         return _unpack_tactic(_SM107_GENPHASE_TACTICS[bucket])
     if in_kernel_fc2_reduce:
         return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
@@ -1068,11 +1121,21 @@ def _default_megamoe_tactic_for_key(
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
         shape_tuned_tactic=_shape_tuned_megamoe_tactic(problem_key),
-        genphase_shape_tuned_tactic=_SM107_KIMI_K3_GENPHASE_TACTICS.get(problem_key),
     )
-    if combine_dedup and _sm107_default_combine_dedup(problem_key):
-        return _with_combine_dedup(tactic)
+    if combine_dedup:
+        dedup_tactic = _SM100_DSV4_EP4_COMBINE_DEDUP_TACTICS.get(problem_key)
+        if dedup_tactic is not None:
+            return _unpack_tactic(dedup_tactic)
+        if _sm107_default_combine_dedup(problem_key):
+            return _with_combine_dedup(tactic)
     return tactic
+
+
+def _megamoe_default_combine_dedup(problem_key: Tuple) -> bool:
+    """Whether the default tactic of ``problem_key`` (a runner key) turns combine dedup on."""
+    return problem_key in _SM100_DSV4_EP4_COMBINE_DEDUP_TACTICS or _sm107_default_combine_dedup(
+        problem_key
+    )
 
 
 def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
@@ -1322,10 +1385,10 @@ def _construct_megamoe_kernel(
     bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
     genphase = bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS
     if common.get("combine_dedup", False):
-        # Only the SM107 generic kernel declares the option; ImplDesc drops undeclared keys,
-        # so any other kernel would silently build without it.
-        if sm_version != 107 or genphase:
-            raise ValueError("combine_dedup applies to the SM107 generic MegaMoE kernel only.")
+        # Only the generic kernels declare the option; ImplDesc drops undeclared keys,
+        # so the SM107 generation-phase kernel would silently build without it.
+        if sm_version not in (100, 103, 107) or genphase:
+            raise ValueError("combine_dedup applies to the generic MegaMoE kernels only.")
         impl_values["combine_dedup"] = True
     ugpu_kernel_cls = None
     if ugpu_weight_layout != "none":
@@ -1386,6 +1449,14 @@ def _construct_megamoe_kernel(
             rejection = exc
     kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
     return construct(kernel_cls), rejection
+
+
+def _megamoe_tmp_buffer_span(kernel) -> Tuple[int, int]:
+    """Return (offset, bytes) of the kernel's tmp buffer behind its local workspace state."""
+    if not hasattr(kernel, "get_tmp_buffer_bytes"):
+        return 0, 0
+    local_bytes, _ = kernel.get_workspace_sizes()
+    return pad_up(int(local_bytes), 128), int(kernel.get_tmp_buffer_bytes())
 
 
 def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
@@ -1571,10 +1642,15 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
     if schedule_mode in {"phase_interleave", "decode"} and work_id_mode != "atomic_counter":
         raise ValueError(f"{schedule_mode} requires work_id_mode='atomic_counter'.")
 
-    if token_back_mode not in {"epi_warps", "standalone_warps", "reuse_dispatch_warps"}:
+    if token_back_mode not in {
+        "epi_warps",
+        "standalone_warps",
+        "reuse_dispatch_warps",
+        "hybrid_warps",
+    }:
         raise ValueError(
             f"token_back_mode must be one of 'epi_warps' / 'standalone_warps' / "
-            f"'reuse_dispatch_warps', got {token_back_mode!r}."
+            f"'reuse_dispatch_warps' / 'hybrid_warps', got {token_back_mode!r}."
         )
 
     if not isinstance(use_bulk_fc2_store, bool):
@@ -1604,9 +1680,15 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             f"flag_batch must be an int in [1, {_FLAG_BATCH_MAX}] (kernel "
             f"TokenInPullTokenBackPush hard limit), got {flag_batch!r}."
         )
-    if token_back_mode == "standalone_warps" and flag_batch != 1:  # nosec B105
+    # The combine-dedup token comm batches the token-in flags in every token-back mode.
+    if (
+        token_back_mode == "standalone_warps"  # nosec B105 -- mode name, not a credential
+        and flag_batch != 1
+        and combine_dedup is not True
+    ):
         raise ValueError(
-            f"token_back_mode='standalone_warps' requires flag_batch == 1, got {flag_batch}."
+            f"token_back_mode='standalone_warps' requires flag_batch == 1 without combine_dedup, "
+            f"got {flag_batch}."
         )
 
     if (not isinstance(epi_flag_batch, (tuple, list))) or len(epi_flag_batch) != 2:
@@ -1642,6 +1724,7 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         if work_id_mode != "atomic_counter":
             unmet.append(f"work_id_mode={work_id_mode!r} (need 'atomic_counter')")
         if token_back_mode not in ("standalone_warps", "reuse_dispatch_warps"):
+            # hybrid_warps (dedup only) is excluded through combine_dedup's 'expert' granularity.
             unmet.append(
                 f"token_back_mode={token_back_mode!r} "
                 f"(need 'standalone_warps' or 'reuse_dispatch_warps')"
@@ -1657,15 +1740,19 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
 
     if not isinstance(combine_dedup, bool):
         raise ValueError(f"combine_dedup must be bool, got {combine_dedup!r}.")
+    if token_back_mode == "hybrid_warps" and not combine_dedup:  # nosec B105 -- mode, not a credential
+        raise ValueError("token_back_mode='hybrid_warps' exists only with combine_dedup=True.")
     if combine_dedup:
         # Tactic-local half of the kernel's combine_dedup guard; the problem-level
-        # half (top-k at FC1, BF16 combine, world size <= 32) raises at construction.
+        # half (top-k at FC1, BF16 combine, world size <= 32, no fused shared expert)
+        # raises at construction.
         unmet = []
-        if sm_version != 107:
-            unmet.append(f"SM{sm_version} (need the SM107 generic kernel)")
+        if sm_version not in (100, 103, 107):
+            unmet.append(f"SM{sm_version} (need an SM100, SM103 or SM107 generic kernel)")
         if token_back_mode == "epi_warps":  # nosec B105 -- token-back mode name, not a credential
             unmet.append(
-                "token_back_mode='epi_warps' (need 'standalone_warps' or 'reuse_dispatch_warps')"
+                "token_back_mode='epi_warps' (need 'standalone_warps', 'reuse_dispatch_warps' "
+                "or 'hybrid_warps')"
             )
         if not use_bulk_fc2_store:
             unmet.append("use_bulk_fc2_store=False (need True, FC2 staged in SMEM)")
@@ -2090,12 +2177,20 @@ if IS_MEGAMOE_OP_AVAILABLE:
         if _MEGAMOE_TUNING_WORKSPACE_KEYS:
             _evict_latched_tuning_workspaces()
         local_bytes, _ = kernel.get_workspace_sizes()
+        # The kernel's caller-owned tmp buffer (per-launch data, never zeroed)
+        # is the 128-byte-aligned tail of the same allocation, so it shares the
+        # local workspace's lifetime, cache eviction and captured address.
+        tmp_offset, tmp_bytes = _megamoe_tmp_buffer_span(kernel)
         # Only the atomic counters need zeroing (a stray negative byte hangs
         # spin_wait at 100% SM); the multi-GiB bulk is overwritten every launch
         # (full ``torch.zeros`` = huge wasted memset). Zero the leading counter
         # prefix plus the persisted ``nvlink_barrier_counter``, deliberately
         # OUTSIDE that prefix so the device tail-reset never touches it.
-        local_workspace = torch.empty(local_bytes, dtype=torch.uint8, device=device)
+        local_workspace = torch.empty(
+            tmp_offset + tmp_bytes if tmp_bytes else local_bytes, dtype=torch.uint8, device=device
+        )
+        if local_workspace.data_ptr() % 128 != 0:
+            raise RuntimeError("MegaMoE-CuteDSL: the local workspace must be 128-byte aligned.")
         _lead = int(kernel.require_zero_workspace_leading_bytes[0])
         local_workspace[:_lead].zero_()
         _bc_off, _bc_n, _, _, _ = _megamoe_barrier_reset_slices(kernel)
@@ -2907,17 +3002,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
-            for default_tactic in (
-                _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
-                _SM107_KIMI_K3_GENPHASE_TACTICS.get(self._tactic_lookup_key()),
-            ):
-                if default_tactic is not None:
-                    default_tactic = _unpack_tactic(default_tactic)
-                    if default_tactic not in candidates:
-                        candidates.append(default_tactic)
+            default_tactic = _shape_tuned_megamoe_tactic(self._tactic_lookup_key())
+            if default_tactic is not None:
+                default_tactic = _unpack_tactic(default_tactic)
+                if default_tactic not in candidates:
+                    candidates.append(default_tactic)
             # The provider fits a dedup default and its non-dedup base (see
             # query_megamoe_kernel_properties); no other dedup tactic is sized for.
-            if _sm107_default_combine_dedup(self.unique_id()):
+            if _megamoe_default_combine_dedup(self.unique_id()):
                 default_tactic = _default_megamoe_tactic_for_key(
                     self.unique_id(), num_tokens=num_tokens
                 )
@@ -3158,7 +3250,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 ugpu_weight_layout=self.ugpu_weight_layout,
             )
             if rejection is not None:
-                logger.debug(
+                # A rejected default runs on the generic kernel: correct but slower, so say so.
+                # Autotune candidates may be rejected by design.
+                log = logger.debug if self.tactic_autotune else logger.warning
+                log(
                     f"[MegaMoE] gen specialization rejected tactic {tactic!r}: "
                     f"{type(rejection).__name__}: {rejection}"
                 )
@@ -3212,6 +3307,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 _megamoe_ugpu_die_smid_mask() if self.ugpu_weight_layout != "none" else None,
             )
 
+        def _default_tactic(self, num_tokens: int) -> Tuple:
+            """Default tactic of this runner; a subclass with its own kernels overrides it."""
+            key = self._tactic_lookup_key()
+            tactic = _default_megamoe_tactic_for_key(key, num_tokens=num_tokens)
+            if self.shared_intermediate_size is not None and _unpack_tactic(tactic)[11]:
+                # The kernel has no combine dedup with the fused shared expert.
+                tactic = _default_megamoe_tactic_for_key(
+                    key, num_tokens=num_tokens, combine_dedup=False
+                )
+            return tactic
+
         def _resolve_kernel_descriptor(
             self, tactic: Tuple, *, allow_fallback: bool
         ) -> Tuple[Any, Tuple]:
@@ -3247,11 +3353,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 if not use_default_tactic and _unpack_tactic(tactic) != _unpack_tactic(tactic_t):
                     raise ValueError("Localized MegaMoE weights require the fixed uGPU tactic")
             elif use_default_tactic:
-                num_tokens = int(inputs[0].shape[0])
-                tactic_t = _default_megamoe_tactic_for_key(
-                    self._tactic_lookup_key(),
-                    num_tokens=num_tokens,
-                )
+                tactic_t = self._default_tactic(int(inputs[0].shape[0]))
             elif isinstance(tactic, list):
                 tactic_t = tuple(tactic)
             else:
@@ -3453,18 +3555,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # present K stride-1 via a transpose VIEW (DLPack carries the
             # strides); do NOT ``.contiguous()``.
             output_activation = combine_output.reshape(combine_output.shape[0], self.hidden_size)
+            # The top-k reduce stores 256-bit rows: the kernel requires the
+            # output declared 32 B aligned (from_dlpack checks the pointer).
+            output_align = 32
             if buffer_cache is None:
                 cute_activation = _to_cute(activation)
                 cute_activation_sf = _to_cute(activation_sf)
                 cute_topk_weights = _to_cute(topk_weights)
-                cute_output = _to_cute(output_activation)
+                cute_output = _to_cute(output_activation, output_align)
                 cute_topk_idx = _to_cute(topk_idx)
             else:
                 cute_activation = _to_cute_cached(buffer_cache, activation)
                 cute_activation_sf = _to_cute_cached(buffer_cache, activation_sf)
                 cute_topk_weights = _to_cute_cached(buffer_cache, topk_weights)
                 # Its live rows change per iteration, not between the layers of one.
-                cute_output = _to_cute_slot(buffer_cache, "output_activation", output_activation)
+                cute_output = _to_cute_slot(
+                    buffer_cache, "output_activation", output_activation, output_align
+                )
                 # topk_idx is the calling module's own staging buffer.
                 cute_topk_idx = _to_cute_w(topk_idx)
             runtime_kwargs = dict(
@@ -3500,6 +3607,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     shared_activation_sf=_to_cute_w(shared_activation_sf),
                     # A runtime scalar, never a compile-time constant.
                     shared_num_tokens=cutlass.Int32(int(shared_num_tokens)),
+                )
+            # The gen-phase entry has no tmp_buffer operand; the others require it.
+            if hasattr(kernel, "get_tmp_buffer_bytes"):
+                tmp_offset, tmp_bytes = _megamoe_tmp_buffer_span(kernel)
+                runtime_kwargs["tmp_buffer"] = (
+                    _to_cute_ptr_cached(local_workspace[tmp_offset:]) if tmp_bytes else None
                 )
             runtime_kwargs.update(
                 topk_indices=cute_topk_idx,
