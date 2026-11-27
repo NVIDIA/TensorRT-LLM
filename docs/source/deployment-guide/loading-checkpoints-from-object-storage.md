@@ -45,7 +45,7 @@ bucket. Include the model name and revision in the prefix so different versions
 do not overwrite each other.
 
 ```bash
-huggingface-cli download Qwen/Qwen3-8B --local-dir ./Qwen3-8B
+huggingface-cli download Qwen/Qwen3-8B --revision <revision> --local-dir ./Qwen3-8B
 
 # Amazon S3
 aws s3 sync ./Qwen3-8B s3://<bucket>/checkpoints/Qwen3-8B/<revision>/
@@ -75,6 +75,9 @@ aws s3 sync s3://<bucket>/checkpoints/Qwen3-8B/<revision>/ "$CACHE_DIR" \
 
 The same download in Python. It skips files that are already present with the
 same size and rejects object keys that would write outside the cache directory.
+Because it compares sizes only, it does not notice an object that was replaced
+in place with different content of the same size. Publish a changed checkpoint
+under a new revision prefix instead of overwriting the objects of an existing one.
 
 ```python
 import os
@@ -126,7 +129,8 @@ trtllm-serve /models/Qwen3-8B/<revision>
 - Keep the cache on fast local storage, and reuse it across restarts instead of
   downloading the checkpoint again.
 - Use one prefix per model revision, so a node never mixes files from two
-  versions.
+  versions, and treat a published prefix as read-only: upload a changed
+  checkpoint under a new revision instead of overwriting it.
 - For large checkpoints, both `aws s3 sync` and `boto3` transfer files in
   parallel multipart requests by default; tune concurrency with the CLI's
   `s3.max_concurrent_requests` setting or a `boto3`
