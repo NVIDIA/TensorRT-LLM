@@ -1081,7 +1081,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         }
         auto const nDesc = static_cast<std::uint32_t>(chunk.srcPtrs.size());
         // Covers plan-array prep + gather launch + event record (the synchronous launch cost;
-        // the gather's GPU time is the async `gather` span ended in drainGatherReady).
+        // the gather's GPU time is the async `gather` span ended in progressPostedChunks).
         BounceNvtxScope gatherLaunchScope(kNvtxGatherLaunch, "gatherLaunch rid=%llu chunk=%u n=%u bytes=%llu",
             static_cast<unsigned long long>(rid), chunkIdx, nDesc, static_cast<unsigned long long>(chunk.packedBytes));
         auto const regionBase = mCtx.arena->baseAddr() + *localOff;
@@ -1125,7 +1125,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         // Record an event for gather completion and DEFER the write. The gather must finish before
         // NIXL reads the region, but on a shared GPU the gather can be delayed behind model kernels
         // — blocking the IO thread on cudaStreamSynchronize here would stall the whole reactor
-        // (no recv/poll/ACK) for that delay. Instead drainGatherReady() polls this event and posts
+        // (no recv/poll/ACK) for that delay. Instead progressPostedChunks() polls this event and posts
         // the write only once the gather is done (NIXL's postXferReq is not stream-ordered anyway).
         // The rule has no exception: even failRequest parks a still-gathering chunk (mOrphanGather)
         // and drainOrphanGather() recycles its region once cudaStreamQuery reports the exec stream idle.
@@ -1134,10 +1134,10 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         if (gatherFailed)
         {
             // If the launch or the event-record failed we must NOT trust the event: an event never
-            // successfully recorded queries as "complete", which would make drainGatherReady post a
+            // successfully recorded queries as "complete", which would make progressPostedChunks post a
             // write of an UN-gathered region (garbage). Clear any non-sticky error so the next launch
             // does not inherit it (a sticky, context-level error cannot be cleared and will surface on
-            // the next CUDA call) and flag the Posted so drainGatherReady fails the request
+            // the next CUDA call) and flag the Posted so progressPostedChunks fails the request
             // deterministically (parked by failRequest, recycled by drainOrphanGather).
             (void) cudaGetLastError();
             TLLM_LOG_WARNING("BounceTransport(%s): gather launch/record failed (launch=%d record=%d) rid=%llu chunk=%u",
@@ -1156,8 +1156,8 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             p.remoteDevId = credit.devId;
         }
         p.writeBytes = static_cast<std::uint32_t>(chunk.packedBytes);
-        // Gather in flight; the write is issued later by drainGatherReady once the event signals. If
-        // the gather launch/record failed, go straight to GatherFailed so drainGatherReady fails the
+        // Gather in flight; the write is issued later by progressPostedChunks once the event signals. If
+        // the gather launch/record failed, go straight to GatherFailed so progressPostedChunks fails the
         // request without ever trusting the (un)recorded event.
         p.state = gatherFailed ? PostState::GatherFailed : PostState::Gathering;
         if (!gatherFailed)
@@ -1206,23 +1206,23 @@ void BounceSender::drainPendingPosts()
     }
 }
 
-bool BounceSender::drainGatherReady()
+bool BounceSender::progressPostedChunks()
 {
     std::lock_guard<std::mutex> lk(mReqMu);
     bool didWork = false;
-    std::vector<std::uint64_t> toFail;
+    std::vector<std::pair<std::uint64_t, BounceFailReason>> toFail;
     for (auto& [rid, req] : mRequests)
     {
         for (auto& p : req.posted)
         {
-            if (p.state == PostState::Writing || p.state == PostState::Sent)
+            if (p.state == PostState::Sent)
             {
-                continue; // gather already done + write issued
+                continue;
             }
             if (p.state == PostState::GatherFailed)
             {
                 // Gather launch / event-record failed in pumpRequest -> never trust the event; fail.
-                toFail.push_back(rid);
+                toFail.emplace_back(rid, BounceFailReason::kGatherFailed);
                 break;
             }
             if (p.state == PostState::Gathering)
@@ -1237,7 +1237,7 @@ bool BounceSender::drainGatherReady()
                 {
                     // Gather kernel / stream error -> fail the request deterministically (never hang).
                     (void) cudaGetLastError();
-                    toFail.push_back(rid);
+                    toFail.emplace_back(rid, BounceFailReason::kGatherFailed);
                     break;
                 }
                 // Gather done — return the exec context immediately for another chunk to reuse (the
@@ -1249,16 +1249,15 @@ bool BounceSender::drainGatherReady()
                 p.state = PostState::Gathered;
                 didWork = true;
             }
-            // state == Gathered: issue the RDMA write once the credit is here (an eagerly-gathered
-            // chunk may finish before its GRANT arrives; it then waits in place until attachCredits
-            // fills in the remote target).
-            if (!p.hasCredit)
+            if (p.state == PostState::Gathered)
             {
-                continue;
-            }
-            p.nvtxWrite = bounceRangeStart(kNvtxNixlWrite, "nixlWrite rid=%llu chunk=%u bytes=%u",
-                static_cast<unsigned long long>(rid), p.chunkIdx, p.writeBytes);
-            {
+                // An eager gather may finish before its GRANT supplies the remote target.
+                if (!p.hasCredit)
+                {
+                    continue;
+                }
+                p.nvtxWrite = bounceRangeStart(kNvtxNixlWrite, "nixlWrite rid=%llu chunk=%u bytes=%u",
+                    static_cast<unsigned long long>(rid), p.chunkIdx, p.writeBytes);
                 // One already-final (src, dst) pair — the remote address came from the credit, so
                 // this goes through the agent's below-the-splitter primitive, not the public path.
                 // A nullptr result (submission failure, logged by the agent) polls as kFAILURE.
@@ -1267,37 +1266,11 @@ bool BounceSender::drainGatherReady()
                         static_cast<std::uint32_t>(mCtx.deviceId)}}};
                 TransferDescs const dst{MemoryType::kVRAM, {MemoryDesc{p.remoteAddr, p.writeBytes, p.remoteDevId}}};
                 p.xfer = mCtx.agent.postXferRequest(TransferOp::kWRITE, src, dst, req.peer, std::nullopt);
+                p.state = PostState::Writing;
+                didWork = true;
+                req.lastProgress = std::chrono::steady_clock::now();
             }
-            p.state = PostState::Writing;
-            didWork = true;
-            req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk was posted
-        }
-    }
-    for (auto rid : toFail)
-    {
-        auto it = mRequests.find(rid);
-        if (it != mRequests.end())
-        {
-            failRequest(rid, it->second, BounceFailReason::kGatherFailed);
-            didWork = true;
-        }
-    }
-    return didWork;
-}
-
-bool BounceSender::pollSenderHandles()
-{
-    std::lock_guard<std::mutex> lk(mReqMu);
-    bool didWork = false;
-    std::vector<std::uint64_t> toFail;
-    for (auto& [rid, req] : mRequests)
-    {
-        for (auto& p : req.posted)
-        {
-            if (p.state != PostState::Writing)
-            {
-                continue; // still gathering (drainGatherReady handles it) or DATA already sent
-            }
+            // A completed write can already be scattered while later chunks are being posted.
             // wait(0) is one non-blocking status query: IN_PROGRESS / SUCCESS / FAILURE.
             // A failed post left p.xfer null -> report FAILURE.
             TransferState const st = p.xfer != nullptr ? p.xfer->wait(0) : TransferState::kFAILURE;
@@ -1341,17 +1314,17 @@ bool BounceSender::pollSenderHandles()
             }
             else if (st == TransferState::kFAILURE)
             {
-                toFail.push_back(rid);
+                toFail.emplace_back(rid, BounceFailReason::kWriteFailed);
                 break;
             }
         }
     }
-    for (auto rid : toFail)
+    for (auto const& [rid, reason] : toFail)
     {
         auto it = mRequests.find(rid);
         if (it != mRequests.end())
         {
-            failRequest(rid, it->second, BounceFailReason::kWriteFailed);
+            failRequest(rid, it->second, reason);
             didWork = true;
         }
     }
@@ -1367,7 +1340,7 @@ void BounceSender::onNack(std::string const& peer, BounceMsgHeader const& h, std
         return;
     }
     Request& req = it->second;
-    // Same terminal path as a failed RDMA write (pollSenderHandles): failRequest resolves the future,
+    // Same terminal path as a failed RDMA write (progressPostedChunks): failRequest resolves the future,
     // recycles/defers the staging regions and sends the cancel that reclaims the receiver's regions.
     failRequest(h.requestId, req, BounceFailReason::kPeerNack);
 }
@@ -2124,10 +2097,10 @@ void BounceTransport::tick(std::string& peer, std::string& blob)
         dispatch(peer, blob);
         work = true;
     }
-    work |= mSender.drainGatherReady(); // post writes for chunks whose gather kernel just finished
-    work |= mSender.pollSenderHandles();
+    // Poll existing orphans first so a write parked by this pass is polled on the next tick.
+    work |= mSender.drainOrphanLocal();
+    work |= mSender.progressPostedChunks();
     work |= mReceiver.drainScatterDone();
-    work |= mSender.drainOrphanLocal();  // recycle failed-but-in-flight write regions once their write ends
     work |= mSender.drainOrphanGather(); // recycle failed-but-still-gathering regions once their exec stream is idle
     drainForgets();
     mSender.drainPendingPosts();         // retry credits parked when the arena was full

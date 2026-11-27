@@ -76,7 +76,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   1. recv() one control message (short timeout) and dispatch it:
 //        [S] GRANT(rid, credits)  -> attach credits to eager-gathered chunks or acquire a local
 //                                    arena region + ExecCtx and launch gather. postWrite is deferred
-//                                    to drainGatherReady() until both gather completion and credit
+//                                    to progressPostedChunks() until both gather completion and credit
 //                                    availability have been observed.
 //        [S] ACK(rid, chunk, h)   -> count the completed remote scatter;
 //                                    all acked -> resolve the request's future SUCCESS.
@@ -301,11 +301,10 @@ public:
     /// The receiver reported it cannot complete a chunk/request: fail the request now (kPeerNack)
     /// instead of waiting out requestTimeoutMs. Unknown / wrong-peer NACKs are dropped like ACKs.
     void onNack(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope);
-    /// Issue the RDMA write for any chunk whose gather kernel has now completed (poll ctx->event,
-    /// non-blocking). Decouples the IO thread from gather latency on a shared GPU. Returns true if it
-    /// posted a write (or failed a request) this pass — used to drive the IO loop's idle backoff.
-    bool drainGatherReady();
-    bool pollSenderHandles();
+    /// Advance each chunk from gather and credit through the RDMA write, sending DATA as soon as
+    /// the write completes. Poll each event and handle once without blocking the IO thread.
+    /// Returns true when a chunk advances or a request fails, for the IO loop's idle backoff.
+    bool progressPostedChunks();
     /// Free local regions whose failed request still had an RDMA write in flight, once that write
     /// reaches a terminal state (so the NIC is done reading the source). Returns true if any freed.
     bool drainOrphanLocal();
@@ -344,7 +343,7 @@ private:
     enum class PostState
     {
         Gathering,    // gather kernel launched + event recorded; write deferred until the event signals
-        GatherFailed, // gather launch / event-record failed -> drainGatherReady fails the request
+        GatherFailed, // gather launch / event-record failed -> progressPostedChunks fails the request
                       // (an unrecorded event queries as "complete", so its event must NOT be trusted)
         Gathered,     // gather event signalled, exec ctx returned; waiting for the credit (eager gather)
         Writing,      // gather done; RDMA write issued (xfer valid); polling getXferStatus
@@ -364,7 +363,7 @@ private:
         // Remote write target (from the GRANT), kept so postWrite can be issued LATER — after the
         // gather kernel completes — instead of blocking the IO thread on cudaStreamSynchronize.
         // The gather may be delayed behind unrelated GPU work (shared device), so we never sync;
-        // drainGatherReady() polls ctx->event and posts the write only when the gather is done.
+        // progressPostedChunks() polls ctx->event and posts the write only when the gather is done.
         // With eager gather these fields are filled in later, by attachCredits() (hasCredit==true).
         std::uint64_t remoteAddr{};
         std::uint32_t remoteDevId{};
