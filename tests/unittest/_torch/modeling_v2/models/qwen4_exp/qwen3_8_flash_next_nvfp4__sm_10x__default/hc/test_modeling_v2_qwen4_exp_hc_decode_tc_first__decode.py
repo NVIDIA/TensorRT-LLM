@@ -5,11 +5,15 @@
 reference at the decode rows the members run, the row-count guard, graph replay at the
 note's 1, 4, 16 and 256 rows (every tile variant)."""
 
+import ast
 import zlib
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.ops.hc import (  # noqa: E501
+    qwen4_exp_hc_decode_tc_first__decode as kernel_module,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.ops.hc.qwen4_exp_hc_decode_tc_first__decode import (  # noqa: E501
     qwen4_exp_hc_decode_tc_first as op,
 )
@@ -93,3 +97,48 @@ def test_cuda_graph_capture_and_replay(rows) -> None:
     torch.cuda.synchronize()
     low, inject = op(fresh, first, rank, c, wi)
     assert torch.equal(g_low, low) and torch.equal(g_inject, inject)
+
+
+_PEER_LOADS = ("_ld_dsmem_f32", "_ld_dsmem_f32_if")
+
+
+def _dsmem_reduce_kernels():
+    """`(class name, [(line, callee)])` for every kernel class of the module that reads its
+    cluster peers' shared memory, its calls in source order."""
+    tree = ast.parse(open(kernel_module.__file__).read())
+    out = []
+    for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+        calls = sorted(
+            (c.lineno, c.func.attr if isinstance(c.func, ast.Attribute) else c.func.id)
+            for c in ast.walk(cls)
+            if isinstance(c, ast.Call) and isinstance(c.func, (ast.Attribute, ast.Name))
+        )
+        if any(name in _PEER_LOADS for _, name in calls):
+            out.append((cls.name, calls))
+    return out
+
+
+_DSMEM_KERNELS = _dsmem_reduce_kernels()
+
+
+@pytest.mark.parametrize("name,calls", _DSMEM_KERNELS, ids=[k[0] for k in _DSMEM_KERNELS])
+def test_no_peer_load_in_flight_at_exit(name, calls) -> None:
+    """A CTA leaves the cluster barrier after its reduce and exits, releasing its shared memory.
+    A thread that reaches that barrier with a peer load still in flight (issued, never summed)
+    lets the barrier release that peer under it: CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT, a
+    sticky launch failure of the whole process. ptxas hoists a later step's unconditional loads
+    ahead of the share check, so either every peer load is predicated on the thread's share
+    (`_ld_dsmem_f32_if`, issued only where summed) or the arrive after them is a release
+    `cluster_arrive()`, which waits for them. (The predicate itself is pinned by the bitwise
+    tests above: a narrower one would drop partials.)"""
+    loads = [(line, callee) for line, callee in calls if callee in _PEER_LOADS]
+    last_read = max(line for line, _ in loads)
+    after = [
+        (line, callee) for line, callee in calls if line > last_read and "cluster_arrive" in callee
+    ]
+    assert after, f"{name}: no cluster barrier after the peer reads (a CTA may exit while read)"
+    unpredicated = [(line, callee) for line, callee in loads if callee == "_ld_dsmem_f32"]
+    relaxed = [(line, callee) for line, callee in after if callee != "cluster_arrive"]
+    assert not (unpredicated and relaxed), (
+        f"{name}: unpredicated peer loads {unpredicated} and a relaxed exit arrive {relaxed}"
+    )
