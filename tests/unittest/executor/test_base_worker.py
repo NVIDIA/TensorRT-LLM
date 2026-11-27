@@ -30,6 +30,7 @@ from utils.util import skip_single_gpu
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, LlmResult
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper, BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
@@ -1050,8 +1051,8 @@ def test_worker_enqueues_serializable_python_input_envelope(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("keeps_result", [
-    None, "generation", "prompt_logprobs", "perf_metrics", "postproc",
-    "no_queue"
+    None, "generation", "generation_only", "prompt_logprobs", "perf_metrics",
+    "postproc", "no_queue"
 ])
 def test_worker_builds_a_result_only_when_it_reads_one(
         keeps_result: str | None) -> None:
@@ -1060,8 +1061,11 @@ def test_worker_builds_a_result_only_when_it_reads_one(
         max_tokens=4 if keeps_result == "generation" else 1,
         prompt_logprobs=1 if keeps_result == "prompt_logprobs" else None,
         return_perf_metrics=keeps_result == "perf_metrics")
-    request = GenerationRequest(prompt_token_ids=[10, 11],
-                                sampling_params=sampling)
+    request = GenerationRequest(
+        prompt_token_ids=[10, 11],
+        sampling_params=sampling,
+        disaggregated_params=DisaggregatedParams(request_type="generation_only")
+        if keeps_result == "generation_only" else None)
     request.set_id(7)
     worker = MagicMock(
         rank=0,

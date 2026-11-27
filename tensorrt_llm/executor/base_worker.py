@@ -632,8 +632,8 @@ class BaseWorker(GenerationExecutor):
     def submit(self, request: GenerationRequest) -> Optional[GenerationResult]:
         """ Low-level API to the executor. Return a "future" GenerationResult which can be waited.
 
-        Returns None for a prefill-only request (max_tokens == 1) whose
-        result only the reader of the result queue uses.
+        Returns None for a prefill-only request (max_tokens == 1 and not
+        generation-only) whose result only the reader of the result queue uses.
         """
         self.start()
 
@@ -656,10 +656,15 @@ class BaseWorker(GenerationExecutor):
         # reads its own only to post-process responses, to compute prompt
         # logprobs or to report perf metrics, so it skips building one for such
         # a request otherwise: a request stored without a result reports no
-        # perf metrics. Every other request gets its result.
+        # perf metrics. Every other request gets its result, and so does a
+        # generation-only request, which runs no context pass here.
+        disaggregated_params = request.disaggregated_params
+        generation_only = (disaggregated_params is not None
+                           and disaggregated_params.request_type
+                           == "generation_only")
         result = None
-        if (request.sampling_params.max_tokens != 1 or self.result_queue is None
-                or self.postproc_queues is not None
+        if (request.sampling_params.max_tokens != 1 or generation_only
+                or self.result_queue is None or self.postproc_queues is not None
                 or self.enable_postprocess_parallel
                 or logprob_params is not None
                 or request.sampling_params.return_perf_metrics):
