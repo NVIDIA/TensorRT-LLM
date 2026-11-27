@@ -330,11 +330,12 @@ class _PlanCapture:
 
 
 def _plan(args, monkeypatch, group_plan: bool) -> dict:
+    """The plan stage's outputs, and the launch's `attn_out` under "attn_out"."""
     with monkeypatch.context() as m:
         capture = _PlanCapture(m, group_plan)
-        op(**args)
+        out = op(**args)
     torch.cuda.synchronize()
-    return capture.out
+    return {**capture.out, "attn_out": out} if capture.out else {}
 
 
 def _assert_same_plan(new: dict, old: dict) -> None:
@@ -397,7 +398,48 @@ def test_group_plan_writes_what_the_two_passes_write(spec, scrambled, monkeypatc
     assert new and old, "a plan stage did not run"
     _assert_same_plan(new, old)
     if not scrambled:
-        assert torch.equal(op(**args), _two_pass_out(args, monkeypatch)), "attn_out"
+        assert torch.equal(new["attn_out"], old["attn_out"]), "attn_out"
+
+
+def _page_size_spec(tpb: int) -> dict:
+    """A launch at `tokens_per_block` other than the checkpoint's 32 (the plan stage takes 8, 16,
+    32 and 64): a request whose rows reach the table's last token, so the selections reach its
+    last union word (partial at 8 and 16 tokens a page: the table's tokens are not a multiple of
+    64; a whole page a word at 64), and a short one in another slot."""
+    pages = {8: 8197, 16: 8195, 64: 8196}[tpb]
+    end = pages * tpb
+    return _with(
+        [(end - 70, 70), (3000, 33)], slots=8, tokens_per_block=tpb, pages=pages,
+        cache_layout="scratch",
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("tpb", [8, 16, 64])
+@pytest.mark.parametrize("scrambled", [False, True], ids=["engine-like", "scrambled"])
+def test_group_plan_matches_the_two_passes_at_other_page_sizes(tpb, scrambled, monkeypatch) -> None:
+    """The group plan's page masks at 8, 16 and 64 tokens a page (a word holds 8, 4 or 1 pages)
+    against the bitmap pass and the plan pass: a selected token on a word's high bit, the
+    table's last word, and (scrambled) pages unmapped or past the pool inside the requests'
+    mapped ranges."""
+    spec = _page_size_spec(tpb)
+    args = _build(spec, seed=700 + tpb)
+    table = args["block_table"]
+    width_tokens = table.shape[1] * tpb
+    assert (width_tokens % 64 != 0) == (tpb in (8, 16))
+    selected = args["selected_tokens"]
+    assert bool(((selected >= 0) & (selected % 64 == 63)).any()), "no selected high bit"
+    assert int(selected.max()) // 64 == (width_tokens - 1) // 64, "the last word is not reached"
+    if scrambled:
+        args = _scramble(args, seed=23 + tpb)
+        holes = (args["block_table"] != table) & (table >= 0)
+        assert bool((holes & (args["block_table"] < 0)).any()), "no unmapped page"
+    new = _plan(args, monkeypatch, group_plan=True)
+    old = _plan(args, monkeypatch, group_plan=False)
+    assert new and old, "a plan stage did not run"
+    _assert_same_plan(new, old)
+    if not scrambled:
+        assert torch.equal(new["attn_out"], old["attn_out"]), "attn_out"
+        _compare(new["attn_out"], op.reference(**args))
 
 
 def _two_pass_out(args, monkeypatch):

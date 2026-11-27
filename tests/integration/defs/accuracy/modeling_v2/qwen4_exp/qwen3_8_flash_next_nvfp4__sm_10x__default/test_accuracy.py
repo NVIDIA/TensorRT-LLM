@@ -1258,12 +1258,14 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
     @skip_unserved_gpu
     @pytest.mark.parametrize("offsets", [[0, 128], [128]], ids=["end_and_128", "128"])
     def test_tp1_long_snapshot_tail_keeps_two_iterations(self, monkeypatch, offsets):
-        """Snapshot offsets past the tail the in-forward split runs (FlashInfer's in-place path,
-        `inforward_snapshot_max_tail`) keep the two-iteration path instead of failing the bind.
+        """A snapshot tail past the in-forward split's keeps the two-iteration path.
 
-        With `[0, 128]` the final snapshot is at the prompt end, and with `[128]` the tail is
-        twice the split's: neither prompt is split in its forward, and a second turn still
-        restores its prefix from the snapshot and names the pass key."""
+        The split runs a tail of at most `inforward_snapshot_max_tail` tokens (FlashInfer's
+        in-place path); a longer one no longer fails the bind. With `[0, 128]` the final
+        snapshot is at the prompt end, and with `[128]` the tail is twice the split's: neither
+        prompt is split in its forward, and a second turn still restores its prefix from the
+        snapshot and names the pass key.
+        """
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
         splits = []
         split = target_modeling.flashinfer_chunk_gdn_inforward_split
