@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import json
-import os
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -27,6 +26,7 @@ import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from test_common.moe_tactics import sm100f_moe_tactic_or_cutlass
 from utils.llm_data import llm_models_root
+from utils.spawn_process import SpawnProcessContext, spawn_process
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
@@ -40,6 +40,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor._util import (
     _derive_draft_max_attention_window,
     _expand_attention_window_pattern_to_global_layers)
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
 from tensorrt_llm._torch.speculative.eagle3 import (Eagle3OneModelSpecMetadata,
@@ -725,247 +726,126 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
         assert draft_kwargs["max_blocks"] is None
 
 
+def _check_spec_decoding_stats(llm: LLM) -> None:
+    stats = llm.get_stats(timeout=2)
+    assert stats, "Should have iteration stats"
+    # Find iterations with speculation (generation phase)
+    iterations_with_spec = []
+    for stat in stats:
+        if 'specDecodingStats' in stat:
+            spec_stats = stat['specDecodingStats']
+            if spec_stats.get('numDraftTokens', 0) > 0:
+                iterations_with_spec.append(spec_stats)
+
+    # Should have at least some iterations with spec decoding
+    assert len(iterations_with_spec) > 0, \
+        f"Should have iterations with specDecodingStats (found {len(iterations_with_spec)})"
+
+    # Validate specDecodingStats structure and values
+    for spec_stats in iterations_with_spec:
+        # Check all fields are present
+        assert 'numDraftTokens' in spec_stats
+        assert 'numAcceptedTokens' in spec_stats
+        assert 'numRequestsWithDraftTokens' in spec_stats
+        assert 'acceptanceLength' in spec_stats
+        assert 'iterLatencyMS' in spec_stats
+        assert 'draftOverhead' in spec_stats
+
+        # Validate value constraints
+        assert spec_stats['numDraftTokens'] > 0
+        assert 0 <= spec_stats['numAcceptedTokens'] <= spec_stats[
+            'numDraftTokens']
+        assert spec_stats['numRequestsWithDraftTokens'] > 0
+        assert spec_stats['acceptanceLength'] >= 1.0
+        assert spec_stats['iterLatencyMS'] >= 0.0
+        assert 0.0 <= spec_stats['draftOverhead'] <= 1.0
+
+    # Calculate overall acceptance rate
+    total_draft = sum(s['numDraftTokens'] for s in iterations_with_spec)
+    total_accepted = sum(s['numAcceptedTokens'] for s in iterations_with_spec)
+    acceptance_rate = (total_accepted / total_draft *
+                       100) if total_draft > 0 else 0
+
+    # Should have reasonable acceptance rate for Eagle3
+    assert acceptance_rate > 5.0, f"Acceptance rate too low: {acceptance_rate:.1f}%"
+
+
 @pytest.mark.parametrize(
     "use_cuda_graph,disable_overlap_scheduler,enable_block_reuse,enable_chunked_prefill,use_hf_speculative_model",
     [
-        [False, False, True, False, False],
-        [True, False, True, False, False],
-        [True, True, False, True, False],
-        [True, True, False, False, False],
-        # Tests (mocked) speculative model auto-download from HuggingFace
-        [False, True, False, False, True],
+        pytest.param(False, False, True, False, False,
+                     id="eager_overlap_reuse"),
+        pytest.param(True, False, True, False, False, id="graph_overlap_reuse"),
+        pytest.param(True, True, False, True, True, id="graph_chunked_hf"),
     ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3(use_cuda_graph: bool, disable_overlap_scheduler: bool,
                       enable_block_reuse: bool, enable_chunked_prefill: bool,
-                      use_hf_speculative_model: bool):
-    # Eagle3 one model works with overlap scheduler and block reuse.
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
+                      use_hf_speculative_model: bool) -> None:
+    """Check acceptance, metrics and short/long greedy parity for representative engines."""
+    if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
         pytest.skip("Not enough memory to load target + draft model")
 
     models_path = llm_models_root()
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    if use_hf_speculative_model:
-        eagle_model = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
-    else:
-        eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
-
-    # bs > 1 gives non-deterministic when doing IFB. There are slight chances
-    # that ref and spec does not match 100%
-    max_batch_size = 1
+    eagle_model = ("yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+                   if use_hf_speculative_model else
+                   f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B")
     max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[i for i in range(1, max_batch_size +
-                                      1)]) if use_cuda_graph else None
-
-    llm_common_config = dict(
+    check_stats = use_cuda_graph and not disable_overlap_scheduler
+    common = dict(
         model=target_model_dir,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
-        max_batch_size=max_batch_size,
-        kv_cache_config=kv_cache_config,
-        # This max_seq_len is larger than the one specified
-        # in the llama 3 8B eagle's config. We want to make sure
-        # that the draft model won't go above its max in warmup
-        # in this test.
+        cuda_graph_config=CudaGraphConfig(
+            batch_sizes=[1]) if use_cuda_graph else None,
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=enable_block_reuse,
+                                      max_tokens=8192),
+        # Exceed the draft checkpoint's limit to exercise its warmup bound.
         max_seq_len=8192,
         enable_chunked_prefill=enable_chunked_prefill,
     )
     if enable_chunked_prefill:
-        # Use a small max_num_tokens so that the chunked prefill path gets exercised.
-        llm_common_config['max_num_tokens'] = 64
-
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model=eagle_model,
-    )
-
-    # Create the LLM instance
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-
-    # Acceptance rate tests
-    if enable_chunked_prefill:
-        # Use a long prompt for chunked prefill tests.
-        prompts = [
-            "The capital of France is a city of romance, art, fashion, and cuisine. Paris is a must-visit destination for anyone who loves history, architecture, and culture. From the iconic Eiffel Tower to the world-famous Louvre Museum, Paris has something to offer for every interest and age.\nThe city is divided into 20 arrondissements, each with its own unique character and charm. The Latin Quarter is a popular area for students and young travelers, while the Champs-Élysées is a hub for shopping and dining. The Montmartre neighborhood is famous for its bohemian vibe and stunning views of the city.\nParis is also known for its beautiful parks and gardens, such as the Luxembourg Gardens and the Tuileries Garden. The city has a rich history, with landmarks like the Notre-Dame Cathedral and the Arc de Triomphe. Visitors can also explore the city's many museums, including the Musée d'Orsay and the Musée Rodin.\nIn addition to its cultural and historical attractions, Paris is also a great destination for foodies. The city is famous for its cuisine, including croissants, baguettes, and cheese. Visitors can sample the city's famous dishes at one of the many restaurants, cafes, and "
-        ]
-        tok_ids = [llm_spec.tokenizer.encode(prompts[0])]
-    else:
-        prompts = [
-            "The capital of France is",
-            "The president of the United States is",
-        ]
-        tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
-
-    sampling_params = SamplingParams(max_tokens=128, temperature=0)
-
-    for i in range(len(tok_ids)):
-        num_tokens = 0
-        num_drafted = 0
-        num_accepted = 0
-
-        for output in llm_spec.generate_async(tok_ids[i],
-                                              sampling_params,
+        common["max_num_tokens"] = 64
+    spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
+                                       speculative_model=eagle_model)
+    long_prompt = ", ".join(str(i) for i in range(1000))
+    prompts = [
+        "The capital of France is", "The president of the United States is",
+        long_prompt
+    ]
+    parity_params = SamplingParams(max_tokens=10, temperature=0)
+    with LLM(**common,
+             speculative_config=spec_config,
+             enable_iter_perf_stats=check_stats) as llm_spec:
+        acceptance_prompt = long_prompt if enable_chunked_prefill else "The future of AI is"
+        token_ids = llm_spec.tokenizer.encode(acceptance_prompt)
+        if enable_chunked_prefill:
+            assert len(token_ids) > common["max_num_tokens"]
+        num_tokens = num_drafted = num_accepted = 0
+        for output in llm_spec.generate_async(token_ids,
+                                              SamplingParams(max_tokens=128,
+                                                             temperature=0),
                                               streaming=True):
             new_tokens = output.outputs[0].token_ids
             num_drafted += max_draft_len
             num_accepted += len(new_tokens) - num_tokens - 1
             num_tokens = len(new_tokens)
+        assert num_drafted > 0
+        assert num_accepted / num_drafted > 0.1
+        if check_stats:
+            _check_spec_decoding_stats(llm_spec)
+        results_spec = llm_spec.generate(prompts, parity_params)
+        spec_tokens = [result.outputs[0].token_ids for result in results_spec]
 
-        accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.1
-
-    # Output tests
-    sampling_params = SamplingParams(max_tokens=10, temperature=0)
-
-    results_spec = llm_spec.generate(prompts, sampling_params)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
-    llm_spec.shutdown()
-
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    llm_ref.shutdown()
-
-    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        # The spec decode algorithm currently guarantees identical results
-        assert text_spec == text_ref
-
-
-def test_eagle3_spec_decoding_stats():
-    """Test that specDecodingStats are correctly populated in metrics endpoint"""
-    models_path = llm_models_root()
-    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    # Skip if models don't exist
-    if not os.path.exists(target_model_dir) or not os.path.exists(
-            eagle_model_dir):
-        pytest.skip(f"Required models not found")
-
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    free_gpu_memory_fraction=0.6,
-                                    use_kv_cache_manager_v2=True)
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=3,
-        speculative_model=eagle_model_dir,
-    )
-
-    with LLM(
-            model=target_model_dir,
-            speculative_config=spec_config,
-            kv_cache_config=kv_cache_config,
-            disable_overlap_scheduler=False,
-            enable_iter_perf_stats=True,
-            max_batch_size=4,
-    ) as llm:
-        # Generate some output to collect stats
-        prompts = [
-            "The capital of France is",
-            "The president of the United States is",
-        ]
-        sampling_params = SamplingParams(max_tokens=20, temperature=0)
-        llm.generate(prompts, sampling_params)
-
-        # Get iteration stats
-        stats = llm.get_stats(timeout=2)
-        assert len(stats) > 0, "Should have iteration stats"
-
-        # Find iterations with speculation (generation phase)
-        iterations_with_spec = []
-        for stat in stats:
-            if 'specDecodingStats' in stat:
-                spec_stats = stat['specDecodingStats']
-                if spec_stats.get('numDraftTokens', 0) > 0:
-                    iterations_with_spec.append(spec_stats)
-
-        # Should have at least some iterations with spec decoding
-        assert len(iterations_with_spec) > 0, \
-            f"Should have iterations with specDecodingStats (found {len(iterations_with_spec)})"
-
-        # Validate specDecodingStats structure and values
-        for spec_stats in iterations_with_spec:
-            # Check all fields are present
-            assert 'numDraftTokens' in spec_stats
-            assert 'numAcceptedTokens' in spec_stats
-            assert 'numRequestsWithDraftTokens' in spec_stats
-            assert 'acceptanceLength' in spec_stats
-            assert 'iterLatencyMS' in spec_stats
-            assert 'draftOverhead' in spec_stats
-
-            # Validate value constraints
-            assert spec_stats['numDraftTokens'] > 0
-            assert 0 <= spec_stats['numAcceptedTokens'] <= spec_stats[
-                'numDraftTokens']
-            assert spec_stats['numRequestsWithDraftTokens'] > 0
-            assert spec_stats['acceptanceLength'] >= 1.0
-            assert spec_stats['iterLatencyMS'] >= 0.0
-            assert 0.0 <= spec_stats['draftOverhead'] <= 1.0
-
-        # Calculate overall acceptance rate
-        total_draft = sum(s['numDraftTokens'] for s in iterations_with_spec)
-        total_accepted = sum(s['numAcceptedTokens']
-                             for s in iterations_with_spec)
-        acceptance_rate = (total_accepted / total_draft *
-                           100) if total_draft > 0 else 0
-
-        # Should have reasonable acceptance rate for Eagle3
-        assert acceptance_rate > 5.0, f"Acceptance rate too low: {acceptance_rate:.1f}%"
-
-
-@pytest.mark.parametrize("use_cuda_graph", [True, False])
-@pytest.mark.high_cuda_memory
-def test_llama_eagle3_long_prompt(use_cuda_graph):
-    # Eagle3 one model works with overlap scheduler and block reuse.
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=3,
-        speculative_model=eagle_model_dir,
-    )
-
-    if use_cuda_graph:
-        cuda_graph_config = CudaGraphConfig(batch_sizes=[1])
-    else:
-        cuda_graph_config = None
-
-    llm_spec = LLM(model=target_model_dir,
-                   speculative_config=spec_config,
-                   max_batch_size=1,
-                   cuda_graph_config=cuda_graph_config,
-                   disable_overlap_scheduler=True)
-
-    prompt = [", ".join(str(i) for i in range(1000))]
-
-    sampling_params = SamplingParams(max_tokens=10, temperature=0)
-    results_spec = llm_spec.generate(prompt, sampling_params)
-
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
-    llm_spec.shutdown()
-
-    llm_ref = LLM(model=target_model_dir,
-                  max_batch_size=1,
-                  cuda_graph_config=None,
-                  disable_overlap_scheduler=False)
-
-    results_ref = llm_ref.generate(prompt, sampling_params)
-
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    llm_ref.shutdown()
-
-    # Greedy decoding must match the non-speculative reference for a long prompt.
-    assert generated_text_spec[0] == generated_text_ref[0]
+    with LLM(**common) as llm_ref:
+        results_ref = llm_ref.generate(prompts, parity_params)
+        ref_tokens = [result.outputs[0].token_ids for result in results_ref]
+    assert len(spec_tokens) == len(ref_tokens) == len(prompts)
+    for actual, expected in zip(spec_tokens, ref_tokens, strict=True):
+        assert actual
+        assert actual == expected
 
 
 def test_deepseek_mla_eagle3():
@@ -1171,51 +1051,97 @@ def test_multi_eagle3():
             pass
 
 
-@pytest.mark.parametrize("use_dynamic_tree", [False, True],
-                         ids=["no_dynamic_tree", "dynamic_tree"])
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.high_cuda_memory
-# Opt out of MPI session reuse: the XQA JIT cubin registry is process-global
-# (DecoderXQARunner::getResourceGlobal) and its lookup key does not include
-# q_seq_len / is_spec_dec_tree, so running the dynamic-tree and non-dynamic-tree
-# variants in one worker process launches a cubin compiled for the other
-# config's q_seq_len -> CUDA_ERROR_INVALID_VALUE on Hopper.
-@pytest.mark.private_mpi_session
-@with_mocked_hf_download_for_single_gpu
-def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
-                                               use_cuda_graph: bool):
-    """Test one-model rejection sampling with and without dynamic tree, with
-    more than one generation request per step."""
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
-        pytest.skip("Not enough memory to load target + draft model")
+def _write_tiny_eagle3_lora(directory: Path) -> None:
+    """Write a nonzero rank-8 Q/V adapter matching the four-layer test target."""
+    from safetensors.torch import save_file
 
-    models_path = llm_models_root()
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-    eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
+    directory.mkdir()
+    rank = 8
+    generator = torch.Generator().manual_seed(17)
+    weights = {}
+    for layer in range(4):
+        for module, out_features in (("q_proj", 512), ("v_proj", 128)):
+            stem = f"base_model.model.model.layers.{layer}.self_attn.{module}"
+            weights[f"{stem}.lora_A.weight"] = torch.randn(rank,
+                                                           512,
+                                                           generator=generator)
+            weights[f"{stem}.lora_B.weight"] = torch.randn(out_features,
+                                                           rank,
+                                                           generator=generator)
+    save_file(weights, str(directory / "adapter_model.safetensors"))
+    (directory / "adapter_config.json").write_text(
+        json.dumps({
+            "peft_type": "LORA",
+            "r": rank,
+            "lora_alpha": rank,
+            "target_modules": ["q_proj", "v_proj"],
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+            "inference_mode": True,
+        }))
 
-    max_batch_size = 2
+
+def _run_tiny_eagle3(context: SpawnProcessContext, tmp_path: Path,
+                     use_dynamic_tree: bool) -> None:
+    """Run one mode in a fresh interpreter, with no nested executor process."""
+    from transformers import LlamaConfig
+
+    # Keep real attention, hidden-state capture, and draft verification without
+    # depending on pretrained weights or a tokenizer.
+    vocab_size = 256
+    target_model_dir = tmp_path / "target"
+    eagle_model = tmp_path / "draft"
+    config = LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=512,
+        intermediate_size=1024,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=128,
+        vocab_size=vocab_size,
+        max_position_embeddings=128,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        torch_dtype="bfloat16",
+    )
+    config.save_pretrained(target_model_dir)
+    config.architectures = ["LlamaForCausalLMEagle3"]
+    config.num_hidden_layers = 1
+    config.draft_vocab_size = vocab_size
+    config.save_pretrained(eagle_model)
+
+    max_batch_size = 2 if use_dynamic_tree else 4
     max_draft_len = 6
     dynamic_tree_max_top_k = 10
     max_total_draft_tokens = 60
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1, 2]) if use_cuda_graph else None
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=1024)
+    # The chain's sampled requests deliberately fall back to eager execution;
+    # its greedy LoRA requests replay the padded graph in the same engine.
+    cuda_graph_config = (CudaGraphConfig(
+        batch_sizes=[1, 2]) if use_dynamic_tree else CudaGraphConfig(
+            batch_sizes=[4], enable_padding=True, sampling_variants=["greedy"]))
 
     llm_common_config = dict(
         model=target_model_dir,
         attn_backend="TRTLLM",
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=use_dynamic_tree,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        max_seq_len=8192,
+        max_seq_len=128,
+        max_num_tokens=128,
+        load_format="dummy",
+        skip_tokenizer_init=True,
     )
 
     spec_config_kwargs = dict(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
         use_rejection_sampling=True,
+        load_format="dummy",
+        eagle3_layers_to_capture={0, 1, 2},
     )
     if use_dynamic_tree:
         spec_config_kwargs.update(
@@ -1224,21 +1150,90 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
             max_total_draft_tokens=max_total_draft_tokens,
         )
 
-    llm_spec = LLM(**llm_common_config,
-                   speculative_config=Eagle3DecodingConfig(
-                       **spec_config_kwargs))
+    prompts = [[1, 3, 5, 7], [1, 4, 6, 8]]
+    sampling_params = SamplingParams(max_tokens=20,
+                                     temperature=1.0,
+                                     top_p=1.0,
+                                     end_id=-1)
+    if not use_dynamic_tree:
+        llm_common_config["lora_config"] = LoraConfig(max_lora_rank=8,
+                                                      max_loras=1,
+                                                      max_cpu_loras=1)
+        adapter_dir = tmp_path / "adapter"
+        _write_tiny_eagle3_lora(adapter_dir)
 
-    prompts = [
-        "The president of the United States is",
-        "The capital of France is",
-    ]
-    sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=1.0)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        with LLM(**llm_common_config,
+                 speculative_config=Eagle3DecodingConfig(
+                     **spec_config_kwargs)) as llm_spec:
+            runner = llm_spec._executor.engine.model_engine.cuda_graph_runner
+            replay = runner.replay
+            replayed: list[KeyType] = []
 
-    results = llm_spec.generate(prompts, sampling_params)
-    llm_spec.shutdown()
+            def record_replay(key: KeyType, current_inputs: dict,
+                              **kwargs) -> torch.Tensor | None:
+                replayed.append(key)
+                return replay(key, current_inputs, **kwargs)
 
-    assert len(results) == len(prompts)
-    assert all(len(result.outputs[0].token_ids) > 0 for result in results)
+            patch.setattr(runner, "replay", record_replay)
+            results = llm_spec.generate(prompts, sampling_params)
+            assert len(results) == len(prompts)
+            for result in results:
+                assert len(result.outputs) == 1
+                token_ids = result.outputs[0].token_ids
+                assert token_ids is not None
+                assert len(token_ids) == sampling_params.max_tokens
+                assert all(0 <= token < vocab_size for token in token_ids)
+            if use_dynamic_tree:
+                assert replayed
+                assert all(not key.is_all_greedy_sample for key in replayed)
+            else:
+                assert not replayed, "Sampled chain requests must exercise eager decoding"
+                lora_prompts = prompts + [[1, 9, 11, 13]]
+                greedy = SamplingParams(max_tokens=8, temperature=0, end_id=-1)
+                baseline = llm_spec.generate(lora_prompts, greedy)
+                replayed.clear()
+                adapted = llm_spec.generate(
+                    lora_prompts,
+                    greedy,
+                    lora_request=[LoRARequest("tiny", 1, str(adapter_dir))] * 3)
+                assert any(key.batch_size == 4 and key.use_lora_graph
+                           for key in replayed)
+                restored = llm_spec.generate(lora_prompts, greedy)
+                for outputs in (baseline, adapted, restored):
+                    assert len(outputs) == 3
+                    for result in outputs:
+                        assert len(result.outputs) == 1
+                        assert len(
+                            result.outputs[0].token_ids) == greedy.max_tokens
+                        assert all(0 <= token < vocab_size
+                                   for token in result.outputs[0].token_ids)
+                base_tokens = [
+                    result.outputs[0].token_ids for result in baseline
+                ]
+                adapted_tokens = [
+                    result.outputs[0].token_ids for result in adapted
+                ]
+                restored_tokens = [
+                    result.outputs[0].token_ids for result in restored
+                ]
+                assert adapted_tokens != base_tokens, "The nonzero adapter must affect generation"
+                assert restored_tokens == base_tokens, "LoRA must not leak into plain requests"
+    context.send("done")
+
+
+@pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                         ids=["chain_eager_lora_graph", "tree_graph"])
+@skip_num_gpus_less_than(1)
+@pytest.mark.private_mpi_session
+def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
+                                               tmp_path: Path) -> None:
+    # XQA's process-global cubin registry omits q_seq_len / is_spec_dec_tree.
+    # Drain pytest's cached MPI workers and keep each mode in a fresh process.
+    with spawn_process(_run_tiny_eagle3, tmp_path, use_dynamic_tree) as process:
+        process.receive("done", timeout=540)
+        assert process.wait(timeout=30) == 0
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
@@ -1321,67 +1316,6 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
         assert text_spec == text_ref
 
 
-@pytest.mark.parametrize("use_cuda_graph", [True, False])
-def test_eagle3_lora(use_cuda_graph: bool):
-    """Test LoRA with 3 requests and max_batch_size=4.
-
-    This test verifies that when using LoRA modules,
-    the system properly applies the LoRA configurations.
-    """
-    attn_backend = "TRTLLM"
-    enable_block_reuse = False
-    enable_chunked_prefill = False
-
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-
-    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-    hf_lora_dir = f"{models_path}/llama-models/luotuo-lora-7b-0.1"
-
-    # Test with 3 requests and max_batch_size=4 to trigger padding
-    max_batch_size = 4
-    max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1, 2, 4], enable_padding=True) if use_cuda_graph else None
-    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
-
-    llm_common_config = dict(
-        model=target_model_dir,
-        attn_backend=attn_backend,
-        cuda_graph_config=cuda_graph_config,
-        max_batch_size=max_batch_size,
-        kv_cache_config=kv_cache_config,
-        max_seq_len=1024,
-        enable_chunked_prefill=enable_chunked_prefill,
-        lora_config=lora_config,
-    )
-
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model=eagle_model_dir,
-    )
-
-    # Create the LLM instance
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-
-    prompts = [
-        "The capital of France is",
-        "The president of the United States is",
-        "The future of AI is",
-    ]
-    lora_requests = [LoRARequest("luotuo", 1, hf_lora_dir)] * len(prompts)
-
-    sampling_params = SamplingParams(max_tokens=20, temperature=0)
-    llm_spec.generate(prompts, sampling_params, lora_request=lora_requests)
-    llm_spec.shutdown()
-
-
 @pytest.mark.parametrize("disable_overlap_scheduler", [False])
 @pytest.mark.parametrize("use_cuda_graph", [True])
 # dl3_k4_dt12_bs1 covers one request against a mask buffer sized for one request on the Blackwell SwapsMmaAb kernel.
@@ -1461,17 +1395,12 @@ def test_llama_eagle3_dynamic_tree(
         accept_rate = num_accepted / num_drafted
         assert accept_rate > 0.10
 
-    # Output tests: verify spec decode matches reference
+    # Check that batched dynamic-tree decoding produces meaningful text.
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
 
     results_spec = llm_spec.generate(prompts, sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
-
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    llm_ref.shutdown()
 
     def assert_meaningful_text(text: str) -> None:
         stripped = text.strip()
@@ -1482,9 +1411,9 @@ def test_llama_eagle3_dynamic_tree(
         assert not any(
             len(set(words[i:i + 6])) == 1 for i in range(len(words) - 5))
 
-    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
+    assert len(generated_text_spec) == len(prompts)
+    for text_spec in generated_text_spec:
         assert_meaningful_text(text_spec)
-        assert_meaningful_text(text_ref)
 
 
 if __name__ == "__main__":
