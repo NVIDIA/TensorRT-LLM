@@ -14,9 +14,11 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import os
 import pickle
 import sys
+from collections.abc import Iterator
 
 import cloudpickle
 import pytest
@@ -34,6 +36,7 @@ from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, SchedulerConfig
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # With the Ray orchestrator, workers spawned through MPI hang inside ray.init()
 # on the Open MPI 5 shipped by the DLFW 26.08 base image: the raylet forked from
@@ -108,6 +111,34 @@ MODEL_PATHS = {
     "Qwen3-8B-FP8": "Qwen3/Qwen3-8B-FP8",
     "Qwen3-8B": "Qwen3/Qwen3-8B",
 }
+
+
+@contextlib.contextmanager
+def mpi_worker_pool(
+        env: dict[str, str],
+        mpi_info: MPI.Info | None = None) -> Iterator[MPIPoolExecutor]:
+    """Spawn the context and generation workers through ``MpiPoolSession``.
+
+    Unless ``FLASHINFER_WORKSPACE_BASE`` is set explicitly or
+    ``TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0`` turns isolation off, each
+    worker gets its own FlashInfer workspace. An explicit
+    ``FLASHINFER_CUBIN_DIR`` is shared by both workers; populate it before
+    they start.
+
+    Args:
+        env: Variables to set in the workers, on top of those that
+            ``MpiPoolSession`` forwards from this process.
+        mpi_info: MPI info for spawning the workers; ``None`` for the
+            defaults.
+
+    Yields:
+        The pool's executor, which runs each submitted task on an idle worker.
+    """
+    session = MpiPoolSession(n_workers=2, env_overrides=env, mpi_info=mpi_info)
+    try:
+        yield session.mpi_pool
+    finally:
+        session.shutdown()
 
 
 def mpi_publish_name():
@@ -441,14 +472,14 @@ def verify_disaggregated(model: str,
                        for rank, args in enumerate(worker_args)]
     port_name = mpi_publish_name()
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             **single_host_ucx_env(), "UCX_MM_ERROR_HANDLING":
-                             "y",
-                             **({
-                                 "TLLM_GEN_ADMISSION_TTFT_PERCENTILE": "90"
-                             } if gen_preemption else {})
-                         }) as executor:
+    with mpi_worker_pool(
+            env={
+                **single_host_ucx_env(), "UCX_MM_ERROR_HANDLING":
+                "y",
+                **({
+                    "TLLM_GEN_ADMISSION_TTFT_PERCENTILE": "90"
+                } if gen_preemption else {})
+            }) as executor:
         futures = []
         worker_arg = None
         try:
@@ -582,11 +613,10 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 
     prompt = "European Union is a political and economic union of 27 countries. The European Union is headquartered in Brussels, Belgium. The first president of the European Union was Jean-Claude Juncker. The current president is Ursula von der Leyen. The European Union is a major economic and political entity."
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             **single_host_ucx_env(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                         }) as executor:
+    with mpi_worker_pool(env={
+            **single_host_ucx_env(),
+            "UCX_MM_ERROR_HANDLING": "y",
+    }) as executor:
         futures = []
         worker_arg = None
         try:
@@ -689,13 +719,12 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     prompt = "What is the capital of Germany?"
     mpi_info = MPI.Info.Create()
     mpi_info.Set("oversubscribe", "true")
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             **single_host_ucx_env(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                             "OMPI_MCA_rmaps_base_oversubscribe": "1",
-                         },
-                         mpi_info=mpi_info) as executor:
+    worker_env = {
+        **single_host_ucx_env(),
+        "UCX_MM_ERROR_HANDLING": "y",
+        "OMPI_MCA_rmaps_base_oversubscribe": "1",
+    }
+    with mpi_worker_pool(env=worker_env, mpi_info=mpi_info) as executor:
         futures = []
         worker_arg = None
         try:
@@ -780,11 +809,10 @@ def test_disaggregated_logprobs(model, generation_overlap):
     max_tokens = 10
     prompt = "What is the capital of Germany?"
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             **single_host_ucx_env(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                         }) as executor:
+    with mpi_worker_pool(env={
+            **single_host_ucx_env(),
+            "UCX_MM_ERROR_HANDLING": "y",
+    }) as executor:
         futures = []
         worker_arg = None
         try:
@@ -889,11 +917,10 @@ def test_disaggregated_cancel_gen_requests(model):
     num_cancel = 8
     max_tokens = 50
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             **single_host_ucx_env(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                         }) as executor:
+    with mpi_worker_pool(env={
+            **single_host_ucx_env(),
+            "UCX_MM_ERROR_HANDLING": "y",
+    }) as executor:
         futures = []
         try:
             futures.append(
@@ -1002,11 +1029,10 @@ def test_disaggregated_logits(model, generation_overlap):
     prompt = "What is the capital of Germany?"
     max_tokens = 10
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             **single_host_ucx_env(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                         }) as executor:
+    with mpi_worker_pool(env={
+            **single_host_ucx_env(),
+            "UCX_MM_ERROR_HANDLING": "y",
+    }) as executor:
         futures = []
         worker_arg = None
         try:
@@ -1190,11 +1216,10 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
 
     prompt = "What is the capital of Germany?"
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             **single_host_ucx_env(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                         }) as executor:
+    with mpi_worker_pool(env={
+            **single_host_ucx_env(),
+            "UCX_MM_ERROR_HANDLING": "y",
+    }) as executor:
         futures = []
         worker_arg = None
         try:
@@ -1352,11 +1377,10 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
 
     prompt = "What is the capital of Germany?"
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             **single_host_ucx_env(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                         }) as executor:
+    with mpi_worker_pool(env={
+            **single_host_ucx_env(),
+            "UCX_MM_ERROR_HANDLING": "y",
+    }) as executor:
         futures = []
         worker_arg = None
         try:
