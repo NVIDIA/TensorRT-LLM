@@ -2275,10 +2275,11 @@ def test_adp_ranks_wait_for_peer_context_retirement(
 
 
 def test_context_retirement_check_skips_transfers_without_logical_cancellation() -> None:
-    """Without logical context cancellation no transfer can await retirement, so none is read."""
+    """Without logical context cancellation no transfer can await retirement, so none is checked."""
     executor = PyExecutor.__new__(PyExecutor)
+    asked = []
     executor.kv_cache_transceiver = types.SimpleNamespace(
-        supports_logical_context_cancellation=lambda request=None: False
+        supports_logical_context_cancellation=lambda request=None: asked.append(request) or False
     )
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {
@@ -2295,7 +2296,30 @@ def test_context_retirement_check_skips_transfers_without_logical_cancellation()
     )
 
     assert not executor._has_pending_context_retirement()
-    executor.async_transfer_manager.requests_in_transfer.assert_not_called()
+    assert asked == [None]
+
+
+def test_context_retirement_check_asks_nothing_without_transfers() -> None:
+    """With no transfer in flight the loop does not ask about logical context cancellation."""
+    executor = PyExecutor.__new__(PyExecutor)
+    asked = []
+    executor.kv_cache_transceiver = types.SimpleNamespace(
+        supports_logical_context_cancellation=lambda request=None: asked.append(request) or True
+    )
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
+    executor._disagg_coordinator = DisaggTransferCoordinator(
+        transceiver=executor.kv_cache_transceiver,
+        transfer_manager=executor.async_transfer_manager,
+        kv_cache_manager=None,
+        dist=types.SimpleNamespace(world_size=2),
+        effects=Mock(),
+        registry=Mock(active_requests=Mock(return_value=[])),
+        enable_attention_dp=True,
+    )
+
+    assert not executor._has_pending_context_retirement()
+    assert asked == []
 
 
 def _classify_termination(
