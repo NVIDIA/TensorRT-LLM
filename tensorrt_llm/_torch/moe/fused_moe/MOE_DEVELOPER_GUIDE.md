@@ -1371,10 +1371,16 @@ set wrong has a test that catches it:
   `SchedulerSpinBound` takes from the MoE communication timeout guard: the
   warmup timeout during warmup and AutoTuner profiling, the native bound
   otherwise.
-- `helper_slot_mode=per_layer_resident` gives each layer its own helper-slot
-  set, and the copy keeps a per-layer table of the expert each helper slot
-  holds so that it skips experts a whole team already holds. Any other writer
-  of those helper rows would invalidate the table.
+- `helper_slot_mode=shared_banks`, the default, has all layers alternate
+  between two shared helper banks and copies every helper expert in every
+  forward pass. `helper_slot_mode=per_layer_resident` gives each layer its own
+  helper-slot set, and the copy keeps a per-layer table of the expert each
+  helper slot holds so that it skips experts a whole team already holds. Any
+  other writer of those helper rows would invalidate the table. Beyond EP8,
+  `per_layer_resident` needs a rank hierarchy that ends in rank pairs (EP16);
+  other sizes are rejected when the slot pool is built, because their pair and
+  team multicast objects exceed the binding budget
+  (`geometry.per_layer_helper_sets_supported`).
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
   `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original
@@ -1391,9 +1397,13 @@ set wrong has a test that catches it:
   `add_layer` returns a `PerLayerDynamicMoeLayerLoadBalancer` with
   `produces_replica_plan = True`. In every chunk `_load_balancer_route` plans,
   the backend reads `MoERunContext.replica_plan`, and the post-`run_moe` hook
-  releases the plan. Such a layer routes separately: `FusedCommMoEScheduler`
-  skips the backend's fused route + quantize launch, whose routes the plan has
-  not remapped. The planner consumes logical routes, so the expert
+  releases the plan. `FusedCommMoEScheduler` gives such a layer the backend's
+  fused route + quantize launch only when the backend declares
+  `replica_plan_fuses_route_quant`, as MegaMoE CuteDSL does: the launch returns
+  the expert IDs for the planner, and `run_moe` stages the planner's slots over
+  the IDs the launch wrote and keeps its weights, activation and scales. Any
+  other backend routes and quantizes such a layer separately, leaving the
+  plan's SMs to the copy kernel. The planner consumes logical routes, so the expert
   statistics and the layer-wise calibrator record (or replay) them before the
   route; standard EPLB records the slots after it. When the forward raises,
   `MoeLoadBalancerIterContext` calls `abort_iter`, which releases the pending
@@ -1414,12 +1424,18 @@ set wrong has a test that catches it:
   `ep_process_group` and `max_tokens_per_rank_capacity`.
 - DeepSeek-V4 selects the fused shared FC12 kernel when the routed backend
   declares per-layer dynamic support, the final projection quantization and
-  hardware (SM100 family) support that kernel, and the model runs eagerly
-  (`cuda_graph_config: null`). Per-layer dynamic EPLB is not a condition, but it
-  requires eager mode, so an EPLB-off baseline runs the same shared kernel only
-  with `cuda_graph_config: null`. Other runs keep the model's existing shared-MLP
-  backend. With per-layer dynamic EPLB, the active configuration supplies the
-  fused kernel an SM budget that leaves the copy kernel its auxiliary SMs.
+  hardware (SM100 family) support that kernel, and `cuda_graph_config` is
+  `null`. With per-layer dynamic EPLB, FC12 leaves the copy kernel its auxiliary
+  SMs.
+- DeepSeek-V4 NVFP4 on SM100/103 supports breakable prefill with an 8192-token
+  bucket and attention DP, in either helper slot mode. The parent segment
+  captures the COPY producer, the route wait, and the MAIN consumers. Replay
+  writes the current READY generation on MAIN, and the lease is released
+  after submission. `PerLayerDynamicMoeLoadBalancer.validate_breakable_prefill_graph`
+  rejects a deployment whose engine drops or clamps that bucket, whose MoE
+  chunking splits it, or whose shared expert is fused into the MoE kernel
+  (`moe_config.megamoe_fuse_shared_expert`), since the fused path routes
+  outside the layer's `load_balancer_overlap` scope.
 
 ## Canonical Examples
 

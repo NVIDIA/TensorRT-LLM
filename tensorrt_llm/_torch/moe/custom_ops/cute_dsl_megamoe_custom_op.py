@@ -54,6 +54,7 @@ from tensorrt_llm._torch.autotuner import (
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import (
     get_last_power_of_2_num_tokens_buckets,
+    get_model_extra_attrs,
     last_positive_power_of_2,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -256,20 +257,24 @@ def _token_back_ready_granularity_choices(*, load_balance: bool = False) -> tupl
     return _TOKEN_BACK_READY_GRANULARITIES if load_balance else ("expert",)
 
 
+MEGAMOE_TUNING_OP_PREFIX = "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
+MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR = "megamoe_allow_untuned_parent_graph"
+
+
 @functools.cache
 def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
     """Separate timing caches without changing the registered op or kernel ABI.
 
     Every launch that may tune asks for it, so each name is built once.
     """
-    base = "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
+    base = MEGAMOE_TUNING_OP_PREFIX
     load_balance = helper_expert_count > 0
     alpha = _autotune_pl_alpha(helper_expert_count)
     granularities = _token_back_ready_granularity_choices(load_balance=load_balance)
     if not load_balance and alpha == 0 and granularities == ("expert",):
         return base
     return (
-        f"{base}:profile_v2:load_balance={int(load_balance)}:alpha={alpha!r}"
+        f"{base}:profile_v3:load_balance={int(load_balance)}:alpha={alpha!r}"
         f":ready={','.join(granularities)}"
     )
 
@@ -979,6 +984,7 @@ def _megamoe_problem_key(
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
     helper_expert_count: int = 0,
+    ready_generation_from_device: bool = False,
 ) -> Tuple:
     return (
         int(sm_version),
@@ -1000,7 +1006,7 @@ def _megamoe_problem_key(
         None if swiglu_beta is None else float(swiglu_beta),
         # The helper count changes generated code and must be part of its cache key.
         int(helper_expert_count),
-    )
+    ) + ((True,) if ready_generation_from_device else ())
 
 
 def _shape_tuned_megamoe_tactic(problem_key: Tuple) -> Optional[Tuple]:
@@ -1306,6 +1312,8 @@ def _construct_megamoe_kernel(
         "token_back_ready_granularity": str(common.get("token_back_ready_granularity", "expert")),
         "reduce_topk_in_kernel": bool(common["in_kernel_fc2_reduce"]),
     }
+    if common.get("ready_generation_from_device", False):
+        impl_values["ready_generation_from_device"] = True
     if sm_version == 107:
         impl_values.update(
             mma_instruction_mnk=(
@@ -1625,6 +1633,8 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             f"{_TOKEN_BACK_READY_GRANULARITIES}, got {token_back_ready_granularity!r}."
         )
     if token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
+        if sm_version != 107:
+            raise ValueError("Blackwell publishes expert-level token-back readiness.")
         # Mirrors the kernel's own guard (kernel_src/*/inference/mega/
         # block_scaled_swap_ab_mega_moe_kernel.py, _validate_geometry). Checking
         # it HERE is the point of putting the granularity in the tuple: the
@@ -2745,6 +2755,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             shared_gate_up_clamp: Optional[float] = None,
             helper_expert_count: int = 0,
             ugpu_weight_layout: str = "none",
+            ready_generation_from_device: bool = False,
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103, 107):
@@ -2815,10 +2826,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # share a compile-cache entry with the ungated baseline.  Hence it
             # is in unique_id() (which _tactic_cache_key wraps).
             self.helper_expert_count = int(helper_expert_count)
+            self.ready_generation_from_device = bool(ready_generation_from_device)
+            if self.ready_generation_from_device and self.helper_expert_count <= 0:
+                raise ValueError("Device READY generation requires helper slots")
             # Per-launch READY runtime bundle (device pointer + generation).
             # Set by the op right after construction; never a codegen input.
             self._helper_ready_flags = None
             self._helper_ready_generation = 0
+            self._helper_ready_generation_tensor = None
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
@@ -2849,12 +2864,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 key = self._tactic_key = self._build_tactic_key()
             return key
 
-        def _build_tactic_key(self):
+        def _build_tactic_key(self, *, include_helpers: bool = True):
+            """Build the problem key; ``include_helpers=False`` keys the shape without helper slots."""
             return _megamoe_problem_key(
                 sm_version=self.sm_version,
                 world_size=self.world_size,
                 num_topk=self.num_topk,
-                num_experts_per_rank=self.num_experts_per_rank,
+                num_experts_per_rank=(
+                    self.num_experts_per_rank
+                    if include_helpers
+                    else self.num_experts_per_rank - self.helper_expert_count
+                ),
                 hidden_size=self.hidden_size,
                 intermediate_size_per_partition=self.intermediate_size_per_partition,
                 expand_intermediate_size_per_partition=(
@@ -2870,7 +2890,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 situ_linear_beta=self.situ_linear_beta,
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
-                helper_expert_count=self.helper_expert_count,
+                helper_expert_count=self.helper_expert_count if include_helpers else 0,
+                ready_generation_from_device=include_helpers and self.ready_generation_from_device,
             )
 
         def get_valid_tactics(
@@ -2907,14 +2928,20 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
-            for default_tactic in (
-                _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
-                _SM107_KIMI_K3_GENPHASE_TACTICS.get(self._tactic_lookup_key()),
-            ):
-                if default_tactic is not None:
-                    default_tactic = _unpack_tactic(default_tactic)
-                    if default_tactic not in candidates:
-                        candidates.append(default_tactic)
+            # The static defaults are recorded without helper slots, so a runner with
+            # helper slots also looks its shape up under the helper-free key.
+            lookup_keys = [self._tactic_lookup_key()]
+            if self.helper_expert_count > 0:
+                lookup_keys.append(self._build_tactic_key(include_helpers=False))
+            for key in lookup_keys:
+                for default_tactic in (
+                    _shape_tuned_megamoe_tactic(key),
+                    _SM107_KIMI_K3_GENPHASE_TACTICS.get(key),
+                ):
+                    if default_tactic is not None:
+                        default_tactic = _unpack_tactic(default_tactic)
+                        if default_tactic not in candidates:
+                            candidates.append(default_tactic)
             # The provider fits a dedup default and its non-dedup base (see
             # query_megamoe_kernel_properties); no other dedup tactic is sized for.
             if _sm107_default_combine_dedup(self.unique_id()):
@@ -3030,12 +3057,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
             config = self.__dict__.get("_tuning_config")
             if config is not None:
                 return config
+            # A replica plan always launches the padded capacity of its bucket.
+            token_axis = (
+                DynamicTensorSpec(0, 0)
+                if self.helper_expert_count > 0
+                else DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
+                )
+            )
             config = self._tuning_config = TuningConfig(
-                dynamic_tensor_specs=(
-                    DynamicTensorSpec(
-                        0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
-                    ),
-                ),
+                dynamic_tensor_specs=(token_axis,),
                 constraint_specs=(
                     ConstraintSpec(1, 0, _megamoe_autotune_num_tokens),  # activation_sf
                     ConstraintSpec(2, 0, _megamoe_autotune_num_tokens),  # topk_idx
@@ -3151,6 +3182,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 helper_expert_count=self.helper_expert_count,
                 **_LOCKED_KERNEL_KWARGS,
             )
+            if self.ready_generation_from_device:
+                if self.sm_version not in (100, 103):
+                    raise RuntimeError("Device READY generation is supported on SM100/103 only")
+                common["ready_generation_from_device"] = True
             kernel, rejection = _construct_megamoe_kernel(
                 sm_version=self.sm_version,
                 common=common,
@@ -3521,7 +3556,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                         "hot_expert_weight_ready_flags (uint64[EP] terminal "
                         "flags); got None."
                     )
-                if not (1 <= int(self._helper_ready_generation) < (1 << 63)):
+                if not self.ready_generation_from_device and not (
+                    1 <= int(self._helper_ready_generation) < (1 << 63)
+                ):
                     raise RuntimeError(
                         "MegaMoE-CuteDSL: hot_expert_weight_ready_generation "
                         f"must be in [1, 2**63); got "
@@ -3536,12 +3573,21 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 runtime_kwargs["hot_expert_weight_ready_flags"] = _to_cute_ptr_cached(
                     self._helper_ready_flags
                 )
-                runtime_kwargs["hot_expert_weight_ready_generation"] = cutlass.Uint64(
-                    int(self._helper_ready_generation)
-                )
-            # unique_id() includes helper_expert_count, separating cached ABIs.
+                if self.ready_generation_from_device:
+                    if self._helper_ready_generation_tensor is None:
+                        raise RuntimeError("Device READY generation tensor is missing")
+                    runtime_kwargs["hot_expert_weight_ready_generation"] = _to_cute_ptr_cached(
+                        self._helper_ready_generation_tensor, assumed_align=8
+                    )
+                else:
+                    runtime_kwargs["hot_expert_weight_ready_generation"] = cutlass.Uint64(
+                        int(self._helper_ready_generation)
+                    )
+            # The cache key distinguishes helper topology and generation ABI.
             cached = self.__class__.kernel_cache.get(cache_key)
             if cached is None:
+                if _capturing and self.ready_generation_from_device and self.tactic_autotune:
+                    raise RuntimeError("Parent MegaMoE graph reached an uncompiled tuned kernel")
                 compiled = cute.compile(kernel, **runtime_kwargs)
                 self.__class__.kernel_cache[cache_key] = (compiled, kernel)
             else:
@@ -3593,6 +3639,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         shared_intermediate_size=None,
         shared_gate_up_clamp=None,
         ugpu_weight_layout="none",
+        ready_generation_from_device=False,
     ):
         """Reuse a runner by its complete constructor key.
 
@@ -3621,7 +3668,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             shared_intermediate_size,
             shared_gate_up_clamp,
             ugpu_weight_layout,
-        )
+        ) + ((True,) if ready_generation_from_device else ())
 
         def _make():
             return Sm100MegaMoENvfp4Runner(
@@ -3647,6 +3694,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 shared_intermediate_size=shared_intermediate_size,
                 shared_gate_up_clamp=shared_gate_up_clamp,
                 ugpu_weight_layout=ugpu_weight_layout,
+                ready_generation_from_device=ready_generation_from_device,
             )
 
         # A runner that may profile owns profiling scratch, so tuning-mode calls
@@ -3717,6 +3765,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
         ugpu_weight_layout: str = "none",
+        hot_expert_weight_ready_generation_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3769,6 +3818,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
         if num_tokens > 0:
             combine_output = combine_output[: min(num_tokens, combine_output.shape[0])]
 
+        ready_generation_from_device = hot_expert_weight_ready_generation_tensor is not None
+        if ready_generation_from_device:
+            generation_tensor = hot_expert_weight_ready_generation_tensor
+            if (
+                helper_expert_count <= 0
+                or not generation_tensor.is_cuda
+                or generation_tensor.dtype != torch.int64
+                or generation_tensor.shape != (1,)
+                or not generation_tensor.is_contiguous()
+                or generation_tensor.device != activation.device
+                or generation_tensor.data_ptr() % 8
+            ):
+                raise ValueError(
+                    "Device READY generation requires helper slots and an aligned "
+                    "contiguous CUDA int64[1] tensor on the activation device"
+                )
+
         runner = _megamoe_get_runner(
             world_size,
             local_rank,
@@ -3792,11 +3858,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
             shared_intermediate_size=shared_intermediate_size,
             shared_gate_up_clamp=shared_gate_up_clamp,
             ugpu_weight_layout=ugpu_weight_layout,
+            ready_generation_from_device=ready_generation_from_device,
         )
         # READY inputs belong to this launch. Never regenerate them or retain stale
         # values across calls, even when the runner itself is cached.
         runner._helper_ready_flags = hot_expert_weight_ready_flags
         runner._helper_ready_generation = int(hot_expert_weight_ready_generation)
+        runner._helper_ready_generation_tensor = hot_expert_weight_ready_generation_tensor
         inputs = [
             activation,
             activation_sf,
@@ -3841,6 +3909,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # Release the cached runner reference to this generation's terminal tensor.
                 # The next call supplies fresh READY inputs.
                 runner._helper_ready_flags = None
+                runner._helper_ready_generation_tensor = None
             return
         tuner = AutoTuner.get()
         # Opt-IN: in tuning mode the MERGE lockstep sweep runs (made safe by
@@ -3878,6 +3947,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
             prof_peer_offsets = peer_offsets
             prof_shared_workspace = shared_workspace
         try:
+            if (
+                ready_generation_from_device
+                and tuner.is_tuning_mode
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError("Parent MegaMoE graph must select its tactic before capture")
             _, best_tactic = tuner.choose_one(
                 _megamoe_tuning_op_name(runner.helper_expert_count),
                 [runner],
@@ -3892,6 +3967,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
             runner._profiling_scratch_factory = None
         # Real run always uses the caller's staging buffer + peer_offsets.
         try:
+            if ready_generation_from_device and best_tactic == -1:
+                attrs = get_model_extra_attrs()
+                allow_default = attrs is not None and attrs.get(
+                    MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR, False
+                )
+                if tuner.is_tuning_mode or not allow_default:
+                    raise RuntimeError("Missing warmup tactic for the parent MegaMoE graph")
             runner(
                 inputs,
                 tactic=best_tactic,
@@ -3901,6 +3983,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
         finally:
             runner._helper_ready_flags = None
+            runner._helper_ready_generation_tensor = None
 
     # Eager callers may call ``run_cute_dsl_megamoe_nvfp4_blackwell`` directly
     # and skip the custom-op dispatch; traced code must use the registered op.
@@ -3962,5 +4045,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
         ugpu_weight_layout: str = "none",
+        hot_expert_weight_ready_generation_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         return None

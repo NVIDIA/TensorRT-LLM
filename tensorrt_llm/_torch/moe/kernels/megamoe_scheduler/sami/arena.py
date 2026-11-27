@@ -171,6 +171,12 @@ class BoundLiveWeightArena:
     destination_ptrs: tuple[int, ...]
     terminal_local_ptr: int
     terminal_mc_ptr: int
+    #: ``[peer][helper][plane]`` unicast address of row ``H + helper`` in each
+    #: peer's UC view, this rank's own row included. Peer rows are writable
+    #: only when the provider maps peers' helper rows (see
+    #: ``peer_helper_rows_mapped`` of the hierarchical arena); the owner of a
+    #: pair-level record writes them, and its own row when its pair holds it.
+    helper_uc_ptrs: tuple[int, ...] = ()
 
     @property
     def local_slot_count(self) -> int:
@@ -325,6 +331,15 @@ class LiveWeightArena:
                     mc_identities[plane_index].pointer
                     + physical_slot * layout.nbytes
                 )
+        helper_uc: list[int] = []
+        for peer in range(world):
+            for helper_index in range(helper_count):
+                physical_slot = home_count + helper_index
+                for plane_index, layout in enumerate(bundle.planes):
+                    helper_uc.append(
+                        plane_identities[plane_index][peer].pointer
+                        + physical_slot * layout.nbytes
+                    )
 
         if self.terminals.aliases_same_backing is not True:
             raise ValueError("terminal UC/MC alias is not provider-attested")
@@ -365,6 +380,7 @@ class LiveWeightArena:
             destination_ptrs=tuple(destinations),
             terminal_local_ptr=terminal_local.pointer,
             terminal_mc_ptr=terminal_mc.pointer,
+            helper_uc_ptrs=tuple(helper_uc),
         )
 
     @staticmethod

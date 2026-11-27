@@ -327,6 +327,32 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
 
 
 @pytest.mark.parametrize(
+    ("world", "supported"),
+    [
+        (4, True),
+        (6, True),
+        (8, True),
+        # A ladder that ends in rank pairs has no team objects above EP8.
+        (16, True),
+        # Rank pairs 4/5 straddle the two five-rank groups.
+        (10, False),
+        (12, False),
+        # 47 pair and team objects per helper set.
+        (32, False),
+    ],
+)
+def test_per_layer_helper_sets_are_limited_to_supported_worlds(world: int, supported: bool) -> None:
+    """A helper set per layer is rejected where its multicast binds or its pair slots do not fit."""
+    path = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/geometry.py"
+    spec = importlib.util.spec_from_file_location("_scheduler_geometry_under_test", path)
+    assert spec is not None and spec.loader is not None
+    geometry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(geometry)
+
+    assert geometry.per_layer_helper_sets_supported(world) is supported
+
+
+@pytest.mark.parametrize(
     (
         "hidden",
         "intermediate",
@@ -595,6 +621,70 @@ def test_ep_collective_adapter_uses_the_resolved_process_group():
         comm.validate_geometry(expected_rank=0, expected_world=3)
     with pytest.raises(ValueError, match="broadcast root"):
         comm.bcast("payload", 3)
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        (("61", "61", "61", "61"), None),
+        ((None, "0", None, "sixty"), r"must be a positive int; got \{1: '0', 3: 'sixty'\}"),
+        (("61", "61", "64", "61"), r"differs across the EP group: \[61, 61, 64, 61\]"),
+    ],
+    ids=["agreed", "invalid_on_some_ranks", "different_spans"],
+)
+def test_pair_span_is_accepted_or_rejected_by_every_rank_together(values, message):
+    """A rank that rejected its own span before the exchange would leave the
+    other ranks waiting in the collective."""
+    source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/arena.py"
+    constants = _module_constants(
+        source, {"_HELPER_BANK_COUNT", "_PAIR_SPAN_LAYERS_ENV", "_PAIR_SPAN_LAYERS_DEFAULT"}
+    )
+    world = len(values)
+    # The exchange completes once every rank has entered it; the timeout only
+    # bounds a run in which one never does.
+    exchange = threading.Barrier(world, timeout=10)
+    payloads = [None] * world
+    entered = [False] * world
+    outcomes = [None] * world
+
+    def run_rank(rank):
+        def allgather(payload):
+            payloads[rank] = payload
+            entered[rank] = True
+            exchange.wait()
+            return list(payloads)
+
+        # Each rank reads its own environment; None leaves the variable unset.
+        environ = {} if values[rank] is None else {constants["_PAIR_SPAN_LAYERS_ENV"]: values[rank]}
+        pool_cls = _extract_class(
+            source,
+            "_SharedSlotPool",
+            {"_pair_span"},
+            {"Any": Any, "os": SimpleNamespace(environ=environ), **constants},
+        )
+        pool = pool_cls.__new__(pool_cls)
+        pool.per_layer_sets = True
+        try:
+            outcomes[rank] = pool._pair_span(SimpleNamespace(allgather=allgather))
+        except (ValueError, threading.BrokenBarrierError) as error:
+            outcomes[rank] = error
+        finally:
+            if not entered[rank]:
+                # This rank left before the exchange: release the ranks waiting for it.
+                exchange.abort()
+
+    ranks = [threading.Thread(target=run_rank, args=(rank,)) for rank in range(world)]
+    for thread in ranks:
+        thread.start()
+    for thread in ranks:
+        thread.join()
+
+    if message is None:
+        assert outcomes == [61] * world
+    else:
+        assert all(isinstance(outcome, ValueError) for outcome in outcomes), outcomes
+        assert len({str(outcome) for outcome in outcomes}) == 1
+        assert re.search(message, str(outcomes[0]))
 
 
 def test_model_engine_warmup_uses_load_balancer_public_api():
@@ -1273,7 +1363,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     )
     torch = SimpleNamespace(cuda=cuda, _C=raw, Tensor=_Routes, int32="int32")
     source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/planner.py"
-    namespace = {"torch": torch}
+    namespace = {"torch": torch, "contextmanager": contextmanager}
     group_cls = _extract_class(source, "RebalanceSlotSchedulerGroup", None, namespace)
     lease_cls = _extract_class(source, "_LiveBankLeaseProvider", None, namespace)
     group = group_cls.__new__(group_cls)
@@ -1292,6 +1382,10 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     group._lent_rows = -1
     group._lent_routes = None
     group._closed = False
+    group.graph_generation = None
+    group.is_capturing_parent_graph = False
+    group._captured_route_wait = False
+    group._graph_replay_failed = False
     group._execution_stream_handle = None
     group.device = 0
     group.topk = 6
@@ -1671,20 +1765,33 @@ def test_native_launch_and_release_order_the_copy_stream_after_main():
     # HALO-Q must not read routes before MAIN wrote them, and the next generation's
     # copy must not overwrite the live bank before MAIN's consumer of it.
     source = (_ROOT / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceTmaOp.cpp").read_text()
-    submit = _cpp_method_body(source, "void submitFused(torch::Tensor const& routes")
+    # The eager and the captured submit check the routes, then share one launch path.
+    checks = _cpp_method_body(
+        source, "kernels::MoeRebalanceHaloQParams schedulerForRoutes(torch::Tensor const& routes"
+    )
+    _assert_in_order(
+        checks, ("TORCH_CHECK_VALUE(routes.is_cuda()", "TORCH_CHECK_VALUE(spinCycles > 0")
+    )
+    for signature in (
+        "void submitFused(torch::Tensor const& routes",
+        "void submitGraph(torch::Tensor const& routes",
+    ):
+        entry = _cpp_method_body(source, signature)
+        _assert_in_order(entry, ("schedulerForRoutes(routes, spinCycles)", "submit("))
+        assert "currentExecutionStream()" in entry
+    submit = _cpp_method_body(
+        source, "void submit(kernels::MoeRebalanceHaloQParams const& scheduler"
+    )
     _assert_in_order(
         submit,
         (
-            "TORCH_CHECK_VALUE(routes.is_cuda()",
-            "TORCH_CHECK_VALUE(spinCycles > 0",
-            "cudaStream_t const execution = currentExecutionStream();",
             "cudaEventRecord(mInputReady, execution)",
             "cudaStreamWaitEvent(mCopyStream, mInputReady, 0)",
             "megamoe_tma_copy_submit_fused(",
         ),
     )
     launch = submit[submit.index("megamoe_tma_copy_submit_fused(") :]
-    assert "reinterpret_cast<void*>(mCopyStream)" in launch
+    assert "mCopyStream" in launch
     release = _cpp_method_body(source, "void releaseAfterCurrentStream()")
     _assert_in_order(
         release,
@@ -1968,16 +2075,117 @@ def test_megamoe_tuning_config_is_built_once_per_runner():
             "_megamoe_autotune_num_tokens": None,
         },
     )
-    first, second = runner_cls(), runner_cls()
-    for runner in (first, second):
-        runner.max_tokens_per_rank = 8192
+    first, scalar, graph = runner_cls(), runner_cls(), runner_cls()
+    first.max_tokens_per_rank = 8192
+    first.helper_expert_count = 0
+    scalar.max_tokens_per_rank = 1024
+    scalar.helper_expert_count = 3
+    graph.max_tokens_per_rank = 8192
+    graph.helper_expert_count = 3
 
     config = first.get_tuning_config()
     assert first.get_tuning_config() is config
     # The profiling pre-hook stays bound to the runner that built the config.
     assert config.inputs_pre_hook.__self__ is first
-    assert second.get_tuning_config().inputs_pre_hook.__self__ is second
-    assert len(configs) == 2
+    assert config.dynamic_tensor_specs == ((0, 0, None, None),)
+    for runner in (scalar, graph):
+        halo_config = runner.get_tuning_config()
+        assert halo_config.inputs_pre_hook.__self__ is runner
+        assert halo_config.dynamic_tensor_specs == ((0, 0),)
+        assert halo_config.tune_max_num_tokens == runner.max_tokens_per_rank
+    assert len(configs) == 3
+
+
+@pytest.mark.parametrize(
+    ("helpers", "genptr", "tuning", "scoped", "expected_priming"),
+    [
+        (3, False, True, True, [256, 1024, 4096]),
+        (3, False, False, True, []),
+        (3, False, True, False, []),
+        (3, True, True, True, []),
+        (0, False, True, True, []),
+    ],
+)
+def test_tuned_megamoe_primes_eager_rungs_on_the_live_replica_plan(
+    helpers, genptr, tuning, scoped, expected_priming
+):
+    primed = set() if scoped else None
+    impl_type = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py",
+        "TrtllmCutedslMegaMoeNvfp4Impl",
+        {"_run_moe", "_prime_ladder", "_prime_ladder_buckets", "_select_launch_max_tokens"},
+        {
+            "AutoTuner": SimpleNamespace(get=lambda: SimpleNamespace(is_tuning_mode=tuning)),
+            "_MEGAMOE_TUNED_LADDERS": SimpleNamespace(get=lambda: primed),
+            "_MEGAMOE_PRIME_LADDER": True,
+            "logger": SimpleNamespace(debug=lambda *_: None),
+            "torch": SimpleNamespace(empty=lambda *_, **__: None, int32="int32", float32="float32"),
+            "stage_megamoe_inputs": lambda *_, **__: None,
+        },
+    )
+    impl = impl_type()
+    impl._maxt_buckets = [256, 1024, 4096, 6144]
+    impl._parent_graph_bucket = 6144 if genptr else None
+    impl._ugpu_weight_layout = "none"
+    impl._shared_expert = impl._prestaged = impl._slot_of_expert = None
+    impl.ep_size = 16
+    impl.ep_rank = 0
+    impl.tactic_autotune = True
+    impl.intermediate_size_per_partition = 3072
+    impl.compute_slot_count = 24 + helpers
+    impl.combine_format = "16e2m1xbf16"
+    impl.act_clamp = impl.act_alpha = impl.act_beta = None
+    impl.apply_topk_in_fc1 = True
+    weights = object()
+    plan = (
+        SimpleNamespace(ready_generation_tensor=object() if genptr else None) if helpers else None
+    )
+    launches = []
+
+    class TopkWeights:
+        def __getitem__(self, _):
+            return self
+
+    impl._acquire_buffers = lambda **kwargs: SimpleNamespace(
+        activation="activation",
+        activation_sf="sf",
+        topk_weights=TopkWeights(),
+        combine_output="combine",
+        shared_workspace=kwargs["launch_max_T"],
+        peer_offsets=(0,),
+        topk_idx_local="routes",
+    )
+    impl._stage_inputs = lambda **_: None
+    impl._launch_megamoe_kernel = lambda **kwargs: launches.append(kwargs)
+
+    def run():
+        impl._active_launch_max_tokens = 257
+        impl._run_moe(
+            x=None,
+            x_sf=None,
+            topk_idx=SimpleNamespace(dtype="int32", is_contiguous=lambda: True),
+            topk_weights=None,
+            weight_view=weights,
+            num_tokens=257,
+            top_k=6,
+            hidden=7168,
+            device="cuda",
+            output_dtype="bf16",
+            replica_plan=plan,
+        )
+
+    run()
+    launch_capacity = 6144 if tuning else 1024
+    assert [x["launch_max_T"] for x in launches] == [*expected_priming, launch_capacity]
+    assert [x["num_tokens"] for x in launches] == [0] * len(expected_priming) + [257]
+    assert all(x["weight_view"] is weights and x["replica_plan"] is plan for x in launches)
+    assert all(x["shared_workspace"] == x["launch_max_T"] for x in launches)
+    run()
+    assert [x["launch_max_T"] for x in launches] == [
+        *expected_priming,
+        launch_capacity,
+        launch_capacity,
+    ]
 
 
 def test_megamoe_runner_identity_is_built_once():
@@ -2009,8 +2217,19 @@ def _autotune_helpers(torch):
         "_epi_flag_batch_for_tokens",
         "_expand_megamoe_ready_tactics",
         "enumerate_megamoe_candidate_tactics",
+        "_default_megamoe_tactic_for_problem",
+        "_default_megamoe_tactic_for_key",
+        "_shape_tuned_megamoe_tactic",
+        "_megamoe_problem_key",
+        "_megamoe_weight_evict_first",
+        "_sm107_dsv4_pro_problem_key",
+        "_sm107_default_combine_dedup",
+        "_with_combine_dedup",
+        "_sm107_tactic_bucket",
+        "default_megamoe_tactic",
     }
     constants = {
+        "MEGAMOE_TUNING_OP_PREFIX",
         "_NVFP4_BLOCK_SIZE",
         "_SUPPORTED_MMA_TILE_M",
         "_SUPPORTED_MMA_TILE_N",
@@ -2031,6 +2250,21 @@ def _autotune_helpers(torch):
         "_EPI_FLAG_BATCH_SMALL",
         "_EPI_FLAG_BATCH_LARGE",
         "_EPI_FLAG_BATCH_TOKEN_THRESHOLD",
+        "_MEGAMOE_NONBULK_STANDALONE_TACTIC",
+        "_MEGAMOE_QUANTIZED_COMBINE_TACTIC",
+        "_MEGAMOE_NVFP4_COMBINE_BULK_MIN_TOKENS",
+        "_MEGAMOE_NVFP4_COMBINE_BULK_TACTIC",
+        "_SM107_DSV4_PRO_DEFAULT_TACTICS",
+        "_SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS",
+        "_SM107_DSV41_FLASH_DEFAULT_TACTICS",
+        "_SM103_DSV41_FLASH_DEFAULT_TACTICS",
+        "_SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT",
+        "_SM103_DSV41_FLASH_SMALL_RUNG_TACTICS",
+        "_SM107_KIMI_K3_GENPHASE_TACTICS",
+        "_SM107_GENPHASE_TACTICS",
+        "_SM107_GENPHASE_MAX_TOKENS_PER_RANK",
+        "_WEIGHT_EVICT_FIRST_MAX_ROWS_PER_EXPERT",
+        "_WEIGHT_EVICT_FIRST_MAX_ROWS_PER_RANK",
     }
     tree = ast.parse(source.read_text())
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
@@ -2042,7 +2276,7 @@ def _autotune_helpers(torch):
             if any(isinstance(target, ast.Name) and target.id in constants for target in targets):
                 nodes.append(node)
     namespace = {
-        "torch": torch,
+        "torch": torch if torch is not None else SimpleNamespace(bfloat16="torch.bfloat16"),
         "math": math,
         "functools": functools,
         "Tuple": Tuple,
@@ -2142,22 +2376,61 @@ def test_megamoe_runner_cache_reuses_only_production_runners():
     assert len(created) == 4
 
 
-def test_on_autotune_uses_distinct_tactics():
+@pytest.mark.parametrize("sm,tokens", [(100, 8192), (103, 8192), (100, 16384), (107, 8192)])
+def test_on_autotune_uses_distinct_tactics(sm, tokens):
     helpers = _autotune_helpers(None)
 
     off_key = helpers["_megamoe_tuning_op_name"](0)
     on_key = helpers["_megamoe_tuning_op_name"](4)
     assert off_key == "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
-    assert on_key != off_key and "alpha=0.8" in on_key
+    assert "profile_v3:load_balance=1:alpha=0.8" in on_key
+    runner = _extract_class(
+        _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
+        "Sm100MegaMoENvfp4Runner",
+        {
+            "__init__",
+            "get_valid_tactics",
+            "unique_id",
+            "_build_unique_id",
+            "_tactic_lookup_key",
+            "_build_tactic_key",
+        },
+        dict(helpers, get_sm_version=lambda: sm),
+    )
+    world_size = 4 if sm == 107 else 16
+    inputs = [SimpleNamespace(shape=(tokens,))]
 
-    off = helpers["enumerate_megamoe_candidate_tactics"](32, 107)
-    on = helpers["enumerate_megamoe_candidate_tactics"](32, 107, load_balance=True)
-    assert all(helpers["_unpack_tactic"](tactic)[10] == "expert" for tactic in off)
-    assert {helpers["_unpack_tactic"](tactic)[10] for tactic in on} == {
-        "expert",
-        "token_tile",
-    }
-    assert any(tactic[2] is not None for tactic in on)
+    def tactics(helper_count, graph=False):
+        instance = runner(
+            local_rank=0,
+            world_size=world_size,
+            num_topk=6,
+            num_experts_per_rank=384 // world_size + helper_count,
+            hidden_size=7168,
+            intermediate_size_per_partition=3072,
+            expand_intermediate_size_per_partition=6144,
+            max_tokens_per_rank=tokens,
+            output_dtype=helpers["torch"].bfloat16,
+            gate_up_clamp=10.0,
+            combine_format="bf16" if sm == 107 else "16e2m1xbf16",
+            helper_expert_count=helper_count,
+            ready_generation_from_device=graph,
+        )
+        return instance.get_valid_tactics(inputs, None)
+
+    off = tactics(0)
+    assert all(t[10] == "expert" for t in off)
+    for count in (2, 3):
+        on = tactics(count)
+        assert on == tactics(count, graph=True)
+        # The provider sizes the combine-dedup default only for a helper-free runner.
+        assert not any(t[11] for t in on)
+        assert all(t in on for t in off if not t[11])
+        if sm == 107:
+            assert any(t[10] == "token_tile" for t in on)
+        else:
+            assert len(off) == 14
+            assert on == off
 
 
 def test_on_autotune_builds_balanced_powerlaw_input(request):
@@ -2186,6 +2459,16 @@ def test_on_autotune_builds_balanced_powerlaw_input(request):
     uniform = helpers["synthesize_profiling_topk"](**{**kwargs, "alpha": 0.0})
     expected = (torch.arange(8192 * 6) % (8 * 52)).view(8192, 6)
     assert torch.equal(uniform, expected)
+
+    # Exercise rotation when a source's assignment count is not divisible by EP.
+    total = torch.zeros(8, 52, dtype=torch.long)
+    for source in range(8):
+        routes = helpers["synthesize_profiling_topk"](
+            **{**kwargs, "num_tokens": 127, "source_rank": source}
+        )
+        total += torch.bincount(routes.flatten(), minlength=8 * 52).view(8, 52)
+    assert (total.sum(1) == 127 * 6).all()
+    assert (total[:, 1:] >= total[:, :-1]).all()
 
 
 def test_per_layer_dynamic_shutdown_reports_in_iter_through_collective_preflight():
@@ -2398,8 +2681,13 @@ class _ChunkRoutes:
         self.name = name
 
 
-@pytest.mark.parametrize("mode", ["per_layer_dynamic", "standard", "off"])
+@pytest.mark.parametrize(
+    "mode", ["per_layer_dynamic", "per_layer_dynamic_fused", "standard", "off"]
+)
 def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
+    # "per_layer_dynamic_fused": the backend's route+quant launch also serves a replica plan.
+    fused = mode == "per_layer_dynamic_fused"
+    mode = mode.removesuffix("_fused")
     source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
     trace = []
     labels = []
@@ -2454,6 +2742,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
 
     def run_moe(ctx):
         trace.append(("run_moe", ctx.token_selected_experts.name, ctx.replica_plan))
+        assert (ctx.x, ctx.x_sf) == (("fused x", "fused sf") if fused else ("x", "sf"))
         return "out"
 
     moe = SimpleNamespace(
@@ -2484,7 +2773,18 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_count_warmup=lambda *args: None,
         backend=SimpleNamespace(
-            fused_route_quant_enabled=False,
+            fused_route_quant_enabled=fused,
+            replica_plan_fuses_route_quant=fused,
+            try_fused_route_quant=lambda x, logits: (
+                trace.append("fused_route_quant")
+                or SimpleNamespace(
+                    token_selected_experts=_ChunkRoutes("logical"),
+                    token_final_scales=SimpleNamespace(dtype="float32"),
+                    x="fused x",
+                    x_sf="fused sf",
+                    routes_counted=False,
+                )
+            ),
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
             run_moe=run_moe,
@@ -2508,12 +2808,15 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         # replays, and quantization leaves the plan's SMs to its copy kernel.
         # The layer has no CPU stage or host statistics, so only the post-MoE
         # hook that releases its plan runs.
+        # A backend whose route+quant launch serves a replica plan routes and quantizes
+        # in that launch, ahead of the planner, which still gets the logical routes.
         expected = [
             ("bucket", 6),
+            *(["fused_route_quant"] if fused else []),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
-            ("quantize", {"reserved_sms": 4}),
+            *([] if fused else [("quantize", {"reserved_sms": 4})]),
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]

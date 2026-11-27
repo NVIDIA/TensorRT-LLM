@@ -128,6 +128,7 @@ public:
         int64_t planWords, int64_t routeFeatures, int64_t tmaRoute, int64_t tmaSourceLoadPercent,
         std::vector<int64_t> const& groupSizes, std::vector<int64_t> const& sourceTable,
         std::vector<int64_t> const& destinationTable, std::vector<int64_t> const& foreignDestinationTable,
+        std::vector<int64_t> const& unicastDestinationTable, std::vector<int64_t> const& pairDestinationTable,
         std::vector<int64_t> const& planeBytes)
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -149,7 +150,7 @@ public:
             helperCountValue <= (std::numeric_limits<int>::max() - 25) / 7, "helper_count exceeds the GPU plan ABI");
         TORCH_CHECK(levelCountValue > 0 && targetCountValue >= 0,
             "level_count must be positive and target_count must be nonnegative");
-        TORCH_CHECK(targetCountValue <= 32 && (routeFeaturesValue == 0 || routeFeaturesValue == 1),
+        TORCH_CHECK(targetCountValue <= 32 && (routeFeaturesValue & ~MEGAMOE_TMA_GPU_PLAN_ROUTE_MASK) == 0,
             "target_count or route_features exceeds the GPU plan ABI");
         TORCH_CHECK(levelCountValue <= MEGAMOE_TMA_GPU_PLAN_MAX_LEVELS, "level_count exceeds the GPU plan ABI");
         TORCH_CHECK(
@@ -163,11 +164,26 @@ public:
 
         uint64_t const sourceCount = static_cast<uint64_t>(globalExpertsValue) * planesValue;
         uint64_t const destinationCount = static_cast<uint64_t>(levelCountValue) * helperCountValue * planesValue;
-        uint64_t const foreignCount
-            = routeFeaturesValue ? static_cast<uint64_t>(targetCountValue) * helperCountValue * planesValue : 0;
+        uint64_t const foreignCount = (routeFeaturesValue & MEGAMOE_TMA_GPU_PLAN_ROUTE_EXTERNAL)
+            ? static_cast<uint64_t>(targetCountValue) * helperCountValue * planesValue
+            : 0;
+        // Owner-direct unicast destinations: [receiver][helper][plane], 0 for this rank.
+        uint64_t const unicastCount = (routeFeaturesValue & MEGAMOE_TMA_GPU_PLAN_ROUTE_OWNER_UNICAST)
+            ? static_cast<uint64_t>(worldValue) * helperCountValue * planesValue
+            : 0;
         auto sources = checkedU64Vector(sourceTable, sourceCount, "source_table");
         auto destinations = checkedU64Vector(destinationTable, destinationCount, "destination_table");
         auto foreign = checkedU64Vector(foreignDestinationTable, foreignCount, "foreign_destination_table");
+        auto unicast = checkedU64Vector(unicastDestinationTable, unicastCount, "unicast_destination_table");
+        // Pair multicast destinations: [pair][helper][plane], 0 for a plane without a pair team.
+        TORCH_CHECK(!(routeFeaturesValue & MEGAMOE_TMA_GPU_PLAN_ROUTE_PAIR_MULTICAST)
+                || (routeFeaturesValue
+                    & (MEGAMOE_TMA_GPU_PLAN_ROUTE_OWNER_UNICAST | MEGAMOE_TMA_GPU_PLAN_ROUTE_BALANCED)),
+            "pair multicast needs owner-direct unicast or the balanced route");
+        uint64_t const pairCount = (routeFeaturesValue & MEGAMOE_TMA_GPU_PLAN_ROUTE_PAIR_MULTICAST)
+            ? static_cast<uint64_t>(worldValue / 2) * helperCountValue * planesValue
+            : 0;
+        auto pairs = checkedU64Vector(pairDestinationTable, pairCount, "pair_destination_table");
         auto bytes = checkedU64Vector(planeBytes, planesValue, "plane_bytes");
 
         MegamoeTmaGpuPlanConfig config{};
@@ -192,6 +208,8 @@ public:
         config.src_table = sources.data();
         config.dst_table = destinations.data();
         config.foreign_dst_table = foreign.empty() ? nullptr : foreign.data();
+        config.uc_dst_table = unicast.empty() ? nullptr : unicast.data();
+        config.pair_dst_table = pairs.empty() ? nullptr : pairs.data();
         config.plane_bytes = bytes.data();
 
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
@@ -295,27 +313,59 @@ public:
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireFusedBound();
-        TORCH_CHECK_VALUE(routes.is_cuda() && routes.get_device() == mDevice
-                && routes.scalar_type() == at::ScalarType::Int && routes.is_contiguous() && routes.dim() == 2
-                && routes.size(1) == mTopk && routes.numel() <= mFusedParams.routeCapacity,
-            "routes must be a contiguous CUDA int32 [tokens, ", mTopk, "] tensor on device ", mDevice, " with at most ",
-            mFusedParams.routeCapacity / mTopk, " tokens");
-        TORCH_CHECK_VALUE(spinCycles > 0, "spin_cycles must be positive");
-        auto scheduler = mFusedParams;
-        scheduler.routes = routes.data_ptr<int>();
-        scheduler.validRouteCount = static_cast<int>(routes.numel());
-        scheduler.spinCycles = static_cast<uint64_t>(spinCycles);
+        auto const scheduler = schedulerForRoutes(routes, spinCycles);
 
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
-        cudaStream_t const execution = currentExecutionStream();
-        checkCudaResult(cudaEventRecord(mInputReady, execution), "cudaEventRecord(rebalance input ready)");
-        checkCudaResult(cudaStreamWaitEvent(mCopyStream, mInputReady, 0), "cudaStreamWaitEvent(rebalance input ready)");
-        checkTmaResult(
-            megamoe_tma_copy_submit_fused(mState, scheduler, mRouteEpochPtr, static_cast<uint64_t>(routeTarget),
-                mFlagMc, mGeneration, reinterpret_cast<void*>(mCopyStream)),
-            "moe rebalance fused HALO-Q + TMA submit");
+        submit(scheduler, static_cast<uint64_t>(routeTarget), currentExecutionStream());
         ++mGeneration;
         TORCH_CHECK(mGeneration != 0, "moe rebalance TMA generation overflow");
+    }
+
+    void submitGraph(torch::Tensor const& routes, torch::Tensor const& generation, int64_t spinCycles)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        requireFusedBound();
+        auto const scheduler = schedulerForRoutes(routes, spinCycles);
+        TORCH_CHECK_VALUE(generation.is_cuda() && generation.get_device() == mDevice
+                && generation.scalar_type() == at::ScalarType::Long && generation.is_contiguous()
+                && generation.numel() == 1,
+            "graph generation must be a CUDA int64 scalar on device ", mDevice);
+        TORCH_CHECK(!mGraphGeneration.defined() || mGraphGeneration.data_ptr() == generation.data_ptr(),
+            "captured producer generation storage changed");
+
+        c10::cuda::CUDAGuard const deviceGuard(routes.device());
+        cudaStream_t const execution = currentExecutionStream();
+        requireCapture(execution);
+        submit(
+            scheduler, /*routeTarget=*/0, execution, reinterpret_cast<uint64_t const*>(generation.data_ptr<int64_t>()));
+        mGraphGeneration = generation;
+    }
+
+    void prepareGraphGeneration(int64_t expectedGeneration)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        requireFusedBound();
+        TORCH_CHECK(mGraphGeneration.defined() && expectedGeneration > 0
+                && static_cast<uint64_t>(expectedGeneration) == mGeneration,
+            "graph replay must consume exactly the next native generation");
+        ++mGeneration;
+    }
+
+    void waitGraphRoutes(torch::Tensor const& generation, int64_t spinCycles)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        requireFusedBound();
+        TORCH_CHECK_VALUE(spinCycles > 0, "spin_cycles must be positive");
+        TORCH_CHECK(
+            mGraphGeneration.defined() && generation.defined() && generation.data_ptr() == mGraphGeneration.data_ptr(),
+            "graph route wait has a different generation storage");
+        c10::cuda::CUDAGuard const deviceGuard(mGraphGeneration.device());
+        cudaStream_t const execution = currentExecutionStream();
+        requireCapture(execution);
+        checkTmaResult(megamoe_tma_copy_wait_replay_routes(mRouteEpochPtr,
+                           reinterpret_cast<uint64_t const*>(mGraphGeneration.data_ptr<int64_t>()),
+                           static_cast<unsigned>(mFusedParams.ctas), static_cast<uint64_t>(spinCycles), execution),
+            "capture HALO-Q route dependency");
     }
 
     // Orders the copy stream after the work already queued on the current stream, such as the consumer of the
@@ -388,6 +438,7 @@ public:
             mWorkspace = torch::Tensor();
             mStatus = torch::Tensor();
             mGridSync = torch::Tensor();
+            mGraphGeneration = torch::Tensor();
             mConfigured = false;
             mBound = false;
             releaseFusedEvents();
@@ -400,6 +451,38 @@ public:
     }
 
 private:
+    kernels::MoeRebalanceHaloQParams schedulerForRoutes(torch::Tensor const& routes, int64_t spinCycles) const
+    {
+        TORCH_CHECK_VALUE(routes.is_cuda() && routes.get_device() == mDevice
+                && routes.scalar_type() == at::ScalarType::Int && routes.is_contiguous() && routes.dim() == 2
+                && routes.size(1) == mTopk && routes.numel() <= mFusedParams.routeCapacity,
+            "routes must be a contiguous CUDA int32 [tokens, ", mTopk, "] tensor on device ", mDevice, " with at most ",
+            mFusedParams.routeCapacity / mTopk, " tokens");
+        TORCH_CHECK_VALUE(spinCycles > 0, "spin_cycles must be positive");
+        auto scheduler = mFusedParams;
+        scheduler.routes = routes.data_ptr<int>();
+        scheduler.validRouteCount = static_cast<int>(routes.numel());
+        scheduler.spinCycles = static_cast<uint64_t>(spinCycles);
+        return scheduler;
+    }
+
+    void submit(kernels::MoeRebalanceHaloQParams const& scheduler, uint64_t routeTarget, cudaStream_t execution,
+        uint64_t const* graphGeneration = nullptr)
+    {
+        checkCudaResult(cudaEventRecord(mInputReady, execution), "cudaEventRecord(rebalance input ready)");
+        checkCudaResult(cudaStreamWaitEvent(mCopyStream, mInputReady, 0), "cudaStreamWaitEvent(rebalance input ready)");
+        checkTmaResult(megamoe_tma_copy_submit_fused(mState, scheduler, mRouteEpochPtr, routeTarget, mFlagMc,
+                           mGeneration, mCopyStream, graphGeneration),
+            "moe rebalance fused HALO-Q + TMA submit");
+    }
+
+    static void requireCapture(cudaStream_t execution)
+    {
+        cudaStreamCaptureStatus capture;
+        checkCudaResult(cudaStreamIsCapturing(execution, &capture), "cudaStreamIsCapturing(rebalance execution)");
+        TORCH_CHECK(capture == cudaStreamCaptureStatusActive, "graph operation requires an active parent capture");
+    }
+
     void requireLive() const
     {
         TORCH_CHECK(mState != nullptr, "moe rebalance TMA state has been destroyed");
@@ -452,6 +535,7 @@ private:
     int mDevice{-1};
     int mHelperCount{0};
     uint64_t mGeneration{1};
+    torch::Tensor mGraphGeneration;
     bool mConfigured{false};
     bool mBound{false};
     torch::Tensor mIds;
@@ -484,12 +568,13 @@ void moeRebalanceTmaConfigureGpuPlan(MoeRebalanceTmaStatePtr const& state, int64
     int64_t levelCount, int64_t targetCount, int64_t planAbiVersion, int64_t planWords, int64_t routeFeatures,
     int64_t tmaRoute, int64_t tmaSourceLoadPercent, std::vector<int64_t> const& groupSizes,
     std::vector<int64_t> const& sourceTable, std::vector<int64_t> const& destinationTable,
-    std::vector<int64_t> const& foreignDestinationTable, std::vector<int64_t> const& planeBytes)
+    std::vector<int64_t> const& foreignDestinationTable, std::vector<int64_t> const& unicastDestinationTable,
+    std::vector<int64_t> const& pairDestinationTable, std::vector<int64_t> const& planeBytes)
 {
     TORCH_CHECK(state, "moe rebalance TMA state is null");
     state->configureGpuPlan(world, rank, helperCount, planes, globalExperts, homeCount, ownerStride, levelCount,
         targetCount, planAbiVersion, planWords, routeFeatures, tmaRoute, tmaSourceLoadPercent, groupSizes, sourceTable,
-        destinationTable, foreignDestinationTable, planeBytes);
+        destinationTable, foreignDestinationTable, unicastDestinationTable, pairDestinationTable, planeBytes);
 }
 
 void moeRebalanceTmaBindGpuDirect(MoeRebalanceTmaStatePtr const& state, torch::Tensor ids, torch::Tensor levels,
@@ -539,6 +624,22 @@ void moeRebalanceTmaSubmitFused(int64_t handle, torch::Tensor const& routes, int
     stateFromHandle(handle).submitFused(routes, routeTarget, spinCycles);
 }
 
+void moeRebalanceTmaSubmitGraph(
+    int64_t handle, torch::Tensor const& routes, torch::Tensor const& generation, int64_t spinCycles)
+{
+    stateFromHandle(handle).submitGraph(routes, generation, spinCycles);
+}
+
+void moeRebalanceTmaPrepareGraphGeneration(int64_t handle, int64_t expectedGeneration)
+{
+    stateFromHandle(handle).prepareGraphGeneration(expectedGeneration);
+}
+
+void moeRebalanceTmaWaitGraphRoutes(int64_t handle, torch::Tensor const& generation, int64_t spinCycles)
+{
+    stateFromHandle(handle).waitGraphRoutes(generation, spinCycles);
+}
+
 void moeRebalanceTmaRelease(int64_t handle)
 {
     stateFromHandle(handle).releaseAfterCurrentStream();
@@ -584,7 +685,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int planes, int global_experts, int home_count, int owner_stride, int level_count, int target_count, "
         "int plan_abi_version, int plan_words, int route_features, int tma_route, int tma_source_load_percent, "
         "int[] group_sizes, int[] source_table, int[] destination_table, int[] foreign_destination_table, "
-        "int[] plane_bytes) -> ()");
+        "int[] unicast_destination_table, int[] pair_destination_table, int[] plane_bytes) -> ()");
     m.def(
         "moe_rebalance_tma_bind_gpu_direct("
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, Tensor ids, Tensor levels, Tensor owners, "
@@ -600,6 +701,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_rebalance_tma_handle("
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int");
     m.def("moe_rebalance_tma_submit_fused(int handle, Tensor routes, int route_target, int spin_cycles) -> ()");
+    m.def("moe_rebalance_tma_submit_graph(int handle, Tensor routes, Tensor generation, int spin_cycles) -> ()");
+    m.def("moe_rebalance_tma_prepare_graph_generation(int handle, int expected_generation) -> ()");
+    m.def("moe_rebalance_tma_wait_graph_routes(int handle, Tensor generation, int spin_cycles) -> ()");
     m.def("moe_rebalance_tma_release(int handle) -> ()");
     m.def(
         "moe_rebalance_tma_current_gen("
@@ -623,6 +727,10 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
     m.impl("moe_rebalance_tma_bind_fused", &tensorrt_llm::torch_ext::moeRebalanceTmaBindFused);
     m.impl("moe_rebalance_tma_handle", &tensorrt_llm::torch_ext::moeRebalanceTmaHandle);
     m.impl("moe_rebalance_tma_submit_fused", &tensorrt_llm::torch_ext::moeRebalanceTmaSubmitFused);
+    m.impl("moe_rebalance_tma_submit_graph", &tensorrt_llm::torch_ext::moeRebalanceTmaSubmitGraph);
+    m.impl(
+        "moe_rebalance_tma_prepare_graph_generation", &tensorrt_llm::torch_ext::moeRebalanceTmaPrepareGraphGeneration);
+    m.impl("moe_rebalance_tma_wait_graph_routes", &tensorrt_llm::torch_ext::moeRebalanceTmaWaitGraphRoutes);
     m.impl("moe_rebalance_tma_release", &tensorrt_llm::torch_ext::moeRebalanceTmaRelease);
     m.impl("moe_rebalance_tma_current_gen", &tensorrt_llm::torch_ext::moeRebalanceTmaCurrentGeneration);
     m.impl("moe_rebalance_tma_result", &tensorrt_llm::torch_ext::moeRebalanceTmaResult);

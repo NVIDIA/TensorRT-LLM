@@ -2311,7 +2311,8 @@ def test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart(
         tuner.reset_statistics()
 
 
-def test_post_tune_merge_tactics_min_time_and_subset_kept():
+@pytest.mark.parametrize("custom_op_prefix", [None, "gemm"])
+def test_post_tune_merge_tactics_min_time_and_subset_kept(custom_op_prefix):
     tuner = autotuner.AutoTuner()
     tuner.mapping = Mapping(world_size=2, rank=0, tp_size=2)
 
@@ -2321,22 +2322,36 @@ def test_post_tune_merge_tactics_min_time_and_subset_kept():
     }
     r1 = {
         ("gemm", "X"): (0, ("cublaslt", 0), 0.5),
+        ("gemm:helper", "Y"): (0, ("cutlass", 5), 1.0),
         ("vae", "B"): (0, ("cutlass", 2), 1.0)
     }
 
     class _FakeDist:
 
         def tp_cp_allgather(self, obj):
-            return [r0, r1]
+            if custom_op_prefix is None:
+                assert obj == r0
+                return [r0, r1]
+            assert obj == {("gemm", "X"): r0[("gemm", "X")]}
+            return [
+                obj, {
+                    key: val
+                    for key, val in r1.items() if key[0].startswith("gemm")
+                }
+            ]
 
     tuner._dist = _FakeDist()
     tuner.profiling_cache.cache = dict(r0)
-    tuner.post_tune_merge_tactics()
+    tuner.post_tune_merge_tactics(custom_op_prefix=custom_op_prefix)
 
     cache = tuner.profiling_cache.cache
     assert cache[("gemm", "X")] == (0, ("cublaslt", 0), 0.5)
+    assert cache[("gemm:helper", "Y")] == r1[("gemm:helper", "Y")]
     assert cache[("q", "A")] == r0[("q", "A")]
-    assert cache[("vae", "B")] == r1[("vae", "B")]
+    if custom_op_prefix is None:
+        assert cache[("vae", "B")] == r1[("vae", "B")]
+    else:
+        assert ("vae", "B") not in cache
 
 
 def test_post_tune_merge_tactics_single_rank_noop():

@@ -116,6 +116,42 @@ def test_enqueue_responses_records_skipped_phase_on_non_output_rank() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("rank", "attention_dp", "gather_all", "responses", "packs"),
+    [
+        (1, True, False, [(7, "response")], True),
+        (0, True, False, [(7, "response")], False),
+        (1, True, False, [], False),
+        (1, True, True, [(7, "response")], False),
+        (1, False, False, [(7, "response")], False),
+    ],
+)
+def test_enqueue_responses_packs_only_what_other_ranks_gather_to_the_leader(
+    rank: int, attention_dp: bool, gather_all: bool, responses: list, packs: bool
+) -> None:
+    executor = object.__new__(PyExecutor)
+    executor.dist = Mock(rank=rank, world_size=2)
+    executor.dist.mapping.tp_group = [0, 1]
+    executor.dist.tp_gather.return_value = None
+    executor.dist.allgather.return_value = [[]]
+    executor.enable_attention_dp = attention_dp
+    executor.gather_all_responses = gather_all
+    executor._response_channel = Mock()
+    executor._stage_responses = False
+    executor._maybe_record_hang_diagnostic_phase = Mock()
+    packer = Mock(return_value=[(-1, "packed")])
+    executor.peer_response_packer = packer
+
+    executor._enqueue_responses(responses)
+
+    assert packer.call_count == int(packs)
+    if attention_dp and not gather_all:
+        gathered = [(-1, "packed")] if packs else responses
+        executor.dist.tp_gather.assert_called_once_with(gathered)
+    else:
+        executor.dist.tp_gather.assert_not_called()
+
+
 def test_create_hang_diagnostics_registers_status_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

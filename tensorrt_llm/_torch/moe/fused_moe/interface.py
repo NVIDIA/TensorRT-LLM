@@ -24,6 +24,8 @@ import torch
 from torch import nn
 
 from ...distributed.ops import reducescatter
+from ...pyexecutor.breakable_cuda_graph.context import \
+    is_parent_moe_graph_enabled
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .impl_blocks import (MoEEplbWeightLayoutMixin, MoEExecutionContractMixin,
                           MoEWeightOwnerMixin)
@@ -754,12 +756,22 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         helper-weight copy. Only the first route call consumes it, and it is
         cleared on every exit; if no route call consumes it, the caller still
         owns that work. Every EP rank must install the same function.
+
+        The scope brackets the layer's complete routed call, so it is also
+        that layer's parent MoE graph scope while the breakable prefill
+        runner warms up or captures one.
         """
         if not callable(overlap_fn):
             raise TypeError("overlap_fn must be callable")
         self._load_balancer_overlap_fn = overlap_fn
         try:
-            yield
+            balancer = self.layer_load_balancer
+            if is_parent_moe_graph_enabled() and getattr(
+                    balancer, "produces_replica_plan", False):
+                with balancer.use_parent_moe_graph():
+                    yield
+            else:
+                yield
         finally:
             self._load_balancer_overlap_fn = None
 

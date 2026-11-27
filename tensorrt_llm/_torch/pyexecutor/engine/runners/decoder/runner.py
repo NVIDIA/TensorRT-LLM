@@ -644,6 +644,12 @@ class DecoderRunner(ScheduledModelRunner):
         )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
+        # A load balancer whose layers join the captured graph says which deployments it supports.
+        validate_parent_graph = getattr(
+            self._moe_load_balancer, "validate_breakable_prefill_graph", None
+        )
+        if validate_parent_graph is not None:
+            validate_parent_graph(decoder_model, self._config.prefill_cuda_graph_num_tokens)
         logger.info(
             f"Breakable prefill CUDA graphs on {type(decoder_model.model).__name__} "
             f"for num_tokens={self._config.prefill_cuda_graph_num_tokens}"
@@ -651,6 +657,7 @@ class DecoderRunner(ScheduledModelRunner):
         return BreakableCUDAGraphRunner(
             decoder_model.model,
             getattr(decoder_model, "prepare_breakable_cuda_graph_replay", None),
+            capture_on_current_stream=validate_parent_graph is not None,
         )
 
     @property

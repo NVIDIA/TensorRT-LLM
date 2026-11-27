@@ -108,7 +108,8 @@ extern "C"
 
     /* A physical interval within one logically concatenated byte stream. Entries
      * in a range are contiguous in virtual space (no per-weight/plane rounding).
-     * Addresses/lengths are multiples of four; source is unicast, dst is multicast.
+     * Addresses/lengths are multiples of four; source is unicast. dst is
+     * multicast, or a peer's unicast row in a range flagged UNICAST.
      */
     typedef struct MegamoeTmaCopySegment
     {
@@ -118,14 +119,18 @@ extern "C"
         uint64_t virtual_begin;
     } MegamoeTmaCopySegment;
 
-    /* A whole routing domain: source-owned slots, or one scatter destination team.
+/* Range flag: every segment of the range stores to unicast destinations. */
+#define MEGAMOE_TMA_COPY_RANGE_UNICAST 1
+
+    /* A whole routing domain: source-owned slots, one scatter destination team,
+     * or the owner-direct unicast writes of this rank's pair-level records.
      * Slice j spans [j*8192,min((j+1)*8192,bytes)) in its virtual byte stream and can
      * cross any number of segments. It keeps ONE GPU/CTA/warp owner throughout.
      * This rank owns floor((first_slice+j*slice_stride)/slice_divisor). Uniform
      * routing uses divisor=1, reciprocal=0 and skips the division.
      * Otherwise reciprocal=UINT64_MAX/divisor enables an exact mulhi+correction.
      * prefix_end compacts rank-local slices across ranges for SM/worker round-robin.
-     * No reset at weight boundaries.
+     * No reset at weight boundaries. flags selects the store kind of the range.
      */
     typedef struct MegamoeTmaCopyRange
     {
@@ -138,6 +143,7 @@ extern "C"
         uint64_t prefix_end;
         uint64_t slice_divisor;
         uint64_t slice_reciprocal;
+        uint64_t flags; /* MEGAMOE_TMA_COPY_RANGE_* */
     } MegamoeTmaCopyRange;
 
     typedef struct MegamoeTmaCopyConfig
@@ -212,9 +218,16 @@ extern "C"
  * route_target is its value after this launch. A cuStreamWaitValue64 (GEQ
  * route_target) on another stream orders that stream after the routes. READY is
  * published as by the copy alone.
+ * replay_generation is null outside graph capture. During capture it points to a
+ * persistent device scalar: the kernel then reads the generation at replay and
+ * computes its route target.
  */
 int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
     tensorrt_llm::kernels::MoeRebalanceHaloQParams const& scheduler, uint64_t* route_epoch, uint64_t route_target,
-    uint64_t flag_mc, uint64_t generation, void* cuda_stream);
+    uint64_t flag_mc, uint64_t generation, void* cuda_stream, uint64_t const* replay_generation);
+
+//! Capture a consumer-stream wait for route sorting, while copy work can finish in parallel.
+int megamoe_tma_copy_wait_replay_routes(uint64_t const* route_epoch, uint64_t const* replay_generation, unsigned ctas,
+    uint64_t spin_cycles, void* cuda_stream);
 #endif
 #endif

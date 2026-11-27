@@ -153,33 +153,30 @@ def build_google_tests(request, build_type):
     )
 
 
-@pytest.fixture(scope="session")
-def build_kv_cache_compression_tests(request, build_type):
-    """Build only the standalone NVFP4 cold-page kernel gtest.
+# The (CUDA arch, build type) pairs _build_standalone_gtest has configured in this session.
+_configured_standalone_builds: set[tuple[str, str]] = set()
 
-    The binary uses NO_TLLM_LINKAGE, so this skips the full-library
-    build that build_google_tests pays for.
-    """
-    if _cpp.prepare_test_bundle(build_type):
-        return
 
-    cuda_arch = f"{request.param}"
-
+def _build_standalone_gtest(cuda_arch: str, build_type: str,
+                            target: str) -> None:
+    """Build only the given gtest target, configuring once per CUDA arch and build type."""
     _logger.info(f"Using CUDA arch: {cuda_arch}")
 
-    build_trt_llm(
-        build_type=build_type,
-        cuda_architectures=cuda_arch,
-        job_count=12,
-        use_ccache=True,
-        generator="Ninja",
-        nixl_root="/opt/nvidia/nvda_nixl",
-        skip_building_wheel=True,
-        configure_only=True,
-        # Same reason as build_google_tests: no libnvrtc_static.a in the DLFW
-        # base image, and this build has no BOLT to turn dynamic linking on.
-        nvrtc_dynamic_linking=True,
-    )
+    if (cuda_arch, build_type) not in _configured_standalone_builds:
+        build_trt_llm(
+            build_type=build_type,
+            cuda_architectures=cuda_arch,
+            job_count=12,
+            use_ccache=True,
+            generator="Ninja",
+            nixl_root="/opt/nvidia/nvda_nixl",
+            skip_building_wheel=True,
+            configure_only=True,
+            # Same reason as build_google_tests: no libnvrtc_static.a in the DLFW
+            # base image, and this build has no BOLT to turn dynamic linking on.
+            nvrtc_dynamic_linking=True,
+        )
+        _configured_standalone_builds.add((cuda_arch, build_type))
 
     build_dir = _cpp.find_build_dir(build_type)
     _cpp.run_command(
@@ -192,12 +189,37 @@ def build_kv_cache_compression_tests(request, build_type):
             "--parallel",
             "12",
             "--target",
-            "nvfp4ColdPageKernelsTest",
+            target,
         ],
         cwd=build_dir,
         env=_os.environ,
         timeout=1800,
     )
+
+
+@pytest.fixture(scope="session")
+def build_kv_cache_compression_tests(request: pytest.FixtureRequest,
+                                     build_type: str) -> None:
+    """Build only the NVFP4 cold-page kernel gtest and the libraries it links.
+
+    This skips the full-library build that build_google_tests pays for.
+    """
+    if _cpp.prepare_test_bundle(build_type):
+        return
+
+    _build_standalone_gtest(f"{request.param}", build_type,
+                            "nvfp4ColdPageKernelsTest")
+
+
+@pytest.fixture(scope="session")
+def build_haloq_planner_tests(request: pytest.FixtureRequest,
+                              build_type: str) -> None:
+    """Build only the HALO-Q planner gtest, which links just the CUDA runtime."""
+    if _cpp.prepare_test_bundle(build_type):
+        return
+
+    _build_standalone_gtest(f"{request.param}", build_type,
+                            "moeRebalanceHaloQTest")
 
 
 @pytest.fixture(scope="session")

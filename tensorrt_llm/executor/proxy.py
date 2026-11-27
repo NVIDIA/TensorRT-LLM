@@ -57,8 +57,8 @@ from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
-from .utils import (EngineDeadError, ErrorResponse, RequestError,
-                    WorkerCommIpcAddrs, create_mpi_comm_session,
+from .utils import (EngineDeadError, ErrorResponse, PackedResponses,
+                    RequestError, WorkerCommIpcAddrs, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response,
                     multi_frontend_request_addr, multi_frontend_result_addr,
                     namespace_client_id, print_alive_threads)
@@ -937,6 +937,11 @@ class GenerationExecutorProxy(GenerationExecutor):
             global_tracer().log_instant("IPC.get")
             if i is None:
                 return False
+            if isinstance(i, PackedResponses):
+                # result_queue.get() authenticated the message that holds it.
+                for response in pickle.loads(i.payload):  # nosec B301
+                    process_res(response)
+                continue
             process_res(i)
 
         if async_queues:

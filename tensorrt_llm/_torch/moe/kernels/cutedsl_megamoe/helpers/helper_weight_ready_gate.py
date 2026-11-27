@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Shared Blackwell/Rubin kernel gate for dynamically installed helper weights.
 
 The gate is deliberately optional at code generation time.  A specialization
@@ -9,8 +11,9 @@ work tile is published.
 ``terminal_flags`` is the local ``uint64[EP]`` view published by the weight
 transport.  Bit 63 is reserved.  A source is terminal-ready when that bit is
 clear and its low-63-bit generation is greater than or equal to the expected
-generation.  The expected generation is a CPU-captured launch-time scalar, not
-device READY storage.  After READY publication, callers keep the weights
+generation. The expected generation is either a launch-time scalar or a stable
+device ``int64[1]`` cell read once by each polling lane. The caller orders cell
+writes on MAIN before the launch and keeps the cell and published weights
 immutable until the MegaMoE launch completes.
 """
 
@@ -140,6 +143,7 @@ class HelperWeightReadyGenerationGate:
         self.source_count = source_count
         self.terminal_flags = terminal_flags
         self.expected_generation = expected_generation
+        self._generation_is_pointer = isinstance(expected_generation, Pointer)
 
     def __extract_mlir_values__(self) -> list:
         values = []
@@ -186,11 +190,22 @@ class HelperWeightReadyGenerationGate:
         )
 
     @cute.jit
-    def _sweep_terminal_flags(self):
+    def _load_expected_generation(self):
+        if cutlass.const_expr(self._generation_is_pointer):
+            pointer = cute.make_ptr(
+                cutlass.Uint64,
+                self.expected_generation.toint(),
+                AddressSpace.gmem,
+                assumed_align=8,
+            )
+            return cute.arch.load(pointer, cutlass.Uint64, sem="acquire", scope="sys")
+        else:
+            return self.expected_generation
+
+    @cute.jit
+    def _sweep_terminal_flags(self, expected_generation):
         """Read every source cell; acquire all releases before admitting READY."""
 
-        # The launch generation is a uniform scalar.  This terminal pointer is
-        # the only global-memory READY authority loaded by the spin loop.
         flags = self._typed_terminal_flags()
         all_sources_geq = Int32(1)
         terminal_error_seen = Int32(0)
@@ -206,7 +221,7 @@ class HelperWeightReadyGenerationGate:
             observed_generation = observed & generation_mask
             if observed > generation_mask:
                 terminal_error_seen = Int32(1)
-            if observed_generation < self.expected_generation:
+            if observed_generation < expected_generation:
                 all_sources_geq = Int32(0)
 
         status = Int32(HelperWeightReadyStatus.WAITING)
@@ -233,13 +248,14 @@ class HelperWeightReadyGenerationGate:
 
         status = Int32(HelperWeightReadyStatus.WAITING)
         if cute.arch.lane_idx() == Int32(0):
+            expected_generation = self._load_expected_generation()
             generation_mask = cutlass.Uint64(HELPER_WEIGHT_READY_GENERATION_MASK)
-            if (self.expected_generation == cutlass.Uint64(0)) | (
-                self.expected_generation > generation_mask
+            if (expected_generation == cutlass.Uint64(0)) | (
+                expected_generation > generation_mask
             ):
                 status = Int32(HelperWeightReadyStatus.INVALID_EXPECTED_GENERATION)
             else:
-                status = self._sweep_terminal_flags()
+                status = self._sweep_terminal_flags(expected_generation)
                 if status == Int32(HelperWeightReadyStatus.WAITING):
                     # Already-ready weights take no timer reads. Unsigned elapsed
                     # time also handles wraparound of the 64-bit nanosecond timer.
@@ -250,7 +266,7 @@ class HelperWeightReadyGenerationGate:
                             status = Int32(HelperWeightReadyStatus.TIMEOUT)
                         else:
                             nanosleep(HELPER_WEIGHT_READY_POLL_SLEEP_NS)
-                            status = self._sweep_terminal_flags()
+                            status = self._sweep_terminal_flags(expected_generation)
 
         status = Int32(cute.arch.shuffle_sync(status, offset=0))
         if status == Int32(HelperWeightReadyStatus.READY):

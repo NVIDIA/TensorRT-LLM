@@ -10,9 +10,11 @@ must drop those late responses via ``self._results.get(client_id)`` rather than
 ``pop``-ing a missing key and crashing the dispatch thread with a ``KeyError``.
 """
 
+import pickle
 from types import SimpleNamespace
 
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.utils import ErrorResponse, PackedResponses
 
 
 class _FakeResultQueue:
@@ -74,3 +76,21 @@ def test_final_response_is_delivered_and_popped():
     assert proxy.dispatch_result_task() is True
     assert queue.delivered == [resp]
     assert 7 not in proxy._results  # popped on is_final
+
+
+def test_packed_responses_are_delivered_like_individual_ones():
+    """A rank's packed batch reaches the same queues as responses sent one by one."""
+    proxy = _make_proxy()
+    queues = {client_id: _RecordingQueue() for client_id in (7, 8, 9)}
+    proxy._results = {
+        client_id: SimpleNamespace(queue=queue) for client_id, queue in queues.items()
+    }
+    # Module-level types, so the payload pickles like real responses do.
+    packed = [ErrorResponse(7, "first", 70), ErrorResponse(8, "second", 80)]
+    single = ErrorResponse(9, "third", 90)
+    payload = pickle.dumps(packed)
+    proxy.result_queue = _FakeResultQueue([[PackedResponses([7, 8], payload), single]])
+
+    assert proxy.dispatch_result_task() is True
+    assert [queues[i].delivered for i in (7, 8, 9)] == [[packed[0]], [packed[1]], [single]]
+    assert not proxy._results

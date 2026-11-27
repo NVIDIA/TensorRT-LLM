@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 _DOCS_URL = "https://nvidia.github.io/TensorRT-LLM"
 _JSON_TYPES = {"string", "number", "integer", "boolean", "null", "array", "object"}
+_DYNAMIC_EPLB_PREFILL_SCHEMA = "DynamicEplbPrefill"
 SERVE_SCHEMA = "trtllm-serve-config.schema.json"
 DISAGG_SCHEMA = "trtllm-serve-disagg-config.schema.json"
 VISUAL_GEN_SCHEMA = "trtllm-serve-visual-gen-config.schema.json"
@@ -331,6 +332,43 @@ def _moe_tactic_schema() -> dict:
     }
 
 
+def _required_property(name: str, schema: dict) -> dict:
+    return {"type": "object", **_is_set_to(name, schema)}
+
+
+def _dynamic_eplb_prefill_schema(inline_dynamic: dict) -> dict:
+    """Describe the constraints on the inline per-layer dynamic EPLB form."""
+    from tensorrt_llm.llmapi.llm_args import (
+        _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS,
+        PrefillCudaGraphBackend,
+    )
+
+    # Neither field is required: the CLI, or the enclosing mapping of a disaggregated server
+    # block, can supply it, and the merged runtime configuration rejects a missing one.
+    capture_fields = {
+        "prefill_capture_num_tokens": {"const": [_PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS]},
+        "enable_attention_dp": {"const": True},
+    }
+
+    return {
+        "if": _required_property("moe_config", _required_property("load_balancer", inline_dynamic)),
+        "then": {
+            "properties": {
+                "prefill_cuda_graph_backend": {
+                    "enum": [PrefillCudaGraphBackend.DISABLED, PrefillCudaGraphBackend.BREAKABLE],
+                },
+                "torch_compile_config": {
+                    "not": _required_property("enable_piecewise_cuda_graph", {"const": True}),
+                },
+            },
+            "if": _required_property(
+                "prefill_cuda_graph_backend", {"const": PrefillCudaGraphBackend.BREAKABLE}
+            ),
+            "then": {"properties": capture_fields},
+        },
+    }
+
+
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
     schema = _serve_schema()
@@ -369,9 +407,10 @@ def _serve_schema() -> dict:
         {"$ref": f"#/$defs/{model.__name__}"}
         for model in (MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig)
     )
+    inline_dynamic = {**per_layer_dynamic, "required": ["mode"]}
     schema["$defs"]["MoeConfig"]["properties"]["load_balancer"]["anyOf"] = [
         standard,
-        {**per_layer_dynamic, "required": ["mode"]},
+        inline_dynamic,
         {"type": ["string", "null"]},
     ]
     # The model validator allows at most one non-null preemption bound.
@@ -465,6 +504,7 @@ def _serve_schema() -> dict:
         "".join(f"[{char}{char.lower()}]" for char in name) for name in encoder_backend.pop("enum")
     ]
     encoder_backend["pattern"] = "^(?:" + "|".join(alternatives) + r")$(?![\s\S])"
+    schema["$defs"][_DYNAMIC_EPLB_PREFILL_SCHEMA] = _dynamic_eplb_prefill_schema(inline_dynamic)
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):
@@ -472,7 +512,7 @@ def _serve_schema() -> dict:
             "type": "null",
             "description": "Live objects require the Python LLM API.",
         }
-    schema["allOf"] = _launch_rules()
+    schema["allOf"] = [*_launch_rules(), {"$ref": f"#/$defs/{_DYNAMIC_EPLB_PREFILL_SCHEMA}"}]
     schema["$defs"]["RayPlacementConfig"]["properties"]["placement_groups"] = {"type": "null"}
     user_draft = schema["$defs"]["UserProvidedDecodingConfig"]["properties"]
     user_draft["drafter"] = {"not": {}, "description": "A Drafter requires the Python LLM API."}
@@ -558,7 +598,7 @@ def generate_disagg_schema() -> dict:
         _schema_for(RouterConfig, schema)["properties"]["type"]
     )
     worker["additionalProperties"] = False
-    worker["allOf"] = _launch_rules()
+    worker["allOf"] = [*_launch_rules(), {"$ref": f"#/$defs/{_DYNAMIC_EPLB_PREFILL_SCHEMA}"}]
     schema["$defs"]["DisaggServerBlock"] = worker
 
     orchestrator = _schema_for(extract_disagg_cfg, schema)["properties"]

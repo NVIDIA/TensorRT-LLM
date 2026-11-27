@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 import weakref
-from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence
 
 import torch
+
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.context import is_parent_moe_graph_enabled
+from tensorrt_llm.llmapi.llm_args import _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
 
 from ..impl_contract import MoEReplicaPlan
 
@@ -70,6 +74,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         self._scheduler_group: Optional[Any] = None
         self._bound_backend_ref: Optional[weakref.ReferenceType[Any]] = None
         self._pending_replica_plan: Optional[Any] = None
+        self._graph_generation: torch.Tensor | None = None
 
     def get_layer_idx(self) -> int:
         return self.layer_idx
@@ -269,6 +274,25 @@ class PerLayerDynamicMoeLayerLoadBalancer:
     def replica_plan(self) -> Optional[Any]:
         return self._pending_replica_plan
 
+    @contextmanager
+    def use_parent_moe_graph(self) -> Iterator[None]:
+        """Enable graph preparation or capture for this layer's complete MoE call."""
+        group = self._scheduler_group
+        if (
+            group is None
+            or self._graph_generation is not None
+            or self._pending_replica_plan is not None
+        ):
+            raise RuntimeError("Parent MoE graph requires one bound, idle layer")
+        with group.use_parent_moe_graph() as generation:
+            self._graph_generation = generation
+            try:
+                yield
+            finally:
+                if group.is_capturing_parent_graph:
+                    self._pending_replica_plan = None
+                self._graph_generation = None
+
     def route(
         self,
         token_selected_experts: torch.Tensor,
@@ -282,6 +306,16 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         physical routes are lent to the caller, so independent main-stream work
         such as shared experts overlaps planning and the helper-weight copy.
         """
+        if is_parent_moe_graph_enabled() and (
+            self._graph_generation is None
+            or not offset_by_ep_rank
+            or token_selected_experts.shape[0] != _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
+        ):
+            raise ValueError(
+                "Breakable prefill CUDA graph with dynamic EPLB requires an attention-DP MoE "
+                f"that routes {_PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS} tokens inside "
+                "its load_balancer_overlap scope"
+            )
         del offset_by_ep_rank  # HALO-Q consumes global logical expert IDs.
         if overlap_fn is not None and not callable(overlap_fn):
             raise TypeError("overlap_fn must be callable")
@@ -315,7 +349,10 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                 raise
             physical, generation = self._scheduler_group.plan_finish(part, defer_wait=True)
         generation = int(generation)
-        self._arena.publish_ready_generation(generation)
+        if self._graph_generation is None or not self._scheduler_group.is_capturing_parent_graph:
+            self._arena.publish_ready_generation(generation)
+            if self._graph_generation is not None:
+                self._scheduler_group.publish_graph_generation(generation)
 
         plan = MoEReplicaPlan(
             resident_experts_per_rank=self.resident_experts_per_rank,
@@ -324,9 +361,18 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             ready_generation=generation,
             reserved_sms=self.manager.auxiliary_sms,
             _wait_for_routes=self._scheduler_group.wait_for_routes,
+            ready_generation_tensor=self._graph_generation,
         )
         self._pending_replica_plan = plan
         return physical
+
+    def reuse_graph_generation(self, generation: int) -> torch.Tensor | None:
+        """Publish an eager generation to the READY cell bound by graph warmup."""
+        group = self._scheduler_group
+        if group is None or group.graph_generation is None:
+            return None
+        group.publish_graph_generation(generation)
+        return group.graph_generation
 
     def require_replica_plan(self) -> Any:
         if self._pending_replica_plan is None:
@@ -358,6 +404,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
 
     def _clear_runtime(self) -> None:
         self._pending_replica_plan = None
+        self._graph_generation = None
         self._scheduler_group = None
         self._arena = None
         self._ready_flags = None

@@ -37,7 +37,7 @@ void checkMoeRebalanceHaloQParams(MoeRebalanceHaloQParams const& params)
             && params.localRank >= 0 && params.localRank < params.ep && params.validRouteCount >= 0
             && params.validRouteCount <= params.routeCapacity && params.routeCapacity > 0
             && params.routeCapacity <= INT_MAX / params.ep && params.routeCapacity <= INT_MAX - params.ctas
-            && params.ctas > 0 && params.ctas <= 128 && params.threads == 512,
+            && params.ctas > 0 && params.ctas <= 128 && params.threads == kHaloQThreads,
         "Invalid HALO-Q scheduler launch parameters");
 }
 

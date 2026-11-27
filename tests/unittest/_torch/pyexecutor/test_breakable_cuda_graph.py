@@ -591,6 +591,7 @@ def test_runner_refreshes_pre_capture_state_through_a_model_wrapper():
     model = Wrapper()
     decoder_runner = object.__new__(DecoderRunner)
     decoder_runner._model = model
+    decoder_runner._moe_load_balancer = None
     decoder_runner._config = SimpleNamespace(
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
         prefill_cuda_graph_num_tokens=[4],

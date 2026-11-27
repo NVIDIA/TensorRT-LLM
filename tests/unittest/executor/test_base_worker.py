@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib
 import importlib.util
+import math
+import pickle
 import sys
 import time
 import warnings
@@ -26,10 +28,15 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, LlmResult
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import base_worker
-from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.executor.base_worker import AwaitResponseHelper, BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
-from tensorrt_llm.executor.result import GenerationResult, LogProbsResult
+from tensorrt_llm.executor.result import (GenerationResult, LogProbsResult,
+                                          ResponseWrapper,
+                                          reduce_prompt_logprobs)
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -1040,3 +1047,260 @@ def test_worker_enqueues_serializable_python_input_envelope(
         assert translated.py_return_routed_experts
         torch.testing.assert_close(translated.py_multimodal_data["embedding"],
                                    torch.ones(2, 4))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("keeps_result", [
+    None, "generation", "generation_only", "prompt_logprobs", "perf_metrics",
+    "postproc", "no_queue"
+])
+def test_worker_builds_a_result_only_when_it_reads_one(
+        keeps_result: str | None) -> None:
+    """A worker skips the result of a prefill-only request that only the proxy reads."""
+    sampling = SamplingParams(
+        max_tokens=4 if keeps_result == "generation" else 1,
+        prompt_logprobs=1 if keeps_result == "prompt_logprobs" else None,
+        return_perf_metrics=keeps_result == "perf_metrics")
+    request = GenerationRequest(
+        prompt_token_ids=[10, 11],
+        sampling_params=sampling,
+        disaggregated_params=DisaggregatedParams(request_type="generation_only")
+        if keeps_result == "generation_only" else None)
+    request.set_id(7)
+    worker = MagicMock(
+        rank=0,
+        result_queue=None if keeps_result == "no_queue" else object(),
+        postproc_queues=[object()] if keeps_result == "postproc" else None,
+        enable_postprocess_parallel=False,
+        _results={},
+        _client_id_to_request_id={})
+    worker._get_logprob_params = MethodType(BaseWorker._get_logprob_params,
+                                            worker)
+    worker._handle_background_error = MethodType(lambda self: None, worker)
+    worker.postproc_config.num_postprocess_workers = 0
+    worker._enqueue_request.return_value = 70
+
+    result = BaseWorker.submit(worker, request)
+
+    assert worker._results == {7: result}
+    assert worker._client_id_to_request_id == {7: 70}
+    if keeps_result is None:
+        assert result is None
+        # The response path treats a missing result as "no logprobs to add".
+        response = SimpleNamespace(client_id=7,
+                                   result=SimpleNamespace(is_final=True))
+        assert base_worker._get_logprobs(worker, response) is None
+    else:
+        assert isinstance(result, GenerationResult)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("return_metrics", [False, True],
+                         ids=["opt_out", "opt_in"])
+def test_submitted_request_is_deserialized_only_for_requested_metrics(
+        monkeypatch: pytest.MonkeyPatch, return_metrics: bool) -> None:
+    """A response of a request whose result the proxy holds honors its opt-in."""
+    request = GenerationRequest(prompt_token_ids=[10, 11],
+                                sampling_params=SamplingParams(
+                                    max_tokens=1,
+                                    return_perf_metrics=return_metrics),
+                                streaming=True)
+    request.set_id(7)
+    worker = MagicMock(rank=0,
+                       result_queue=object(),
+                       postproc_queues=None,
+                       enable_postprocess_parallel=False,
+                       _results={},
+                       _client_id_to_request_id={})
+    worker._get_logprob_params = MethodType(BaseWorker._get_logprob_params,
+                                            worker)
+    worker._handle_background_error = MethodType(lambda self: None, worker)
+    worker.postproc_config.num_postprocess_workers = 0
+    worker._enqueue_request.return_value = 70
+    BaseWorker.submit(worker, request)
+
+    metrics = {"latency": 0.125}
+    deserialize = Mock(return_value=SimpleNamespace(
+        request_perf_metrics=metrics))
+    update = SimpleNamespace(client_id=7,
+                             result=SimpleNamespace(is_final=False,
+                                                    _result=None,
+                                                    get_result=deserialize))
+    monkeypatch.setattr("tensorrt_llm.executor.result._build_perf_metrics_dict",
+                        lambda value: value)
+
+    wrapped = base_worker._maybe_wrap_response(worker, update)
+
+    if return_metrics:
+        assert wrapped.request_perf_metrics is metrics
+        deserialize.assert_called_once_with()
+    else:
+        assert wrapped is update
+        deserialize.assert_not_called()
+
+
+def _llm_response(client_id: int,
+                  *,
+                  final: bool = True,
+                  prefill_only: bool = True,
+                  perf_metrics: bool = False,
+                  error: str | None = None,
+                  context_logits: object = None,
+                  prompt_rows: list[torch.Tensor] | None = None,
+                  prompt_last_row: torch.Tensor | None = None) -> LlmResponse:
+    result = None
+    if error is None:
+        py_result = SimpleNamespace(
+            context_logits=context_logits,
+            context_prompt_logprob_rows=prompt_rows,
+            context_prompt_last_logprobs=prompt_last_row)
+        result = LlmResult(b"serialized", py_result, is_final=final)
+        result.ends_after_context = final and prefill_only
+        result.return_perf_metrics = perf_metrics
+    return LlmResponse(request_id=100 + client_id,
+                       error_msg=error,
+                       result=result,
+                       client_id=client_id)
+
+
+@pytest.mark.cpu_only
+def test_other_ranks_pack_final_responses_and_the_leader_forwards_them(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # Packing reads no perf metrics, which would deserialize the result.
+    monkeypatch.setattr(base_worker, "get_metrics_dict",
+                        Mock(side_effect=AssertionError))
+    # The leader finishes these itself: only the final response of a request
+    # that ended after its context pass and asked for no perf metrics is packed.
+    kept = [(104, _llm_response(4, final=False)),
+            (105, _llm_response(5, error="boom")),
+            (106, _llm_response(6, context_logits="logits")),
+            (107, _llm_response(7, prefill_only=False)),
+            (108, _llm_response(8, perf_metrics=True))]
+
+    pairs = base_worker.pack_final_responses([(101, _llm_response(1)), *kept,
+                                              (103, _llm_response(3))])
+
+    assert pairs[:5] == kept
+    (_, packed), = pairs[5:]
+    assert packed.client_ids == [1, 3]
+    first, second = pickle.loads(packed.payload)
+    assert type(first) is LlmResponse and type(second) is LlmResponse
+    assert first.client_id == 1 and first.result.is_final
+    assert second.client_id == 3
+    assert base_worker.pack_final_responses(kept) == kept
+
+    sent = []
+    worker = SimpleNamespace(
+        enable_postprocess_parallel=False,
+        postproc_config=SimpleNamespace(num_postprocess_workers=0),
+        frontend_result_queues=None,
+        result_queue=SimpleNamespace(put=sent.append),
+        _results={
+            1: None,
+            3: None,
+            9: None
+        },
+        _client_id_to_request_id={
+            1: 101,
+            3: 103,
+            9: 109
+        })
+    worker._pop_result = MethodType(BaseWorker._pop_result, worker)
+
+    AwaitResponseHelper(worker).handle_for_ipc_batched([packed])
+
+    assert sent == [[packed]]
+    assert worker._results == {9: None}
+    assert worker._client_id_to_request_id == {9: 109}
+
+
+@pytest.mark.cpu_only
+def test_leader_converts_compact_prompt_logprobs_of_another_rank(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A final that holds only reduced prompt-logprob rows is not packed."""
+    logits = torch.tensor([[0., 1., 2., 3.]] * 3)
+    request = GenerationRequest(prompt_token_ids=[0, 1, 2],
+                                sampling_params=SamplingParams(
+                                    max_tokens=1, prompt_logprobs=0))
+    request.set_id(7)
+    generation_result = GenerationResult(request,
+                                         logprob_params=LogprobParams(
+                                             prompt_logprobs=0,
+                                             drop_context_logits=True))
+    # What the executor keeps instead of the context logits: a reduced row for
+    # each prompt token after the first, and the normalized last row.
+    response = _llm_response(
+        7,
+        prompt_rows=[reduce_prompt_logprobs(logits[:2], [1, 2], 0)],
+        prompt_last_row=torch.log_softmax(logits[2:], dim=-1))
+    native_result = SimpleNamespace(output_token_ids=[[0]],
+                                    request_perf_metrics=None)
+    monkeypatch.setattr(LlmResult, "get_result", lambda self: native_result)
+
+    # The rank that ran the request leaves the response as it is.
+    pairs = [(107, response)]
+    assert base_worker.pack_final_responses(pairs) == pairs
+
+    sent = []
+    worker = SimpleNamespace(
+        enable_postprocess_parallel=False,
+        postproc_config=SimpleNamespace(num_postprocess_workers=0),
+        frontend_result_queues=None,
+        result_queue=SimpleNamespace(put=sent.append),
+        _refused_client_ids=set(),
+        _has_background_error=lambda: False,
+        _results={7: generation_result},
+        _client_id_to_request_id={7: 107})
+    worker._pop_result = MethodType(BaseWorker._pop_result, worker)
+
+    AwaitResponseHelper(worker).handle_for_ipc_batched([response])
+
+    (wrapped, ), = sent
+    assert isinstance(wrapped, ResponseWrapper) and wrapped.client_id == 7
+    # Row t scores prompt token t + 1; the last row scores the generated token.
+    scored_tokens = [1, 2, 0]
+    normalizer = math.log(sum(math.exp(i) for i in range(4)))
+    assert len(wrapped.logprobs.prompt) == len(scored_tokens)
+    for entry, token in zip(wrapped.logprobs.prompt, scored_tokens):
+        assert entry[token].logprob == pytest.approx(token - normalizer)
+    assert not worker._results
+
+
+@pytest.mark.cpu_only
+def test_leader_sends_packed_finals_after_the_rest_of_a_drain(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A request's streamed chunk reaches the proxy before its packed final."""
+    monkeypatch.setattr(base_worker, "get_metrics_dict", lambda response: {})
+    channel = ResponseChannel()
+    chunk = _llm_response(2, final=False)
+    # Request 1 finishes, then request 2 streams a chunk and finishes, each in
+    # an iteration of its own and all before the leader drains its channel.
+    for responses in ([(101, _llm_response(1))], [(102, chunk)],
+                      [(102, _llm_response(2))]):
+        channel.publish(base_worker.pack_final_responses(responses))
+    drained = channel.await_any(0, is_shutdown=lambda: False)
+
+    sent = []
+    worker = SimpleNamespace(
+        enable_postprocess_parallel=False,
+        postproc_config=SimpleNamespace(num_postprocess_workers=0),
+        frontend_result_queues=None,
+        result_queue=SimpleNamespace(put=sent.append),
+        _refused_client_ids=set(),
+        _has_background_error=lambda: False,
+        _results={
+            1: None,
+            2: None
+        },
+        _client_id_to_request_id={
+            1: 101,
+            2: 102
+        })
+    worker._pop_result = MethodType(BaseWorker._pop_result, worker)
+
+    AwaitResponseHelper(worker).handle_for_ipc_batched(drained)
+
+    (batch, ) = sent
+    order = [getattr(response, "client_ids", response) for response in batch]
+    assert order == [chunk, [1], [2]]
+    assert not worker._results
