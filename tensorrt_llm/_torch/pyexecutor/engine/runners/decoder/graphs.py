@@ -990,7 +990,8 @@ class DecoderCudaGraphs:
                             _MXFP8_GEMM_AUTOTUNED_OP,
                         )
 
-                        # Every rank captures the GEMM kernels most ranks tuned.
+                        # Every rank captures the same tactics: the vote settles the quantizer
+                        # and the GEMM profiles only some ranks tuned (see agree_mxfp8_tactics).
                         agree_mxfp8_tactics(_MXFP8_GEMM_AUTOTUNED_OP)
                         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
                         if cache_path:
