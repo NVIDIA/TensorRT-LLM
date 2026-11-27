@@ -107,6 +107,24 @@ def _ld_dsmem_f32(addr, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _ld_dsmem_f32_if(addr, pred, *, loc=None, ip=None):
+    """`ld.shared::cluster.f32` where `pred` is not 0, else 0.0 with nothing read; volatile
+    so it stays behind the cluster barrier."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Int32(addr), cutlass.Int32(pred)],
+            "{ .reg .pred p; setp.ne.b32 p, $2, 0; mov.b32 $0, 0; "
+            "@p ld.shared::cluster.f32 $0, [$1]; }",
+            "=f,r,r",
+            loc,
+            ip,
+            side_effects=True,
+        )
+    )
+
+
 class HcDecodeTcFirstKernel:
     """`low[t, n] = silu(L[t, n] / C)` for `n < R` and, with `with_inject`,
     `inject[t, j] = 2 * sigmoid(L[t, R + j] / C)`, where `L = A @ B^T`,
@@ -880,9 +898,9 @@ class HcDecodeTcFirstRowsNKernel:
         cute.arch.cluster_wait()
 
         # This CTA's share of the tile's `rows * BN` outputs (`rows` of this M tile),
-        # all 6 warps. Every load is issued before any sum (indices clamped in bounds,
-        # so no branch separates them); the `KS` partials are summed in slice order
-        # (deterministic).
+        # all 6 warps. Every load is issued before any sum (predicated on the thread's share,
+        # indices clamped in bounds, so no branch separates them); the `KS` partials are summed
+        # in slice order (deterministic).
         row0 = mt * self.tm
         total = cutlass.min(cutlass.Int32(self.n_cols) - row0, self.tm) * self.bn
         per = (total + self.ks - 1) // self.ks
@@ -896,8 +914,13 @@ class HcDecodeTcFirstRowsNKernel:
             row = fs // self.bn
             col = fs - row * self.bn
             off = (row * self.p_stride + col) * 4
+            # Only the loads of a step this thread sums (the sum's own condition): every load is
+            # consumed before the exit barrier, so none is in flight when the peers exit.
+            live = cutlass.Int32(0)
+            if tidx + it * nthr < per and base + tidx + it * nthr < total:
+                live = cutlass.Int32(1)
             for j in cutlass.range_constexpr(self.ks):
-                vals[it * self.ks + j] = _ld_dsmem_f32(peers[j] + off)
+                vals[it * self.ks + j] = _ld_dsmem_f32_if(peers[j] + off, live)
         inv_hc = cutlass.Float32(1.0 / self.hc)
         for it in cutlass.range_constexpr(self.red_iters):
             local = tidx + it * nthr
@@ -917,7 +940,10 @@ class HcDecodeTcFirstRowsNKernel:
                     if n >= self.rank and n < self.rank + self.hc and col < m:
                         mInj[(col, n - self.rank)] = (cutlass.Float32(2.0) * sg).to(self.io_dtype)
 
-        # No CTA may exit (releasing its shared memory) while a peer still reads it.
+        # No CTA may exit (releasing its shared memory) while a peer still reads it. A relaxed
+        # arrive suffices because a thread arrives only after summing every load it issued; a
+        # load issued but never summed would still be in flight here, and a peer could exit under
+        # it (CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT).
         cute.arch.cluster_arrive_relaxed()
         cute.arch.cluster_wait()
 
