@@ -141,3 +141,19 @@ def test_check_tables_names_a_broken_table(breaks, message):
     views = _tables(ids, 128, 128, 8)
     breaks(views, ids)
     assert message in op.check_tables(views, ids, 128, 128, 8)
+
+
+@pytest.mark.cpu_only
+def test_check_tables_rejects_a_route_into_spare_capacity():
+    """One live route in a window of tile 8: one CTA, 8 padded rows. Moved to permuted row 8,
+    with the spare entries naming its token, its expert and a limit of 9, every per-entry check
+    holds, but the runner launches one CTA and never serves row 8."""
+    ids = torch.tensor(
+        [[130, 0, 1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int32
+    )  # one slot in 128..255
+    views = _tables(ids, 128, 128, 8)
+    assert op.check_tables(views, ids, 128, 128, 8) == ""
+    e2p, p2t, cta_expert, cta_limit, n_ctas, n_padded = views
+    assert int(n_ctas[0]) == 1 and int(n_padded[0]) == 8 and int(e2p[0]) == 0
+    e2p[0], p2t[8], cta_expert[1], cta_limit[1] = 8, 0, int(cta_expert[0]), 9
+    assert "past the padded rows" in op.check_tables(views, ids, 128, 128, 8)

@@ -242,6 +242,8 @@ def check_tables(views, ids: torch.Tensor, local_offset: int, num_local: int, ti
     perm = e2p[inside]
     if bool((perm < 0).any()) or perm.unique().numel() != perm.numel():
         return "the window's slots do not have distinct permuted indices"
+    if bool((perm >= int(n_padded[0])).any()):
+        return "a permuted index sits past the padded rows (a CTA the runner does not launch)"
     tokens = torch.arange(rows).unsqueeze(1).expand_as(e2p)[inside]
     if not torch.equal(p2t[perm].to(torch.int64), tokens):
         return "a permuted index names another token"
