@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._utils import is_blackwell_datacenter
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -633,11 +634,12 @@ def test_retained_metadata_buffers_and_workspace_accounting(manager_requests):
     extra = torch.empty(129, device="cuda", dtype=torch.uint8)
     metadata._csa2_buffers["extra", (129,), torch.uint8, False] = extra
     assert metadata.get_workspace_bytes() == before + extra.untyped_storage().nbytes()
-    # Exact sum of the graph descriptor allocations: block table, contexts,
-    # visible lengths, request contexts, page validity, radix scratch and one schedule.
-    # Index rows are read from the owner's cache pages in place, so no page copies are
-    # retained.
-    expected = 4 * (1 * (4 + 1) + 12 + 80 * 32) + (148 + 1) * 8
+    # Exact sum of the graph descriptor allocations: block table (and on SM100/SM103 its
+    # masked-page copy), contexts, visible lengths, request contexts, page validity, radix
+    # scratch and one schedule. Index rows are read from the owner's cache pages in place,
+    # so no page copies are retained.
+    table_bytes = 8 if is_blackwell_datacenter() else 4
+    expected = 4 * (1 * (table_bytes + 1) + 12 + 80 * 32) + (148 + 1) * 8
     assert metadata.workspace_reservation_bytes(2, 4, 64, 32, 148) == expected
 
 
@@ -1703,16 +1705,25 @@ def test_swa_table_backing_stays_fixed_across_publication_and_fallback(published
     outer = torch.arange(16, dtype=torch.int32).reshape(2, 2, 4)
     published = outer[:, 0, :3]
     host = torch.full((2, 3), 17, dtype=torch.int32)
-    first = metadata._bind_swa_pages(0, host, published if published_first else None)
+
+    def bind(source):
+        copies = []
+        result = metadata._bind_swa_pages(0, host, source, copies)
+        if copies:
+            targets, sources = zip(*copies)
+            torch._foreach_copy_(targets, sources, non_blocking=True)
+        return result
+
+    first = bind(published if published_first else None)
     pointer, stride = first.data_ptr(), first.stride()
     assert (pointer == published.data_ptr()) == published_first
     # Direct fallback refreshes captured backing, even when that backing is an
     # outer-table view rather than the old private contiguous allocation.
-    fallback = metadata._bind_swa_pages(0, host, None)
+    fallback = bind(None)
     assert (fallback.data_ptr(), fallback.stride()) == (pointer, stride)
     torch.testing.assert_close(fallback, host, atol=0, rtol=0)
     other = torch.full((2, 2, 4), 29, dtype=torch.int32)[:, 0, :3]
-    normal = metadata._bind_swa_pages(0, host, other)
+    normal = bind(other)
     assert (normal.data_ptr(), normal.stride()) == (pointer, stride)
     torch.testing.assert_close(normal, other, atol=0, rtol=0)
 

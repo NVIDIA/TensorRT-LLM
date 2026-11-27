@@ -104,6 +104,8 @@ private:
 class NixlTransferAgent : public BaseTransferAgent
 {
 public:
+    static std::string normalizeBackend(std::string const& backend);
+
     NixlTransferAgent(BaseAgentConfig const& config);
     ~NixlTransferAgent();
 
@@ -160,6 +162,8 @@ public:
     {
         return mBounce != nullptr;
     }
+
+    [[nodiscard]] bool peerSupportsBounce(std::string const& name) const;
 
     /// Number of transfer requests routed to the bounce fast path so far.
     [[nodiscard]] std::uint64_t getBounceSubmitCount() const noexcept

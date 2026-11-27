@@ -69,7 +69,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestTyp
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig, RemoteCacheConfig
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -118,6 +118,8 @@ class KvCacheConfigV2:
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+    # Mirrors KvCacheConfig.remote_cache_config; read by KVCacheManagerV2.__init__.
+    remote_cache_config: Optional[RemoteCacheConfig] = None
     enable_kv_pool_rebalance: bool = False
 
 
@@ -2323,13 +2325,13 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
         _unique_rid=1,
         slice_id=0,
     )
-    req_info = SimpleNamespace(
+    req_info = transfer_mod.RecvReqInfo(
+        sender_req_id=task._unique_rid,
         instance_name="gen",
         instance_rank=cp_rank,
-        block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
-        dst_start_token=None,
+        block_ids_per_layer_groups=[np.asarray(dst_table, dtype=np.int64)],
+        unique_rid=task._unique_rid,
         slice_id=0,
-        kv_result_report_token=b"",
     )
     meta = transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info
@@ -2419,13 +2421,13 @@ def _helix_ring_write_meta(
         _unique_rid=1,
         slice_id=0,
     )
-    req_info = SimpleNamespace(
+    req_info = transfer_mod.RecvReqInfo(
+        sender_req_id=task._unique_rid,
         instance_name="gen",
         instance_rank=cp_rank,
-        block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
-        dst_start_token=None,
+        block_ids_per_layer_groups=[np.asarray(dst_table, dtype=np.int64)],
+        unique_rid=task._unique_rid,
         slice_id=0,
-        kv_result_report_token=b"",
     )
     return transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info

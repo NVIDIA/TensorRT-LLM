@@ -155,16 +155,17 @@ def test_gen_only_benchmark_still_reaps_context_sends_when_idle(monkeypatch) -> 
     assert h.dist.calls == []
 
 
-def test_sync_transfers_skip_the_idle_poll_on_a_multi_rank_worker(monkeypatch) -> None:
-    """A synchronous GEN receive blocks rank-locally, so a multi-rank worker
-    must not enter the context status collective from the idle path, even
-    with a send in flight."""
+def test_sync_transfers_skip_the_idle_poll_of_a_non_empty_batch_on_a_multi_rank_worker(
+    monkeypatch,
+) -> None:
+    """With a batch to forward, a multi-rank worker leaves the context status
+    collective to the post-forward reap, even with a send in flight."""
     monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
     h = CoordinatorHarness(dist=FakeDistGroup(world_size=4, tp_size=4).rank(0))
     h.send(TransferRequest(1))
     sent = list(h.transceiver.call_log)
 
-    h.coordinator.poll_progress_when_idle()
+    h.coordinator.poll_progress_when_idle(batch_is_empty=False)
 
     assert h.transceiver.call_log == sent
     assert h.dist.calls == []
@@ -198,16 +199,25 @@ def test_async_idle_poll_is_entered_by_every_rank_regardless_of_local_sends() ->
     assert [h.dist.calls for h in ranks] == [[], []]
 
 
-def test_sync_idle_poll_is_skipped_by_every_rank_of_a_multi_rank_worker(monkeypatch) -> None:
+@pytest.mark.parametrize("batch_is_empty", [False, True])
+def test_sync_idle_poll_follows_the_shared_batch_on_every_rank_of_a_multi_rank_worker(
+    monkeypatch, batch_is_empty: bool
+) -> None:
+    """Every rank enters the context status poll exactly when the batch is
+    empty, whichever rank holds the send."""
     monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
     group = FakeDistGroup(world_size=2, tp_size=2)
     ranks = _ranks(group)
     ranks[1].send(TransferRequest(1))
     logs = [list(h.transceiver.call_log) for h in ranks]
 
-    group.run(lambda rank: ranks[rank].coordinator.poll_progress_when_idle())
+    group.run(
+        lambda rank: ranks[rank].coordinator.poll_progress_when_idle(batch_is_empty=batch_is_empty)
+    )
 
-    assert [h.transceiver.call_log for h in ranks] == logs
+    assert [h.transceiver.call_log for h in ranks] == [
+        log + ([_CONTEXT_POLL] if batch_is_empty else []) for log in logs
+    ]
 
 
 # -- generation-first context gate -------------------------------------------

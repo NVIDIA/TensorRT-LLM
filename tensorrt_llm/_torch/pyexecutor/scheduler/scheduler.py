@@ -88,6 +88,7 @@ class SchedulerOutput(
             # Multimodal encoder scheduling outputs.
             "scheduled_mm_encoder_items",
             "recompute_paused_requests",
+            "failed_requests",
         ],
     )
 ):
@@ -96,6 +97,7 @@ class SchedulerOutput(
     The optional multimodal fields default to ``None``. The V2-only
     ``recompute_paused_requests`` defaults to a fresh empty list so existing
     V1 schedulers can keep constructing the original six-field output.
+    ``failed_requests`` carries V2 admission failures for executor cleanup.
     """
 
     __slots__ = ()
@@ -110,6 +112,7 @@ class SchedulerOutput(
         num_fitting_requests: int,
         scheduled_mm_encoder_items: dict[int, list[int]] | None = None,
         recompute_paused_requests: RequestList | None = None,
+        failed_requests: RequestList | None = None,
     ):
         return super(SchedulerOutput, cls).__new__(
             cls,
@@ -121,16 +124,17 @@ class SchedulerOutput(
             num_fitting_requests,
             scheduled_mm_encoder_items,
             [] if recompute_paused_requests is None else recompute_paused_requests,
+            [] if failed_requests is None else failed_requests,
         )
 
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
     """Return whether decoder-context scheduling is blocked on encoder output."""
-    if not req.is_context_init_state:
-        return False
-
+    # The attribute is unset outside encoder-decoder models; read it before the state binding.
     ready_event = getattr(req, "py_encoder_output_ready_event", None)
-    return ready_event is not None and not ready_event.query()
+    if ready_event is None or not req.is_context_init_state:
+        return False
+    return not ready_event.query()
 
 
 def drop_decoder_context_requests_waiting_for_encoder_output(
@@ -174,13 +178,49 @@ def _get_lora_task_id(req: LlmRequest):
     return (1, lora_id)
 
 
-def _get_forced_context_chunk_size(req: LlmRequest) -> int:
-    next_point = min(
-        (point for point in req.expect_snapshot_points if point > req.context_current_position),
-        default=None,
+def _is_midchunk_snapshot_point(req: LlmRequest, point: int) -> bool:
+    """Whether the cache manager takes the snapshot at ``point`` inside a context step.
+
+    The cache manager sets ``py_midchunk_snapshot_alignment`` when it can store
+    a recurrent-state snapshot at a point inside the step, for the last
+    snapshot point and only at that alignment relative to the step start.
+    """
+    alignment = getattr(req, "py_midchunk_snapshot_alignment", None)
+    return (
+        isinstance(alignment, int)
+        and point < req.prompt_len
+        and point == max(req.expect_snapshot_points)
+        and (point - req.context_current_position) % alignment == 0
     )
-    if next_point is None:
+
+
+def _is_midchunk_pass_point(req: LlmRequest, point: int) -> bool:
+    """Whether a context step may pass the snapshot point ``point``.
+
+    The cache manager sets ``py_midchunk_pass_point`` to a point (not the last
+    one) whose snapshot it can take inside a context step. A step holds at
+    most one such snapshot.
+    """
+    alignment = getattr(req, "py_midchunk_snapshot_alignment", None)
+    return (
+        isinstance(alignment, int)
+        and point == getattr(req, "py_midchunk_pass_point", None)
+        and point < req.prompt_len
+        and (point - req.context_current_position) % alignment == 0
+    )
+
+
+def _get_forced_context_chunk_size(req: LlmRequest) -> int:
+    later_points = sorted(
+        point for point in req.expect_snapshot_points if point > req.context_current_position
+    )
+    if not later_points or _is_midchunk_snapshot_point(req, later_points[0]):
         return req.context_remaining_length
+    next_point = later_points[0]
+    if len(later_points) > 1 and _is_midchunk_pass_point(req, next_point):
+        # The snapshot at the next point is taken inside the step, which ends
+        # at the following point at the latest.
+        next_point = later_points[1]
     next_position = min(next_point, req.prompt_len)
     return max(0, next_position - req.context_current_position)
 
@@ -221,6 +261,8 @@ class ScheduledRequests:
     """Requests whose KV cache was suspended without resetting request state."""
     recompute_paused_requests: RequestList
     """Requests that must release resources and restart from context."""
+    failed_requests: RequestList
+    """Requests that must fail through the executor's request error path."""
     added_inflight_req_ids: list[int]
     """Request ids this batch inserted into the executor's inflight set.
 
@@ -248,6 +290,7 @@ class ScheduledRequests:
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
         self.recompute_paused_requests: RequestList = []
+        self.failed_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
         self.paused_in_place_ids: frozenset[int] = frozenset()
@@ -378,6 +421,18 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
+    def set_transfer_held_requests(self, requests: RequestList) -> None:
+        pass
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        """Requests whose KV pages a failed remote cache level took, which the
+        executor must fail, with their error messages.
+
+        Only the KV cache manager V2 scheduler loses pages this way; the
+        default has none.
+        """
+        return []
+
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         """Register the executor's disaggregated KV-transfer window
         (DisaggTransferAdmissionController), when it bounds admission.
@@ -396,6 +451,19 @@ class RequestScheduler(ABC):
         Args:
             probe: Whether cancelled receives still retain local resources.
         """
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        """Register the executor's AsyncTransferManager, which owns the KV
+        pages of finished disaggregated sends until they land.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+        """
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        """Long-prefill demotion threshold in uncached tokens; 0 (the default) when off."""
+        return 0
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
@@ -427,6 +495,8 @@ class SerializableSchedulerOutput:
     scheduled_mm_encoder_items: dict[int, list[int]] | None = None
     recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
     """Request ids of recompute-paused requests."""
+    failed_requests: list[int] = dataclasses.field(default_factory=list)
+    """Requests whose resource admission stalled past the scheduler limit."""
 
     @classmethod
     def from_scheduler_result(
@@ -455,6 +525,7 @@ class SerializableSchedulerOutput:
             recompute_paused_requests=[
                 req.request_id for req in scheduled_requests.recompute_paused_requests
             ],
+            failed_requests=[req.request_id for req in scheduled_requests.failed_requests],
         )
 
     def to_scheduler_result(
@@ -480,6 +551,9 @@ class SerializableSchedulerOutput:
         scheduled_requests.scheduled_mm_encoder_items = self.scheduled_mm_encoder_items
         scheduled_requests.recompute_paused_requests = [
             id_to_request[req_id] for req_id in self.recompute_paused_requests
+        ]
+        scheduled_requests.failed_requests = [
+            id_to_request[req_id] for req_id in self.failed_requests
         ]
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
@@ -756,6 +830,12 @@ class MultimodalScheduler(RequestScheduler):
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         self.scheduler.set_disagg_transfer_admission_controller(controller)
 
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        return self.scheduler.take_lost_kv_requests()
+
+    def set_transfer_held_requests(self, requests: RequestList) -> None:
+        self.scheduler.set_transfer_held_requests(requests)
+
     def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
         """Forward the local retirement probe to the wrapped scheduler.
 
@@ -763,6 +843,13 @@ class MultimodalScheduler(RequestScheduler):
             probe: Whether cancelled receives still retain local resources.
         """
         self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        self.scheduler.set_async_transfer_manager(mgr)
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        return self.scheduler.ctx_demote_uncached_tokens
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         return self.scheduler.take_decision_counters()

@@ -32,20 +32,27 @@ from .trt_test_alternative import (check_call, check_output, print_info,
                                    print_warning)
 
 
-def get_ucx_tls() -> str:
-    """Get UCX_TLS value based on GPU architecture.
+def single_host_ucx_env() -> dict[str, str]:
+    """Return UCX_TLS and UCX_NET_DEVICES for workers whose UCX peers are local.
 
-    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    UCX_TLS selects the transports for this GPU. UCX_NET_DEVICES=lo keeps UCX
+    off the other host interfaces: UCX would probe each of them for every new
+    endpoint, and some refuse connections from this host. Apply the result
+    over the inherited environment, which may already set either variable.
     """
     from .conftest import get_sm_version
 
     sm = get_sm_version()
-    # GB300 ARM clusters need these transports enabled explicitly.
     if sm == 103 and "aarch" in platform.machine().lower():
-        return "cuda_copy,cuda_ipc,sm,self,tcp"
-    if sm < 90:
-        return "^cuda_ipc,ib,gdr_copy"
-    return "^ib,gdr_copy"
+        # Some GB300 ARM clusters need an explicit list: UCX auto-selection
+        # picks a misbehaving NIC transport there.
+        transports = "cuda_copy,cuda_ipc,sm,self,tcp"
+    elif sm < 90:
+        # Pre-Hopper GPUs need cuda_ipc excluded.
+        transports = "^cuda_ipc,ib,gdr_copy"
+    else:
+        transports = "^ib,gdr_copy"
+    return {"UCX_TLS": transports, "UCX_NET_DEVICES": "lo"}
 
 
 def venv_check_call(venv, cmd, env=None, **kwargs):
@@ -226,97 +233,6 @@ def run_and_check(llm_venv, run_cmd, valid_outputs, streaming=False):
         assert any([
             similar(output, expect, threshold=0.95) for expect in valid_outputs
         ]), f"output is: {output}"
-
-
-def get_dummy_spec_decoding_heads(hf_model_dir,
-                                  save_dir,
-                                  mode='medusa',
-                                  num_heads=4,
-                                  num_layers=1):
-
-    import os
-
-    import modelopt.torch.opt as mto
-    import modelopt.torch.speculative as mtsp
-    import transformers
-    from modelopt.torch.export import export_hf_checkpoint
-
-    # Create the base model.
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        hf_model_dir, trust_remote_code=True)
-
-    if mode == "medusa":
-        config = {
-            "medusa_num_heads": num_heads,
-            "medusa_num_layers": num_layers,
-        }
-    elif mode == "eagle":
-        config = {
-            "eagle_num_layers": num_layers,
-            "use_input_layernorm_in_first_layer": True,
-            "use_last_layernorm": False,
-        }
-    else:
-        raise NotImplementedError(f"Unknown mode {mode}.")
-    mtsp.convert(model, [(mode, config)])
-
-    tokenizer = transformers.AutoTokenizer.from_pretrained(hf_model_dir)
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # Create a dummy trainer.
-    trainer = transformers.Trainer(model=model, tokenizer=tokenizer)
-    trainer._move_model_to_device(model, 'cuda')
-
-    # Enable HF checkpointing so that the saved model will contain the speculative decoding module.
-    mto.enable_huggingface_checkpointing()
-    trainer.save_model(os.path.join(save_dir, 'native'))
-    tokenizer.save_pretrained(os.path.join(save_dir, 'native'))
-
-    import modelopt.torch.quantization as mtq
-    import modelopt.torch.utils.dataset_utils as dataset_utils
-
-    mto.enable_huggingface_checkpointing()
-
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        os.path.join(save_dir, 'native'))
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        os.path.join(save_dir, 'native'))
-
-    calib_dataloader = dataset_utils.get_dataset_dataloader(
-        dataset_name="cnn_dailymail",
-        tokenizer=tokenizer,
-        batch_size=1,
-        num_samples=1,
-        device=model.device,
-        include_labels=False,
-    )
-
-    quant_cfg = getattr(mtq, "FP8_DEFAULT_CFG")
-    # Following quantizers are needed for KV cache quantization.
-    quant_cfg["quant_cfg"]["*output_quantizer"] = {
-        "num_bits": (4, 3),
-        "axis": None,
-        "enable": True,
-    }
-    quant_cfg["quant_cfg"]["*k_bmm_quantizer"] = {
-        "num_bits": (4, 3),
-        "axis": None,
-        "enable": True,
-    }
-    quant_cfg["quant_cfg"]["*v_bmm_quantizer"] = {
-        "num_bits": (4, 3),
-        "axis": None,
-        "enable": True,
-    }
-
-    calibrate_loop = dataset_utils.create_forward_loop(
-        calib_dataloader, dataloader=calib_dataloader)
-    model = mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
-    mtq.print_quant_summary(model)
-
-    export_hf_checkpoint(model,
-                         dtype=model.config.torch_dtype,
-                         export_dir=os.path.join(save_dir, 'fp8'))
 
 
 def get_mmlu_accuracy(output):

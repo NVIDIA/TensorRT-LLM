@@ -67,6 +67,8 @@ def _manager() -> Mock:
     manager.kv_connector_manager = None
     manager.enable_block_reuse = False
     manager._has_cp_helix = False
+    manager.num_locality_domains = 1
+    manager._keep_growth_block = False
     manager.num_extra_kv_tokens = 0
     manager._kv_alloc_extra_tokens = 0
     manager.kv_cache_map = {}
@@ -246,6 +248,7 @@ def test_cancelled_admission_releases_event() -> None:
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
     manager._early_freed_index_requests = set()
+    manager._defer_close_enabled = False  # the default: closes run in free_resources
     manager.impl = Mock()
     manager.index_mapper = Mock()
 

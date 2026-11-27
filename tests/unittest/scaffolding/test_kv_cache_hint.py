@@ -24,6 +24,8 @@ import pytest
 from tensorrt_llm.scaffolding.task import ChatTask, DropKVCacheTask, RoleMessage, TaskStatus
 from tensorrt_llm.scaffolding.worker import OpenaiWorker
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("suffix", ["", "/", "/v1", "/v1/"])
 @pytest.mark.parametrize("api_key", [None, "test-key"])

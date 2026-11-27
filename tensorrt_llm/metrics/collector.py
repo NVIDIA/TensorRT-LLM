@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from tensorrt_llm.logger import logger
 
 from .enums import MetricNames
+from .perf import (FINISH_REASON_LABEL, PerfMetricsCollector, PerfMetricsRecord,
+                   kv_cache_utilization)
 
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry, Counter
@@ -36,9 +38,29 @@ if TYPE_CHECKING:
 # makes the metrics-side limit its own explicit concern.
 MAX_SPEC_DECODE_POSITION_LABELS = 16
 
+_PROCESSING_TIME_BUCKETS = (
+    0.0001,
+    0.00025,
+    0.0005,
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+)
+
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
-class MetricsCollector:
+class PrometheusExposure:
     """Collects and logs metrics from TensorRT-LLM engine stats to Prometheus.
 
     Used by OpenAIServer in tensorrt_llm/serve/openai_server.py.
@@ -68,6 +90,9 @@ class MetricsCollector:
             trtllm_prefill_perplexity
             trtllm_generation_perplexity
             trtllm_request_error_total
+            trtllm_input_processing_seconds
+            trtllm_input_processing_queue_seconds
+            trtllm_media_processing_seconds
 
         Iteration-level metrics:
             trtllm_kv_cache_hit_rate
@@ -113,6 +138,7 @@ class MetricsCollector:
             trtllm_spec_decode_draft_overhead
             trtllm_prefill_batch_occupancy
             trtllm_prefill_batch_tokens
+            trtllm_multimodal_encoder_gpu_time_seconds
 
         Config info metrics (logged once at startup via log_config_info):
             trtllm_model_config_info
@@ -120,7 +146,7 @@ class MetricsCollector:
             trtllm_speculative_config_info
             trtllm_kv_cache_config_info
     """
-    labelname_finish_reason = "finished_reason"
+    labelname_finish_reason = FINISH_REASON_LABEL
     labelname_cache_level = "cache_level"
     labelname_cache_tier = "cache_tier"
     labelname_dp_rank = "dp_rank"
@@ -172,6 +198,7 @@ class MetricsCollector:
         self._registry = REGISTRY if registry is None else registry
         self._gauge_multiprocess_mode = gauge_multiprocess_mode
         Counter = partial(Counter, registry=self._registry)
+        self._counter_cls = Counter
         Histogram = partial(Histogram, registry=self._registry)
         Gauge = partial(Gauge,
                         registry=self._registry,
@@ -195,6 +222,7 @@ class MetricsCollector:
                     f"{name} must be strictly increasing, got {buckets}.")
         self.last_log_time = time.time()
         self.labels = labels
+        self._last_rank_snapshots: dict[str, object] = {}
         iteration_labelnames = (*self.labels, self.labelname_dp_rank)
         self.metric_prefix = "trtllm_"
 
@@ -539,6 +567,12 @@ class MetricsCollector:
             documentation="Draft overhead in speculative decoding",
             labelnames=self.labels.keys())
 
+        # Shared-prefix attention counters, registered by the first record
+        # that carries them (only when TLLM_FMHA_LIBS enables the library).
+        self.counters_shared_prefix_attn: Optional[Dict[str, Counter]] = None
+        # Per counter: dp_rank -> last cumulative value seen.
+        self._prev_shared_prefix_attn: Dict[str, Dict[str, int]] = {}
+
         # Prompt cache hit tracking
         self.counter_tokens_cached_prompt = Counter(
             name=self.metric_prefix + "prompt_cached_tokens_total",
@@ -619,6 +653,38 @@ class MetricsCollector:
             documentation="Histogram of total context tokens per iteration.",
             buckets=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
             labelnames=iteration_labelnames)
+
+        self.histogram_input_processing = Histogram(
+            name=self.metric_prefix + "input_processing_seconds",
+            documentation=(
+                "Server input processing wall time per stage. Media loading "
+                "and chat template stages can overlap and include async waits; "
+                "processor time excludes its thread-pool queue wait. Includes "
+                "failed attempts. Stages must not be added to obtain TTFT."),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=[*self.labels, "stage"])
+        self.histogram_input_processing_queue = Histogram(
+            name=self.metric_prefix + "input_processing_queue_seconds",
+            documentation="Time waiting for a server input-processor thread.",
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=self.labels.keys())
+        self.histogram_media_processing = Histogram(
+            name=self.metric_prefix + "media_processing_seconds",
+            documentation=
+            ("Per-media-item download, decode execution and decode "
+             "worker queue times. Local file decode includes file IO; "
+             "data-URI decode includes base64 conversion. Includes failed attempts."
+             ),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=[*self.labels, "stage", "modality"])
+        self.histogram_multimodal_encoder_gpu_time = Histogram(
+            name=self.metric_prefix + "multimodal_encoder_gpu_time_seconds",
+            documentation=
+            ("Rank-0 GPU elapsed time per completed multimodal encoder "
+             "call through MultimodalModelMixin. Excludes pre-encoder H2D, cache-only "
+             "lookups and warmup. Batched work is not per-request latency."),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=self.labels.keys())
 
         # HTTP error counter
         self.labelname_http_code = "http_code"
@@ -848,9 +914,46 @@ class MetricsCollector:
         # Convenience function for logging to gauge.
         gauge.labels(**self._label_merge(labels)).set(data)
 
-    def _log_cumulative_kv_counter(self, counter: "Counter", value: int,
-                                   previous: dict[str, int], rank: str, *,
-                                   field_name: str) -> None:
+    def _shared_prefix_attn_counters(self) -> Dict[str, "Counter"]:
+        """The shared-prefix attention counters, registered on first use.
+
+        Each counts generation requests per decode step: a request decoding for
+        100 steps adds 100.
+        """
+        if self.counters_shared_prefix_attn is None:
+            labelnames = (*self.labels, self.labelname_dp_rank)
+            self.counters_shared_prefix_attn = {
+                key:
+                self._counter_cls(name=self.metric_prefix + name,
+                                  documentation=documentation,
+                                  labelnames=labelnames)
+                for key, name, documentation in (
+                    ("requestSteps", "shared_prefix_attn_request_steps_total",
+                     "Generation requests decoded, summed over decode steps"),
+                    ("shareableRequestSteps",
+                     "shared_prefix_attn_shareable_request_steps_total",
+                     "Generation requests that share prompt KV pages with "
+                     "another request of the step, summed over decode steps"),
+                    ("sharedRequestSteps",
+                     "shared_prefix_attn_shared_request_steps_total",
+                     "Generation requests attended through shared-prefix "
+                     "attention, summed over decode steps"),
+                )
+            }
+            self._prev_shared_prefix_attn = {
+                key: {}
+                for key in self.counters_shared_prefix_attn
+            }
+        return self.counters_shared_prefix_attn
+
+    def _log_cumulative_kv_counter(self,
+                                   counter: "Counter",
+                                   value: int,
+                                   previous: dict[str, int],
+                                   rank: str,
+                                   *,
+                                   field_name: str,
+                                   source: str = "KV cache") -> None:
         """Accumulate positive deltas from one rank's ordered snapshots.
 
         A decrease emits a warning and updates the baseline without incrementing
@@ -862,19 +965,55 @@ class MetricsCollector:
             previous: Per-rank baselines, updated after processing the snapshot.
             rank: Normalized data-parallel rank label.
             field_name: Source KV statistics field named in decrease warnings.
+            source: What the counts describe, named in decrease warnings.
         """
         previous_value = previous.get(rank, 0)
         delta = value - previous_value
         if delta < 0:
             logger.warning(
-                f"Cumulative KV cache {field_name} decreased for dp_rank={rank} "
+                f"Cumulative {source} {field_name} decreased for dp_rank={rank} "
                 f"from {previous_value} to {value}; "
                 "skipping increment and updating baseline.")
         elif delta > 0:
             self._log_counter(counter, {self.labelname_dp_rank: rank}, delta)
         previous[rank] = value
 
+    def emit(self, record: PerfMetricsRecord) -> None:
+        """Expose collected observations through the legacy statistics adapters."""
+        if record.kind == "request":
+            self._expose_request_metrics(record.per_req)
+        elif record.kind == "loop":
+            self._expose_rank_snapshot(record)
+            self._expose_iteration_stats(
+                {"executorLoop": {
+                    "kind": "loop",
+                    "per_iter": record.per_iter
+                }})
+        elif record.kind == "rank":
+            self._expose_rank_snapshot(record)
+        else:
+            self._expose_iteration_stats(record.iteration_view())
+
+    def _expose_rank_snapshot(self, record: PerfMetricsRecord) -> None:
+        """A cached rank snapshot may accompany several loop records; observe it once."""
+        if not record.per_rank:
+            return
+        identity = str(
+            record.per_rank.get("globalRank", record.per_rank.get("rank", 0)))
+        if self._last_rank_snapshots.get(identity) is record.per_rank:
+            return
+        self._last_rank_snapshots[identity] = record.per_rank
+        self._expose_iteration_stats(record.per_rank)
+
     def log_request_metrics_dict(self, metrics_dict: dict) -> None:
+        """Compatibility adapter for legacy candidate dictionaries."""
+        self.emit(PerfMetricsCollector.collect_request(metrics_dict))
+
+    def log_iteration_stats(self, iteration_stats: dict) -> None:
+        """Compatibility adapter for legacy iteration dictionaries."""
+        self.emit(PerfMetricsCollector.collect_iteration(iteration_stats))
+
+    def _expose_request_metrics(self, metrics_dict: dict) -> None:
         """Log per-request metrics from TRTLLM engine responses.
 
         This method updates Prometheus metrics including:
@@ -990,7 +1129,26 @@ class MetricsCollector:
 
             self.last_log_time = time.time()
 
-    def log_iteration_stats(self, iteration_stats: dict) -> None:
+    def log_input_processing(
+        self,
+        stage: str,
+        duration_seconds: float,
+        modality: str | None = None,
+    ) -> None:
+        """Observe the same input-stage sample stored in the request record."""
+        if modality is not None:
+            self.histogram_media_processing.labels(**self.labels,
+                                                   stage=stage,
+                                                   modality=modality).observe(
+                                                       duration_seconds)
+        elif stage == "processor_queue":
+            self._log_histogram(self.histogram_input_processing_queue,
+                                duration_seconds)
+        else:
+            self.histogram_input_processing.labels(
+                **self.labels, stage=stage).observe(duration_seconds)
+
+    def _expose_iteration_stats(self, iteration_stats: dict) -> None:
         """Log iteration-level statistics from TRTLLM engine.
 
         Updates Prometheus gauges/counters for queue load, memory usage, batch sizes,
@@ -1001,7 +1159,8 @@ class MetricsCollector:
                 Top-level fields: numActiveRequests, numQueuedRequests, numCompletedRequests,
                 maxNumActiveRequests, iterLatencyMS, gpuMemUsage, cpuMemUsage, pinnedMemUsage,
                 maxBatchSizeStatic, maxBatchSizeRuntime, maxNumTokensRuntime.
-                Nested dicts: kvCacheStats, inflightBatchingStats, specDecodingStats.
+                Nested dicts: kvCacheStats, inflightBatchingStats, specDecodingStats,
+                sharedPrefixAttnStats.
 
         Note:
             - Needs `enable_iter_perf_stats: true` in LLM args to collect iteration-level stats.
@@ -1031,6 +1190,11 @@ class MetricsCollector:
         Args:
             iteration_stats: Serialized iteration measurements from rank 0.
         """
+        for elapsed_ms in (iteration_stats.get("multimodalEncoderStats")
+                           or {}).get("gpuTimesMS", ()):
+            self._log_histogram(self.histogram_multimodal_encoder_gpu_time,
+                                elapsed_ms / 1000.0)
+
         # Top-level queue & load metrics
         if "numActiveRequests" in iteration_stats:
             self._log_gauge(self.num_requests_running,
@@ -1140,6 +1304,18 @@ class MetricsCollector:
         """
         rank_labels = {self.labelname_dp_rank: rank}
 
+        # Shared-prefix attention counters (cumulative per rank).
+        if attn_stats := iteration_stats.get("sharedPrefixAttnStats"):
+            for key, counter in self._shared_prefix_attn_counters().items():
+                if key in attn_stats:
+                    self._log_cumulative_kv_counter(
+                        counter,
+                        attn_stats[key],
+                        self._prev_shared_prefix_attn[key],
+                        rank,
+                        field_name=key,
+                        source="shared-prefix attention")
+
         # KV cache stats
         if kv_stats := iteration_stats.get("kvCacheStats"):
             cache_hit_rate = kv_stats.get("cacheHitRate")
@@ -1164,7 +1340,7 @@ class MetricsCollector:
             if "usedNumBlocks" in kv_stats and "maxNumBlocks" in kv_stats:
                 max_num_blocks = kv_stats["maxNumBlocks"]
                 if max_num_blocks:
-                    utilization = kv_stats["usedNumBlocks"] / max_num_blocks
+                    utilization = kv_cache_utilization(kv_stats)
                     self._log_gauge(self.kv_cache_utilization,
                                     utilization,
                                     labels=rank_labels)
@@ -1350,3 +1526,7 @@ class MetricsCollector:
         """Increment the error counter, labeled by HTTP status code."""
         labels = {**self.labels, self.labelname_http_code: str(http_code)}
         self.counter_request_error.labels(**labels).inc(1)
+
+
+class MetricsCollector(PrometheusExposure):
+    """Compatibility name for the long-lived Prometheus exposure adapter."""

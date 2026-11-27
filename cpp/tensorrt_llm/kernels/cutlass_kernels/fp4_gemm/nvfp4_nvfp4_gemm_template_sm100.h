@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,9 +25,11 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 #include "cutlass/arch/arch.h"
+#include "cutlass/arch/grid_dependency_control.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/gemm.h"
+#include "cutlass/version.h"
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -101,6 +103,26 @@ struct SMTypeAdapter<cutlass::arch::Sm103, _2SM>
     using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs16Sm103;
 };
 
+// The SM103 block-scaled kernel loads scale factors from a dedicated warp that, unlike its other load warps, does not
+// wait for the producer grid under programmatic dependent launch. Make that warp wait before its first scale-factor
+// load; load_sf_init only builds the TMA tensor views.
+static_assert(
+    CUTLASS_VERSION < 480, "CUTLASS >= 4.8 waits in the SM103 SF-load warp; remove Sm103WaitBeforeScaleFactorLoad");
+
+template <typename Base>
+struct Sm103WaitBeforeScaleFactorLoad : Base
+{
+    using Base::Base;
+
+    template <class ProblemShape_MNKL>
+    CUTLASS_DEVICE auto load_sf_init(ProblemShape_MNKL const& problem_shape_MNKL, typename Base::Params const& params,
+        typename Base::TensorStorage& shared_tensors) const
+    {
+        cutlass::arch::wait_on_dependent_grids();
+        return Base::load_sf_init(problem_shape_MNKL, params, shared_tensors);
+    }
+};
+
 template <typename>
 constexpr auto always_false = false;
 
@@ -169,12 +191,14 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
             cutlass::epilogue::fusion::LinCombPerColBias<OutElementType, float, OutElementType, void,                  \
                 float>>::CollectiveOp;                                                                                 \
                                                                                                                        \
-        using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<Arch,                         \
+        using CollectiveMainloopBase = typename cutlass::gemm::collective::CollectiveBuilder<Arch,                     \
             cutlass::arch::OpClassBlockScaledTensorOp, cute::tuple<ElementA, SFType>, LayoutA, AlignmentA,             \
             cute::tuple<ElementB, SFType>, LayoutB, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,        \
             cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(                                        \
                 sizeof(typename CollectiveEpilogue::SharedStorage))>,                                                  \
             MainloopSchedule>::CollectiveOp;                                                                           \
+        using CollectiveMainloop = std::conditional_t<std::is_same_v<Arch, cutlass::arch::Sm103>,                      \
+            Sm103WaitBeforeScaleFactorLoad<CollectiveMainloopBase>, CollectiveMainloopBase>;                           \
                                                                                                                        \
         template <typename Base>                                                                                       \
         struct Sm10xOnly : Base                                                                                        \

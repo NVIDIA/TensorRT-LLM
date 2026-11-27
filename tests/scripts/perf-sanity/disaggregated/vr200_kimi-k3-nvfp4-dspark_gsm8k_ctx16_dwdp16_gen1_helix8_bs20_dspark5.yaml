@@ -1,0 +1,153 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GSM8K deployment of the kimi_k3_nvfp4__sm_107__helix8_moetp2ep4 (generation) and
+# kimi_k3_nvfp4__sm_107__tp1 (context) targets
+# (accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moetp2ep4/test_accuracy.py):
+# 16 one-GPU DWDP context servers feeding one Helix CP8 generation server
+# (batch 20, DSpark 5). 6 Rubin nodes. The test replaces the client with GSM8K
+# against the disaggregated frontend.
+metadata:
+  model_name: kimi_k3_nvfp4
+  precision: fp4
+  model_dir_name: Kimi-K3-NVFP4
+  supported_gpus: [VR200]
+slurm:
+  timeout: 3600
+  numa_bind: false
+benchmark:
+  mode: e2e
+  concurrency_list: '64'
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 16
+  num_gen_servers: 1
+environment:
+  # Both roles store the BF16 shared and latent MLP projections as FP8
+  # (KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1; without it the context servers run out of
+  # memory) and keep the KV cache of the last two MLA layers in FP8.
+  # UCX_TLS keeps the KV cache transfer on the CUDA IPC, shared-memory and TCP
+  # transports: the servers reach each other over NVLink. With the RDMA transports
+  # also enabled, the KV cache pool sized during the startup memory profiling stays
+  # registered with UCX after it is released, and its memory does not come back
+  # for the final KV cache allocation.
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_MODELING_V2_VALIDATE=1 TRTLLM_DISAGG_SHARED_DRAFT_KV=1
+    TRTLLM_NIXL_NUM_THREADS=1 TRTLLM_KV_TRANSFER_NUM_THREADS=8 TLLM_KIMI_K3_FP8_KV_LAYERS=91,92
+    KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    NCCL_GRAPH_MIXING_SUPPORT=0 TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
+    TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES=2097152
+    UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp
+  ctx_worker_env_var: TLLM_FMHA_LIBS=-flashinfer_trtllm_gen TLLM_MOE_ASYNC_INPUT_QUANT=0
+    TLLM_ROUTING_DISABLE_COOP_LAUNCH=1
+worker_config:
+  ctx:
+    modeling_v2: require
+    attention_dp_config:
+      kv_cache_routing_conversation_affinity: true
+      kv_cache_routing_new_conv_placement: least_queued
+    cache_transceiver_config:
+      backend: NIXL
+      kv_cache_bounce_size_mb: 0
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    dwdp_config:
+      contention_opt: false
+      copy_mode: gather
+      dwdp_size: 16
+      gather_kernel: tma
+      num_experts_per_worker: 56
+      num_groups: 1
+      num_prefetch_experts: 56
+    enable_attention_dp: true
+    enable_chunked_prefill: true
+    kv_cache_config:
+      block_reuse_config:
+        max_num_turns: 5
+        policy: per_conversation
+      dtype: nvfp4
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.7
+      host_cache_size: 171798691840
+      mamba_ssm_cache_dtype: bfloat16
+      mamba_state_config:
+        additional_snapshot_offsets_from_end: [0]
+      # Layer-group order: ssm, fp4_mla, fp8_mla, mla_hp_tail.
+      pool_ratio: [0.14, 0.635, 0.205, 0.02]
+      tokens_per_block: 128
+      use_kv_cache_manager_v2: true
+    max_batch_size: 16
+    max_num_tokens: 16384
+    max_seq_len: 996672
+    moe_config:
+      backend: CUTEDSL
+      max_num_tokens: 16384
+      use_low_precision_moe_combine: true
+    moe_expert_parallel_size: 1
+    num_serve_frontends: 8
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    stream_interval: 10
+    tensor_parallel_size: 1
+    trust_remote_code: true
+    speculative_config:
+      block_size: 5
+      decoding_type: DSpark
+      attention_backend: CUTEDSL
+      max_draft_len: 5
+      speculative_model: Inferact-Kimi-K3-DSpark
+      advanced_sampling_mode: no_topk_no_topp
+  gen:
+    modeling_v2: require
+    cache_transceiver_config:
+      backend: NIXL
+      kv_cache_bounce_size_mb: 0
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    context_parallel_size: 8
+    cp_config:
+      cp_type: HELIX
+      fifo_version: 2
+      tokens_per_block: 128
+      use_nccl_for_alltoall: false
+    cuda_graph_config:
+      batch_sizes: [1, 2, 4, 8, 16, 20]
+      enable_padding: true
+    enable_attention_dp: false
+    kv_cache_config:
+      avg_seq_len: 149442
+      block_reuse_config:
+        max_num_turns: 5
+        policy: per_conversation
+      dtype: nvfp4
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+      host_cache_size: 0
+      mamba_ssm_cache_dtype: bfloat16
+      mamba_state_config:
+        additional_snapshot_offsets_from_end: [0]
+      tokens_per_block: 128
+      use_kv_cache_manager_v2: true
+    max_batch_size: 20
+    max_num_tokens: 120
+    max_seq_len: 997696
+    moe_config:
+      backend: CUTEDSL_FC12
+      use_low_precision_moe_combine: true
+    moe_expert_parallel_size: 4
+    moe_tensor_parallel_size: 2
+    num_postprocess_workers: 4
+    num_serve_frontends: 8
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    speculative_config:
+      block_size: 5
+      decoding_type: DSpark
+      attention_backend: CUTEDSL
+      max_draft_len: 5
+      speculative_model: Inferact-Kimi-K3-DSpark
+      advanced_sampling_mode: no_topk_no_topp
+    stream_interval: 100
+    tensor_parallel_size: 1
+    trust_remote_code: true

@@ -26,12 +26,14 @@ class PreparedInputs:
     ``runtime_draft_len`` is the draft length the prepared step runs with.
     ``static_inputs_staged`` is the number of tokens whose input ids and
     positions the preparation already wrote to the CUDA graph's static inputs
-    (0: none).
+    (0: none). ``pre_replay_staged``: it also did the graph's pre-replay hook
+    work for those tokens.
     """
 
     kwargs: dict[str, Any]
     runtime_draft_len: int = 0
     static_inputs_staged: int = 0
+    pre_replay_staged: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,11 @@ class ScheduledInputs:
     Keep borrowed data valid until GPU consumption completes. Spec enablement
     is independent of draft length; updates use outputs["runtime_draft_len"].
     Omitting that key preserves the input length without modifying this record.
+
+    ``inputs_staged`` lets a caller overlap forwards. A runner that reuses host
+    staging memory across calls records it on the forward's stream once the
+    stream has consumed that memory; the caller waits on it before the next
+    forward, which may then run while this one is still executing.
     """
 
     batch: ScheduledRequests
@@ -66,6 +73,7 @@ class ScheduledInputs:
     gather_context_logits: bool = False
     enable_spec_decode: bool = False
     runtime_draft_len: int = 0
+    inputs_staged: torch.cuda.Event | None = None
 
 
 @dataclass(frozen=True)

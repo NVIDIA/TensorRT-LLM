@@ -105,7 +105,14 @@ def _coordinator(
         transfer_manager=None,
         kv_cache_manager=None,
         dist=SimpleNamespace(
-            rank=4, world_size=8, tp_rank=1, pp_rank=0, cp_rank=0, pp_size=1, cp_size=1
+            rank=4,
+            tp_rank=1,
+            pp_rank=0,
+            cp_rank=0,
+            tp_size=1,
+            pp_size=1,
+            cp_size=1,
+            world_size=1,
         ),
         effects=SimpleNamespace(revert_ctx_alloc=Mock()),
         registry=SimpleNamespace(active_requests=lambda: list(active_requests)),
@@ -1424,7 +1431,7 @@ def test_backend_wait_continues_when_submission_diagnostic_callback_fails(
     sender._agent = SimpleNamespace(submit_transfer_requests=Mock(return_value=status))
     sender._ownership_poison_lock = threading.Lock()
     sender._ownership_poisoned = None
-    task = Mock()
+    task = Mock(lock=threading.Lock(), _native_inflight=0)
     task._enforce_physical_ownership = enforce_physical_ownership
     request = Mock()
     callback = Mock(side_effect=RuntimeError("diagnostics failed"))

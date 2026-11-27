@@ -14,17 +14,28 @@
 # limitations under the License.
 """The one-launch store scatter and the side-stream snapshot hold what four ``index_copy_`` write."""
 
+import os
+import subprocess
+import sys
 import types
+from contextlib import ExitStack
 
 import pytest
 import torch
+from cuda.bindings import runtime as cudart
 
+from tensorrt_llm._torch.kernels.spec_step_copies.op import slot_scatter_supported
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.speculative import spec_sampler_base as sampler_ops
 from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 from tensorrt_llm._torch.speculative.spec_store_scatter import spec_store_scatter
+from tensorrt_llm._torch.utils import make_weak_ref
+from tensorrt_llm._utils import CUASSERT, TensorWrapper, convert_to_torch_tensor
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+requires_slot_scatter = pytest.mark.skipif(
+    not slot_scatter_supported(), reason="SlotScatter must be available on the current device"
+)
 
 WIDTH, SLOTS, DRAFT = 6, 8, 5
 
@@ -147,9 +158,58 @@ def _assert_step(state, scheduled, outputs):
 
 def test_sample_async_snapshots_the_store_on_the_side_stream(monkeypatch):
     sampler = _sampler(monkeypatch)
-    for seed in (1, 2):  # the second step reuses the batch's slot index
-        scheduled, outputs = _step(seed)
+    for seed, slots in enumerate(((6, 2), (6, 2), (6,), (6, 7), (7, 6))):
+        scheduled, outputs = _step(seed, slots)
         state = sampler.sample_async(scheduled, outputs, [])
         assert state.sampler_event.side_stream_event is not None
         state.sampler_event.synchronize()
         _assert_step(state, scheduled, outputs)
+
+
+@requires_slot_scatter
+def test_side_stream_scatter_from_graph_output_views(monkeypatch):
+    sampler = _sampler(monkeypatch)
+    sampler.stores_on_side_stream = True
+    scheduled, eager = _step(5)
+    with ExitStack() as allocations:
+        captured = dict(eager)
+        tensors = {name: value for name, value in eager.items() if isinstance(value, torch.Tensor)}
+        # Use graph output buffers outside the PyTorch allocator's ownership.
+        for name, value in tensors.items():
+            (ptr,) = CUASSERT(cudart.cudaMalloc(value.numel() * value.element_size()))
+            allocations.callback(cudart.cudaFree, ptr)
+            captured[name] = convert_to_torch_tensor(TensorWrapper(ptr, value.dtype, value.shape))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for name, value in tensors.items():
+                captured[name].copy_(value)
+        outputs = make_weak_ref(captured)
+        graph.replay()
+        state = sampler.sample_async(scheduled, outputs, [])
+        assert state.device.stores_ready is not None
+        state.sampler_event.synchronize()
+        _assert_step(state, scheduled, eager)
+
+
+@requires_slot_scatter
+def test_graph_output_scatter_under_cuda_malloc_async():
+    if torch.cuda.memory.get_allocator_backend() == "cudaMallocAsync":
+        pytest.skip("already running under cudaMallocAsync")
+    config = "backend:cudaMallocAsync"
+    env = dict(os.environ, PYTORCH_ALLOC_CONF=config, PYTORCH_CUDA_ALLOC_CONF=config)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            f"{__file__}::test_side_stream_scatter_from_graph_output_views",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout[-6000:] + result.stderr[-3000:]

@@ -10,7 +10,7 @@ This file provides guidance to coding agents when working with code in this dire
 ## What This Is
 
 The Python surface of KVCacheManagerV2, the KV cache management subsystem for TensorRT-LLM.
-It manages GPU/host/disk memory for key-value caches used during LLM inference, handling page
+It manages GPU/host/disk/remote memory for key-value caches used during LLM inference, handling page
 allocation, eviction, multi-tier caching, radix-tree-based prefix sharing, and disaggregated
 serving.
 

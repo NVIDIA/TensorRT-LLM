@@ -533,6 +533,169 @@ def test_pack_gdn_decode_qkv(
     torch.testing.assert_close(actual_v.view(num_tokens, -1), expected_v, rtol=0, atol=0)
 
 
+# ---- Tests for fused_gdn_conv_post_conv ----
+
+
+def _ref_prefill_conv(x, weight, bias, conv_states, query_start_loc, cache_indices, has_init):
+    """Varlen causal conv1d + SiLU of token-major x; rolls conv_states forward in place."""
+    from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
+    width = weight.shape[1]
+    out = torch.zeros_like(x)
+    starts = query_start_loc.tolist()
+    for seq, (slot, init) in enumerate(zip(cache_indices.tolist(), has_init.tolist())):
+        if slot == PAD_SLOT_ID:
+            continue
+        window = conv_states[slot].T if init else torch.zeros_like(conv_states[slot].T)
+        padded = torch.cat((window, x[starts[seq] : starts[seq + 1]])).float()
+        y = F.conv1d(
+            padded.T.unsqueeze(0),
+            weight.float().unsqueeze(1),
+            None if bias is None else bias.float(),
+            groups=weight.shape[0],
+        )
+        out[starts[seq] : starts[seq + 1]] = F.silu(y[0].T).to(x.dtype)
+        conv_states[slot] = padded[-(width - 1) :].T.to(conv_states.dtype)
+    return out
+
+
+def _run_fused_gdn_conv_post_conv(
+    heads,
+    seq_lens,
+    has_init,
+    width,
+    has_bias=False,
+    beta_dtype=torch.float32,
+    g_linear=False,
+    preallocated=False,
+    cache_indices=None,
+    num_slots=None,
+    slot_padding=0,
+):
+    """Run fused_gdn_conv_post_conv and the reference on the same random inputs; return both.
+
+    Conv windows are strided views into a pool with ``slot_padding`` unrelated elements per slot,
+    which the op must leave exactly as the reference does. By default sequence ``i`` uses slot
+    ``num_slots - 1 - 2 * i`` of a pool with three spare slots.
+    """
+    from tensorrt_llm._torch.modules.mamba.fused_gdn_conv import fused_gdn_conv_post_conv
+
+    if cache_indices is None:
+        num_slots = len(seq_lens) + 3
+        cache_indices = [num_slots - 1 - 2 * i for i in range(len(seq_lens))]
+    num_k_heads, head_k_dim, num_v_heads, head_v_dim = heads
+    qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+    num_tokens = sum(seq_lens)
+    bf16 = {"dtype": torch.bfloat16, "device": "cuda"}
+    # Row-strided views, as sliced out of the in_proj outputs.
+    projected = torch.randn(num_tokens, qkv_dim + 64, **bf16) * 0.5
+    ba = torch.randn(num_tokens, 2 * num_v_heads, **bf16)
+    mixed_qkv = projected[:, :qkv_dim]
+    weight = torch.randn(qkv_dim, width, **bf16) * 0.5
+    # A strided bias view: the op must read it by its logical layout.
+    bias = (torch.randn(2 * qkv_dim, **bf16) * 0.1)[::2] if has_bias else None
+    pool = torch.randn(num_slots, qkv_dim * (width - 1) + slot_padding, **bf16) * 0.5
+    expected_pool = pool.clone()
+    conv_states, expected_states = (
+        p.as_strided((num_slots, qkv_dim, width - 1), (p.stride(0), width - 1, 1))
+        for p in (pool, expected_pool)
+    )
+    seq_args = (
+        torch.tensor([0, *seq_lens], device="cuda").cumsum(0, dtype=torch.int32),
+        torch.tensor(cache_indices, dtype=torch.int32, device="cuda"),
+        torch.tensor(has_init, dtype=torch.bool, device="cuda"),
+    )
+    gate_args = (
+        ba[:, num_v_heads:],
+        ba[:, :num_v_heads],
+        torch.randn(num_v_heads, device="cuda") - 2.0,
+        torch.randn(num_v_heads, device="cuda") * 0.1,
+        *heads,
+    )
+
+    conv_out = _ref_prefill_conv(mixed_qkv, weight, bias, expected_states, *seq_args)
+    expected = list(_ref_gdn_post_conv(conv_out.T, None, *gate_args, beta_dtype))
+    if g_linear:
+        expected[3] = torch.exp(expected[3])
+    out = tuple(torch.full_like(t, float("nan")) for t in expected) if preallocated else None
+    actual = fused_gdn_conv_post_conv(
+        mixed_qkv,
+        weight,
+        bias,
+        conv_states,
+        *seq_args,
+        *gate_args,
+        beta_dtype=beta_dtype,
+        g_linear=g_linear,
+        out=out,
+    )
+    if preallocated:
+        assert all(got is buf for got, buf in zip(actual, out))
+    # Conv windows hold raw inputs, so they match exactly; the rest of the pool is untouched.
+    assert torch.equal(pool, expected_pool)
+    return actual, expected
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "heads",
+    [
+        (16, 128, 64, 128),  # Qwen3.5-397B: num_k_heads, head_k_dim, num_v_heads, head_v_dim
+        (4, 64, 8, 64),
+        (2, 96, 4, 96),
+    ],
+)
+@pytest.mark.parametrize(
+    "seq_lens,has_init,beta_dtype",
+    [
+        ((77,), (False,), torch.float32),  # fresh prefill
+        # Chunked-prefill continuations, including chunks shorter than the conv window.
+        ((1, 2, 3, 40), (True, True, True, True), torch.float32),
+        ((5, 1, 300, 17), (True, False, True, False), torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("width,has_bias", [(4, False), (3, True)])
+@pytest.mark.parametrize("g_linear,preallocated", [(False, False), (True, True)])
+def test_fused_gdn_conv_post_conv(
+    heads, seq_lens, has_init, beta_dtype, width, has_bias, g_linear, preallocated
+):
+    """Fused token-major conv matches a varlen conv reference followed by the post-conv."""
+    torch.manual_seed(42)
+    actual, expected = _run_fused_gdn_conv_post_conv(
+        heads, seq_lens, has_init, width, has_bias, beta_dtype, g_linear, preallocated
+    )
+    for actual_output, expected_output in zip(actual[:3], expected[:3]):
+        assert actual_output.is_contiguous()
+        torch.testing.assert_close(actual_output, expected_output, rtol=1e-2, atol=1e-2)
+    for actual_output, expected_output in zip(actual[3:], expected[3:]):
+        assert actual_output.dtype == expected_output.dtype
+        torch.testing.assert_close(actual_output, expected_output, rtol=1e-4, atol=1e-4)
+
+
+@skip_no_cuda
+def test_fused_gdn_conv_post_conv_pad_slot_and_strided_states():
+    """Padded sequences keep their windows; conv windows may live in a strided pool view."""
+    from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
+    torch.manual_seed(42)
+    seq_lens = (6, 2, 10)
+    actual, expected = _run_fused_gdn_conv_post_conv(
+        (4, 64, 8, 64),
+        seq_lens,
+        (True, True, False),
+        width=4,
+        cache_indices=[3, PAD_SLOT_ID, 0],
+        num_slots=5,
+        slot_padding=32,
+    )
+    live_tokens = torch.ones(sum(seq_lens), dtype=torch.bool, device="cuda")
+    live_tokens[6:8] = False  # outputs of the padded sequence are unspecified
+    for actual_output, expected_output in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_output[:, live_tokens], expected_output[:, live_tokens], rtol=1e-2, atol=1e-2
+        )
+
+
 # ---- Tests for the GDN compile boundary and derived state ----
 
 
@@ -754,6 +917,163 @@ def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
         assert kwargs["old_u"] == "old_x"
 
 
+def test_gdn_mtp_replay_verify_addresses_history_by_replay_slot(monkeypatch):
+    """GDN MTP replay reads the checkpoint and Conv state at the state slots, the
+    history at the replay slots, and hands the kernel per-request [T, C] raw rows."""
+    from tensorrt_llm._torch.modules.fla.cache_manager import ReplayStateUpdateMetadata
+    from tensorrt_llm._torch.modules.mamba import gdn_mixer
+
+    num_decodes, tokens, heads, channels = 3, 4, 2, 24
+    layer = gdn_mixer.Qwen3NextGatedDeltaNet.__new__(gdn_mixer.Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.A_log = torch.zeros(heads)
+    layer.dt_bias = torch.zeros(heads)
+    layer.conv1d = SimpleNamespace(weight="conv_weight", bias=None)
+    layer.activation = "silu"
+    layer.conv_dim_per_tp = channels
+    layer.num_v_heads_per_tp = heads
+    layer.head_v_dim = 8
+    calls = {}
+    monkeypatch.setattr(gdn_mixer, "gdn_mtp_replay", lambda **kwargs: calls.update(kwargs))
+    history_len = torch.tensor([0, 3, 9, 13, 5, 7], dtype=torch.int32)
+    candidates = torch.zeros(8, tokens, channels)
+    layer_cache = SimpleNamespace(
+        prev_num_accepted_tokens=history_len,
+        old_x="history_u",
+        old_B="history_k",
+        old_dt="history_G",
+        intermediate_conv_window=candidates,
+    )
+    # Row-strided pre-conv q|k|v rows of the fused in_proj output.
+    projection = torch.arange(num_decodes * tokens * 40, dtype=torch.float32).view(-1, 40)
+    raw_x = projection[:, :channels]
+    is_dummy = torch.tensor([False, True, False])
+
+    output = layer._replay_verify(
+        raw_x=raw_x,
+        b="beta",
+        a="decay",
+        conv_states="conv",
+        ssm_states="pool",
+        state_indices=torch.tensor([3, 1, 5, 0], dtype=torch.int32),
+        replay_indices=torch.tensor([4, 2, 0, 1], dtype=torch.int32),
+        num_decodes=num_decodes,
+        draft_token_num=tokens,
+        replay_metadata=ReplayStateUpdateMetadata(history_len, None, tokens, 16),
+        layer_cache=layer_cache,
+        is_dummy=is_dummy,
+    )
+
+    assert calls["state_indices"].tolist() == [3, 1, 5]
+    assert calls["replay_indices"].tolist() == [4, 2, 0]
+    assert calls["history_u"] == "history_u" and calls["history_len"] is history_len
+    assert calls["is_dummy"] is is_dummy
+    assert (calls["b"], calls["a"]) == ("beta", "decay")
+    assert calls["candidate_x"].data_ptr() == candidates.data_ptr()
+    assert calls["candidate_x"].shape == (num_decodes, tokens, channels)
+    assert torch.equal(calls["raw_x"], raw_x.reshape(num_decodes, tokens, channels))
+    assert calls["raw_x"].stride() == (tokens * 40, 40, 1)
+    assert output.shape == (num_decodes, tokens, heads, 8)
+    with pytest.raises(AssertionError, match="dynamic draft length"):
+        layer._replay_verify(
+            raw_x=raw_x,
+            b="beta",
+            a="decay",
+            conv_states="conv",
+            ssm_states="pool",
+            state_indices=torch.tensor([3, 1, 5], dtype=torch.int32),
+            replay_indices=torch.tensor([4, 2, 0], dtype=torch.int32),
+            num_decodes=num_decodes,
+            draft_token_num=tokens - 1,
+            replay_metadata=ReplayStateUpdateMetadata(history_len, None, tokens, 16),
+            layer_cache=layer_cache,
+            is_dummy=is_dummy,
+        )
+
+
+def test_gdn_mtp_replay_in_mixed_step_takes_the_raw_decode_rows(monkeypatch):
+    """A mixed prefill + verify step hands GDN MTP replay the raw (pre-conv)
+    decode rows and their b / a gate rows, without the standalone conv1d update or the
+    q/k/v pack, and concatenates its output after the prefill rows."""
+    from tensorrt_llm._torch.modules.mamba import gdn_mixer
+
+    num_prefill_tokens, num_decodes, tokens, heads, head_dim, channels = 5, 2, 4, 2, 8, 24
+    layer = gdn_mixer.Qwen3NextGatedDeltaNet.__new__(gdn_mixer.Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.A_log = torch.zeros(heads)
+    layer.dt_bias = torch.zeros(heads)
+    layer.num_v_heads, layer.attn_tp_size, layer.head_v_dim = heads, 1, head_dim
+    layer.num_v_heads_per_tp, layer.num_k_heads_per_tp, layer.head_k_dim = heads, 1, head_dim
+    layer._prefill_conv = lambda *args: "prefill_conv_out"
+    monkeypatch.setattr(gdn_mixer, "fused_gdn_post_conv", lambda *args, **kwargs: ("p",) * 5)
+    monkeypatch.setattr(
+        gdn_mixer,
+        "chunk_gated_delta_rule",
+        lambda **kwargs: (torch.ones(1, num_prefill_tokens, heads, head_dim), None),
+    )
+    for name in ("causal_conv1d_update_triton", "pack_gdn_decode_qkv"):
+        monkeypatch.setattr(
+            gdn_mixer, name, lambda *a, _name=name, **k: pytest.fail(f"{_name} called")
+        )
+    captured = {}
+
+    def fake_replay_verify(**kwargs):
+        captured.update(kwargs)
+        return torch.full((num_decodes, tokens, heads, head_dim), 2.0)
+
+    layer._replay_verify = fake_replay_verify
+    rows = num_prefill_tokens + num_decodes * tokens
+    mixed_qkv = torch.randn(rows, channels)
+    ba = torch.randn(rows, 2 * heads)
+    b = ba[:, :heads]
+    state_indices = torch.tensor([6, 2, 4], dtype=torch.int32)
+    replay_indices_d = torch.tensor([9, 1], dtype=torch.int32)
+    is_dummy = torch.tensor([False, True])
+
+    out = layer.forward_extend(
+        "conv_states",
+        "ssm_states",
+        spec_metadata=SimpleNamespace(runtime_draft_len=tokens - 1),
+        intermediate_conv_states="candidates",
+        is_target_verify=True,
+        mixed_qkv=mixed_qkv,
+        a=ba[:, heads:],
+        b=b,
+        batch_size=1 + num_decodes,
+        has_initial_states_bs=torch.ones(3, dtype=torch.bool),
+        has_initial_states_p=torch.ones(1, dtype=torch.bool),
+        cache_indices=state_indices,
+        query_start_loc=torch.tensor([0, num_prefill_tokens]),
+        query_start_loc_p=torch.tensor([0, num_prefill_tokens]),
+        query_start_loc_long=torch.tensor([0, num_prefill_tokens]),
+        num_prefill_tokens=num_prefill_tokens,
+        num_decode_tokens=num_decodes * tokens,
+        state_indices_p=state_indices[:1],
+        state_indices_d=state_indices[1:],
+        num_prefill=1,
+        num_decodes=num_decodes,
+        g_linear=False,
+        use_replay=True,
+        use_mtp_replay=True,
+        replay_state_indices_d=replay_indices_d,
+        replay_is_dummy=is_dummy,
+        replay_metadata="metadata",
+        layer_cache="layer_cache",
+    )
+
+    assert torch.equal(captured["raw_x"], mixed_qkv[num_prefill_tokens:])
+    assert torch.equal(captured["b"], b[num_prefill_tokens:])
+    assert torch.equal(captured["a"], ba[num_prefill_tokens:, heads:])
+    assert captured["state_indices"].tolist() == [2, 4]
+    assert captured["replay_indices"] is replay_indices_d
+    assert captured["is_dummy"] is is_dummy
+    assert captured["conv_states"] == "conv_states" and captured["ssm_states"] == "ssm_states"
+    assert (captured["num_decodes"], captured["draft_token_num"]) == (num_decodes, tokens)
+    assert out.shape == (1, rows, heads, head_dim)
+    assert torch.all(out[:, :num_prefill_tokens] == 1.0)
+    assert torch.all(out[:, num_prefill_tokens:] == 2.0)
+
+
 def test_verify_intermediate_state_indices_reuses_buffers():
     """The verify path's row-index vector is built once, not per GDN layer.
 
@@ -848,7 +1168,12 @@ def _assert_late_copy_overlaps(src):
     for _ in range(3):
         _late_copy(dst, src)
         _copy_no_wait[(triton.cdiv(src.numel(), 1024),)](
-            dst, snap, src.numel(), BLOCK=1024, launch_pdl=True
+            dst,
+            snap,
+            src.numel(),
+            BLOCK=1024,
+            # pyrefly: ignore [unexpected-keyword]
+            launch_pdl=True,
         )
         torch.cuda.synchronize()
         stale.append(not torch.equal(snap, src))

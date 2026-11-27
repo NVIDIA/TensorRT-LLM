@@ -33,6 +33,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import get_padding_support
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
@@ -244,17 +245,15 @@ class MiniMaxH3Pipeline(BasePipeline):
                     "cfg_size=1, ring_size=1, attn2d_size=(1, 1), and "
                     "tp_size * ulysses_size=world_size."
                 )
-            if vgm.ulysses_size > 1 and pipeline_config.attention.backend not in (
-                "VANILLA",
-                "FA4",
-                "TRTLLM",
-                "FLASHINFER",
-            ):
-                raise NotImplementedError(
-                    "MiniMax-H3 Ulysses requires VANILLA, FA4, TRTLLM, or FLASHINFER attention. "
-                    "Other attention backends do not support the required "
-                    "packed-row padding mask."
-                )
+            if vgm.ulysses_size > 1:
+                # Ulysses pads the packed sequence to a multiple of its size.
+                if not get_padding_support(pipeline_config.attention).supports_padding:
+                    raise NotImplementedError(
+                        "MiniMax-H3 Ulysses requires an attention backend that takes "
+                        "key_padding_mask or valid_seq_len for the padded packed rows, such "
+                        f"as VANILLA; the {pipeline_config.attention.backend} backend takes "
+                        "neither."
+                    )
         self._text_encoder_tp_group = None
         if (
             self._uses_tensor_parallel_text_encoder
@@ -398,6 +397,8 @@ class MiniMaxH3Pipeline(BasePipeline):
     @property
     def default_generation_params(self) -> dict:
         fastvideo_inference = getattr(self, "_fastvideo_inference", {})
+        dmd_steps = fastvideo_inference.get("dmd_denoising_steps")
+        default_steps = len(dmd_steps) + 1 if dmd_steps is not None else 50
         return {
             # MiniMax-H3 derives the default canvas from the first present
             # keyframe, or from 16:9 for T2VA.
@@ -405,7 +406,9 @@ class MiniMaxH3Pipeline(BasePipeline):
             "width": None,
             "num_frames": 124,
             "frame_rate": float(MINIMAX_H3_FPS),
-            "num_inference_steps": int(fastvideo_inference.get("num_inference_steps", 28)),
+            "num_inference_steps": int(
+                fastvideo_inference.get("num_inference_steps", default_steps)
+            ),
         }
 
     @property

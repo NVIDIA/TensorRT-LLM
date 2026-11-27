@@ -22,12 +22,14 @@ import ipaddress
 import json
 import math
 import os
+import platform
 import re
 import secrets
 import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -43,7 +45,7 @@ from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info, print_warning
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
-from ..conftest import get_llm_root, llm_models_root
+from ..conftest import get_device_count, get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
 from .perf_regression_utils import _percentile, get_job_info, process_and_upload_test_results
 from .time_breakdown_metrics import ALL_METRICS as TIME_BREAKDOWN_METRIC_NAMES
@@ -72,6 +74,13 @@ SUPPORTED_GPU_MAPPING = {
     "B300": "b300",
     "H200": "h200",
     "VR200": "vr200",
+}
+
+# Pre-production boards report the placeholder product name "NVIDIA Graphics
+# Device", so they are identified by (compute capability, host CPU) instead.
+PLACEHOLDER_GPU_NAME = "Graphics Device"
+PLACEHOLDER_GPU_MAPPING = {
+    ("10.7", "x86_64"): "gr100",
 }
 
 # benchmark_client value selecting the AgentX trace-replay client
@@ -1082,6 +1091,7 @@ STARTUP_METRIC_NAMES = (
     "draft_weight_population_seconds",
     "draft_checkpoint_finalization_seconds",
     "post_load_processing_seconds",
+    "checkpoint_page_cache_release_seconds",
 )
 CHECKPOINT_PIPELINE_PHASES = (
     "checkpoint_preparation_seconds",
@@ -1098,7 +1108,7 @@ CHECKPOINT_IO_POLICY_PATTERN = re.compile(
     r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
     r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
 )
-CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v4-postmerge-50-auto-50-native"
+CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v5-postmerge-50-auto-50-native"
 CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV = "TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY"
 CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 2
 CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET = 0
@@ -1656,6 +1666,352 @@ def add_startup_metric_values(
     )
 
 
+# Name of the aggregated server in its warmup time file. A disagg worker uses
+# its serving type instead (CTX_0, GEN_1, ...).
+AGGREGATE_SERVER_NAME = "aggregate"
+WARMUP_TIME_POLL_INTERVAL = 1.0
+
+
+def _warmup_time_path(test_output_dir: str, server_name: str, server_idx: int) -> str:
+    return os.path.join(test_output_dir, f"warmup_time.{server_name}.{server_idx}.json")
+
+
+def write_warmup_time(
+    test_output_dir: str, server_name: str, server_idx: int, warmup_time: float
+) -> None:
+    """Save a server's warmup time for the task that uploads the results.
+
+    The warmup time is the seconds from the server's launch until its /health
+    first returns 200, so it includes weight loading and the executor warmup.
+    """
+    print_info(f"{server_name} warmup time: {warmup_time:.1f}s")
+    path = _warmup_time_path(test_output_dir, server_name, server_idx)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=test_output_dir, prefix=f"{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output_file:
+            json.dump({"warmup_time": warmup_time}, output_file)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def remove_warmup_time(test_output_dir: str, server_name: str, server_idx: int) -> None:
+    """Remove the warmup time an earlier attempt saved.
+
+    A retry reuses test_output_dir, and must never upload the previous attempt's value.
+    """
+    path = _warmup_time_path(test_output_dir, server_name, server_idx)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def record_warmup_time(
+    test_output_dir: str, server_name: str, server_idx: int, warmup_time: float
+) -> None:
+    """Save a server's warmup time for test_e2e, where the field is informational.
+
+    A failure to save it leaves the row without the field instead of failing the benchmark.
+    """
+    try:
+        write_warmup_time(test_output_dir, server_name, server_idx, warmup_time)
+    except OSError as error:
+        print_warning(f"Failed to save the {server_name} warmup time: {error}")
+
+
+def warmup_time_fields(
+    test_output_dir: str, server_idx: int, server_names: List[str]
+) -> Dict[str, float]:
+    """Return the OpenSearch fields of the warmup times these servers saved.
+
+    The aggregated server's field is d_warmup_time, and a disagg worker's field
+    carries the worker's name, e.g. d_gen_0_warmup_time. A server that saved no
+    warmup time gets no field.
+    """
+    fields = {}
+    for server_name in server_names:
+        path = _warmup_time_path(test_output_dir, server_name, server_idx)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as input_file:
+                warmup_time = float(json.load(input_file)["warmup_time"])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print_warning(f"Failed to read the warmup time from {path}: {error}")
+            continue
+        prefix = "" if server_name == AGGREGATE_SERVER_NAME else f"{server_name.lower()}_"
+        fields[f"d_{prefix}warmup_time"] = warmup_time
+    return fields
+
+
+def spans_nodes(server_config: "ServerConfig") -> bool:
+    """Whether the server has more GPUs than a node."""
+    return server_config.gpus > server_config.gpus_per_node
+
+
+def is_multi_node_case(runtime: str, server_config: "ServerConfig") -> bool:
+    """Whether the case runs on more than one node, which CI does alone in a stage.
+
+    A disaggregated case gives each worker nodes of its own; any other case spans
+    nodes when its server has more GPUs than a node. Only such a case uploads
+    warmup time from test_e2e: a single-node stage runs several cases in one
+    process, and each reuses the caches of the cases before it, so test_warmup
+    measures single-node servers instead.
+    """
+    return runtime == "multi_node_disagg_server" or spans_nodes(server_config)
+
+
+def _server_reports_healthy(addr_path: str) -> bool:
+    """Return whether the server whose address is in addr_path answers /health with 200."""
+    try:
+        with open(addr_path, "r", encoding="utf-8") as addr_file:
+            host, _, port = addr_file.read().strip().rpartition(":")
+        if not port:
+            return False
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=5) as response:
+            return response.status == 200
+    except (OSError, ValueError, http.client.HTTPException):
+        # The address is not reported yet, the server is not listening yet, or
+        # /health answers 503 while the server starts.
+        return False
+
+
+class WarmupTimeRecorder:
+    """Save a server's warmup time from a background thread.
+
+    For a disagg worker, whose task waits for the benchmark to finish instead of
+    for its own server. addr_path is the file the server's host:port is (or will
+    be) reported to. Stop the recorder before stopping the server, and before the
+    test ends: integration tests fail on a thread that is still running.
+    """
+
+    def __init__(
+        self,
+        server_proc: subprocess.Popen,
+        addr_path: str,
+        launch_time: float,
+        test_output_dir: str,
+        server_name: str,
+        server_idx: int,
+    ):
+        remove_warmup_time(test_output_dir, server_name, server_idx)
+        self._stop_event = threading.Event()
+
+        def record() -> None:
+            while not self._stop_event.is_set() and server_proc.poll() is None:
+                if _server_reports_healthy(addr_path):
+                    record_warmup_time(
+                        test_output_dir, server_name, server_idx, time.monotonic() - launch_time
+                    )
+                    return
+                self._stop_event.wait(WARMUP_TIME_POLL_INTERVAL)
+
+        self._thread = threading.Thread(target=record, name=f"warmup-time-{server_name}")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join()
+
+    def __enter__(self) -> "WarmupTimeRecorder":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.stop()
+
+
+#: Compile and tuning caches that a cold start must not inherit even where the
+#: job sets an explicit path (CI points TLLM_AUTOTUNER_CACHE_PATH at one file for
+#: a whole stage): each one that is set moves into the cold start's own directory.
+#: The caches nobody sets derive from HOME, XDG_CACHE_HOME or TMPDIR, which a cold
+#: start redirects too.
+COLD_START_CACHE_ENV = (
+    "TLLM_AUTOTUNER_CACHE_PATH",
+    "TRITON_CACHE_DIR",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "TORCH_EXTENSIONS_DIR",
+    "DG_JIT_CACHE_DIR",
+    "FLASHINFER_WORKSPACE_BASE",
+    "CUDA_CACHE_PATH",
+    "TRTLLM_CACHE_DIR",
+    "TRTLLM_DG_CACHE_DIR",
+    "TRTLLM_CUTE_DSL_CACHE_DIR",
+    "CUTE_DSL_CACHE_DIR",
+    "MINFER_FMHA_CACHE_DIR",
+    "MM_SPARSE_ATTN_AOT_CACHE",
+)
+#: Lets a server reuse the JIT builds of other processes.
+COLD_START_UNSET_ENV = ("TLLM_JIT_SHARE_DIR",)
+#: Default homes of those caches under HOME. One that grows during a cold start
+#: is a cache the redirection missed.
+COLD_START_WATCHED_HOME_PATHS = (
+    ".cache/flashinfer",
+    ".cache/minfer",
+    ".cache/tensorrt_llm",
+    ".cache/torch",
+    ".triton",
+    ".nv/ComputeCache",
+    ".deep_gemm",
+)
+
+
+def cold_start_env(env: Dict[str, str], cold_dir: str) -> Dict[str, str]:
+    """Return env with every compile and tuning cache moved under the empty cold_dir."""
+    env = dict(env)
+    # One-letter names: MPI and ZeroMQ create Unix sockets under TMPDIR, and a
+    # socket path may not exceed 107 bytes.
+    for name, subdir in (("HOME", "h"), ("XDG_CACHE_HOME", "x"), ("TMPDIR", "t")):
+        env[name] = os.path.join(cold_dir, subdir)
+        os.makedirs(env[name])
+    for name in COLD_START_CACHE_ENV:
+        if name in env:
+            env[name] = os.path.join(cold_dir, name.lower())
+    for name in COLD_START_UNSET_ENV:
+        env.pop(name, None)
+    return env
+
+
+def drop_page_cache(paths: List[str]) -> None:
+    """Drop the page cache of every file under paths, so that a server reads them cold."""
+    for path in paths:
+        for dirpath, _, filenames in os.walk(path):
+            for filename in filenames:
+                try:
+                    fd = os.open(os.path.join(dirpath, filename), os.O_RDONLY)
+                except OSError:
+                    continue
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+
+
+def _tree_bytes(path: str) -> int:
+    if not os.path.isdir(path):
+        return os.path.getsize(path)
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for filename in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, filename)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _cache_footprint(cold_dir: str) -> Dict[str, int]:
+    """Bytes in each place a cold start must not write to.
+
+    The default cache homes, the explicitly set cache paths, and every entry of
+    the temp dir but cold_dir.
+    """
+    home = os.path.expanduser("~")
+    paths = [os.path.join(home, path) for path in COLD_START_WATCHED_HOME_PATHS]
+    paths += [os.environ[name] for name in COLD_START_CACHE_ENV if name in os.environ]
+    tmp = tempfile.gettempdir()
+    paths += [os.path.join(tmp, name) for name in os.listdir(tmp)]
+    footprint = {}
+    for path in paths:
+        if path != cold_dir and os.path.exists(path):
+            try:
+                footprint[path] = _tree_bytes(path)
+            except OSError:
+                pass
+    return footprint
+
+
+#: Seconds a cold-start server gets to exit after SIGTERM before it is killed.
+SERVER_STOP_TIMEOUT = 300
+
+
+def stop_server(server_proc: subprocess.Popen, server_name: str) -> None:
+    """Stop a server with SIGTERM, and kill it if it has not exited within SERVER_STOP_TIMEOUT."""
+    server_proc.terminate()
+    try:
+        server_proc.wait(timeout=SERVER_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print_warning(
+            f"{server_name} did not exit {SERVER_STOP_TIMEOUT}s after SIGTERM; killing it"
+        )
+        server_proc.kill()
+        server_proc.wait()
+
+
+def run_cold_warmup(
+    server_cmd: List[str],
+    server_env: Dict[str, str],
+    model_dirs: List[str],
+    num_frontends: int,
+    test_output_dir: str,
+    server_name: str,
+    server_idx: int,
+) -> None:
+    """Start a server cold, save its warmup time once /health returns 200, and stop it.
+
+    Cold means no compile, tuning or page cache left by an earlier server of the
+    same job: the checkpoint's page cache is dropped, and the server gets empty
+    cache directories of its own, removed afterwards.
+    """
+    host = "localhost"
+    addr_path = os.path.join(test_output_dir, f"trtllm-serve.{server_name}.{server_idx}.addr")
+    log_path = os.path.join(test_output_dir, f"trtllm-serve.{server_name}.{server_idx}.log")
+    if os.path.exists(addr_path):
+        os.remove(addr_path)
+    remove_warmup_time(test_output_dir, server_name, server_idx)
+    if num_frontends > 1:
+        port = reserve_multi_frontend_port(host)
+        cmd = add_host_port_to_cmd(server_cmd, host, port)
+        publish_addr_file(addr_path, host, port)
+    else:
+        cmd = add_host_port_to_cmd(server_cmd, host, 0) + ["--report_addr", addr_path]
+    timeout = min(DEFAULT_TIMEOUT, server_ready_timeout(AGG_SERVER_READY_TIMEOUT, "AGG"))
+
+    drop_page_cache(model_dirs)
+    cold_dir = tempfile.mkdtemp(prefix="psc_")
+    try:
+        footprint = _cache_footprint(cold_dir)
+        env = cold_start_env({**os.environ, **server_env}, cold_dir)
+        server_proc = None
+        print_info(f"Starting {server_name} cold, caches in {cold_dir}. cmd is {cmd}")
+        try:
+            with open(log_path, "w") as log_file:
+                launch_time = time.monotonic()
+                server_proc = subprocess.Popen(
+                    cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT
+                )
+                _, port = wait_for_reported_addr(addr_path, timeout, server_proc)
+                wait_for_endpoint_ready(
+                    f"http://{host}:{port}/health",
+                    timeout=timeout,
+                    check_files=[log_path],
+                    server_proc=server_proc,
+                )
+                write_warmup_time(
+                    test_output_dir, server_name, server_idx, time.monotonic() - launch_time
+                )
+        except Exception as error:
+            report_error(error_msg=error, log_files=[log_path])
+            raise
+        finally:
+            if server_proc is not None:
+                stop_server(server_proc, server_name)
+    finally:
+        shutil.rmtree(cold_dir, ignore_errors=True)
+
+    grown = [
+        path for path, size in _cache_footprint(cold_dir).items() if size > footprint.get(path, -1)
+    ]
+    if grown:
+        print_warning(
+            f"{server_name} wrote outside its cold cache directory, so its warmup "
+            f"time may not be a cold start: {grown}"
+        )
+
+
 def get_model_dir(model_name: str) -> str:
     """Get model directory path from model name."""
     if model_name in MODEL_PATH_DICT:
@@ -1687,6 +2043,48 @@ def to_env_dict(env_vars: str) -> Dict[str, str]:
             key, value = env_var.split("=", 1)
             env[key] = value
     return env
+
+
+RELEASE_CHECKPOINT_PAGE_CACHE_ENV = "TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE"
+# GPU types whose servers the release turns on for by default, on a node whose
+# Lustre client drops a file's cached pages once its lock has been idle for at
+# most RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS: for a server started
+# shortly before, that drop, and the compaction of the freed memory, land in
+# its measurement.
+RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES = ("gb300",)
+RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS = 10 * 60 * 1000
+
+
+def lustre_lock_max_age_ms() -> Optional[int]:
+    """The shortest lock lifetime (lru_max_age, ms) of this node's Lustre client.
+
+    None without a Lustre client.
+    """
+    ages = []
+    for path in glob.glob("/sys/fs/lustre/ldlm/namespaces/*/lru_max_age"):
+        try:
+            with open(path) as f:
+                ages.append(int(f.read().strip()))
+        except (OSError, ValueError):
+            continue
+    return min(ages) if ages else None
+
+
+def default_release_checkpoint_page_cache(gpu_type: str) -> Optional[str]:
+    """TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE for servers whose YAML does not set it.
+
+    The job's own value when it exports one, else "1" for the GPU types above on
+    a node whose Lustre client ages idle locks out within the limit above.
+    """
+    value = os.environ.get(RELEASE_CHECKPOINT_PAGE_CACHE_ENV)
+    if value is not None:
+        return value
+    if gpu_type not in RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES:
+        return None
+    max_age_ms = lustre_lock_max_age_ms()
+    if max_age_ms is None or max_age_ms > RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS:
+        return None
+    return "1"
 
 
 # AgentX knobs a ctx_only lane overrides on top of the yaml's client_env_var.
@@ -2288,9 +2686,28 @@ class ServerConfig:
             config_data = {**external_config, **config_data}
         return config_data
 
-    def generate_extra_llm_api_config(self) -> str:
-        """Generate extra-llm-api-config.yml content."""
+    def generate_extra_llm_api_config(
+        self, page_cache_release_default: Optional[str] = None
+    ) -> str:
+        """Generate extra-llm-api-config.yml content.
+
+        ``page_cache_release_default`` is TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE
+        unless this server's env_vars set it.
+        """
         config_data = self.merged_llm_api_config_data()
+
+        # Drop the checkpoint's page cache during startup, so that neither the
+        # file system's delayed drop nor the kernel's compaction of the freed
+        # memory lands in a measurement. Set through env_overrides, which every
+        # rank applies before loading: the MPI ranks of a multi-node server do
+        # not inherit this process's environment.
+        release = to_env_dict(self.env_vars).get(
+            RELEASE_CHECKPOINT_PAGE_CACHE_ENV, page_cache_release_default
+        )
+        if release is not None:
+            env_overrides = dict(config_data.get("env_overrides") or {})
+            env_overrides.setdefault(RELEASE_CHECKPOINT_PAGE_CACHE_ENV, release)
+            config_data["env_overrides"] = env_overrides
 
         # Handle speculative_model path conversion
         if (
@@ -2923,6 +3340,7 @@ class AggrTestCmds(NamedTuple):
             server_addr_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.addr")
             if os.path.exists(server_addr_path):
                 os.remove(server_addr_path)
+            remove_warmup_time(self.test_output_dir, AGGREGATE_SERVER_NAME, server_idx)
             num_frontends = 1
             if server_idx < len(self.server_configs):
                 num_frontends = (
@@ -2950,6 +3368,7 @@ class AggrTestCmds(NamedTuple):
             if server_idx < len(self.server_configs):
                 server_env.update(self.server_configs[server_idx].to_env())
             with open(server_file_path, "w") as server_ctx:
+                launch_time = time.monotonic()
                 server_proc = subprocess.Popen(
                     server_cmd_with_port,
                     env=server_env,
@@ -2966,6 +3385,16 @@ class AggrTestCmds(NamedTuple):
                     check_files=[server_file_path],
                     server_proc=server_proc,
                 )
+                # Uploaded only for a server that spans nodes (is_multi_node_case).
+                if server_idx < len(self.server_configs) and spans_nodes(
+                    self.server_configs[server_idx]
+                ):
+                    record_warmup_time(
+                        self.test_output_dir,
+                        AGGREGATE_SERVER_NAME,
+                        server_idx,
+                        time.monotonic() - launch_time,
+                    )
                 observation = collect_startup_observation(
                     f"{server_hostname}:{server_port}",
                     [server_file_path],
@@ -3725,6 +4154,9 @@ class DisaggTestCmds(NamedTuple):
         # Same LLM args a plain ctx server gets from its --config file, with
         # the speculative model / load balancer paths already resolved.
         # model_path is set by to_cmd(), which get_commands() runs first.
+        # Without the page-cache release default: each instance is a server
+        # of its own, so it would drop the checkpoint files that the other
+        # instances on its node are still reading.
         ctx_args = yaml.safe_load(ctx_cfg.generate_extra_llm_api_config()) or {}
         ctx_args["backend"] = ctx_cfg.backend
         worker_config = {
@@ -3805,12 +4237,21 @@ class DisaggTestCmds(NamedTuple):
         try:
             print_info(f"Starting DWDP ctx rank {rank}/{world_size}. cmd is {server_cmd}")
             with open(server_log, "w") as log_file:
+                launch_time = time.monotonic()
                 server_proc = subprocess.Popen(
                     server_cmd, env=worker_env, stdout=log_file, stderr=subprocess.STDOUT
                 )
-                self.wait_for_benchmark_ready(
-                    benchmark_status_file, server_proc=server_proc, server_log=server_log
-                )
+                with WarmupTimeRecorder(
+                    server_proc,
+                    self._hostname_file(server_idx, f"CTX_{rank}"),
+                    launch_time,
+                    self.test_output_dir,
+                    f"CTX_{rank}",
+                    server_idx,
+                ):
+                    self.wait_for_benchmark_ready(
+                        benchmark_status_file, server_proc=server_proc, server_log=server_log
+                    )
         finally:
             print_info(f"DWDP ctx rank {rank} stopped")
             if server_proc is not None:
@@ -3881,17 +4322,26 @@ class DisaggTestCmds(NamedTuple):
                 if worker_cfg is not None:
                     worker_env.update(worker_cfg.to_env())
                 with open(server_file_path, "w") as server_ctx:
+                    launch_time = time.monotonic()
                     server_proc = subprocess.Popen(
                         server_cmd,
                         env=worker_env,
                         stdout=server_ctx,
                         stderr=subprocess.STDOUT,
                     )
-                    self.wait_for_benchmark_ready(
-                        benchmark_status_file,
-                        server_proc=server_proc,
-                        server_log=server_file_path,
-                    )
+                    with WarmupTimeRecorder(
+                        server_proc,
+                        hostname_file,
+                        launch_time,
+                        self.test_output_dir,
+                        self.disagg_serving_type,
+                        server_idx,
+                    ):
+                        self.wait_for_benchmark_ready(
+                            benchmark_status_file,
+                            server_proc=server_proc,
+                            server_log=server_file_path,
+                        )
             finally:
                 print_info(f"Server {self.disagg_serving_type} stopped")
                 server_proc.terminate()
@@ -4277,6 +4727,7 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
 
         gen_proc = None
         proxy_proc = None
+        gen_warmup_recorder = None
         try:
             num_frontends = getattr(gen_cfg, "num_serve_frontends", 1) or 1
             gen_addr_path = os.path.join(self.test_output_dir, f"GEN_0.{server_idx}.addr")
@@ -4303,12 +4754,23 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
             # in benchmark gen-only mode, whichever launcher started this test.
             gen_env[GEN_ONLY_NO_CONTEXT_ENV] = "1"
             with open(gen_log_path, "a") as gen_ctx:
+                launch_time = time.monotonic()
                 gen_proc = subprocess.Popen(
                     gen_cmd_with_port,
                     env=gen_env,
                     stdout=gen_ctx,
                     stderr=subprocess.STDOUT,
                 )
+                # Uploaded only for a gen worker that spans nodes (is_multi_node_case).
+                if gen_cfg is not None and spans_nodes(gen_cfg):
+                    gen_warmup_recorder = WarmupTimeRecorder(
+                        gen_proc,
+                        gen_addr_path,
+                        launch_time,
+                        self.test_output_dir,
+                        "GEN_0",
+                        server_idx,
+                    )
                 gen_host, gen_port = wait_for_reported_addr(gen_addr_path, self.timeout, gen_proc)
 
                 self._write_proxy_config(server_idx, [f"{gen_host}:{gen_port}"])
@@ -4439,6 +4901,8 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
                             server_idx=server_idx,
                         )
         finally:
+            if gen_warmup_recorder is not None:
+                gen_warmup_recorder.stop()
             for proc, name in ((proxy_proc, "disagg proxy"), (gen_proc, "gen worker")):
                 if proc:
                     print_info(f"Stopping {name}")
@@ -4610,6 +5074,19 @@ class PerfSanityTestConfig:
                     stderr=subprocess.DEVNULL,
                     text=True,
                 )
+                if PLACEHOLDER_GPU_NAME in output:
+                    compute_cap = (
+                        subprocess.check_output(
+                            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                        )
+                        .splitlines()[0]
+                        .strip()
+                    )
+                    return PLACEHOLDER_GPU_MAPPING.get(
+                        (compute_cap, platform.machine()), "unsupported"
+                    )
                 model = output.split()[-1]
                 return SUPPORTED_GPU_MAPPING.get(model, "unsupported")
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
@@ -4619,6 +5096,16 @@ class PerfSanityTestConfig:
             os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
         )
         self.gpu_type = get_gpu_type()
+        self.page_cache_release_default = default_release_checkpoint_page_cache(self.gpu_type)
+        if (
+            self.page_cache_release_default is not None
+            or self.gpu_type in RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES
+        ):
+            print_info(
+                f"{RELEASE_CHECKPOINT_PAGE_CACHE_ENV} for servers whose env_vars do not "
+                f"set it: {self.page_cache_release_default or 'unset'} (gpu {self.gpu_type}, "
+                f"Lustre lock lru_max_age {lustre_lock_max_age_ms()} ms)"
+            )
 
         # Parse test case name to get config_base_name, select_pattern, runtime,
         # benchmark_mode and the time_breakdown modifier
@@ -5110,7 +5597,9 @@ class PerfSanityTestConfig:
             server_cmd = server_config.to_cmd(test_output_dir)
 
             # Generate extra-llm-api-config.yml
-            config_content = server_config.generate_extra_llm_api_config()
+            config_content = server_config.generate_extra_llm_api_config(
+                self.page_cache_release_default
+            )
             config_filename = f"extra-llm-api-config.aggr.{server_config.name}.yml"
             config_path = os.path.join(test_output_dir, config_filename)
             with open(config_path, "w") as f:
@@ -5158,7 +5647,9 @@ class PerfSanityTestConfig:
             # Generate ctx server command
             ctx_cmd = ctx_config.to_cmd(test_output_dir, numa_bind, "CTX")
             if disagg_serving_type == "CTX_0":
-                config_content = ctx_config.generate_extra_llm_api_config()
+                config_content = ctx_config.generate_extra_llm_api_config(
+                    self.page_cache_release_default
+                )
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
                 )
@@ -5168,7 +5659,9 @@ class PerfSanityTestConfig:
             # Generate gen server command
             gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
             if disagg_serving_type == "GEN_0":
-                config_content = gen_config.generate_extra_llm_api_config()
+                config_content = gen_config.generate_extra_llm_api_config(
+                    self.page_cache_release_default
+                )
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
                 )
@@ -5236,7 +5729,9 @@ class PerfSanityTestConfig:
                 )
 
             gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
-            config_content = gen_config.generate_extra_llm_api_config()
+            config_content = gen_config.generate_extra_llm_api_config(
+                self.page_cache_release_default
+            )
             config_path = os.path.join(
                 test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
             )
@@ -5337,6 +5832,112 @@ class PerfSanityTestConfig:
                 raise
 
         return outputs
+
+    def run_cold_warmups(self) -> None:
+        """Start each server of the case cold, save its warmup time and stop it.
+
+        No client runs. Outputs go under ``<output_dir>/warmup`` so that they never
+        mix with a test_e2e run of the same id.
+        """
+        self._output_dir = os.path.join(self._output_dir, "warmup")
+        commands = self.get_commands()
+        device_count = get_device_count()
+        launches = []
+        for server_idx, server_cmd in enumerate(commands.server_cmds):
+            if self.runtime == GEN_ONLY_NO_CONTEXT_RUNTIME:
+                server_config = self.server_configs[server_idx][1]
+                server_cmd = server_cmd[0]
+                server_env = {**server_config.to_env(), GEN_ONLY_NO_CONTEXT_ENV: "1"}
+                server_name = "GEN_0"
+            else:
+                server_config = self.server_configs[server_idx]
+                server_env = server_config.to_env()
+                server_name = AGGREGATE_SERVER_NAME
+            if is_multi_node_case(self.runtime, server_config):
+                raise ValueError(
+                    f"test_warmup runs single-node servers only; {server_config.name} uses "
+                    f"{server_config.gpus} GPUs at {server_config.gpus_per_node} per node."
+                )
+            if server_config.gpus > device_count:
+                pytest.skip(
+                    f"{server_config.name} needs {server_config.gpus} GPUs; this node has "
+                    f"{device_count}."
+                )
+            model_dirs = [server_config.model_path]
+            if server_config.speculative_model:
+                model_dirs.append(os.path.join(llm_models_root(), server_config.speculative_model))
+            launches.append(
+                (
+                    server_cmd,
+                    server_env,
+                    model_dirs,
+                    getattr(server_config, "num_serve_frontends", 1) or 1,
+                    server_name,
+                    server_idx,
+                )
+            )
+        for server_cmd, server_env, model_dirs, num_frontends, server_name, server_idx in launches:
+            run_cold_warmup(
+                server_cmd,
+                server_env,
+                model_dirs,
+                num_frontends,
+                self.test_output_dir,
+                server_name,
+                server_idx,
+            )
+
+    def upload_warmup_results_to_database(self) -> None:
+        """Upload one row per server with its cold-start warmup time.
+
+        A row is named ``<server>-warmup`` and carries ``b_warmup_only``, so that it
+        never shares a series with the server's test_e2e rows, and it has no metric
+        that can fail the test.
+        """
+        new_data_dict = {}
+        for server_idx, server_config in enumerate(self.server_configs):
+            if self.runtime == GEN_ONLY_NO_CONTEXT_RUNTIME:
+                _, gen_config, disagg_config = server_config
+                warmup_times = warmup_time_fields(self.test_output_dir, server_idx, ["GEN_0"])
+                new_data = {
+                    "s_gpu_type": self.gpu_type,
+                    "s_runtime": self.runtime,
+                    "s_benchmark_mode": disagg_config.benchmark_mode,
+                    "s_server_env_var": disagg_config.server_env_var,
+                    "l_num_ctx_servers": 0,
+                    "l_num_gen_servers": 1,
+                    **{
+                        f"{key[:2]}gen_{key[2:]}": value
+                        for key, value in gen_config.to_db_data().items()
+                    },
+                    "s_test_case_name": f"{disagg_config.name}-warmup",
+                }
+            else:
+                warmup_times = warmup_time_fields(
+                    self.test_output_dir, server_idx, [AGGREGATE_SERVER_NAME]
+                )
+                new_data = {
+                    "s_gpu_type": self.gpu_type,
+                    "s_runtime": "aggr_server",
+                    **server_config.to_db_data(),
+                    "s_test_case_name": f"{server_config.name}-warmup",
+                }
+            if warmup_times:
+                new_data_dict[server_idx] = {**new_data, **warmup_times, "b_warmup_only": True}
+
+        process_and_upload_test_results(
+            new_data_dict=new_data_dict,
+            match_keys=get_test_case_match_keys(),
+            maximize_metrics=MAXIMIZE_METRICS,
+            minimize_metrics=MINIMIZE_METRICS,
+            regression_metrics=[],
+            extra_fields={
+                "s_stage_name": os.environ.get("stageName", ""),
+                "s_test_list": self._test_param_labels,
+            },
+            upload_to_db=self.upload_to_db,
+            fail_on_regression=False,
+        )
 
     def get_perf_result(self, outputs: Dict[int, List[str]]):
         """Parse performance results from outputs."""
@@ -5536,6 +6137,11 @@ class PerfSanityTestConfig:
                 server_config_dict = server_config.to_db_data()
                 server_perf_results = self._perf_results.get(server_idx, [])
                 startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
+                warmup_times = (
+                    warmup_time_fields(self.test_output_dir, server_idx, [AGGREGATE_SERVER_NAME])
+                    if is_multi_node_case(self.runtime, server_config)
+                    else {}
+                )
                 startup_primary_row_pending = True
                 # Skip if server failed
                 if len(server_perf_results) != len(client_configs):
@@ -5591,6 +6197,7 @@ class PerfSanityTestConfig:
                         server_config.checkpoint_io_experiment,
                         expected_server_count=1,
                     )
+                    new_data.update(warmup_times)
 
                     new_data_dict[cmd_idx] = new_data
                     startup_primary_row_pending = False
@@ -5613,6 +6220,16 @@ class PerfSanityTestConfig:
                 client_configs = self.server_client_configs[server_idx]
                 server_perf_results = self._perf_results.get(server_idx, [])
                 startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
+                warmup_times = (
+                    warmup_time_fields(
+                        self.test_output_dir,
+                        server_idx,
+                        [f"CTX_{i}" for i in range(disagg_config.num_ctx_servers)]
+                        + [f"GEN_{i}" for i in range(disagg_config.num_gen_servers)],
+                    )
+                    if is_multi_node_case(self.runtime, gen_config)
+                    else {}
+                )
                 startup_primary_row_pending = True
                 # Skip if server failed
                 if len(server_perf_results) != len(client_configs):
@@ -5688,6 +6305,7 @@ class PerfSanityTestConfig:
                         role="gen",
                         expected_server_count=num_gen_servers,
                     )
+                    new_data.update(warmup_times)
 
                     new_data_dict[cmd_idx] = new_data
                     startup_primary_row_pending = False
@@ -5889,3 +6507,23 @@ def test_e2e(output_dir, perf_sanity_test_case):
 
     # Upload results to database
     config.upload_test_results_to_database()
+
+
+#: The ids of the aggregated launch path: an aggregated server, ctx_only and
+#: gen_only_no_context.
+WARMUP_TEST_CASES = [
+    case for case in PERF_SANITY_TEST_CASES if case.split("-")[0] in AGG_TEST_TYPES
+]
+
+
+@pytest.mark.parametrize("perf_sanity_test_case", WARMUP_TEST_CASES)
+def test_warmup(output_dir, perf_sanity_test_case):
+    """Upload each single-node server's cold-start warmup time; no benchmark client runs.
+
+    test_e2e uploads warmup time for multi-node cases only (is_multi_node_case):
+    in a single-node stage it would reuse the caches of the cases before it.
+    """
+    config = PerfSanityTestConfig(perf_sanity_test_case, output_dir)
+    config.parse_config_file()
+    config.run_cold_warmups()
+    config.upload_warmup_results_to_database()

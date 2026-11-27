@@ -42,11 +42,12 @@ def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
 
 
 @triton.jit
-def _embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings,
+def _embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings, scale,
                              H: tl.constexpr, BLOCK: tl.constexpr,
-                             PDL: tl.constexpr):
-    """out[t] = weight[ids[t]] for ids in [0, num_embeddings), zeros otherwise (flashinfer's rejection sampler
-    pads with -1): the non-parallel masked lookup's values in one launch per call."""
+                             SCALE: tl.constexpr, PDL: tl.constexpr):
+    """out[t] = weight[ids[t]] (times ``scale`` if SCALE) for ids in [0, num_embeddings), zeros otherwise
+    (flashinfer's rejection sampler pads with -1): the non-parallel masked lookup's values in one launch per
+    call."""
     t = tl.program_id(0)
     if PDL:
         gdc_wait_with_memory_clobber()
@@ -57,6 +58,8 @@ def _embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings,
         offs = h0 + tl.arange(0, BLOCK)
         m = offs < H
         v = tl.load(w_ptr + row * H + offs, mask=m & ok, other=0.0)
+        if SCALE:
+            v = (v.to(tl.float32) * scale).to(out_ptr.dtype.element_ty)
         tl.store(out_ptr + t.to(tl.int64) * H + offs, v, mask=m)
     if PDL:
         # PDL rule: release the dependents only after a CTA barrier that follows the last global access (the ids
@@ -65,8 +68,13 @@ def _embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings,
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def embedding_gather(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """One-launch lookup of a full (non-parallel) table, bitwise the masked F.embedding path."""
+def embedding_gather(input: torch.Tensor,
+                     weight: torch.Tensor,
+                     scale: Optional[float] = None) -> torch.Tensor:
+    """One-launch lookup of a full (non-parallel) table, bitwise the masked F.embedding path.
+
+    A ``scale`` (a value exactly representable in the table dtype) multiplies the rows as ``lookup * scale``
+    by a 0-dim tensor of that dtype does: an fp32 product rounded to the table dtype."""
     ids = input.reshape(-1)
     if not ids.is_contiguous():
         ids = ids.contiguous()
@@ -76,17 +84,20 @@ def embedding_gather(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
                       device=weight.device)
     if ids.numel() > 0:
         from ..flashinfer_utils import get_env_enable_pdl
-        pdl = get_env_enable_pdl()
+        pdl = get_env_enable_pdl() and get_sm_version() >= 90
         block = min(triton.next_power_of_2(hidden), 8192)
-        _embedding_gather_kernel[(ids.numel(), )](ids,
-                                                  weight,
-                                                  out,
-                                                  num_embeddings,
-                                                  H=hidden,
-                                                  BLOCK=block,
-                                                  PDL=pdl,
-                                                  num_warps=4,
-                                                  launch_pdl=pdl)
+        _embedding_gather_kernel[(ids.numel(), )](
+            ids,
+            weight,
+            out,
+            num_embeddings,
+            1.0 if scale is None else float(scale),
+            H=hidden,
+            BLOCK=block,
+            SCALE=scale is not None,
+            PDL=pdl,
+            num_warps=4,
+            launch_pdl=pdl)
     return out.view(*input.shape, hidden)
 
 

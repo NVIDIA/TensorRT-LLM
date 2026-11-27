@@ -13,6 +13,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.custom_ops.mxfp8_gemm import MXFP8_DEFAULT_BACKENDS
 from tensorrt_llm._torch.distributed import AllReduceStrategy
 from tensorrt_llm._torch.modules.linear import (
     _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE,
@@ -60,6 +61,13 @@ def _lowm_tiles(n: int, rows: int) -> int:
     if rows >= _LOWM_TWO_TILE_MIN_ROWS and n % (8 * _LOWM_QUERY_TILES) == 0:
         return _LOWM_QUERY_TILES
     return 1
+
+
+def _lowm_query_mma_options(weight: torch.Tensor, rows: int) -> tuple[bool, bool] | None:
+    """Use BF16 dequantization for the small SM107 QAKV and Q-B projections."""
+    if get_sm_version() == 107 and 0 < rows <= 8 and weight.shape in ((1792, 5120), (4096, 1280)):
+        return True, False
+    return None
 
 
 # Per (device, stream): the fused context kernel's O-A input buffers, grown to the largest forward.
@@ -339,6 +347,15 @@ class DeepseekV41Attention(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             allreduce_strategy=allreduce_strategy,
+            mxfp8_allowed_backends=(
+                [*MXFP8_DEFAULT_BACKENDS, "cutedsl_sm107"]
+                if projection_quantization == "mxfp8"
+                and get_sm_version() == 107
+                and mapping.tp_size == 1
+                and hidden_size == 5120
+                and num_groups * o_lora_rank == 8192
+                else None
+            ),
         )
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope, head_dim=rope_head_dim, is_neox=pos_embd_params.is_neox
@@ -532,6 +549,7 @@ class DeepseekV41Attention(nn.Module):
                 split_n=self.wq_a.weight.shape[0],
                 scale_swizzled=True,
                 n_tiles=_lowm_tiles(self._fused_qkv_weight.shape[0], hidden_states.shape[0]),
+                mma_options=_lowm_query_mma_options(self._fused_qkv_weight, hidden_states.shape[0]),
             )
             return self._project_decode_query(
                 latent, swa, query_stream, late_stream=late_stream, fp8_query=fp8_query
@@ -828,6 +846,7 @@ class DeepseekV41Attention(nn.Module):
                         (self.q_norm.weight, self.q_norm.variance_epsilon) if norm_in_q_b else None
                     ),
                     n_tiles=_lowm_tiles(self.wq_b.weight.shape[0], latent.shape[0]),
+                    mma_options=_lowm_query_mma_options(self.wq_b.weight, latent.shape[0]),
                 )
             elif fused:
                 q = mxfp8_query_gemm(
@@ -1548,11 +1567,25 @@ class DeepseekV41Attention(nn.Module):
             and self.layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX)
         )
         weights_stream = None
+        index_ready = None
         if overlap:
             if self.aux_stream.device != hidden_states.device:
                 raise ValueError("CSA2 auxiliary stream must use the input CUDA device")
             attn_metadata.resolve_swa_slots()
             self._prepare_start.record()
+            indexer = getattr(self.backend, "indexer", None)
+            if (
+                self.layer.mode == CSA2Mode.REINDEX
+                and attn_metadata.num_ctx_tokens == 0
+                and indexer is not None
+                and indexer.prefetches_candidates(attn_metadata, hidden_states.shape[0])
+            ):
+                # The published candidates' index rows go to L2 while this layer projects.
+                with torch.cuda.stream(csa2_side_stream(hidden_states.device, 1)):
+                    self._prepare_start.wait()
+                    indexer.prefetch_candidate_pages(attn_metadata)
+                    self._descriptors_done.record()
+                index_ready = self._descriptors_done
             if (
                 self.layer.mode == CSA2Mode.FULL
                 and global_source is not None
@@ -1562,7 +1595,7 @@ class DeepseekV41Attention(nn.Module):
                 # nor the compressor's rows: in forwards without context tokens, derive them on
                 # two more side streams next to the compression chain.
                 weights_stream = csa2_side_stream(hidden_states.device)
-                indexer = getattr(self.backend, "indexer", None)
+                index_ready = self._weights_done
                 descriptor_stream = None
                 if indexer is not None:
                     descriptor_stream = csa2_side_stream(hidden_states.device, 1)
@@ -1812,7 +1845,7 @@ class DeepseekV41Attention(nn.Module):
             swa_transform=swa_transform,
             main_transform=main_transform,
             index_transform=index_transform,
-            index_ready=self._weights_done if weights_stream is not None else None,
+            index_ready=index_ready,
             output_position_ids=positions if inverse_rope_applied else None,
             output_rotary_cos_sin=self.inverse_rotary_emb.rotary_cos_sin
             if inverse_rope_applied

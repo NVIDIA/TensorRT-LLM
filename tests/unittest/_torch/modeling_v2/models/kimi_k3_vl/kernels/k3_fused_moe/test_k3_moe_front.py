@@ -15,7 +15,7 @@
 """trtllm::k3_moe_front (the Kimi K3 MoE front: sharded head GEMV, head all-gather, top-16 routing, MXFP8 latent,
 shared gate_up + SiTU), alone on random input and followed by trtllm::k3_moe through a head_flags K3MoeLayer (k3_moe
 acquires the ready words the front publishes with ag_ready), one process per GPU over the TP group of this run, over
-one K3MoeHeadWorkspace shared by fabric handle (the catalog entry's matrix runs POSIX handles, exact payloads, the
+one K3MoeHeadWorkspace shared by fabric handle (the op's matrix runs POSIX handles, exact payloads, the
 fused head_flags handoff, capture and the refusals). The head is sharded over the group
 (TP W: 3584 / W latent + 896 / W router rows and 2 x 6144 / W shared rows per rank; W = 4 on one GB200 tray, the
 model's TP16 shapes with 16 processes); the routed experts are one rank of experts TP4 x EP4 (224 local experts,
@@ -149,12 +149,8 @@ def _context(with_experts):
     gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % gpus)
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        front_op,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op as moe_op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import front_op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op as moe_op
     from tensorrt_llm._torch.modules import situ  # noqa: F401  (registers trtllm::situ_and_mul)
     from tensorrt_llm.mapping import Mapping
 
@@ -183,9 +179,7 @@ def _context(with_experts):
 def _layer(ctx, num_ctas):
     """This rank's experts as a layer of a new K3MoeState, the head_flags build; ``num_ctas`` caps k3_moe's persistent
     grid."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op as moe_op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op as moe_op
 
     p = ctx.experts
     state = moe_op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL, head_flags=True,
@@ -335,9 +329,7 @@ _QUANT_HOLD = (
 
 def _held_front(tmp_dir):
     """k3_moe_front.py with _QUANT_HOLD before the role CTAs' flags read, loaded from a file as a sibling module."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        front_op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import front_op
 
     with open(os.path.join(os.path.dirname(front_op.__file__), "k3_moe_front.py")) as f:
         src = f.read()
@@ -364,9 +356,7 @@ def check_publish_order(ctx, num_ctas=None):
     warm-up call, from epoch 0, calls at M 1, 8, 3; per call: no word the call polls already holds its epoch + 1 (else
     the call is not run), afterwards the epoch and every ready word at the next call's epoch, the head buffers empty,
     rank 1's y all zeros."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        front_op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import front_op
 
     flags, ready = ctx.ws.flags, ctx.ws.ready
     idle = 1

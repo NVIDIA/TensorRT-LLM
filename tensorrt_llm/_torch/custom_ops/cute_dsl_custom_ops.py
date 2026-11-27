@@ -22,6 +22,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE,
                               reserved_max_active_clusters, sm_reserve)
 from ..locality_domain.autotune import tune_locality_domain_concurrent
@@ -34,9 +35,7 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      infer_output_m_shape, is_gated_activation,
                      last_positive_power_of_2, mxfp8_scale_infer_shape,
                      next_positive_power_of_2)
-from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
-                                        nvmmh_enabled_for_nvfp4, nvmmh_fields,
-                                        nvmmh_max_tactics, rank_configs)
+from . import cutedsl_matmul_heuristics as cutedsl_nvmmh
 from .fast_custom_op import fast_custom_op
 
 try:
@@ -725,6 +724,60 @@ def _launchable_raster_order(
     return raster_order
 
 
+def _nvmmh_tactic_space_key() -> Optional[Tuple]:
+    """Profiling-cache discriminator of nvMMH-guided tactic lists."""
+    config = AutoTuner.get().nvmmh_config
+    if config is None or not cutedsl_nvmmh.IS_NVMMH_AVAILABLE:
+        return None
+    return ("nvmmh", cutedsl_nvmmh.library_version(), config.max_tactics)
+
+
+def _merge_nvmmh_rankings(rankings: List[List[Tuple]]) -> List[Tuple]:
+    """Merge per-orientation nvMMH rankings of (config, tactics) pairs.
+
+    Each ranking keeps nvMMH's own order; across rankings (plain and A/B
+    swapped problems) the next pick is the head with the lowest nvMMH ranking
+    score.
+    """
+    heads = [0] * len(rankings)
+    merged = []
+    while True:
+        best = None
+        for i, ranking in enumerate(rankings):
+            if heads[i] < len(ranking) and (
+                    best is None or ranking[heads[i]][0].score
+                    < rankings[best][heads[best]][0].score):
+                best = i
+        if best is None:
+            return merged
+        merged.append(rankings[best][heads[best]])
+        heads[best] += 1
+
+
+def _log_nvmmh_fallback(runner: str, m: int, n: int, k: int,
+                        batch_size: int) -> None:
+    """Log a shape nvMMH gave no tactic for, so it runs the full sweep."""
+    logger.debug(f"CuteDSL: nvMMH returned no tactic for {runner} M={m}, "
+                 f"N={n}, K={k}, batch={batch_size}; using the full sweep.")
+    logger.info_once(
+        f"CuteDSL: nvMMH returned no tactic for some {runner} shapes, which "
+        "use the full tactic sweep; debug logging lists the shapes.",
+        key=f"nvmmh_fallback_{runner}")
+
+
+# The Blackwell block-scaled GEMM reduces split-K partials with TMA reduce-add
+# into the zeroed output and supports both rasters.
+_SM100_BLOCKSCALED_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
+    split_k_kind=cutedsl_nvmmh.SPLIT_K_IN_PLACE, supports_col_major_raster=True)
+
+# Rubin block-scaled GEMMs reduce split-K partials with TMA reduce-add into the
+# zeroed output (no workspace, no reduction launch), support both rasters and
+# launch 2-CTA clusters above two CTAs with a 2x1 fallback cluster.
+_SM107_BLOCKSCALED_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
+    split_k_kind=cutedsl_nvmmh.SPLIT_K_IN_PLACE,
+    supports_col_major_raster=True,
+    supports_fallback_cluster=True)
+
 if IS_CUTLASS_DSL_AVAILABLE:
 
     import cutlass
@@ -764,6 +817,125 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
     from ..moe.kernels.blackwell.moe_as_dense_gemm.fc1 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
+
+    def _parse_sm100_tactic(tactic):
+        """Decode an SM100 BF16 / FP8 blockwise tactic into (use_2cta_instrs,
+        mma_tiler_mn, cluster_shape_mn, raster_along, swizzle_size).
+
+        The 5-field form appends the scheduler's raster ("m" or "n") and
+        swizzle width to (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn);
+        the 3-field form rasterizes along M without swizzle. The 6-field form
+        adds the split-K factor (see _sm100_tactic_split_k).
+        """
+        if not isinstance(tactic, tuple):
+            return False, (128, 128), (1, 1), "m", 1
+        if len(tactic) >= 5:
+            return tactic[:5]
+        return (*tactic, "m", 1)
+
+    def _sm100_tactic_split_k(tactic) -> int:
+        """Split-K factor of an SM100 BF16 / FP8 blockwise tactic (1 unless
+        6 fields)."""
+        if isinstance(tactic, tuple) and len(tactic) == 6:
+            return int(tactic[5])
+        return 1
+
+    def _sm100_fp8_blockwise_mma_tiler_candidates(
+            m: int) -> List[Tuple[int, int]]:
+        """Full-sweep MMA tiles of the SM100 FP8 blockwise GEMM / BMM.
+
+        Tiles narrower than a 128-column scale block of B (N = 32, 64) put more
+        CTAs on the weight stream of decode-sized M; they are swept only there.
+        """
+        tiles = [(64, 128), (128, 128), (256, 128)]
+        if m <= 256:
+            tiles += [(tile_m, tile_n) for tile_n in (32, 64)
+                      for tile_m in (64, 128, 256)]
+        return tiles
+
+    def _sm100_split_k_candidates(n: int, k: int) -> List[int]:
+        """Full-sweep split-K factors of the SM100 dense GEMMs / BMMs whose
+        K slices reduce-add into the zeroed output.
+
+        Split-K pays off for long K with few output tiles.
+        """
+        return [1, 2, 4, 8] if k >= 4096 and n <= 512 else [1]
+
+    # SM100 BF16 and FP8 blockwise GEMMs support both rasters. The BF16 GEMM
+    # and the FP8 blockwise GEMM/BMM split K: every slice reduce-adds its
+    # partial into the zeroed output with TMA (no workspace, no reduction
+    # launch).
+    _SM100_NVMMH_BACKEND = cutedsl_nvmmh.Backend(split_k_kind="NONE",
+                                                 supports_col_major_raster=True)
+    _SM100_SPLIT_K_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
+        split_k_kind=cutedsl_nvmmh.SPLIT_K_IN_PLACE,
+        supports_col_major_raster=True)
+
+    def _sm100_nvmmh_tactics(kernel_class,
+                             ab_dtype,
+                             c_dtype,
+                             precision: str,
+                             m: int,
+                             n: int,
+                             k: int,
+                             batch_size: int,
+                             mma_tiler_n: Optional[int],
+                             cta_tile_k: int,
+                             max_tactics: int,
+                             allow_split_k: bool = False) -> List[Tuple]:
+        """SM100 BF16 / FP8 blockwise tactics of the top ``max_tactics``
+        nvMMH configs (tile, cluster, raster, swizzle and split-K from nvMMH).
+
+        Blackwell MMAs are at most 128 rows per CTA; an even nvMMH cluster M
+        means a 2-CTA MMA, whose MMA tile covers both CTAs. ``mma_tiler_n``
+        pins the kernel's tile N (None: any N the kernel implements) and
+        ``cta_tile_k`` is the kernel's fixed K tile. ``allow_split_k`` lets
+        nvMMH split K (in place) up to one K tile per slice.
+        """
+        if precision == cutedsl_nvmmh.BF16_PRECISION:
+            if c_dtype == cutlass.Float32:
+                precision = cutedsl_nvmmh.BF16_FP32_OUTPUT_PRECISION
+            elif c_dtype == cutlass.Float8E4M3FN:
+                precision = cutedsl_nvmmh.BF16_FP8_OUTPUT_PRECISION
+
+        def shape(config):
+            cta_m, cta_n, cta_k = config.cta
+            if (cta_k != cta_tile_k or cta_m not in (64, 128)
+                    or (mma_tiler_n is not None and cta_n != mma_tiler_n)
+                    or cta_n % 32 != 0 or not 32 <= cta_n <= 256
+                    or (config.split_k != 1 and
+                        (not allow_split_k
+                         or config.split_k > ceil_div(k, cta_tile_k)))
+                    or any(c not in (1, 2, 4) for c in config.cluster)):
+                return None
+            use_2cta_instrs = cutedsl_nvmmh.pairs_ctas(config)
+            mma_tiler_mn = (cta_m * (2 if use_2cta_instrs else 1), cta_n)
+            if not kernel_class.can_implement(
+                    ab_dtype, cutlass.Float32, c_dtype, use_2cta_instrs,
+                    mma_tiler_mn, config.cluster, m, n, k, batch_size, "k", "k",
+                    "n"):
+                return None
+            return use_2cta_instrs, mma_tiler_mn
+
+        configs = cutedsl_nvmmh.query(
+            cutedsl_nvmmh.Problem(m, n, k, batch_size, precision),
+            cutedsl_nvmmh.query_count(max_tactics),
+            lambda config: shape(config) is not None,
+            backend=(_SM100_SPLIT_K_NVMMH_BACKEND
+                     if allow_split_k else _SM100_NVMMH_BACKEND),
+            cache_key=(kernel_class.__name__, mma_tiler_n, str(c_dtype)))
+        ranked = []
+        for config in configs:
+            use_2cta_instrs, mma_tiler_mn = shape(config)
+            raster_along = cutedsl_nvmmh.cta_order_to_raster(config.cta_order)
+            scheduler = (() if raster_along == "m" and config.swizzle == 1
+                         and config.split_k == 1 else
+                         (raster_along, config.swizzle))
+            split_k = (config.split_k, ) if config.split_k > 1 else ()
+            ranked.append(
+                (config, [(use_2cta_instrs, mma_tiler_mn, config.cluster) +
+                          scheduler + split_k]))
+        return cutedsl_nvmmh.select_tactics(ranked, max_tactics)
 
     @functools.cache
     def _get_full_device_max_active_clusters(device_id: int, cluster_size: int,
@@ -898,6 +1070,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 f"CuteDSL: M={m}, N={n}(aligned={output_aligned}), K={real_k}(aligned=True). "
                 f"Using swap_ab={swap_ab_candidates}")
 
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if nvmmh_config is not None:
+                nvmmh_tactics = self._nvmmh_tactics(m, n, real_k,
+                                                    swap_ab_candidates,
+                                                    nvmmh_config.max_tactics)
+                if nvmmh_tactics:
+                    return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, real_k, 1)
+
             # full shamoo
             mma_tiler_mn_candidates = [
                 (128, 64),
@@ -922,6 +1103,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ]
             # prune: prefetch is beneficial only when K is large enough
             use_prefetch_candidates = [True, False]
+            # forward allocates the whole [M, N] output, so K may be split.
+            split_k_candidates = _sm100_split_k_candidates(n, real_k)
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch in itertools.product(
@@ -964,94 +1147,119 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     )):
                         continue
 
-                    valid_tactics.append(
-                        (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch))
+                    # Split-K serves grids of few output tiles, so only the
+                    # smallest cluster without prefetch splits K.
+                    splits_k = (cluster_shape_mn == (mma_tiler_mn[0] // 128, 1)
+                                and not use_prefetch)
+                    valid_tactics.extend(
+                        (mma_tiler_mn, cluster_shape_mn, swap_ab,
+                         use_prefetch) +
+                        ((1, True, split_k) if split_k > 1 else ())
+                        for split_k in (
+                            split_k_candidates if splits_k else [1]))
 
             logger.debug(
                 f"CuteDSL: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
             )
-            # Optionally rank/prune the sweep with nvMatmulHeuristics (opt-in via
-            # TRTLLM_CUTEDSL_NVMMH_ENABLE). Returns the full sweep unchanged when
-            # disabled, unconfigured, or on any failure.
-            return self._rank_prune_tactics(valid_tactics, m, n, real_k)
+            return valid_tactics
 
-        def _swap_ab_candidates(self, m, n):
-            """Deterministic swap_ab choice (not swept), constrained by C-layout
-            alignment.
+        def tactic_space_key(self):
+            return _nvmmh_tactic_space_key()
 
-            swap_ab=True maps the kernel M to the GEMM N (and vice versa), which
-            is preferred when M is small (<=128) so the kernel works on the
-            larger dimension; large M does not swap. The chosen value must still
-            satisfy the output (C) 16-byte alignment: swap_ab=False needs
-            N%8==0, swap_ab=True needs M%8==0. Falls back to the feasible value
-            if the preferred one violates alignment; returns [] if neither works.
+        # K extent of one MMA tile (FP4 A/B)
+        mma_tiler_k = 256
+
+        def _nvmmh_tactic(self, config, m: int, n: int, real_k: int,
+                          swap_ab: bool, use_prefetch: bool):
+            """Map an nvMMH config onto this kernel, or None if it cannot run it.
+
+            Blackwell block-scaled MMAs are 128 rows per CTA; an even nvMMH
+            cluster M means a 2-CTA MMA, which this kernel encodes as
+            mma_tiler_m == 256. The K tile is fixed; split-K slices take
+            balanced K-tile ranges, so any split up to the K-tile count runs.
             """
-            m_aligned = m % 8 == 0
-            n_aligned = n % 8 == 0
-            prefer_swap = m <= 128
-            if prefer_swap and m_aligned:
-                return [True]
-            if not prefer_swap and n_aligned:
-                return [False]
-            if n_aligned:
-                return [False]
-            if m_aligned:
-                return [True]
-            return []
+            cta_m, cta_n, cta_k = config.cta
+            # Cheap rejections first: can_implement prints every refusal.
+            if (cta_m != 128 or cta_k != self.mma_tiler_k
+                    or config.split_k > real_k // self.mma_tiler_k
+                    or cta_n not in (64, 128, 192, 256)
+                    or any(c not in (1, 2, 4) for c in config.cluster)):
+                return None
+            mma_tiler_mn = (256 if cutedsl_nvmmh.pairs_ctas(config) else 128,
+                            cta_n)
+            if not self._tactic_is_supported(mma_tiler_mn, config.cluster,
+                                             swap_ab, use_prefetch, m, n,
+                                             real_k):
+                return None
+            raster_along_m = cutedsl_nvmmh.cta_order_to_raster(
+                config.cta_order) == "m"
+            if config.split_k > 1:
+                return (mma_tiler_mn, config.cluster, swap_ab, use_prefetch,
+                        config.swizzle, raster_along_m, config.split_k)
+            if config.swizzle == 1 and raster_along_m:
+                return (mma_tiler_mn, config.cluster, swap_ab, use_prefetch)
+            return (mma_tiler_mn, config.cluster, swap_ab, use_prefetch,
+                    config.swizzle, raster_along_m)
 
-        @staticmethod
-        def _heuristic_to_tactic_tile(cta, cluster):
-            """Translate a nvMatmulHeuristics (cta, cluster) config to this
-            kernel's (mma_tiler_mn, cluster_shape_mn).
+        def _nvmmh_tactics(self, m: int, n: int, real_k: int,
+                           swap_ab_candidates: List[bool],
+                           max_tactics: int) -> List[Tuple]:
+            """Tactics of the top ``max_tactics`` nvMMH configs.
 
-            nvMatmulHeuristics caps the per-CTA tile M at 128 on Blackwell and
-            encodes the 2-SM (2-CTA) MMA as cluster_m == 2 (in the queried
-            kernel frame), so its effective M tile is cluster_m * cta_m. This
-            kernel instead encodes the same 2-SM op as mma_tiler_m == 256
-            (use_2cta_instrs). So a 2-CTA config (cluster_m == 2) doubles the M
-            tile while keeping the cluster; everything else passes through.
-
-            The 2-SM op additionally requires the N tile to be aligned (the
-            ``mma_n_align_requirement_2cta`` in libheuristics; 16 for NVFP4/bf16
-            output, 32 when the N tile exceeds the 256 UTCMMA max). If N is not
-            aligned it is not a valid 2-SM config, so leave it single-CTA.
+            Tile, cluster, raster and swizzle come from nvMMH; prefetch is not
+            modeled and keeps the full sweep's pruning rule.
             """
-            cta_m, cta_n = int(cta[0]), int(cta[1])
-            cluster_m, cluster_n = int(cluster[0]), int(cluster[1])
-            n_align = 32 if cta_n > 256 else 16
-            if cluster_m == 2 and cta_n % n_align == 0:
-                # 2-SM MMA along the kernel M dimension.
-                return (2 * cta_m, cta_n), (cluster_m, cluster_n)
-            return (cta_m, cta_n), (cluster_m, cluster_n)
+            rankings = []
+            for swap_ab in swap_ab_candidates:
+                kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
+                problem = cutedsl_nvmmh.Problem(
+                    kernel_m, kernel_n, real_k, 1, cutedsl_nvmmh.FP4_PRECISION,
+                    cutedsl_nvmmh.LAYOUT_COL_MAJOR_C
+                    if swap_ab else cutedsl_nvmmh.LAYOUT_ROW_MAJOR_C)
+                configs = cutedsl_nvmmh.query(
+                    problem,
+                    cutedsl_nvmmh.query_count(max_tactics),
+                    lambda config: self._nvmmh_tactic(
+                        config, m, n, real_k, swap_ab, False) is not None,
+                    backend=_SM100_BLOCKSCALED_NVMMH_BACKEND,
+                    cache_key=(self.__class__.__name__, swap_ab))
+                rankings.append([(config, [
+                    tactic for use_prefetch in (False, True)
+                    if (tactic := self._nvmmh_tactic(config, m, n, real_k,
+                                                     swap_ab, use_prefetch)
+                        ) is not None
+                ]) for config in configs])
+            return cutedsl_nvmmh.select_tactics(_merge_nvmmh_rankings(rankings),
+                                                max_tactics)
 
         @staticmethod
         def _unpack_tactic(tactic):
             """Unpack a tactic into the full knob set with back-compat defaults.
 
             The base tactic is (mma_tiler_mn, cluster_shape_mn, swap_ab,
-            use_prefetch). The heuristic path may append two tile-scheduler
-            knobs (swizzle_size, raster_along_m); older 4-tuples (and the full
-            sweep) default to the kernel's neutral values (no swizzle, M-major
-            raster). Non-tuple tactics use the default kernel tactic.
+            use_prefetch). Two tile-scheduler knobs (swizzle_size,
+            raster_along_m) and the split-K factor may follow; shorter tuples
+            default to the kernel's neutral values (no swizzle, M-major
+            raster, no split-K). Non-tuple tactics use the default tactic.
             """
             if not isinstance(tactic, (tuple, list)):
-                return (128, 128), (1, 1), False, False, 1, True
+                return (128, 128), (1, 1), False, False, 1, True, 1
             mma_tiler_mn = tactic[0]
             cluster_shape_mn = tactic[1]
             swap_ab = tactic[2]
             use_prefetch = tactic[3]
             swizzle_size = int(tactic[4]) if len(tactic) > 4 else 1
             raster_along_m = bool(tactic[5]) if len(tactic) > 5 else True
+            split_k = int(tactic[6]) if len(tactic) > 6 else 1
             return (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
-                    swizzle_size, raster_along_m)
+                    swizzle_size, raster_along_m, split_k)
 
         def _tactic_is_supported(self, mma_tiler_mn, cluster_shape_mn, swap_ab,
                                  use_prefetch, m, n, real_k) -> bool:
             """Whether the kernel can run this (tile, cluster, swap, prefetch).
 
-            Validity gate used by get_valid_tactics() (the full enumeration).
-            The nvMatmulHeuristics path does NOT call this -- it trusts the
-            model's mapped tiles and emits them directly.
+            Validity gate of the nvMatmulHeuristics path; it applies the same
+            prefetch pruning rule as the full enumeration.
             """
             sf_vec_size = 16
             if swap_ab:
@@ -1087,126 +1295,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return False
             return True
 
-        def _rank_prune_tactics(self, tactics, m, n, real_k):
-            """Rank/prune the full-sweep tactics with nvMatmulHeuristics (opt-in).
-
-            Called at the end of get_valid_tactics. A strict, re-validated subset
-            of ``tactics`` -- it never introduces a (tile, cluster, swap) the
-            kernel validator rejected. Gated by TRTLLM_CUTEDSL_NVMMH_ENABLE;
-            TRTLLM_CUTEDSL_NVMMH_FIELDS selects the model-driven knobs. When
-            "tile"/"cluster" is selected we keep only the top
-            TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS ranked (mma_tiler, cluster, swap)
-            keys (all matching prefetch variants retained); when only scheduler
-            knobs (swizzle / cta_order) are selected we sweep every tile/cluster
-            and just annotate it with the model's swizzle / raster (a safe
-            6-tuple extension -- they do not affect can_implement). Deterministic
-            swap_ab selection (small M swaps) is applied here, in the opt-in path
-            only.
-
-            Purely additive: on any failure, an empty match, or when heuristics
-            are disabled / unconfigured, returns ``tactics`` unchanged so
-            profiling never loses a valid candidate.
-            """
-            if not nvmmh_enabled_for_nvfp4() or not tactics:
-                return tactics
-            fields = nvmmh_fields()
-            if not fields:
-                return tactics
-            try:
-                max_tactics = nvmmh_max_tactics()
-                # Only prune the tile/cluster set when the model is asked to
-                # drive it; scheduler-only fields keep the full sweep.
-                prune_tile_cluster = bool(fields & {"tile", "cluster"})
-                use_swizzle = "swizzle" in fields
-                use_cta_order = "cta_order" in fields
-                emit_extended = use_swizzle or use_cta_order
-
-                # Deterministic swap orientation (opt-in only), intersected with
-                # the orientations actually present in the valid tactics.
-                valid_swaps = {t[2] for t in tactics}
-                swap_pref = [
-                    s
-                    for s in self._swap_ab_candidates(m, n) if s in valid_swaps
-                ] or list(valid_swaps)
-
-                # Build the model's ranked preference over (mma_tiler, cluster,
-                # swap) keys, plus the per-key scheduler knobs. Query enough
-                # configs to find matches within the valid candidate list.
-                query_count = max(max_tactics * 4, 16)
-                pref_rank = {}
-                pref_sched = {}
-                for swap_ab in swap_pref:
-                    kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
-                    for cfg in rank_configs(kernel_m, kernel_n, real_k,
-                                            NVFP4_PRECISION, query_count):
-                        # Map per-CTA tile + cluster to this kernel's mma_tiler /
-                        # cluster (cluster_m==2 encodes an mma_tiler_m==256 2-SM
-                        # op). Off-grid maps simply won't match the valid list.
-                        mma_tiler_mn, cluster_shape_mn = \
-                            self._heuristic_to_tactic_tile(cfg.cta, cfg.cluster)
-                        key = (mma_tiler_mn, cluster_shape_mn, swap_ab)
-                        if key in pref_rank:
-                            continue
-                        pref_rank[key] = len(pref_rank)
-                        swizzle_size = cfg.swizzle_factor if use_swizzle else 1
-                        # nvMatmulHeuristics cta_order==0 is row-major (N-major)
-                        # raster -> raster_along_m=False; !=0 -> M-major -> True.
-                        raster_along_m = ((cfg.cta_order != 0)
-                                          if use_cta_order else True)
-                        pref_sched[key] = (max(1, int(swizzle_size)),
-                                           bool(raster_along_m))
-
-                # Restrict to the top-K ranked tile/cluster keys ONLY when the
-                # model drives tile/cluster. For scheduler-only fields keep every
-                # valid tile/cluster key and just annotate it below.
-                valid_keys = {(t[0], t[1], t[2]) for t in tactics}
-                if prune_tile_cluster:
-                    matched_keys = valid_keys & pref_rank.keys()
-                    if not matched_keys:
-                        return tactics
-                    kept_keys = set(
-                        sorted(matched_keys,
-                               key=lambda kk: pref_rank[kk])[:max_tactics])
-                else:
-                    kept_keys = valid_keys
-
-                # Emit every supplied (already-valid) tactic whose key is kept,
-                # re-validating as a safety net and optionally annotating the
-                # model's swizzle / raster (neutral defaults for unranked keys).
-                selected = []
-                for t in tactics:
-                    key = (t[0], t[1], t[2])
-                    if key not in kept_keys:
-                        continue
-                    mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = t[:
-                                                                              4]
-                    if not self._tactic_is_supported(
-                            mma_tiler_mn, cluster_shape_mn, swap_ab,
-                            use_prefetch, m, n, real_k):
-                        continue
-                    if emit_extended:
-                        swizzle_size, raster_along_m = pref_sched.get(
-                            key, (1, True))
-                        selected.append(
-                            (mma_tiler_mn, cluster_shape_mn, swap_ab,
-                             use_prefetch, swizzle_size, raster_along_m))
-                    else:
-                        selected.append((mma_tiler_mn, cluster_shape_mn,
-                                         swap_ab, use_prefetch))
-
-                logger.debug(
-                    f"CuteDSL nvMatmulHeuristics: {len(tactics)} valid -> "
-                    f"{len(selected)} tactics ({len(kept_keys)} keys) for "
-                    f"M={m}, N={n}, K={real_k}; fields={sorted(fields)}")
-                return selected if selected else tactics
-            except Exception as e:  # noqa: BLE001 - must never break tuning
-                logger.warning_once(
-                    f"[nvMatmulHeuristics] NVFP4 tactic filtering failed: {e}. "
-                    f"Falling back to full tactic list.",
-                    key="nvmmh_nvfp4_filter_failure",
-                )
-                return tactics
-
         def should_profile_tactic_in_subprocess(
             self,
             custom_op: str,
@@ -1215,9 +1303,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tuning_config: TuningConfig,
             **kwargs,
         ) -> bool:
-            # get_valid_tactics emits 4 fields:
-            # (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch).
-            return isinstance(tactic, tuple) and len(tactic) == 4
+            # get_valid_tactics emits (mma_tiler_mn, cluster_shape_mn, swap_ab,
+            # use_prefetch), plus (swizzle_size, raster_along_m) for a
+            # non-default scheduler and the split-K factor.
+            return isinstance(tactic, tuple) and len(tactic) in (4, 6, 7)
 
         def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                          assumed_align: int):
@@ -1255,7 +1344,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_vec_size = 16
 
             (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
-             swizzle_size, raster_along_m) = self._unpack_tactic(tactic)
+             swizzle_size, raster_along_m,
+             split_k) = self._unpack_tactic(tactic)
 
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
@@ -1318,7 +1408,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 stream = cuda.CUstream(torch_stream.cuda_stream)
 
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                         use_prefetch, swizzle_size, raster_along_m,
+                         use_prefetch, swizzle_size, raster_along_m, split_k,
                          self.use_tvm_ffi)
             if swap_ab:
                 kernel_m = n
@@ -1388,6 +1478,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_prefetch,
                     swizzle_size,
                     raster_along_m,
+                    split_k=split_k,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -1421,6 +1512,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Split-K slices reduce-add into C through TMA; zero it on the
+            # launch stream right before the GEMM so CUDA graph replay is safe.
+            if split_k > 1:
+                c_tensor.zero_()
 
             # launch gemm kernel
             if self.use_tvm_ffi:
@@ -3295,7 +3391,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      output_dtype: torch.dtype,
                      scaling_vector_size: int = 16,
-                     use_expert_counts: bool = False):
+                     use_expert_counts: bool = False,
+                     weights_evict_first: bool = False,
+                     weights_evict_first_max_tokens: int = 0):
+            """``weights_evict_first``: load the expert weights (B / SFB) evict-first. Such a runner serves calls
+            of up to ``weights_evict_first_max_tokens`` tokens (the caller's bound; 0: unknown), and its tuning
+            covers row buckets up to that bound whatever the tuning call's rows."""
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -3312,6 +3413,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError("Expert-count scheduling requires top_k=1")
             self.fc2_n_tile_size_override = (
                 _get_cutedsl_fc2_n_tile_size_override())
+            self.weights_evict_first = weights_evict_first
+            self.weights_evict_first_max_tokens = (
+                weights_evict_first_max_tokens if weights_evict_first else 0)
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3339,6 +3443,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     "fc2_n_tile_size_override",
                     self.fc2_n_tile_size_override,
                 )
+            if self.weights_evict_first:
+                runner_id += ("weights_evict_first", )
             return runner_id
 
         def _get_default_tactic(
@@ -3403,7 +3509,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = self.unique_id()
+            """The runner's TuningConfig; an evict-first runner with a token bound tunes up to the permuted rows of
+            that bound (``tune_max_num_tokens``), so its tactics cover every call it serves."""
+            key = (self.unique_id(), self.weights_evict_first_max_tokens)
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -3439,6 +3547,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cold_l2_cache=True,
                     share_jit_builds=True,
+                    # The dynamic dimension is input 0's (permuted) rows.
+                    tune_max_num_tokens=helper.get_max_num_permuted_tokens(
+                        self.weights_evict_first_max_tokens)
+                    if self.weights_evict_first_max_tokens > 0 else None,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -3552,14 +3664,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
-            # A kernel class a subclass swaps in need not take the L2 hint.
-            weight_evict_first = (issubclass(
-                self.__class__.kernel_class,
-                Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel)
-                                  and not self.use_expert_counts
-                                  and _moe_weight_evict_first(
-                                      num_tokens, self.top_k, self.num_experts,
-                                      self.num_local_experts, self.tile_size))
+            # A kernel class a subclass swaps in need not take the L2 hint. The
+            # runner's own weights_evict_first (a model-declared token bound)
+            # adds to the shape rule.
+            weight_evict_first = (
+                issubclass(
+                    self.__class__.kernel_class,
+                    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel)
+                and (self.weights_evict_first or
+                     (not self.use_expert_counts and _moe_weight_evict_first(
+                         num_tokens, self.top_k, self.num_experts,
+                         self.num_local_experts, self.tile_size))))
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn, raster_along_m,
                          self.use_expert_counts, self.num_local_experts,
@@ -3662,7 +3777,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        weights_evict_first: bool = False,
+        weights_evict_first_max_tokens: int = 0,
     ) -> None:
+        """``weights_evict_first``: load the expert weights (B / SFB) with an L2 evict_first policy (same math).
+        ``weights_evict_first_max_tokens``: the most tokens of a call that takes ``weights_evict_first`` (the
+        caller's bound): that runner is tuned up to it, whatever the tuning call's tokens (0: up to the tuning
+        call's)."""
         tuner = AutoTuner.get()
         if expert_counts is None and expert_capacity != 0:
             raise ValueError(
@@ -3684,7 +3805,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             output_dtype,
             scaling_vector_size,
-            use_expert_counts=expert_counts is not None)
+            use_expert_counts=expert_counts is not None,
+            weights_evict_first=weights_evict_first,
+            weights_evict_first_max_tokens=weights_evict_first_max_tokens)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -3724,6 +3847,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        weights_evict_first: bool = False,
+        weights_evict_first_max_tokens: int = 0,
     ) -> None:
         num_tokens = token_final_scales.size(0)
         n = weight.size(1)
@@ -5145,11 +5270,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
+        # Profile with a cold L2 like the other CuTe DSL GEMMs: a decode-sized
+        # weight fits in L2 and would otherwise rank tactics by L2 bandwidth.
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 0, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(2, 1, fp8_scale_infer_shape), ),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self,
@@ -5162,6 +5290,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.output_dtype = output_dtype
             self.use_tvm_ffi = use_tvm_ffi
+
+        def tactic_space_key(self):
+            return _nvmmh_tactic_space_key()
 
         def get_valid_tactics(
             self,
@@ -5187,8 +5318,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # m, n
             c_major = "n"
 
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if nvmmh_config is not None:
+                # forward allocates the whole [M, N] output, so K may be
+                # split.
+                nvmmh_tactics = _sm100_nvmmh_tactics(
+                    self.__class__.kernel_class,
+                    cutlass.Float8E4M3FN,
+                    cutlass.BFloat16,
+                    cutedsl_nvmmh.FP8_PRECISION,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    None,
+                    128,
+                    nvmmh_config.max_tactics,
+                    allow_split_k=True)
+                if nvmmh_tactics:
+                    return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
+
             use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            mma_tiler_mn_candi = _sm100_fp8_blockwise_mma_tiler_candidates(m)
             cluster_shape_mn_candi = [
                 (1, 1),
                 (1, 2),
@@ -5200,8 +5352,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
+            split_k_candi = _sm100_split_k_candidates(n, k)
             return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn) +
+                (("m", 1, split_k) if split_k > 1 else ())
                 for use_2cta_instrs in use_2cta_instrs_candi
                 for mma_tiler_mn in mma_tiler_mn_candi
                 for cluster_shape_mn in cluster_shape_mn_candi
@@ -5219,7 +5373,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_major,
                     b_major,
                     c_major,
-                )
+                ) for split_k in split_k_candi
+                # Split-K serves grids of few output tiles, so only the
+                # smallest cluster M splits K.
+                if split_k == 1 or cluster_shape_mn[0] == (
+                    2 if use_2cta_instrs else 1)
             ]
 
         def forward(
@@ -5241,15 +5399,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Returns:
                 torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
             """
-            if isinstance(tactic, tuple):
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
-            else:
-                # fallback to default tactic
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
-                    False,
-                    (128, 128),
-                    (1, 1),
-                ]
+            (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along,
+             swizzle_size) = _parse_sm100_tactic(tactic)
+            split_k = _sm100_tactic_split_k(tactic)
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
             m, n, k = a_tensor.shape[0], b_tensor.shape[0], b_tensor.shape[1]
             sf_m = m
@@ -5296,6 +5448,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_2cta_instrs,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                raster_along,
+                swizzle_size,
+                split_k,
                 self.use_tvm_ffi,
             )
             if cache_key not in self.__class__.kernel_cache:
@@ -5335,6 +5490,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_2cta_instrs=use_2cta_instrs,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    swizzle_size=swizzle_size,
+                    raster_along_m=raster_along == "m",
+                    split_k=split_k,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -5363,6 +5521,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Split-K slices reduce-add into C through TMA; zero it on the
+            # launch stream right before the GEMM.
+            if split_k > 1:
+                c_tensor.zero_()
 
             # launch gemm kernel
             if self.use_tvm_ffi:
@@ -5467,6 +5630,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                               ConstraintSpec(
                                   4, 1,
                                   lambda input_shapes: input_shapes[0][1])),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self,
@@ -5479,6 +5643,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.output_dtype = output_dtype
             self.use_tvm_ffi = use_tvm_ffi
+
+        def tactic_space_key(self):
+            return _nvmmh_tactic_space_key()
 
         def get_valid_tactics(
             self,
@@ -5505,8 +5672,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # m, n
             c_major = "n"
 
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if nvmmh_config is not None:
+                # Split-K reduce-adds into the whole [B, M, N] output.
+                nvmmh_tactics = _sm100_nvmmh_tactics(
+                    self.__class__.kernel_class,
+                    cutlass.Float8E4M3FN,
+                    cutlass.BFloat16,
+                    cutedsl_nvmmh.FP8_PRECISION,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    None,
+                    128,
+                    nvmmh_config.max_tactics,
+                    allow_split_k=inputs[4].shape[1] == m)
+                if nvmmh_tactics:
+                    return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
+
             use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            mma_tiler_mn_candi = _sm100_fp8_blockwise_mma_tiler_candidates(m)
             cluster_shape_mn_candi = [
                 (1, 1),
                 (1, 2),
@@ -5518,8 +5705,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
+            split_k_candi = (_sm100_split_k_candidates(n, k)
+                             if inputs[4].shape[1] == m else [1])
             return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn) +
+                (("m", 1, split_k) if split_k > 1 else ())
                 for use_2cta_instrs in use_2cta_instrs_candi
                 for mma_tiler_mn in mma_tiler_mn_candi
                 for cluster_shape_mn in cluster_shape_mn_candi
@@ -5537,7 +5727,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_major,
                     b_major,
                     c_major,
-                )
+                ) for split_k in split_k_candi
+                # Split-K serves grids of few output tiles, so only the
+                # smallest cluster M splits K.
+                if split_k == 1 or cluster_shape_mn[0] == (
+                    2 if use_2cta_instrs else 1)
             ]
 
         def forward(
@@ -5559,15 +5753,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Returns:
                 torch.Tensor: Output tensor of shape (batch_size, m, n), dtype: bf16.
             """
-            if isinstance(tactic, tuple):
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
-            else:
-                # fallback to default tactic
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
-                    False,
-                    (128, 128),
-                    (1, 1),
-                ]
+            (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along,
+             swizzle_size) = _parse_sm100_tactic(tactic)
+            split_k = _sm100_tactic_split_k(tactic)
 
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor = inputs
             c_tmp = c_tensor.permute(1, 2, 0)
@@ -5615,6 +5803,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_2cta_instrs,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                raster_along,
+                swizzle_size,
+                split_k,
                 self.use_tvm_ffi,
             )
             if cache_key not in self.__class__.kernel_cache:
@@ -5655,6 +5846,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_2cta_instrs=use_2cta_instrs,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    swizzle_size=swizzle_size,
+                    raster_along_m=raster_along == "m",
+                    split_k=split_k,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -5683,6 +5877,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Split-K slices reduce-add into C through TMA; zero it on the
+            # launch stream right before the GEMM.
+            if split_k > 1:
+                c_tensor.zero_()
 
             # launch gemm kernel
             if self.use_tvm_ffi:
@@ -10233,13 +10432,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # Output element type; subclasses override (see the FP8-out runner).
         c_dtype = cutlass.BFloat16
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 1, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ), )
+        # The output's M (inputs[2] dim 1) tracks input0's bucketed M, so the
+        # profiling-cache key does not embed the raw tuning-time M (which every
+        # other runtime M would miss).
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 1, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(
+                2, 1, lambda input_shapes: input_shapes[0][1]), ),
+            use_cold_l2_cache=True,
+        )
 
         def __init__(self, use_tvm_ffi: bool = True):
             super().__init__()
             self.use_tvm_ffi = use_tvm_ffi
+
+        def tactic_space_key(self):
+            return _nvmmh_tactic_space_key()
 
         def get_valid_tactics(
             self,
@@ -10265,6 +10475,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             b_major = "k"
             # m, n
             c_major = "n"
+
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if nvmmh_config is not None:
+                nvmmh_tactics = _sm100_nvmmh_tactics(
+                    self.__class__.kernel_class, cutlass.BFloat16,
+                    self.__class__.c_dtype, cutedsl_nvmmh.BF16_PRECISION, m, n,
+                    k, batch_size, None, 64, nvmmh_config.max_tactics)
+                if nvmmh_tactics:
+                    return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
 
             use_2cta_instrs_candi = [False, True]
             mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
@@ -10317,14 +10537,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tactic: Tiling and cluster strategy, typically a tuple
                     (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
             """
-            if isinstance(tactic, tuple):
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
-            else:
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
-                    False,
-                    (128, 128),
-                    (1, 1),
-                ]
+            (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along,
+             swizzle_size) = _parse_sm100_tactic(tactic)
 
             a_tensor, b_tensor, c_tensor = inputs
 
@@ -10373,6 +10587,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_2cta_instrs,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                raster_along,
+                swizzle_size,
                 self.use_tvm_ffi,
             )
             if cache_key not in self.__class__.kernel_cache:
@@ -10399,6 +10615,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_2cta_instrs=use_2cta_instrs,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    swizzle_size=swizzle_size,
+                    raster_along=raster_along,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -10526,14 +10744,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs: List[torch.Tensor],
             tactic,
         ) -> None:
-            if isinstance(tactic, tuple):
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
-            else:
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
-                    False,
-                    (128, 128),
-                    (1, 1),
-                ]
+            (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along,
+             swizzle_size) = _parse_sm100_tactic(tactic)
             a_tensor, b_tensor, c_tensor = inputs
             batch_size, m, k = a_tensor.shape[0], a_tensor.shape[
                 1], a_tensor.shape[2]
@@ -10557,13 +10769,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              assumed_align=16)
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-            cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+            cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn,
+                         raster_along, swizzle_size)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     cutlass.Float32,  # acc_dtype
                     use_2cta_instrs=use_2cta_instrs,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    swizzle_size=swizzle_size,
+                    raster_along=raster_along,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -10652,13 +10867,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = PersistentDenseGemmKernel
         kernel_cache = dict()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ), )
+        # See CuteDSLBf16BlackwellBmmRunner.tuning_config.
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(
+                2, 0, lambda input_shapes: input_shapes[0][0]), ),
+            use_cold_l2_cache=True,
+        )
 
-        def __init__(self, use_tvm_ffi: bool = True):
+        def __init__(self,
+                     use_tvm_ffi: bool = True,
+                     output_dtype: Optional[torch.dtype] = None):
             super().__init__()
             self.use_tvm_ffi = use_tvm_ffi
+            # The best tactic and the nvMMH ranking depend on the output
+            # dtype, so unique_id() keys the profiling cache on it.
+            self.output_dtype = output_dtype
+
+        def unique_id(self):
+            return (self.use_tvm_ffi, self.output_dtype)
+
+        def tactic_space_key(self):
+            return _nvmmh_tactic_space_key()
 
         def get_valid_tactics(
             self,
@@ -10687,6 +10919,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             b_major = "k"
             c_major = "n"
 
+            # Split-K reduce-adds into the whole [M, N] output, so the output
+            # must hold exactly the M rows of A.
+            allow_split_k = inputs[2].shape[0] == m
+
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if nvmmh_config is not None:
+                nvmmh_tactics = _sm100_nvmmh_tactics(
+                    self.__class__.kernel_class, cutlass.BFloat16,
+                    c_dtype_cutlass, cutedsl_nvmmh.BF16_PRECISION, m, n, k,
+                    batch_size, None, 64, nvmmh_config.max_tactics,
+                    allow_split_k)
+                if nvmmh_tactics:
+                    return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
+
             use_2cta_instrs_candi = [False, True]
             mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
             cluster_shape_mn_candi = [
@@ -10700,8 +10947,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
+            split_k_candi = (_sm100_split_k_candidates(n, k)
+                             if allow_split_k else [1])
             return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn) +
+                (("m", 1, split_k) if split_k > 1 else ())
                 for use_2cta_instrs in use_2cta_instrs_candi
                 for mma_tiler_mn in mma_tiler_mn_candi
                 for cluster_shape_mn in cluster_shape_mn_candi
@@ -10719,7 +10969,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_major,
                     b_major,
                     c_major,
-                )
+                ) for split_k in split_k_candi
+                # Split-K serves grids of few output tiles, so only the
+                # smallest cluster M splits K.
+                if split_k == 1 or cluster_shape_mn[0] == (
+                    2 if use_2cta_instrs else 1)
             ]
 
         def forward(
@@ -10738,14 +10992,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tactic: Tiling and cluster strategy, typically a tuple
                     (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
             """
-            if isinstance(tactic, tuple):
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
-            else:
-                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
-                    False,
-                    (128, 128),
-                    (1, 1),
-                ]
+            (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along,
+             swizzle_size) = _parse_sm100_tactic(tactic)
+            split_k_slices = _sm100_tactic_split_k(tactic)
 
             a_tensor, b_tensor, c_tensor = inputs
 
@@ -10753,6 +11002,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a_tensor.shape[0], a_tensor.shape[1]
             n = b_tensor.shape[0]
             batch_size = 1
+            if split_k_slices > 1 and tuple(c_tensor.shape) != (m, n):
+                raise RuntimeError(
+                    "BF16 split-K GEMM requires an [M, N] output, got "
+                    f"output.shape={tuple(c_tensor.shape)}, expected={(m, n)}.")
 
             # Ensure inputs are contiguous
             a_tensor = a_tensor.contiguous()
@@ -10796,6 +11049,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_2cta_instrs,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                raster_along,
+                swizzle_size,
+                split_k_slices,
                 self.use_tvm_ffi,
                 c_dtype_cutlass,
             )
@@ -10823,6 +11079,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     use_2cta_instrs=use_2cta_instrs,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    swizzle_size=swizzle_size,
+                    raster_along=raster_along,
+                    split_k_slices=split_k_slices,
+                    use_direct_split_k_reduce=split_k_slices > 1,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -10845,6 +11105,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # TMA ADD accumulates the split-K slices into C; zero it on the
+            # launch stream right before the GEMM so CUDA graph replay is safe.
+            if split_k_slices > 1:
+                c_buf.zero_()
 
             # launch gemm kernel
             if self.use_tvm_ffi:
@@ -10898,7 +11163,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLBf16BlackwellGemmRunner(use_tvm_ffi=use_tvm_ffi)
+        runner = CuteDSLBf16BlackwellGemmRunner(use_tvm_ffi=use_tvm_ffi,
+                                                output_dtype=output.dtype)
 
         inputs = [input, weight, output]
 
@@ -11058,22 +11324,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
     def _parse_sm107_bf16_tactic(tactic):
         """Decode a tactic into (kernel_variant, use_2cta_instrs, mma_tiler_mn,
         preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
-        split_k_slices)."""
+        split_k_slices, raster_along, swizzle_size).
+
+        The 8-field forms append (raster_along, swizzle_size) to the base
+        ("base", 2cta, tile, cluster, max_num_ab_stage, split_k) and preferred
+        ("preferred_cluster", 2cta, tile, preferred, fallback,
+        max_num_ab_stage) tactics; shorter forms use raster "m", swizzle 1.
+        """
         if (isinstance(tactic, tuple) and len(tactic) > 0
                 and isinstance(tactic[0], str)):
             kernel_variant = tactic[0]
             if kernel_variant == "preferred_cluster":
-                _, use_2cta_instrs, mma_tiler_mn, preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage = tactic
+                (_, use_2cta_instrs, mma_tiler_mn, preferred_cluster_shape_mn,
+                 cluster_shape_mn, max_num_ab_stage, *scheduler) = tactic
+                raster_along, swizzle_size = scheduler or ("m", 1)
                 return (kernel_variant, use_2cta_instrs, mma_tiler_mn,
                         preferred_cluster_shape_mn, cluster_shape_mn,
-                        max_num_ab_stage, 1)
-            if len(tactic) == 6:
+                        max_num_ab_stage, 1, raster_along, swizzle_size)
+            raster_along, swizzle_size = "m", 1
+            if len(tactic) == 8:
+                _, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_num_ab_stage, split_k_slices, raster_along, swizzle_size = tactic
+            elif len(tactic) == 6:
                 _, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_num_ab_stage, split_k_slices = tactic
             else:
                 _, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_num_ab_stage = tactic
                 split_k_slices = 1
             return (kernel_variant, use_2cta_instrs, mma_tiler_mn, None,
-                    cluster_shape_mn, max_num_ab_stage, split_k_slices)
+                    cluster_shape_mn, max_num_ab_stage, split_k_slices,
+                    raster_along, swizzle_size)
         if isinstance(tactic, tuple):
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
         else:
@@ -11081,7 +11359,94 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_tiler_mn = (128, 128)
             cluster_shape_mn = (1, 1)
         return ("base", use_2cta_instrs, mma_tiler_mn, None, cluster_shape_mn,
-                0, 1)
+                0, 1, "m", 1)
+
+    # SM107 BF16 GEMMs reduce split-K partials with TMA reduce-add into the
+    # zeroed output (no workspace, no reduction launch) and launch 2-CTA
+    # clusters above two CTAs with a 2x1 fallback cluster.
+    _SM107_BF16_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
+        split_k_kind=cutedsl_nvmmh.SPLIT_K_IN_PLACE,
+        supports_col_major_raster=True,
+        supports_fallback_cluster=True)
+
+    def _sm107_bf16_nvmmh_shape(config, m: int, n: int, k: int, batch_size: int,
+                                c_dtype_cutlass, allow_split_k: bool):
+        """Map an nvMMH config onto the SM107 BF16 kernel, or None.
+
+        Returns (use_2cta_instrs, mma_tiler_mn). nvMMH's per-CTA tile is
+        64 or 128 rows; an even cluster M means 2-CTA MMA, whose MMA tile
+        covers both CTAs. The kernel's K tile is 64.
+        """
+        cta_m, cta_n, cta_k = config.cta
+        cluster_m, cluster_n = config.cluster
+        if (cta_k != 64 or cta_m not in (64, 128) or cta_n % 32 != 0
+                or not 32 <= cta_n <= 256 or cluster_m not in (1, 2, 4)
+                or cluster_n not in (1, 2, 4)
+                # CTA_N=256 with cluster_n=2 is an illegal memory access on SM107.
+                or (cta_n == 256 and cluster_n == 2) or
+            (config.split_k > 1 and
+             (not allow_split_k or config.split_k > ceil_div(k, 64)))):
+            return None
+        use_2cta_instrs = cutedsl_nvmmh.pairs_ctas(config)
+        mma_tiler_mn = (cta_m * (2 if use_2cta_instrs else 1), cta_n)
+        if not _bf16_cluster_m_fits(m, use_2cta_instrs, mma_tiler_mn,
+                                    config.cluster):
+            return None
+        if not _sm107_bf16_kernel_class("base").can_implement(
+                cutlass.BFloat16, cutlass.Float32, c_dtype_cutlass,
+                use_2cta_instrs, mma_tiler_mn, config.cluster, m, n, k,
+                batch_size, "k", "k", "n"):
+            return None
+        return use_2cta_instrs, mma_tiler_mn
+
+    def _sm107_bf16_nvmmh_tactics(m: int, n: int, k: int, batch_size: int,
+                                  c_dtype_cutlass, allow_split_k: bool,
+                                  max_tactics: int) -> List[Tuple]:
+        """SM107 BF16 tactics of the top ``max_tactics`` nvMMH configs.
+
+        Tile, cluster, split-K, raster, swizzle and the A/B stage count come
+        from nvMMH. A preferred cluster above two 2-CTA CTAs is also launched
+        with a 2x1 fallback cluster, which nvMMH does not model.
+        """
+        precision = (cutedsl_nvmmh.BF16_FP32_OUTPUT_PRECISION if c_dtype_cutlass
+                     == cutlass.Float32 else cutedsl_nvmmh.BF16_PRECISION)
+        configs = cutedsl_nvmmh.query(
+            cutedsl_nvmmh.Problem(m, n, k, batch_size, precision),
+            cutedsl_nvmmh.query_count(max_tactics),
+            lambda config: _sm107_bf16_nvmmh_shape(
+                config, m, n, k, batch_size, c_dtype_cutlass, allow_split_k) is
+            not None,
+            backend=_SM107_BF16_NVMMH_BACKEND,
+            cache_key=("sm107_bf16", allow_split_k))
+        fallback_cluster_shape_mn = _SM107_BF16_FALLBACK_CLUSTER_SHAPE_MN
+        ranked = []
+        for config in configs:
+            use_2cta_instrs, mma_tiler_mn = _sm107_bf16_nvmmh_shape(
+                config, m, n, k, batch_size, c_dtype_cutlass, allow_split_k)
+            max_num_ab_stage = config.stages
+            raster_along = cutedsl_nvmmh.cta_order_to_raster(config.cta_order)
+            scheduler = (() if raster_along == "m" and config.swizzle == 1 else
+                         (raster_along, config.swizzle))
+            split_k = ((config.split_k, ) if allow_split_k or scheduler else ())
+            tactics = [("base", use_2cta_instrs, mma_tiler_mn, config.cluster,
+                        max_num_ab_stage) + split_k + scheduler]
+            preferred_class = _sm107_bf16_kernel_class("preferred_cluster")
+            if (config.split_k == 1 and use_2cta_instrs
+                    and math.prod(config.cluster) > 2
+                    and _bf16_preferred_cluster_has_launchable_grid(
+                        m, n, batch_size, use_2cta_instrs, mma_tiler_mn,
+                        config.cluster, fallback_cluster_shape_mn)
+                    and preferred_class.can_implement(
+                        cutlass.BFloat16, cutlass.Float32, c_dtype_cutlass,
+                        use_2cta_instrs, mma_tiler_mn,
+                        fallback_cluster_shape_mn, m, n, k, batch_size, "k",
+                        "k", "n")):
+                tactics.append(("preferred_cluster", use_2cta_instrs,
+                                mma_tiler_mn, config.cluster,
+                                fallback_cluster_shape_mn, max_num_ab_stage) +
+                               scheduler)
+            ranked.append((config, tactics))
+        return cutedsl_nvmmh.select_tactics(ranked, max_tactics)
 
     def _sm107_bf16_gemm_kernel(kernel_variant: str,
                                 use_2cta_instrs: bool,
@@ -11089,7 +11454,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 preferred_cluster_shape_mn,
                                 cluster_shape_mn,
                                 max_num_ab_stage: int,
-                                split_k_slices: int = 1):
+                                split_k_slices: int = 1,
+                                raster_along: str = "m",
+                                swizzle_size: int = 1):
         kernel_class = _sm107_bf16_kernel_class(kernel_variant)
         if kernel_variant == "preferred_cluster":
             return kernel_class(
@@ -11098,6 +11465,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn=mma_tiler_mn,
                 preferred_cluster_shape_mn=preferred_cluster_shape_mn,
                 fallback_cluster_shape_mn=cluster_shape_mn,
+                swizzle_size=swizzle_size,
+                raster_along=raster_along,
                 max_num_ab_stage=max_num_ab_stage,
             )
         return kernel_class(
@@ -11105,6 +11474,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_2cta_instrs=use_2cta_instrs,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            swizzle_size=swizzle_size,
+            raster_along=raster_along,
             max_num_ab_stage=max_num_ab_stage,
             split_k_slices=split_k_slices,
         )
@@ -11148,9 +11519,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return []
             batch_size, m, k = inputs[0].shape
             n = inputs[1].shape[1]
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if nvmmh_config is not None:
+                nvmmh_tactics = _sm107_bf16_nvmmh_tactics(
+                    m, n, k, batch_size, cutlass.BFloat16, False,
+                    nvmmh_config.max_tactics)
+                if nvmmh_tactics:
+                    return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
             return _sm107_bf16_valid_tactics(
                 m, n, k, batch_size, cutlass.BFloat16,
                 _SM107_BF16_MMA_TILER_MN_CANDIDATES, None)
+
+        def tactic_space_key(self):
+            return _nvmmh_tactic_space_key()
 
         def forward(
             self,
@@ -11158,8 +11540,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tactic,
         ) -> None:
             (kernel_variant, use_2cta_instrs, mma_tiler_mn,
-             preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
-             _) = _parse_sm107_bf16_tactic(tactic)
+             preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage, _,
+             raster_along, swizzle_size) = _parse_sm107_bf16_tactic(tactic)
 
             a_tensor, b_tensor, c_tensor = inputs
             batch_size, m, k = a_tensor.shape
@@ -11222,6 +11604,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 preferred_cluster_shape_mn,
                 cluster_shape_mn,
                 max_num_ab_stage,
+                raster_along,
+                swizzle_size,
                 self.use_tvm_ffi,
                 c_layout_key,
                 max_active_clusters,
@@ -11242,11 +11626,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     stream = cute.runtime.make_fake_stream(
                         use_tvm_ffi_env_stream=True)
 
-                gemm = _sm107_bf16_gemm_kernel(kernel_variant, use_2cta_instrs,
+                gemm = _sm107_bf16_gemm_kernel(kernel_variant,
+                                               use_2cta_instrs,
                                                mma_tiler_mn,
                                                preferred_cluster_shape_mn,
                                                cluster_shape_mn,
-                                               max_num_ab_stage)
+                                               max_num_ab_stage,
+                                               raster_along=raster_along,
+                                               swizzle_size=swizzle_size)
                 compile_args = [
                     m, n, k, batch_size, a_ptr, b_ptr, c_cute_tensor,
                     a_stride_m, a_stride_batch, b_stride_n, b_stride_batch
@@ -11631,6 +12018,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def unique_id(self):
             return (self.use_tvm_ffi, self.output_dtype)
 
+        def tactic_space_key(self):
+            return _nvmmh_tactic_space_key()
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -11646,6 +12036,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = inputs[0].shape
             n = inputs[1].shape[0]
             c_dtype_cutlass = _TORCH_TO_CUTLASS_DTYPE[inputs[2].dtype]
+
+            nvmmh_config = AutoTuner.get().nvmmh_config
+            if nvmmh_config is not None:
+                # Split-K writes the full [M, N] output; dynamic tuning may
+                # bucket input M while leaving C at the full M.
+                nvmmh_tactics = _sm107_bf16_nvmmh_tactics(
+                    m, n, k, 1, c_dtype_cutlass, inputs[2].shape[0] == m,
+                    nvmmh_config.max_tactics)
+                if nvmmh_tactics:
+                    return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, 1)
 
             mma_tiler_mn_candi = list(_SM107_BF16_MMA_TILER_MN_CANDIDATES)
             # Skinny-M / small-N shapes under-use a 128x128 MMA tile (half the
@@ -11672,7 +12073,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> None:
             (kernel_variant, use_2cta_instrs, mma_tiler_mn,
              preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
-             split_k_slices) = _parse_sm107_bf16_tactic(tactic)
+             split_k_slices, raster_along,
+             swizzle_size) = _parse_sm107_bf16_tactic(tactic)
 
             a_tensor, b_tensor, c_tensor = inputs
             m, k = a_tensor.shape
@@ -11715,6 +12117,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_num_ab_stage,
                     split_k_slices,
                     c_dtype_cutlass,
+                    raster_along,
+                    swizzle_size,
                 )
                 if c_needs_copy:
                     c_tensor.copy_(c_buf)
@@ -11742,6 +12146,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 preferred_cluster_shape_mn,
                 cluster_shape_mn,
                 max_num_ab_stage,
+                raster_along,
+                swizzle_size,
                 self.use_tvm_ffi,
                 c_dtype_cutlass,
                 c_layout_key,
@@ -11763,11 +12169,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     stream = cute.runtime.make_fake_stream(
                         use_tvm_ffi_env_stream=True)
 
-                gemm = _sm107_bf16_gemm_kernel(kernel_variant, use_2cta_instrs,
+                gemm = _sm107_bf16_gemm_kernel(kernel_variant,
+                                               use_2cta_instrs,
                                                mma_tiler_mn,
                                                preferred_cluster_shape_mn,
                                                cluster_shape_mn,
-                                               max_num_ab_stage)
+                                               max_num_ab_stage,
+                                               raster_along=raster_along,
+                                               swizzle_size=swizzle_size)
                 compile_args = [
                     m, n, k, batch_size, a_ptr, b_ptr, c_cute_tensor
                 ]
@@ -11826,6 +12235,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_num_ab_stage: int,
             split_k_slices: int,
             c_dtype_cutlass,
+            raster_along: str = "m",
+            swizzle_size: int = 1,
         ) -> None:
             """Direct split-K: each K-slice reduce-adds into the zeroed C."""
             batch_size = 1
@@ -11839,6 +12250,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cluster_shape_mn,
                 max_num_ab_stage,
                 split_k_slices,
+                raster_along,
+                swizzle_size,
                 self.use_tvm_ffi,
                 c_dtype_cutlass,
                 c_layout_key,
@@ -11871,7 +12284,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                None,
                                                cluster_shape_mn,
                                                max_num_ab_stage,
-                                               split_k_slices=split_k_slices)
+                                               split_k_slices=split_k_slices,
+                                               raster_along=raster_along,
+                                               swizzle_size=swizzle_size)
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
                     m,
@@ -11996,14 +12411,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      accept_cap=8192,
                      num_next_n_atoms=1,
                      atom=None,
-                     row_heads=0):
+                     row_heads=0,
+                     emit_block_max=False):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
                    emit_cand_bucketed, accept_cap, num_next_n_atoms, atom,
-                   row_heads)
+                   row_heads, emit_block_max)
             if key in cls.kernel_cache:
                 return
 
@@ -12160,6 +12576,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         stride_order=(1, 0),
                         assumed_align=4)
 
+            block_max32_fake = None
+            row_visible_fake = None
+            if emit_block_max:
+                block_max32_fake = cute.runtime.make_fake_tensor(
+                    cutlass.Float32, (cute.sym_int(), cute.sym_int()),
+                    stride=(cute.sym_int64(), 1))
+                row_visible_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), ), stride_order=(0, ))
+
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -12185,6 +12610,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 emit_cand_bucketed=emit_cand_bucketed,
                 accept_cap=accept_cap,
                 row_heads=row_heads,
+                emit_block_max=emit_block_max,
             )
 
             compiled = cute.compile(
@@ -12211,6 +12637,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_ctl=cand_ctl_fake,
                 cand_idx_t=cand_idx_fake,
                 cand_cur=cand_cur_fake,
+                block_max32=block_max32_fake,
+                row_visible=row_visible_fake,
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled
@@ -12249,6 +12677,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_next_n_atoms: int = 1,
             atom: Optional[int] = None,
             row_heads: int = 0,
+            block_max32_out: Optional[torch.Tensor] = None,
+            row_visible: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -12298,7 +12728,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         or emit_cand or emit_cand_bucketed):
                     raise ValueError(
                         "Split query rows need FP32, one epilogue sub-tile, "
-                        "one atom and no emission")
+                        "one atom and no GVR emission")
             split_rows = H // row_heads if row_heads else 1
             # num_next_n_atoms / atom: in-kernel split, as in the FP8 runner.
             atom = validate_atom_split(next_n, H, num_next_n_atoms, atom,
@@ -12496,13 +12926,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_idx_out = None
                 cand_cur_out = None
 
+            # Maxima of every 32 visible logits of a row, for the CSA2 block selection.
+            emit_block_max = block_max32_out is not None
+            assert (row_visible is not None) == emit_block_max, (
+                "block maxima and the rows' visible lengths go together")
+            if emit_block_max:
+                rows = B * next_n * split_rows
+                columns = aligned_max_ctx // 32
+                block_max_ok = (not emit_block_meta
+                                and block_max32_out.dtype == torch.float32
+                                and block_max32_out.stride(1) == 1
+                                and block_max32_out.shape[0] == rows
+                                and block_max32_out.shape[1] >= columns
+                                and row_visible.dtype == torch.int32
+                                and row_visible.is_contiguous()
+                                and row_visible.numel() == rows)
+                assert block_max_ok, (
+                    "block maxima need an fp32 [rows, >= aligned ctx / 32] output "
+                    "and int32 [rows] visible lengths")
+
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
                    emit_cand_bucketed, accept_cap, num_next_n_atoms, atom,
-                   row_heads)
+                   row_heads, emit_block_max)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -12525,7 +12974,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     accept_cap=accept_cap,
                     num_next_n_atoms=num_next_n_atoms,
                     atom=atom,
-                    row_heads=row_heads)
+                    row_heads=row_heads,
+                    emit_block_max=emit_block_max)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -12534,11 +12984,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          context_lens, schedule_meta, num_phys_blocks, B,
                          block_max_out, hit_stats_out, hit_bitmap, seed_thr,
                          seed_counts_out, cand_out, cand_ctl_out, cand_idx_out,
-                         cand_cur_out)
+                         cand_cur_out, None, None)
                 return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
                      context_lens, schedule_meta, num_phys_blocks, exp_B, None,
-                     None, None, None, None, None, None, None, None)
+                     None, None, None, None, None, None, None, None,
+                     block_max32_out, row_visible)
             return logits
 
     # NOTE: the optional emission tensors ARE written by the kernel but must
@@ -12569,6 +13020,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_next_n_atoms: int = 1,
         atom: Optional[int] = None,
         row_heads: int = 0,
+        block_max32_out: Optional[torch.Tensor] = None,
+        row_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -12620,7 +13073,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cand_cur_out=cand_cur_out,
             num_next_n_atoms=num_next_n_atoms,
             atom=atom,
-            row_heads=row_heads)
+            row_heads=row_heads,
+            block_max32_out=block_max32_out,
+            row_visible=row_visible)
         # with emission on the runner returns a tuple; the op returns
         # logits only (emission buffers are caller-owned)
         return ret[0] if isinstance(ret, tuple) else ret
@@ -12649,6 +13104,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_next_n_atoms: int = 1,
         atom: Optional[int] = None,
         row_heads: int = 0,
+        block_max32_out: Optional[torch.Tensor] = None,
+        row_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]
@@ -13714,6 +14171,75 @@ if IS_CUTLASS_DSL_AVAILABLE:
             (4, 4),
         ]
 
+        def _parse_sm107_fp8_blockwise_tactic(tactic):
+            """Decode (use_2cta_instrs, mma_tiler, mma_inst_shape,
+            cluster_shape_mn[, raster_along_m, swizzle_size]); the scheduler
+            fields default to raster along M without swizzle."""
+            if not isinstance(tactic, tuple):
+                return (False, (128, 128, 128), (128, 128, 64), (1, 1), True, 1)
+            if len(tactic) == 6:
+                return tactic
+            return (*tactic, True, 1)
+
+        def _sm107_fp8_blockwise_nvmmh_tactics(
+                kernel_class,
+                m: int,
+                n: int,
+                k: int,
+                batch_size: int,
+                c_dtype,
+                max_tactics: int,
+                fp8_quantize_1x128: bool = False) -> List[Tuple]:
+            """SM107 FP8 blockwise tactics of the top ``max_tactics`` nvMMH
+            configs (tile, cluster, raster and swizzle from nvMMH).
+
+            The kernel's CTA tile is 128x128 or 256x128 (two 128-row MMAs
+            sharing B) with K=128, and an even cluster M means 2-CTA MMA. It
+            has no split-K. The fused FP8 1x128 output needs 128x128 tiles.
+            """
+
+            def shape(config):
+                cta_m, cta_n, cta_k = config.cta
+                cluster_m, cluster_n = config.cluster
+                if (cta_k != 128 or cta_n != 128 or cta_m not in (128, 256)
+                        or config.split_k != 1 or cluster_m not in (1, 2, 4)
+                        or cluster_n not in (1, 2, 4)):
+                    return None
+                use_2cta_instrs = cutedsl_nvmmh.pairs_ctas(config)
+                mma_tiler = (cta_m * (2 if use_2cta_instrs else 1), 128, 128)
+                mma_inst_shape = (256 if use_2cta_instrs else 128, 128, 64)
+                if not kernel_class.can_implement(
+                        cutlass.Float8E4M3FN, cutlass.Float8E4M3FN,
+                        cutlass.Float32, c_dtype, use_2cta_instrs, mma_tiler,
+                        mma_inst_shape, config.cluster, m, n, k, batch_size,
+                        "k", "k", "n", fp8_quantize_1x128):
+                    return None
+                return use_2cta_instrs, mma_tiler, mma_inst_shape
+
+            configs = cutedsl_nvmmh.query(
+                cutedsl_nvmmh.Problem(m, n, k, batch_size,
+                                      cutedsl_nvmmh.FP8_PRECISION),
+                cutedsl_nvmmh.query_count(max_tactics),
+                lambda config: shape(config) is not None,
+                backend=_SM107_FP8_BLOCKWISE_NVMMH_BACKEND,
+                cache_key=("sm107_fp8_blockwise", c_dtype, fp8_quantize_1x128))
+            ranked = []
+            for config in configs:
+                use_2cta_instrs, mma_tiler, mma_inst_shape = shape(config)
+                raster_along_m = cutedsl_nvmmh.cta_order_to_raster(
+                    config.cta_order) == "m"
+                scheduler = (() if raster_along_m and config.swizzle == 1 else
+                             (raster_along_m, config.swizzle))
+                ranked.append(
+                    (config, [(use_2cta_instrs, mma_tiler, mma_inst_shape,
+                               config.cluster) + scheduler]))
+            return cutedsl_nvmmh.select_tactics(ranked, max_tactics)
+
+        # The SM107 FP8 blockwise kernel has no split-K and supports both
+        # rasters.
+        _SM107_FP8_BLOCKWISE_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
+            split_k_kind="NONE", supports_col_major_raster=True)
+
         class CuteDSLFp8RubinGemmRunner(TunableRunner):
             """FP8 1x128/128x128 blockwise GEMM runner for SM107."""
 
@@ -13739,6 +14265,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.output_dtype = output_dtype
                 self.use_tvm_ffi = use_tvm_ffi
 
+            def tactic_space_key(self):
+                return _nvmmh_tactic_space_key()
+
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
@@ -13758,6 +14287,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 a_major = "k"
                 b_major = "k"
                 c_major = "n"
+
+                nvmmh_config = AutoTuner.get().nvmmh_config
+                if nvmmh_config is not None:
+                    nvmmh_tactics = _sm107_fp8_blockwise_nvmmh_tactics(
+                        self.__class__.kernel_class, m, n, k, batch_size,
+                        cutlass.BFloat16, nvmmh_config.max_tactics)
+                    if nvmmh_tactics:
+                        return nvmmh_tactics
+                    _log_nvmmh_fallback(
+                        type(self).__name__, m, n, k, batch_size)
 
                 return [(use_2cta_instrs, mma_tiler, mma_inst_shape,
                          cluster_shape_mn) for use_2cta_instrs, mma_tiler,
@@ -13787,15 +14326,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 inputs: List[torch.Tensor],
                 tactic,
             ) -> torch.Tensor:
-                if isinstance(tactic, tuple):
-                    use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn = tactic
-                else:
-                    use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn = [
-                        False,
-                        (128, 128, 128),
-                        (128, 128, 64),
-                        (1, 1),
-                    ]
+                (use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn,
+                 raster_along_m,
+                 swizzle_size) = _parse_sm107_fp8_blockwise_tactic(tactic)
                 a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
                 m, k = a_tensor.shape
                 n = b_tensor.shape[0]
@@ -13834,6 +14367,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler,
                     mma_inst_shape,
                     cluster_shape_mn,
+                    raster_along_m,
+                    swizzle_size,
                     self.use_tvm_ffi,
                 )
                 if cache_key not in self.__class__.kernel_cache:
@@ -13865,6 +14400,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         mma_tiler=mma_tiler,
                         mma_inst_shape=mma_inst_shape,
                         cluster_shape_mn=cluster_shape_mn,
+                        swizzle_size=swizzle_size,
+                        raster_along_m=raster_along_m,
                     )
                     hardware_info = cutlass.utils.HardwareInfo()
                     max_active_clusters = hardware_info.get_max_active_clusters(
@@ -13985,6 +14522,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  use_tvm_ffi=use_tvm_ffi)
                 self.fp8_quantize_1x128 = fp8_quantize_1x128
 
+            def tactic_space_key(self):
+                return _nvmmh_tactic_space_key()
+
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
@@ -13998,6 +14538,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 batch_size, m, k = inputs[0].shape
                 n = inputs[1].shape[1]
+
+                nvmmh_config = AutoTuner.get().nvmmh_config
+                if nvmmh_config is not None:
+                    nvmmh_tactics = _sm107_fp8_blockwise_nvmmh_tactics(
+                        self.__class__.kernel_class, m, n, k, batch_size,
+                        (cutlass.Float8E4M3FN
+                         if self.fp8_quantize_1x128 else cutlass.BFloat16),
+                        nvmmh_config.max_tactics, self.fp8_quantize_1x128)
+                    if nvmmh_tactics:
+                        return nvmmh_tactics
+                    _log_nvmmh_fallback(
+                        type(self).__name__, m, n, k, batch_size)
 
                 return [(use_2cta_instrs, mma_tiler, mma_inst_shape,
                          cluster_shape_mn) for use_2cta_instrs, mma_tiler,
@@ -14031,14 +14583,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tactic,
             ) -> None:
                 """Run FP8 block-scaled BMM with TRT-LLM tensor layouts."""
-                if isinstance(tactic, tuple):
-                    (use_2cta_instrs, mma_tiler, mma_inst_shape,
-                     cluster_shape_mn) = tactic
-                else:
-                    use_2cta_instrs = False
-                    mma_tiler = (128, 128, 128)
-                    mma_inst_shape = (128, 128, 64)
-                    cluster_shape_mn = (1, 1)
+                (use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn,
+                 raster_along_m,
+                 swizzle_size) = _parse_sm107_fp8_blockwise_tactic(tactic)
 
                 if self.fp8_quantize_1x128:
                     (
@@ -14110,6 +14657,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler,
                     mma_inst_shape,
                     cluster_shape_mn,
+                    raster_along_m,
+                    swizzle_size,
                     self.use_tvm_ffi,
                     self.fp8_quantize_1x128,
                 )
@@ -14151,6 +14700,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         mma_inst_shape=mma_inst_shape,
                         cluster_shape_mn=cluster_shape_mn,
                         fp8_quantize_1x128=self.fp8_quantize_1x128,
+                        swizzle_size=swizzle_size,
+                        raster_along_m=raster_along_m,
                     )
                     hardware_info = cutlass.utils.HardwareInfo()
                     max_active_clusters = hardware_info.get_max_active_clusters(
@@ -14403,6 +14954,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_class = Sm107BlockScaledPersistentDenseGemmKernel
             kernel_cache: ClassVar[dict]
             gemm_name: ClassVar[str]
+            nvmmh_precision: ClassVar[str]
             a_dtype: ClassVar[type]
             b_dtype: ClassVar[type]
             sf_dtype: ClassVar[type]
@@ -14423,6 +14975,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
                                                             ...]] = ("static", )
             split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            split_k_fp32_partials: ClassVar[bool] = False
+            max_split_k_workspace_bytes: ClassVar[int] = 64 * 1024 * 1024
+            split_k_reduction_cache: ClassVar[dict] = {}
             # Whether an output_tensor without partition_id is a plain in-place
             # GEMM. Otherwise a missing partition_id is rejected.
             allow_unpartitioned_output: ClassVar[bool] = False
@@ -14449,6 +15004,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # run (or the reverse).  Unpinned runs keep the old key.
                 base = (self.output_dtype, self.to_userbuffers,
                         self.use_tvm_ffi)
+                if self.split_k_fp32_partials:
+                    base += ("fp32_split_k_partials", self.split_k_candidates)
                 override = _dense_gemm_scheduler_override()
                 return base if override is None else base + (override, )
 
@@ -14459,6 +15016,163 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if not isinstance(other, self.__class__):
                     return False
                 return self.unique_id() == other.unique_id()
+
+            def tactic_space_key(self):
+                return _nvmmh_tactic_space_key()
+
+            def _exceeds_split_k_workspace(self, m: int, n: int,
+                                           split_k: int) -> bool:
+                return (self.split_k_fp32_partials and split_k > 1 and
+                        m * n * split_k * 4 > self.max_split_k_workspace_bytes)
+
+            def _nvmmh_kernel_shapes(self, config, kernel_m: int, kernel_n: int,
+                                     real_k: int, swap_ab: bool):
+                """Map an nvMMH config onto this kernel, or None if it cannot run it.
+
+                nvMMH's per-CTA tile M is 128, or 256 for B-reuse (two
+                128-row MMAs per CTA); an even cluster M means 2-CTA MMA.
+                """
+                cta_m, cta_n, cta_k = config.cta
+                cluster_m, cluster_n = config.cluster
+                # Cheap rejections first: can_implement prints every refusal.
+                if (cta_k != self.mma_tiler_k or cta_m not in (128, 256)
+                        or cta_n not in (64, 128, 192, 256)
+                        or cluster_m not in (1, 2, 4)
+                        or cluster_n not in (1, 2, 4)
+                        or real_k % self.mma_tiler_k != 0
+                        or self._exceeds_split_k_workspace(
+                            kernel_m, kernel_n, config.split_k)
+                        or config.split_k > real_k // self.mma_tiler_k
+                        or -(-kernel_m // cta_m) < cluster_m):
+                    return None
+                use_2cta = cutedsl_nvmmh.pairs_ctas(config)
+                mma_tiler_mnk = (cta_m * (2 if use_2cta else 1), cta_n,
+                                 self.mma_tiler_k)
+                mma_inst_shape = (256 if use_2cta else 128, cta_n,
+                                  self.mma_inst_shape_k)
+                if not self.__class__.kernel_class.can_implement(
+                    (kernel_m, kernel_n, real_k, 1),
+                        self.a_dtype,
+                        self.b_dtype,
+                        self.sf_dtype,
+                        cutlass.Float32 if self.split_k_fp32_partials
+                        and config.split_k > 1 else cutlass.BFloat16,
+                        "k",
+                        "k",
+                        "m" if swap_ab else "n",
+                        self.sf_vec_size,
+                        mma_tiler_mnk,
+                        mma_inst_shape,
+                        config.cluster,
+                        config.split_k,
+                ):
+                    return None
+                return mma_tiler_mnk, mma_inst_shape
+
+            def _nvmmh_realizations(self, config, kernel_m: int, kernel_n: int,
+                                    real_k: int, swap_ab: bool) -> List[Tuple]:
+                """Tactics realizing one nvMMH config.
+
+                Tile, cluster, split-K, raster and swizzle come from nvMMH.
+                Prefetch, the scheduler and the preferred/fallback cluster
+                launch (a preferred cluster above two CTAs with a 2x1
+                fallback) are not modeled by nvMMH and are swept.
+                """
+                shapes = self._nvmmh_kernel_shapes(config, kernel_m, kernel_n,
+                                                   real_k, swap_ab)
+                if shapes is None:
+                    return []
+                mma_tiler_mnk, mma_inst_shape = shapes
+                use_2cta = mma_inst_shape[0] == 256
+                cluster_shape_mn = config.cluster
+                split_k = config.split_k
+                swizzle_size = config.swizzle
+                raster_order = cutedsl_nvmmh.cta_order_to_raster(
+                    config.cta_order)
+                swizzle_suffix = (swizzle_size, ) if swizzle_size > 1 else ()
+                tactics = []
+                for use_prefetch, scheduler_mode in itertools.product(
+                    (False, True),
+                        _dense_gemm_scheduler_modes(
+                            self.scheduler_mode_candidates)):
+                    if (scheduler_mode == "clc_dynamic" and raster_order == "n"
+                            and not _clc_raster_n_has_launchable_grid(
+                                kernel_m, kernel_n, split_k, mma_tiler_mnk[:2],
+                                use_2cta, cluster_shape_mn)):
+                        continue
+                    tactics.append(("base", mma_tiler_mnk, mma_inst_shape,
+                                    cluster_shape_mn, swap_ab, use_prefetch,
+                                    scheduler_mode, raster_order, split_k) +
+                                   swizzle_suffix)
+                fallback_cluster_shape_mn = (2, 1)
+                if (split_k == 1 and use_2cta
+                        and math.prod(cluster_shape_mn) > 2 and
+                        Sm107BlockScaledPersistentDenseGemmMixedClustersKernel.
+                        can_implement(
+                            (kernel_m, kernel_n, real_k, 1),
+                            self.a_dtype,
+                            self.b_dtype,
+                            self.sf_dtype,
+                            cutlass.BFloat16,
+                            "k",
+                            "k",
+                            "m" if swap_ab else "n",
+                            self.sf_vec_size,
+                            mma_tiler_mnk,
+                            mma_inst_shape,
+                            cluster_shape_mn,
+                            fallback_cluster_shape_mn,
+                        )):
+                    for use_prefetch, scheduler_mode in itertools.product(
+                        (False, True),
+                            _dense_gemm_scheduler_modes(
+                                self.mixed_scheduler_mode_candidates)):
+                        # CLC mixed clusters only launch with raster M.
+                        if scheduler_mode == "clc_dynamic" and raster_order != "m":
+                            continue
+                        scheduler = ((scheduler_mode, )
+                                     if self.mixed_scheduler_mode_candidates
+                                     != ("static", ) or swizzle_suffix else ())
+                        tactics.append(("mixed_clusters", mma_tiler_mnk,
+                                        mma_inst_shape, cluster_shape_mn,
+                                        fallback_cluster_shape_mn, swap_ab,
+                                        use_prefetch) + scheduler +
+                                       (raster_order, ) + swizzle_suffix)
+                return tactics
+
+            def _nvmmh_tactics(self, m: int, n: int, real_k: int,
+                               swap_ab_candidates: List[bool],
+                               max_tactics: int) -> List[Tuple]:
+                """Tactics of the top ``max_tactics`` nvMMH configs."""
+                backend = _SM107_BLOCKSCALED_NVMMH_BACKEND
+                if self.split_k_fp32_partials:
+                    backend = replace(
+                        backend,
+                        split_k_kind=cutedsl_nvmmh.SPLIT_K_OUT_OF_PLACE)
+                rankings = []
+                for swap_ab in swap_ab_candidates:
+                    kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
+                    problem = cutedsl_nvmmh.Problem(
+                        kernel_m, kernel_n, real_k, 1, self.nvmmh_precision,
+                        cutedsl_nvmmh.LAYOUT_COL_MAJOR_C
+                        if swap_ab else cutedsl_nvmmh.LAYOUT_ROW_MAJOR_C)
+                    configs = cutedsl_nvmmh.query(
+                        problem,
+                        cutedsl_nvmmh.query_count(max_tactics),
+                        lambda config: self._nvmmh_kernel_shapes(
+                            config, kernel_m, kernel_n, real_k, swap_ab
+                        ) is not None,
+                        backend=backend,
+                        cache_key=(self.__class__.kernel_class.__name__,
+                                   self.mma_tiler_k, swap_ab))
+                    rankings.append([
+                        (config,
+                         self._nvmmh_realizations(config, kernel_m, kernel_n,
+                                                  real_k, swap_ab))
+                        for config in configs
+                    ])
+                return cutedsl_nvmmh.select_tactics(
+                    _merge_nvmmh_rankings(rankings), max_tactics)
 
             def get_valid_tactics(
                 self,
@@ -14529,6 +15243,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"Using base swap_ab={base_swap_ab_candidates}, "
                     f"mixed-cluster swap_ab={mixed_swap_ab_candidates}")
 
+                nvmmh_config = AutoTuner.get().nvmmh_config
+                if nvmmh_config is not None:
+                    # nvMMH ranks both A/B orientations; it decides which one
+                    # each kernel config runs in.
+                    nvmmh_tactics = self._nvmmh_tactics(
+                        m, n, real_k, [False, True], nvmmh_config.max_tactics)
+                    if nvmmh_tactics:
+                        return nvmmh_tactics
+                    _log_nvmmh_fallback(type(self).__name__, m, n, real_k, 1)
+
                 # SM107 dense block-scaled tile sizes.
                 # b-reuse is enabled when mma_tiler_m = 2 * mma_inst_shape_m
                 mma_tiler_k = self.mma_tiler_k
@@ -14585,12 +15309,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         kernel_n = n
 
                     for split_k in self.split_k_candidates:
+                        if self._exceeds_split_k_workspace(m, n, split_k):
+                            continue
+                        fp32_partials = self.split_k_fp32_partials and split_k > 1
                         if self.__class__.kernel_class.can_implement(
                             (kernel_m, kernel_n, real_k, batch_size),
                                 self.a_dtype,
                                 self.b_dtype,
                                 self.sf_dtype,
-                                cutlass.BFloat16,
+                                cutlass.Float32
+                                if fp32_partials else cutlass.BFloat16,
                                 a_major,
                                 b_major,
                                 c_major,
@@ -14730,16 +15458,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 """
                 sf_vec_size = self.sf_vec_size
                 split_k = 1
+                swizzle_size = 1
 
                 if (isinstance(tactic, tuple) and len(tactic) > 0
                         and isinstance(tactic[0], str)):
                     kernel_variant = tactic[0]
                     if kernel_variant == "mixed_clusters":
-                        if len(tactic) not in {7, 8, 9}:
+                        if len(tactic) not in {7, 8, 9, 10}:
                             raise ValueError(
                                 "CuteDSL SM107 mixed-cluster tactics must use "
                                 "Boolean use_prefetch with optional scheduler "
-                                "mode and raster order")
+                                "mode, raster order and swizzle size")
                         (_, mma_tiler_mnk, mma_inst_shape,
                          preferred_cluster_shape_mn, cluster_shape_mn, swap_ab,
                          use_prefetch, *tuning_options) = tactic
@@ -14755,14 +15484,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 raster_order = "m"
                             else:
                                 raster_order = tuning_options[0]
-                        else:
+                        elif len(tuning_options) == 2:
                             scheduler_mode, raster_order = tuning_options
+                        else:
+                            scheduler_mode, raster_order, swizzle_size = tuning_options
                     else:
-                        if len(tactic) not in {6, 7, 8, 9}:
+                        if len(tactic) not in {6, 7, 8, 9, 10}:
                             raise ValueError(
                                 "CuteDSL SM107 base tactics must use Boolean "
                                 "use_prefetch with an optional scheduler mode "
-                                "and raster order, followed by split_k")
+                                "and raster order, followed by split_k and "
+                                "swizzle size")
                         (_, mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
                          swap_ab, use_prefetch, *tuning_options) = tactic
                         preferred_cluster_shape_mn = None
@@ -14772,8 +15504,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             scheduler_mode = tuning_options[0]
                         if len(tuning_options) >= 2:
                             raster_order = tuning_options[1]
-                        if len(tuning_options) == 3:
+                        if len(tuning_options) >= 3:
                             split_k = tuning_options[2]
+                        if len(tuning_options) == 4:
+                            swizzle_size = tuning_options[3]
                 elif isinstance(tactic, tuple) and len(tactic) == 5:
                     kernel_variant = "base"
                     (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab,
@@ -14801,6 +15535,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError(
                         f"CuteDSL SM107 split_k must be a positive integer, got {split_k!r}"
                     )
+                if (not isinstance(swizzle_size, int)
+                        or isinstance(swizzle_size, bool) or swizzle_size < 1):
+                    raise ValueError(
+                        "CuteDSL SM107 swizzle_size must be a positive "
+                        f"integer, got {swizzle_size!r}")
                 if raster_order not in {"m", "n"}:
                     raise ValueError("CuteDSL SM107 raster_order must be 'm' "
                                      f"or 'n', got {raster_order!r}")
@@ -14828,6 +15567,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[
                     0]
+
+                # A cached profile can cover larger M than its tuning sample.
+                # Keep the workspace bound valid for the actual invocation.
+                if self._exceeds_split_k_workspace(m, n, split_k):
+                    split_k = 1
 
                 partition_id = kwargs.get("partition_id", -1)
                 # A caller-owned output is a locality-domain half GEMM, except on
@@ -14875,7 +15619,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 if swap_ab:
                     c_tensor = c_tensor.permute(1, 0)
-                if split_k > 1:
+                fp32_partials = self.split_k_fp32_partials and split_k > 1
+                if fp32_partials:
+                    if output_tensor is not None or self.to_userbuffers:
+                        raise ValueError(
+                            "FP32 split-K partials require a standalone output")
+                    partials = torch.empty((split_k, m, n),
+                                           dtype=torch.float32,
+                                           device=a_tensor.device)
+                    kernel_c_tensor = partials
+                    kernel_c_dtype = cutlass.Float32
+                else:
+                    kernel_c_tensor = c_tensor
+                    kernel_c_dtype = cutlass.BFloat16
+                if split_k > 1 and not fp32_partials:
                     # Split-K uses TMA reduce-add stores, so every invocation
                     # and CUDA-graph replay must begin from a zeroed output.
                     c_tensor.zero_()
@@ -14919,7 +15676,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_ptr = self.make_cute_dsl_global_pointer(
                     b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                 c_ptr = self.make_cute_dsl_global_pointer(
-                    c_tensor, cutlass.BFloat16, 16)
+                    kernel_c_tensor, kernel_c_dtype, 16)
 
                 # get stream
                 torch_stream = torch.cuda.current_stream()
@@ -15003,6 +15760,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              mma_inst_shape, preferred_cluster_shape_mn,
                              cluster_shape_mn, swap_ab, use_prefetch,
                              raster_order, scheduler_mode, split_k,
+                             swizzle_size, fp32_partials,
                              locality_domain_half_gemm, self.use_tvm_ffi,
                              max_active_preferred_clusters, max_active_clusters)
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
@@ -15022,7 +15780,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_sf_ptr = self.make_cute_dsl_global_pointer(
                             b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                         c_ptr = self.make_cute_dsl_global_pointer(
-                            c_tensor, cutlass.BFloat16, 16)
+                            kernel_c_tensor, kernel_c_dtype, 16)
                         alpha_cute_tensor = cute.runtime.from_dlpack(
                             alpha_tensor)
                         # make faked stream
@@ -15057,6 +15815,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             preferred_cluster_shape_mn,
                             cluster_shape_mn,
                             None if use_prefetch else 0,
+                            swizzle_size=swizzle_size,
                             raster_order=raster_order,
                             scheduler_type=scheduler_type,
                         )
@@ -15067,9 +15826,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             mma_tiler_mnk,
                             cluster_shape_mn,
                             None if use_prefetch else 0,
+                            swizzle_size=swizzle_size,
                             raster_order=raster_order,
                             scheduler_type=scheduler_type,
                             split_k=split_k,
+                            split_k_partials=fp32_partials,
                         )
                     # Note: when tvm_ffi fake stream is used, at least one parameter should be tensor type,
                     # so we make alpha as the cute.Tensor type in the jit func.
@@ -15123,7 +15884,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         kernel_b_tensor.data_ptr(),
                         kernel_a_sf_tensor.data_ptr(),
                         kernel_b_sf_tensor.data_ptr(),
-                        c_tensor.data_ptr(),
+                        kernel_c_tensor.data_ptr(),
                         alpha_tensor,
                         c_ld_key,
                     ]
@@ -15149,6 +15910,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 if swap_ab:
                     c_tensor = c_tensor.permute(1, 0)
+                if fp32_partials:
+                    self._reduce_split_k_partials(partials, c_tensor, split_k)
 
                 if output_tensor is None:
                     if bias is not None:
@@ -15164,11 +15927,45 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     return
 
+            def _reduce_split_k_partials(self, partials: torch.Tensor,
+                                         output: torch.Tensor,
+                                         split_k: int) -> None:
+                from ..kernels.rubin.dense_blockscaled_gemm_persistent import \
+                    reduce_split_k_fp32
+
+                partials_flat = partials.view(-1)
+                output_flat = output.view(-1)
+                partials_cute = cute.runtime.from_dlpack(
+                    partials_flat).mark_layout_dynamic()
+                output_cute = cute.runtime.from_dlpack(
+                    output_flat).mark_layout_dynamic()
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+                key = (split_k, self.use_tvm_ffi)
+                if key not in self.split_k_reduction_cache:
+                    compile_stream = (cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+                                      if self.use_tvm_ffi else stream)
+                    self.split_k_reduction_cache[key] = cute.compile(
+                        reduce_split_k_fp32,
+                        partials_cute,
+                        output_cute,
+                        split_k,
+                        compile_stream,
+                        options="--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
+                reduction = self.split_k_reduction_cache[key]
+                if self.use_tvm_ffi:
+                    reduction(partials_flat, output_flat)
+                else:
+                    reduction(partials_cute, output_cute, stream)
+
         class CuteDSLNVFP4RubinLinear(CuteDSLBlockScaledRubinLinear):
             """SM107 NVFP4 runner backed by the persistent dense kernel."""
 
             kernel_cache = dict()
             gemm_name = "NVFP4"
+            nvmmh_precision = cutedsl_nvmmh.FP4_PRECISION
             a_dtype = cutlass.Float4E2M1FN
             b_dtype = cutlass.Float4E2M1FN
             sf_dtype = cutlass.Float8E4M3FN
@@ -15196,6 +15993,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             kernel_cache = dict()
             gemm_name = "MXFP8"
+            nvmmh_precision = cutedsl_nvmmh.FP8_PRECISION
             a_dtype = cutlass.Float8E4M3FN
             b_dtype = cutlass.Float8E4M3FN
             sf_dtype = cutlass.Float8E8M0FNU
@@ -15222,6 +16020,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         class CuteDSLKimiK3MXFP8RubinLinear(CuteDSLMXFP8RubinLinear):
             """MXFP8 runner with fine-grained tuning for K3's low-M range."""
+
+            # Split-K keeps separate FP32 partials and reduces them in order,
+            # rounding only the completed sum to the public BF16 output.
+            split_k_fp32_partials = True
 
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
@@ -15320,6 +16122,63 @@ if IS_CUTLASS_DSL_AVAILABLE:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]
             return mat_a.new_empty(shape, dtype=torch.bfloat16)
+
+        # Prefill-sized MXFP8 GEMMs take one SM107 tile instead of autotuning the full tactic space per shape.
+        _MXFP8_PREFILL_TILE_SM107 = ((512, 256, 128), (256, 256, 64), (4, 2))
+
+        def _mxfp8_prefill_tactic_sm107(
+            runner: CuteDSLMXFP8RubinLinear,
+            inputs: list[torch.Tensor],
+        ) -> Optional[tuple]:
+            """Validate just the fixed prefill tile, including M-dependent cluster feasibility."""
+            if (get_sm_version() != 107 or inputs[0].ndim != 2
+                    or inputs[1].ndim != 2):
+                return None
+            m, k = inputs[0].shape
+            n = inputs[1].shape[0]
+            if (k % runner.k_alignment != 0
+                    or False not in _get_cute_dsl_swap_ab_candidates(
+                        m, n % 8 == 0)
+                    or "static" not in _dense_gemm_scheduler_modes(
+                        runner.scheduler_mode_candidates)):
+                return None
+            tiler, instruction, cluster = _MXFP8_PREFILL_TILE_SM107
+            if not runner.kernel_class.can_implement(
+                (m, n, k, 1),
+                    runner.a_dtype,
+                    runner.b_dtype,
+                    runner.sf_dtype,
+                    cutlass.BFloat16,
+                    "k",
+                    "k",
+                    "n",
+                    runner.sf_vec_size,
+                    tiler,
+                    instruction,
+                    cluster,
+                    1,
+            ):
+                return None
+            return ("base", tiler, instruction, cluster, False, True, "static",
+                    "m", 1)
+
+        def cute_dsl_mxfp8_prefill_gemm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> Optional[torch.Tensor]:
+            """BF16 ``input @ weight.T`` of MXFP8 operands with R128c4 UE8M0 scales on the SM107 GEMM's
+            prefill tile, or None when that tile does not fit the shape."""
+            runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16)
+            inputs = [
+                input, weight,
+                input_scale.view(torch.uint8),
+                weight_scale.view(torch.uint8), alpha
+            ]
+            tactic = _mxfp8_prefill_tactic_sm107(runner, inputs)
+            return runner(inputs, tactic=tactic) if tactic else None
 
         @torch.library.custom_op(
             "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",
@@ -18659,6 +19518,825 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                n,
                                dtype=output_dtype,
                                device=input.device)
+
+        # ----------------------------------------------------------------
+        # Rubin MXFP8 fused FC12 MoE: gather + FC1 GEMM + SwiGLU + MXFP8
+        # requant + FC2 GEMM + top-k finalize in ONE persistent kernel.
+        # ----------------------------------------------------------------
+        # Gated separately from IS_CUTLASS_DSL_RUBIN_AVAILABLE: the vendored
+        # kernel needs a newer CuTe DSL build (see cute_dsl_utils.py).
+        if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
+            # The flag only probes the submodules cute_dsl_utils knows about.
+            # A build that has them but lacks something else the vendored
+            # kernel imports disables this op instead of breaking the import of
+            # every CuTe DSL op; the MoEDep probe reads the cleared flag.
+            try:
+                from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
+                    Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel as \
+                    Sm107Mxfp8BlockScaledContiguousGroupedGemmFusedFc12Kernel
+                from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
+                    validate_l2_atomic_descriptor_bounds as \
+                    validate_mxfp8_fc12_l2_atomic_descriptor_bounds
+                from ..moe.kernels.rubin.utils import TRTLLM_ENABLE_PDL
+            except (ImportError, AttributeError) as e:
+                logger.warning(
+                    "The installed CuTe DSL cannot build the Rubin MXFP8 fused "
+                    f"FC12 MoE kernel ({e!r}); MXFP8 CuTe DSL MoE is disabled")
+                IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE = False
+                from .. import cute_dsl_utils
+                cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE = False
+
+        if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
+            # MXFP8: E4M3 operands with UE8M0 scales over 32 elements.
+            MXFP8_FUSED_FC12_SF_VEC_SIZE = 32
+
+            class Sm107Mxfp8FusedFc12InputsHelper(GatherGroupedGemmInputsHelper
+                                                  ):
+                """Autotuning helper for the fused FC12 MoE op.
+
+                Inputs 0..9 keep the FC1 gather layout so the parent's moe_sort
+                regeneration is reused verbatim; inputs 10..14 carry the FC2
+                operands. The output buffer and routing scales depend on the token
+                count and are re-materialized for the profiled bucket.
+
+                Input tensor layout:
+                    0: input                      - [orig_m, K] e4m3 activations
+                    1: fc1_weight                 - [L, 2*I, K] e4m3
+                    2: input_scale                - [orig_m, K/32] uint8, linear
+                    3: fc1_weight_scale           - [L, 2*I, K/32] uint8, swizzled
+                    4: fc1_alpha                  - [L] float32
+                    5: tile_idx_to_group_idx      - [num_tiles] int32
+                    6: tile_idx_to_mn_limit       - [num_tiles] int32
+                    7: permuted_idx_to_expanded_idx - [m] int32
+                    8: num_non_exiting_tiles      - [1] int32
+                    9: fc1_norm_const             - [1] float32
+                    10: fc2_weight                - [L, H, I] e4m3
+                    11: fc2_weight_scale          - [L, H, I/32] uint8, swizzled
+                    12: fc2_alpha                 - [L] float32
+                    13: output                    - [num_tokens, H] bf16 (accumulated)
+                    14: token_final_scales        - [num_tokens, top_k] float32
+                """
+                IDX_FC2_B = 10
+                IDX_FC2_SFB = 11
+                IDX_FC2_ALPHA = 12
+                IDX_OUTPUT = 13
+                IDX_ROUTING = 14
+
+                def inputs_pre_hook(
+                        self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+                    # Reuse the parent's moe_sort regeneration on the FC1 prefix.
+                    # The two None placeholders stand in for the locality-domain
+                    # output tensors the parent knows how to resize.
+                    fc1_prefix = list(super().inputs_pre_hook(
+                        list(inputs[:10]) + [None, None]))[:10]
+                    permuted = fc1_prefix[self.IDX_PERMUTED_IDX_TO_EXPANDED_IDX]
+                    num_tokens = self.infer_num_tokens(permuted.size(0))
+                    output = inputs[self.IDX_OUTPUT]
+                    routing = inputs[self.IDX_ROUTING]
+                    return (
+                        *fc1_prefix,
+                        inputs[self.IDX_FC2_B],
+                        inputs[self.IDX_FC2_SFB],
+                        inputs[self.IDX_FC2_ALPHA],
+                        output.new_zeros((num_tokens, output.size(1))),
+                        routing.new_ones((num_tokens, routing.size(1))),
+                    )
+
+            class Sm107Mxfp8FusedFc12MoeRunner(TunableRunner):
+                """Rubin (SM107) runner for the MXFP8 fused FC1+FC2 MoE kernel.
+
+                One persistent kernel replaces the FC1 (gather + GEMM + SwiGLU +
+                requant) and FC2 (GEMM + finalize) op pair: the FC1 intermediate
+                and its block scales are scratch tensors the kernel writes and
+                re-reads, FC2 A-loads gate on per-M-tile readiness counters, and
+                the finalize scatter-adds ``route_scale * fc2`` into ``output``.
+
+                Contract:
+                - ``output`` must be zero on entry for the rows this rank owns
+                  (the backend runs ``moe_output_memset_inplace``); the kernel
+                  accumulates into it.
+                - Weight scales are in the 128x4 swizzled layout produced by
+                  ``block_scale_interleave``; the activation scale is linear
+                  ``[orig_m, K/32]``. FC1 weights and scales are gate/up
+                  interleaved at granularity 64.
+                - K (hidden) must be a multiple of 512 (16-byte SFA gather), the
+                  intermediate a multiple of 128, and the routing tile equals the
+                  MMA tile M (no B-reuse in the fused kernel).
+
+                Tactic: ``(mma_tiler, mma_inst_shape, cluster_shape_mn,
+                scheduler)`` with ``mma_tiler_m == mma_inst_m == tile_size``,
+                ``mma_n in {128, 256}``, ``mma_tiler_k in {128, 256}``
+                (``UMMA_K = 64`` for FP8), ``cluster_shape_mn == (cta_group, 1)``
+                and ``scheduler in {"l2_atomic", "static"}``.
+                """
+                kernel_class = Sm107Mxfp8BlockScaledContiguousGroupedGemmFusedFc12Kernel
+                kernel_cache = dict()
+                tuning_config_cache = dict()
+                sf_vec_size = MXFP8_FUSED_FC12_SF_VEC_SIZE
+                # FP8 UMMA_K is 64; the CTA K tile may be one or two 128-byte atoms.
+                mma_inst_k = 64
+                mma_tiler_k_candidates = (128, 256)
+                mma_n_candidates = (128, 256)
+                scheduler_candidates = ("l2_atomic", "static")
+                # The FC1 SFA gather fetches 16-byte chunks of scales per row.
+                fc1_k_alignment = 16 * MXFP8_FUSED_FC12_SF_VEC_SIZE
+
+                def __init__(
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    swiglu_limit: float = float("inf")) -> None:
+                    super().__init__()
+                    self.num_experts = num_experts
+                    self.top_k = top_k
+                    self.num_local_experts = num_local_experts
+                    self.local_expert_offset = local_expert_offset
+                    self.tile_size = tile_size
+                    # The kernel treats a negative limit as "no clamp".
+                    swiglu_limit = float(swiglu_limit)
+                    self.swiglu_limit = swiglu_limit if swiglu_limit >= 0 else float(
+                        "inf")
+
+                    if (sm_version := get_sm_version()) != 107:
+                        raise ValueError(
+                            f"{self.__class__.kernel_class.__name__} supports SM 107 "
+                            f"(Rubin) only, but got SM {sm_version}")
+                    # tile_M == inst_M: 128 (1-CTA MMA) or 256 (2-CTA MMA).
+                    if self.tile_size not in (128, 256):
+                        raise ValueError(
+                            f"{self.__class__.kernel_class.__name__} supports "
+                            f"tile_size 128 and 256 only, but got {self.tile_size}"
+                        )
+
+                def unique_id(self) -> Tuple:
+                    return (
+                        self.num_experts,
+                        self.top_k,
+                        self.num_local_experts,
+                        self.local_expert_offset,
+                        self.tile_size,
+                        self.swiglu_limit,
+                    )
+
+                @property
+                def cta_group(self) -> int:
+                    return self.tile_size // 128
+
+                def _default_tactic(self) -> Tuple:
+                    return (
+                        (self.tile_size, 128, 128),
+                        (self.tile_size, 128, self.mma_inst_k),
+                        (self.cta_group, 1),
+                        "l2_atomic",
+                    )
+
+                @staticmethod
+                def _normalize_tactic(tactic: Tuple) -> Tuple:
+                    mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = tactic
+                    return (tuple(int(v) for v in mma_tiler),
+                            tuple(int(v) for v in mma_inst_shape),
+                            tuple(int(v)
+                                  for v in cluster_shape_mn), str(scheduler))
+
+                def _is_tactic_feasible(
+                        self,
+                        mma_tiler: Tuple[int, int, int],
+                        mma_inst_shape: Tuple[int, int, int],
+                        cluster_shape_mn: Tuple[int, int],
+                        scheduler: str,
+                        m: int,
+                        fc1_n: int,
+                        k: int,
+                        l: int,  # noqa: E741
+                        fc2_n: int,
+                        fc2_k: int) -> bool:
+                    if not self.__class__.kernel_class.can_implement(
+                            a_dtype=cutlass.Float8E4M3FN,
+                            b_dtype=cutlass.Float8E4M3FN,
+                            sf_dtype=cutlass.Float8E8M0FNU,
+                            sf_vec_size=self.sf_vec_size,
+                            fc1_c_dtype=cutlass.Float8E4M3FN,
+                            fc2_c_dtype=cutlass.BFloat16,
+                            mma_inst_shape=mma_inst_shape,
+                            mma_tiler=mma_tiler,
+                            cluster_shape_mn=cluster_shape_mn,
+                            fc1_gemm_shape=(m, fc1_n, k, l),
+                            fc2_gemm_shape=(m, fc2_n, fc2_k, l),
+                            a_major="k",
+                            b_major="k",
+                            fc1_c_major="n",
+                            fc2_c_major="n",
+                    ):
+                        return False
+                    if scheduler == "l2_atomic" and (cluster_shape_mn[0] *
+                                                     cluster_shape_mn[1]) > 1:
+                        # Clustered L2-atomic scheduling packs the tile coordinates
+                        # into 16-bit fields.
+                        cta_tile_m = mma_tiler[0] // self.cta_group
+                        try:
+                            validate_mxfp8_fc12_l2_atomic_descriptor_bounds(
+                                phase="FC1",
+                                gemm_shape=(m, fc1_n // 2, 1),
+                                cta_tile_shape_mnk=(cta_tile_m,
+                                                    mma_tiler[1] // 2,
+                                                    mma_tiler[2]))
+                            validate_mxfp8_fc12_l2_atomic_descriptor_bounds(
+                                phase="FC2",
+                                gemm_shape=(m, fc2_n, 1),
+                                cta_tile_shape_mnk=(cta_tile_m, mma_tiler[1],
+                                                    mma_tiler[2]))
+                        except ValueError:
+                            return False
+                    return True
+
+                def get_valid_tactics(
+                    self,
+                    inputs: List[torch.Tensor],
+                    profile: OptimizationProfile,
+                    **kwargs,
+                ) -> List[Tuple]:
+                    (fc1_a, fc1_b, fc1_sfa, fc1_sfb, fc1_alpha,
+                     tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                     permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                     fc1_norm_const, fc2_b, *_) = inputs
+                    m = permuted_idx_to_expanded_idx.size(0)
+                    k = fc1_a.size(1)
+                    l, fc1_n = fc1_b.size(0), fc1_b.size(1)  # noqa: E741
+                    fc2_n, fc2_k = fc2_b.size(1), fc2_b.size(2)
+
+                    mma_m = self.tile_size
+                    cluster_shape_mn = (self.cta_group, 1)
+                    valid_tactics = []
+                    for mma_n, mma_tiler_k, scheduler in itertools.product(
+                            self.mma_n_candidates, self.mma_tiler_k_candidates,
+                            self.scheduler_candidates):
+                        # The fused N tile must divide both the FC1 (2*I) and the
+                        # FC2 (hidden) output N; the K tile both GEMM K extents.
+                        if fc1_n % mma_n != 0 or fc2_n % mma_n != 0:
+                            continue
+                        if k % mma_tiler_k != 0 or fc2_k % mma_tiler_k != 0:
+                            continue
+                        mma_tiler = (mma_m, mma_n, mma_tiler_k)
+                        mma_inst_shape = (mma_m, mma_n, self.mma_inst_k)
+                        if self._is_tactic_feasible(mma_tiler, mma_inst_shape,
+                                                    cluster_shape_mn, scheduler,
+                                                    m, fc1_n, k, l, fc2_n,
+                                                    fc2_k):
+                            valid_tactics.append((mma_tiler, mma_inst_shape,
+                                                  cluster_shape_mn, scheduler))
+
+                    logger.debug(
+                        f"CuteDSL Rubin MXFP8 FusedFC12: Found {len(valid_tactics)} "
+                        f"valid tactics for M={m}, FC1_N={fc1_n}, FC2_N={fc2_n}, "
+                        f"K={k}, L={l}")
+                    return valid_tactics
+
+                def get_tuning_config(self) -> TuningConfig:
+                    key = self.unique_id()
+                    if key not in self.__class__.tuning_config_cache:
+                        helper = Sm107Mxfp8FusedFc12InputsHelper(
+                            self.num_experts, self.top_k,
+                            self.num_local_experts, self.local_expert_offset,
+                            self.tile_size)
+                        self.__class__.tuning_config_cache[key] = TuningConfig(
+                            dynamic_tensor_specs=(DynamicTensorSpec(
+                                GatherGroupedGemmInputsHelper.IDX_SHAPE_INFER,
+                                0, helper.gen_tuning_buckets,
+                                helper.map_to_tuning_buckets), ),
+                            constraint_specs=(
+                                ConstraintSpec(0, 0,
+                                               helper.infer_shape_num_tokens),
+                                ConstraintSpec(2, 0,
+                                               helper.infer_shape_num_tokens),
+                                ConstraintSpec(
+                                    5, 0, helper.infer_shape_max_num_tiles),
+                                ConstraintSpec(
+                                    6, 0, helper.infer_shape_max_num_tiles),
+                                ConstraintSpec(helper.IDX_OUTPUT, 0,
+                                               helper.infer_shape_num_tokens),
+                                ConstraintSpec(helper.IDX_ROUTING, 0,
+                                               helper.infer_shape_num_tokens),
+                            ),
+                            inputs_pre_hook=helper.inputs_pre_hook,
+                        )
+                    return self.__class__.tuning_config_cache[key]
+
+                def forward(self, inputs: List[torch.Tensor],
+                            tactic: Optional[tuple], **kwargs) -> torch.Tensor:
+                    (fc1_a, fc1_b, fc1_sfa, fc1_sfb, fc1_alpha,
+                     tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                     permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                     fc1_norm_const, fc2_b, fc2_sfb, fc2_alpha, output,
+                     token_final_scales) = inputs
+
+                    assert fc1_a.dtype == torch.float8_e4m3fn and fc1_a.dim(
+                    ) == 2
+                    assert fc1_b.dtype == torch.float8_e4m3fn and fc1_b.dim(
+                    ) == 3
+                    assert fc2_b.dtype == torch.float8_e4m3fn and fc2_b.dim(
+                    ) == 3
+                    assert fc1_sfa.dtype == torch.uint8 and fc1_sfa.dim() == 2
+                    assert fc1_sfb.dtype == torch.uint8 and fc1_sfb.dim() == 3
+                    assert fc2_sfb.dtype == torch.uint8 and fc2_sfb.dim() == 3
+                    assert fc1_alpha.dtype == torch.float32 and fc1_alpha.dim(
+                    ) == 1
+                    assert fc2_alpha.dtype == torch.float32 and fc2_alpha.dim(
+                    ) == 1
+                    assert fc1_norm_const.dtype == torch.float32
+                    assert fc1_norm_const.numel() == 1
+                    assert output.dtype == torch.bfloat16 and output.dim() == 2
+                    assert token_final_scales.dtype == torch.float32
+
+                    sf_vec = self.sf_vec_size
+                    orig_m, k = fc1_a.size(0), fc1_a.size(1)
+                    m = permuted_idx_to_expanded_idx.size(0)
+                    l, fc1_n = fc1_b.size(0), fc1_b.size(1)  # noqa: E741
+                    interm_size = fc1_n // 2  # SwiGLU halves the FC1 N extent
+                    fc2_n, fc2_k = fc2_b.size(1), fc2_b.size(2)
+                    num_tokens = output.size(0)
+                    num_tiles = m // self.tile_size
+
+                    assert fc1_b.size(2) == k
+                    assert fc2_k == interm_size, (
+                        f"FC2 K ({fc2_k}) must equal the FC1 intermediate "
+                        f"({interm_size})")
+                    assert fc2_n == k, (
+                        f"FC2 N ({fc2_n}) must equal the FC1 K / hidden size ({k})"
+                    )
+                    assert k % self.fc1_k_alignment == 0, (
+                        f"hidden size {k} must be a multiple of "
+                        f"{self.fc1_k_alignment}")
+                    assert fc1_n % 128 == 0 and interm_size % 128 == 0
+                    assert m % self.tile_size == 0 and m % 128 == 0
+                    scale_k = k // sf_vec
+                    fc2_scale_k = fc2_k // sf_vec
+                    assert fc1_sfa.size() == (orig_m, scale_k)
+                    assert fc1_sfb.size() == (l, fc1_n, scale_k)
+                    assert fc2_sfb.size() == (l, fc2_n, fc2_scale_k)
+                    assert fc1_alpha.size(0) == l and fc2_alpha.size(0) == l
+                    assert tile_idx_to_group_idx.dtype == torch.int32
+                    assert tile_idx_to_group_idx.size() == (num_tiles, )
+                    assert tile_idx_to_mn_limit.dtype == torch.int32
+                    assert tile_idx_to_mn_limit.size() == (num_tiles, )
+                    assert permuted_idx_to_expanded_idx.dtype == torch.int32
+                    assert num_non_exiting_tiles.dtype == torch.int32
+                    assert num_non_exiting_tiles.numel() == 1
+                    assert output.size(1) == fc2_n
+                    assert token_final_scales.size() == (num_tokens, self.top_k)
+
+                    if isinstance(tactic, (tuple, list)) and len(tactic) == 4:
+                        mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = \
+                            self._normalize_tactic(tactic)
+                    else:
+                        mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = \
+                            self._default_tactic()
+                    assert mma_tiler[0] == self.tile_size, (
+                        f"Tactic ({tactic}) is incompatible with tile size "
+                        f"({self.tile_size})")
+
+                    # FC1 intermediate (FC2 A operand) and its swizzled block
+                    # scales: written and re-read by the kernel, so plain scratch.
+                    fc1_c = torch.empty(m,
+                                        interm_size,
+                                        dtype=fc1_a.dtype,
+                                        device=fc1_a.device)
+                    fc1_sfc = torch.empty(m * interm_size // sf_vec,
+                                          dtype=fc1_sfa.dtype,
+                                          device=fc1_sfa.device)
+                    # Per-launch zeroed workspaces: FC1->FC2 readiness counters
+                    # (one per 128-row M tile is an upper bound for every tile
+                    # geometry) and the two L2-atomic work-ID counters.
+                    fc1_ready = torch.zeros(m // 128,
+                                            dtype=torch.int32,
+                                            device=fc1_a.device)
+                    fc1_scheduler_counter = torch.zeros(1,
+                                                        dtype=torch.int32,
+                                                        device=fc1_a.device)
+                    fc2_scheduler_counter = torch.zeros(1,
+                                                        dtype=torch.int32,
+                                                        device=fc1_a.device)
+
+                    def _e4m3_ptr(t: torch.Tensor) -> cute.Pointer:
+                        return make_ptr(cutlass.Float8E4M3FN,
+                                        t.data_ptr(),
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=16)
+
+                    def _ue8m0_ptr(t: torch.Tensor) -> cute.Pointer:
+                        return make_ptr(cutlass.Float8E8M0FNU,
+                                        t.data_ptr(),
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=16)
+
+                    def _f32_ptr(t: torch.Tensor) -> cute.Pointer:
+                        return make_ptr(cutlass.Float32, t.data_ptr(),
+                                        cute.AddressSpace.gmem)
+
+                    def _i32_ptr(t: torch.Tensor) -> cute.Pointer:
+                        return make_ptr(cutlass.Int32, t.data_ptr(),
+                                        cute.AddressSpace.gmem)
+
+                    fc1_a_ptr = _e4m3_ptr(fc1_a)
+                    fc1_b_ptr = _e4m3_ptr(fc1_b)
+                    fc1_c_ptr = _e4m3_ptr(fc1_c)
+                    fc1_sfa_ptr = _ue8m0_ptr(fc1_sfa)
+                    fc1_sfb_ptr = _ue8m0_ptr(fc1_sfb)
+                    fc1_sfc_ptr = _ue8m0_ptr(fc1_sfc)
+                    fc1_norm_const_ptr = _f32_ptr(fc1_norm_const)
+                    fc1_alpha_ptr = _f32_ptr(fc1_alpha)
+                    fc2_alpha_ptr = _f32_ptr(fc2_alpha)
+                    tile_idx_to_group_idx_ptr = _i32_ptr(tile_idx_to_group_idx)
+                    tile_idx_to_mn_limit_ptr = _i32_ptr(tile_idx_to_mn_limit)
+                    permuted_idx_to_expanded_idx_ptr = _i32_ptr(
+                        permuted_idx_to_expanded_idx)
+                    num_non_exiting_tiles_ptr = _i32_ptr(num_non_exiting_tiles)
+                    fc1_ready_ptr = _i32_ptr(fc1_ready)
+                    fc1_scheduler_counter_ptr = _i32_ptr(fc1_scheduler_counter)
+                    fc2_scheduler_counter_ptr = _i32_ptr(fc2_scheduler_counter)
+                    fc2_b_ptr = _e4m3_ptr(fc2_b)
+                    fc2_sfb_ptr = _ue8m0_ptr(fc2_sfb)
+                    output_ptr = make_ptr(cutlass.BFloat16,
+                                          output.data_ptr(),
+                                          cute.AddressSpace.gmem,
+                                          assumed_align=16)
+                    token_final_scales_ptr = _f32_ptr(token_final_scales)
+
+                    torch_stream = torch.cuda.current_stream()
+                    stream = cuda.CUstream(torch_stream.cuda_stream)
+                    max_active_clusters = get_max_activate_clusters(
+                        cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                    cache_key = (self.tile_size, self.top_k, mma_tiler,
+                                 mma_inst_shape, cluster_shape_mn, scheduler,
+                                 self.swiglu_limit, max_active_clusters)
+                    if cache_key not in self.__class__.kernel_cache:
+                        gemm = self.__class__.kernel_class(
+                            self.sf_vec_size,
+                            mma_inst_shape,
+                            mma_tiler,
+                            cluster_shape_mn,
+                            True,  # vectorized_f32
+                            topk=self.top_k,
+                            use_pdl=TRTLLM_ENABLE_PDL,
+                            swiglu_limit=self.swiglu_limit,
+                            scheduler=scheduler,
+                        )
+                        sf_vec_cx = self.sf_vec_size
+                        tile_size_cx = self.tile_size
+                        top_k_cx = self.top_k
+
+                        # The fused kernel exposes only ``__call__`` with
+                        # cute.Tensor arguments. Build the tensors from raw
+                        # pointers and dynamic Int64 extents inside a @cute.jit
+                        # wrapper (as the standalone FC1/FC2 kernels do in their
+                        # ``wrapper`` methods) so one compile serves every shape.
+                        @cute.jit
+                        def _fused_fc12_wrapper(
+                            a_ptr: cute.Pointer,
+                            b_ptr: cute.Pointer,
+                            c_ptr: cute.Pointer,
+                            sfa_ptr: cute.Pointer,
+                            sfb_ptr: cute.Pointer,
+                            sfc_ptr: cute.Pointer,
+                            norm_const_ptr: cute.Pointer,
+                            tile_grp_ptr: cute.Pointer,
+                            tile_mn_ptr: cute.Pointer,
+                            num_non_exiting_ptr: cute.Pointer,
+                            fc1_alpha_ptr: cute.Pointer,
+                            fc2_alpha_ptr: cute.Pointer,
+                            ready_ptr: cute.Pointer,
+                            fc1_sched_ptr: cute.Pointer,
+                            fc2_sched_ptr: cute.Pointer,
+                            w2_ptr: cute.Pointer,
+                            out_ptr: cute.Pointer,
+                            w2_sf_ptr: cute.Pointer,
+                            permuted_ptr: cute.Pointer,
+                            routing_ptr: cute.Pointer,
+                            orig_m: cutlass.Int64,
+                            m: cutlass.Int64,
+                            fc1_n: cutlass.Int64,
+                            k: cutlass.Int64,
+                            l: cutlass.Int64,  # noqa: E741
+                            fc2_n: cutlass.Int64,
+                            fc2_k: cutlass.Int64,
+                            num_tokens: cutlass.Int64,
+                            max_active_clusters: cutlass.Constexpr,
+                            stream: cuda.CUstream,
+                        ) -> None:
+                            interm_size = fc1_n // 2
+                            scale_k = k // sf_vec_cx
+                            fc2_scale_k = fc2_k // sf_vec_cx
+                            num_tiles = m // tile_size_cx
+                            num_ready_tiles = m // 128
+                            a = cute.make_tensor(
+                                a_ptr,
+                                layout=cute.make_ordered_layout(
+                                    (orig_m, k, 1), order=(1, 0, 2)))
+                            b = cute.make_tensor(
+                                b_ptr,
+                                layout=cute.make_ordered_layout(
+                                    (fc1_n, k, l), order=(1, 0, 2)))
+                            c = cute.make_tensor(c_ptr,
+                                                 layout=cute.make_layout(
+                                                     (m, interm_size, 1),
+                                                     stride=(interm_size, 1,
+                                                             m * interm_size)))
+                            # Per-token FC1 scales stay linear [orig_m, K/32]; the
+                            # gather warps read 16-byte chunks of each row.
+                            sfa = cute.make_tensor(
+                                sfa_ptr,
+                                layout=cute.make_ordered_layout(
+                                    (orig_m, scale_k, 1), order=(1, 0, 2)))
+                            # Weight / intermediate scales use the 128x4 swizzled
+                            # block-scale atom layout (tile_atom_to_shape_SF).
+                            sfb = cute.make_tensor(
+                                sfb_ptr,
+                                layout=cute.make_ordered_layout(
+                                    (32, 4, fc1_n // 128, 4, scale_k // 4, l),
+                                    order=(2, 1, 4, 0, 3, 5)))
+                            sfc = cute.make_tensor(
+                                sfc_ptr,
+                                layout=cute.make_ordered_layout(
+                                    (32, 4, m // 128, 4, interm_size //
+                                     (sf_vec_cx * 4), 1),
+                                    order=(2, 1, 4, 0, 3, 5)))
+                            norm_const = cute.make_tensor(
+                                norm_const_ptr, layout=cute.make_layout((1, )))
+                            fc1_alpha = cute.make_tensor(
+                                fc1_alpha_ptr, layout=cute.make_layout((l, )))
+                            fc2_alpha = cute.make_tensor(
+                                fc2_alpha_ptr, layout=cute.make_layout((l, )))
+                            tile_grp = cute.make_tensor(tile_grp_ptr,
+                                                        layout=cute.make_layout(
+                                                            (num_tiles, )))
+                            tile_mn = cute.make_tensor(tile_mn_ptr,
+                                                       layout=cute.make_layout(
+                                                           (num_tiles, )))
+                            num_non_exiting = cute.make_tensor(
+                                num_non_exiting_ptr,
+                                layout=cute.make_layout((1, )))
+                            ready = cute.make_tensor(ready_ptr,
+                                                     layout=cute.make_layout(
+                                                         (num_ready_tiles, )))
+                            fc1_sched = cute.make_tensor(
+                                fc1_sched_ptr, layout=cute.make_layout((1, )))
+                            fc2_sched = cute.make_tensor(
+                                fc2_sched_ptr, layout=cute.make_layout((1, )))
+                            w2 = cute.make_tensor(
+                                w2_ptr,
+                                layout=cute.make_ordered_layout(
+                                    (fc2_n, fc2_k, l), order=(1, 0, 2)))
+                            w2_sf = cute.make_tensor(
+                                w2_sf_ptr,
+                                layout=cute.make_ordered_layout(
+                                    (32, 4, fc2_n // 128, 4, fc2_scale_k // 4,
+                                     l),
+                                    order=(2, 1, 4, 0, 3, 5)))
+                            out = cute.make_tensor(
+                                out_ptr,
+                                layout=cute.make_layout(
+                                    (num_tokens, fc2_n, 1),
+                                    stride=(fc2_n, 1, num_tokens * fc2_n)))
+                            permuted = cute.make_tensor(permuted_ptr,
+                                                        layout=cute.make_layout(
+                                                            (m, )))
+                            routing = cute.make_tensor(
+                                routing_ptr,
+                                layout=cute.make_ordered_layout(
+                                    (num_tokens, top_k_cx), order=(1, 0)))
+                            gemm(
+                                a,
+                                b,
+                                c,
+                                sfa,
+                                sfb,
+                                sfc,
+                                norm_const,
+                                tile_grp,
+                                tile_mn,
+                                num_non_exiting,
+                                fc1_alpha,
+                                fc2_alpha,
+                                ready,
+                                fc1_sched,
+                                fc2_sched,
+                                w2,
+                                out,
+                                w2_sf,
+                                permuted,
+                                routing,
+                                max_active_clusters=max_active_clusters,
+                                stream=stream,
+                            )
+
+                        compiled_gemm = cute.compile(
+                            _fused_fc12_wrapper,
+                            fc1_a_ptr,
+                            fc1_b_ptr,
+                            fc1_c_ptr,
+                            fc1_sfa_ptr,
+                            fc1_sfb_ptr,
+                            fc1_sfc_ptr,
+                            fc1_norm_const_ptr,
+                            tile_idx_to_group_idx_ptr,
+                            tile_idx_to_mn_limit_ptr,
+                            num_non_exiting_tiles_ptr,
+                            fc1_alpha_ptr,
+                            fc2_alpha_ptr,
+                            fc1_ready_ptr,
+                            fc1_scheduler_counter_ptr,
+                            fc2_scheduler_counter_ptr,
+                            fc2_b_ptr,
+                            output_ptr,
+                            fc2_sfb_ptr,
+                            permuted_idx_to_expanded_idx_ptr,
+                            token_final_scales_ptr,
+                            orig_m,
+                            m,
+                            fc1_n,
+                            k,
+                            l,
+                            fc2_n,
+                            fc2_k,
+                            num_tokens,
+                            max_active_clusters=max_active_clusters,
+                            stream=stream,
+                        )
+                        self.__class__.kernel_cache[cache_key] = compiled_gemm
+                    else:
+                        compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                    compiled_gemm(
+                        fc1_a_ptr,
+                        fc1_b_ptr,
+                        fc1_c_ptr,
+                        fc1_sfa_ptr,
+                        fc1_sfb_ptr,
+                        fc1_sfc_ptr,
+                        fc1_norm_const_ptr,
+                        tile_idx_to_group_idx_ptr,
+                        tile_idx_to_mn_limit_ptr,
+                        num_non_exiting_tiles_ptr,
+                        fc1_alpha_ptr,
+                        fc2_alpha_ptr,
+                        fc1_ready_ptr,
+                        fc1_scheduler_counter_ptr,
+                        fc2_scheduler_counter_ptr,
+                        fc2_b_ptr,
+                        output_ptr,
+                        fc2_sfb_ptr,
+                        permuted_idx_to_expanded_idx_ptr,
+                        token_final_scales_ptr,
+                        orig_m,
+                        m,
+                        fc1_n,
+                        k,
+                        l,
+                        fc2_n,
+                        fc2_k,
+                        num_tokens,
+                        stream=stream,
+                    )
+                    return output
+
+            def _run_mxfp8_fused_fc12_moe_rubin(
+                input: torch.Tensor,
+                fc1_weight: torch.Tensor,
+                input_scale: torch.Tensor,
+                fc1_weight_scale: torch.Tensor,
+                fc1_alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                fc1_norm_const: torch.Tensor,
+                fc2_weight: torch.Tensor,
+                fc2_weight_scale: torch.Tensor,
+                fc2_alpha: torch.Tensor,
+                output: torch.Tensor,
+                token_final_scales: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                swiglu_limit: float,
+                precomputed_tactic: Optional[str],
+                tuner_key: str,
+            ) -> None:
+                tuner = AutoTuner.get()
+                runner = Sm107Mxfp8FusedFc12MoeRunner(
+                    num_experts,
+                    top_k,
+                    num_local_experts,
+                    local_expert_offset,
+                    tile_size,
+                    swiglu_limit=swiglu_limit,
+                )
+                # Input order matches Sm107Mxfp8FusedFc12InputsHelper.
+                inputs = [
+                    input, fc1_weight, input_scale, fc1_weight_scale, fc1_alpha,
+                    tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                    fc1_norm_const, fc2_weight, fc2_weight_scale, fc2_alpha,
+                    output, token_final_scales
+                ]
+                if precomputed_tactic is None:
+                    _, best_tactic = tuner.choose_one(
+                        tuner_key,
+                        [runner],
+                        runner.get_tuning_config(),
+                        inputs,
+                    )
+                else:
+                    best_tactic = ast.literal_eval(precomputed_tactic)
+                runner(inputs, tactic=best_tactic)
+
+            @torch.library.custom_op(
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin",
+                mutates_args=("output", ),
+                schema=
+                "(Tensor input, Tensor fc1_weight, Tensor input_scale, Tensor fc1_weight_scale, "
+                "Tensor fc1_alpha, Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
+                "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, "
+                "Tensor fc1_norm_const, Tensor fc2_weight, Tensor fc2_weight_scale, "
+                "Tensor fc2_alpha, Tensor(a13!) output, Tensor token_final_scales, "
+                "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
+                "SymInt local_expert_offset, SymInt tile_size, "
+                f"float swiglu_limit={SWIGLU_LIMIT_SCALAR_DISABLED}, "
+                "str? precomputed_tactic=None) -> ()",
+                device_types="cuda")
+            def cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+                input: torch.Tensor,
+                fc1_weight: torch.Tensor,
+                input_scale: torch.Tensor,
+                fc1_weight_scale: torch.Tensor,
+                fc1_alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                fc1_norm_const: torch.Tensor,
+                fc2_weight: torch.Tensor,
+                fc2_weight_scale: torch.Tensor,
+                fc2_alpha: torch.Tensor,
+                output: torch.Tensor,
+                token_final_scales: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+                precomputed_tactic: Optional[str] = None,
+            ) -> None:
+                """MXFP8 fused FC1+FC2 MoE on Rubin, scatter-adding into ``output``.
+
+                ``output`` must already be zero for the rows this rank produces
+                (see ``moe_output_memset_inplace``): the fused finalize
+                accumulates ``token_final_scales * fc2`` into it. A negative
+                ``swiglu_limit`` disables the SwiGLU clamp.
+                """
+                _run_mxfp8_fused_fc12_moe_rubin(
+                    input, fc1_weight, input_scale, fc1_weight_scale, fc1_alpha,
+                    tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                    fc1_norm_const, fc2_weight, fc2_weight_scale, fc2_alpha,
+                    output, token_final_scales, num_experts, top_k,
+                    num_local_experts, local_expert_offset, tile_size,
+                    swiglu_limit, precomputed_tactic,
+                    "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin")
+
+            @torch.library.register_fake(
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin")
+            def _(
+                input: torch.Tensor,
+                fc1_weight: torch.Tensor,
+                input_scale: torch.Tensor,
+                fc1_weight_scale: torch.Tensor,
+                fc1_alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                fc1_norm_const: torch.Tensor,
+                fc2_weight: torch.Tensor,
+                fc2_weight_scale: torch.Tensor,
+                fc2_alpha: torch.Tensor,
+                output: torch.Tensor,
+                token_final_scales: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+                precomputed_tactic: Optional[str] = None,
+            ) -> None:
+                return None
 
         # ----------------------------------------------------------------
         # Rubin BF16/FP16 Finalize Fusion (FC2 layer: grouped GEMM + scatter-add)

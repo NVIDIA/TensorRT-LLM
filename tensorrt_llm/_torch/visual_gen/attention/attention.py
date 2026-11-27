@@ -28,7 +28,7 @@ from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
 from .backends.interface import AttentionTensorLayout
 from .backends.parallel import wrap_parallel_attention
-from .backends.utils import create_attention
+from .backends.utils import create_attention, get_quant_algorithm
 
 
 class QKVMode(str, Enum):
@@ -120,6 +120,16 @@ class Attention(nn.Module):
         is_separate_qkv_cross_attention = (
             self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
         )
+        # A FUSE_KV layer projects K and V from the encoder states when it gets them, so it is
+        # cross-attention as well unless the caller marks it self-attention.
+        is_cross_attention_layer = (
+            self.qkv_mode != QKVMode.FUSE_QKV and not separate_qkv_is_self_attention
+        )
+        quant_attention_config = getattr(config.attention, "quant_attention_config", None)
+        is_deco = (
+            base_backend == "CUTEDSL"
+            and get_quant_algorithm(quant_attention_config) == "deco_attention"
+        )
 
         # Cross-attention fallback: every TRTLLM backend and every VSA backend are
         # self-attention only. The CuTeDSL SOL backend delegates cross-attention per
@@ -140,6 +150,11 @@ class Attention(nn.Module):
                 f"support qkv_mode=SEPARATE_QKV; falling back to {backend_name}.",
                 key=(type(self).__name__, requested, backend_name),
             )
+        elif is_cross_attention_layer and is_deco:
+            # DeCo-Attention attends one sequence to itself, so its cross-attention layers run on
+            # VANILLA. The module knows the kind of the layer; the backend only sees shapes, and
+            # a cross-attention call with as many queries as keys looks like one sequence to it.
+            backend_name = "VANILLA"
         else:
             backend_name = base_backend
 

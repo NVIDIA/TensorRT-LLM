@@ -23,15 +23,13 @@ from cutlass.cute.runtime import make_ptr
 
 from .config import _fp4_mla_packed_wave_plan_enabled
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
-from .fp4_mla_cutedsl_mufu16 import (
-    KV_TILE,
+from .cutedsl_common import (
     LOG2_E,
-    PACKED_MIN_TILES_PER_TASK,
     _cutlass_output_dtype,
-    _packed_query_bound,
     _validate_output_dtype,
     _validate_tensor_pointer_alignment,
 )
+from .fp4_mla_cutedsl_mufu16 import KV_TILE, PACKED_MIN_TILES_PER_TASK, _packed_query_bound
 
 _PACKED_REDUCE_COMPILE_CACHE: dict[tuple[int, bool, torch.dtype], Callable] = {}
 _PACKED_PLAN_COMPILE_CACHE: dict[tuple[int, bool, bool, bool], Callable] = {}
@@ -1103,6 +1101,7 @@ def reduce_packed_splits(
     plan: torch.Tensor,
     stats: torch.Tensor | None = None,
     sm_count: int = 128,
+    task_capacity: int | None = None,
 ) -> None:
     """Reduce ``[splits * requests, physical_m, 512]`` FP32 partials into ``output``.
 
@@ -1110,9 +1109,13 @@ def reduce_packed_splits(
     ``stats`` the optional contiguous ``[requests * valid_m, 2]`` FP32 Helix
     (max, sum) buffer. ``q_scale``/``kv_scale`` are the device FP4 global scales
     and ``plan`` the task plan written by ``launch_packed_plan`` for the same
-    ``splits * requests`` slots the decode kernel ran.
+    ``splits * requests`` slots the decode kernel ran. ``task_capacity`` overrides the slot count
+    (``splits * requests`` by default) for plans whose capacity is not a multiple of the requests
+    (the 4x split mode); the kernel itself only reads the plan's task prefix.
     """
-    tasks = num_splits * num_requests
+    tasks = num_splits * num_requests if task_capacity is None else int(task_capacity)
+    if task_capacity is not None and tasks < num_requests:
+        raise ValueError("task_capacity must cover one slot per request")
     total_rows = num_requests * valid_m
     if num_requests <= 0 or num_splits <= 0 or valid_m <= 0 or physical_m < valid_m:
         raise ValueError("packed reduce needs positive requests/splits and physical_m >= valid_m")

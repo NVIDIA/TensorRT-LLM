@@ -5,8 +5,10 @@ recorded batch / block-table key invalidate on any change, and consecutive stead
 the model what forced full passes hand it."""
 
 import types
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
@@ -16,14 +18,21 @@ from _torch.pyexecutor.engine_test_utils import DummyModel
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.kernels.spec_step_copies.op import slot_scatter_supported
+from tensorrt_llm._torch.pyexecutor import steady_spec_prepare
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.steady_spec_prepare import SteadyMtpPrepare, stage_steady_inputs
-from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
+from tensorrt_llm._torch.speculative.spec_sampler_base import (
+    SampleStateTensorsSpec,
+    SpecSampler,
+    StepOutputRows,
+)
 from tensorrt_llm.llmapi import MTPDecodingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -33,7 +42,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 SLOTS, MAX_TOKENS, MAX_DRAFT, BATCH = 8, 64, 8, 4
 
 
-def _buffers():
+def _buffers(batch: int = BATCH) -> dict:
+    """The staging kernel's destination buffers, the per-request ones sized for ``batch`` requests."""
     i32 = dict(dtype=torch.int32, device="cuda")
     return dict(
         input_ids=torch.full((MAX_TOKENS,), -1, **i32),
@@ -41,11 +51,11 @@ def _buffers():
         prev_batch_idx=torch.full((MAX_TOKENS,), -1, **i32),
         prev_pos_idx=torch.full((MAX_TOKENS,), -1, **i32),
         prev_pos_offsets=torch.zeros((MAX_TOKENS,), **i32),
-        prev_kv_offsets=torch.zeros((BATCH,), **i32),
+        prev_kv_offsets=torch.zeros((batch,), **i32),
         positions=torch.full((MAX_TOKENS,), -1, **i32),
         mrope_positions=torch.full((3, 1, MAX_TOKENS), -1, **i32),
         gather_ids=torch.full((MAX_TOKENS,), -1, **i32),
-        kv_lens_cuda=torch.full((BATCH,), -1, **i32),
+        kv_lens_cuda=torch.full((batch,), -1, **i32),
     )
 
 
@@ -86,7 +96,8 @@ def _device_tensors(gen):
 @pytest.mark.parametrize("block", [None, 64])
 @pytest.mark.parametrize("b,t", [(1, 7), (3, 8), (4, 9)])
 @pytest.mark.parametrize("mrope", [True, False])
-def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab):
+@pytest.mark.parametrize("loads_first", [False, True])
+def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab, loads_first):
     gen = torch.Generator().manual_seed(100 * b + t)
     n = b * t
     for _ in range(3):
@@ -110,6 +121,7 @@ def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab):
             static_input_ids=static_ids,
             static_position_ids=static_pos,
             block=block,
+            loads_first=loads_first,
             **{k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")},
             mrope_positions=actual["mrope_positions"] if mrope else None,
             kv_lens_cuda=actual["kv_lens_cuda"] if kv_lens else None,
@@ -125,6 +137,168 @@ def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab):
             else expected["positions"][:n].view(1, -1)
         )
         assert torch.equal(static_pos[..., :n], pos_ref)
+
+
+@pytest.mark.parametrize("host_slab", [False, True])
+@pytest.mark.parametrize("b,t", [(1, 2), (5, 7)])
+@pytest.mark.parametrize("mode", ["legacy", "loads_first", "padded", "output_rows", "admit"])
+def test_staged_rng_matches_uploaded_rng(b, t, host_slab, mode):
+    """With an RNG slab the kernel writes SpecMetadata's Philox buffers exactly as
+    _populate_request_rng_state uploads them: request_* per request, and row j of request r as
+    (seed_r, offset_r + j * _RNG_SLOT_SPAN)."""
+    from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN
+
+    gen = torch.Generator().manual_seed(7 * b + t)
+    dev = _device_tensors(gen)
+    slots = torch.randperm(SLOTS, generator=gen)[:b].tolist()
+    num_rows = b + 2 if mode == "padded" else b
+    positions = [100 * row + column for row in range(num_rows) for column in range(t)]
+    seeds = torch.randint(0, 1 << 62, (num_rows,), generator=gen, dtype=torch.int64).tolist()
+    offsets = torch.randint(0, 1 << 40, (num_rows,), generator=gen, dtype=torch.int64).tolist()
+    expected_seeds = torch.tensor([s for s in seeds for _ in range(t)], dtype=torch.int64)
+    expected_offsets = torch.tensor(
+        [o + j * _RNG_SLOT_SPAN for o in offsets for j in range(t)], dtype=torch.int64
+    )
+
+    rng_buffers = tuple(
+        torch.full((MAX_TOKENS,), -1, dtype=torch.int64, device="cuda") for _ in range(4)
+    )
+    rng_slab = torch.tensor(seeds + offsets, dtype=torch.int64).pin_memory()
+    from_host = mode == "admit"
+    host_tokens = list(range(b * t)) if from_host else []
+    slab = torch.tensor(slots + positions + host_tokens, dtype=torch.int32).pin_memory()
+    rows = _with_output_rows(dev, slots).rows if mode == "output_rows" else None
+    stage_steady_inputs(
+        slab if host_slab else slab.cuda(),
+        b,
+        t,
+        dev,
+        **{
+            k: v
+            for k, v in _buffers(batch=num_rows).items()
+            if k not in ("mrope_positions", "kv_lens_cuda")
+        },
+        mrope_positions=None,
+        loads_first=mode != "legacy",
+        num_rows=num_rows,
+        from_host=from_host,
+        rows=rows,
+        rng_slab=rng_slab if host_slab else rng_slab.cuda(),
+        rng_buffers=rng_buffers,
+        rng_span=_RNG_SLOT_SPAN,
+    )
+    torch.cuda.synchronize()
+    request_seeds, request_offsets, row_seeds, row_offsets = (x.cpu() for x in rng_buffers)
+    n = num_rows * t
+    assert request_seeds[:num_rows].tolist() == seeds
+    assert request_offsets[:num_rows].tolist() == offsets
+    assert torch.equal(row_seeds[:n], expected_seeds)
+    assert torch.equal(row_offsets[:n], expected_offsets)
+    assert request_seeds[num_rows] == request_offsets[num_rows] == -1
+    assert row_seeds[n] == row_offsets[n] == -1
+
+
+def _rng_meta():
+    """Just enough of SpecMetadata to run _populate_request_rng_state."""
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
+
+    meta = types.SimpleNamespace(
+        is_all_greedy_sample=False,
+        max_num_requests=BATCH,
+        request_seeds=None,
+        request_offsets=None,
+        seeds=None,
+        offsets=None,
+        temperatures=None,
+        pack_rng_uploads=False,
+        _rng_window_counter={},
+        _rng_slot_owner={},
+        rng_accept_slot=3,
+    )
+    meta._take_rng_window_offsets = lambda *args: SpecMetadata._take_rng_window_offsets(meta, *args)
+    return meta
+
+
+@pytest.mark.parametrize("uniform", [True, False], ids=["deferred", "uploaded"])
+def test_populate_before_stage_matches_the_upload(uniform):
+    """The steady MTP step populates the sampling parameters before staging (defer_rows = its rows per request) and
+    the staging kernel writes the Philox buffers from the deferred values: over consecutive steps of seeded and
+    unseeded requests, the same buffers and window counters as the uploads of the full pass. A batch whose requests'
+    rows differ is uploaded."""
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import request_random_seed
+    from tensorrt_llm._torch.speculative.interface import (
+        _RNG_SLOT_SPAN,
+        OneModelSamplingParams,
+        SpecMetadata,
+    )
+
+    t = 4
+    seeds = [None, 123, None, (1 << 63) + 5]
+    requests = [
+        types.SimpleNamespace(
+            sampling_config=types.SimpleNamespace(seed=seed),
+            py_seq_slot=slot,
+            py_request_id=100 + slot,
+        )
+        for slot, seed in zip((5, 2, 7, 0), seeds)
+    ]
+    for request in requests:
+        # The sampling parameters LlmRequest caches; only the seed is read here.
+        request.py_spec_sampling_params = OneModelSamplingParams(
+            temperature=1.0,
+            top_k=torch.iinfo(torch.int32).max,
+            top_p=1.0,
+            min_p=0.0,
+            is_greedy=False,
+            is_temperature_only=True,
+            seed=request_random_seed(request),
+        )
+    b = len(requests)
+    rows = [t] * b if uniform else [t, 1, t, t]
+    normalized = [(1.0, 0, 1.0, 0.0, n) for n in rows]
+    staged, uploaded = _rng_meta(), _rng_meta()
+    dev = _device_tensors(torch.Generator().manual_seed(3))
+    slab = torch.tensor([0, 1, 2, 3] + list(range(b * t)), dtype=torch.int32, device="cuda")
+    for step in range(3):
+        deferred = SpecMetadata._populate_request_rng_state(
+            staged, requests, normalized, defer_rows=t
+        )
+        assert SpecMetadata._populate_request_rng_state(uploaded, requests, normalized) is None
+        if uniform:
+            request_seeds, request_offsets = deferred
+            stage_steady_inputs(
+                slab,
+                b,
+                t,
+                dev,
+                **{
+                    k: v
+                    for k, v in _buffers().items()
+                    if k not in ("mrope_positions", "kv_lens_cuda")
+                },
+                mrope_positions=None,
+                rng_slab=torch.tensor(
+                    request_seeds + request_offsets, dtype=torch.int64, device="cuda"
+                ),
+                rng_buffers=(
+                    staged.request_seeds,
+                    staged.request_offsets,
+                    staged.seeds,
+                    staged.offsets,
+                ),
+                rng_span=_RNG_SLOT_SPAN,
+            )
+        else:
+            assert deferred is None
+        torch.cuda.synchronize()
+        for name, n in (
+            ("request_seeds", b),
+            ("request_offsets", b),
+            ("seeds", sum(rows)),
+            ("offsets", sum(rows)),
+        ):
+            assert torch.equal(getattr(staged, name)[:n], getattr(uploaded, name)[:n]), (step, name)
+        assert staged._rng_window_counter == uploaded._rng_window_counter
 
 
 def _manager(pools=2, rows=4, max_blocks=16):
@@ -354,15 +528,64 @@ def _previous_step_tensors(gen, t, num_slots=8):
     )
 
 
-def test_prepare_inputs_steady_steps_match_forced_full_passes():
-    """Consecutive decode steps of DecoderInputPreparer.prepare_inputs + preprocess_inputs on real
-    TrtllmAttentionMetadata: the steady path hands the model what a forced full pass (invalidate()
-    first) hands it while blocks are kept, appended and re-paged."""
+def _with_output_rows(stored, slots):
+    """``stored`` plus the previous step's output rows of the requests on ``slots``, in order."""
+    index = torch.tensor(slots, device="cuda")
+    rows = StepOutputRows(
+        next_new_tokens=stored.new_tokens[:, index, 0].t().contiguous(),
+        new_tokens_lens=stored.new_tokens_lens[index],
+        next_draft_tokens=stored.next_draft_tokens[index],
+        slots=tuple(slots),
+    )
+    return SampleStateTensorsSpec(
+        new_tokens=stored.new_tokens,
+        new_tokens_lens=stored.new_tokens_lens,
+        next_draft_tokens=stored.next_draft_tokens,
+        rows=rows,
+    )
+
+
+def _sample_stores(sampler, stored, requests):
+    """Scatter real sampler outputs in a different order from the next batch."""
+    batch = ScheduledRequests()
+    batch.generation_requests = list(reversed(requests))
+    rows = _with_output_rows(stored, [r.py_seq_slot for r in batch.generation_requests]).rows
+    outputs = dict(
+        new_tokens=rows.next_new_tokens,
+        new_tokens_lens=rows.new_tokens_lens,
+        next_new_tokens=rows.next_new_tokens,
+        next_draft_tokens=rows.next_draft_tokens,
+        native_uniform_verify=True,
+    )
+    sampler.store.next_new_tokens.fill_(-1)
+    sampler.store.next_draft_tokens.fill_(-1)
+    sampler.store.new_tokens_lens.zero_()
+    state = sampler.sample_async(batch, outputs, [])
+    assert state.device.stores_ready is not None
+    return state.device
+
+
+@pytest.mark.parametrize("mode", ["plain", "tp", "attention_dp_padded"])
+def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
+    """Steady decode steps of DecoderInputPreparer on real TrtllmAttentionMetadata hand the model
+    what forced full passes hand it; with steady_decode_prepare also with attention DP padding and
+    at new requests' first steps."""
     draft_len, tokens_per_block = 3, 16
     t = draft_len + 1
+    attention_dp = mode == "attention_dp_padded"
+    opted_in = mode != "plain"
     config = decoder_config(
-        spec_config=MTPDecodingConfig(max_draft_len=draft_len), spec_decode_fast_paths=True
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len),
+        spec_decode_fast_paths=not attention_dp,
+        enable_attention_dp=attention_dp,
+        steady_decode_prepare=opted_in,
     )
+    exchanges = []
+
+    def allgather(values):
+        exchanges.append(list(values))
+        return np.asarray([values], dtype=np.int64)
+
     model = DummyModel(config.dtype)
     manager = KVCacheManagerV2(
         KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
@@ -377,6 +600,18 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
         dtype=tensorrt_llm.bindings.DataType.HALF,
     )
     try:
+        sampler = None
+        if mode == "tp" and slot_scatter_supported():
+            sampler = SpecSampler(
+                TorchSampler.Args(
+                    max_seq_len=512,
+                    max_draft_len=draft_len,
+                    max_num_sequences=SLOTS,
+                    max_beam_width=1,
+                    max_total_draft_tokens=draft_len,
+                )
+            )
+            sampler.stores_on_side_stream = True
         requests = manager.add_dummy_requests(
             [1, 2, 3], token_nums=[10, 17, 33], is_gen=True, max_num_draft_tokens=draft_len
         )
@@ -388,34 +623,57 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
                 request.max_beam_num_tokens + draft_len
             )
         request_ids = [request.py_request_id for request in requests]
+        rows = list(requests)
+        if attention_dp:
+            (padding,) = manager.add_dummy_requests(
+                [9], token_nums=[1], is_gen=True, max_num_draft_tokens=draft_len
+            )
+            padding.is_cuda_graph_dummy = True
+            rows += [padding, padding]
         batch = ScheduledRequests()
-        batch.generation_requests = requests
+        batch.generation_requests = rows
         resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
 
         arms = {}
         for arm in ("steady", "full"):
-            preparer = input_preparer(
-                config, model=model, buffers=DecoderInputBuffers.for_config(config, False)
+            buffers = DecoderInputBuffers.for_config(config, False)
+            for buffer in vars(buffers).values():
+                if isinstance(buffer, torch.Tensor):
+                    buffer.zero_()
+            preparer = input_preparer(config, model=model, buffers=buffers)
+            preparer.dist = types.SimpleNamespace(tp_cp_allgather_int64=allgather)
+            disabled_graph_runner = types.SimpleNamespace(enabled=False)
+            with patch.object(SteadyMtpPrepare, "_warm_stage_kernel") as warm_stage_kernel:
+                preparer.attach_cuda_graph_runners(disabled_graph_runner, None)
+                warm_stage_kernel.assert_not_called()
+            assert preparer._steady_mtp is None
+            enabled_graph_runner = types.SimpleNamespace(
+                enabled=True,
+                shared_static_tensors={},
+                fusible_engram_hook=None,
+                take_agreed_replay_key=lambda _: None,
             )
-            preparer.attach_cuda_graph_runners(None, None)
+            preparer.attach_cuda_graph_runners(enabled_graph_runner, None)
             assert preparer._steady_mtp is not None
-            attn_metadata = (
-                DecoderMetadata(
-                    config=config,
-                    mapping=Mapping(),
-                    model=model,
-                    buffers=preparer._buffers,
-                    attention_runtime_features=AttentionRuntimeFeatures(),
-                )
-                .setup_attention(manager)
-                .create_cuda_graph_metadata(len(requests), False, draft_len)
+            metadata = DecoderMetadata(
+                config=config,
+                mapping=Mapping(),
+                model=model,
+                buffers=preparer._buffers,
+                attention_runtime_features=AttentionRuntimeFeatures(),
+            )
+            metadata.keep_steady_growth_blocks = preparer.steady_decode_prepare_enabled
+            attn_metadata = metadata.setup_attention(manager).create_cuda_graph_metadata(
+                len(rows), False, draft_len
             )
             assert type(attn_metadata) is TrtllmAttentionMetadata
             spec_metadata = Mock(
                 _force_non_greedy_for_capture=False,
                 context_prompt_lookahead_tokens=None,
-                supports_steady_prepare=True,
+                supports_steady_prepare=not attention_dp,
+                runtime_draft_len=draft_len,
             )
+            spec_metadata.dp_num_tokens = lambda spec=spec_metadata: spec.num_tokens
             arms[arm] = (preparer, attn_metadata, spec_metadata)
         # Both arms start from the same metadata buffer contents.
         steady_fields, full_fields = (vars(arms[arm][1]) for arm in ("steady", "full"))
@@ -428,13 +686,46 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
 
         # Accepted tokens per request and step. None: request 1 re-pages its last block (which holds
         # draft slots only) and no request advances, so that is the batch's only block-table change.
+        # A tuple: new requests (ids, tokens, slots) replace the batch and take their first step.
         schedule = [[1, 1, 1], [4, 4, 4], None, [2, 3, 1], [4, 4, 4], [3, 1, 2], [1, 2, 4]]
+        schedule[4:4] = [([11, 12, 13], [20, 9, 41], [1, 6, 3]), [3, 2, 4]]
+        # The second batch takes the first batch's slots, which the steady arm last uploaded.
+        schedule += [([21, 22, 23], [5, 30, 12], [5, 2, 7]), [2, 4, 1]]
+        forced = {len(schedule)}
+        schedule.append([3, 1, 2])
+        joins = {step for step, accepted in enumerate(schedule, 1) if isinstance(accepted, tuple)}
+        # Without steady_decode_prepare a first step and the step after it take full passes.
+        steady_steps = [
+            step
+            for step in range(1, len(schedule) + 1)
+            if step not in forced and (opted_in or not joins & {step, step - 1})
+        ]
         gen = torch.Generator(device="cuda").manual_seed(0)
+        drafts = np.random.default_rng(0)
         keys = [manager.batch_block_table_key(request_ids)]
-        copied = []
+        copied, admitted, by_row = [], [], []
         for step, accepted in enumerate([[0, 0, 0]] + schedule):
+            joining = isinstance(accepted, tuple)
+            use_stores = sampler is not None and step == 2
+            previous_slots = [request.py_seq_slot for request in requests]
             if accepted is None:
                 _repage_last_block(manager, requests[0], other)
+            elif joining:
+                for request in requests:
+                    manager.free_resources(request)
+                ids, token_nums, slots = accepted
+                requests = manager.add_dummy_requests(
+                    ids, token_nums=token_nums, is_gen=True, max_num_draft_tokens=draft_len
+                )
+                for request, slot in zip(requests, slots):
+                    request.is_dummy_request = False
+                    request.py_seq_slot = slot
+                    request.py_draft_tokens = drafts.integers(0, 1000, draft_len).tolist()
+                    assert manager.kv_cache_map[request.py_request_id].resize(
+                        request.max_beam_num_tokens + draft_len
+                    )
+                request_ids = [request.py_request_id for request in requests]
+                batch.generation_requests = requests + rows[len(requests) :]
             else:
                 for request, count in zip(requests, accepted):
                     for _ in range(count):
@@ -444,11 +735,28 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
                     )
             if step > 0:
                 keys.append(manager.batch_block_table_key(request_ids))
-            previous = _previous_step_tensors(gen, t)
+            stored = _previous_step_tensors(gen, t)
+            idle = joining and accepted[0][0] == 11  # the device was idle
             states = {}
             for arm, (preparer, attn_metadata, spec_metadata) in arms.items():
-                if arm == "full":
+                previous = None if idle else _with_output_rows(stored, previous_slots)
+                if arm == "full" or step in forced:
                     preparer._steady_mtp.invalidate()
+                if joining:
+                    for request in requests:
+                        request.py_batch_idx = None
+                if use_stores:
+                    previous = _sample_stores(sampler, stored, requests)
+                wait_patch = (
+                    patch.object(
+                        torch.cuda.Stream,
+                        "wait_event",
+                        autospec=True,
+                        side_effect=torch.cuda.Stream.wait_event,
+                    )
+                    if use_stores
+                    else nullcontext()
+                )
                 with (
                     patch.object(
                         manager, "copy_batch_block_offsets", wraps=manager.copy_batch_block_offsets
@@ -458,6 +766,12 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
                         "_apply_steady_mtp_fast_prepare",
                         wraps=preparer._apply_steady_mtp_fast_prepare,
                     ) as steady,
+                    patch.object(
+                        steady_spec_prepare,
+                        "stage_steady_inputs",
+                        wraps=steady_spec_prepare.stage_steady_inputs,
+                    ) as stage,
+                    wait_patch as wait_event,
                 ):
                     prepared = preparer.prepare_inputs(
                         scheduled_requests=batch,
@@ -474,12 +788,28 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
                         prepared.kwargs, enable_spec_decode=True, runtime_draft_len=draft_len
                     )
                 torch.cuda.synchronize()
-                assert steady.called == (arm == "steady" and step > 0), (arm, step)
+                assert steady.called == (arm == "steady" and step in steady_steps), (arm, step)
                 if steady.called:
                     copied.append(copy.called)
+                    admitted.append(steady.call_args.kwargs["admit"])
+                    by_row.append(stage.call_args.kwargs["rows"] is not None)
                 states[arm] = _step_state(
-                    preparer, inputs, attn_metadata, spec_metadata, len(requests), t
+                    preparer, inputs, attn_metadata, spec_metadata, len(rows), t
                 )
+                if use_stores:
+                    wait_event.assert_any_call(torch.cuda.current_stream(), previous.stores_ready)
+                    expected_ids = stored.new_tokens[:t, previous_slots, 0].T.reshape(-1)
+                    expected_drafts = stored.next_draft_tokens[previous_slots, :draft_len].flatten()
+                    expected_offsets = stored.new_tokens_lens[previous_slots]
+                    assert torch.equal(states[arm]["input_ids"], expected_ids), arm
+                    assert torch.equal(states[arm]["draft_tokens"], expected_drafts), arm
+                    assert torch.equal(
+                        states[arm]["previous_pos_id_offsets"],
+                        expected_offsets.repeat_interleave(t),
+                    ), arm
+                    assert torch.equal(
+                        states[arm]["previous_kv_lens_offsets"], expected_offsets - t
+                    ), arm
             mismatches = sorted(
                 name
                 for name in states["steady"].keys() | states["full"].keys()
@@ -487,8 +817,17 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes():
             )
             assert not mismatches, (step, mismatches)
         assert arms["steady"][0]._steady_mtp.record.attn_steady
+        if attention_dp:
+            # Each step of each arm exchanged its counts once, steady or not.
+            assert len(exchanges) == 2 * (len(schedule) + 1), exchanges
         # A steady step copies the block table exactly when it changed.
-        changed = [a != b for a, b in zip(keys, keys[1:])]
+        changed = [keys[step] != keys[step - 1] for step in steady_steps]
         assert copied == changed and any(changed) and not all(changed), (copied, changed)
+        assert admitted == [step in joins for step in steady_steps], admitted
+        # A step that verifies its previous drafts reads them from the previous step's output rows.
+        assert by_row == [
+            opted_in and step not in joins and not (sampler is not None and step == 2)
+            for step in steady_steps
+        ], by_row
     finally:
         manager.shutdown()

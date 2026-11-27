@@ -195,12 +195,6 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
         if implementation == "self_sampling" or (implementation == "default" and is_prefill)
         else TopKImplementation.CUTE_DSL_RADIX
     )
-    if (
-        implementation == "self_sampling"
-        and not is_prefill
-        and torch.cuda.get_device_capability() == (10, 7)
-    ):
-        expected_impl = TopKImplementation.CUDA_RADIX
     assert (
         selector.prefill_implementation if is_prefill else selector.decode_implementation
     ) == expected_impl
@@ -229,6 +223,88 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
             expected = scores[row, :length].topk(512).indices
             # These deterministic, continuous scores have no boundary ties.
             torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 GVR selection",
+)
+@torch.inference_mode()
+def test_sm107_capped_gvr_masks_holes_during_graph_replay(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import INDEX_PAGE_ROWS
+
+    width = 132096
+    rows, top_k = 2, 512
+    layout = CSA2Layout((1,), (0,), (0,), index_topk=top_k)
+    indexer = CSA2Indexer(
+        layout, 0, 8, 128, CSA2Params(enable_heuristic_topk=True, use_cute_dsl_topk=False)
+    )
+    assert indexer.top_k.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+    metadata = CSA2TrtllmMetadata(max_num_requests=rows, max_num_tokens=rows)
+    metadata.mapping = Mapping(world_size=8, tp_size=8, rank=0)
+    valid = torch.ones(rows, width // INDEX_PAGE_ROWS, device="cuda", dtype=torch.bool)
+    visible = torch.tensor([width, 1024], device="cuda", dtype=torch.int32)
+    metadata.csa2_indexer_valid_pages = valid
+    metadata.csa2_indexer_visible_lengths = visible
+    metadata.csa2_indexer_radix_aux_indices = None
+    metadata.csa2_indexer_radix_aux_logits = None
+    logits = torch.arange(width, device="cuda", dtype=torch.float32).repeat(rows, 1)
+    output = torch.empty(rows, top_k, device="cuda", dtype=torch.int32)
+    select = indexer.select_prepared_scores
+
+    selection_captures = []
+
+    def checked_select(*args, **kwargs):
+        assert kwargs["gvr_r_cap"] == 4
+        assert not kwargs["gvr_pdl"]
+        assert kwargs["gvr_finalize"] is not None
+        result = select(*args, **kwargs)
+        assert kwargs["gvr_finalize"]["done"], "the cluster launch must finalize its own output"
+        selection_captures.append(torch.cuda.is_current_stream_capturing())
+        return result
+
+    monkeypatch.setattr(indexer, "select_prepared_scores", checked_select)
+
+    def run():
+        indexer._select_paged_logits(metadata, logits.clone(), None, output, None)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    assert selection_captures == [False, True]
+
+    columns = torch.arange(width, device="cuda")
+
+    def check_replay():
+        graph.replay()
+        valid_columns = valid[:, columns // INDEX_PAGE_ROWS] & (columns < visible[:, None])
+        expected = torch.full_like(output, -1, dtype=torch.long)
+        for row, mask in enumerate(valid_columns):
+            valid_indices = columns[mask]
+            count = min(top_k, valid_indices.numel())
+            selected = logits[row, valid_indices].topk(count).indices
+            expected[row, :count] = valid_indices[selected].sort().values
+        torch.testing.assert_close(output.long(), expected)
+
+    # Keep scores fixed. Each metadata update removes columns from the previous Top-K.
+    full_lengths = visible.new_tensor([width - 17, 768])
+    visible.copy_(full_lengths)
+    check_replay()
+    valid[0, -2:] = False
+    valid[1, 10] = False
+    check_replay()
+
+    visible.copy_(visible.new_tensor([0, top_k - 1]))
+    check_replay()
+
+    # Refill the output before shortening a row by invalidating pages alone.
+    visible.copy_(full_lengths)
+    check_replay()
+    valid[1].fill_(False)
+    valid[1, 1] = True
+    check_replay()
 
 
 def _reference_candidate_mask(
@@ -1085,6 +1161,23 @@ def test_packed_prefill_logits_schedule_matches_grid_stride(monkeypatch):
         grid_stride = run()
     torch.testing.assert_close(scheduled, grid_stride, atol=0, rtol=0)
     torch.testing.assert_close(again, grid_stride, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with monkeypatch.context() as context:
+        context.setattr(csa2_indexer, "get_mqa_logits_metadata", counted)
+        with torch.cuda.graph(graph):
+            captured = run()
+    # Capture must build a live schedule rather than reuse the eager schedule.
+    assert len(built) == 2
+    original_visible = visible.clone()
+    for shrink in (512, 0):
+        visible.copy_((original_visible - shrink).clamp_min(0))
+        graph.replay()
+        actual = captured.clone()
+        with monkeypatch.context() as context:
+            context.setattr(CSA2Indexer, "_packed_group_schedule", lambda *args: None)
+            expected = run()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _single_request_state(heads=8, two_owners=False):
@@ -2047,7 +2140,7 @@ def test_candidate_decode_batched_exact_and_mixed(monkeypatch, mixed):
         # SM100 metadata plans no prefix for decode rows, so they must take the
         # native paged sparse decode.
         with monkeypatch.context() as context:
-            context.setattr(state.metadata, "prepare_sparse_indexer", lambda *a: None)
+            context.setattr(state.metadata, "prepare_sparse_indexer", lambda *a, **k: None)
             with pytest.raises(ValueError, match="native paged sparse decode"):
                 _candidate_decode_run(indexer, state, monkeypatch)
     # An admitted domain wider than the candidate pool changes nothing: only

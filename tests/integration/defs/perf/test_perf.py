@@ -33,9 +33,9 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import get_device_count, llm_models_root
+from ..conftest import get_device_count, get_gpu_device_list, llm_models_root
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
-from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
+from .pytorch_model_config import get_model_yaml_config, get_perf_config_preset
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
@@ -72,16 +72,30 @@ NEMOTRON_SUPER_MODELS = {
     "nemotron_3.5_lightning_30b_bf16_mtp",
 }
 
+# Cases that run out of memory on H100 at the default KV cache fraction, keyed
+# by (model, input length, output length) and mapped to the fraction they run
+# with there: KV cache sizing does not yet reserve memory for a full batch of
+# logits. Remove an entry once it does. 128/128 is not KV-bound (0.75); the
+# long cases are KV-bound on H100, so they keep more KV (0.82).
+_H100_KV_CACHE_FRACTION_CAPS = {
+    ("qwen3.5_122b_a10b", 128, 128): 0.75,
+    ("qwen3.5_122b_a10b", 500, 2000): 0.82,
+    ("qwen3.5_122b_a10b", 2000, 500): 0.82,
+    ("qwen3.5_122b_a10b", 1000, 2000): 0.82,
+}
+
 KIMI_K3_MODELS = {"kimi_k3"}
 DEEPSEEK_V41_MODELS = {
     "deepseek_v41_flash_nvfp4",
     "deepseek_v41_flash_nvfp4_dspark",
 }
 GLM53_FLASH_NVFP4_MODELS = {
+    "glm_5.3_flash_nvfp4_mtp_bf16_kv",
     "glm_5.3_flash_nvfp4",
     "glm_5.3_flash_nvfp4_mtp",
 }
 QWEN38_MTP_MODELS = {
+    "qwen3.8_flash_next_fp8_mtp_tep4",
     "qwen3.8_max_fp4_mtp",
     "qwen3.8_flash_next_fp8_mtp",
     "qwen3.8_flash_next_fp4_mtp",
@@ -91,6 +105,10 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    "kimi_k3_nvfp4_dep8",
+    "minimax_m3.1_flash_nvfp4",
+    "minimax_m3.1_flash_nvfp4_dspark",
+    "muse_spark_open_nvfp4_agentx",
     *GLM53_FLASH_NVFP4_MODELS,
     *DEEPSEEK_V41_MODELS,
     *QWEN38_MTP_MODELS,
@@ -99,12 +117,17 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "minimax_m3_fp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_super_120b_fp8",
     "nemotron_3_ultra_550b_nvfp4",
     "glm_5.3_fp8",
     "glm_5.3_flash_fp8",
     "minimax_m3_mxfp8",
     "qwen3.6_35b_a3b_fp4",
     "qwen3.6_35b_a3b_fp4_mtp",
+    "qwen3.8_27b",
+    "qwen3.8_27b_fp4",
+    "qwen3.8_flash_next_fp4",
+    "qwen3.8_flash_next_fp8",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
     "nemotron_3.5_lightning_30b_nvfp4_mtp",
@@ -148,6 +171,7 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    "minimax_m3.1_flash_nvfp4_dspark",
     "glm_5.3_flash_fp8_mtp",
     "deepseek_v4_pro_base_fp8",
     *QWEN38_MTP_MODELS,
@@ -451,6 +475,26 @@ class PerfTestMetric(NamedTuple):
     cmd_idx: int
 
 
+# Test-name options also consumed by the launcher, with their YAML paths.
+_LAUNCH_OPTIONS = {
+    'maxbs': ('max_batch_size', 'max_batch_size'),
+    'maxnt': ('max_num_tokens', 'max_num_tokens'),
+    'tp': ('tp_size', 'tensor_parallel_size'),
+    'pp': ('pp_size', 'pipeline_parallel_size'),
+    'ep': ('ep_size', 'moe_expert_parallel_size'),
+    'kv_frac': ('kv_cache_free_gpu_mem_fraction',
+                'kv_cache_config.free_gpu_memory_fraction'),
+}
+
+
+def _launch_options_in(config: dict):
+    for option, (attribute, path) in _LAUNCH_OPTIONS.items():
+        parent, _, key = path.rpartition('.')
+        section = config.get(parent, {}) if parent else config
+        if section is not None and key in section:
+            yield option, attribute, section, key
+
+
 class PerfTestConfig:
     """
     Configurations defining the LLM perf test.
@@ -538,8 +582,9 @@ class PerfTestConfig:
         self.moe_backend = moe_backend
         # Shared random prefix length (serve only), added in front of every prompt.
         self.prefix_len = prefix_len
-        # "+"-joined names from PERF_CONFIG_PRESETS in pytorch_model_config.py.
+        # "+"-joined presets with optional per-recipe field overrides.
         self.cfg_presets = cfg_presets
+        self.explicit_options: set[str] = set()
 
     def to_string(self,
                   custom_server_name: str = None,
@@ -670,8 +715,15 @@ class PerfTestConfig:
         Populate the config properties given the test param string.
         """
 
-        # Extract configs from test param labels.
-        labels = test_param_labels.split("-")
+        # Keep hyphens in curated YAML filenames within the final cfg label.
+        case, separator, presets = test_param_labels.partition("-cfg:")
+        labels = case.split("-")
+        self.explicit_options = {
+            label.partition(':')[0]
+            for label in labels if ':' in label
+        }
+        if separator:
+            labels.append(f"cfg:{presets}")
 
         self.model_name = labels.pop(0)
 
@@ -778,8 +830,24 @@ class PerfTestConfig:
             labels
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
 
-        # Validate the parsed config.
+        supplied = self.explicit_options.copy()
+        if self.cfg_presets is not None:
+            for selection in self.cfg_presets.split("+"):
+                recipe = get_perf_config_preset(selection)
+                for option, attribute, section, key in _launch_options_in(
+                        recipe):
+                    if option not in self.explicit_options:
+                        setattr(self, attribute, section[key])
+                    supplied.add(option)
+
+        self._resolve_topology(supplied)
         self.validate()
+
+    def _resolve_topology(self, supplied: set[str]) -> None:
+        if 'gpus' not in supplied:
+            self.num_gpus = self.tp_size * self.pp_size
+        elif 'tp' not in supplied and self.pp_size > 0:
+            self.tp_size = self.num_gpus // self.pp_size
 
     def validate(self):
         """
@@ -821,15 +889,6 @@ class PerfTestConfig:
                 and self.model_name not in SERVE_IMAGE_MODELS, \
                 "prefix applies only to the random text dataset!"
 
-        if self.cfg_presets is not None:
-            unknown_presets = [
-                name for name in self.cfg_presets.split("+")
-                if name not in PERF_CONFIG_PRESETS
-            ]
-            assert not unknown_presets, (
-                f"Unknown cfg preset(s) {unknown_presets}; "
-                f"known presets: {sorted(PERF_CONFIG_PRESETS)}")
-
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
             VALID_QUANTS = [
@@ -858,12 +917,7 @@ class PerfTestConfig:
         if self.pp_size > 1:
             assert self.model_name in MODEL_PATH_DICT.keys(
             ), f"Invalid model name for pp size {self.pp_size} test"
-        if self.num_gpus > 1 and self.tp_size == 1 and self.pp_size == 1:
-            self.tp_size = self.num_gpus
-
-        if self.tp_size > 1 or self.pp_size > 1 and self.num_gpus == 1:
-            self.num_gpus = self.tp_size * self.pp_size
-
+        assert self.tp_size > 0 and self.pp_size > 0, "TP and PP must be positive!"
         assert self.num_gpus == self.tp_size * self.pp_size, f"Num of GPU shall be equal to TP*PP: {self.num_gpus}, {self.tp_size}, {self.pp_size}"
         if self.gpu_weights_percent != -1:
             assert 0 <= self.gpu_weights_percent <= 1, f"Invalid gpu_weights_percent: {self.gpu_weights_percent}!"
@@ -871,7 +925,7 @@ class PerfTestConfig:
         if self.is_bert_like():
             assert len(self.output_lens
                        ) == 0, f"BERT-like models must not have output_lens!"
-        else:
+        elif self.model_name != "muse_spark_open_nvfp4_agentx":
             assert len(
                 self.output_lens
             ) > 0, f"GPT-like models and enc-dec models must have output_lens!"
@@ -1019,6 +1073,27 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_test_name(self) -> str:
         return str(self._config)
 
+    def _get_kv_cache_free_gpu_mem_fraction(self,
+                                            fraction: float | None = None
+                                            ) -> float:
+        """Return the KV cache fraction, capped on H100 for known OOM cases.
+
+        The cap leaves the test name, and thus its perf history, unchanged.
+        """
+        if fraction is None:
+            fraction = self._config.kv_cache_free_gpu_mem_fraction
+        lens = list(zip(self._config.input_lens, self._config.output_lens))
+        cap = None
+        if len(lens) == 1:
+            cap = _H100_KV_CACHE_FRACTION_CAPS.get(
+                (self._config.model_name, *lens[0]))
+        if cap is not None and cap < fraction and any(
+                "H100" in gpu for gpu in get_gpu_device_list()):
+            print_info(f"Capping kv_cache_free_gpu_mem_fraction {fraction} -> "
+                       f"{cap} for {self.get_test_name()} on H100.")
+            return cap
+        return fraction
+
     def set_runtime_configs(self,
                             llm_root,
                             working_dir,
@@ -1040,11 +1115,62 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._gpu_clock_lock = gpu_clock_lock
 
     def get_trtllm_bench_model(self):
-        return get_model_dir(self._config.model_name)
+        model_dir = get_model_dir(self._config.model_name)
+        if self._config.model_name == "glm_5.3_flash_nvfp4_mtp_bf16_kv":
+            return self._prepare_bf16_kv_checkpoint(model_dir)
+        return model_dir
+
+    def _prepare_bf16_kv_checkpoint(self, model_dir: str) -> str:
+        """Keep checkpoint weight quantization while disabling KV quantization.
+
+        The shared GLM export declares FP8 KV. The loader's ``auto`` preserves
+        that metadata and it rejects an explicit ``bfloat16`` override. Use a
+        workspace-local view with amended JSON metadata and symlinked weights.
+        """
+
+        def clear_kv_quantization(config: dict) -> None:
+            for key, value in config.items():
+                if key in {"kv_cache_quant_algo", "kv_cache_scheme"}:
+                    config[key] = None
+                elif isinstance(value, dict):
+                    clear_kv_quantization(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            clear_kv_quantization(item)
+
+        checkpoint = os.path.join(self._get_engine_dir(), "bf16-kv-model")
+        os.makedirs(checkpoint, exist_ok=True)
+        for name in os.listdir(model_dir):
+            source = os.path.join(model_dir, name)
+            destination = os.path.join(checkpoint, name)
+            if name in {
+                    "config.json", "hf_quant_config.json", "quant_cfg.json"
+            }:
+                with open(source) as f:
+                    config = json.load(f)
+                if name == "config.json":
+                    dtype = config.get("dtype", config.get("torch_dtype"))
+                    if dtype not in {"bfloat16", "bf16"}:
+                        raise ValueError(
+                            "The GLM BF16-KV recipe requires a BF16 checkpoint; "
+                            f"found dtype={dtype!r}")
+                clear_kv_quantization(config)
+                with open(destination, "w") as f:
+                    json.dump(config, f)
+            elif not os.path.lexists(destination):
+                os.symlink(os.path.abspath(source), destination)
+        return checkpoint
 
     def _get_model_yaml_config(self) -> dict:
         config = get_model_yaml_config(self._config.to_string(),
                                        lora_dirs=self.lora_dirs)
+        for option, attribute, section, key in _launch_options_in(config):
+            if option in self._config.explicit_options:
+                section[key] = getattr(self._config, attribute)
+        if 'kv_cache_dtype' in self._config.explicit_options:
+            config.setdefault('kv_cache_config',
+                              {})['dtype'] = self._config.kv_cache_dtype
         if self._config.moe_backend is not None:
             config.setdefault('moe_config',
                               {})['backend'] = self._config.moe_backend
@@ -1218,7 +1344,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--max_batch_size={self._config.max_batch_size}",
             f"--max_num_tokens={self._config.max_num_tokens}",
             f"--report_json={report_path}",
-            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
+            f"--kv_cache_free_gpu_mem_fraction={self._get_kv_cache_free_gpu_mem_fraction()}",
         ]
         benchmark_cmd += [f"--backend={self._config.backend}"]
         if self._config.num_reqs > 0:
@@ -1285,8 +1411,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         serve_config.setdefault('max_batch_size', self._config.max_batch_size)
         serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)
         kv_cache_cfg = serve_config.setdefault('kv_cache_config', {})
-        kv_cache_cfg.setdefault('free_gpu_memory_fraction',
-                                self._config.kv_cache_free_gpu_mem_fraction)
+        fraction = self._get_kv_cache_free_gpu_mem_fraction(
+            kv_cache_cfg.get('free_gpu_memory_fraction'))
+        kv_cache_cfg['free_gpu_memory_fraction'] = fraction
         if self._config.tp_size > 1:
             serve_config.setdefault('tensor_parallel_size',
                                     self._config.tp_size)
@@ -1436,6 +1563,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                         output_len,
                                         real_dataset_path: str = ""):
         model_dir = self.get_trtllm_bench_model()
+        if self._config.model_name == "muse_spark_open_nvfp4_agentx":
+            return [
+                "env",
+                "AGENTX_DURATION=3600",
+                # Cover warmup, benchmark grace, and dataset preparation.
+                "AGENTX_TIMEOUT_GRACE=2400",
+                "AGENTX_MAX_CTX=1048576",
+                "AGENTX_WARMUP_PER_LANE=10",
+                "AGENTX_EXTRA_ARGS=--benchmark-grace-period 30 "
+                "--warmup-grace-period 1800 --num-dataset-entries 393",
+                "python",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "agentx_client.py"),
+                "--model",
+                model_dir,
+                "--concurrency",
+                str(self._config.concurrency),
+                "--dataset",
+                "semianalysis_cc_traces_weka_062126",
+                "--artifact-dir",
+                os.path.join(self._output_dir, "agentx"),
+            ]
         client_cmd = [
             "python",
             "-m",
@@ -1534,6 +1683,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         reuse would then serve their prefixes to the measured requests. If the
         source has no articles to spare, the client gets no pass.
         """
+        if self._config.model_name == "muse_spark_open_nvfp4_agentx":
+            # AgentX owns the scenario warmup and measured duration.
+            return None
         if not warmup_pass_enabled():
             return None
         num_requests = one_wave_requests(self._config.concurrency,
@@ -1586,7 +1738,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             data_cmds = []
             for bs in self._config.batch_sizes:
                 for len_idx, input_len in enumerate(self._config.input_lens):
-                    output_len = self._config.output_lens[len_idx]
+                    output_len = (self._config.output_lens[len_idx]
+                                  if self._config.output_lens else None)
                     real_dataset_path = ""
                     if self._config.model_name in SPEC_DEC_REAL_DATASET_MODELS:
                         dataset_source = SPEC_DEC_REAL_DATASET_MODELS[
@@ -1628,7 +1781,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_env.pop("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS",
                                None)
                 server_env["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
-            if self._config.model_name in QWEN38_MTP_MODELS:
+            if self._config.model_name in {
+                    "kimi_k3_nvfp4_dep8",
+                    "glm_5.3_flash_nvfp4_mtp_bf16_kv",
+                    "minimax_m3.1_flash_nvfp4",
+                    "minimax_m3.1_flash_nvfp4_dspark",
+                    "muse_spark_open_nvfp4_agentx",
+            }:
+                server_timeout = 5400
+            elif self._config.model_name in QWEN38_MTP_MODELS:
                 server_timeout = 5400
             elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
@@ -1747,15 +1908,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             print_info(f"Metric {metric_name} is N/A; skip recording it.")
             return None
 
-        if len(metric_values) == 0:
-            if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
-                print_info("skip building process for multi-gpu test"
-                           )  #https://nvbugspro.nvidia.com/bug/5210111
-                metric_values = [0.0]
-            else:
-                raise RuntimeError(
-                    f"Cannot find perf result for {metric_name} from perf script logs!"
-                )
+        if not metric_values:
+            raise RuntimeError(
+                f"Cannot find perf result for {metric_name} from perf script logs!"
+            )
 
         if metric.metric_type in BUILDER_METRICS and metric.metric_type != PerfMetricType.ENGINE_SIZE:
             # For enc-dec models, there are 2 builder perf metrics, we add them up.
@@ -1988,8 +2144,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         for bs in self._config.batch_sizes:
             for len_idx, input_len in enumerate(self._config.input_lens):
                 cmd_idx += 1
-                output_len = None if self._config.is_bert_like(
-                ) else self._config.output_lens[len_idx]
+                output_len = (self._config.output_lens[len_idx]
+                              if self._config.output_lens else None)
 
                 # Get list of metrics depending on config.
                 if self._config.runtime == "serve":

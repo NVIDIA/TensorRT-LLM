@@ -31,7 +31,7 @@ import triton.language as tl
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 from ....modules.fla.op import gdc_wait_with_memory_clobber
-from .flashinfer_trtllm_gen import _get_bmm1_scale_log2
+from .flashinfer_trtllm_gen import trtllm_gen_paged_decode
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -310,6 +310,12 @@ def _seg_merge_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+def load_trtllm_gen_decode_module() -> None:
+    """Load FlashInfer's trtllm-gen decode module, which segment_attention and the trtllm-gen decode call; FlashInfer
+    JIT-builds it on first use."""
+    flashinfer.decode.get_trtllm_gen_fmha_module()
+
+
 def segment_attention(
     seg_q: torch.Tensor,
     kv_pool: torch.Tensor,
@@ -325,9 +331,9 @@ def segment_attention(
 ) -> None:
     """trtllm-gen decode of every segment as a one-token request of seg_q's folded heads, with its base-2 LSE.
 
-    Calls FlashInfer's trtllm-gen decode op directly (the op behind ``trtllm_batch_decode_with_kv_cache``), skipping
-    the public wrapper's per-call argument validation. Launched without PDL: the FMHA may read the segment tables /
-    lengths, which the kernel right before it writes, before its dependency wait.
+    Calls FlashInfer's trtllm-gen decode op directly (trtllm_gen_paged_decode), skipping the public wrapper's per-call
+    argument validation. Launched without PDL: the FMHA may read the segment tables / lengths, which the kernel right
+    before it writes, before its dependency wait.
 
     Args:
         workspace: the trtllm-gen decode's FMHA workspace plus segment_attention_softmax_bytes(*seg_q.shape[:2])
@@ -338,11 +344,9 @@ def segment_attention(
     assert counter.numel() * counter.element_size() >= 4 * max(
         num_requests * num_heads, sm_count
     ), "multi-CTA counter buffer too small for the segment attention call"
-    flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
+    trtllm_gen_paged_decode(
         seg_out,
-        None,  # out_scale_factor
         seg_q,
-        kv_pool,
         kv_pool,
         workspace,
         counter,
@@ -350,31 +354,13 @@ def segment_attention(
         seg_lens,
         _SEGMENT_MAX_Q_LEN,  # max_q_len
         max_seg_len,
-        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale,
+        bmm1_scale,
         bmm2_scale,
-        -1.0,  # o_sf_scale
-        -1,  # o_sf_vec_size
-        0,  # o_sf_start_index
         num_requests,
         -1,  # window_left
-        0,  # sparse_mla_top_k
         sm_count,
         False,  # enable_pdl
-        workspace.numel() * workspace.element_size(),
-        None,  # sinks
-        None,  # cum_seq_lens_q
-        None,  # k_block_scales
-        None,  # v_block_scales
-        None,  # skip_softmax_threshold_scale_factor
-        False,  # uses_shared_paged_kv_idx
-        seg_lse,
-        1.0,  # lse_scale
-        seg_lse.stride(0),
-        seg_lse.stride(1),
-        False,  # enable_block_sparse_attention
-        None,  # sparse_mla_top_k_lens
-        0,  # bf16q_fp8kv_transform_mode (FP8 query)
-        None,  # use_fp16_softmax
+        lse=seg_lse,
     )
 
 

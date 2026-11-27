@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The tp4 (Rubin) decode target's fast-path table (``modeling.py``: the row ranges and the selection functions): its
-row ranges against the catalog cells that certify them, the selection for every decode row count, and the phase split.
+row ranges against the catalog cells that certify them, and the selection for every decode row count. The
+prefill/decode phase split is covered for every SM 10.7 target in ``test_prefill_fullgraph.py``.
 
 The paths whose cells pass on SM 10.7 take the sm_103 tp4 rows; the ones built on kernels with no SM 10.7 build (the
 the fp32 routers, the low-M GEMM, the fused / mega / c1 attention) and the ones not yet driven on
@@ -15,13 +16,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
     triton_sparse_decode as tsd,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm import (  # noqa: E501
     m3_mx_gemv,
 )
 
@@ -116,7 +117,7 @@ def test_the_dense_layers_take_the_fullctx_decode_at_the_measured_tp4_shapes() -
 
 
 def test_the_fullctx_plans_keep_the_tp4_geometry() -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
         m3_fullctx_decode as kernel,
     )
 
@@ -125,7 +126,7 @@ def test_the_fullctx_plans_keep_the_tp4_geometry() -> None:
 
 
 def test_the_fullctx_entry_cells_run_at_the_forward_plan_capacity() -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention import (  # noqa: E501
         m3_fullctx_decode as entry,
     )
 
@@ -199,16 +200,6 @@ def test_the_generation_router_takes_router_tc_only_on_its_rows(
     calls.clear()
     dispatch._router_logits(_router_core(cluster16), 3, h)
     assert calls == ["fp32"]
-
-
-def test_the_core_selects_the_target_on_the_context_count_alone() -> None:
-    """Every pure generation step is decode's, whatever its width; a step with context rows (a mixed one too) is
-    prefill's."""
-    core = SimpleNamespace(_prefill="prefill", _decode="decode")
-    select = dispatch.MiniMaxM3Tp4ModelingV2._select_target
-    assert select(core, SimpleNamespace(num_contexts=0)) == "decode"
-    assert select(core, SimpleNamespace(num_contexts=1)) == "prefill"
-    assert select(core, SimpleNamespace(num_contexts=7)) == "prefill"
 
 
 @pytest.mark.parametrize("rows", range(1, dispatch.DECODE_MAX_TOKENS + 1))

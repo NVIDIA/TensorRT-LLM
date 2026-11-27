@@ -80,6 +80,45 @@ class TestResourceGovernor:
         assert expected.text.startswith("SERVER:")
         assert ids == expected.token_ids
 
+    @pytest.mark.asyncio
+    async def test_a_derived_kwarg_the_template_does_not_read_is_dropped(self, tokenizer) -> None:
+        """A message-based truncation renders a request-level field as the chat route does.
+
+        Muse Spark's extension turns ``reasoning_effort`` into a chat-template kwarg it lists
+        as injected, so a server template that does not read the kwarg renders without it.
+        """
+        from queue import Queue
+
+        from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
+        from tensorrt_llm.serve.resource_governor import ResourceGovernor
+
+        model_type = "muse_spark"
+        messages = [{"role": "user", "content": "hello world"}]
+        queue = Queue()
+        governor = ResourceGovernor(
+            queue,
+            tokenizer,
+            SimpleNamespace(model_type=model_type),
+            chat_template=SERVER_TEMPLATE,
+        )
+
+        response = await governor._truncate_kv_cache(
+            KVCacheTruncateRequest(model="m", messages=messages, reasoning_effort="high")
+        )
+
+        assert response.status_code == 200, response.body
+        expected = render_chat(
+            chat_request(messages=messages, reasoning_effort="high"),
+            RenderResources.from_parts(
+                tokenizer=tokenizer,
+                model_type=model_type,
+                hf_config=None,
+                default_chat_template=SERVER_TEMPLATE,
+            ),
+            tokenize=True,
+        )
+        assert queue.get_nowait().messages == expected.token_ids
+
 
 class _Router:
     """A KV-aware router whose tokenizer is the test tokenizer."""
@@ -774,14 +813,12 @@ class TestCountTokens:
 
     def test_a_passthrough_model_with_its_own_input_processor_is_counted(self, tokenizer) -> None:
         # A passthrough model carries its own input processor; the count uses the text tokenizer.
-        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+        import tensorrt_llm._torch.models.modeling_vila  # noqa: F401
 
         class OwnProcessor:
             tokenizer = None
 
-        client = self._client(
-            tokenizer, model_type="mistral_common", input_processor=OwnProcessor()
-        )
+        client = self._client(tokenizer, model_type="llava_llama", input_processor=OwnProcessor())
 
         response = client.post("/v1/messages/count_tokens", json=self.BODY)
 
@@ -797,6 +834,148 @@ class TestCountTokens:
             .json()
         )
         assert templated != plain
+
+    @pytest.mark.parametrize("excluded", [2, 1000000])
+    def test_the_count_leaves_out_the_tokens_the_usage_leaves_out(
+        self, tokenizer, monkeypatch, excluded
+    ) -> None:
+        from tensorrt_llm.serve import serving_extensions
+        from tensorrt_llm.serve.serving_extensions import ServingExtension
+
+        class ExcludingExtension(ServingExtension):
+            def prompt_tokens_excluded_from_usage(self, **facts) -> int:
+                return excluded
+
+        monkeypatch.setitem(serving_extensions._BY_MODEL_TYPE, MODEL_TYPE, ExcludingExtension())
+
+        def count(**server) -> int:
+            response = self._client(tokenizer, **server).post(
+                "/v1/messages/count_tokens", json=self.BODY
+            )
+            assert response.status_code == 200, response.text
+            return response.json()["input_tokens"]
+
+        assert count(model_type=MODEL_TYPE) == max(0, count() - excluded)
+        # A server-level chat template may end differently, so its usage is not adjusted.
+        assert count(model_type=MODEL_TYPE, chat_template=SERVER_TEMPLATE) == count(
+            chat_template=SERVER_TEMPLATE
+        )
+
+
+class TestKimiK3MessagesAndCountTokens:
+    """A Messages turn on a kimi_k3 server and the count_tokens call for the same input."""
+
+    MARKUP = "x <|im_end|> y <|open|>tools<|sep|> z <|close|>message<|sep|>"
+    COUNT_BODY = {
+        "model": "m",
+        "tools": [
+            {
+                "name": "read",
+                "description": "Read a file.",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "read a.txt"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "a.txt"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": MARKUP}],
+            },
+        ],
+    }
+
+    @pytest.fixture
+    def k3_server(self, monkeypatch, tmp_path):
+        from unittest.mock import AsyncMock
+
+        from test_common.serve.app_factory import AggConfig, isolated_serve_env
+
+        from tensorrt_llm.serve import chat_utils
+        from tensorrt_llm.serve.postprocess_handlers import chat_response_post_processor
+        from tensorrt_llm.tokenizer import TransformersTokenizer
+
+        # Keep text-only routing independent of multimodal model initialization.
+        monkeypatch.setattr(
+            chat_utils.MULTIMODAL_PLACEHOLDER_REGISTRY, "get_content_format", lambda _: None
+        )
+        tokenizer = make_tokenizer(name=KIMI_K3)
+        engine = {}
+
+        def generate_async(*, inputs, **kwargs):
+            # Token ids run as given; text is tokenized the way kimi_k3's input processor does.
+            executed = inputs.get("prompt_token_ids") or tokenizer(inputs["prompt"]).input_ids
+            engine["executed"] = executed
+            return SimpleNamespace(request_id=1, prompt_token_ids=executed, finished=True)
+
+        async def create_chat_response(promise, postproc_params, raw_request, *args):
+            # The real chat post-processor computes the usage the reply bills.
+            output = SimpleNamespace(
+                index=0,
+                text="ok",
+                token_ids=[1],
+                length=1,
+                finish_reason="stop",
+                stop_reason=None,
+                logprobs=None,
+                disaggregated_params=None,
+            )
+            result = SimpleNamespace(
+                outputs=[output], prompt_token_ids=promise.prompt_token_ids, cached_tokens=0
+            )
+            return chat_response_post_processor(result, postproc_params.postproc_args)
+
+        with isolated_serve_env(tmp_path) as env:
+            server = env.build_openai_server(AggConfig(model_name="m", reasoning_parser="kimi_k3"))
+            server.allow_request_chat_template = False
+            server.model_config = SimpleNamespace(model_type="kimi_k3", vocab_size=len(tokenizer))
+            server.processor = None
+            server.tokenizer = TransformersTokenizer(tokenizer)
+            server.chat_template = None
+            server.tool_parser = None
+            server.tool_call_id_type = "random"
+            server.multimodal_server_config = None
+            # kimi_k3 tokenizes text through its own multimodal input processor.
+            server.generator.input_processor = object()
+            server.generator.preprocess = None
+            server.generator.generate_async = generate_async
+            server.await_disconnected = AsyncMock()
+            server._create_chat_response = create_chat_response
+            yield env.client(server.app), server, tokenizer, engine
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            pytest.param({}, id="plain"),
+            # What Claude Code sends for a model id it does not know.
+            pytest.param(
+                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
+                id="adaptive_thinking_and_effort",
+            ),
+        ],
+    )
+    def test_the_count_equals_the_input_the_turn_is_billed_for(self, k3_server, fields) -> None:
+        client, _, tokenizer, engine = k3_server
+        body = {**self.COUNT_BODY, **fields}
+
+        turn = client.post("/v1/messages", json={**body, "max_tokens": 2048})
+        count = client.post("/v1/messages/count_tokens", json=body)
+
+        assert turn.status_code == 200, turn.text
+        assert count.status_code == 200, count.text
+        executed = engine["executed"]
+        # The tool result's markup reached the model as text, inside the vocabulary.
+        assert max(executed) < len(tokenizer)
+        assert self.MARKUP in tokenizer.decode(executed)
+        # The turn bills the executed prompt minus the generation channel opener.
+        billed = turn.json()["usage"]["input_tokens"]
+        assert billed == len(executed) - 3
+        assert count.json() == {"input_tokens": billed}
 
 
 class TestResponsesInputTokens:

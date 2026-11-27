@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the ``comm/mnnvl_allgather_split`` catalog entry on its ``MnnvlWorkspace``.
+"""GPU certification matrix for the ``comm/mnnvl_allgather_split`` op on its ``MnnvlWorkspace``.
 
 The op takes one turn of the workspace's Lamport rotation, which every MNNVL op of the TP group advances (this op,
 ``comm/mnnvl_fusion_allreduce`` on either path and ``comm/mnnvl_allreduce_attn_res``). So beyond single calls (every
@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+from tensorrt_llm._torch.modeling_v2._native import load_family_ops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
@@ -58,7 +58,7 @@ TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 SPLITS = tuple((LATENT // w, EXPERTS // w) for w in (2, 4, 8, 16)) + ((8, 4),)
 DECODE_MAX_TOKENS = 8
 # Kimi K3's one-shot ceilings: DECODE_AR_ONE_SHOT_MAX_BYTES on decode steps (at most 8 tokens),
-# WIDE_AR_ONE_SHOT_MAX_BYTES (main's default) on wide decode steps.
+# WIDE_AR_ONE_SHOT_MAX_BYTES (the stock MNNVL all-reduce's 1 MiB) on wide decode steps.
 DECODE_ONE_SHOT_MAX_BYTES = 4 << 20
 WIDE_ONE_SHOT_MAX_BYTES = 1 << 20
 EPS = 1e-5
@@ -93,7 +93,7 @@ ROT = {}
 STATS = {"normed_err": 0.0, "attn_res_err": 0.0}
 
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 
 def buffer_bytes(world: int) -> int:
@@ -447,7 +447,7 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
     expect_refusal(lambda: allgather_split(rows[:0], 8, WS_A), RuntimeError, "no rows")
     expect_refusal(
         lambda: load_family_ops(
-            "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+            "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
         ).mnnvl_allgather_split(
             rows, 8, R.world + 1, WS_A.comm_buffer(torch.bfloat16), WS_A.buffer_flags
         ),
@@ -708,13 +708,13 @@ def _run_one_rank(args) -> int:
     global validating
     R = ls.Rank(args)
     assert R.world in (2, 4, 8, 16), f"K3's shapes shard over 2, 4, 8 or 16 ranks, not {R.world}"
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allgather_split as module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allreduce_attn_res as attn_res_module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_fusion_allreduce as reduce_module,
     )
 

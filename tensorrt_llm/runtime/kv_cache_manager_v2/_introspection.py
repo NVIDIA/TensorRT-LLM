@@ -265,6 +265,19 @@ def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     return list(_cpp().storage_utilization(manager, cache_level))
 
 
+def remote_unquiesced_transfers(manager: Any) -> int:
+    """Release the staging of remote transfers that quiesced after their deadline; return how many still have not."""
+    return int(_cpp().remote_unquiesced_transfers(manager))
+
+
+def level_pool_groups(manager: Any, cache_level: int) -> list[tuple[int, int, list[int]]]:
+    """Return (slot count, bytes per slot, layer-group IDs) for each pool group of a cache level."""
+    return [
+        (int(slots), int(slot_bytes), list(life_cycles))
+        for slots, slot_bytes, life_cycles in _cpp().level_pool_groups(manager, cache_level)
+    ]
+
+
 def disk_copy_counters(manager: Any) -> dict[str, int]:
     """Return the retained disk copy and write-through counters of the storage manager."""
     return dict(_cpp().disk_copy_counters(manager))
@@ -277,6 +290,11 @@ def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     BAD_PAGE_INDEX. Empty when the life cycle reserves no cache.
     """
     return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
+
+
+def locality_domain_free_slots(manager: Any) -> list[int]:
+    """Return the free GPU slot count per locality domain, summed over pool groups."""
+    return list(_cpp().locality_domain_free_slots(manager))
 
 
 def sparse_cache_base_cell(kv_cache: Any, lc_id: int, pool: int = 0) -> int | None:
