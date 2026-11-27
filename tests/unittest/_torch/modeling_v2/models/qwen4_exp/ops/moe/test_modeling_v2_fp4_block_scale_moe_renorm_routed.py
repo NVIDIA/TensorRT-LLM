@@ -212,3 +212,30 @@ def test_decode_tactic_valid_and_bitwise(bucket, many_expert_layer):  # noqa: F8
     )[0]
     differing = (y.view(torch.int16) != y_tuner.view(torch.int16)).any(dim=1).sum().item()
     assert differing == 0, f"{differing} of {bucket} rows differ from the AutoTuner path"
+
+
+@pytest.mark.parametrize("rows", [12288, 16384])
+def test_one_launch_is_bitwise_the_8192_row_chunks(rows, many_expert_layer):  # noqa: F811
+    """A context launch of up to 16384 rows at one rank is one call (the NVFP4 target's
+    `_routed_experts`); every row equals what the 8192-row chunks it replaces answer."""
+    spec = _ckpt(rows)
+    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
+        many_expert_layer(), spec, 8192 + rows, renorm_moe_routing_op
+    )
+    whole = _routed(args, data, sf, logits, scalars, spec)
+    sf_cols = spec["hidden"] // 16
+    chunks = torch.cat(
+        [
+            _routed(
+                args,
+                data[lo : lo + 8192],
+                sf[lo * sf_cols : (lo + 8192) * sf_cols],
+                logits[lo : lo + 8192],
+                scalars,
+                spec,
+            )
+            for lo in range(0, rows, 8192)
+        ]
+    )
+    differing = (whole.view(torch.int16) != chunks.view(torch.int16)).any(dim=1).sum().item()
+    assert differing == 0, f"{differing} of {rows} rows differ from the 8192-row chunks"

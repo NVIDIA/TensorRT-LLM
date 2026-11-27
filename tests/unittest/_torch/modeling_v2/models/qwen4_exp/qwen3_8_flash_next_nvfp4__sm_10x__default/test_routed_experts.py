@@ -173,6 +173,68 @@ def test_second_expert_copy_kept_only_where_its_launches_can_happen(
     assert M._moe_prefill_copy(one_rank, backend, max_num_tokens) is kept
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "one_rank, prefill_router, rows, launches",
+    [
+        (True, True, 12288, [12288]),
+        (True, True, 16384, [16384]),
+        (True, True, 8192, [8192]),
+        (True, True, 16385, [8192, 8192, 1]),
+        (True, False, 12288, [8192, 4096]),
+        (False, True, 12288, [8192, 4096]),
+    ],
+)
+def test_one_rank_context_launch_up_to_16384_rows_is_one_runner_call(
+    monkeypatch, one_rank, prefill_router, rows, launches
+):
+    """Without the CuteDSL copy a one-rank context launch of 8193..16384 rows is one runner
+    call; its router logits still come from 8192-row GEMMs (cuBLAS picks its kernel by the row
+    count). A decode router, another layout or more rows keep the chunks."""
+    router_rows, runner_rows = [], []
+
+    def router(x, w):
+        router_rows.append(x.shape[0])
+        return torch.zeros(x.shape[0], 4)
+
+    def runner(logits, xq, xsf, *args):
+        assert xsf.numel() == xq.shape[0] * 2
+        runner_rows.append(logits.shape[0])
+        return torch.zeros(logits.shape[0], 8)
+
+    monkeypatch.setattr(M, "cublas_mm", router)
+    monkeypatch.setattr(M, "fp4_block_scale_moe_renorm_routed", runner)
+    core = SimpleNamespace(
+        one_rank=one_rank,
+        trunk_moe_backend="TRTLLM",
+        num_experts=4,
+        topk=2,
+        expert_inter=8,
+        expert_offset=0,
+        local_experts=4,
+    )
+    layer = SimpleNamespace(
+        router=None,
+        fc1_w_cd=None,
+        fc1_w=None,
+        fc1_s=None,
+        fc2_w=None,
+        fc2_s=None,
+        out1_scale=None,
+        out1_gate_scale=None,
+        out2_scale=None,
+    )
+    x = torch.zeros(rows, 32, dtype=torch.bfloat16)
+    # NVFP4 codes (two a byte) and linear e4m3 block scales (one per 16 columns), flat.
+    fp4 = (torch.zeros(rows, 16, dtype=torch.uint8), torch.zeros(rows * 2, dtype=torch.uint8))
+    out = M._routed_experts(
+        core, x, layer, fp4, router if prefill_router else (lambda x, w: router(x, w))
+    )
+    assert out.shape == (rows, 8)
+    assert runner_rows == launches
+    assert router_rows == [min(8192, rows - lo) for lo in range(0, rows, 8192)]
+
+
 # ---- CuteDSL: the experts' geometry and gates ---------------------------------------------
 
 #: The trunk's routed experts: count, top-k, hidden, intermediate, NVFP4 block.

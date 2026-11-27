@@ -895,6 +895,11 @@ def _check_switches(one_rank: bool) -> None:
 #: 656 vs 882.
 _CUTE_DSL_MOE_MIN_ROWS = 4096  # capacity: fixed: a dispatch threshold, not a buffer size
 _CUTE_DSL_MOE_MAX_ROWS = 16384  # capacity: fixed: the op's certified rows
+#: At one rank without that copy, a context-step launch of more than `_MOE_MAX_ROWS` rows and at
+#: most this many is one trtllm-gen runner call (the routed op's certified rows over the whole
+#: layer): the runner streams the layer's experts once instead of once a chunk. GB300, 16384
+#: rows: 1356 -> 1059 us a layer, an engine step's GPU forward 225.4 -> 212.5 ms.
+_MOE_ONE_LAUNCH_MAX_ROWS = 16384  # capacity: fixed: the routed op's certified rows
 # Whether one rank keeps that second copy (about 1.3 GiB a layer). No engine arg owns it, hence
 # an env var read at construction (`_switch`, default on); off drops the copy and every launch
 # runs on trtllm-gen.
@@ -2989,8 +2994,10 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
 
     At one rank with the CuteDSL-layout copy (`moe_prefill_copy`) a launch of
     `_CUTE_DSL_MOE_MIN_ROWS` to `_CUTE_DSL_MOE_MAX_ROWS` rows runs the CuteDSL MoE over it
-    instead, in one call. On the CuteDSL backend (one rank) every launch is
-    `_cute_dsl_routed`, in one call."""
+    instead, in one call. Without it, a context launch (the prefill router) of more than
+    `_MOE_MAX_ROWS` and at most `_MOE_ONE_LAUNCH_MAX_ROWS` rows is one runner call over the
+    chunks' router logits: the same bits as the chunks. On the CuteDSL backend (one rank) every
+    launch is `_cute_dsl_routed`, in one call."""
     rows = x.shape[0]
     if core.trunk_moe_backend == "CUTEDSL":
         xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, False) if fp4 is None else fp4
@@ -3012,6 +3019,37 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
             core.num_experts,
             core.topk,
             memset_stream=core._moe_memset_stream,
+        )
+    if (
+        core.one_rank
+        and router_mm is cublas_mm
+        and fp4 is not None
+        and _MOE_MAX_ROWS < rows <= _MOE_ONE_LAUNCH_MAX_ROWS
+    ):
+        # The router GEMM keeps its chunk-sized calls: cuBLAS picks its kernel by the row count,
+        # and another kernel could move a logit's last bit and flip a near-tie of the top-k.
+        logits = torch.cat(
+            [
+                router_mm(x[lo : lo + _MOE_MAX_ROWS], L.router)
+                for lo in range(0, rows, _MOE_MAX_ROWS)
+            ]
+        )
+        return fp4_block_scale_moe_renorm_routed(
+            logits,
+            fp4[0],
+            torch.reshape(fp4[1], [-1]).view(torch.float8_e4m3fn),
+            L.fc1_w,
+            L.fc1_s,
+            L.fc2_w,
+            L.fc2_s,
+            L.out1_scale,
+            L.out1_gate_scale,
+            L.out2_scale,
+            core.num_experts,
+            core.topk,
+            core.expert_inter,
+            core.expert_offset,
+            core.local_experts,
         )
     sf_cols = x.shape[1] // _SF_VEC
     parts = []
