@@ -72,6 +72,18 @@ def test_moe_load_balancer_configs_use_restricted_serialization(config):
     assert restored == config
 
 
+def test_lora_config_uses_restricted_serialization():
+    from tensorrt_llm.llmapi import LoraConfig
+
+    config = LoraConfig(lora_dir=["/tmp/lora"])
+    restored = serialization.loads(
+        serialization.dumps(config),
+        approved_imports=serialization.BASE_EXAMPLE_CLASSES,
+    )
+    assert type(restored) is LoraConfig
+    assert restored == config
+
+
 def test_serialization_disallowed_class():
     obj = TestClass("test")
     a = serialization.dumps(obj)

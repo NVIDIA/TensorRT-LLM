@@ -8,8 +8,8 @@ from typing import Optional
 from huggingface_hub import snapshot_download
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor import LoRARequest
+from tensorrt_llm.llmapi import LoraConfig
 
 
 def main(chatbot_lora_dir: Optional[str], mental_health_lora_dir: Optional[str],
