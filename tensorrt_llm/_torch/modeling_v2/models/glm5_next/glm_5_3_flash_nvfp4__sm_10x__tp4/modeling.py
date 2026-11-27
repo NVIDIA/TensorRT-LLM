@@ -120,8 +120,6 @@ IDX_SPLIT_MIN_T = 1024
 ATTN_TILED_MIN = 64
 # temperatures below this are greedy (the runtime's sampler threshold)
 GREEDY_TEMPERATURE = 1e-4
-# `multimodal_data` entries that carry media for an encoder, or encoder output in place of it
-MEDIA_KEYS = frozenset({"audio", "image", "video", "multimodal_embedding"})
 
 
 def _runtime_model_config(model_config: ModelConfig) -> ModelConfig:
@@ -1136,18 +1134,6 @@ class ModelingV2Glm53FlashNvfp4Sm10xTp4(
                 "return_context_logits / prompt_logprobs are not supported by the GLM-5.3-Flash "
                 "ModelingV2 target: it computes the logits of each sequence's last token only. "
                 "Drop them from the request."
-            )
-
-    def validate_multimodal_request_data(self, mm_data: dict) -> None:
-        """Admission check of a request's multimodal payload, run by the executor: a payload that
-        carries media is refused, as that request's own error. The target builds no vision tower,
-        so the forward would serve the request's text without the media. A payload without media
-        is admitted."""
-        media = sorted(key for key in MEDIA_KEYS if mm_data.get(key) is not None)
-        if media:
-            raise ValueError(
-                f"{type(self).__name__} serves this checkpoint's language model only and does not "
-                f"accept multimodal input; the request carries {', '.join(media)}"
             )
 
     def forward(

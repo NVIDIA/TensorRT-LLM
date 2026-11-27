@@ -81,7 +81,9 @@ double underscores between the three parts:
 The target class name contains the same three parts in CamelCase, for example
 `ModelingV2DeepseekR10528Nvfp4Sm10xDefault` in
 [`r1_0528_nvfp4__sm_10x__default`](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/).
-These names are conventions, not requirements.
+These names are conventions, not requirements. The one rule is for a
+vision-language model, whose class name ends with `ForConditionalGeneration`
+(see [Multimodal targets](#multimodal-targets)).
 
 A target can contain several execution paths. The DeepSeek R1 target, for
 example, has separate `PrefillTarget` and `DecodeTarget` classes and picks one
@@ -93,6 +95,7 @@ on each forward step. In this guide, "target" always means the whole directory.
 modeling_v2/
 ├── _router_index.py           # Route registration and target resolution
 ├── _native.py                 # Loads family native libraries
+├── multimodal.py              # Base class of vision-language targets
 ├── catalog/
 │   ├── _op.py                 # OpWrapper: the operation contract
 │   └── <category>/            # Operations used by more than one family
@@ -134,6 +137,11 @@ family's and its own operations and kernels. From the rest of TensorRT-LLM,
 it uses only runtime interfaces, for example:
 
 * `DecoderModel`, `DecoderModelForCausalLM`, `ModelConfig` and `Mapping`.
+* `MultimodalModelMixin` and `MultimodalEncoderMixin`. A vision-language target
+  inherits the first through `MultimodalModelForCausalLM`
+  ([`multimodal.py`](multimodal.py)), and its tower the second. It does not
+  subclass or call a Modeling V1 model, vision tower, layer, attention backend
+  or MoE.
 * Attention and speculative metadata, and the KV cache managers.
 
 A target does not import, subclass or call Modeling V1 model code: the model
@@ -173,8 +181,11 @@ example that uses no Modeling V1 model code.
 ## Model lifecycle
 
 A target plugs into TensorRT-LLM through the existing `DecoderModel` and
-`DecoderModelForCausalLM` interfaces. It inherits these classes directly, not
-a Modeling V1 model class, and can override any of these steps:
+`DecoderModelForCausalLM` interfaces. A language model target inherits these
+classes directly, not a Modeling V1 model class. A vision-language target
+subclasses `MultimodalModelForCausalLM`, which holds such a language
+model target as `llm` (see [Multimodal targets](#multimodal-targets)). Either
+can override any of these steps:
 
 * **Constructor:** builds the model structure and parameters.
 * **`load_weights`:** loads checkpoint weights into the model. Put weight
@@ -192,6 +203,74 @@ classes are fine when they make the code clearer or faster. The
 [GPT-OSS target](models/gpt_oss/gpt_oss_120b__sm_10x__default/modeling.py) and
 its [weight loader](models/gpt_oss/gpt_oss_120b__sm_10x__default/weights.py)
 are a small example.
+
+## Multimodal targets
+
+A vision-language target declares its decoder and its towers on
+`MultimodalModelForCausalLM`. The base constructs the decoder as `llm` and
+stores the towers in an `nn.ModuleDict` keyed by their declared names.
+
+```python
+class ModelingV2MyTargetForConditionalGeneration(MultimodalModelForCausalLM):
+    llm_class = ModelingV2MyTarget
+    mm_encoders = {
+        "vision": MultimodalEncoderSpec(
+            cls=MyTower, weight_prefix="model.visual.", modalities=("image", "video")
+        ),
+    }
+```
+
+Each spec constructs a local tower with the corresponding checkpoint subconfig
+(for example, `vision_config`) and the decoder activation dtype. When the checkpoint
+has no subconfig for that encoder name, the tower receives the composite config.
+`weight_prefix` accepts one prefix or a tuple of disjoint prefixes for a tower
+and its projector. With `disable_mm_encoder`, the base skips tower construction
+and matching values in the weight mapping it receives. The checkpoint reader
+can still load an entire shard before calling the model.
+
+| Feature | Tower or processor contract |
+| --- | --- |
+| Chunked prefill | The processor publishes prompt embedding positions. The shared forward retrieves request embeddings and selects the active chunk. |
+| Grouped encoding | One spec defines one compatible group. Its tower's `build_batched_input(params)` packs in declared modality order, then request order. `forward(**packed)` preserves that order. The processor provides prompt-ordered `item_refs` and exact `output_embedding_lengths` for real and dummy inputs. |
+| Item scheduling | Each tower opts in with `supports_mm_encoder_item_scheduling`. The paired processor supplies costs and field partitions in `get_mm_item_metadata`, maximum item sizes, output capacity, and legal dummy inputs. A tower with tighter limits can implement `get_mm_max_tokens_per_item` and `get_dummy_mm_data` together. Both receive the processor as their first argument. |
+| Cross-request cache | Every tower declares `supports_encoder_cache` when its output is reusable by stable media and processor hashes. The mixin builds partial misses from the processor's partitions. A worker needs a local tower and a positive `encoder_cache_max_bytes` for persistent reuse. |
+| Side-stream prefetch | A tower that runs safely on the current stream declares `multimodal_data_device_paths`. The base combines paths across towers. Configure `encoder_side_stream_max_ahead` with item scheduling disabled. |
+| GPU vision normalization | Image and video towers opt in with `supports_vision_gpu_normalize`. The architecture's processor must support raw pixels with `VisionNormalization`. The packer calls `normalize_vision_pixels` after staging. |
+| Encoder attention | The model exposes each tower's `supported_encoder_attention_backends` by spec name. An empty set declares fixed attention. Configurable towers receive a private `model_config` with explicit selections applied. Use `get_encoder_attention_backend(name, default)` when the tower's default differs from the decoder's. |
+
+The default fusion uses the decoder's text embedding layer. A decoder that
+needs the original IDs sets `llm_requires_input_ids = True` and receives
+`input_ids`, the current `mm_embeds` and their `mm_token_indices`.
+Both Qwen targets use this path for PLE. Their processor supplies M-RoPE
+positions, item partitions and merged lengths. Their towers use fixed attention.
+
+A target can customize decoder arguments with `get_language_model_extra_forward_kwargs`.
+A custom forward processing media must call `prepare_multimodal_inputs` or
+`prepare_multimodal_embeds`. Subclass registration checks the grouped encoder
+and shared preparation methods. A custom forward is checked on an actual media step.
+
+Modeling V2 checks admission before batching. The base accepts in-vocabulary
+prompt IDs. A target using out-of-vocabulary media sentinels needs admission
+that validates them against its processor's exact IDs and placement.
+A V2 worker without a local
+encoder rejects raw media. Precomputed embeddings require a multimodal V2
+model in encoder/prefill disaggregated mode. M-RoPE positions alone pass
+this check. Modeling V1 models keep their existing admission behavior.
+MiniMax-M3.1 DEP uses its registered model's vision tower.
+
+| Media architecture | Composite | Existing encoder | Text-only targets |
+| --- | --- | --- | --- |
+| Qwen3.8-Flash-Next (sm103, sm107) | FP8 and NVFP4 | — | — |
+| GLM-5.3-Flash | — | — | FP8 and NVFP4 TP4 on sm100/sm103, NVFP4 default and default MTP-fused on sm100 |
+| Kimi K3 | — | — | Both sm100 MXFP4 TP16 targets and all four sm107 NVFP4 targets |
+| MiniMax-M3 | — | — | NVFP4 TP4/TP8 on sm103 and TP2/TP4/TP8 on sm107 |
+| MiniMax-M3.1-Flash (sm107) | — | DEP | TP2, TP4, TP8, TP2 context and DEP2 context |
+
+The Qwen vision towers support side-stream prefetch and decline encoder CUDA graphs.
+
+Name a new composite `ModelingV2<Target>ForConditionalGeneration`. Its decoder
+keeps the name `ModelingV2<Target>`. The naming test checks routed composites
+against the shared base and their class suffix.
 
 ## Routing
 

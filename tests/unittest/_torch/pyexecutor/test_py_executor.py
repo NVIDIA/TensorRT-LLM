@@ -849,6 +849,36 @@ def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:
     assert kwargs == {"requests": [requests[1]], "charge_budget": False}
 
 
+@pytest.mark.parametrize(
+    "payload, error",
+    [
+        ({"image": {"pixel_values": torch.zeros(1)}}, "no local multimodal encoder"),
+        ({"multimodal_embedding": torch.zeros(1, 4)}, "Precomputed multimodal embeddings"),
+    ],
+    ids=["raw-image", "attached-embeddings"],
+)
+def test_text_only_model_fails_only_the_media_request(payload, error, monkeypatch) -> None:
+    from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_10x__tp4.modeling import (  # noqa: E501
+        ModelingV2Glm53FlashNvfp4Sm10xTp4 as Target,
+    )
+
+    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+    model = Target.__new__(Target)
+    torch.nn.Module.__init__(model)
+    model.spec_config = None
+    media, text = [_make_admission_request(i) for i in range(2)]
+    media.py_multimodal_data = payload
+    text.py_multimodal_data = {"mrope_config": {"mrope_position_deltas": torch.zeros(1, 1)}}
+    executor = _make_admission_executor(model, [media, text])
+
+    assert PyExecutor._fetch_and_activate_new_requests(executor) == [text]
+    assert executor.active_requests == [text]
+    executor._handle_errors.assert_called_once()
+    (message,), kwargs = executor._handle_errors.call_args
+    assert error in message
+    assert kwargs == {"requests": [media], "charge_budget": False}
+
+
 def test_model_validation_runs_after_the_sampler_and_before_the_budget() -> None:
     order = []
     model = types.SimpleNamespace(validate_request=lambda request: order.append("model"))

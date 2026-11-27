@@ -994,6 +994,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_vision_gpu_normalize: ClassVar[bool] = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
+    @property
+    def _has_local_encoder(self) -> bool:
+        # Both Gemma variants project locally, including Unified without separate towers.
+        return self.embed_audio is not None or self.embed_vision is not None
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""

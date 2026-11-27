@@ -128,6 +128,15 @@ Optionally, you may replace the native PyTorch modules with our implementations 
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
 
+#### Multimodal Models
+
+For a Modeling V2 vision-language target, subclass `MultimodalModelForCausalLM`
+and name the concrete class `ModelingV2<Target>ForConditionalGeneration`.
+Set `llm_class` to the decoder and declare each tower in the `mm_encoders`
+dictionary with its checkpoint prefix and supported modalities. See the
+[modeling guide](../../../tensorrt_llm/_torch/modeling_v2/README.md#multimodal-targets)
+for the tower and decoder interfaces.
+
 ### Weight Loading
 
 The base class `DecoderModelForCausalLM` provides a `load_weights` method that loads the weights from the checkpoint file and assigns them to the corresponding layers in the model. However, if the default method does not work for `MyModelForCausalLM`, you need to implement your own `load_weights`:

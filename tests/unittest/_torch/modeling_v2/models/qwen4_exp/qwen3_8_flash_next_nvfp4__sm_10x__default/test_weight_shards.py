@@ -45,6 +45,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
     pool as P,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
+    vision as V,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     weights as WT,
 )
 from tensorrt_llm.llmapi import MTPDecodingConfig, QSASparseAttentionConfig
@@ -131,10 +134,9 @@ def _mapping(member: str, rank: int) -> Mapping:
 
 
 def _dims(configs, member: str, rank: int, mtp: bool = True, prefill_copy: bool = False):
-    text, vision = configs
+    text, _ = configs
     return WT.rank_dims(
         text,
-        vision,
         _mapping(member, rank),
         mtp_enabled=mtp,
         trunk_moe_backend="TRTLLM",
@@ -167,6 +169,10 @@ def _rank_manifest(stored, d, member: str) -> dict[str, list[tuple]]:
     cut, pad = WT.lm_head_share(_lm_head_rows(member, d.vocab), d.vocab, d.tp_rank)
     manifest["lm_head.weight"] = [("lm_head.weight", None, cut, pad)]
     return manifest
+
+
+def _vision_dims(configs):
+    return WT.vision_dims(configs[1], torch.bfloat16)
 
 
 def _keys_and_cuts(ckpt_key, cut):
@@ -253,6 +259,11 @@ def test_every_checkpoint_tensor_is_claimed(stored, configs, member, mtp):
             f"rank {rank}: neither read nor predicted {sorted(everything - claimed - unread)[:8]}"
         )
         read_by.update(claimed)
+        # The tower's own table reads the `model.visual.` keys the language table leaves.
+        vision_claimed = _claimed(WT.VISION_WEIGHTS.manifest(_vision_dims(configs)))
+        assert vision_claimed == {k for k in everything if k.startswith("model.visual.")}
+        assert vision_claimed.isdisjoint(claimed)
+        read_by.update(vision_claimed)
 
     mtp_keys = set() if mtp else {k for k in everything if k.startswith("mtp.")}
     assert set(read_by) == everything - mtp_keys, "tensors no rank reads: " + str(
@@ -278,8 +289,11 @@ def test_rank_operands_have_their_parameter_shapes(stored, configs, member, rank
     fills its parameter exactly; the rank reads each tensor at its share, and once per
     layout it is kept in (the routed experts twice with the CuteDSL prefill copy)."""
     d = _dims(configs, member, rank, mtp=True, prefill_copy=prefill_copy)
+    vd = _vision_dims(configs)
     with torch.device("meta"):
         params = dict(WT.MODEL_WEIGHTS.declare(d))
+        # The vision tower's table, which every rank declares whole.
+        params.update(WT.VISION_WEIGHTS.declare(vd))
         # What `load` adds beside the table: the n-gram table and the shell's lm_head.
         params["ple_table"] = torch.empty(
             d.ple_shards * _rows_per_shard(stored, d), d.ple_head_dim, dtype=d.ple_table_dtype
@@ -289,6 +303,7 @@ def test_rank_operands_have_their_parameter_shapes(stored, configs, member, rank
         )
     entries = {key: _HeaderEntry(*spec) for key, spec in stored.items()}
     manifest = _rank_manifest(stored, d, member)
+    manifest.update(WT.VISION_WEIGHTS.manifest(vd))
     assert manifest.keys() == params.keys()
 
     read = collections.Counter()
@@ -507,6 +522,9 @@ def test_load_fills_every_parameter_and_covers_the_checkpoint(
     model = _stub_model(configs, member, rank, mtp)
     WT.MODEL_WEIGHTS.load(model, _meta_checkpoint(stored))
     assert tuple(model.model.w["ple_table"].shape) == (320_001_536, 160)
+    with torch.device("meta"):
+        tower = V.VisionTower(configs[1], torch.bfloat16)
+    tower.load_weights(_meta_checkpoint(stored))
 
 
 @pytest.mark.parametrize("expert_override", (None, QuantAlgo.NVFP4))
@@ -1046,6 +1064,7 @@ def test_dep2_ranks_read_the_checkpoint_in_two_256_expert_windows(stored, config
             f"rank {rank}: neither read nor predicted {sorted(everything - claimed - unread)[:8]}"
         )
         read_by.update(claimed)
+        read_by.update(_claimed(WT.VISION_WEIGHTS.manifest(_vision_dims(configs))))
 
         dep4 = _dims(configs, "dep4", rank, mtp=False)
         non_expert = {k for k in claimed if not _TRUNK_EXPERT_TENSOR.match(k)}

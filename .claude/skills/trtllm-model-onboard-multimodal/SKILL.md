@@ -2,9 +2,8 @@
 name: trtllm-model-onboard-multimodal
 description: >
   Onboard a HuggingFace multimodal model (vision/audio/video + text) to the
-  TensorRT-LLM PyTorch backend. Use when writing a new
-  `tensorrt_llm/_torch/models/modeling_{vlm}.py` plus its input processor and
-  weight mapper, or extending an existing VLM.
+  TensorRT-LLM PyTorch backend. Use for Modeling V2 multimodal targets,
+  Modeling V1 wrappers, their input processors and weight loading.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -25,6 +24,28 @@ for request ownership and process boundaries. Its
 defines minimum metadata, scheduling requirements, unusual payload selection,
 coupled media items, and model-specific extensions. Use that contract alongside
 the implementation steps below.
+
+## Modeling V2 targets
+
+Route the target to a `MultimodalModelForCausalLM` subclass. Set `llm_class` to its V2 decoder and declare one `mm_encoders` entry per compatible tower with `MultimodalEncoderSpec(cls, weight_prefix, modalities)`. With `disable_mm_encoder`, the base skips tower construction and never looks up matching keys in the checkpoint mapping passed to `load_weights`.
+
+| Feature | Shared behavior | What the target supplies |
+| --- | --- | --- |
+| Chunked prefill | The mixin reuses request embeddings and selects the active chunk before fusion. | Publish prompt embedding positions. Default fusion uses the decoder's text embedding layer. |
+| Grouped encoding | The base builds an `EncoderGroup` per spec. The shared `encode_multimodal_inputs` restores request and prompt order. | Pack in spec modality order, then request order, with `build_batched_input`. Tower `forward` preserves that order. Supply `item_refs` and exact `output_embedding_lengths` on real and dummy inputs. |
+| Item scheduling | The base derives `supports_mm_encoder_item_scheduling` across all towers. | Opt in for independent items. The processor supplies costs and partitions via `get_mm_item_metadata`, output capacity and legal dummy inputs. Declare `embedding_dim` and `embedding_dtype` when they cannot be inferred from the text embedding layer. A tower with tighter limits supplies paired sizing and dummy hooks. |
+| Cross-request cache | When all towers declare `supports_encoder_cache`, shared preparation can reuse stable media and processor hashes and encode partial misses. | Supply item lengths and partitions. Enable persistent reuse with `encoder_cache_max_bytes`. |
+| Side-stream prefetch | The base combines tower `multimodal_data_device_paths`. | Declare device fields and run safely on the current stream. Exercise `encoder_side_stream_max_ahead` with item scheduling disabled. |
+| GPU vision normalization | The base derives `supports_vision_gpu_normalize` across image and video towers. | The registered architecture must also opt in so the processor receives `_vision_gpu_normalize`. Supply uint8 pixels with `VisionNormalization` and call `normalize_vision_pixels` after transfer. |
+| Encoder attention | The base collects `supported_encoder_attention_backends` by spec name and passes a private `model_config` with explicit overrides applied. | Declare the supported set. An empty set indicates fixed attention. Use `get_encoder_attention_backend(name, default)` for a tower-specific default. |
+
+Both qwen4_exp targets declare `{"vision": MultimodalEncoderSpec(_vision.VisionTower, "model.visual.", ("image", "video"))}`. Their towers opt into caching, item scheduling and GPU normalization, stage pixels and M-RoPE positions for prefetch, and use fixed attention. FP8 and NVFP4 set `llm_requires_input_ids = True` for n-gram PLE. The shared forward uses `prepare_multimodal_embeds` and passes the original IDs, active `mm_embeds` and `mm_token_indices` to the decoder. See the [qwen4_exp implementations](../../../tensorrt_llm/_torch/modeling_v2/models/qwen4_exp).
+
+P0 checks run at subclass definition. Give each modality and checkpoint prefix one owner. Keep the grouped encode and shared preparation methods, concrete tower packing and forward hooks, and concrete fusion for default placement. A cache opt-in requires every tower's support. A custom forward is checked on media steps and must reach `prepare_multimodal_inputs` or `prepare_multimodal_embeds`. See the [V2 target contract](../../../tensorrt_llm/_torch/modeling_v2/README.md#multimodal-targets).
+
+## Modeling V1 wrappers
+
+Use the following wrapper phases and decorators for Modeling V1.
 
 **Output:**
 - `tensorrt_llm/_torch/models/modeling_{name}.py` — wrapper class (multimodal encoder + LLM) decorated with `@register_auto_model`, `@register_vision_encoder`, `@register_input_processor` (and `@support_multimodal_disaggregated` if EPD is supported), plus a `BaseMultimodalInputProcessor` (+ `BaseMultimodalDummyInputsBuilder`) subclass.
@@ -71,7 +92,7 @@ the implementation steps below.
                 For item-scheduled models, reserve space in the model's one
                 TensorLRUCache. Reuse ready outputs and encode each missing item only
                 once, within the encoder item / token / output-byte limits. Then
-                assemble the current chunk's rows in a forward Params view with
+                assemble the current chunk's embeddings in a forward Params view with
                 multimodal_embedding_is_chunk. The request keeps cache references,
                 not a combined embedding buffer.
                 Full-request models stage the request payload here. H2D obeys
@@ -84,14 +105,13 @@ the implementation steps below.
     MultimodalModelMixin.prepare_multimodal_inputs: full-request encoding looks up
        the persistent cache and encodes partial-hit misses;
        get_multimodal_embeddings then encodes the remaining full misses and
-       joins every request's rows into one batch tensor. If any request is
-       chunk-local, full-request peers are cut to their current-chunk rows
-       before that join.
-    find_input_mm_embeds: returns chunk-local rows unchanged; slices
-       full-request rows down to the active chunk.
+       assembles one batch tensor. If any request is chunk-local, select the
+       active embeddings of its full-request peers before combining them.
+    find_input_mm_embeds: reuses chunk-local embeddings and slices full-request
+       embeddings to the active chunk.
     prepare_mrope_config (mRoPE models): one-shot mrope_rotary_cos_sin per
        request from the staged mrope_position_ids buffer.
-    fuse_input_embeds: merges text and MM rows through the existing precomputed
+    fuse_input_embeds: merges text and multimodal embeddings through the existing precomputed
        index path (optional extra_embeds remain available for multi-feature encoders).
     self.llm.forward(inputs_embeds=..., mrope_config=...) → logits.
 ```
@@ -274,7 +294,7 @@ Confirm `preprocessor_config.json` and `chat_template.json` are pulled. Verify `
 
 Read `config.json`'s `architectures` and `model_type`. If a `_torch/models/modeling_*.py` already claims that architecture via `@register_auto_model`, extend rather than create new. Identify the closest existing multimodal model and note which TRT-LLM modules it reuses.
 
-### Phase 2 — Model wrapper
+### Phase 2 — Modeling V1 wrapper
 
 Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern below mirrors `modeling_llava_next.py` and `modeling_gemma3vl.py` — a single wrapper class that composes a multimodal encoder + an LLM resolved through `AutoModelForCausalLM.from_config(text_config)`. The `*ModelBase + *Model` Base/non-Base split in `modeling_qwen2vl.py` and `modeling_qwen3vl.py` is an implementation detail for sharing one wrapper between two variants of the same family (Qwen2-VL ↔ Qwen2.5-VL; Qwen3-VL ↔ Qwen3-VL-MoE) — keep the wrapper a single class unless you have the same multi-variant need.
 
@@ -336,8 +356,8 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
 
     @property
     def embedding_dim(self) -> int:
-        # Width of one cached encoder-output row. Override when the encoder
-        # folds extra features into each row (Qwen3-VL deepstack).
+        # Width of a cached encoder embedding. Include any extra features
+        # stored in each embedding (Qwen3-VL deepstack).
         return self.text_embedding_layer.embedding_dim
 
     @property
@@ -349,7 +369,7 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
         return ["image.pixel_values", "image.image_grid_thw", "multimodal_embedding"]
 ```
 
-**Required (every multimodal model):**
+**Required for Modeling V1 wrappers:**
 
 - Inherit `MultimodalModelMixin` and use its `forward` unless the family needs explicit
   language-model delegation. If overriding, call `prepare_multimodal_inputs`; never add
@@ -358,8 +378,8 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
   `embedding_dim`, and `embedding_dtype`. The encoder must return one tensor whose first
   dimension equals the processor-declared aggregate output length. The item path validates and
   splits it per item; full-request encoding uses the same common metadata record.
-  `embedding_dim` and `embedding_dtype` describe one cached encoder-output row, not the text
-  embedding: include any extra features folded into each row (Qwen3-VL deepstack returns
+  `embedding_dim` and `embedding_dtype` describe each cached encoder embedding,
+  including any extra features it contains (Qwen3-VL deepstack returns
   `hidden * (deepstack_num_level + 1)`). Item scheduling sizes cache entries from them and
   rejects item outputs with any other width or dtype.
 - Set `supports_mm_encoder_item_scheduling=True` only when the input processor emits valid atomic
@@ -372,7 +392,7 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
 - **mRoPE (Qwen-VL family):** add `init_mrope_embedding(model_config)` in `__init__`, then
   build and forward the mRoPE config from `get_language_model_extra_forward_kwargs`. Reference:
   `Qwen3VLModelBase.prepare_mrope_config`.
-- **Deepstack features (Qwen3-VL):** keep each item's primary and deepstack rows in the same cache
+- **Deepstack features (Qwen3-VL):** keep each item's primary and deepstack embeddings in the same cache
   entry, then use the existing `after_active_multimodal_embeddings` and
   `_fuse_multimodal_embeddings` hooks after the prompt-order tensor is assembled.
 - **HF wrapper without a clean `text_config`:** Qwen2-VL's `Qwen2VLModelBase` rewrites `architectures` to surface the inner LLM. Fall back to that pattern only when the multimodal HF config does not expose a `text_config` sub-config.
@@ -389,10 +409,10 @@ Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and
 - `get_dummy_mm_data(*, max_num_encoder_tokens, mm_counts, dtype) -> multimodal_data` — build the profiler-selected per-modality item counts **directly** as processed encoder tensors (no PIL image + HF-processor round-trip).
 
 For grouped encoders, include `MultimodalItemMetadata` with item references and
-exact output rows in the returned dummy data. Profiling bypasses the normal
+exact output embedding lengths in the returned dummy data. Profiling bypasses the normal
 processor wrapper, so it does not call `get_mm_item_metadata` for you.
 
-Following vLLM's separation of common budgeting from model processing geometry, the profiler selects the largest legal runtime workload and computes its repetition count under `encoder_max_num_tokens` and `encoder_max_batch_size`. It passes the resulting plan (for example, `{"image": 8}`) to the concrete processor's `get_dummy_mm_data`; the processor owns only geometry and tensor layout. Qwen builds `pixel_values`/`*_grid_thw`; Mistral builds `pixel_values`/`image_sizes` and uses its private `_vit_tokens` helper so the LLM-side Pixtral hashing count is unchanged. A model without the contract falls back to a text-only dummy (encoder memory unaccounted). Don't hardcode the encoder attention workspace (`max_num_*=8192`): inherit `MultimodalEncoderMixin` and let the engine size it via `setup_attn_metadata` at load.
+The profiler selects the largest legal runtime workload and computes its repetition count under `encoder_max_num_tokens` and `encoder_max_batch_size`. It passes the resulting plan (for example, `{"image": 8}`) to the concrete processor's `get_dummy_mm_data`; the processor owns only geometry and tensor layout. Qwen builds `pixel_values`/`*_grid_thw`; Mistral builds `pixel_values`/`image_sizes` and uses its private `_vit_tokens` helper so the LLM-side Pixtral hashing count is unchanged. A model without the contract falls back to a text-only dummy (encoder memory unaccounted). Don't hardcode the encoder attention workspace (`max_num_*=8192`): inherit `MultimodalEncoderMixin` and let the engine size it via `setup_attn_metadata` at load.
 
 The workspace dimension comes from `encoder_max_num_tokens`, falling back to the LLM-side `max_num_tokens` when unset. `encoder_max_batch_size` independently bounds the number of atomic items in a multimodal encoder iteration and falls back to `max_batch_size`. The profiler resolves both limits into `mm_counts` before calling `get_dummy_mm_data`. Model-internal attention sequence counts are not the item batch size; they are derived separately from the token budget and model geometry.
 
@@ -401,9 +421,9 @@ The workspace dimension comes from `encoder_max_num_tokens`, falling back to the
 **Common item metadata.** Implement
 `get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)`
 and return `MultimodalItemMetadata`. The framework supplies prompt order and
-known output rows; the processor adds encoder costs and input partitions.
+known output embedding lengths. The processor adds encoder costs and input partitions.
 Full-request models can leave unknown costs as `None`; grouped assembly still
-requires exact output row counts. Do not implement the removed
+requires exact output embedding lengths. Do not implement the removed
 `get_mm_encoder_item_metadata` hook: the registry rejects it at wrapper creation.
 
 **Atomic-item scheduling (optional).** Enable
@@ -425,7 +445,7 @@ Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model tex
 
 **Optional tokenized+MM fast path (skip unless needed):** set `supports_token_id_mm_expansion = True` (`ClassVar`) and implement `get_text_with_mm_placeholders(mm_counts)` + `expand_prompt_token_ids_for_mm(prompt_token_ids, num_mm_tokens, ...)`. The base-class `call_with_token_ids` then builds dummy placeholder text, runs `call_with_text_prompt` on it, expands the real token IDs, and merges any returned `mm_data_updates` (e.g. video `evs_ids`) into `multimodal_data`. Leave the flag `False` and the base class just detokenizes token-ID inputs and re-runs `call_with_text_prompt`. Only LlavaNext + Nemotron H multimodal opt in today.
 
-**EPD overrides (if `@support_multimodal_disaggregated`):** override `_attach_multimodal_embeddings_impl(inputs, multimodal_embedding, sampling_params)` — **not** the `attach_multimodal_embeddings` wrapper — for supplied embeddings. The base wrapper detokenizes tokenized inputs for non-fast-path VLMs before delegating to your impl. If the model supports handle-based E/P handoff, implement `build_disagg_prefill_multimodal_inputs(inputs, mm_handles, *, mm_hashes=None) -> tuple[list[int], MultimodalParams]`; preserve prompt order, hashes, output rows, and model-specific auxiliary data in the returned Params. See Qwen3-VL's implementation and the developer guide's [handoff contract](../../../docs/source/developer-guide/multimodal.md#encoderprefill-handoff).
+**EPD overrides (if `@support_multimodal_disaggregated`):** override `_attach_multimodal_embeddings_impl(inputs, multimodal_embedding, sampling_params)` — **not** the `attach_multimodal_embeddings` wrapper — for supplied embeddings. The base wrapper detokenizes tokenized inputs for non-fast-path VLMs before delegating to your impl. If the model supports handle-based E/P handoff, implement `build_disagg_prefill_multimodal_inputs(inputs, mm_handles, *, mm_hashes=None) -> tuple[list[int], MultimodalParams]`; preserve prompt order, hashes, output embeddings, and model-specific auxiliary data in the returned Params. See Qwen3-VL's implementation and the developer guide's [handoff contract](../../../docs/source/developer-guide/multimodal.md#encoderprefill-handoff).
 
 **Decorator stack** — bottom-up application; `register_vision_encoder` requires `register_auto_model` to have run first:
 
@@ -541,7 +561,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 
 **Input processor**
 - [ ] Subclasses both `BaseMultimodalInputProcessor` and `BaseMultimodalDummyInputsBuilder`.
-- [ ] Encoder profiling implements `get_mm_max_tokens_per_item` + `get_dummy_mm_data`. The processor returns `MultimodalItemMetadata` from `get_mm_item_metadata`; item scheduling additionally supplies exact costs/output rows, item selection, and `get_max_mm_encoder_output_embeddings`. The model exposes batched `encode_multimodal_inputs`; encoder metadata capacity comes from `setup_attn_metadata`, not hardcoded `max_num_*` values.
+- [ ] Encoder profiling implements `get_mm_max_tokens_per_item` + `get_dummy_mm_data`. The processor returns `MultimodalItemMetadata` from `get_mm_item_metadata`; item scheduling additionally supplies exact input costs and output lengths, item selection, and `get_max_mm_encoder_output_embeddings`. The model exposes batched `encode_multimodal_inputs`; encoder metadata capacity comes from `setup_attn_metadata`, not hardcoded `max_num_*` values.
 - [ ] Batched/packed/shared fields have explicit `input_partitions`, or the model overrides selection for its layout. Payload indices are modality-local; metadata indices are prompt-global. Execution reads `item_metadata.item_refs`, not frontend `mm_item_order`.
 - [ ] `call_with_text_prompt` (not `__call__` — that's the base-class dispatcher) runs HF AutoProcessor + tokenizer, builds `multimodal_data` by modality, computes `mrope_config` on CPU, `_postprocess`-rewrites mm token ids to the OOV sentinel.
 - [ ] `mm_processor_kwargs` flow-through preserved. (Tokenized fast path is optional: set `supports_token_id_mm_expansion = True` + implement `get_text_with_mm_placeholders` / `expand_prompt_token_ids_for_mm`; otherwise the base class detokenizes token-ID inputs automatically.)
@@ -554,7 +574,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 - [ ] Async loaders used for URL/bytes inputs.
 - [ ] Broadcast payload < 1 MB per rank per request (NVTX `broadcast_requests` / `tp_broadcast_requests`); media crosses ranks only via `to_handle` / `to_tensor`.
 - [ ] Post-prefill/termination cleanup drains item-cache refs exactly once and leaves only fields retained by `strip_mm_data_for_generation`.
-- [ ] Encoder output is one tensor whose first dim equals the processor-declared MM output rows; cache item splits preserve prompt order and are reassembled into the existing single-tensor fusion contract.
+- [ ] Encoder output is one tensor whose first dim equals the total output embedding length declared by the processor; cache item splits preserve prompt order and are reassembled into the existing single-tensor fusion contract.
 - [ ] Encoder is batched across compatible requests within each hook call; separate item-scheduled modality runs may produce separate blocks (Contract 4).
 
 **Tests & docs**
@@ -564,7 +584,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 - [ ] Accuracy test under `test_llm_api_pytorch_multimodal.py`; entry in `test-db/l0_<gpu>.yml`.
 - [ ] Reference accuracy captured via `TRTLLM_ACCURACY_NO_REFERENCE=1` and entered in `references/mmmu.yaml`; threshold derived value sanity-checked.
 - [ ] Prequantized assertions use the correct `QuantAlgo` variant for the checkpoint (flat FP8 vs `FP8_BLOCK_SCALES`; FP4 vs `NVFP4`).
-- [ ] Rows added to **Supported Models** + **Multimodal Feature Support Matrix**.
+- [ ] Model listed in **Supported Models** and **Multimodal Feature Support Matrix**.
 - [ ] `examples/llm-api/quickstart_multimodal.py` round-trip passes for every modality the model supports (`--modality image|video|audio|...`); then `trtllm-serve` round-trip verified with a real image prompt; EPD round-trip verified if applicable.
 - [ ] Chunked-prefill verification: ran `trtllm-serve` with low `--max_num_tokens` and confirmed the log contains neither `Multimodal hashing failed:` nor `Multimodal runtime data missing or incomplete, will not cache embeddings.`
 - [ ] `/bot run` triggered and multimodal stages pass.

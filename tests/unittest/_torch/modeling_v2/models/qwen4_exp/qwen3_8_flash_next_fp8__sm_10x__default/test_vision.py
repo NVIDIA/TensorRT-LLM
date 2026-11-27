@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
+import math
 import zlib
 from types import SimpleNamespace
 from typing import List, Sequence, Tuple
@@ -38,6 +39,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.vision.triton_pos_embed_interpolate import (  # noqa: E501
     triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import EncoderGroup
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
@@ -53,7 +55,7 @@ from _validating import (  # noqa: E402,F401 — path above; fixture by name
 
 CHECKPOINT = "Qwen3.8-Flash-Next-FP8"
 
-Shell = M.ModelingV2Qwen38FlashNextFp8Sm10xDefault
+Shell = M.ModelingV2Qwen38FlashNextFp8Sm10xDefaultForConditionalGeneration
 
 _VISION = dict(
     deepstack_visual_indexes=[], depth=27, dtype="bfloat16", hidden_act="gelu_pytorch_tanh",
@@ -66,30 +68,9 @@ HIDDEN_OUT = 2560
 _needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 
-def _dims(vcfg) -> SimpleNamespace:
-    """The vision widths of `weights.rank_dims` (the tower is replicated: every rank's)."""
-    return SimpleNamespace(
-        hidden=HIDDEN_OUT, dtype=torch.bfloat16, v_depth=vcfg.depth, v_hidden=vcfg.hidden_size,
-        v_inter=vcfg.intermediate_size, v_channels=vcfg.in_channels,
-        v_tpatch=vcfg.temporal_patch_size, v_patch=vcfg.patch_size,
-        v_pos_rows=vcfg.num_position_embeddings,
-        v_merge_dim=vcfg.hidden_size * vcfg.spatial_merge_size**2,
-    )  # fmt: skip
-
-
-def _vision_entries():
-    return [entry for entry in W.MODEL_WEIGHTS.WEIGHTS if entry.name.startswith("vis_")]
-
-
 def _tower_over_the_weight_table() -> V.VisionTower:
-    """The tower over the table's `vis_*` weights on meta; `embed` only supplies the dtype."""
-    vcfg = Qwen4ExpVisionConfig(**_VISION)
-    d = _dims(vcfg)
-    w = {"embed": torch.empty(8, HIDDEN_OUT, dtype=torch.bfloat16, device="meta")}
-    for entry in _vision_entries():
-        for key, _, _ in W.MODEL_WEIGHTS._targets(entry, d):
-            w[key] = torch.empty(*entry.shape(d), dtype=entry.dtype or d.dtype, device="meta")
-    return V.VisionTower(w, vcfg)
+    with torch.device("meta"):
+        return V.VisionTower(Qwen4ExpVisionConfig(**_VISION), torch.bfloat16)
 
 
 MERGE = 2
@@ -129,16 +110,18 @@ HIDDEN = 3
 IMAGE, VIDEO = 1, 2
 
 
-class _Tower:
-    """Stub `VisionTower`: a merged row carries its first patch's pixel value (`_media`)."""
+class _Tower(torch.nn.Module):
+    """Stub `VisionTower`: each embedding carries its first patch's pixel value (`_media`)."""
 
     merge = MERGE
+    build_batched_input = staticmethod(V.VisionTower.build_batched_input)
 
     def __init__(self):
+        super().__init__()
         self.calls = 0
         self.patches = 0
 
-    def __call__(self, pixel_values, grid_thw):
+    def forward(self, pixel_values, grid_thw):
         self.calls += 1
         self.patches += pixel_values.shape[0]
         assert sum(t * h * w for t, h, w in grid_thw.tolist()) == pixel_values.shape[0]
@@ -166,16 +149,25 @@ def _params(image=None, video=None, order=None, runtime=None, mrope=True):
         data["image"] = _media(IMAGE, image)
     if video is not None:
         data["video"] = _media(VIDEO, video)
-    if order is not None:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    _item_metadata(data, order)
     return MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
+
+
+def _item_metadata(data, order=None):
+    grids = {m: data[m][f"{m}_grid_thw"] for m in ("image", "video") if m in data}
+    refs = order or [(m, i) for m, grid in grids.items() for i in range(len(grid))]
+    if refs:
+        lengths = [int(grids[m][i].prod()) for m, i in refs]
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+            refs, lengths, [n // MERGE**2 for n in lengths]
+        )
 
 
 # Two videos of 4 and 8 rows, two images of 4 and 1.
 VIDEOS = [(2, 2, 4), (2, 4, 4)]
 IMAGES = [(1, 4, 4), (1, 2, 2)]
 MIXED_ORDER = [("video", 0), ("image", 0), ("video", 1), ("image", 1)]
-MIXED_ROWS = [200.0] * 4 + [100.0] * 4 + [201.0] * 8 + [101.0]
+MIXED_EMBEDS = [200.0] * 4 + [100.0] * 4 + [201.0] * 8 + [101.0]
 
 
 class _StepBegun(Exception):
@@ -190,10 +182,20 @@ def _forward_to_begin_step(tower, kwargs):
         seen.update(step)
         raise _StepBegun
 
-    shell = SimpleNamespace(model=SimpleNamespace(begin_step=begin_step), vision_tower=tower)
+    llm = object.__new__(Shell.llm_class)
+    torch.nn.Module.__init__(llm)
+    llm.model = SimpleNamespace(begin_step=begin_step)
+    shell = Shell.__new__(Shell)
+    torch.nn.Module.__init__(shell)
+    shell.llm = llm
+    shell.mm_encoders = torch.nn.ModuleDict({"vision": tower})
+    shell.mm_encoder_groups = (EncoderGroup(("image", "video"), tower, tower.build_batched_input),)
+    md = SimpleNamespace(num_contexts=1, num_generations=0)
     with pytest.raises(_StepBegun):
-        Shell.forward(shell, None, torch.zeros(1, dtype=torch.int32), None, **kwargs)
-    return seen["vision"]
+        shell(md, torch.zeros(1, dtype=torch.int32), **kwargs)
+    if seen["mm_embeds"] is None:
+        return None
+    return seen["mm_embeds"], seen["mm_token_indices"]
 
 
 TEXT_TOKENS = 5
@@ -231,8 +233,17 @@ def _request(image=None, video=None, order=None, **overrides):
         data["image"] = _request_media("image", image)
     if video is not None:
         data["video"] = _request_media("video", video)
-    if order is not None:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    if order is not None or len({"image", "video"} & data.keys()) == 1:
+        grids = {"image": image, "video": video}
+        refs = (
+            order
+            if order is not None
+            else [(m, i) for m, grid in grids.items() for i in range(len(grid or []))]
+        )
+        lengths = [math.prod(grids[m][i]) // MERGE**2 if m in grids else 1 for m, i in refs]
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+            refs, output_embedding_lengths=lengths
+        )
     fields = {"py_multimodal_data": data, "prompt_len": prompt_len}
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -398,14 +409,14 @@ def _load_models(checkpoint):
     vision = json.loads((checkpoint / "config.json").read_text())["vision_config"]
     assert vision["deepstack_visual_indexes"] == [], "the reference has no deepstack mergers"
     vcfg = Qwen4ExpVisionConfig(**{k: v for k, v in vision.items() if k != "model_type"})
-    d = _dims(vcfg)
+    d = W.vision_dims(vcfg, torch.bfloat16)
     index = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
 
     # Each `vis_*` parameter is one whole checkpoint tensor: the tower is replicated and bf16.
     sources = {}
-    for entry in _vision_entries():
+    for entry in W.VISION_WEIGHTS.WEIGHTS:
         assert entry.transform is None and entry.cut is None, entry.name
-        for key, i, prefix in W.MODEL_WEIGHTS._targets(entry, d):
+        for key, i, prefix in W.VISION_WEIGHTS._targets(entry, d):
             [(ckpt_key, at, cut)] = entry.sources(d, i, prefix)
             assert at is None and cut is None, (key, ckpt_key)
             sources[key] = (ckpt_key, entry.shape(d), entry.dtype or d.dtype)
@@ -421,13 +432,10 @@ def _load_models(checkpoint):
             for key in f.keys():
                 if key in visual:
                     tensors[key] = f.get_tensor(key)
-    w = {}
-    for key, (ckpt_key, shape, dtype) in sources.items():
-        tensor = tensors[ckpt_key]
-        assert tuple(tensor.shape) == tuple(shape) and tensor.dtype == dtype, key
-        w[key] = tensor.cuda()
-    w["embed"] = torch.empty(1, d.hidden, dtype=torch.bfloat16, device="cuda")
-    tower = V.VisionTower(w, vcfg)
+    with torch.device("cuda"):
+        tower = V.VisionTower(vcfg, torch.bfloat16)
+    tower.load_weights(tensors)
+    tower.post_load_weights()
 
     fields = (
         "depth hidden_size hidden_act intermediate_size num_heads in_channels patch_size "
@@ -475,7 +483,7 @@ def _load_media(checkpoint):
 
 
 def _reference_outputs(models, media):
-    """Per media item `(ref, envelope)`: the fp32 HF reference `[rows, 2560]`, and the worst
+    """Per media item `(ref, envelope)`: the fp32 HF reference `[num_embeddings, 2560]`, and the worst
     of each statistic (`_stats`) the bf16 HF forward reaches against it over `_HF_BACKENDS`."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -558,10 +566,10 @@ def _counted_runs(tower, monkeypatch) -> list:
 
 
 def _spliced_in_chunks(tower, data, bounds):
-    """The rows `multimodal_embeds` splices for each `(start, end)` chunk of one request whose
-    `multimodal_data` is `data`, the one dict the executor hands all of a request's chunks."""
+    """The active embeddings from each chunk of one request."""
     total = bounds[-1][1]
     chunks = []
+    _item_metadata(data)
     for start, end in bounds:
         runtime = SimpleNamespace(
             num_cached_mm_tokens=start,
@@ -570,8 +578,7 @@ def _spliced_in_chunks(tower, data, bounds):
         )
         params = MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
         kwargs = {"multimodal_params": [params], "mm_token_indices": torch.arange(end - start)}
-        chunks.append(V.multimodal_embeds(tower, kwargs)[0])
-    assert V._TOWER_ROWS_KEY not in data, "the chunk with the last row drops the kept rows"
+        chunks.append(_forward_to_begin_step(tower, kwargs)[0])
     return torch.cat(chunks)
 
 
@@ -595,8 +602,7 @@ def _hf_image_in_chunks(tower, media, references, monkeypatch):
 
 def _hf_video_in_chunks(tower, media, references, monkeypatch):
     """The video spliced over three chunked-prefill chunks whose boundaries cut its two 96-row
-    frames: each frame runs once, in the first chunk holding its rows, and together the chunks
-    are the one-pass rows bitwise."""
+    frames. The first chunk encodes the request and every chunk takes its own slice."""
     px, grid = media["video"]
     total = int(grid.prod(-1).sum()) // tower.merge**2
     data = {
@@ -607,8 +613,7 @@ def _hf_video_in_chunks(tower, media, references, monkeypatch):
         whole = tower(px, grid)
         runs = _counted_runs(tower, monkeypatch)
         out = _spliced_in_chunks(tower, data, ((0, 50), (50, 150), (150, total)))
-    frame = px.shape[0] // 2
-    assert runs == [frame, frame], runs
+    assert runs == [px.shape[0]], runs
     assert torch.equal(out, whole), _mismatch(out, whole)
     _check("video in three chunks", out, *references["video"])
 
@@ -783,9 +788,6 @@ _REFUSED = [
     ("pixel_width", _req(_pixels(48, 1), video=VIDEOS), "48 patch rows of"),
     ("pixel_dtype", _req(_pixels(48, dtype=torch.uint8), video=VIDEOS),
      "torch.uint8; the vision tower runs at torch.bfloat16"),
-    ("precomputed_embedding",
-     _req(lambda d: d.update(multimodal_embedding=[torch.zeros(4, 8)]), image=_TILE),
-     "precomputed image embeddings"),
     ("no_grid", _req(lambda d: d["video"].pop("video_grid_thw"), video=VIDEOS),
      "this target reads 'pixel_values_videos'"),
     ("positions_short", _req(_positions(3, 1, 40), video=VIDEOS), "one position per prompt token"),
@@ -813,15 +815,15 @@ _ADMISSIONS = (
 def test_admission_serves_what_the_tower_serves(build, refusal, reads_tower):
     """`validate_request` admits text without reading the tower and the media it serves, and
     refuses what the tower or the splice would assert on, naming the item and the bound."""
-    shell = SimpleNamespace(vision_tower=_assembled_tower() if reads_tower else None)
+    tower = _assembled_tower() if reads_tower else None
     if refusal is None:
-        Shell.validate_request(shell, build())
+        V.VisionTower.validate_request(tower, build())
     else:
         with pytest.raises(ValueError, match=refusal):
-            Shell.validate_request(shell, build())
+            V.VisionTower.validate_request(tower, build())
 
 
-def _chunk(cached, in_chunk, total=len(MIXED_ROWS)):
+def _chunk(cached, in_chunk, total=len(MIXED_EMBEDS)):
     return SimpleNamespace(
         num_cached_mm_tokens=cached,
         num_mm_tokens_in_chunk=in_chunk,
@@ -829,18 +831,23 @@ def _chunk(cached, in_chunk, total=len(MIXED_ROWS)):
     )
 
 
-#: `(id, _params kwargs, placeholder rows, rows that land there (None: no media), tower calls,
-#: patch rows the tower runs)`. The mixed chunk takes prompt-order rows 3..9: the second frame of
-#: video 0, image 0 and the first frame of video 1 (40 of the request's 68 patch rows); the video
-#: chunk rows 5..7, inside video 1's first frame.
+#: `(id, _params kwargs, placeholder count, expected embeddings (None for text), tower calls,
+#: patch count). The mixed and video chunks each encode the request once and take their active embeddings.
 _SPLICES = [
     ("text", dict(), 0, None, 0, 0),
     ("image", dict(image=IMAGES), 5, [100.0] * 4 + [101.0], 1, 20),
     ("video", dict(video=VIDEOS), 12, [200.0] * 4 + [201.0] * 8, 1, 48),
-    ("mixed", _MIXED, len(MIXED_ROWS), MIXED_ROWS, 1, 68),
-    ("chunk", dict(_MIXED, runtime=_chunk(3, 6)), 6, MIXED_ROWS[3:9], 1, 40),
-    ("video_chunk", dict(video=VIDEOS, runtime=_chunk(5, 2, 12)), 2, [201.0] * 2, 1, 16),
-    ("chunk_without_placeholders", dict(_MIXED, runtime=_chunk(len(MIXED_ROWS), 0)), 0, None, 0, 0),
+    ("mixed", _MIXED, len(MIXED_EMBEDS), MIXED_EMBEDS, 1, 68),
+    ("chunk", dict(_MIXED, runtime=_chunk(3, 6)), 6, MIXED_EMBEDS[3:9], 1, 68),
+    ("video_chunk", dict(video=VIDEOS, runtime=_chunk(5, 2, 12)), 2, [201.0] * 2, 1, 48),
+    (
+        "chunk_without_placeholders",
+        dict(_MIXED, runtime=_chunk(len(MIXED_EMBEDS), 0)),
+        0,
+        None,
+        0,
+        0,
+    ),
 ]
 
 
@@ -848,12 +855,11 @@ _SPLICES = [
 @pytest.mark.parametrize(
     "params,num_rows,want,calls,patches", [s[1:] for s in _SPLICES], ids=[s[0] for s in _SPLICES]
 )
-def test_the_splice_puts_each_items_rows_on_its_placeholders(
+def test_the_splice_puts_each_items_embeddings_on_its_placeholders(
     params, num_rows, want, calls, patches
 ):
-    """The tower's rows reach `begin_step` with the placeholder indices, and the splice writes them
-    over the placeholders in prompt order and zeroes the padding rows after the step. A chunk runs
-    the tower on only the frames that hold its rows."""
+    """The vision embeddings reach `begin_step` with the placeholder indices, and the splice writes them
+    over the placeholders in prompt order and zeroes the padding after the step."""
     tower = _Tower()
     indices = torch.arange(1, 1 + num_rows, dtype=torch.int64)
     kwargs = {
@@ -865,9 +871,21 @@ def test_the_splice_puts_each_items_rows_on_its_placeholders(
     assert (tower.calls, tower.patches) == (calls, patches)
     total = num_rows + 2
     h = torch.full((total + 3, HIDDEN), -1.0)
-    M.PrefillTarget._splice(
-        SimpleNamespace(_step=SimpleNamespace(vision=vision, num_tokens=total)), h
+    step = M._PrefillStep(
+        num_tokens=total,
+        physical_tokens=h.shape[0],
+        dp_pad_rows=None,
+        input_ids=torch.arange(total),
+        attn={},
+        gdn=(),
+        ple=(),
+        qsa=(),
+        mm_embeds=vision[0] if vision else None,
+        mm_token_indices=indices,
     )
+    target = SimpleNamespace(_step=step)
+    M.PrefillTarget._splice(target, h)
+    assert target._step.mm_embeds is None and target._step.mm_token_indices is None
     assert torch.count_nonzero(h[total:]) == 0, "padding rows must be zeroed"
     if want is None:
         assert vision is None and torch.all(h[:total] == -1.0)
@@ -878,18 +896,17 @@ def test_the_splice_puts_each_items_rows_on_its_placeholders(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("chunk", range(1, len(MIXED_ROWS) + 1))
+@pytest.mark.parametrize("chunk", range(1, len(MIXED_EMBEDS) + 1))
 def test_a_chunked_request_runs_each_frame_once(chunk):
     """Over all of one request's chunks the tower runs each frame once (the one-pass 68 patch
-    rows) and the chunks splice the one-pass rows; the last chunk drops the kept rows."""
+    rows) and the chunks splice the one-pass embeddings."""
     tower = _Tower()
     params = _params(**_MIXED)
     spliced = []
-    for start in range(0, len(MIXED_ROWS), chunk):
-        count = min(chunk, len(MIXED_ROWS) - start)
+    for start in range(0, len(MIXED_EMBEDS), chunk):
+        count = min(chunk, len(MIXED_EMBEDS) - start)
         params.multimodal_runtime = _chunk(start, count)
         kwargs = {"multimodal_params": [params], "mm_token_indices": torch.arange(count)}
-        spliced += V.multimodal_embeds(tower, kwargs)[0][:, 0].tolist()
-    assert spliced == MIXED_ROWS
+        spliced += _forward_to_begin_step(tower, kwargs)[0][:, 0].tolist()
+    assert spliced == MIXED_EMBEDS
     assert tower.patches == 68, (tower.calls, tower.patches)
-    assert V._TOWER_ROWS_KEY not in params.multimodal_data

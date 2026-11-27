@@ -16,10 +16,12 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
+from tensorrt_llm._torch.models import modeling_multimodal_utils as mm_utils
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
+    resolve_mm_encoder_embedding_dtype,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
@@ -32,6 +34,7 @@ from tensorrt_llm.inputs.multimodal import (
     get_multimodal_item_metadata,
     strip_mm_encoder_inputs,
 )
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -105,6 +108,48 @@ def is_multimodal(model: nn.Module, input_processor: InputProcessor) -> bool:
     return isinstance(input_processor, BaseMultimodalInputProcessor)
 
 
+def _validate_multimodal_input(
+    model: nn.Module,
+    mm_data: dict,
+    input_processor: InputProcessor | None = None,
+) -> None:
+    """Check media and embedding payloads for the Modeling V2 model serving the request."""
+    model = getattr(model, "_orig_mod", model)
+    if not any(
+        cls.__module__.startswith("tensorrt_llm._torch.modeling_v2.") for cls in type(model).__mro__
+    ):
+        return
+
+    has_media = mm_utils.has_multimodal_input(mm_data, MEDIA_MODALITIES)
+    has_embeds = mm_data.get("multimodal_embedding") is not None
+    if not (has_media or has_embeds):
+        return
+
+    # V2 composites expose their first local encoder as mm_encoder. Targets
+    # with a standalone vision tower expose it as vision_tower.
+    has_encoder = (
+        getattr(model, "mm_encoder", None) is not None
+        or getattr(model, "vision_tower", None) is not None
+    )
+    if has_media and not has_encoder:
+        raise ValueError(f"{type(model).__name__} has no local multimodal encoder for raw media")
+    if has_embeds and not (
+        mm_utils._is_mm_disagg()
+        and (
+            isinstance(model, MultimodalModelMixin)
+            or has_encoder
+            or (
+                getattr(model, "supported_encoder_attention_backends", None)
+                and isinstance(input_processor, BaseMultimodalInputProcessor)
+            )
+        )
+    ):
+        raise ValueError(
+            "Precomputed multimodal embeddings require a multimodal model "
+            "in encoder/prefill disaggregated mode"
+        )
+
+
 def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool:
     """Whether the item-scheduling wiring is engaged this run.
 
@@ -130,6 +175,7 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
         not llm_args.disable_mm_encoder
         and isinstance(model, MultimodalModelMixin)
         and model.supports_mm_encoder_item_scheduling
+        and model._has_local_encoder
         and policy != MultimodalEncoderSchedulingPolicy.DISABLED
     )
     if (
@@ -195,6 +241,36 @@ def setup_mm_encoder_cuda_graphs(
         module.enable_blocks_cuda_graph(max_num_tokens=max_num_tokens)
 
 
+def _mm_max_tokens_per_item(model, input_processor, **budget) -> dict[str, int]:
+    """Combine each local tower's legal item sizes, defaulting to processor geometry."""
+    specs = getattr(type(model), "mm_encoders", None)
+    if not specs:
+        return input_processor.get_mm_max_tokens_per_item(**budget)
+
+    sizes = {}
+    processor_sizes = None
+    for name, tower in model.mm_encoders.items():
+        if hasattr(tower, "get_mm_max_tokens_per_item"):
+            bounds = tower.get_mm_max_tokens_per_item(input_processor, **budget)
+        else:
+            if processor_sizes is None:
+                processor_sizes = input_processor.get_mm_max_tokens_per_item(**budget)
+            bounds = processor_sizes
+        sizes.update({m: bounds[m] for m in specs[name].modalities if m in bounds})
+    return sizes
+
+
+def _mm_dummy_data(model, input_processor, modality, **kwargs):
+    """Build the dummy with the same tower that supplied the item's geometry."""
+    for name, spec in getattr(type(model), "mm_encoders", {}).items():
+        if modality in spec.modalities:
+            tower = model.mm_encoders[name]
+            if hasattr(tower, "get_dummy_mm_data"):
+                return tower.get_dummy_mm_data(input_processor, **kwargs)
+            break
+    return input_processor.get_dummy_mm_data(**kwargs)
+
+
 def setup_mm_encoder_attn_metadata(
     model: nn.Module,
     input_processor: InputProcessor,
@@ -221,7 +297,7 @@ def setup_mm_encoder_attn_metadata(
 
     max_seq_len = encoder_max_num_tokens
     if isinstance(input_processor, BaseMultimodalDummyInputsBuilder):
-        max_tokens_per_item = input_processor.get_mm_max_tokens_per_item()
+        max_tokens_per_item = _mm_max_tokens_per_item(model, input_processor)
         max_seq_len = max(max_seq_len, max(max_tokens_per_item.values(), default=0))
 
     for module in encoders:
@@ -245,25 +321,19 @@ def setup_mm_encoder_attn_metadata(
 def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
     """Bytes occupied by one multimodal encoder output embedding.
 
-    Prefers the mixin's explicit ``embedding_dim``/``embedding_dtype`` contract, then the
-    text embedding layer's weight, then the pretrained config's hidden size with the
-    loaded weights' dtype -- both mixin properties are optional and most VLMs implement
-    neither.
+    Models can override the width and dtype for packed encoder outputs. Fall back to
+    the text width when a worker cannot expose the encoder embedding width.
     """
+    element_size = resolve_mm_encoder_embedding_dtype(model).itemsize
     embedding_dim = None
     try:
         embedding_dim = model.embedding_dim
     except (AttributeError, NotImplementedError):
         pass
     if embedding_dim is not None:
-        try:
-            embedding_dtype = model.embedding_dtype
-        except (AttributeError, NotImplementedError):
-            embedding_dtype = model.model_config.torch_dtype
-        return embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
+        return embedding_dim * element_size
     try:
-        weight = model.text_embedding_layer.weight
-        return weight.shape[-1] * weight.element_size()
+        return model.text_embedding_layer.weight.shape[-1] * element_size
     except (AttributeError, NotImplementedError):
         pass
     pretrained = model.model_config.pretrained_config
@@ -277,7 +347,6 @@ def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
             "text_embedding_layer, and its pretrained config exposes "
             "no (text_config.)hidden_size"
         )
-    element_size = model.model_config.torch_dtype.itemsize
     return hidden_size * element_size
 
 
@@ -415,7 +484,7 @@ class MultimodalItemScheduler:
                 "MM encoder item scheduling requires a token budget; set "
                 "encoder_max_num_tokens or max_num_tokens"
             )
-        max_tokens_per_item = input_processor.get_mm_max_tokens_per_item()
+        max_tokens_per_item = _mm_max_tokens_per_item(model, input_processor)
         if not max_tokens_per_item:
             raise ValueError(
                 "A model with MM encoder item scheduling must implement "
@@ -653,10 +722,7 @@ class MultimodalItemScheduler:
 
     def _embedding_dtype_and_width(self) -> tuple[torch.dtype, int]:
         """Return the dtype and row width of one MM encoder output."""
-        try:
-            expected_dtype = self.model.embedding_dtype
-        except (AttributeError, NotImplementedError):
-            expected_dtype = self.model.model_config.torch_dtype
+        expected_dtype = resolve_mm_encoder_embedding_dtype(self.model)
         return expected_dtype, self.bytes_per_embedding // expected_dtype.itemsize
 
     def build_multimodal_data_for_llm(

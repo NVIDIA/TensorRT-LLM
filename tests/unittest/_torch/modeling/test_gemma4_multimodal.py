@@ -150,6 +150,19 @@ SMALL_TEXT_CONFIG = {
 }
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("vision,audio", [(True, False), (False, True), (False, False)])
+def test_gemma4_unified_encoder_cache_follows_local_projections(vision, audio):
+    model = Gemma4UnifiedForConditionalGeneration.__new__(Gemma4UnifiedForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.vision_tower = model.audio_tower = None
+    model.embed_vision = torch.nn.Identity() if vision else None
+    model.embed_audio = torch.nn.Identity() if audio else None
+    model.model_config = ModelConfig(multimodal_config=MultimodalConfig())
+
+    assert model.encoder_cache_active == (vision or audio)
+
+
 class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
     """Lightweight Gemma4 encoder-cache harness without model weights."""
 

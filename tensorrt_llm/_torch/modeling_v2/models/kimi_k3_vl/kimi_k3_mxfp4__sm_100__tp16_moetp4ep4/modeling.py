@@ -105,6 +105,7 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import K3AllReduce
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import K3KdaBuffers
+from tensorrt_llm._torch.models.modeling_multimodal_utils import has_multimodal_input
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
@@ -1263,7 +1264,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
-        if kwargs.pop("multimodal_params", None):
+        multimodal_params = kwargs.pop("multimodal_params", None) or []
+        if any(
+            p is not None and has_multimodal_input(p.multimodal_data) for p in multimodal_params
+        ):
             raise ValueError(
                 "this Kimi K3 target is text only: it loads no vision tower, and a request carried image input"
             )

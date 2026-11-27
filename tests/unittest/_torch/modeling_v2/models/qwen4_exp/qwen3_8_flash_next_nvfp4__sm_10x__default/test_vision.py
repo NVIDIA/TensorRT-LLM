@@ -1,21 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The default target's vision path on the CPU: the tower's weights, its calls and angle table,
-the splice's bookkeeping and the admission check.
+the encoder hook's bookkeeping and the admission check.
 
-The tower is built over the weight table's own `vis_*` declarations on the meta device, so
-what it reads is what `weights.py` declares. Its per-call body is a stub where a test needs one
-(the vision ops need a GPU), and so is the whole tower where the shell's bookkeeping is under
-test: every row of a stub tower names the item it came from, so the modality dispatch, item
-metadata, chunk slice, frame grouping and the order of concatenated calls run with no engine.
+The tower is built over its own `vis_*` table on the meta device, so what it reads is what
+`weights.py` declares. Its per-call body is a stub where a test needs one (the vision ops need
+a GPU), and so is the whole tower where the encoder hook's bookkeeping is under test: each embedding
+identifies its source item, so the modality dispatch, item metadata, frame
+grouping and the order of concatenated calls run with no engine. The shared base handles chunk slicing.
 """
 
 from __future__ import annotations
 
+from math import prod
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.configs import Qwen4ExpVisionConfig
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
@@ -24,9 +26,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     vision as V,
 )
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
-    weights as W,
-)
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import EncoderGroup
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
@@ -35,7 +35,7 @@ from tensorrt_llm.inputs.multimodal import (
 
 pytestmark = pytest.mark.cpu_only
 
-Shell = M.ModelingV2Qwen38FlashNextNvfp4Sm10xDefault
+Model = M.ModelingV2Qwen38FlashNextNvfp4Sm10xDefaultForConditionalGeneration
 
 # Qwen3.8-Flash-Next's vision config.
 _VISION = dict(
@@ -57,28 +57,12 @@ HIDDEN_OUT = 2560
 
 
 def _tower_over_the_weight_table() -> V.VisionTower:
-    """The tower over every `vis_*` weight the table declares, at the checkpoint's shapes,
-    on meta; `embed` stands in for the activation dtype the tower reads off it."""
-    vcfg = Qwen4ExpVisionConfig(**_VISION)
-    d = SimpleNamespace(
-        hidden=HIDDEN_OUT,
-        dtype=torch.bfloat16,
-        v_depth=vcfg.depth,
-        v_hidden=vcfg.hidden_size,
-        v_inter=vcfg.intermediate_size,
-        v_channels=vcfg.in_channels,
-        v_tpatch=vcfg.temporal_patch_size,
-        v_patch=vcfg.patch_size,
-        v_pos_rows=vcfg.num_position_embeddings,
-        v_merge_dim=vcfg.hidden_size * vcfg.spatial_merge_size**2,
-    )
-    w = {"embed": torch.empty(8, HIDDEN_OUT, dtype=torch.bfloat16, device="meta")}
-    for entry in W.MODEL_WEIGHTS.WEIGHTS:
-        if not entry.name.startswith("vis_"):
-            continue
-        for key, _, _ in W.MODEL_WEIGHTS._targets(entry, d):
-            w[key] = torch.empty(*entry.shape(d), dtype=entry.dtype or d.dtype, device="meta")
-    return V.VisionTower(w, vcfg)
+    """The tower at the checkpoint's shapes, on meta: it declares its own `vis_*` table
+    (`weights.VISION_WEIGHTS`), and the views are what `post_load_weights` builds."""
+    with torch.device("meta"):
+        tower = V.VisionTower(Qwen4ExpVisionConfig(**_VISION), torch.bfloat16)
+    tower._w = V._vision_views(tower.w, tower.depth)
+    return tower
 
 
 def test_the_tower_reads_the_weight_tables_vision_rows_at_the_ops_layouts():
@@ -173,9 +157,9 @@ def _random_grid(gen):
 def test_frames_are_grouped_whole_and_in_order():
     # 16-row frames, 32 rows to a call: one item's frames split across calls.
     assert V._frame_calls([(5, 4, 4)], 32) == [[(2, 4, 4)], [(2, 4, 4)], [(1, 4, 4)]]
-    # A call takes the end of one item and the start of the next.
+    # An item's frame boundaries stay the same regardless of its neighbors.
     grid = [(1, 8, 4), (3, 4, 4), (1, 2, 2)]
-    assert V._frame_calls(grid, 48) == [[(1, 8, 4), (1, 4, 4)], [(2, 4, 4), (1, 2, 2)]]
+    assert V._frame_calls(grid, 48) == [[item] for item in grid]
     assert V._frame_calls(grid, 1 << 20) == [grid]
 
 
@@ -188,10 +172,14 @@ def test_a_call_is_filled_to_the_ceiling_and_never_past_it():
         assert [f for call in calls for f in _frames(call)] == _frames(grid)
         sizes = [sum(t * h * w for t, h, w in call) for call in calls]
         assert all(0 < size <= cap for size in sizes)
-        # Greedy: the next call's first frame would not have fit.
+        independent = [
+            tile for item in grid for call in V._frame_calls([item], cap) for tile in call
+        ]
+        assert [tile for call in calls for tile in call] == independent
+        # The next call's first complete tile would not have fit.
         for size, call in zip(sizes, calls[1:]):
-            h, w = _frames(call)[0]
-            assert size + h * w > cap
+            t, h, w = call[0]
+            assert size + t * h * w > cap
 
 
 def test_one_frame_past_the_ceiling_is_refused_and_one_at_it_is_not():
@@ -201,17 +189,18 @@ def test_one_frame_past_the_ceiling_is_refused_and_one_at_it_is_not():
 
 
 def test_the_tower_call_ceiling_is_the_vision_entries_largest_cell():
-    """32768 patch rows (8192 merged rows) per call: the ceiling the patch embedding,
+    """32768 patch rows (8192 multimodal tokens) per call: the ceiling the patch embedding,
     position interpolation, layer norm, rotary, GEMM and attention cells reach."""
     assert V.VISION_CALL_MAX_PATCHES == 32768
 
 
 def _stub_tower(monkeypatch, cap):
-    """A `VisionTower` whose per-call body is a stub: merged row `j` of a call carries the
+    """A `VisionTower` whose per-call body is a stub: embedding `j` of a call carries the
     pixel value of the call's patch row `4 * j`, which `_pixels` set to the patch's index in
     the request."""
     monkeypatch.setattr(V, "VISION_CALL_MAX_PATCHES", cap)
     tower = object.__new__(V.VisionTower)
+    nn.Module.__init__(tower)
     tower.dtype = torch.float32
     tower.pixel_width = PIXEL_WIDTH
     tower.merge = MERGE
@@ -230,7 +219,7 @@ def _pixels(grid):
     return torch.arange(patches, dtype=torch.float32)[:, None].expand(-1, PIXEL_WIDTH).clone()
 
 
-def test_the_tower_calls_whole_frames_and_concatenates_their_rows_in_order(monkeypatch):
+def test_the_tower_concatenates_embeddings_from_whole_frames_in_order(monkeypatch):
     grid = [(1, 8, 4), (3, 4, 4), (2, 2, 6), (1, 2, 2)]
     tower = _stub_tower(monkeypatch, 48)
     out = tower(_pixels(grid), torch.tensor(grid))
@@ -273,32 +262,41 @@ def test_the_tower_refuses_pixels_its_grid_does_not_describe(monkeypatch):
 IMAGE, VIDEO = 1, 2
 
 
-class _Tower:
-    """Stands in for `VisionTower`: every row of item `i` of modality `m` holds `100 * m +
-    i`, so a spliced row says where it came from."""
+class _Tower(V.VisionTower):
+    """Identify item `i` of modality `m` by the value `100 * m + i` in its embedding."""
 
     merge = MERGE
 
     def __init__(self):
+        nn.Module.__init__(self)
         self.calls = 0
 
-    def __call__(self, pixel_values, grid_thw):
+    def forward(self, pixel_values, grid_thw):
         self.calls += 1
-        modality = int(pixel_values[0, 0])
-        return torch.cat(
-            [
-                torch.full((t * h * w // (MERGE * MERGE), HIDDEN), float(100 * modality + item))
-                for item, (t, h, w) in enumerate(grid_thw.tolist())
-            ]
-        )
+        return pixel_values[:: MERGE**2].expand(-1, HIDDEN)
 
 
 def _media(modality, grids):
-    """One `multimodal_data` entry; `pixel_values` only carries the stub's modality."""
-    patches = sum(t * h * w for t, h, w in grids)
     key = "pixel_values" if modality == IMAGE else "pixel_values_videos"
     grid_key = "image_grid_thw" if modality == IMAGE else "video_grid_thw"
-    return {key: torch.full((patches, 1), float(modality)), grid_key: torch.tensor(grids)}
+    pixels = torch.cat(
+        [torch.full((prod(grid), 1), float(100 * modality + i)) for i, grid in enumerate(grids)]
+    )
+    return {key: pixels, grid_key: torch.tensor(grids)}
+
+
+def _set_item_metadata(data, image, video, order):
+    if image and video and order is None:
+        return
+    lengths = {
+        (modality, i): prod(grid) // MERGE**2
+        for modality, grids in (("image", image or []), ("video", video or []))
+        for i, grid in enumerate(grids)
+    }
+    refs = list(lengths) if order is None else order
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        refs, output_embedding_lengths=[lengths.get(ref, 0) for ref in refs]
+    )
 
 
 def _params(image=None, video=None, order=None, runtime=None, mrope=True):
@@ -309,62 +307,56 @@ def _params(image=None, video=None, order=None, runtime=None, mrope=True):
         data["image"] = _media(IMAGE, image)
     if video is not None:
         data["video"] = _media(VIDEO, video)
-    if order is not None:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    _set_item_metadata(data, image, video, order)
     return MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
 
 
-def _splice(tower, params, num_rows, padding=0):
-    """The tower's rows spliced, as the prefill target's break does, over a prompt whose
-    tokens 1..num_rows are the placeholders and which `padding` rows follow; returns the rows
-    that landed there, one value per row, or None when the step carries no media."""
-    kwargs = {
-        "multimodal_params": [params],
-        "mm_token_indices": torch.arange(1, 1 + num_rows, dtype=torch.int64),
-    }
-    vision = V.multimodal_embeds(tower, kwargs)
-    if vision is None:
-        return None
-    total = num_rows + 2
+def _splice(tower, params, num_mm_tokens, padding=0):
+    """Place the tower's embeddings at their placeholder positions, leaving room for padding."""
+    total = num_mm_tokens + 2
     h = torch.full((total + padding, HIDDEN), -1.0)
-    target = SimpleNamespace(_step=SimpleNamespace(vision=vision, num_tokens=total))
+    model = Model.__new__(Model)
+    nn.Module.__init__(model)
+    model.mm_encoder_groups = (
+        EncoderGroup(Model.mm_encoders["vision"].modalities, tower, tower.build_batched_input),
+    )
+    step = SimpleNamespace(
+        mm_embeds=model.encode_multimodal_inputs([params]),
+        mm_token_indices=torch.arange(1, 1 + num_mm_tokens, dtype=torch.int64),
+        num_tokens=total,
+    )
+    target = SimpleNamespace(_step=step)
     M.PrefillTarget._splice(target, h)
-    assert torch.count_nonzero(h[total:]) == 0, "padding rows must be zeroed"
+    assert torch.count_nonzero(h[total:]) == 0, "padding must be zeroed"
     assert torch.all(h[0] == -1.0) and torch.all(h[total - 1] == -1.0)
-    return h[1 : 1 + num_rows, 0].tolist()
+    return h[1 : 1 + num_mm_tokens, 0].tolist()
 
 
 def _item(modality, index):
     return modality, index
 
 
-# Two videos of 4 and 8 rows, two images of 4 and 1.
+# Two videos of 4 and 8 tokens, two images of 4 and 1.
 VIDEOS = [(2, 2, 4), (2, 4, 4)]
 IMAGES = [(1, 4, 4), (1, 2, 2)]
 MIXED_ORDER = [_item("video", 0), _item("image", 0), _item("video", 1), _item("image", 1)]
-MIXED_ROWS = [200.0] * 4 + [100.0] * 4 + [201.0] * 8 + [101.0]
-
-
-def test_a_text_step_runs_no_tower():
-    assert V.multimodal_embeds(None, {}) is None
-    assert V.multimodal_embeds(None, {"multimodal_params": []}) is None
-    # Position ids alone (a text prompt through a multimodal processor) are not media.
-    assert V.multimodal_embeds(None, {"multimodal_params": [_params()]}) is None
+MIXED_EMBEDS = [200.0] * 4 + [100.0] * 4 + [201.0] * 8 + [101.0]
 
 
 def test_the_splice_fills_the_placeholders_and_zeroes_the_padding():
-    """An image request's rows land on its placeholders in one tower call and the padding
-    rows after the step are zeroed (`_splice` checks); a text step writes only the padding."""
+    """Placeholders take their image embeddings and both text and media steps zero the padding."""
     tower = _Tower()
     assert _splice(tower, _params(image=IMAGES), 5, padding=3) == [100.0] * 4 + [101.0]
     assert tower.calls == 1
-    target = SimpleNamespace(_step=SimpleNamespace(vision=None, num_tokens=2))
+    target = SimpleNamespace(
+        _step=SimpleNamespace(mm_embeds=None, mm_token_indices=None, num_tokens=2)
+    )
     h = torch.full((4, HIDDEN), -1.0)
     M.PrefillTarget._splice(target, h)
     assert torch.all(h[:2] == -1.0) and torch.count_nonzero(h[2:]) == 0
 
 
-def test_video_rows_reach_the_placeholders_item_by_item():
+def test_video_embeddings_reach_the_placeholders_item_by_item():
     tower = _Tower()
     assert _splice(tower, _params(video=VIDEOS), 12) == [200.0] * 4 + [201.0] * 8
     assert tower.calls == 1
@@ -373,56 +365,32 @@ def test_video_rows_reach_the_placeholders_item_by_item():
 def test_a_mixed_request_is_reassembled_in_prompt_order():
     tower = _Tower()
     params = _params(image=IMAGES, video=VIDEOS, order=MIXED_ORDER)
-    assert _splice(tower, params, len(MIXED_ROWS)) == MIXED_ROWS
-    assert tower.calls == 2
+    assert _splice(tower, params, len(MIXED_EMBEDS)) == MIXED_EMBEDS
+    assert tower.calls == 1
 
 
 def test_a_mixed_request_needs_its_manifest():
-    with pytest.raises(AssertionError, match="needs item metadata"):
-        _splice(_Tower(), _params(image=IMAGES, video=VIDEOS), len(MIXED_ROWS))
+    with pytest.raises(ValueError, match="item metadata"):
+        _splice(_Tower(), _params(image=IMAGES, video=VIDEOS), len(MIXED_EMBEDS))
 
 
-def test_a_chunk_takes_its_slice_of_the_prompt_order_rows():
-    runtime = SimpleNamespace(
-        num_cached_mm_tokens=3, num_mm_tokens_in_chunk=6, total_embeds_in_request=len(MIXED_ROWS)
-    )
-    params = _params(image=IMAGES, video=VIDEOS, order=MIXED_ORDER, runtime=runtime)
-    assert _splice(_Tower(), params, 6) == MIXED_ROWS[3:9]
-
-
-def test_a_chunk_without_placeholders_skips_the_tower():
-    runtime = SimpleNamespace(
-        num_cached_mm_tokens=len(MIXED_ROWS),
-        num_mm_tokens_in_chunk=0,
-        total_embeds_in_request=len(MIXED_ROWS),
-    )
-    tower = _Tower()
-    params = _params(image=IMAGES, video=VIDEOS, order=MIXED_ORDER, runtime=runtime)
-    assert _splice(tower, params, 0) is None
-    assert tower.calls == 0
-
-
-def test_a_media_request_needs_the_processors_position_ids():
-    with pytest.raises(AssertionError, match="mrope_position_ids"):
-        _splice(_Tower(), _params(video=VIDEOS, mrope=False), 12)
-
-
-def test_the_placeholder_rows_must_match_the_towers_rows():
-    kwargs = {
-        "multimodal_params": [_params(image=IMAGES)],
-        "mm_token_indices": torch.arange(4, dtype=torch.int64),
-    }
-    with pytest.raises(AssertionError, match="4 placeholder rows and the tower produced 5"):
-        V.multimodal_embeds(_Tower(), kwargs)
+def test_the_encoder_hook_needs_no_position_ids():
+    """The engine's memory profiling hands the encoder a dummy image with no position ids;
+    admission checks them for a real request."""
+    assert _splice(_Tower(), _params(image=IMAGES, mrope=False), 5) == [100.0] * 4 + [101.0]
 
 
 def test_the_grids_stay_on_the_host():
     """The executor moves only the pixels and the position ids; the grids the tower and the
     admission check read on the host stay there."""
-    paths = Shell.multimodal_data_device_paths.fget(None)
+    model = Model.__new__(Model)
+    nn.Module.__init__(model)
+    model.mm_encoders = nn.ModuleDict()
+    paths = model.multimodal_data_device_paths
     assert set(paths) == {
         "image.pixel_values",
         "video.pixel_values_videos",
+        "multimodal_embedding",
         "mrope_config.mrope_position_ids",
         "mrope_config.mrope_position_deltas",
     }
@@ -451,32 +419,30 @@ def _request_media(modality, grids):
 def _request(image=None, video=None, order=None, **overrides):
     """A request whose prompt is `TEXT_TOKENS` text tokens around the placeholders the media
     produce, with the position ids and placeholder cumsum the processor emits."""
-    rows = sum(t * h * w for t, h, w in (image or []) + (video or [])) // (MERGE * MERGE)
-    prompt_len = rows + TEXT_TOKENS
+    num_mm_tokens = sum(t * h * w for t, h, w in (image or []) + (video or [])) // (MERGE * MERGE)
+    prompt_len = num_mm_tokens + TEXT_TOKENS
     data = {
         "mrope_config": {"mrope_position_ids": torch.zeros(3, 1, prompt_len, dtype=torch.int32)},
         "multimodal_embed_mask_cumsum": torch.cat(
-            [torch.arange(1, rows + 1), torch.full((TEXT_TOKENS,), rows)]
+            [torch.arange(1, num_mm_tokens + 1), torch.full((TEXT_TOKENS,), num_mm_tokens)]
         ),
     }
     if image is not None:
         data["image"] = _request_media("image", image)
     if video is not None:
         data["video"] = _request_media("video", video)
-    if order is not None:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    _set_item_metadata(data, image, video, order)
     fields = {"py_multimodal_data": data, "prompt_len": prompt_len}
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
 
 def _admit(request):
-    """Through the shell's own hook, as the executor calls it."""
-    Shell.validate_request(SimpleNamespace(vision_tower=_GEOMETRY), request)
+    """The tower's admission check, which the model's `validate_request` calls."""
+    V.VisionTower.validate_request(_GEOMETRY, request)
 
 
 def test_clean_requests_are_admitted():
-    # A single-modality request needs no manifest.
     _admit(_request(image=IMAGES))
     _admit(_request(video=VIDEOS))
     _admit(_request(image=IMAGES, video=VIDEOS, order=MIXED_ORDER))
@@ -575,3 +541,20 @@ def test_the_placeholder_count_is_the_sum_over_both_modalities():
         _admit(request)
     del request.py_multimodal_data["multimodal_embed_mask_cumsum"]
     _admit(request)
+
+
+def test_admission_counts_only_vision_placeholders_with_an_audio_tower():
+    order = [("image", 1), ("audio", 0), ("video", 0), ("image", 0)]
+    request = _request(image=IMAGES, video=VIDEOS[:1], order=order)
+    data = request.py_multimodal_data
+    data["audio"] = {"audio_features": torch.ones(3, 1)}
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        order, output_embedding_lengths=[1, 3, 4, 4]
+    )
+    request.prompt_len += 3
+    data["mrope_config"]["mrope_position_ids"] = torch.zeros(3, 1, request.prompt_len)
+    data["multimodal_embed_mask_cumsum"] = torch.tensor([*range(1, 13), *([12] * TEXT_TOKENS)])
+    _admit(request)
+    data["multimodal_embed_mask_cumsum"][-1] = 11
+    with pytest.raises(ValueError, match="holds 8 image/video placeholder tokens.*9"):
+        _admit(request)

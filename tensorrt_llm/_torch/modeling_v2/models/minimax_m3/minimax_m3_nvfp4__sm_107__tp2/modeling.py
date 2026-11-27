@@ -207,6 +207,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.prefill_ops import (
     register_prefill_core,
     run_prefill_attention,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_utils import has_multimodal_input
 from tensorrt_llm._torch.models.modeling_speculative import (
     _draft_loader_moe_kwargs as _draft_loader_moe_kwargs,
 )
@@ -6202,7 +6203,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
         """One engine step: the target forward, then the logits (or, with speculation, the worker's verify and
         draft, and on a decode step the spec fold's store of its outputs). Text only."""
         multimodal_params = kwargs.pop("multimodal_params", None) or []
-        if any(p is not None and getattr(p, "multimodal_data", None) for p in multimodal_params):
+        if any(
+            p is not None and has_multimodal_input(p.multimodal_data) for p in multimodal_params
+        ):
             raise ValueError(
                 "this MiniMax-M3 target is text only; the request carries multimodal input"
             )

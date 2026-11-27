@@ -174,6 +174,7 @@ class TestModelingV2Qwen38FlashNextFp8Sm10xDefault(LlmapiAccuracyTestHarness):
 
     # The breakable prefill CUDA graph, up to max_num_tokens.
     BREAKABLE_PREFILL = dict(
+        disable_mm_encoder=True,
         prefill_cuda_graph_backend="breakable",
         prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
     )

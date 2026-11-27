@@ -2,17 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """The vision tower and the multimodal splice's host bookkeeping.
 
-The checkpoint's 27-block ViT (no KV cache, deepstack or quantization) and its 2x2 patch
-merger turn a request's images and videos into one `[rows, hidden]` embedding row per
-placeholder token, which the prefill target's `_splice` break writes over the token
-embedding. The tower is replicated: every rank holds all of its weights and runs it on the
-media of the requests it serves -- under attention TP every rank the whole batch's, and gets
-the same rows back, since every op is a deterministic function of its operands; under
-attention DP a rank its own requests'.
+The replicated 27-block ViT and its patch merger return one multimodal embedding per
+image or video placeholder. Each rank encodes the media for its requests. The mixin
+caches the resulting embeddings and selects the active chunk. The language model writes
+those embeddings at the placeholder positions during prefill.
 
-The shell calls `multimodal_embeds` on every step, before the core's `begin_step`, and the
-executor calls `validate_request` on every new request. Neither runs inside a captured
-graph: the tower is eager and reads the request's grid on the host.
+The tower validates the request before scheduling and runs eagerly using the host grids.
 """
 
 from __future__ import annotations
@@ -21,6 +16,7 @@ import math
 from typing import NamedTuple
 
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
@@ -36,20 +32,22 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.ops.vision.triton_pos_embed_interpolate import (  # noqa: E501
     triton_pos_embed_interpolate,
 )
-from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
+
+from .._vision import (
+    VISION_CALL_MAX_PATCHES,
+    _frame_calls,
+    _item_attention_args,
+    _project_items,
+    _validate_request,
+    _VisionInputs,
+)
+from . import weights as _weights
 
 #: Tower rope base (`vision_config` has no rope field); unrelated to the text 1e7.
 VISION_ROPE_THETA = 10000.0
 
 #: LayerNorm epsilon of `norm1`, `norm2`, `merger.norm`: a literal in the reference.
 VISION_NORM_EPS = 1e-6
-
-#: The most patch rows one tower call carries, the ceiling the vision entries' cells reach:
-#: 8192 placeholder tokens x `spatial_merge_size`**2 patch rows each. `VisionTower` splits a
-#: request's frames into calls under it, so the bound a request meets is per frame: one
-#: frame's `h * w` patches.
-VISION_CALL_MAX_PATCHES = 32768
-
 #: `mask_type` 0 = padding mask: bidirectional within a batch segment. Causal (1) would make
 #: a patch depend on raster order.
 _VISION_MASK_PADDING = 0
@@ -135,26 +133,6 @@ _VISION_CALL_CONSTANTS = dict(
     skip_correction_threshold=0.0,
 )
 
-#: Per modality, the keys under `multimodal_data[modality]`: the flat patch rows and the
-#: host-side `(t, h, w)` grid.
-MEDIA_KEYS = {
-    "image": ("pixel_values", "image_grid_thw"),
-    "video": ("pixel_values_videos", "video_grid_thw"),
-}
-
-#: Tensors under `multimodal_data` the executor moves to the device. Everything else stays
-#: on the host: the grids are read there, and moved they would cost a synchronization each.
-DEVICE_PATHS = (
-    "image.pixel_values",
-    "video.pixel_values_videos",
-    "mrope_config.mrope_position_ids",
-    "mrope_config.mrope_position_deltas",
-)
-
-#: The position-ids axes of the mRoPE layout a media request carries.
-_POSITION_AXES = 3
-
-
 #: The grids `VisionTower.warm_up` runs: one call whose patch count is a multiple of 16 (4x4)
 #: and one whose count is not (2x2), the two variants Triton compiles a row count into.
 WARM_UP_GRIDS = (((1, 4, 4),), ((1, 2, 2),))
@@ -233,32 +211,6 @@ def _vision_views(w: dict, depth: int) -> _VisionWeights:
 # ------------------------------------------------------------------- the tower ---
 
 
-def _frame_calls(
-    grid: list[tuple[int, int, int]], max_rows: int
-) -> list[list[tuple[int, int, int]]]:
-    """Cut `grid` (one `(frames, height, width)` row per image or video) into tower calls of
-    whole frames, in order, each at most `max_rows` patch rows. A call is its grid rows: the
-    frames of one item that fall in it are one `(frames, height, width)` row."""
-    calls: list[list[tuple[int, int, int]]] = [[]]
-    room = max_rows
-    for frames, height, width in grid:
-        rows = height * width
-        assert rows <= max_rows, (
-            f"one frame is {height}x{width} = {rows} patch rows; the vision ops are "
-            f"certified up to {max_rows} rows in one call"
-        )
-        while frames:
-            take = min(frames, room // rows)
-            if take == 0:
-                calls.append([])
-                room = max_rows
-                continue
-            calls[-1].append((take, height, width))
-            room -= take * rows
-            frames -= take
-    return calls
-
-
 def _merge_order_positions(grid: list[tuple[int, int, int]], merge: int) -> torch.Tensor:
     """Each patch row's `(row, col)` in its frame, int64 `[rows, 2]` on the host, in
     spatial-merge order: whole `merge x merge` blocks row-major, row-major inside a block,
@@ -292,25 +244,27 @@ def _rope_tables(
     return angles.cos().contiguous(), angles.sin().contiguous()
 
 
-class VisionTower:
-    """One request's images or videos through the 27-block ViT and its patch merger.
+class VisionTower(nn.Module, _VisionInputs):
+    """A batch of images and videos through the 27-block ViT and its patch merger.
 
-    Not a target: runs only for a context request carrying media, from the shell, before
-    the step. Attention is bidirectional per frame (a video's frame group is a frame),
-    expressed to `thop_attention` as one context "sequence" per frame; running the rows as
-    one sequence is far outside tolerance. The position-embedding interpolation and the 2-D
-    rope both emit in spatial-merge order (what the merger's 4-to-1 reshape consumes); a
-    raster-order emitter gives a correctly shaped, silently wrong tower.
+    Not a target: the vision-language model's encoder, run only for a context request carrying
+    media, before the step. Attention is bidirectional per frame (a video's frame group is a
+    frame), expressed to `thop_attention` as one context sequence per frame. Position embedding
+    interpolation and 2-D RoPE both emit in the spatial-merge order the merger consumes.
 
     The frames run in calls of at most `VISION_CALL_MAX_PATCHES` rows, cut only between
     frames: attention is per frame, the position embedding and rope are per grid row and
     repeat per frame, the norms and MLPs are row-wise, and a frame's `h * w` is a multiple
     of `merge**2`, so a cut keeps every merger block whole. One frame past the bound cannot
-    be served; `validate_request` refuses it at admission."""
+    be served; `validate_request` refuses it at admission.
 
-    def __init__(self, w: dict, vision_config) -> None:
-        """`w` is the core's weight table after load; `vision_config` the composite
-        config's vision half, which `check_deployment` matched against this checkpoint's."""
+    The tower declares and loads its own weights (`weights.VISION_WEIGHTS`), so a model
+    built without it (`disable_mm_encoder`) allocates no vision weight."""
+
+    def __init__(self, vision_config, dtype: torch.dtype) -> None:
+        """`vision_config` is the composite config's vision half, which `check_deployment`
+        matched against this checkpoint's; `dtype` the activation dtype the tower runs at."""
+        super().__init__()
         vcfg = vision_config
         self.depth = vcfg.depth
         self.hidden = vcfg.hidden_size
@@ -324,11 +278,27 @@ class VisionTower:
         self.merge_dim = self.hidden * self.merge * self.merge
         # The position table is a square grid of this side.
         self.grid_side = math.isqrt(vcfg.num_position_embeddings)
-        self.dtype = w["embed"].dtype
-        self._w = _vision_views(w, self.depth)
+        self.dtype = dtype
+        # Every weight, declared here (meta-init intercepts `torch.empty`) and filled by
+        # `load_weights`; the views the ops read are built after load.
+        self.dims = _weights.vision_dims(vcfg, dtype)
+        self.w = _weights.VISION_WEIGHTS.declare(self.dims)
+        self._w: _VisionWeights | None = None
         # Persistent scratch: `thop_attention` grows `workspace` in place; never the
         # engine's own workspace.
-        self._ws: torch.Tensor | None = None
+        self._workspaces: dict[torch.cuda.Stream, torch.Tensor] = {}
+
+    def load_weights(self, weights) -> None:
+        """Fill the tower's weights from the checkpoint's `model.visual.` keys."""
+        _weights.VISION_WEIGHTS.load(self, weights)
+
+    def post_load_weights(self) -> None:
+        """Build the views the ops read, then warm the kernels up; once, though the
+        engine's post-load walk may reach this module more than once."""
+        if self._w is not None:
+            return
+        self._w = _vision_views(self.w, self.depth)
+        self.warm_up()
 
     def warm_up(self) -> None:
         """Run the tower once per `WARM_UP_GRIDS` grid on zero pixels, so every JIT kernel it
@@ -340,12 +310,14 @@ class VisionTower:
             rows = sum(t * h * w for t, h, w in grid)
             self._run(torch.zeros(rows, self.pixel_width, dtype=self.dtype, device=device), grid)
 
-    def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    def validate_request(self, request) -> None:
+        _validate_request(self, request, VISION_CALL_MAX_PATCHES)
+
+    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """`pixel_values` is `[sum(t*h*w), in_channels*kt*kh*kw]`, one flat patch per row,
         channel-slowest. `grid_thw` is one `(frames, height, width)` row per image or video
         and stays on the host (no synchronization). Returns
-        `[sum(t*h*w) / merge**2, out_hidden_size]`, one row per placeholder, in grid row
-        order."""
+        `[sum(t*h*w) / merge**2, out_hidden_size]`, one embedding per placeholder in grid order."""
         assert pixel_values.dtype == self.dtype, (
             f"the tower runs at the activation dtype {self.dtype}; the runtime handed "
             f"pixel_values as {pixel_values.dtype}. The input processor's `dtype` property is "
@@ -387,21 +359,13 @@ class VisionTower:
         assert pixel_values.is_cuda, "pixel_values must reach the tower on the device"
 
         # ---- the frame segmentation, host-side ------------------------------
-        # One attention segment per frame: a video's frames do not attend to each other.
-        seg_lens: list[int] = []
-        for frames, height, width in grid:
-            seg_lens.extend([height * width] * frames)
+        item_patches = [t * h * w for t, h, w in grid]
         num_patches = pixel_values.shape[0]
-        num_segments = len(seg_lens)
-        max_seg = max(seg_lens)
-
-        # Batch-state tensors for the encoder-only call; they describe the frames.
-        host_lens = torch.tensor(seg_lens, dtype=torch.int32)
-        host_types = torch.zeros([num_segments], dtype=torch.int32)
-        host_total = torch.tensor([num_patches, 0], dtype=torch.int32)
-        dev_lens = host_lens.to(dev)
-        if self._ws is None:
-            self._ws = torch.empty([0], dtype=torch.int8, device=dev)
+        attention_items = _item_attention_args(grid, dev)
+        stream = torch.cuda.current_stream(dev)
+        if stream not in self._workspaces:
+            self._workspaces[stream] = torch.empty(0, dtype=torch.int8, device=dev)
+        workspace = self._workspaces[stream]
         # The rotary's angles, once for all blocks.
         cos, sin = _rope_tables(grid, self.merge, VISION_ROPE_THETA, self.head_dim, dev)
 
@@ -412,41 +376,45 @@ class VisionTower:
             for t, h, w in grid
         ]
         h = torch.add(
-            patch_embed_conv3d(pixel_values, V.patch_w, V.patch_b),
+            _project_items(patch_embed_conv3d, pixel_values, item_patches, V.patch_w, V.patch_b),
             pos[0] if len(pos) == 1 else torch.cat(pos, 0),
         )
         attn_out = torch.empty([num_patches, self.hidden], dtype=dt, device=dev)
 
         for B in V.blocks:
-            qkv = cublas_mm(layer_norm(h, B.n1_w, B.n1_b, VISION_NORM_EPS), B.qkv, B.qkv_b)
+            qkv = _project_items(
+                cublas_mm,
+                layer_norm(h, B.n1_w, B.n1_b, VISION_NORM_EPS),
+                item_patches,
+                B.qkv,
+                B.qkv_b,
+            )
             # The q|k prefix of each packed row, rotated in place; v is never addressed.
             qkv_heads = torch.reshape(qkv, [num_patches, 3 * self.heads, self.head_dim])
             vision_rope_2d_packed_qk(qkv_heads[:, : 2 * self.heads], cos, sin)
-            attn_out = thop_attention(
-                q=qkv,
-                output=attn_out,
-                workspace=self._ws,
-                sequence_length=dev_lens,
-                host_past_key_value_lengths=host_lens,
-                host_total_kv_lens=host_total,
-                context_lengths=dev_lens,
-                host_context_lengths=host_lens,
-                host_request_types=host_types,
-                max_num_requests=num_segments,
-                max_context_length=max_seg,
-                max_seq_len=max_seg,
-                attention_window_size=max_seg,
-                num_contexts=num_segments,
-                num_ctx_tokens=num_patches,
-                num_heads=self.heads,
-                num_kv_heads=self.heads,
-                head_size=self.head_dim,
-                **_VISION_CALL_CONSTANTS,
+            for span, args in attention_items:
+                thop_attention(
+                    q=qkv[span],
+                    output=attn_out[span],
+                    workspace=workspace,
+                    num_heads=self.heads,
+                    num_kv_heads=self.heads,
+                    head_size=self.head_dim,
+                    **args,
+                    **_VISION_CALL_CONSTANTS,
+                )
+            h = torch.add(h, _project_items(cublas_mm, attn_out, item_patches, B.proj, B.proj_b))
+            mlp = _project_items(
+                cublas_mm,
+                layer_norm(h, B.n2_w, B.n2_b, VISION_NORM_EPS),
+                item_patches,
+                B.fc1,
+                B.fc1_b,
             )
-            h = torch.add(h, cublas_mm(attn_out, B.proj, B.proj_b))
-            mlp = cublas_mm(layer_norm(h, B.n2_w, B.n2_b, VISION_NORM_EPS), B.fc1, B.fc1_b)
             # Non-gated MLP with the tanh GELU (not the merger's erf).
-            h = torch.add(h, cublas_mm(gelu_tanh(mlp), B.fc2, B.fc2_b))
+            h = torch.add(
+                h, _project_items(cublas_mm, gelu_tanh(mlp), item_patches, B.fc2, B.fc2_b)
+            )
 
         # ---- the patch merger -----------------------------------------------
         # The norm runs over `hidden` before the 4-to-1 shuffle; the reshape is legal only
@@ -455,252 +423,6 @@ class VisionTower:
             layer_norm(h, V.m_n_w, V.m_n_b, VISION_NORM_EPS), [-1, self.merge_dim]
         )
         # The erf GELU (`nn.GELU()`); within one bf16 ulp of tanh, hence a separate entry.
-        return cublas_mm(gelu_erf(cublas_mm(merged, V.m_fc1, V.m_fc1_b)), V.m_fc2, V.m_fc2_b)
-
-
-# ------------------------------------------------------------ the shell's side ---
-
-
-def multimodal_embeds(tower: VisionTower | None, kwargs: dict):
-    """Run the vision tower for this batch; returns `(rows, mm_token_indices)` (the tower's
-    `[R, hidden]` rows in packed-batch order and the `[R]` placeholder rows they replace,
-    which the prefill target splices into its embedding), or None when the step carries no
-    media.
-
-    Called by the shell, because the inherited `DecoderModelForCausalLM.forward` drops
-    `multimodal_params` from `**kwargs` on the no-speculation path. Host-side bookkeeping:
-    `multimodal_params` is a subset of the context requests, so never zip it positionally;
-    `multimodal_runtime` (chunked prefill / KV reuse only) gives the cached and in-chunk row
-    counts over the request's images and videos together, in prompt order; `mm_token_indices`
-    names every placeholder row.
-
-    The tower runs once per modality a request carries, and `in_prompt_order` merges the
-    two outputs. Positions are not derived here: every coordinate of a vision span, a
-    video's temporal one included, is in the payload's `mrope_config.mrope_position_ids`,
-    which the engine slices into `position_ids`."""
-    mm_params = kwargs.get("multimodal_params") or []
-    if not mm_params:
-        return None
-    rows = []
-    for params in mm_params:
-        data = getattr(params, "multimodal_data", None) or {}
-        image, video = data.get("image"), data.get("video")
-        if image is None and video is None:
-            continue
-        mrope_ids = (data.get("mrope_config") or {}).get("mrope_position_ids")
-        assert (
-            mrope_ids is not None and mrope_ids.dim() == 3 and mrope_ids.shape[0] == _POSITION_AXES
-        ), (
-            f"a media request needs mrope_config.mrope_position_ids of shape "
-            f"[{_POSITION_AXES}, 1, L]; got {None if mrope_ids is None else tuple(mrope_ids.shape)}"
-        )
-        runtime = getattr(params, "multimodal_runtime", None)
-        if runtime is not None and int(runtime.num_mm_tokens_in_chunk) == 0:
-            # Every placeholder row of this request lies in another chunk.
-            continue
-        assert tower is not None, "post_load_weights builds the vision tower before any step"
-        towers = {}
-        if image is not None:
-            towers["image"] = run_tower(tower, image, *MEDIA_KEYS["image"])
-        if video is not None:
-            towers["video"] = run_tower(tower, video, *MEDIA_KEYS["video"])
-        embeds = in_prompt_order(tower.merge, params, towers)
-        if runtime is not None:
-            # Chunked prefill or reused prefix: splice only this chunk's slice.
-            start = int(runtime.num_cached_mm_tokens)
-            count = int(runtime.num_mm_tokens_in_chunk)
-            total = embeds.shape[0]
-            assert int(runtime.total_embeds_in_request) == total, (
-                f"the executor counted {runtime.total_embeds_in_request} placeholder rows for "
-                f"this request and the tower produced {total} over its {sorted(towers)}; the "
-                "two are derived from the same grids and a disagreement means the merger's "
-                "row count is wrong"
-            )
-            assert 0 <= start <= start + count <= total, (start, count, total)
-            embeds = embeds[start : start + count]
-        rows.append(embeds)
-    if not rows:
-        return None
-    vision = rows[0] if len(rows) == 1 else torch.cat(rows, 0)
-    mm_token_indices = kwargs.get("mm_token_indices")
-    assert mm_token_indices is not None, (
-        "the executor shipped multimodal params but no mm_token_indices; that pairing is what "
-        "the shell's `multimodal_token_ids` buys, and without it there is no sync-free way to "
-        "find the placeholder rows"
-    )
-    assert mm_token_indices.shape[0] == vision.shape[0], (
-        f"the batch has {mm_token_indices.shape[0]} placeholder rows and the tower produced "
-        f"{vision.shape[0]} embedding rows"
-    )
-    return vision, mm_token_indices
-
-
-def run_tower(tower, media: dict, pixel_key: str, grid_key: str):
-    """The tower over one modality's payload: `(rows, grid_thw)`, the rows one per
-    placeholder, item by item in the order the processor emitted them."""
-    pixel_values, grid_thw = media.get(pixel_key), media.get(grid_key)
-    assert pixel_values is not None and grid_thw is not None, (
-        f"the multimodal payload carries {sorted(media)}; this target reads {pixel_key!r} and "
-        f"{grid_key!r} from it"
-    )
-    assert not grid_thw.is_cuda, f"{grid_key} must stay on the host; see DEVICE_PATHS"
-    return tower(pixel_values, grid_thw), grid_thw
-
-
-def in_prompt_order(merge: int, params, towers: dict) -> torch.Tensor:
-    """One request's tower rows in the order its placeholders appear.
-
-    `towers` maps each modality the request carries to `(rows, grid_thw)`; each grid row is
-    one item of `t*h*w / merge**2` rows. One modality is already in prompt order. Two are
-    reassembled item by item from `item_metadata.item_refs` (`(modality, index)` per item in
-    prompt order, `index` counting that modality's items); without it there is no host-side
-    way to tell which placeholder run is an image and which a video."""
-    if len(towers) == 1:
-        return next(iter(towers.values()))[0]
-    metadata = params.item_metadata
-    order = metadata.item_refs if metadata is not None else None
-    assert order, (
-        f"a request carrying {sorted(towers)} needs item metadata to splice them in prompt "
-        "order; the payload holds each modality's rows apart"
-    )
-    merge_unit = merge * merge
-    items = {}
-    for modality, (embeds, grid_thw) in towers.items():
-        counts = [t * h * w // merge_unit for t, h, w in grid_thw.tolist()]
-        assert sum(counts) == embeds.shape[0], (
-            f"the {modality} grid describes {sum(counts)} rows and the tower produced "
-            f"{embeds.shape[0]}"
-        )
-        items[modality] = torch.split(embeds, counts, 0)
-    listed = {modality: [] for modality in items}
-    for modality, index in order:
-        assert modality in items, (
-            f"item_refs lists a {modality!r} item; this request carries {sorted(items)}"
-        )
-        listed[modality].append(int(index))
-    for modality, parts in items.items():
-        assert sorted(listed[modality]) == list(range(len(parts))), (
-            f"item_refs lists {modality} items {listed[modality]}; the payload carries {len(parts)}"
-        )
-    return torch.cat([items[modality][int(index)] for modality, index in order], 0)
-
-
-# ---------------------------------------------------------------- admission ---
-
-
-def validate_request(tower, request) -> None:
-    """Admission check, run by the executor on every new request. A media request the
-    forward would assert on fails here as that request's own error; an assert inside the
-    step ends the executor under the overlap scheduler. Reads only the request's host-side
-    payload, and a request without media returns at once. `tower` supplies the geometry
-    (`merge`, `patch`, `pixel_width`).
-
-    Refused: a frame past `VISION_CALL_MAX_PATCHES` patches (the one bound the tower keeps),
-    a malformed grid or pixel payload (or pixels not at the tower's dtype), media whose rows disagree with the prompt's
-    placeholder count, missing or mis-sized `mrope_position_ids`, and a request with both
-    images and videos whose item metadata is missing or does not list its items."""
-    data = request.py_multimodal_data
-    if not data:
-        return
-    grids = {}
-    for modality, (pixel_key, grid_key) in MEDIA_KEYS.items():
-        media = data.get(modality)
-        if media is not None:
-            grids[modality] = _media_grid(tower, modality, media, pixel_key, grid_key)
-    if not grids:
-        return
-
-    mrope_ids = (data.get("mrope_config") or {}).get("mrope_position_ids")
-    if (
-        mrope_ids is None
-        or mrope_ids.dim() != 3
-        or mrope_ids.shape[0] != _POSITION_AXES
-        or mrope_ids.shape[2] != request.prompt_len
-    ):
-        raise ValueError(
-            f"a media request needs the [{_POSITION_AXES}, 1, {request.prompt_len}] "
-            "mrope_config.mrope_position_ids from the input processor, one position per prompt "
-            f"token; got {None if mrope_ids is None else tuple(mrope_ids.shape)}"
-        )
-
-    if len(grids) > 1:
-        metadata = get_multimodal_item_metadata(data)
-        _check_item_order(grids, metadata.item_refs if metadata is not None else None)
-
-    cumsum = data.get("multimodal_embed_mask_cumsum")
-    if cumsum is not None:
-        merge_unit = tower.merge * tower.merge
-        rows = sum(t * h * w for grid in grids.values() for t, h, w in grid) // merge_unit
-        placeholders = int(cumsum[-1])
-        if placeholders != rows:
-            raise ValueError(
-                f"the prompt holds {placeholders} image/video placeholder tokens and its "
-                f"{' and '.join(sorted(grids))} payload produces {rows} embedding rows"
-            )
-
-
-def _media_grid(tower, modality, media, pixel_key, grid_key):
-    """One modality's `(frames, height, width)` rows, checked on the host."""
-    pixel_values, grid_thw = media.get(pixel_key), media.get(grid_key)
-    if pixel_values is None or grid_thw is None:
-        raise ValueError(
-            f"the {modality} payload carries {sorted(media)}; this target reads {pixel_key!r} "
-            f"and {grid_key!r} from it"
-        )
-    if grid_thw.dim() != 2 or grid_thw.shape[0] == 0 or grid_thw.shape[1] != 3:
-        raise ValueError(
-            f"{grid_key} must hold one (t, h, w) row per {modality}; got shape "
-            f"{tuple(grid_thw.shape)}"
-        )
-    merge = tower.merge
-    grid = [tuple(int(v) for v in row) for row in grid_thw.tolist()]
-    for item, (frames, height, width) in enumerate(grid):
-        if min(frames, height, width) < 1 or height % merge or width % merge:
-            raise ValueError(
-                f"{modality} {item} has grid {(frames, height, width)}; every entry must be "
-                f"positive and the sides divisible by spatial_merge_size {merge}"
-            )
-        if height * width > VISION_CALL_MAX_PATCHES:
-            raise ValueError(
-                f"{modality} {item} has frames of {height}x{width} = {height * width} patches "
-                f"({height * tower.patch}x{width * tower.patch} pixels); the vision tower "
-                f"serves frames of at most {VISION_CALL_MAX_PATCHES} patches, so send it at a "
-                "lower resolution"
-            )
-    patches = sum(t * h * w for t, h, w in grid)
-    if tuple(pixel_values.shape) != (patches, tower.pixel_width):
-        raise ValueError(
-            f"{pixel_key} is {tuple(pixel_values.shape)}; its grids describe {patches} patch "
-            f"rows of {tower.pixel_width}"
-        )
-    if pixel_values.dtype != tower.dtype:
-        raise ValueError(
-            f"{pixel_key} is {pixel_values.dtype}; the vision tower runs at {tower.dtype} "
-            "(multimodal_config.vision_gpu_normalize ships uint8)"
-        )
-    return grid
-
-
-def _check_item_order(grids, order) -> None:
-    """A request with several modalities lists its items in prompt order."""
-    if not order:
-        raise ValueError(
-            f"a request carrying {sorted(grids)} needs item metadata to splice them in prompt "
-            "order; the payload holds each modality's rows apart"
-        )
-    listed = {modality: [] for modality in grids}
-    for entry in order:
-        try:
-            modality, index = entry
-            listed[modality].append(int(index))
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(
-                f"item_refs entry {entry!r} is not an item of this request, which carries "
-                f"{sorted(grids)}; entries are (modality, index) pairs"
-            ) from error
-    for modality, grid in grids.items():
-        if sorted(listed[modality]) != list(range(len(grid))):
-            raise ValueError(
-                f"item_refs lists {modality} items {listed[modality]}; the payload carries "
-                f"{len(grid)}"
-            )
+        item_outputs = [n // self.merge**2 for n in item_patches]
+        mlp = _project_items(cublas_mm, merged, item_outputs, V.m_fc1, V.m_fc1_b)
+        return _project_items(cublas_mm, gelu_erf(mlp), item_outputs, V.m_fc2, V.m_fc2_b)

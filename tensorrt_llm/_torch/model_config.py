@@ -99,6 +99,58 @@ def _get_kv_cache_layer_specs(
     return layer_specs
 
 
+def _validate_encoder_attention_backend_support(
+        model_cls: type | None, mm_config: MultimodalConfig | None) -> None:
+    """Reject unsupported encoder selections before allocating model weights."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    supported = getattr(model_cls, "supported_encoder_attention_backends", {})
+    model_name = model_cls.__name__ if model_cls is not None else "The model"
+    for encoder, backend in mm_config.encoder_attention_backend.items():
+        if not supported or encoder in supported and not supported[encoder]:
+            raise ValueError(
+                f"The {encoder} encoder's attention backend cannot be changed "
+                f"for {model_name}")
+        if encoder not in supported:
+            raise ValueError(f"Unknown encoder {encoder!r} for {model_name}; "
+                             f"available encoders: {sorted(supported)}")
+        if backend not in supported[encoder]:
+            raise ValueError(
+                f"The {encoder} encoder does not support attention backend {backend!r}; "
+                f"supported backends: {sorted(supported[encoder])}")
+        if backend == "FLASHINFER":
+            from .flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+            if not IS_FLASHINFER_AVAILABLE:
+                raise ValueError(
+                    f"The {encoder} encoder requested FLASHINFER, but FlashInfer is unavailable"
+                )
+
+
+def _validate_encoder_attention_backend_enabled(
+    mm_config: MultimodalConfig | None,
+    pretrained_config: object,
+    *,
+    disable_mm_encoder: bool = False,
+    declared_encoders=()) -> None:
+    """Reject selections for encoders that the effective model config omits."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    if disable_mm_encoder:
+        # Text-only runs, such as trtllm-bench without --modality, reuse
+        # serving configs. A skipped encoder never applies the selection, and
+        # models that ignore disable_mm_encoder still build it with the setting.
+        logger.info(
+            "multimodal_config.encoder_attention_backend is not applied "
+            "to encoders skipped by disable_mm_encoder=True")
+        return
+    for encoder in mm_config.encoder_attention_backend:
+        default = pretrained_config if encoder in declared_encoders else None
+        if getattr(pretrained_config, f"{encoder}_config", default) is None:
+            raise ValueError(
+                f"The {encoder} encoder is not enabled in the model config")
+
+
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 # V4.1 shares V4's routed-MoE formats and backend choice, but needs its own
 # dense FP8 policy for both original and ModelOpt-converted checkpoints.

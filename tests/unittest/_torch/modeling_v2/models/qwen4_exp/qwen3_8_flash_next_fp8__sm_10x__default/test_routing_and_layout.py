@@ -83,11 +83,11 @@ _DUMMY_MODEL = "/tmp/dummy_model"
 _ARCH = "Qwen4ExpForConditionalGeneration"
 _TARGET = (
     "models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.modeling."
-    "ModelingV2Qwen38FlashNextFp8Sm10xDefault"
+    "ModelingV2Qwen38FlashNextFp8Sm10xDefaultForConditionalGeneration"
 )
 _NVFP4_DEFAULT_TARGET = (
     "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.modeling."
-    "ModelingV2Qwen38FlashNextNvfp4Sm10xDefault"
+    "ModelingV2Qwen38FlashNextNvfp4Sm10xDefaultForConditionalGeneration"
 )
 
 # The quantization the engine resolves for the FP8 (128x128 blocks) and the NVFP4 exports.
@@ -374,8 +374,10 @@ def test_every_layout_is_admitted_on_every_served_gpu(on_sm103, monkeypatch, gpu
         ),
         (
             dict(member="tep4"),
-            dict(multimodal_config=MultimodalConfig(vision_gpu_normalize=True)),
-            "vision_gpu_normalize",
+            dict(
+                multimodal_config=MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"})
+            ),
+            "vision encoder's attention backend cannot be changed",
         ),
     ],
     ids=[
@@ -399,13 +401,15 @@ def test_every_layout_is_admitted_on_every_served_gpu(on_sm103, monkeypatch, gpu
         "sliding-window",
         "sliding-window-inferred-max-seq-len",
         "eplb",
-        "vision-gpu-normalize",
+        "fixed-vision-backend",
     ],
 )
 def test_what_the_target_does_not_run_declines(on_sm103, config_kwargs, llm_args_kwargs, match):
     """``auto`` falls back to the built-in model and ``require`` says why, once per reason."""
+    args = _llm_args("auto", **llm_args_kwargs)
     config = _routed_config(**config_kwargs)
-    assert modeling_v2_resolve(config, _llm_args("auto", **llm_args_kwargs)) is None
+    config.multimodal_config = args.multimodal_config
+    assert modeling_v2_resolve(config, args) is None
     with pytest.raises(ValueError, match=match):
         modeling_v2_resolve(config, _llm_args("require", **llm_args_kwargs))
 
@@ -514,7 +518,8 @@ def test_a_switch_that_would_do_nothing_declines(on_sm103, monkeypatch):
 
 @pytest.mark.cpu_only
 def test_the_quantization_picks_the_checkpoint(on_sm103):
-    """MIXED_PRECISION routes to the NVFP4 target (its own checks mocked), FP8_BLOCK_SCALES here."""
+    """MIXED_PRECISION routes to the NVFP4 target's vision-language model (its own checks
+    mocked), FP8_BLOCK_SCALES here."""
     from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
         modeling as nvfp4_modeling,
     )

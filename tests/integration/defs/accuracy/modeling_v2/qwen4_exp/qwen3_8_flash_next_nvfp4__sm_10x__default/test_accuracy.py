@@ -126,7 +126,7 @@ def _target_core(llm: LLM):
     Reachable only with the executor in this process (``TLLM_WORKER_USE_SINGLE_PROCESS=1``),
     where the iteration stats that ``compute_acceptance_length`` reads are not collected.
     """
-    return llm._executor.engine.model_engine.model.model
+    return llm._executor.engine.model_engine.model.language_model.model
 
 
 def _count_prefill_graph_replays(monkeypatch: pytest.MonkeyPatch) -> dict[int, int]:
@@ -513,6 +513,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
 
     # The breakable prefill CUDA graph, up to max_num_tokens.
     BREAKABLE_PREFILL = dict(
+        disable_mm_encoder=True,
         prefill_cuda_graph_backend="breakable",
         prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
     )
@@ -1082,6 +1083,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 scoped_env_overrides(_VALIDATE) as rank_env,
                 LLM(
                     self.MODEL_PATH,
+                    disable_mm_encoder=True,
                     speculative_config=self.MTP3,
                     **engine,
                     modeling_v2="require",

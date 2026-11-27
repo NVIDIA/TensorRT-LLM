@@ -983,6 +983,219 @@ class Qwen4ExpFp8Weights:
             src=lambda d, i: [(f"{_ngram_prefix(d.ple_layer)}.weight_scale", None)],
             layers=None,
         ),
+        # --- the MTP draft module, at layer index num_hidden_layers, only when live ---
+        # A trunk full-attention layer plus a two-branch front end; keys carry no `{p}`.
+        W(
+            "mtp_pre_e_norm",
+            shape=lambda d: (d.hidden,),
+            src=f"{_MTP}.pre_fc_norm_embedding.weight",
+            layers=_mtp_only,
+        ),
+        # `[hc_count * hidden]`: the module's input is the trunk's four-stream residual.
+        W(
+            "mtp_pre_h_norm",
+            shape=lambda d: (d.stream,),
+            src=f"{_MTP}.pre_fc_norm_hidden.weight",
+            layers=_mtp_only,
+        ),
+        W(
+            "mtp_fc_e",
+            shape=lambda d: (d.hidden, d.hidden),
+            src=f"{_MTP}.fc_embedding.weight",
+            layers=_mtp_only,
+        ),
+        W(
+            "mtp_fc_h",
+            shape=lambda d: (d.hidden, d.hidden),
+            src=f"{_MTP}.fc_hidden.weight",
+            layers=_mtp_only,
+        ),
+        *(
+            w
+            for tag, module in _HC_MODULES
+            for w in _hyper_connection(
+                f"mtp_{tag}",
+                lambda name, m=module: f"{_MTP_LAYER}.{m}.{name}.weight",
+                _mtp_only,
+            )
+        ),
+        W(
+            "mtp_attn_in_w",
+            shape=lambda d: (d.attn_in_rows, d.hidden),
+            src=_mtp_attn_in_fused,
+            transform=_attn_in_w,
+            layers=_mtp_only,
+        ),
+        *_attn_out_and_norms("mtp_", f"{_MTP_LAYER}.self_attn", _mtp_only),
+        *_index_branch("mtp_", f"{_MTP_LAYER}.self_attn.indexer", _mtp_only),
+        W(
+            "mtp_router",
+            shape=lambda d: (d.num_experts, d.hidden),
+            src=f"{_MTP_LAYER}.mlp.gate.weight",
+            layers=_mtp_only,
+        ),
+        *_routed_experts("mtp_", _mtp_mlp, _mtp_only),
+        *_block_experts("mtp_", _mtp_mlp, _mtp_only),
+        *_block_shared("mtp_", _mtp_mlp, _mtp_only),
+        *_shared_expert("mtp_", _mtp_mlp, _mtp_only),
+        # The module's own stack-final mixer, which is its `shared_head`.
+        *_mixer("mtp_fhc", f"{_MTP}.hyper_connection_mixer", _mtp_only),
+    )
+
+    def dims(self, core) -> SimpleNamespace:
+        """This rank's text model dimensions."""
+        return rank_dims(
+            core.model_config.pretrained_config,
+            core.model_config.mapping,
+            mtp_enabled=getattr(core.model_config, "spec_config", None) is not None,
+            dtype=core.model_config.torch_dtype,
+        )
+
+    def expected_unconsumed(self, d: SimpleNamespace, keys) -> set:
+        """Keys this rank leaves unread: off-window experts, and `mtp.*` without MTP.
+
+        Computed from `d`, not the checkpoint, so a real weight's key can never land here.
+        """
+        start, count = _window(d)
+
+        def off_window(i):
+            if getattr(d, "moe_tpb", False):
+                return []  # the block-major copy reads a block of every expert
+            return [e for e in range(d.num_experts) if not start <= e < start + count]
+
+        out = {
+            f"{_trunk_mlp(i)}.experts.{e}.{t}"
+            for i in range(d.num_layers)
+            for e in off_window(i)
+            for t in _EXPERT_TENSORS
+        }
+        out.update(k for k in keys if k.startswith(f"{_VISUAL}."))
+        if not d.mtp_enabled:
+            return out | {k for k in keys if k.startswith(f"{_MTP}.")}
+        out.update(
+            f"{_mtp_mlp(None)}.experts.{e}.{t}"
+            for e in off_window(d.num_layers)
+            for t in _EXPERT_TENSORS
+        )
+        return out
+
+    def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
+        """Allocate every weight at this rank's share (meta-init intercepts `torch.empty`)."""
+        w = nn.ParameterDict()
+        for entry in self.WEIGHTS:
+            dtype = entry.dtype or d.dtype
+            for key, _, _ in self._targets(entry, d):
+                w[key] = nn.Parameter(
+                    torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False
+                )
+        return w
+
+    def _targets(self, entry: W, d: SimpleNamespace) -> list[tuple[str, int | None, str]]:
+        """`[(param key, layer index | None, checkpoint layer prefix), ...]` of one entry."""
+        layers = entry.layer_indices(d)
+        if layers is None:
+            return [(entry.name, None, "")]
+        return [(f"l{i}_{entry.name}", i, f"{_LM}.layers.{i}") for i in layers]
+
+    def manifest(self, d: SimpleNamespace) -> dict[str, list[tuple]]:
+        """Param key -> `[(checkpoint key, index | None, cut | None, transform | None), ...]`."""
+        rows: dict[str, list[tuple]] = {}
+        for entry in self.WEIGHTS:
+            for key, i, prefix in self._targets(entry, d):
+                rows[key] = [
+                    (ckpt, index, cut, entry.transform)
+                    for ckpt, index, cut in entry.sources(d, i, prefix)
+                ]
+        return rows
+
+    def read(self, weights, ckpt_key, cut, transform, d, device=None) -> torch.Tensor:
+        """One manifest source -> its destination's tensor: keys read through cuts, transformed."""
+        multi = isinstance(ckpt_key, tuple)
+        keys = ckpt_key if multi else (ckpt_key,)
+        cuts = (cut if cut is not None else (None,) * len(keys)) if multi else (cut,)
+        assert len(cuts) == len(keys), (ckpt_key, cut)
+        for key in keys:
+            assert key in weights, f"checkpoint key missing: {key}"
+        src_all = tuple(_read(weights[key], c) for key, c in zip(keys, cuts))
+        if device is not None:
+            src_all = tuple(t.to(device, non_blocking=True) for t in src_all)
+        if transform is not None:
+            return transform(src_all if multi else src_all[0], d)
+        assert len(src_all) == 1, "a multi-key row needs a transform"
+        return src_all[0]
+
+    def fill(self, param: nn.Parameter, sources, weights, d: SimpleNamespace) -> set:
+        """Fill `param` from its manifest rows on the parameter's device; return the keys read."""
+        consumed = set()
+        for ckpt_key, index, cut, transform in sources:
+            dst = param.data if index is None else param.data[index]
+            src = self.read(weights, ckpt_key, cut, transform, d, dst.device)
+            assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
+            assert src.dtype == dst.dtype, (ckpt_key, src.dtype, dst.dtype)
+            dst.copy_(src, non_blocking=True)
+            consumed.update(ckpt_key if isinstance(ckpt_key, tuple) else (ckpt_key,))
+        return consumed
+
+    def load(self, model, weights) -> None:
+        """Fill every declared parameter and assert checkpoint coverage both ways."""
+        core = model.model
+        d = self.dims(core)
+        # Declared before the manifest: its height comes from the shards.
+        rows_per_shard = _declare_ngram_table(core, d, weights)
+        try:
+            self._fill_declared(model, d, weights, rows_per_shard)
+        except BaseException:
+            _close_ngram_table(core)
+            raise
+
+    def _fill_declared(self, model, d: SimpleNamespace, weights, rows_per_shard: int) -> None:
+        core = model.model
+        manifest = self.manifest(d)
+        manifest["ple_table"] = ngram_table_sources(d, rows_per_shard)
+        consumed: set = set()
+
+        assert set(manifest.keys()) == set(core.w.keys()), (
+            "manifest/parameter drift",
+            set(manifest.keys()) ^ set(core.w.keys()),
+        )
+        for param_key, sources in manifest.items():
+            if param_key == "ple_table":
+                consumed |= _fill_ngram_table(core, d, weights, rows_per_shard)
+                continue
+            consumed |= self.fill(core.w[param_key], sources, weights, d)
+            if param_key.endswith(_RELEASE_AFTER):
+                torch.cuda.empty_cache()
+
+        # The shell owns lm_head (untied, bf16); read only the rows it built.
+        cut, pad = lm_head_share(model.lm_head.weight.shape[0], d.vocab, d.tp_rank)
+        assert tuple(model.lm_head.weight.shape[1:]) == (d.hidden,), (
+            f"the shell built lm_head {tuple(model.lm_head.weight.shape)}; this checkpoint's "
+            f"is a dense [{d.vocab}, {d.hidden}] weight"
+        )
+        consumed |= self.fill(
+            model.lm_head.weight, [("lm_head.weight", None, cut, pad)], weights, d
+        )
+        # Every parameter outside `core.w` must be lm_head.
+        shell = {n for n, _ in model.named_parameters() if not n.startswith("model.w.")}
+        assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
+
+        torch.cuda.synchronize()
+        leftover = set(weights.keys()) - consumed
+        expected = self.expected_unconsumed(d, weights.keys())
+        assert leftover == expected, (
+            "checkpoint coverage: leftover keys are not exactly this rank's off-window "
+            f"experts{'' if d.mtp_enabled else ' and the MTP module'}; unexpected "
+            f"{sorted(leftover - expected)[:8]}, missed {sorted(expected - leftover)[:8]}"
+        )
+
+
+MODEL_WEIGHTS = Qwen4ExpFp8Weights()
+
+
+class _VisionWeights(Qwen4ExpFp8Weights):
+    """The replicated vision weights, declared and loaded only by a local tower."""
+
+    WEIGHTS = (
         # --- the vision tower: all bf16, replicated, one-to-one, no transform ---
         W(
             "vis_patch_w",
@@ -1106,213 +1319,16 @@ class Qwen4ExpFp8Weights:
             src=_visual("merger.linear_fc2.bias"),
             layers=None,
         ),
-        # --- the MTP draft module, at layer index num_hidden_layers, only when live ---
-        # A trunk full-attention layer plus a two-branch front end; keys carry no `{p}`.
-        W(
-            "mtp_pre_e_norm",
-            shape=lambda d: (d.hidden,),
-            src=f"{_MTP}.pre_fc_norm_embedding.weight",
-            layers=_mtp_only,
-        ),
-        # `[hc_count * hidden]`: the module's input is the trunk's four-stream residual.
-        W(
-            "mtp_pre_h_norm",
-            shape=lambda d: (d.stream,),
-            src=f"{_MTP}.pre_fc_norm_hidden.weight",
-            layers=_mtp_only,
-        ),
-        W(
-            "mtp_fc_e",
-            shape=lambda d: (d.hidden, d.hidden),
-            src=f"{_MTP}.fc_embedding.weight",
-            layers=_mtp_only,
-        ),
-        W(
-            "mtp_fc_h",
-            shape=lambda d: (d.hidden, d.hidden),
-            src=f"{_MTP}.fc_hidden.weight",
-            layers=_mtp_only,
-        ),
-        *(
-            w
-            for tag, module in _HC_MODULES
-            for w in _hyper_connection(
-                f"mtp_{tag}",
-                lambda name, m=module: f"{_MTP_LAYER}.{m}.{name}.weight",
-                _mtp_only,
-            )
-        ),
-        W(
-            "mtp_attn_in_w",
-            shape=lambda d: (d.attn_in_rows, d.hidden),
-            src=_mtp_attn_in_fused,
-            transform=_attn_in_w,
-            layers=_mtp_only,
-        ),
-        *_attn_out_and_norms("mtp_", f"{_MTP_LAYER}.self_attn", _mtp_only),
-        *_index_branch("mtp_", f"{_MTP_LAYER}.self_attn.indexer", _mtp_only),
-        W(
-            "mtp_router",
-            shape=lambda d: (d.num_experts, d.hidden),
-            src=f"{_MTP_LAYER}.mlp.gate.weight",
-            layers=_mtp_only,
-        ),
-        *_routed_experts("mtp_", _mtp_mlp, _mtp_only),
-        *_block_experts("mtp_", _mtp_mlp, _mtp_only),
-        *_block_shared("mtp_", _mtp_mlp, _mtp_only),
-        *_shared_expert("mtp_", _mtp_mlp, _mtp_only),
-        # The module's own stack-final mixer, which is its `shared_head`.
-        *_mixer("mtp_fhc", f"{_MTP}.hyper_connection_mixer", _mtp_only),
     )
 
-    def dims(self, core) -> SimpleNamespace:
-        """This rank's `rank_dims` bundle; `core.vision_config` must be set before `declare`."""
-        return rank_dims(
-            core.model_config.pretrained_config,
-            core.vision_config,
-            core.model_config.mapping,
-            mtp_enabled=getattr(core.model_config, "spec_config", None) is not None,
-            dtype=core.model_config.torch_dtype,
-        )
-
-    def expected_unconsumed(self, d: SimpleNamespace, keys) -> set:
-        """Keys this rank leaves unread: off-window experts, and `mtp.*` without MTP.
-
-        Computed from `d`, not the checkpoint, so a real weight's key can never land here.
-        """
-        start, count = _window(d)
-
-        def off_window(i):
-            if getattr(d, "moe_tpb", False):
-                return []  # the block-major copy reads a block of every expert
-            return [e for e in range(d.num_experts) if not start <= e < start + count]
-
-        out = {
-            f"{_trunk_mlp(i)}.experts.{e}.{t}"
-            for i in range(d.num_layers)
-            for e in off_window(i)
-            for t in _EXPERT_TENSORS
-        }
-        if not d.mtp_enabled:
-            return out | {k for k in keys if k.startswith(f"{_MTP}.")}
-        out.update(
-            f"{_mtp_mlp(None)}.experts.{e}.{t}"
-            for e in off_window(d.num_layers)
-            for t in _EXPERT_TENSORS
-        )
-        return out
-
-    def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
-        """Allocate every weight at this rank's share (meta-init intercepts `torch.empty`)."""
-        w = nn.ParameterDict()
-        for entry in self.WEIGHTS:
-            dtype = entry.dtype or d.dtype
-            for key, _, _ in self._targets(entry, d):
-                w[key] = nn.Parameter(
-                    torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False
-                )
-        return w
-
-    def _targets(self, entry: W, d: SimpleNamespace) -> list[tuple[str, int | None, str]]:
-        """`[(param key, layer index | None, checkpoint layer prefix), ...]` of one entry."""
-        layers = entry.layer_indices(d)
-        if layers is None:
-            return [(entry.name, None, "")]
-        return [(f"l{i}_{entry.name}", i, f"{_LM}.layers.{i}") for i in layers]
-
-    def manifest(self, d: SimpleNamespace) -> dict[str, list[tuple]]:
-        """Param key -> `[(checkpoint key, index | None, cut | None, transform | None), ...]`."""
-        rows: dict[str, list[tuple]] = {}
-        for entry in self.WEIGHTS:
-            for key, i, prefix in self._targets(entry, d):
-                rows[key] = [
-                    (ckpt, index, cut, entry.transform)
-                    for ckpt, index, cut in entry.sources(d, i, prefix)
-                ]
-        return rows
-
-    def read(self, weights, ckpt_key, cut, transform, d, device=None) -> torch.Tensor:
-        """One manifest source -> its destination's tensor: keys read through cuts, transformed."""
-        multi = isinstance(ckpt_key, tuple)
-        keys = ckpt_key if multi else (ckpt_key,)
-        cuts = (cut if cut is not None else (None,) * len(keys)) if multi else (cut,)
-        assert len(cuts) == len(keys), (ckpt_key, cut)
-        for key in keys:
-            assert key in weights, f"checkpoint key missing: {key}"
-        src_all = tuple(_read(weights[key], c) for key, c in zip(keys, cuts))
-        if device is not None:
-            src_all = tuple(t.to(device, non_blocking=True) for t in src_all)
-        if transform is not None:
-            return transform(src_all if multi else src_all[0], d)
-        assert len(src_all) == 1, "a multi-key row needs a transform"
-        return src_all[0]
-
-    def fill(self, param: nn.Parameter, sources, weights, d: SimpleNamespace) -> set:
-        """Fill `param` from its manifest rows on the parameter's device; return the keys read."""
+    def load(self, tower, weights) -> None:
         consumed = set()
-        for ckpt_key, index, cut, transform in sources:
-            dst = param.data if index is None else param.data[index]
-            src = self.read(weights, ckpt_key, cut, transform, d, dst.device)
-            assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
-            assert src.dtype == dst.dtype, (ckpt_key, src.dtype, dst.dtype)
-            dst.copy_(src, non_blocking=True)
-            consumed.update(ckpt_key if isinstance(ckpt_key, tuple) else (ckpt_key,))
-        return consumed
-
-    def load(self, model, weights) -> None:
-        """Fill every declared parameter and assert checkpoint coverage both ways."""
-        core = model.model
-        d = self.dims(core)
-        # Declared before the manifest: its height comes from the shards.
-        rows_per_shard = _declare_ngram_table(core, d, weights)
-        try:
-            self._fill_declared(model, d, weights, rows_per_shard)
-        except BaseException:
-            _close_ngram_table(core)
-            raise
-
-    def _fill_declared(self, model, d: SimpleNamespace, weights, rows_per_shard: int) -> None:
-        core = model.model
-        manifest = self.manifest(d)
-        manifest["ple_table"] = ngram_table_sources(d, rows_per_shard)
-        consumed: set = set()
-
-        assert set(manifest.keys()) == set(core.w.keys()), (
-            "manifest/parameter drift",
-            set(manifest.keys()) ^ set(core.w.keys()),
-        )
-        for param_key, sources in manifest.items():
-            if param_key == "ple_table":
-                consumed |= _fill_ngram_table(core, d, weights, rows_per_shard)
-                continue
-            consumed |= self.fill(core.w[param_key], sources, weights, d)
-            if param_key.endswith(_RELEASE_AFTER):
-                torch.cuda.empty_cache()
-
-        # The shell owns lm_head (untied, bf16); read only the rows it built.
-        cut, pad = lm_head_share(model.lm_head.weight.shape[0], d.vocab, d.tp_rank)
-        assert tuple(model.lm_head.weight.shape[1:]) == (d.hidden,), (
-            f"the shell built lm_head {tuple(model.lm_head.weight.shape)}; this checkpoint's "
-            f"is a dense [{d.vocab}, {d.hidden}] weight"
-        )
-        consumed |= self.fill(
-            model.lm_head.weight, [("lm_head.weight", None, cut, pad)], weights, d
-        )
-        # Every parameter outside `core.w` must be lm_head.
-        shell = {n for n, _ in model.named_parameters() if not n.startswith("model.w.")}
-        assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
-
-        torch.cuda.synchronize()
-        leftover = set(weights.keys()) - consumed
-        expected = self.expected_unconsumed(d, weights.keys())
-        assert leftover == expected, (
-            "checkpoint coverage: leftover keys are not exactly this rank's off-window "
-            f"experts{'' if d.mtp_enabled else ' and the MTP module'}; unexpected "
-            f"{sorted(leftover - expected)[:8]}, missed {sorted(expected - leftover)[:8]}"
-        )
+        for key, sources in self.manifest(tower.dims).items():
+            consumed.update(self.fill(tower.w[key], sources, weights, tower.dims))
+        assert consumed == set(weights), "Unexpected vision checkpoint weights"
 
 
-MODEL_WEIGHTS = Qwen4ExpFp8Weights()
+VISION_WEIGHTS = _VisionWeights()
 
 
 class ExpertWindow(NamedTuple):
@@ -1390,7 +1406,7 @@ def _heads(total: int, ranks: int, rank: int) -> tuple[int, int]:
     return -(-total // ranks), rank * total // ranks
 
 
-def rank_dims(cfg, vcfg, mapping, *, mtp_enabled: bool, dtype: torch.dtype) -> SimpleNamespace:
+def rank_dims(cfg, mapping, *, mtp_enabled: bool, dtype: torch.dtype) -> SimpleNamespace:
     """Every width the table declares at rank `mapping.rank`, and the shares behind them."""
     hidden = cfg.hidden_size
     head_dim = cfg.head_dim
@@ -1424,7 +1440,6 @@ def rank_dims(cfg, vcfg, mapping, *, mtp_enabled: bool, dtype: torch.dtype) -> S
     local_experts = num_experts // mapping.tp_size
 
     ngram_heads = cfg.heads_per_ngram * (cfg.ngram_size - 1)
-    v_hidden = vcfg.hidden_size
     return SimpleNamespace(
         num_layers=cfg.num_hidden_layers,
         is_attn=[t == "full_attention" for t in cfg.layer_types],
@@ -1478,6 +1493,19 @@ def rank_dims(cfg, vcfg, mapping, *, mtp_enabled: bool, dtype: torch.dtype) -> S
         ple_shards=cfg.split_ngram_parts,
         ngram_vocab_divisor=cfg.make_ngram_vocab_size_divisible_by,
         ple_table_dtype=PLE_TABLE_DTYPE,
+        mtp_enabled=mtp_enabled,
+        dtype=dtype,
+    )
+
+
+def vision_dims(vcfg, dtype: torch.dtype) -> SimpleNamespace:
+    """The vision table's dimension bundle, from the composite's vision config. The tower
+    is replicated, so every rank declares it whole. `hidden` is the merger's output width,
+    the hidden size of the language model."""
+    v_hidden = vcfg.hidden_size
+    return SimpleNamespace(
+        hidden=vcfg.out_hidden_size,
+        dtype=dtype,
         v_depth=vcfg.depth,
         v_hidden=v_hidden,
         v_inter=vcfg.intermediate_size,
@@ -1486,8 +1514,6 @@ def rank_dims(cfg, vcfg, mapping, *, mtp_enabled: bool, dtype: torch.dtype) -> S
         v_patch=vcfg.patch_size,
         v_pos_rows=vcfg.num_position_embeddings,
         v_merge_dim=v_hidden * vcfg.spatial_merge_size * vcfg.spatial_merge_size,
-        mtp_enabled=mtp_enabled,
-        dtype=dtype,
     )
 
 

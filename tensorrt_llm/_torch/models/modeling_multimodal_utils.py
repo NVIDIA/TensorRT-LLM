@@ -34,6 +34,7 @@ from transformers.image_processing_backends import TorchvisionBackend
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
 from tensorrt_llm.logger import logger
 
 
@@ -160,7 +161,45 @@ def normalize_vision_pixels(
             BLOCK=1024,
             num_warps=4,
         )
+        # The LRU may evict a table created on another stream while this lookup is in flight.
+        table.record_stream(torch.cuda.current_stream(pixel_values.device))
     return output
+
+
+def _qwen3vl_build_batched_input(
+    multimodal_params: list[MultimodalParams], ) -> dict[str, Any]:
+    """Cat image items then video items across requests (matching the
+    ``EncoderGroup.modalities`` order) into one ViT input."""
+    pixels: list[torch.Tensor] = []
+    grids: list[torch.Tensor] = []
+    for m, pv_key, thw_key in (
+        ("image", "pixel_values", "image_grid_thw"),
+        ("video", "pixel_values_videos", "video_grid_thw"),
+    ):
+        for mp in multimodal_params:
+            bucket = mp.multimodal_data.get(m)
+            if bucket is not None:
+                if bucket[pv_key].dtype not in (
+                        torch.uint8,
+                        torch.float16,
+                        torch.bfloat16,
+                        torch.float32,
+                ):
+                    raise ValueError(
+                        f"Unsupported pixel dtype: {bucket[pv_key].dtype}")
+                pixel_values = bucket[pv_key]
+                if pixel_values.dtype == torch.uint8:
+                    # Normalize each raw bucket before concatenation can promote its dtype.
+                    shape = pixel_values.shape
+                    pixel_values = normalize_vision_pixels(
+                        pixel_values.view(-1, 3, shape[-1] // 3),
+                        bucket["vision_normalization"]).view(shape)
+                pixels.append(pixel_values)
+                grids.append(bucket[thw_key])
+    return {
+        "pixel_values": torch.cat(pixels, dim=0),
+        "grid_thw": torch.cat(grids, dim=0),
+    }
 
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
@@ -172,10 +211,16 @@ def _is_mm_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
+def has_multimodal_input(
+    mm_data: dict | None,
+    keys: tuple[str, ...] = (*MEDIA_MODALITIES, "multimodal_embedding")
+) -> bool:
+    """Whether processed input carries raw media or precomputed embeddings."""
+    return bool(mm_data) and any(mm_data.get(key) is not None for key in keys)
+
+
 def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
-    multimodal_data = param.multimodal_data or {}
-    return any(
-        multimodal_data.get(m) is not None for m in ("image", "video", "audio"))
+    return has_multimodal_input(param.multimodal_data, MEDIA_MODALITIES)
 
 
 # Processor *output* keys that transformers 5.x's
