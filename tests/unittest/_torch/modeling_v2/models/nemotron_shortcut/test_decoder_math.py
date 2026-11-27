@@ -62,8 +62,8 @@ def test_prefill_retains_the_clamped_state():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="requires SM103 NVFP4 paged attention",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="requires SM100 or SM103 NVFP4 paged attention",
 )
 def test_native_nvfp4_kv_continuation_across_pages():
     from tensorrt_llm._torch.modeling_v2.catalog.attention.qsa_paged_kv_store_nvfp4 import (

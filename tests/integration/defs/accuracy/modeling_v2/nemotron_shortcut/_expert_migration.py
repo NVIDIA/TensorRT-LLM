@@ -22,7 +22,7 @@ def verify_hot_expert_migration():
     assert comm.size == 4 and torch.cuda.device_count() >= comm.size
     rank = comm.rank
     torch.cuda.set_device(rank)
-    assert torch.cuda.get_device_capability() == (10, 3)
+    assert torch.cuda.get_device_capability() in ((10, 0), (10, 3))
     initial = [0, 1, 0, 2, 3, 1, 4, 5, 2, 6, 7, 3]
     config = MoeLoadBalancerConfig(
         num_slots=len(initial), layer_updates_per_iter=1, initial_global_assignments={0: initial}

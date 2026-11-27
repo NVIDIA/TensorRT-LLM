@@ -422,13 +422,14 @@ def test_nemotron_shortcut_tp4_prefix_mtp_handoff(precision, record_property) ->
 
 def _check_shortcut_handoff(record_property, precision: str, *, use_mtp: bool) -> None:
     from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
-    from tensorrt_llm._utils import get_sm_version
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.serve.perf_metrics import build_metrics_record_from_headers
 
+    from .modeling_v2.nemotron_shortcut._engine import require_four_rank_platform
+
     _require_two_node_allocation()
-    if get_sm_version() != 103:
-        pytest.skip("This handoff test requires four GB300 GPUs per worker")
+    # Each role holds a complete four-rank copy of the checkpoint.
+    require_four_rank_platform(precision)
     model = str(Path(llm_models_root()) / "nemotron_shortcut" / precision)
     index_topk = json.loads((Path(model) / "config.json").read_text())["text_config"]["index_topk"]
     env = {**_worker_env(), MODELING_V2_VALIDATE_ENV: "1"}

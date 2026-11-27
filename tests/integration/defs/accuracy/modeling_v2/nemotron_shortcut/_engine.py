@@ -11,10 +11,16 @@ from tensorrt_llm._utils import get_sm_version
 from .._env import scoped_env_overrides
 
 
+def require_four_rank_platform(precision):
+    # Only the quantized Super checkpoints fit on four GB200 GPUs.
+    supported_sms = (103,) if precision == "bf16" else (100, 103)
+    if get_sm_version() not in supported_sms:
+        pytest.skip(f"{precision} four-rank tests require SM {supported_sms}")
+
+
 @contextmanager
 def shortcut_text_engine(checkpoint, **options):
-    if get_sm_version() != 103:
-        pytest.skip("Four-rank text generation is qualified on GB300")
+    require_four_rank_platform(checkpoint.name)
     if not checkpoint.is_dir():
         pytest.skip(f"Checkpoint unavailable: {checkpoint}")
     overrides = {**options.pop("env_overrides", {}), MODELING_V2_VALIDATE_ENV: "1"}

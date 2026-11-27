@@ -23,8 +23,10 @@ LABEL_PROMPT = 'Return the label "violet" as a compact JSON object with the key 
 @pytest.fixture(scope="class")
 def server(request):
     precision, _, mode = request.param.partition("-")
-    if get_sm_version() != 103:
-        pytest.skip("Nemotron Shortcut serving is qualified on four GB300 GPUs")
+    # Only the quantized Super checkpoints fit on four GB200 GPUs.
+    supported_sms = (103,) if precision == "bf16" else (100, 103)
+    if get_sm_version() not in supported_sms:
+        pytest.skip(f"{precision} serving requires SM {supported_sms}")
     root = llm_models_root()
     if root is None or not (root / "nemotron_shortcut" / precision).is_dir():
         pytest.skip(f"Missing nemotron_shortcut/{precision} under LLM_MODELS_ROOT")

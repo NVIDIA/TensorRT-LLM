@@ -52,8 +52,8 @@ def test_hot_expert_replica_uses_migrated_weight_planes(llm_venv):
 
     from ....common import venv_mpi_check_call
 
-    if get_sm_version() != 103:
-        pytest.skip("Online placement uses host-accessible GB300 device weights")
+    if get_sm_version() not in (100, 103):
+        pytest.skip("Online placement requires host-accessible Grace Blackwell device weights")
     worker = Path(__file__).resolve().with_name("_expert_migration.py")
     venv_mpi_check_call(llm_venv, ["mpirun", "--allow-run-as-root", "-n", "4"], [str(worker)])
 

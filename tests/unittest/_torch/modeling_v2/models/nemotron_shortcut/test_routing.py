@@ -63,15 +63,31 @@ def _route(
 
 
 @pytest.mark.parametrize(
-    "quant,kv,state,target",
+    "quant,kv,state,world,capability,target",
     [
-        (None, None, "auto", "bf16__sm_103__default"),
-        (QuantAlgo.MIXED_PRECISION, QuantAlgo.NVFP4, "float32", "nvfp4__sm_103__default"),
-        (QuantAlgo.MXFP8, None, "auto", "mxfp8__sm_103__default"),
+        (None, None, "auto", 4, (10, 3), "bf16__sm_103__default"),
+        (
+            QuantAlgo.MIXED_PRECISION,
+            QuantAlgo.NVFP4,
+            "float32",
+            4,
+            (10, 3),
+            "nvfp4__sm_10x__default",
+        ),
+        (QuantAlgo.MXFP8, None, "auto", 4, (10, 3), "mxfp8__sm_10x__default"),
+        (
+            QuantAlgo.MIXED_PRECISION,
+            QuantAlgo.NVFP4,
+            "float32",
+            2,
+            (10, 0),
+            "nvfp4__sm_10x__default",
+        ),
+        (QuantAlgo.MXFP8, None, "auto", 4, (10, 0), "mxfp8__sm_10x__default"),
     ],
 )
-def test_four_rank_mixed_expert_parallelism_uses_default(quant, kv, state, target):
-    cls = _route(quant, 4, 2, state=state, kv_cache_quant_algo=kv)
+def test_qualified_mapping_uses_default(quant, kv, state, world, capability, target):
+    cls = _route(quant, world, 2, state=state, kv_cache_quant_algo=kv, capability=capability)
     assert cls.__module__.split(".")[-2] == target
 
 
@@ -112,5 +128,13 @@ def test_requires_fp32_recurrent_state(state, stochastic):
 
 
 def test_requires_qualified_gpu():
-    with pytest.raises(NoTarget, match="SM103"):
-        _route(QuantAlgo.MIXED_PRECISION, 4, 2, capability=(10, 0))
+    with pytest.raises(NoTarget, match="SM100 or SM103"):
+        _route(QuantAlgo.MIXED_PRECISION, 4, 2, capability=(9, 0))
+
+
+@pytest.mark.parametrize(
+    "quant,world", [(None, 4), (QuantAlgo.MXFP8, 2), (QuantAlgo.MIXED_PRECISION, 1)]
+)
+def test_sm100_rejects_weights_that_exceed_hbm(quant, world):
+    with pytest.raises(NoTarget, match="Super checkpoint requires"):
+        _route(quant, world, 1, capability=(10, 0))

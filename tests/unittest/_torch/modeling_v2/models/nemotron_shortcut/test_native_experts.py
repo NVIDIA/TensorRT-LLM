@@ -7,10 +7,10 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
-from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_103__default.ops import (
+from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_10x__default.ops import (
     grouped_experts,
 )
-from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_103__default.weights import (
+from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_10x__default.weights import (
     Projection,
     _kv_scale_keys,
     _load_kv_scales,
@@ -147,7 +147,7 @@ def test_expert_calibration_and_weighted_fc2_across_ep():
 def test_separate_attention_scales_and_padded_segmented_projection():
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_103__default.modeling import (
+    from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_10x__default.modeling import (
         Nvfp4Decoder,
     )
 
@@ -229,7 +229,7 @@ def test_separate_attention_scales_and_padded_segmented_projection():
     reason="masked grouped NVFP4 requires Blackwell SM100/SM103",
 )
 def test_expert_graph_replay_matches_eager_after_routing_change():
-    from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_103__default.ops import (
+    from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_10x__default.ops import (
         Nvfp4Projection,
     )
 

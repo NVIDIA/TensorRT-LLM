@@ -965,7 +965,7 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     K/V to the pool, and q's projection, norm, RoPE and output gate are not.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_107})
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -1043,7 +1043,7 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     bitwise the eager call on them.
 
     Compiled variants: the kernels are Triton, JIT-compiled on first call for the
-    device that runs them; every cell ran that path on sm_103 and sm_107. They take
+    device that runs them; every cell ran that path on sm_100, sm_103 and sm_107. They take
     the pool's page count (`num_pages`), the
     table's row count (`num_requests`) and the split-K kernel the step's row
     count as plain ints, and Triton compiles each apart at 1, at multiples of 16

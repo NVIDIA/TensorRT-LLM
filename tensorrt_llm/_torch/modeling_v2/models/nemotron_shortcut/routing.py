@@ -15,7 +15,7 @@ from ..._router_index import (
     routes,
 )
 
-# (world size, attention DP, MoE TP, MoE EP), all on a single SM103 node.
+# (world size, attention DP, MoE TP, MoE EP), all on a single node.
 _FOUR_RANK_LAYOUTS = {
     (4, False, 1, 4),
     (4, False, 2, 2),
@@ -39,8 +39,8 @@ def route(model_config, llm_args, compute_capability):
 
     cfg = model_config.pretrained_config
     mapping = model_config.mapping
-    if compute_capability != (10, 3):
-        raise NoTarget("The text decoder requires SM103.")
+    if compute_capability not in ((10, 0), (10, 3)):
+        raise NoTarget("The text decoder requires SM100 or SM103.")
     if model_config.lora_config is not None:
         if mapping.enable_attention_dp:
             raise NoTarget("The decoder's LoRA projections use tensor-parallel weight shards.")
@@ -70,6 +70,14 @@ def route(model_config, llm_args, compute_capability):
     if model_config.torch_dtype != torch.bfloat16:
         raise NoTarget("The text decoder requires BF16 activations.")
     quant = model_config.quant_config.quant_algo
+    if compute_capability == (10, 0):
+        # With GB200 HBM the Super weights need two ranks for NVFP4 and four for MXFP8.
+        if quant is None:
+            raise NoTarget("The BF16 Super checkpoint requires four SM103 GPUs.")
+        if quant == QuantAlgo.MXFP8 and mapping.world_size < 4:
+            raise NoTarget("The MXFP8 Super checkpoint requires four GPUs on SM100.")
+        if quant == QuantAlgo.MIXED_PRECISION and mapping.world_size < 2:
+            raise NoTarget("The NVFP4 Super checkpoint requires at least two GPUs on SM100.")
     kv_quant = engine_kv_cache_quant_algo(model_config, llm_args)
     if kv_quant is not None and (
         kv_quant != QuantAlgo.NVFP4 or quant != QuantAlgo.MIXED_PRECISION or cfg.index_topk is None
@@ -154,20 +162,20 @@ def route(model_config, llm_args, compute_capability):
         if layout not in _QUANTIZED_LAYOUTS or mapping.world_size == 1:
             raise NoTarget(f"Unsupported MXFP8 text decoder mapping: {layout}.")
         if media:
-            from .mxfp8__sm_103__default.multimodal import ShortcutMxfp8ForConditionalGeneration
+            from .mxfp8__sm_10x__default.multimodal import ShortcutMxfp8ForConditionalGeneration
 
             return ShortcutMxfp8ForConditionalGeneration
-        from .mxfp8__sm_103__default.modeling import ShortcutMxfp8ForCausalLM
+        from .mxfp8__sm_10x__default.modeling import ShortcutMxfp8ForCausalLM
 
         return ShortcutMxfp8ForCausalLM
     if quant == QuantAlgo.MIXED_PRECISION:
         if layout not in _QUANTIZED_LAYOUTS:
             raise NoTarget(f"Unsupported mixed-precision text decoder mapping: {layout}.")
         if media:
-            from .nvfp4__sm_103__default.multimodal import ShortcutNvfp4ForConditionalGeneration
+            from .nvfp4__sm_10x__default.multimodal import ShortcutNvfp4ForConditionalGeneration
 
             return ShortcutNvfp4ForConditionalGeneration
-        from .nvfp4__sm_103__default.modeling import ShortcutNvfp4ForCausalLM
+        from .nvfp4__sm_10x__default.modeling import ShortcutNvfp4ForCausalLM
 
         return ShortcutNvfp4ForCausalLM
     raise NoTarget(f"Unsupported checkpoint precision: {quant}.")

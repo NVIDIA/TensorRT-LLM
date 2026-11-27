@@ -7,7 +7,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.mxfp8_quantize import mxfp8_quantize
 from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.moe import grouped_quantized_experts
-from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.mxfp8__sm_103__default.ops import (
+from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.mxfp8__sm_10x__default.ops import (
     Mxfp8Projection,
 )
 

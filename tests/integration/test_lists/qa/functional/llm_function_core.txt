@@ -812,12 +812,12 @@ accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_accurac
 # without and with MTP 3, and the MTP acceptance length, at both of its layouts.
 accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4] TIMEOUT (45)
 accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4_ep4] TIMEOUT (45)
-# Nemotron Shortcut functional QA on four GB300 GPUs.
+# Four-rank Nemotron Shortcut QA uses GB300 for BF16 and GB200 or GB300 for quantized weights.
 test_e2e.py::test_nemotron_shortcut_serving[nvfp4] TIMEOUT (90)
 accuracy/modeling_v2/nemotron_shortcut/bf16__sm_103__default/test_accuracy.py::TestShortcutBf16::test_gsm8k
-accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_103__default/test_accuracy.py::TestShortcutNvfp4::test_gsm8k
-accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_103__default/test_accuracy.py::test_mtp_greedy_matches_ordinary_decode
-accuracy/modeling_v2/nemotron_shortcut/mxfp8__sm_103__default/test_accuracy.py::TestShortcutMxfp8::test_gsm8k
+accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_10x__default/test_accuracy.py::TestShortcutNvfp4::test_gsm8k
+accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_10x__default/test_accuracy.py::test_mtp_greedy_matches_ordinary_decode
+accuracy/modeling_v2/nemotron_shortcut/mxfp8__sm_10x__default/test_accuracy.py::TestShortcutMxfp8::test_gsm8k
 accuracy/modeling_v2/nemotron_shortcut/test_video.py::test_decoded_video_frames[nvfp4]
 accuracy/modeling_v2/nemotron_shortcut/test_video.py::test_evs_conditioned_video[unpruned-nvfp4]
 accuracy/modeling_v2/nemotron_shortcut/test_video.py::test_evs_conditioned_video[evs-nvfp4]
