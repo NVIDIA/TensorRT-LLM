@@ -20,6 +20,7 @@ llm_perf_core:
 # 12: VR200 single-node test cases
 # 13: B300, GB300 (SM103), single-node tests with >260 GiB per GPU
 # 14: B200, GB200 (SM100), GLM-5.3-Flash NVFP4 TP4/EP4
+# 15: GB200 attention-DP/MTP recompute-pause trade-off
 # ===============================================================================
 
 
@@ -494,3 +495,14 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4-cfg:glm53_flash_nvfp4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:glm53_flash_nvfp4,decoding_type=MTP,max_draft_len=3] TIMEOUT(120)
   - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4-cfg:glm53_flash_nvfp4,decoding_type=MTP,max_draft_len=3] TIMEOUT(120)
+
+
+- condition:
+    wildcards:
+      gpu:
+      - 'gb200'
+    ranges:
+      system_gpu_count:
+        gte: 4
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k8k]

@@ -606,6 +606,48 @@ KV cache manager V1 can reuse an unreferenced leaf directly, even with `copy_on_
 
 Property ```max_attention_window``` specifies the maximum attention window size for each layer in the model as a list of integer values. If the length of this list is less than number of layers, the list is repeated as many times as necessary. For instance, if the model has only full attention layers and maximum sequence length is 4096, you can specify this as ```max_attention_window = [4096]```. If the first layer is full attention, the second layer is limited attention with window size 256 and then this repeats for the remaining layers, you specify this as ```max_attention_window = [4096,256]```. This means first layer is full attention, second layer is limited attention, third layer is full attention, fourth layer is limited attention and so on.
 
+### Generation Recompute-Pause Waiting (V2)
+
+When a generation request cannot allocate KV pages, `KVCacheV2Scheduler` first
+tries ordinary suspension where it can reclaim GPU pages. If that is not enough
+and another generation request has already been scheduled in the same pass, the
+blocked request can wait for pages rather than discard a started victim's KV and
+re-prefill it. Earlier in-flight pipeline micro-batches do not count as scheduled
+generation work in this pass. The first blocked generation request of a pass can
+still recompute-pause a victim when needed. Context-path preemption is unchanged.
+
+`TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS` controls this wait:
+
+- **Unset:** wait without a limit when the manager has a cache tier below GPU.
+  In a GPU-only pool, do not wait: suspension cannot reclaim GPU pages there.
+  This includes `host_cache_size=0`, GPU-only aggregated Helix, and connectors
+  whose page-address registration requires a GPU-only pool.
+- **Negative integer:** explicitly wait without a limit, including in GPU-only
+  pools. This can reduce the decode batch when suspended requests retain their
+  pages, so use it only after measuring the workload.
+- **`0`:** do not wait; use the previous recompute-pause behavior immediately.
+  Unlike `TLLM_V2_CTX_DEMOTE_MAX_ITERS`, zero does not mean unbounded here.
+- **Positive integer `k`:** allow `k` consecutive passes as the first blocked
+  generation request before trying to recompute-pause a victim. There is one
+  waiter slot, not a per-request deadline: another blocked request taking the
+  slot restarts the count. Scheduling the waiter or giving up its KV, including
+  a preemption deferred for connector saves, ends that wait.
+
+The setting is parsed once when the scheduler is constructed. Empty or
+non-integer values raise an error naming the variable. The startup log reports
+the effective bound (`unbounded` for negative values), and debug logs report each
+wait and its count. Disabling recompute pause also disables this wait.
+
+Waiting trades less re-prefill work for potentially smaller decode batches.
+Attention-DP/MTP workloads can prefer earlier recompute-pause even with a host
+tier; `0` restores the previous behavior, and a small positive bound is an
+intermediate option. Measure throughput and scheduled generation requests per
+iteration for the target workload rather than assuming that less re-prefill is
+always faster. Aggregated Helix without a lower tier skips ordinary suspension
+and relies on recompute-pause for reclaiming pages; it therefore defaults to `0`
+as well. A disaggregated generation server cannot replay its prefill and keeps
+its existing no-recompute behavior.
+
 ### Debugging Aids
 
 Two opt-in environment variables help when a result looks like it came from KV

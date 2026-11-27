@@ -488,7 +488,8 @@ def _failing_gen_scheduler(
         has_cp_helix=True,
         enable_recompute_pause=enable_recompute_pause,
         _single_beam=False,
-        _recompute_pause_waiter=None,
+        _recompute_pause_waiter_id=None,
+        _recompute_pause_wait_iters=0,
         kv_cache_manager=SimpleNamespace(
             try_allocate_generation=lambda req: False,
             is_request_active=lambda request_id: True,
@@ -514,6 +515,9 @@ def _failing_gen_scheduler(
     sched._clear_request_runtime_state = types.MethodType(
         KVCacheV2Scheduler._clear_request_runtime_state, sched
     )
+    sched._reset_recompute_pause_wait = types.MethodType(
+        KVCacheV2Scheduler._reset_recompute_pause_wait, sched
+    )
     return sched
 
 
@@ -535,6 +539,7 @@ def _schedule_failing_gen(sched: SimpleNamespace, req: SimpleNamespace):
         recompute_paused=[],
         inflight_request_ids=set(),
         scheduled_beam_width=0,
+        generation_scheduled=False,
     )
 
 
@@ -599,8 +604,9 @@ def test_disagg_helix_allocation_failure_closes_deferred_releases_first(
 
 def test_scheduler_allocation_failure_preempts_under_agg_helix() -> None:
     """Aggregated helix can replay a prefill, and without a tier below GPU
-    suspending frees nothing, so a generation allocation failure goes
-    straight to recompute-pause. The request sits out the step without being
+    suspending frees nothing, so the first blocked generation request goes
+    straight to recompute-pause. An explicit wait override can delay later
+    generation requests. The request sits out the step without being
     suspended, so its stale batch index must still be cleared."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
 
