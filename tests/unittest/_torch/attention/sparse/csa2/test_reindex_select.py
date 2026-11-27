@@ -3,10 +3,13 @@
 """A Reindex layer's decode candidate logits and mapped Top-K in one launch (``reindex_select.py``) select
 exactly what DeepGEMM's paged sparse MQA logits followed by ``select_mapped_consumer_topk_`` select."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2 import decode_select
 from tensorrt_llm._torch.attention.backends.sparse.csa2 import indexer as indexer_module
 from tensorrt_llm._torch.attention.backends.sparse.csa2 import reindex_select as rs
 from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
@@ -14,7 +17,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Trtl
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2ForwardState
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
 from tensorrt_llm._torch.modules.top_k import TopKImplementation
-from tensorrt_llm._utils import is_blackwell_datacenter
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ._utils import _plan_indexer
@@ -28,10 +31,42 @@ from .test_indexer import (
 NBLK, SB, TOP_K = 2048, 8, 512
 
 
+def test_cluster_limit_is_cached_per_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.kernels.blackwell.top_k import single_pass_multi_cta_radix_topk_cluster
+
+    cluster = single_pass_multi_cta_radix_topk_cluster
+    queried = []
+    devices = iter((0, 1, 0))
+    limits = (16, 8)
+
+    def query(kernel, config):
+        queried.append(kernel)
+        return limits[kernel]
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: next(devices))
+    monkeypatch.setattr(
+        cluster,
+        "HardwareInfo",
+        lambda device_id: SimpleNamespace(
+            _get_device_function=lambda: device_id, _checkCudaErrors=lambda value: value
+        ),
+    )
+    monkeypatch.setattr(cluster.driver, "cuFuncSetAttribute", lambda *args: None)
+    monkeypatch.setattr(cluster.driver, "cuOccupancyMaxPotentialClusterSize", query)
+    cache = cluster._query_max_cluster_size_for_device
+    cache.cache_clear()
+    try:
+        assert [cluster._query_max_cluster_size() for _ in range(3)] == [16, 8, 16]
+        assert queried == [0, 1]
+    finally:
+        cache.cache_clear()
+
+
 @skip_pre_blackwell
 @pytest.mark.skipif(
-    not _sparse_kernels_available() or not is_blackwell_datacenter(),
-    reason="DeepGEMM sparse MQA and the fused select on SM100 / SM103",
+    not _sparse_kernels_available() or get_sm_version() not in (100, 103, 107),
+    reason="DeepGEMM sparse MQA and fused Reindex require SM100, SM103 or SM107",
 )
 @torch.inference_mode()
 def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
@@ -91,8 +126,10 @@ def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
     original = rs.reindex_select_
 
     def counting(*args, **kwargs):
-        calls.append(args[0].shape[0])
-        return original(*args, **kwargs)
+        launched = original(*args, **kwargs)
+        if launched:
+            calls.append(args[0].shape[0])
+        return launched
 
     monkeypatch.setattr(rs, "reindex_select_", counting)
     prebuild = metadata.prebuild_sparse_schedule
@@ -113,7 +150,7 @@ def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
                 patch.setattr(rs, "_FUSED_SELECT_MAX_ROWS", 0)
             metadata._csa2_forward_serial = getattr(metadata, "_csa2_forward_serial", 0) + 1
             source(state, 0, tokens)
-            return consumer(state, 0, tokens)
+            return consumer(state, 0, tokens).clone()
 
     def both():
         return forward(False), forward(True)
@@ -132,9 +169,30 @@ def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         plain, fused = both()
-    for trial in range(3):
-        q.neg_() if trial % 2 else q.mul_(0.5)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(fused, plain), trial
-        assert int((plain >= 0).sum()) == tokens * TOP_K, trial
+    # Hold the projected inputs fixed to isolate replay of the page mapping and visibility.
+    graph.replay()
+    previous = plain.clone()
+    table.copy_(table.roll(7, 1))
+    visible.clamp_max_(8192)
+    graph.replay()
+    _plan_indexer(metadata)
+    expected = forward(False)
+    assert not torch.equal(plain, previous)
+    assert torch.equal(plain, expected)
+    assert torch.equal(fused, expected)
+    assert int((plain >= 0).sum()) == tokens * TOP_K
+
+    previous = expected
+    q.neg_()
+    graph.replay()
+    expected = forward(False)
+    assert not torch.equal(expected, previous)
+    assert torch.equal(plain, expected)
+    assert torch.equal(fused, expected)
+
+    # The same shape must take the two-launch path where even an 8-CTA cluster cannot fit.
+    calls.clear()
+    monkeypatch.setattr(decode_select, "_max_cluster_size", lambda: 4)
+    monkeypatch.setattr(rs, "_APPLIES", {})
+    assert torch.equal(forward(True), expected)
+    assert not calls

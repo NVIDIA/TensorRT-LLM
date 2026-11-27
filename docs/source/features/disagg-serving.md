@@ -748,3 +748,54 @@ export LD_LIBRARY_PATH=$(python3 -c "import importlib.util, pathlib; print(pathl
 ```
 
 Because a node can be broken in isolation, a NIXL failure that appears on only one of several otherwise identical nodes is worth checking here first, before spending a full weight load on an environment change.
+
+
+### Native NIXL agent recovery
+
+Agent recovery is automatic for the Python transceiver with C++ NIXL over UCX,
+bounce buffers disabled, and ownership enforcement disabled. Multi-rank recovery uses
+the MPI executor containment path; other launchers retain their existing path.
+It requires bindings that
+expose `TransferStatus.release`; older bindings log
+`NIXL agent recovery requires rebuilt request-release bindings` and retain the
+legacy path. Released terminal peer errors remain request scoped; an unretirable
+native handle fences the local agent and starts recovery. If replaying a peer's
+metadata fails, healthy peers remain available. The sender retains the failed
+descriptor and retries it on a later request, at most once per second per peer,
+without requiring the receiver to send a new registration message. After three
+consecutive failures for one peer, the sender rebuilds its local agent and replays
+every retained descriptor, because a failed load can leave state that blocks
+later loads of the same peer on that agent.
+
+The fence closes new send and receive admission. Pending GEN admissions remain
+queued and return speculative allocations while the agent recovers. New CTX
+prefills also wait; the existing idle poll keeps admission state progressing. Existing
+transfer outcome exchanges propagate failed request IDs and agent availability
+across the ranks sharing a request. Failure cancellation uses the existing
+session cancellation protocol; request resources remain held until every
+participating rank reports physical retirement. Internal failures remain errors,
+including when a user cancellation arrives during retirement.
+
+An interrupted `IN_PROGRESS` handle is not retired by destroying its agent.
+Recovery polls it to a terminal native result before teardown. If the configured
+KV transfer timeout expires, the existing retirement fatal handler retains the
+unresolved memory roots and terminates the executor. Multi-rank MPI recovery requires
+an MPI executor communicator with `MPI_THREAD_MULTIPLE`; startup validates this
+on every rank and warns that MPI/launcher termination can affect other executors
+sharing the job.
+
+The recovery loop checks the deadline between teardown, construction and memory
+registration stages and does not publish a replacement that completed late.
+These checks do not interrupt a blocked native call; there is no additional
+watchdog thread.
+
+Scheduler admission failure consensus is batched every 64 scheduling passes for
+model-parallel replicas, adding at most 63 passes after local stall detection.
+Rank-local attention-DP requests do not add a TP vote. Requests whose transfers
+still hold memory remain visible to the scheduler's capacity-stall hold probe.
+Each stall window selects one newest eligible KV holder (or one newest pending
+context if none holds KV), including starved contexts. After three agreed
+failure rounds without a successful model forward on a real request, the executor escalates
+through its existing event-loop failure containment instead of rejecting new
+requests indefinitely. A successful real-request forward resets that round count;
+rejected candidates, empty batches, padding dummies and warmup do not.

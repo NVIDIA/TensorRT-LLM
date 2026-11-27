@@ -190,6 +190,88 @@ class TestHunyuanVideo15Transformer(unittest.TestCase):
         self.assertEqual(output.shape, hidden_states.shape)
 
 
+def test_deco_recipe_builds_deco_layers(require_deco_kernels, deco_recipe):
+    """Every attention layer of a model under a DeCo-Attention recipe is a DeCo layer."""
+    from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
+    from tensorrt_llm._torch.visual_gen.models.hunyuan_video1_5 import (
+        transformer_hunyuan_video1_5 as hunyuan,
+    )
+
+    require_deco_kernels()
+    model_config = _create_model_config(CONFIG | {"num_layers": 1}, backend="CUTEDSL")
+    model_config.attention = AttentionConfig(
+        backend="CUTEDSL", quant_attention_config=deco_recipe()
+    )
+    model = hunyuan.HunyuanVideo15Transformer3DModel(model_config)
+
+    layers = [m.attn for m in model.modules() if isinstance(m, hunyuan.Attention)]
+    assert layers and all(type(layer) is DeCoAttention for layer in layers)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_joint_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch):
+    """The joint blocks of a forward hand their backend one tags tensor and one padding mask."""
+    from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
+    from tensorrt_llm._torch.visual_gen.models.hunyuan_video1_5 import (
+        transformer_hunyuan_video1_5 as hunyuan,
+    )
+
+    config = CONFIG | {"num_layers": 2}
+    dtype = torch.bfloat16
+    model = hunyuan.HunyuanVideo15Transformer3DModel(_create_model_config(config))
+    model = model.to("cuda", dtype=dtype).eval()
+
+    inputs = [t.repeat(2, *[1] * (t.dim() - 1)) for t in _make_inputs(config, dtype, "cuda")]
+    hidden_states, text, image_embeds, text_mask, text_2, text_mask_2, timestep = inputs
+    text_mask[1, 2:] = 0  # a CFG batch: the second sample has a shorter text
+    text_mask_2[1, 4:] = 0
+    num_text = (text_mask.sum(dim=1) + text_mask_2.sum(dim=1)).long()
+    num_image = image_embeds.shape[1]
+
+    calls: list[dict] = []
+    backend_forward = VanillaAttention.forward
+
+    def record(self, q, k=None, v=None, **kwargs):
+        if kwargs.get("token_tags") is not None:  # the token refiner passes none
+            calls.append(kwargs)
+        return backend_forward(self, q, k, v, **kwargs)
+
+    monkeypatch.setattr(VanillaAttention, "forward", record)
+
+    def forward(embeds):
+        """Run the model and return the tags and the mask that its blocks passed."""
+        calls.clear()
+        with torch.no_grad():
+            model(
+                hidden_states=hidden_states,
+                encoder_hidden_states=text,
+                timestep=timestep,
+                encoder_attention_mask=text_mask,
+                encoder_hidden_states_2=text_2,
+                image_embeds=embeds,
+                encoder_attention_mask_2=text_mask_2,
+            )
+        passed_tags, passed_mask = calls[0]["token_tags"], calls[0]["key_padding_mask"]
+        assert len(calls) == len(model.transformer_blocks)
+        assert all(
+            c["token_tags"] is passed_tags and c["key_padding_mask"] is passed_mask for c in calls
+        )
+        assert all(c.get("valid_seq_len") is None for c in calls)
+        return passed_tags, passed_mask
+
+    # Text to video: tag 0 on the video rows, 1 after them; the image rows hold no token.
+    tags, mask = forward(torch.zeros_like(image_embeds))
+    num_video = tags.numel() - text.shape[1] - text_2.shape[1] - num_image
+    positions = torch.arange(tags.numel(), device="cuda")
+    assert torch.equal(tags, (positions >= num_video).to(tags.dtype))
+    assert torch.equal(mask, positions < (num_video + num_text)[:, None])
+
+    # With image embeddings the image rows follow the video rows and share their tag.
+    tags, mask = forward(image_embeds)
+    assert torch.equal(tags, (positions >= num_video + num_image).to(tags.dtype))
+    assert torch.equal(mask, positions < (num_video + num_image + num_text)[:, None])
+
+
 class TestHunyuanVideo15HuggingFaceComparison(unittest.TestCase):
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

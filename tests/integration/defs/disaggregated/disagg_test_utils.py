@@ -31,6 +31,7 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
+from defs.common import single_host_ucx_env
 from defs.conftest import is_sm_100f
 
 from tensorrt_llm.logger import logger
@@ -147,7 +148,8 @@ def _run_worker(
         work_dir: Working directory for config files
         device: CUDA device ID (-1 for default)
         save_log: Whether to save logs to file
-        env: Environment variables for the subprocess
+        env: Environment variables for the subprocess. single_host_ucx_env()
+            replaces its UCX_TLS and UCX_NET_DEVICES.
         worker_index: Index used for log/config filenames (avoids collisions when
             multiple workers share port=0)
 
@@ -182,6 +184,9 @@ def _run_worker(
         # (nvbugs/6888251). Tests only need the tier to exist, so use 4 KiB
         # pages unless the caller asks for THP.
         env.setdefault("TLLM_KV_CACHE_MANAGER_V2_THP", "0")
+        # Every worker started here serves on localhost, so its UCX peers all
+        # run on this host.
+        env.update(single_host_ucx_env())
         log_file = None
         log_path = None
         # WAR for QA env (pytest --capture=tee-sys): sys.stdout/sys.stderr lack

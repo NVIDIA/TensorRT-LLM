@@ -14,8 +14,8 @@
 # limitations under the License.
 """Check Kimi K3 MLA head layouts, KV ownership and prefill/decode handoff.
 
-Head-only cases replicate KV history to isolate projection/layout correctness.
-Storage cases use Helix pages, check exact ownership and unchanged storage,
+Head-only cases use the production Helix cache mapping and append metadata.
+Storage cases additionally check exact ownership and unchanged storage,
 and decode directly from prefill, including multiple context chunks.
 """
 
@@ -28,7 +28,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from _torch.attention.multi_gpu.helix_test_utils import CACHE_TYPE_SELFKONLY, setup_kv_and_metadata
+from _torch.attention.multi_gpu.helix_test_utils import (
+    CACHE_TYPE_SELFKONLY,
+    setup_kv_and_metadata,
+    setup_kv_cache,
+)
 from _torch.modeling.kimi_k3_mla_reference import KimiMLAAttention
 from _torch.modeling.test_kimi_k3_checkpoint import load_mla_checkpoint
 from _torch.modeling.test_kimi_k3_mla import _assert_matches_reference, _checkpoint_weights
@@ -43,7 +47,7 @@ from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 from tensorrt_llm._torch.pyexecutor.engine.metadata import build_attention_metadata
-from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm._torch.utils import helix_local_len, model_extra_attrs
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 from tensorrt_llm.mapping import CpType, Mapping
@@ -194,30 +198,49 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
     )[None, None]
     expected = reference(hidden, attention_mask=mask)
     cache_scenario = SimpleNamespace(
-        ctx_len=context_length,
+        ctx_len=context_length * mapping.world_size,
         batch=batch,
         kv_cache_tokens_per_block=64,
         num_layers=1,
         kv_cache_dtype=torch.bfloat16,
     )
-    # Complete local caches isolate head-layout checks from distributed KV
-    # ownership and gathering.
-    manager, metadata = setup_kv_and_metadata(
+    manager = setup_kv_cache(
         cache_scenario,
-        Mapping(world_size=1, rank=0, tp_size=1),
+        mapping,
         cache_type=CACHE_TYPE_SELFKONLY,
         num_kv_heads=1,
         head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
     )
-    full_q_projection_rows = []
-    handle = mixer.q_b_proj.register_forward_hook(
-        lambda module, inputs, output: full_q_projection_rows.append(output.shape[0])
-    )
-    extra_attrs = {
-        "attention_metadata": weakref.ref(metadata),
-        "mla_layers": {mixer.layer_idx_str: weakref.ref(mixer)},
-    }
-    try:
+    with ExitStack() as cleanup:
+        cleanup.callback(manager.shutdown)
+        metadata = build_attention_metadata(
+            model_config,
+            max_batch_size=batch,
+            max_num_tokens=context_length * batch,
+            max_beam_width=1,
+            attention_backend=get_attention_backend("TRTLLM"),
+            attention_runtime_features=AttentionRuntimeFeatures(),
+            kv_cache_manager=manager,
+            mapping=mapping,
+            cache_indirection=None,
+        )
+        metadata.seq_lens = torch.tensor([context_length] * batch, dtype=torch.int)
+        metadata.request_ids = list(range(batch))
+        metadata.num_contexts = batch
+        metadata.prompt_lens = [context_length] * batch
+        metadata.kv_cache_params = KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=[0] * batch
+        )
+        metadata.prepare()
+        full_q_projection_rows = []
+        handle = mixer.q_b_proj.register_forward_hook(
+            lambda module, inputs, output: full_q_projection_rows.append(output.shape[0])
+        )
+        cleanup.callback(handle.remove)
+        extra_attrs = {
+            "attention_metadata": weakref.ref(metadata),
+            "mla_layers": {mixer.layer_idx_str: weakref.ref(mixer)},
+        }
         context = hidden[:, :context_length].reshape(-1, config.hidden_size).contiguous()
         with model_extra_attrs(extra_attrs):
             actual = runtime(context, metadata).view(batch, context_length, -1)
@@ -227,11 +250,9 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
                 "prefill must not run the full TP-local Q projection"
             )
 
-        # Revisit the second half using a complete local prefix. This checks
-        # head layouts in both cached-context implementations without needing
-        # distributed KV gathering. Rewriting the same tokens is intentional.
         half = context_length // 2
-        for chunked in (False, True):
+        chunked_modes = (True,) if mapping.has_cp_helix() else (False, True)
+        for chunked in chunked_modes:
             print(f"Checking cached context: CP={scenario.cp_size}, chunked={chunked}", flush=True)
             metadata = get_attention_backend("TRTLLM").Metadata(
                 seq_lens=torch.tensor([half] * batch, dtype=torch.int),
@@ -251,6 +272,7 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
                     chunk_size=half,
                     chunked_prefill_buffer_batch_size=1,
                 ),
+                mapping=mapping,
                 enable_context_mla_with_cached_kv=True,
             )
             metadata.prepare()
@@ -271,15 +293,21 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
             max_num_tokens=context_length + 1,
             kv_cache_manager=manager,
             kv_cache_params=KVCacheParams(
-                use_cache=True, num_cached_tokens_per_seq=[0, context_length]
+                use_cache=True,
+                num_cached_tokens_per_seq=[
+                    0,
+                    helix_local_len(
+                        context_length, manager.tokens_per_block, mapping.cp_size, mapping.cp_rank
+                    ),
+                ],
             ),
             mapping=mapping,
             enable_context_mla_with_cached_kv=True,
         )
-        # The generation kernel emits CP softmax statistics only when its
-        # Helix fields are present. Every rank appends to its full replica in
-        # this fixture; owner-only writes are checked separately.
-        metadata.update_helix_param([context_length], [False])
+        metadata.update_helix_param(
+            [context_length],
+            [(context_length // manager.tokens_per_block) % mapping.cp_size != mapping.cp_rank],
+        )
         metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(metadata)
         mixed = torch.cat((hidden[0, :context_length], hidden[1, -1:]), dim=0)
@@ -294,9 +322,6 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
                 "only decode tokens use the full TP-local Q projection"
             )
         return 0.0
-    finally:
-        handle.remove()
-        manager.shutdown()
 
 
 def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scenario):

@@ -233,6 +233,7 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         "enable_iter_perf_stats": True,
         "print_iter_log": True,
         "custom_tokenizer": "deepseek_v4",
+        "autotuner_nvmmh_config": {},
         "cache_transceiver_config": {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
