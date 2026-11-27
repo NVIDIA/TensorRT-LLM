@@ -6,7 +6,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from tensorrt_llm.bindings.executor import Request
+from tensorrt_llm.bindings.executor import Request, RequestType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
@@ -103,6 +103,10 @@ class ExecutorRequest:
         # Include both owners explicitly; the bound request's reducer omits its
         # dynamic Python attributes. Never serialize execution state here.
         return type(self), (self.request, self.inputs)
+
+    @property
+    def request_type(self) -> RequestType:
+        return self.request.request_type
 
     @property
     def py_scheduling_params(self) -> SchedulingParams | None:

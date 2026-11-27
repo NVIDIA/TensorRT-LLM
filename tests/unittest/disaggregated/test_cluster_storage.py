@@ -421,6 +421,7 @@ async def test_consecutive_outages_are_not_charged_to_ttl():
 async def test_registry_capacity_tracks_live_worker_records(monkeypatch):
     store = HttpClusterStorageServer("", "")
     monkeypatch.setattr(store, "MAX_RECORDS", 2)
+    monkeypatch.setattr(store, "MAX_KEY_BYTES", 4)
     monkeypatch.setattr(store, "MAX_VALUE_BYTES", 4)
     assert await store.set("a", "meta")
     assert await store.set("b", "old")
@@ -429,4 +430,7 @@ async def test_registry_capacity_tracks_live_worker_records(monkeypatch):
     assert not await store.set("a", "large", overwrite_if_exists=True)
     assert await store.get("a") == "meta"
     assert await store.delete("a")
-    assert await store.set("c", "next")
+    assert not await store.set("ééé", "old")
+    assert await store.set("éé", "éé")
+    assert not await store.set("éé", "ééé", overwrite_if_exists=True)
+    assert await store.get("éé") == "éé"
