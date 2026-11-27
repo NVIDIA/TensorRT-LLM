@@ -6,23 +6,22 @@ its indexer.
 ``GlmMLA.adopt`` re-classes a layer's built-in attention modules in place -- the
 ``DeepseekV32Attention`` as ``GlmMLA``, its ``DSAHooks`` as ``GlmDsaHooks``, its
 ``DSATrtllmAttention`` as ``GlmDsaBackend`` and its ``Indexer`` as ``GlmIndexer`` -- and attaches
-the attention fast paths the installed plan enables: the attention output tail and, with
-``sparse_mla_decode``, that FMHA library ahead of the registry's on the layer's attention
-backends. The backends build their FMHA libraries later, in ``create_weights``, so the library is
-created when and where the built-in model creates its own. The classes add methods and
-class-level defaults only, so the module tree and the weights stay the built-in model's.
+the attention fast paths enabled by the installed plan. With ``sparse_mla_decode``, it gives
+both attention backends the target's ordered FMHA candidates. The module tree and weights
+stay the built-in model's.
 
 Each forward override runs the target's decode composition (``attention_forward``) when the
 step is a decode step (``dispatch.Phase.DECODE``) and the built-in method otherwise.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, cast
 
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention.attention import _helix_cp_allgather_input
+from tensorrt_llm._torch.attention.backends.fmha.registry import FmhaCls
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -32,12 +31,25 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmA
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import DSAHooks
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV32Attention
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
 from . import attention_forward, dispatch
 from .kernels.indexer_topk import region
+
+GLM52_NVFP4_SM103_FMHA_LIBS = (
+    "fp4_mla",
+    "triton_custom_mask",
+    "prims_ts",
+    "cute_dsl_mla",
+    "flashinfer_sparse_mla",
+    "prims_ts_block_sparse",
+    "prims_ts_dsa_sparse_mla",
+    "flashinfer_trtllm_gen",
+    "fallback",
+)
 
 
 def reclass(module, builtin: type, cls: type) -> None:
@@ -84,13 +96,17 @@ class GlmMLA(DeepseekV32Attention):
         GlmDsaBackend.adopt(mla.mqa)
         if mla.mqa.indexer is not None:
             GlmIndexer.adopt(mla.mqa.indexer)
-        # The sparse-MLA decode library goes ahead of the registry's libraries on both attention
-        # backends, which build their FMHA libraries in ``create_weights``.
         if dispatch.is_enabled("sparse_mla_decode"):
-            libraries = (dispatch.get_impl("sparse_mla_decode", "fmha_lib"),)
+            libraries = (
+                cast(FmhaCls, dispatch.get_impl("sparse_mla_decode", "fmha_lib")),
+                *GLM52_NVFP4_SM103_FMHA_LIBS,
+            )
             for backend in (mla.mha, mla.mqa):
-                if backend is not None:
-                    backend.prepended_fmha_lib_classes = libraries
+                if isinstance(backend, TrtllmAttention):
+                    backend._fmha_libs = libraries
+                    # Deferred layers build the manager later in create_weights().
+                    if backend._fmha_manager is not None:
+                        backend._rebuild_fmha_manager()
         return mla
 
     def _adopt_attention_tail(self) -> None:

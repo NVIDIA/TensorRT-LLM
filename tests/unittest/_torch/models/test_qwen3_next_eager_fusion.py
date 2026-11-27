@@ -302,9 +302,18 @@ def test_pre_moe_allreduce_runs_in_mixer_output_projection() -> None:
     assert mlp.call_args.kwargs["do_finalize"]
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "enabled,backend,helix",
+    [
+        (False, "TRTLLM", False),
+        (True, "TRTLLM", False),
+        (True, "FLASHINFER", False),
+        (True, "TRTLLM", True),
+    ],
+    ids=["disabled", "trtllm", "flashinfer", "helix"],
+)
 def test_attention_takes_the_gqa_decode_kernel_where_the_model_declares_it(
-    monkeypatch, enabled
+    monkeypatch, enabled, backend, helix
 ) -> None:
     """The decode kernels the model class declares (test_decode_kernels_follow_the_model_declaration) reach the
     attention module as constructor arguments."""
@@ -320,13 +329,16 @@ def test_attention_takes_the_gqa_decode_kernel_where_the_model_declares_it(
     monkeypatch.setattr(Qwen3Attention, "__init__", record_init)
     config = SimpleNamespace(
         pretrained_config=SimpleNamespace(model_type="qwen3_5_moe_text"),
-        mapping=SimpleNamespace(enable_attention_dp=False),
+        mapping=SimpleNamespace(enable_attention_dp=False, has_cp_helix=lambda: helix),
+        attn_backend=backend,
         extra_attrs={"qwen3_next_decode_kernels": True} if enabled else {},
     )
 
     modeling_qwen3_next.Qwen3NextAttention(config, layer_idx=0, fuse_qk_norm_rope=True)
 
     assert built["use_gqa_decode_fmha"] is enabled
+    expected = modeling_qwen3_next.QWEN3_5_FMHA_LIBS if backend == "TRTLLM" else None
+    assert built["fmha_libs"] is expected
     assert built["cache_context_plan"] is enabled
     assert built["fp8_output_gate"] is False
     assert built["context_fmha_head_dim_per_stage_kv"] == 0
@@ -350,6 +362,7 @@ def test_attention_takes_the_prefill_kernels_where_the_model_declares_them(
     config = SimpleNamespace(
         pretrained_config=SimpleNamespace(model_type="qwen3_5_moe_text", head_dim=256),
         mapping=SimpleNamespace(enable_attention_dp=False),
+        attn_backend="TRTLLM",
         extra_attrs={"qwen3_next_prefill_kernels": True} if declared else {},
     )
 

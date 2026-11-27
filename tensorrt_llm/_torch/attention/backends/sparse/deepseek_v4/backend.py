@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -46,7 +45,22 @@ from .metadata import DeepseekV4TrtllmAttentionMetadata
 from .params import DeepseekV4AttentionType, DeepSeekV4Params
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+
+
+DEEPSEEK_V4_FMHA_LIBS: list[str | type["Fmha"]] = [
+    "fp4_mla",
+    "triton_custom_mask",
+    "prims_ts",
+    "cute_dsl_mla",
+    "flashinfer_sparse_mla",
+    "prims_ts_block_sparse",
+    "prims_ts_sparse_mla",
+    "prims_ts_dsa_sparse_mla",
+    "flashinfer_trtllm_gen",
+    "fallback",
+]
 
 
 def _alloc_nvfp4_compress_fp8_scratch(
@@ -102,7 +116,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         if self._uses_nvfp4_compress:
             # The base update builds FMHA libraries before the effective cache
             # mode is converted from NVFP4 storage to FP8 execution.
-            self._fmha_manager = FmhaManager(self)
+            self._rebuild_fmha_manager()
 
     def __init__(
         self,
@@ -120,6 +134,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         sparse_params: Optional[DeepSeekV4Params] = None,
         dtype: Optional[torch.dtype] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        fmha_libs: list[str | type["Fmha"]] | None = None,
         **kwargs,
     ):
         if sparse_attention_config is None:
@@ -153,6 +168,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             mla_params=mla_params,
             skip_create_weights_in_init=skip_create_weights_in_init,
             attention_chunk_size=attention_chunk_size,
+            fmha_libs=DEEPSEEK_V4_FMHA_LIBS if fmha_libs is None else fmha_libs,
             **kwargs,
         )
 

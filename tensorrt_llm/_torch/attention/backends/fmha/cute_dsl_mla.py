@@ -32,6 +32,7 @@ from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -182,6 +183,7 @@ def launch_mla_split_kv_plan(
     )
 
 
+@fmha_lib("cute_dsl_mla")
 class CuteDslMlaFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
 

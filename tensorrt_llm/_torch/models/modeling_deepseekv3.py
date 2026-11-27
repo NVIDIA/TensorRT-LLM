@@ -55,6 +55,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
 from ..attention.attention import (maybe_allgather_for_helix_cp,
                                    maybe_slice_for_helix_cp)
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.registry import FmhaCls
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
@@ -915,6 +916,7 @@ class DeepseekV32Attention(MLA):
                                        torch.cuda.Stream]] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
+        fmha_libs: list[str | FmhaCls] | None = None,
     ):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.tokens_per_gen_step if model_config.spec_config is not None else 1
@@ -941,7 +943,8 @@ class DeepseekV32Attention(MLA):
                          aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output,
-                         enable_locality_domain_bf16_linear=True)
+                         enable_locality_domain_bf16_linear=True,
+                         fmha_libs=fmha_libs)
 
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,

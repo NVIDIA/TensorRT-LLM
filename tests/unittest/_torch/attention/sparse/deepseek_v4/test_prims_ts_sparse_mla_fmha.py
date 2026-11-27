@@ -15,6 +15,7 @@ from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
     get_prims_ts_toolchain_unsupported_reason,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import DEEPSEEK_V4_FMHA_LIBS
 from tensorrt_llm._utils import get_sm_version
 
 from ..test_sparse_mla_forward import HAS_FLASH_MLA
@@ -53,21 +54,15 @@ def _skip_unless_toolchain() -> None:
         pytest.skip(reason)
 
 
-def test_registry_entry_is_default_before_fallback(monkeypatch) -> None:
-    """The library ships enabled and ahead of the TRTLLM-Gen fallback.
-
-    Its ``is_available`` restricts it to DeepSeek-V4 on SM100, so being
-    in the default set changes nothing for other models or architectures.
-    """
+def test_registry_entry_is_in_deepseek_v4_candidates_before_fallback(monkeypatch) -> None:
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
     assert registry.FMHA_LIBS[LIB_NAME] is PrimsTSSparseMlaFmha
-    assert LIB_NAME in registry.DEFAULT_FMHA_LIBS
-    names = tuple(registry.FMHA_LIBS)
+    names = DEEPSEEK_V4_FMHA_LIBS
     assert names.index(LIB_NAME) < names.index("flashinfer_trtllm_gen")
     assert names.index(LIB_NAME) < names.index("fallback")
-    assert PrimsTSSparseMlaFmha in registry.get_enabled_fmha_lib_classes()
+    assert PrimsTSSparseMlaFmha in registry.get_enabled_fmha_lib_classes(names)
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{LIB_NAME}")
-    assert PrimsTSSparseMlaFmha not in registry.get_enabled_fmha_lib_classes()
+    assert PrimsTSSparseMlaFmha not in registry.get_enabled_fmha_lib_classes(names)
 
 
 def test_sm103_stays_on_the_fallback_until_qualified(monkeypatch) -> None:
@@ -855,10 +850,10 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
     ],
 )
 def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_dtype, library):
-    """Run the DeepSeek-V4 module test on the default library set and on the opt-out.
+    """Run the DeepSeek-V4 module test with the model's candidates and with the opt-out.
 
-    ``prims_ts``: no ``TLLM_FMHA_LIBS`` override; the PrimTS library is in the
-    default set and must win the generation phase on its own. ``fallback``:
+    With ``prims_ts``, the model's candidates must select PrimTS for generation.
+    With ``fallback``,
     ``TLLM_FMHA_LIBS=-prims_ts_sparse_mla``, the documented opt-out, must hand
     generation back to the TRTLLM-Gen fallback (``FallbackFmha``) with PrimTS
     never entered, so a regression on that path (what SM103, ``fp8_ds_mla`` and

@@ -86,6 +86,7 @@ from .flash_attn4_kernels import (
 )
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 from .shared_prefix_fa4 import (
     Fa4Prefix,
     Fa4Tail,
@@ -1018,6 +1019,7 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         )
 
 
+@fmha_lib(LIB_NAME)
 class SamplingSharedPrefixFmha(PhasedFmha):
     """Generation-phase library for n-sample requests; see the module docstring."""
 

@@ -26,6 +26,7 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
 from .backends import (AttentionForwardArgs, AttentionMetadata,
                        FlashInferAttentionMetadata, TrtllmAttentionMetadata)
 from .backends.fmha.gqa_decode import GqaDecodeSetup, KvAppendPlan
+from .backends.fmha.registry import FmhaCls
 from .backends.interface import (AttentionMask, CustomAttentionMask,
                                  PositionalEmbeddingParams,
                                  PredefinedAttentionMask)
@@ -575,6 +576,7 @@ class Attention(nn.Module):
         cache_context_plan: bool = False,
         context_fmha_head_dim_per_stage_kv: int = 0,
         context_last_rows_only: bool = False,
+        fmha_libs: list[str | FmhaCls] | None = None,
     ):
         """
         Initialize the Attention module.
@@ -596,11 +598,15 @@ class Attention(nn.Module):
             disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
             attn_output_gate (Optional[bool]): Determines whether to use an output gate in the attention Op. If False, the decision is automatically handled by the attention backend based on its capabilities.
             mapping_with_cp (Optional[Mapping]): Override mapping with CP configuration.
-            use_gqa_decode_fmha (bool): With the TRTLLM backend, serve generation calls with the GQA decode FMHA
-                library (backends/fmha/gqa_decode.py), offering it the output gate and the prologue's FP8 KV append.
+            use_gqa_decode_fmha (bool): Build GqaDecodeSetup for TRTLLM layers
+                without Helix CP and offer eligible GQA libraries the output
+                gate and the prologue's FP8 KV append. Include the desired GQA
+                libraries in fmha_libs or enable their registered names through
+                TLLM_FMHA_LIBS.
             cache_context_plan (bool): Let the TRTLLM backend plan a context-only forward once for all layers.
             context_fmha_head_dim_per_stage_kv (int): See TrtllmAttention; 0 keeps the default context kernel.
             context_last_rows_only (bool): See TrtllmAttention; the layer reads only each context request's last row.
+            fmha_libs: Ordered FMHA names or classes for the TRTLLM backend. None uses the default candidates.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -896,6 +902,7 @@ class Attention(nn.Module):
             context_fmha_head_dim_per_stage_kv=
             context_fmha_head_dim_per_stage_kv,
             context_last_rows_only=context_last_rows_only,
+            fmha_libs=fmha_libs,
         )
         self.cache_context_plan = cache_context_plan
         # (_use_quantize_output(), FP4 KV cache) once the weights are loaded, with cache_context_plan.

@@ -5,8 +5,8 @@
   * MiniMaxM31MsaSparseAttention subclasses TrtllmAttention and reuses its
     inherited forward, overriding only the sparse hooks and owning an
     MsaIndexer.
-  * The main attention runs through the registered MsaPrefillFmha for context
-    rows and MsaDecodeFmha for generation rows.
+  * The main attention runs through M31MsaPrefillFmha for context rows
+    and M31MsaDecodeFmha for generation rows.
   * The indexer calls fmha_sm100 directly to produce the per-query selected
     block indices, which the model layer threads through
     forward_args.sparse_backend_args.
@@ -23,10 +23,7 @@
     per-request lengths, the slots and the counts after the overlap scheduler
     corrects kv_lens on device.
 
-The classes subclass TrtllmAttention and TrtllmAttentionMetadata, imported at
-module scope. That is cycle-free only because the dependency runs one way: the
-two FMHA libraries reach the kernels through ...minimax_m3.kernels and never
-load this module, so trtllm's import chain does not come back here.
+The family adapter supplies the FMHA pair for its own attention metadata.
 """
 
 from __future__ import annotations
@@ -40,6 +37,9 @@ from typing import Callable, NamedTuple, Optional, Tuple
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
+from tensorrt_llm._torch.attention.backends.fmha.msa_decode import MsaDecodeFmha
+from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import MsaPrefillFmha
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseConfig,
@@ -65,7 +65,6 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm._utils import maybe_pin_memory, mpi_rank
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
@@ -1677,12 +1676,27 @@ class MiniMaxM31MsaSparseAttentionMetadata(_StockMsaMetadata):
         return store[:numel].view(num_index_heads, plan_max_k_tiles, num_tokens)
 
 
+MINIMAX_M3_V2_FMHA_LIBS: list[str | type[Fmha]] = [
+    M31MsaDecodeFmha,
+    M31MsaPrefillFmha,
+    "fp4_mla",
+    "triton_custom_mask",
+    "prims_ts",
+    "cute_dsl_mla",
+    MsaDecodeFmha,
+    MsaPrefillFmha,
+    "flashinfer_sparse_mla",
+    "prims_ts_block_sparse",
+    "prims_ts_dsa_sparse_mla",
+    "flashinfer_trtllm_gen",
+    "fallback",
+]
+
+
 class MiniMaxM31MsaSparseAttention(_StockMsaAttention):
     """MSA-backed MiniMax-M3 sparse attention."""
 
     Metadata = MiniMaxM31MsaSparseAttentionMetadata
-    # This family's MSA context and generation FMHA libraries, ahead of the registry's.
-    prepended_fmha_lib_classes = (M31MsaDecodeFmha, M31MsaPrefillFmha)
 
     def __init__(
         self,
@@ -1693,6 +1707,7 @@ class MiniMaxM31MsaSparseAttention(_StockMsaAttention):
         quant_config=None,
         *,
         sparse_params,
+        fmha_libs: list[str | type[Fmha]] | None = None,
         **kwargs,
     ):
         TrtllmAttention.__init__(
@@ -1703,6 +1718,7 @@ class MiniMaxM31MsaSparseAttention(_StockMsaAttention):
             num_kv_heads=num_kv_heads,
             quant_config=quant_config,
             sparse_params=sparse_params,
+            fmha_libs=MINIMAX_M3_V2_FMHA_LIBS if fmha_libs is None else fmha_libs,
             **kwargs,
         )
         self.m3_config = MiniMaxM3SparseConfig.from_sparse_params(
@@ -1735,38 +1751,6 @@ class MiniMaxM31MsaSparseAttention(_StockMsaAttention):
         if config.topk != MSA_REQUIRED_TOPK:
             raise NotImplementedError(
                 f"MSA backend requires topk={MSA_REQUIRED_TOPK}, got {config.topk}."
-            )
-
-    def update_quant_config(self, new_quant_config: Optional[QuantConfig]) -> None:
-        """Build the FMHA manager, then require the MSA pair among its libraries.
-
-        The base class defers this past __init__ when weight creation is
-        deferred, and reruns it whenever the quant config lands, so the pair
-        check belongs here rather than with the other preconditions.
-        """
-        super().update_quant_config(new_quant_config)
-        self._validate_fmha_pair()
-
-    def _validate_fmha_pair(self) -> None:
-        """Require both halves of the MSA pair on this layer.
-
-        MsaPrefillFmha serves the context phase and MsaDecodeFmha the
-        generation phase, and neither will take the other's. Losing one, as a
-        TLLM_FMHA_LIBS subset would, leaves that phase to a library that
-        refuses it. Checking as they are built reports it once per layer rather
-        than on the first step that happens to carry those rows.
-        """
-        # By class and base class: the family's M31MsaPrefillFmha / M31MsaDecodeFmha are the stock pair's subclasses.
-        present = {
-            cls.__name__ for fmha in self._fmha_manager.fmha_libs for cls in type(fmha).__mro__
-        }
-        missing = sorted({"MsaPrefillFmha", "MsaDecodeFmha"} - present)
-        if missing:
-            raise RuntimeError(
-                f"MiniMax-M3 MSA attention layer {self.layer_idx} is missing the FMHA "
-                f"{'library' if len(missing) == 1 else 'libraries'} {', '.join(missing)}. "
-                "The two are a pair covering one phase each; enable both (msa_prefill "
-                "and msa_decode) or none."
             )
 
     @classmethod
@@ -2139,6 +2123,7 @@ class MiniMaxM31MsaSparseAttention(_StockMsaAttention):
 
 
 __all__ = [
+    "MINIMAX_M3_V2_FMHA_LIBS",
     "MiniMaxM31MsaSparseAttention",
     "MiniMaxM31MsaSparseAttentionMetadata",
 ]

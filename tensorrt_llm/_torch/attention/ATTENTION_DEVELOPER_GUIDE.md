@@ -521,16 +521,51 @@ The main differences across backends:
 
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
-Each `TrtllmAttention` owns a per-instance `FmhaManager`. The manager builds
-the ordered list of internal FMHA libraries from the registry, performs
-phase-aware selection, and caches request-dependent selections. These are not
-separate attention backends. Check `fmha/registry.py` for the current libraries,
-defaults, and canonical order.
+Each `TrtllmAttention` owns a `FmhaManager` that constructs the layer's FMHA
+libraries, performs phase-aware selection, and caches request-dependent
+selections. Existing callers can omit `fmha_libs` to keep using the ordered
+`DEFAULT_FMHA_LIBS` in `fmha/registry.py`.
 
-`update_quant_config()` replaces the manager, rebuilding the library list and
-starting with an empty selection cache. `TrtllmAttention` prepares the complete
-per-forward state, passes itself to the manager for selection, and then executes
-the selected library.
+For a shared library that callers can opt into, decorate the class with
+`@fmha_lib("name")` and import its module in `fmha/__init__.py`. This makes the
+name available to `fmha_libs` and `TLLM_FMHA_LIBS`. Choose a unique name
+in the process-wide registry. Registration alone leaves the default
+candidates unchanged. Add the name to `DEFAULT_FMHA_LIBS` only
+when layers using the defaults should consider the library automatically.
+Validate its availability, request support, and position in the default
+order as part of that change.
+
+For a Modeling V2 target that customizes TRTLLM attention, keep a model-only
+implementation in its family or target and pass the unregistered `Fmha`
+subclass directly in `fmha_libs`. List every candidate the model intends to
+use in order, including any shared libraries needed as fallbacks after
+preferred libraries. Maintain that list in the model so that changes to
+`DEFAULT_FMHA_LIBS` do not carry over to explicit lists. If a model-owned
+library needs selection by name through `TLLM_FMHA_LIBS`, register it
+without adding it to the defaults and import its module before the
+environment variable is parsed. The name is visible process-wide after
+import. Keep its availability and support checks aligned with the model's
+requirements.
+
+Use `fmha_libs` for new Modeling V2 targets that customize FMHA selection.
+`prepended_fmha_lib_classes` remains available to existing targets during
+migration. The legacy hook will be removed after those targets move to
+`fmha_libs`.
+
+Pass `fmha_libs` to `create_attention()` or `TrtllmAttention` to supply the
+layer's complete ordered base list. Its entries are names registered with
+`@fmha_lib("name")` or FMHA classes that accept the owning attention in their
+constructor. `None` selects the defaults, while `[]` selects an empty base
+list. The resolver places legacy `prepended_fmha_lib_classes` before the
+resolved base candidates and keeps the first occurrence of each class.
+For dense FP4 MLA, an explicit list must include a library that can serve the
+FP8 context path. The temporary FP8 attention view uses the same list and
+checks availability for its own KV cache type.
+
+`update_quant_config()` replaces the manager with the same layer configuration,
+constructing fresh library instances and starting with an empty selection cache.
+`TrtllmAttention` prepares the per-forward state and executes the library that
+the manager selects.
 
 Libraries with a shared JIT module can implement `Fmha.can_prewarm()` and
 `Fmha.prewarm()`. The first checks static layer, dtype and page-size eligibility
@@ -563,27 +598,43 @@ with the native `AttentionOp` input requirements.
 
 ##### 3.2.2.1 Selection order (`TLLM_FMHA_LIBS`)
 
-`TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
-it may add host overhead, except for MLA generation on SM107. On SM100 and
-SM103, MLA generation is opt-in too: its decode kernels compile at startup for
-each new configuration, which takes minutes on a cold cache. Use
-`TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
-`TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
-block-sparse PrimTS remains enabled by default because a dense fallback cannot
-preserve its routing semantics. The PrimTS sparse MLA library
-(`prims_ts_sparse_mla`) is also enabled by default: it serves only DeepSeek-V4
-generation on SM100 and sits ahead of the TRTLLM-Gen libraries, so DeepSeek-V4
-decode on B200/GB200 runs on it unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
-removes it. With sparse KV cache offload, it reads the compress-ratio-4
-layers' compressed rows from the sparse cache arena (§3.2.5). Delta entries update the
-default membership and follow canonical registry order, while an exact list
-preserves the user-specified order.
+`TLLM_FMHA_LIBS` accepts an exact list of registered names in selection order
+or a list of `+name` and `-name` entries. An exact list replaces the base
+candidates, including any anonymous classes supplied through `fmha_libs`.
+In a signed list, `+name` moves or adds the class to the front of the base
+candidates in the order written, and `-name` removes it from those candidates.
+The last operation for a name determines whether it is included.
+These overrides apply only to the base candidates. Legacy
+`prepended_fmha_lib_classes` remain first in either mode.
+Set `use_fmha_libs_env=False` to skip the candidate-list overrides for a layer.
+Shared metadata still reads the global setting.
+
+The default candidate list places dense PrimTS ahead of CuTe DSL MLA. Its
+default performance policy considers only supported MLA generation on SM107.
+On SM100 and SM103, MLA decode requires an explicit `TLLM_FMHA_LIBS` opt-in
+because compiling decode kernels for a new configuration can take minutes on a
+cold cache. Use `TLLM_FMHA_LIBS=+prims_ts` to prioritize it and consider other
+supported requests, or `TLLM_FMHA_LIBS=-prims_ts` to remove it.
+Generic block-sparse PrimTS remains enabled
+by default because a dense fallback cannot preserve its routing semantics.
+
+GQA decode libraries are opt-in. Include the desired libraries in `fmha_libs`
+or enable their registered names through `TLLM_FMHA_LIBS`. The layer also
+needs a `GqaDecodeSetup`. `Attention` builds it with
+`use_gqa_decode_fmha=True` for TRTLLM layers without Helix CP. Qwen3.5 supplies
+its own FMHA list for TRTLLM layers, with PrimTS ahead of the GQA candidates.
+
+DeepSeek-V4 includes the PrimTS sparse MLA library (`prims_ts_sparse_mla`) in
+its own FMHA candidate list. It serves generation on SM100, ahead of the
+TRTLLM-Gen libraries, unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla` removes it.
+With sparse KV cache offload, it reads the compress-ratio-4 layers' compressed
+rows from the sparse cache arena (§3.2.5).
 
 ##### 3.2.2.2 Library contract
 
-Each FMHA library exposes `is_available()` for module/static environment checks
-and `is_supported()` for per-forward request checks.
-`AttentionForwardArgs.sparse_runtime_params` is the sole
+Each FMHA library exposes `is_available()`
+for module/static environment checks and `is_supported()` for per-forward
+request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
 per-call lowered sparse runtime carrier and defaults to an empty
 `SparseRuntimeParams()`. The core forward installs the predicted carrier in a new arguments object,
 leaving the caller's `sparse_runtime_params` unchanged. The carrier holds both flat `AttentionOp` parameters and optional
@@ -739,14 +790,15 @@ The FMHA package is split by role:
   generation library reads them (`_page_size_exclusive_to_cute_dsl`): the
   fallback thop op has TRTLLM-Gen MLA generation kernels for 32-token pages
   only, FlashInfer TRTLLM-Gen reads 128-token pages only when the KV cache
-  manager lists them in `trtllm_gen_extra_tokens_per_block`, and the opt-in
-  PrimTS library reads them on SM100/SM103 from an FP8 or BF16 KV cache
-  manager. Every other page size keeps the default routing.
+  manager lists them in `trtllm_gen_extra_tokens_per_block`. Earlier candidates,
+  including PrimTS, have already declined the request when default selection
+  reaches CuTe DSL MLA. Every other page size keeps the default routing.
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
   PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
-  it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
-  removes it. For compress-ratio-4 layers under KV-cache offload, its extra
-  source is the layer's sparse cache arena (§3.2.5).
+  DeepSeek-V4 includes it in its FMHA candidates and
+  `TLLM_FMHA_LIBS=-prims_ts_sparse_mla` removes it. For compress-ratio-4 layers
+  under KV-cache offload, its extra source is the layer's sparse cache arena
+  (§3.2.5).
 - `fmha/prims_ts_dsa_sparse_mla.py` runs DSA generation on the vendored PrimTS
   D576 sparse MLA kernel (SM100/SM103, and SM107 with the Rubin helpers of the
   CuTe DSL), which reads the NVFP4 KV records of the
@@ -782,9 +834,12 @@ The FMHA package is split by role:
   [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
   upstream-worthy changes in FlashInfer and update the vendor lock; keep only
   TRT-LLM-specific adaptations in the persistent patch.
-- `fmha/msa_prefill.py` integrates the packaged SM100/SM103 block-sparse GQA
-  implementation for the context phase, and `fmha/msa_decode.py` runs the
-  MiniMax-M3 decode kernels for the generation phase.
+- `fmha/msa_prefill.py` integrates the packaged block-sparse GQA kernel for
+  MiniMax-M3 context, and `fmha/msa_decode.py` runs the generation kernels.
+  The stock MiniMax-M3 adapter supplies `MINIMAX_M3_V1_FMHA_LIBS` at construction.
+  The Modeling V2 M3.1 family adapter supplies `MINIMAX_M3_V2_FMHA_LIBS`.
+  Both lists enumerate the full candidate order. MSA classes are anonymous,
+  and shared libraries use their registered names.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/gqa_decode.py` serves the layers built with a `GqaDecodeSetup`:

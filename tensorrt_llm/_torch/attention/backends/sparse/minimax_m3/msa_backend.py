@@ -5,7 +5,7 @@
   * MiniMaxM3MsaSparseAttention subclasses TrtllmAttention and reuses its
     inherited forward, overriding only the sparse hooks and owning an
     MsaIndexer.
-  * The main attention runs through the registered MsaPrefillFmha for context
+  * The main attention runs through the layer's MsaPrefillFmha for context
     rows and MsaDecodeFmha for generation rows.
   * The indexer calls fmha_sm100 directly to produce the per-query selected
     block indices, which the model layer threads through
@@ -23,10 +23,8 @@
     per-request lengths, the slots and the counts after the overlap scheduler
     corrects kv_lens on device.
 
-The classes subclass TrtllmAttention and TrtllmAttentionMetadata, imported at
-module scope. That is cycle-free only because the dependency runs one way: the
-two FMHA libraries reach the kernels through ...minimax_m3.kernels and never
-load this module, so trtllm's import chain does not come back here.
+The stock adapter supplies its FMHA pair for the built-in model and Modeling
+V2 targets that reuse stock MSA.
 """
 
 from __future__ import annotations
@@ -37,6 +35,9 @@ from typing import NamedTuple, Optional, Tuple
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
+from tensorrt_llm._torch.attention.backends.fmha.msa_decode import MsaDecodeFmha
+from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import MsaPrefillFmha
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
@@ -1444,6 +1445,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         return store[:numel].view(num_index_heads, plan_max_k_tiles, num_tokens)
 
 
+MINIMAX_M3_V1_FMHA_LIBS: list[str | type[Fmha]] = [
+    "fp4_mla",
+    "triton_custom_mask",
+    "prims_ts",
+    "cute_dsl_mla",
+    MsaDecodeFmha,
+    MsaPrefillFmha,
+    "flashinfer_sparse_mla",
+    "prims_ts_block_sparse",
+    "prims_ts_dsa_sparse_mla",
+    "flashinfer_trtllm_gen",
+    "fallback",
+]
+
+
 class MiniMaxM3MsaSparseAttention(TrtllmAttention):
     """MSA-backed MiniMax-M3 sparse attention."""
 
@@ -1458,6 +1474,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         quant_config=None,
         *,
         sparse_params,
+        fmha_libs: list[str | type[Fmha]] | None = None,
         **kwargs,
     ):
         TrtllmAttention.__init__(
@@ -1468,6 +1485,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             num_kv_heads=num_kv_heads,
             quant_config=quant_config,
             sparse_params=sparse_params,
+            fmha_libs=MINIMAX_M3_V1_FMHA_LIBS if fmha_libs is None else fmha_libs,
             **kwargs,
         )
         self.m3_config = MiniMaxM3SparseConfig.from_sparse_params(
@@ -1513,22 +1531,19 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         self._validate_fmha_pair()
 
     def _validate_fmha_pair(self) -> None:
-        """Require both halves of the MSA pair on this layer.
-
-        MsaPrefillFmha serves the context phase and MsaDecodeFmha the
-        generation phase, and neither will take the other's. Losing one, as a
-        TLLM_FMHA_LIBS subset would, leaves that phase to a library that
-        refuses it. Checking as they are built reports it once per layer rather
-        than on the first step that happens to carry those rows.
-        """
-        present = {type(fmha).__name__ for fmha in self._fmha_manager.fmha_libs}
-        missing = sorted({"MsaPrefillFmha", "MsaDecodeFmha"} - present)
+        """Require a context and generation implementation after manager construction."""
+        assert self._fmha_manager is not None
+        libraries = self._fmha_manager.fmha_libs
+        missing = [
+            cls.__name__
+            for cls in (MsaDecodeFmha, MsaPrefillFmha)
+            if not any(isinstance(lib, cls) for lib in libraries)
+        ]
         if missing:
             raise RuntimeError(
-                f"MiniMax-M3 MSA attention layer {self.layer_idx} is missing the FMHA "
-                f"{'library' if len(missing) == 1 else 'libraries'} {', '.join(missing)}. "
-                "The two are a pair covering one phase each; enable both (msa_prefill "
-                "and msa_decode) or none."
+                f"MiniMax-M3 MSA attention layer {self.layer_idx} is missing required FMHA "
+                f"libraries: {', '.join(missing)}. Both MSA phases need a candidate. "
+                "An exact TLLM_FMHA_LIBS list replaces the model's MSA candidates."
             )
 
     @classmethod
@@ -1781,6 +1796,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
 
 
 __all__ = [
+    "MINIMAX_M3_V1_FMHA_LIBS",
     "MiniMaxM3MsaSparseAttention",
     "MiniMaxM3MsaSparseAttentionMetadata",
 ]

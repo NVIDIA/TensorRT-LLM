@@ -64,6 +64,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase, FmhaPrewarmConfig
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 from .utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
@@ -419,6 +420,7 @@ def _get_workspace_size(
     return max(context_size, generation_size)
 
 
+@fmha_lib("flashinfer_trtllm_gen")
 class FlashInferTrtllmGenFmha(PhasedFmha):
     """
     An attention backend using pure trtllm-gen kernels from flashinfer.

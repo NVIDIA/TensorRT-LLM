@@ -13,10 +13,8 @@ support, and neither has a fallback: prepare() settles the query length per
 step as metadata.msa_decode_span, and ensure_msa_available and
 _validate_decode_kernel_support settle the geometry once per run.
 
-Every import of the kernels below is function-local. This module is on the
-import path of every attention.backends.trtllm import, and the minimax_m3
-package init reaches msa_backend, which subclasses TrtllmAttention, so a
-module-scope import here would close a cycle.
+Imports of the MiniMax-M3 kernels are function-local because the package
+also imports the attention backend that uses this class.
 """
 
 from __future__ import annotations
