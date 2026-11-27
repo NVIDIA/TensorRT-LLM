@@ -1107,6 +1107,67 @@ def test_qwen_raw_float_array_batch_rescale(dark_image_first):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("overrides", "reference_metadata", "seconds"),
+    [
+        ({}, {"total_num_frames": 16, "fps": 8, "frames_indices": list(range(0, 16, 2))}, 0.5),
+        ({"fps": 2}, {"total_num_frames": 8, "fps": 2}, 1.0),
+        ({"fps": 2, "do_sample_frames": True}, {"total_num_frames": 8, "fps": 4}, 1.0),
+        (
+            {"videos_kwargs": {"do_resize": False}, "fps": 2, "do_sample_frames": True},
+            {"total_num_frames": 8, "fps": 4},
+            1.0,
+        ),
+        (
+            {"video_metadata": [{"total_num_frames": 8, "fps": 1}]},
+            {"total_num_frames": 8, "fps": 1},
+            2.0,
+        ),
+    ],
+    ids=["decoded", "explicit-fps", "resampled", "mixed-video-options", "caller-metadata"],
+)
+def test_qwen2_5_video_seconds_per_grid(overrides, reference_metadata, seconds):
+    from transformers import (
+        Qwen2_5_VLProcessor,
+        Qwen2Tokenizer,
+        Qwen2VLImageProcessor,
+        Qwen2VLVideoProcessor,
+    )
+
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+
+    tokenizer = Qwen2Tokenizer()
+    tokenizer.add_tokens(["<|video_pad|>", "<|image_pad|>"], special_tokens=True)
+    processor, _ = _make_qwen_vl_embedding_processor("qwen2.5", [])
+    processor._processor = Qwen2_5_VLProcessor(
+        image_processor=Qwen2VLImageProcessor(),
+        video_processor=Qwen2VLVideoProcessor(size={"shortest_edge": 84**2, "longest_edge": 84**2}),
+        tokenizer=tokenizer,
+    )
+    frames = np.zeros((8, 56, 56, 3), dtype=np.uint8)
+    # The decoder kept every second frame of a two-second, 8 FPS source.
+    video = VideoData(
+        frames, {"total_num_frames": 16, "fps": 8, "frames_indices": list(range(0, 16, 2))}
+    )
+    prompt = "<|video_pad|>"
+    reference = processor.processor(
+        text=[prompt],
+        videos=[frames],
+        video_metadata=[reference_metadata],
+        fps=overrides.get("fps"),
+        do_sample_frames=overrides.get("do_sample_frames", False),
+        return_tensors="pt",
+        **overrides.get("videos_kwargs", {}),
+    )
+    original_overrides = copy.deepcopy(overrides)
+    result = processor._preprocess(prompt, {"video": [video]}, overrides)
+    assert overrides == original_overrides
+    assert reference["second_per_grid_ts"].tolist() == [seconds]
+    torch.testing.assert_close(result["second_per_grid_ts"], reference["second_per_grid_ts"])
+    torch.testing.assert_close(result["video_grid_thw"], reference["video_grid_thw"])
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
 @pytest.mark.parametrize(
     "sizes",
