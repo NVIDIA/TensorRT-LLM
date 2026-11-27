@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.metadata.base import attention_metadata_mode
+from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
@@ -29,7 +31,7 @@ from tensorrt_llm._torch.speculative.interface import supports_sharded_target_sa
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...metadata import build_attention_metadata
+from ...metadata import build_attention_metadata, build_feature_attention_metadata
 from .config import DecoderRunnerConfig
 
 if TYPE_CHECKING:
@@ -108,6 +110,28 @@ class DecoderMetadata:
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
 
+        if attention_metadata_mode() == "new":
+            self.attn_metadata = build_feature_attention_metadata(
+                self.model.model_config,
+                max_batch_size=self._config.max_batch_size,
+                max_num_tokens=self._config.max_num_tokens,
+                max_beam_width=self._config.max_beam_width,
+                attention_backend=self._config.attention_backend,
+                attention_runtime_features=self._attention_runtime_features,
+                mapping=self.mapping,
+                kv_cache_manager=kv_cache_manager,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                spec_config=self._config.spec_config,
+                mamba_metadata_cls=resolve_mamba_metadata_cls(self.model, kv_cache_manager),
+            )
+            logger.info(
+                "Attention metadata: feature-split ("
+                + ", ".join(t.__name__ for t in self.attn_metadata.attached_types())
+                + ")"
+            )
+            self._arm_msa_policy(kv_cache_manager)
+            return self.attn_metadata
+
         config = self.model.model_config.pretrained_config
         self.attn_metadata = build_attention_metadata(
             self.model.model_config,
@@ -153,10 +177,13 @@ class DecoderMetadata:
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
             MiniMaxM3MsaSparseAttentionMetadata,
         )
+        from tensorrt_llm._torch.attention.metadata.minimax_m3 import MiniMaxM3MsaMetadata
 
-        if not isinstance(
-            self.attn_metadata, MiniMaxM3MsaSparseAttentionMetadata
-        ) or not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
+        if isinstance(self.attn_metadata, TrtllmCoreMetadata):
+            has_msa_metadata = self.attn_metadata.get_metadata(MiniMaxM3MsaMetadata) is not None
+        else:
+            has_msa_metadata = isinstance(self.attn_metadata, MiniMaxM3MsaSparseAttentionMetadata)
+        if not has_msa_metadata or not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
             raise ValueError(
                 "RuntimeHooks.msa requires the MiniMax-M3 MSA sparse attention backend and KV cache, "
                 f"got {type(self.attn_metadata).__name__} and {type(kv_cache_manager).__name__}"
@@ -427,6 +454,10 @@ def update_spec_metadata(
     else:
         max_draft_len = config.original_max_draft_len
         max_total_draft_tokens = config.spec_dec_max_total_draft_tokens
+
+    if isinstance(attn_metadata, TrtllmCoreMetadata):
+        # The feature-split metadata take the speculative state from the step's inputs.
+        return
 
     if spec_tree_manager is not None:
         spec_tree_manager.slot_storage.fill_all_slot_ids(

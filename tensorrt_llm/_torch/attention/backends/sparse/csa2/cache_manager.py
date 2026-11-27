@@ -1044,11 +1044,21 @@ class CSA2CacheManager(KVCacheManagerV2):
             self._page_index_converters[key] = self.impl.get_page_index_converter(layer_id, role)
         return self._page_index_converters[key]
 
-    @contextmanager
-    def _swa_publication_scope(self):
+    @property
+    def swa_publication_token(self):
+        """The token of the open publication scope, or None."""
+        return self._swa_publication_token
+
+    def open_swa_publication(self):
+        """Open a publication scope in place of the current one and return its token."""
         token = object()
         self._swa_publication = None
         self._swa_publication_token = token
+        return token
+
+    @contextmanager
+    def _swa_publication_scope(self):
+        token = self.open_swa_publication()
         try:
             yield token
         finally:

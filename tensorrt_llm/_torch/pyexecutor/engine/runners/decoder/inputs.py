@@ -21,6 +21,9 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.metadata.batch_inputs import SpecStepInputs
+from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
+from tensorrt_llm._torch.attention.metadata.draft.base import DraftMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
@@ -91,12 +94,14 @@ from ...lora import LoraParamBuilder
 from ...multimodal import MultimodalItemScheduler
 from ..common import (
     apply_position_id_offset,
+    get_adp_token_counts,
     get_all_rank_num_tokens,
     get_position_id_offset,
     get_top_level_model,
     pad_input_tokens,
     prepare_multimodal_indices,
     resolve_mrope_position_deltas_cache,
+    set_adp_token_counts,
     ship_multimodal_indices,
     token_model_inputs,
 )
@@ -417,6 +422,8 @@ class DecoderInputPreparer:
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
     # The model's decode prologue (RuntimeHooks.decode_prologue), set by the runner.
     decode_prologue: DecodePrologue | None = None
+    # The runner's TRTLLM-Gen FMHA JIT warmup pass; set by the runner around that pass.
+    trtllm_gen_jit_warmup: bool = False
     _spec_overlap_staging = False
 
     def __init__(
@@ -671,7 +678,7 @@ class DecoderInputPreparer:
                 ),
                 gathered.T.tolist(),
             )
-        counts = attn_metadata.get_adp_token_counts()
+        counts = get_adp_token_counts(attn_metadata)
         if self.mapping.has_cp_helix():
             counts = [math.ceil(count / self.mapping.cp_size) for count in counts]
         runner = self.cuda_graph_runner
@@ -697,7 +704,7 @@ class DecoderInputPreparer:
                     f"CUDA graph {replay_key}"
                 )
             cols = [[value] * self.mapping.tp_size for value in (*counts, *spec_counts)]
-        return (attn_metadata.set_adp_token_counts(cols[: len(counts)]), cols[len(counts) :])
+        return (set_adp_token_counts(attn_metadata, cols[: len(counts)]), cols[len(counts) :])
 
     def record_cached_kv_tokens_per_req(
         self,
@@ -1328,24 +1335,41 @@ class DecoderInputPreparer:
         runtime_draft_len = resolve_runtime_draft_len(spec_config, runtime_draft_len)
 
         steady_mtp = self._steady_mtp if enable_spec_decode else None
+        # The fast paths below advance the previous step's metadata in place.
+        # The feature-split metadata take every step through prepare().
+        feature_metadata = isinstance(attn_metadata, TrtllmCoreMetadata)
+        if feature_metadata:
+            steady_mtp = None
 
-        fast_inputs = self._prepare_inputs_fast_path(
-            scheduled_requests,
-            kv_cache_manager,
-            attn_metadata,
-            new_tokens_device,
-            next_draft_tokens_device,
-            resource_manager,
-            promoted_context_request_ids=promoted_context_request_ids,
-            enable_spec_decode=enable_spec_decode,
+        fast_inputs = (
+            None
+            if feature_metadata
+            else self._prepare_inputs_fast_path(
+                scheduled_requests,
+                kv_cache_manager,
+                attn_metadata,
+                new_tokens_device,
+                next_draft_tokens_device,
+                resource_manager,
+                promoted_context_request_ids=promoted_context_request_ids,
+                enable_spec_decode=enable_spec_decode,
+            )
         )
         if fast_inputs is not None:
             return self._finish_prepared(
                 fast_inputs, scheduled_requests, kv_cache_manager, runtime_draft_len
             )
 
-        if not promoted_context_request_ids and self._can_use_steady_gen_fast_prepare(
-            scheduled_requests, new_tokens_device, next_draft_tokens_device, spec_metadata, is_dummy
+        if (
+            not feature_metadata
+            and not promoted_context_request_ids
+            and self._can_use_steady_gen_fast_prepare(
+                scheduled_requests,
+                new_tokens_device,
+                next_draft_tokens_device,
+                spec_metadata,
+                is_dummy,
+            )
         ):
             return self._finish_prepared(
                 self._apply_steady_gen_fast_prepare(
@@ -1515,6 +1539,7 @@ class DecoderInputPreparer:
                     for request in scheduled_requests.generation_requests
                 ]
             self.has_previous_device_draft = next_draft_tokens_device is not None
+        if not is_dummy and not feature_metadata:
             self._record_steady_gen_cache(
                 host,
                 scheduled_requests,
@@ -2986,6 +3011,16 @@ class DecoderInputPreparer:
         enable_spec_decode: bool,
         is_dummy: bool,
     ) -> None:
+        if isinstance(attn_metadata, TrtllmCoreMetadata):
+            self._prepare_feature_metadata(
+                host,
+                scheduled_requests,
+                attn_metadata,
+                spec_config,
+                enable_spec_decode=enable_spec_decode,
+            )
+            return
+
         num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
         gen_request_seq_slots = host.lists.gen_request_seq_slots
         extend_requests = host.lists.extend_requests
@@ -3187,6 +3222,94 @@ class DecoderInputPreparer:
         )
         attn_metadata.locality_domain_num_ctx_tokens = per_locality_domain_ctx_tokens
         attn_metadata.locality_domain_num_gen_tokens = per_locality_domain_gen_tokens
+
+    def _backend_step_inputs(
+        self, attn_metadata: TrtllmCoreMetadata, scheduled_requests: ScheduledRequests
+    ) -> Any:
+        """The step inputs that only the attention backend of this metadata reads, or None."""
+        from tensorrt_llm._torch.attention.metadata.base import UnsupportedMetadataConfiguration
+        from tensorrt_llm._torch.attention.metadata.csa2 import CSA2Metadata, CSA2StepInputs
+
+        if attn_metadata.get_metadata(CSA2Metadata) is None:
+            return None
+        if any(
+            getattr(request, "py_csa2_remote_tail_mode", None) is not None
+            for request in scheduled_requests.context_requests
+        ):
+            raise UnsupportedMetadataConfiguration("CSA2 remote-tail replay")
+        return CSA2StepInputs(
+            context_requests=tuple(scheduled_requests.context_requests),
+            allow_final_window=self.replays_final_windows_only(),
+        )
+
+    def _prepare_feature_metadata(
+        self,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        attn_metadata: TrtllmCoreMetadata,
+        spec_config: DecodingBaseConfig | None,
+        *,
+        enable_spec_decode: bool,
+    ) -> None:
+        """Describe the step as a ``BatchInputs`` and prepare the feature-split metadata."""
+        num_contexts = scheduled_requests.num_context_requests
+        spec = None
+        if enable_spec_decode:
+            spec_dec_mode = spec_config.spec_dec_mode
+            num_extend_ctx_requests = 0
+            if (
+                spec_dec_mode.extend_ctx(self._config.attention_backend)
+                and spec_config.is_linear_tree
+            ):
+                # Verify rows that run as the step's trailing context rows.
+                num_extend_ctx_requests = len(host.lists.extend_requests)
+                num_contexts += num_extend_ctx_requests
+            # A parallel-draft mode states its width as a total of draft tokens.
+            if spec_dec_mode.is_parallel_draft():
+                max_draft_len = self._config.original_max_total_draft_tokens
+                max_total_draft_tokens = self._config.original_max_total_draft_tokens
+            else:
+                max_draft_len = self._config.original_max_draft_len
+                max_total_draft_tokens = self._config.spec_dec_max_total_draft_tokens
+            spec = SpecStepInputs(
+                spec_dec_mode=spec_dec_mode,
+                runtime_draft_len=host.runtime_draft_len,
+                max_draft_len=max_draft_len,
+                max_total_draft_tokens=max_total_draft_tokens,
+                attention_spec_dec_mode=spec_dec_mode.attention_need_spec_dec_mode(
+                    self._config.attention_backend
+                ),
+                is_spec_dec_tree=not spec_config.is_linear_tree,
+                is_spec_dec_dynamic_tree=bool(getattr(spec_config, "use_dynamic_tree", False)),
+                tokens_per_gen_step=self.get_runtime_tokens_per_gen_step(host.runtime_draft_len),
+                num_extend_ctx_requests=num_extend_ctx_requests,
+            )
+        num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
+        inputs = replace(
+            attn_metadata.config,
+            seq_lens=torch.tensor(
+                host.lists.sequence_lengths, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            num_contexts=num_contexts,
+            request_ids=host.lists.request_ids,
+            prompt_lens=host.lists.prompt_lengths,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+                num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            ),
+            spec=spec,
+            trtllm_gen_jit_warmup=self.trtllm_gen_jit_warmup,
+            backend_inputs=self._backend_step_inputs(attn_metadata, scheduled_requests),
+        )
+        attn_metadata.padded_num_tokens = None
+        attn_metadata.prepare_all(inputs)
+        # The draft layers of a linear chain read a second set of metadata.
+        draft_set = getattr(attn_metadata.get_metadata(DraftMetadata), "draft_set", None)
+        if draft_set is not None and spec is not None and spec.runtime_draft_len > 0:
+            draft_set.prepare_all(inputs)
+        host.num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
+        host.remote_tail_modes = set()
 
     def _pad_inputs(
         self,
@@ -3685,6 +3808,13 @@ class DecoderInputPreparer:
         # Overlap scheduling corrects kv_lens_cuda below from the runtime
         # accepted-token counts and calls on_update_kv_lens() again after it.
         has_kv_lens_correction = self._kv_lens_corrected_in_preprocess(inputs, enable_spec_decode)
+        if isinstance(attn_meta, TrtllmCoreMetadata):
+            self._preprocess_feature_metadata(inputs, attn_meta, has_kv_lens_correction)
+            if self.guided_decoder is not None:
+                self.guided_decoder.token_event.record()
+            if mark_prologue_start is not None:
+                mark_prologue_start(attn_meta)
+            return inputs
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
         # With a correction, the call after it does this: every on_update_kv_lens rebuilds
         # from the current lengths and nothing reads its outputs in between.
@@ -3796,6 +3926,38 @@ class DecoderInputPreparer:
             mark_prologue_start(attn_meta)
 
         return inputs
+
+    def _preprocess_feature_metadata(
+        self,
+        inputs: dict[str, Any],
+        attn_metadata: TrtllmCoreMetadata,
+        has_kv_lens_correction: bool,
+    ) -> None:
+        """Derive the step's device metadata inside the forward.
+
+        The derivation binds device tensors that the layers read, so it has to
+        run where a CUDA graph captures it; replay would otherwise read the
+        tensors of the captured step. The host values were staged by
+        ``prepare_inputs``.
+
+        A speculative step under the overlap scheduler also applies its
+        corrections here: the KV cache of the draft tokens was reserved for
+        the largest draft, so the accepted-token counts of the previous step,
+        still on the device, correct the position ids and the KV lengths.
+        """
+        kv_lens_offsets = None
+        if has_kv_lens_correction:
+            num_ctx_tokens = attn_metadata.num_ctx_tokens
+            previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
+            position_offsets = self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
+            if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
+                inputs["position_ids"][:, :, num_ctx_tokens:] += position_offsets
+            else:
+                inputs["position_ids"][0, num_ctx_tokens:] += position_offsets
+            kv_lens_offsets = self._buffers.previous_kv_lens_offsets_cuda
+        attn_metadata.prepare_all(
+            replace(attn_metadata.inputs, kv_lens_offsets=kv_lens_offsets, stage_host=False)
+        )
 
     def postprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int

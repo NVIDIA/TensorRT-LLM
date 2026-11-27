@@ -46,6 +46,7 @@ _MUTATORS = {
 _COPY_HELPERS = {"copy_", "copy_h2d_if_changed", "copy_h2d_pool_shared"}
 _BACKEND = "attention/backends/sparse/minimax_m3/msa_backend.py"
 _FAMILY_BACKEND = "modeling_v2/models/minimax_m3/msa/msa_backend.py"
+_FEATURE_SPLIT_METADATA = "attention/metadata/minimax_m3.py"
 # (file relative to tensorrt_llm/_torch, enclosing function) -> writes allowed there
 _ALLOWED = {
     (_BACKEND, "_alloc_msa_proxy_scratch"),  # the allocation
@@ -55,6 +56,9 @@ _ALLOWED = {
     (_FAMILY_BACKEND, "_alloc_msa_proxy_scratch"),
     (_FAMILY_BACKEND, "_build_step_plans"),
     (_FAMILY_BACKEND, "on_update_kv_lens"),
+    # The feature-split MSA metadata takes the allocation and the H2D copy over from the backend's class and
+    # makes the same device-side correction before the forward.
+    (_FEATURE_SPLIT_METADATA, "_update_kv_lens"),
 }
 
 

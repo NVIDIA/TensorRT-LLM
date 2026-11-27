@@ -21,10 +21,12 @@ from tensorrt_llm.mapping import Mapping
 from ..config_utils import is_mla
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-__all__ = ["build_attention_metadata"]
+__all__ = ["build_attention_metadata", "build_feature_attention_metadata"]
 
 
 def _get_max_num_heads_per_kv(model_config: ModelConfig) -> int:
@@ -121,3 +123,221 @@ def build_attention_metadata(
         sparse_metadata_params=sparse_metadata_params,
         **metadata_kwargs,
     )
+
+
+def build_feature_attention_metadata(
+    model_config: ModelConfig,
+    *,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_beam_width: int,
+    attention_backend: type[AttentionBackend],
+    attention_runtime_features: AttentionRuntimeFeatures,
+    mapping: Mapping,
+    kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+    draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None,
+    spec_config: DecodingBaseConfig | None,
+    mamba_metadata_cls: type | None = None,
+) -> TrtllmCoreMetadata:
+    """Construct the feature-split attention metadata (TRTLLM_ATTENTION_METADATA=new).
+
+    Returns:
+        The core metadata; the other features are reached from it with ``get_metadata``.
+
+    Raises:
+        UnsupportedMetadataConfiguration: The configuration is outside what the
+            feature-split metadata cover.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+        MiniMaxM3MsaSparseAttention,
+        MiniMaxM3SparseRuntimeBackend,
+    )
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.metadata.base import (
+        UnsupportedMetadataConfiguration,
+        build_metadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.batch_inputs import BatchInputs
+    from tensorrt_llm._torch.attention.metadata.chunked_prefill import ChunkedPrefillMetadata
+    from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
+    from tensorrt_llm._torch.attention.metadata.csa2 import CSA2Metadata
+    from tensorrt_llm._torch.attention.metadata.deepseek_v4 import DeepseekV4Metadata
+    from tensorrt_llm._torch.attention.metadata.draft.csa2 import CSA2DraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.deepseek_v4 import DeepseekV4DraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.dense_linear import DenseLinearDraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.dflash import DFlashDraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.embedded_dspark import (
+        EmbeddedDSparkDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.linear import LinearDraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.linear_lengths import (
+        LinearDraftLengthsMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.shared_kv_cache_dense_linear import (
+        SharedKVCacheDenseLinearDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.shared_kv_cache_dflash import (
+        SharedKVCacheDFlashDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.shared_kv_cache_linear import (
+        SharedKVCacheLinearDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.shared_kv_cache_standalone_dspark import (
+        SharedKVCacheStandaloneDSparkDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.standalone_dspark import (
+        StandaloneDSparkDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.suffix_automaton import (
+        SuffixAutomatonDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.minimax_m3 import (
+        MiniMaxM3MsaMetadata,
+        MiniMaxM3TritonMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
+    from tensorrt_llm._torch.attention.metadata.recurrent import RecurrentStateMetadata
+    from tensorrt_llm._torch.attention.metadata.sparse import SparseMetadata
+    from tensorrt_llm._torch.attention.metadata.spec_decoding import SpecDecodingMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.locality_domain import (
+        locality_domain_forkjoin_enabled,
+    )
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+        BaseMambaCacheManager,
+    )
+
+    is_deepseek_v4 = issubclass(attention_backend, DeepseekV4TrtllmAttention)
+    is_csa2 = issubclass(attention_backend, CSA2TrtllmAttention)
+    is_minimax_m3_triton = issubclass(attention_backend, MiniMaxM3SparseRuntimeBackend)
+    is_minimax_m3_msa = issubclass(attention_backend, MiniMaxM3MsaSparseAttention)
+    # A backend with metadata of its own keeps state the feature metadata do not carry.
+    if (
+        not is_deepseek_v4
+        and not is_csa2
+        and not is_minimax_m3_triton
+        and not is_minimax_m3_msa
+        and attention_backend.Metadata is not TrtllmAttentionMetadata
+    ):
+        raise UnsupportedMetadataConfiguration(
+            f"the attention backend {attention_backend.__name__} (only TrtllmAttention, "
+            "DeepSeek-V4, CSA2 and MiniMax-M3 are covered)"
+        )
+    if model_config.is_generation is False or getattr(
+        model_config.pretrained_config, "is_encoder_decoder", False
+    ):
+        raise UnsupportedMetadataConfiguration("encoder and encoder-decoder models")
+    if max_beam_width != 1:
+        raise UnsupportedMetadataConfiguration("beam search")
+    if mapping.has_cp_helix():
+        raise UnsupportedMetadataConfiguration("Helix context parallelism")
+    if model_config.enable_flash_mla:
+        raise UnsupportedMetadataConfiguration("FlashMLA")
+    if locality_domain_forkjoin_enabled(kv_cache_manager):
+        raise UnsupportedMetadataConfiguration("fork-join attention over locality domains")
+
+    # CSA2 attends over its own staged selections and reads no MLA context tables.
+    model_is_mla = is_mla(model_config.pretrained_config) and not is_csa2
+    metadata_types = [TrtllmCoreMetadata, SpecDecodingMetadata]
+    enable_context_mla_with_cached_kv = model_is_mla and (
+        attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
+    )
+    if model_is_mla:
+        metadata_types.append(MlaContextMetadata)
+        if attention_runtime_features.chunked_prefill:
+            metadata_types.append(ChunkedPrefillMetadata)
+    # The metadata of a sparse algorithm requires the dense one.
+    if is_deepseek_v4:
+        metadata_types.append(DeepseekV4Metadata)
+    elif is_csa2:
+        metadata_types.append(CSA2Metadata)
+    elif is_minimax_m3_triton:
+        metadata_types.append(MiniMaxM3TritonMetadata)
+    elif is_minimax_m3_msa:
+        metadata_types.append(MiniMaxM3MsaMetadata)
+    else:
+        metadata_types.append(SparseMetadata)
+    is_hybrid = isinstance(kv_cache_manager, BaseMambaCacheManager)
+    if is_hybrid:
+        metadata_types.append(RecurrentStateMetadata)
+    max_draft_tokens = 0
+    if spec_config is not None:
+        spec_dec_mode = spec_config.spec_dec_mode
+        if getattr(spec_config, "enable_confidence_scheduling", False):
+            raise UnsupportedMetadataConfiguration("ragged verification")
+        has_separate_draft_cache = (
+            draft_kv_cache_manager is not None and draft_kv_cache_manager is not kv_cache_manager
+        )
+        if spec_dec_mode.is_mtp_eagle_one_model() and spec_config.is_linear_tree:
+            metadata_types.append(
+                LinearDraftMetadata
+                if has_separate_draft_cache
+                else SharedKVCacheLinearDraftMetadata
+            )
+            # What the draft set holds that changes from one draft step to the next.
+            metadata_types.append(LinearDraftLengthsMetadata)
+            if is_deepseek_v4:
+                metadata_types.append(DeepseekV4DraftMetadata)
+            elif is_csa2:
+                metadata_types.append(CSA2DraftMetadata)
+        elif spec_dec_mode.is_eagle3_one_model() and spec_config.is_linear_tree:
+            # The Eagle3 drafter is a dense model of its own.
+            metadata_types.append(
+                DenseLinearDraftMetadata
+                if has_separate_draft_cache
+                else SharedKVCacheDenseLinearDraftMetadata
+            )
+            metadata_types.append(LinearDraftLengthsMetadata)
+        elif spec_dec_mode.is_dspark() and spec_config.draft_is_embedded_in_target:
+            metadata_types.append(EmbeddedDSparkDraftMetadata)
+        elif spec_dec_mode.is_dspark():
+            metadata_types.append(
+                StandaloneDSparkDraftMetadata
+                if has_separate_draft_cache
+                else SharedKVCacheStandaloneDSparkDraftMetadata
+            )
+        elif spec_dec_mode.is_dflash():
+            metadata_types.append(
+                DFlashDraftMetadata
+                if has_separate_draft_cache
+                else SharedKVCacheDFlashDraftMetadata
+            )
+        elif spec_dec_mode.is_sa():
+            metadata_types.append(SuffixAutomatonDraftMetadata)
+        else:
+            raise UnsupportedMetadataConfiguration(
+                f"the speculative decoding mode {spec_dec_mode.name} (linear MTP-Eagle and "
+                "Eagle3 one-model, DFlash, DSpark and the suffix automaton are covered)"
+            )
+        max_draft_tokens = spec_config.max_draft_len
+
+    sparse_attention_config = model_config.sparse_attention_config
+    engine_inputs = BatchInputs(
+        seq_lens=torch.zeros((0,), dtype=torch.int),
+        num_contexts=0,
+        request_ids=[],
+        prompt_lens=[],
+        kv_cache_params=KVCacheParams(use_cache=True),
+        max_num_requests=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        max_num_sequences=max_batch_size * max_beam_width,
+        kv_cache_manager=kv_cache_manager,
+        draft_kv_cache_manager=draft_kv_cache_manager,
+        mapping=mapping,
+        runtime_features=attention_runtime_features,
+        max_num_heads_per_kv=_get_max_num_heads_per_kv(model_config),
+        sparse_metadata_params=(
+            sparse_attention_config.to_sparse_metadata_params(
+                pretrained_config=model_config.pretrained_config
+            )
+            if sparse_attention_config is not None
+            else None
+        ),
+        enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
+        mamba_metadata_cls=mamba_metadata_cls if is_hybrid else None,
+        mamba_chunk_size=getattr(model_config.pretrained_config, "chunk_size", 128),
+        max_draft_tokens=max_draft_tokens,
+    )
+    return build_metadata(metadata_types, engine_inputs)

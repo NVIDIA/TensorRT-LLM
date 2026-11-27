@@ -89,6 +89,16 @@ def _gather_prewarm_errors(
     return [error]
 
 
+def _dsa_metadata(attn_metadata: Any, legacy_dsa_type: type) -> Any:
+    """The metadata that holds the DSA indexer state of ``attn_metadata``, or None without DSA."""
+    from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
+    from tensorrt_llm._torch.attention.metadata.dsa import DSAMetadata
+
+    if isinstance(attn_metadata, TrtllmCoreMetadata):
+        return attn_metadata.get_metadata(DSAMetadata)
+    return attn_metadata if isinstance(attn_metadata, legacy_dsa_type) else None
+
+
 class WarmupAgreement:
     """Keeps every rank of a warmup forward on the same shapes and phases."""
 
@@ -757,7 +767,8 @@ class DecoderWarmup:
             )
         except ImportError:
             return
-        if not isinstance(attn_meta, DSAtrtllmAttentionMetadata):
+        attn_meta = _dsa_metadata(attn_meta, DSAtrtllmAttentionMetadata)
+        if attn_meta is None:
             return
         try:
             from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -1136,7 +1147,8 @@ class DecoderWarmup:
             from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
         except ImportError:
             return
-        if isinstance(attn_meta, DSAtrtllmAttentionMetadata):
+        attn_meta = _dsa_metadata(attn_meta, DSAtrtllmAttentionMetadata)
+        if attn_meta is not None:
             next_n = 1 + self._config.original_max_draft_len
             attn_meta.warmup_cute_dsl_radix_topk(next_n)
             if hasattr(attn_meta, "warmup_selfsampling_topk"):
