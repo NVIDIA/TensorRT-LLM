@@ -10,6 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+import gc
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -27,7 +28,10 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalModelMixin,
+    make_multimodal_encoder_model_config,
+)
 from tensorrt_llm._torch.pyexecutor._util import (
     _NO_CTX_MLA_KV_LEN_CAP,
     CacheCost,
@@ -312,8 +316,12 @@ def _make_reserve_creator(
     )
 
 
+@pytest.mark.parametrize("explicit", [False, True], ids=["unset", "active_disabled_flag"])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     monkeypatch,
+    explicit,
+    compiled,
 ):
     scope = MagicMock()
 
@@ -336,11 +344,12 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
             item_count = mm_counts["image"]
             return {"image": {"item_count": item_count}}
 
-    class _Model(MultimodalModelMixin):
+    class _Model(MultimodalModelMixin, torch.nn.Module):
         dtype = torch.float16
         mm_encoder = object()
 
         def __init__(self):
+            super().__init__()
             self.forwarded_item_counts = []
             self.last_output = None
 
@@ -354,15 +363,32 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
 
     input_processor = _InputProcessor()
     model = _Model()
-    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
+    args = TorchLlmArgs(
+        model="dummy",
+        checkpoint_format="HF",
+        disable_mm_encoder=explicit,
+        tensor_parallel_size=2,
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=2 if explicit else None),
+    )
+    if explicit:
+        model.supports_mm_encoder_data_parallel = True
+        model.model_config = ModelConfig(
+            pretrained_config=SimpleNamespace(vocab_size=128),
+            mapping=Mapping(world_size=2, tp_size=2),
+            multimodal_config=args.multimodal_config,
+            disable_mm_encoder=True,
+        )
+        make_multimodal_encoder_model_config(model.model_config)
+    else:
+        model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(
-        model=model,
+        model=torch.compile(model, backend="eager") if compiled else model,
         input_processor=input_processor,
         encoder_batch_size=4,
         encoder_max_num_tokens=8192,
     )
-    creator._llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
+    creator._llm_args = args
     creator._profiling_stage_data = {"enable_mm_reqs": True}
     creator._mapping = SimpleNamespace(enable_attention_dp=False)
     creator._max_num_tokens = 18
@@ -375,7 +401,12 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert input_processor.calls == []
     assert all(getattr(request, "py_multimodal_data", None) is None for request in requests)
 
+    model._encoder_forward_context = Mock(side_effect=AssertionError("Unexpected profiling timer"))
     creator._dummy_encoder_inputs = creator._create_dummy_encoder_inputs()
+    if compiled and not explicit:
+        assert creator._dummy_encoder_inputs == []
+        assert input_processor.calls == []
+        return
     encoder_inputs = creator._dummy_encoder_inputs
     assert input_processor.calls == [(8192, {"image": 2}, torch.float16)]
 
@@ -388,8 +419,41 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     make_scope.assert_called_once_with(encoder_inputs)
     scope.__exit__.assert_called_once_with(None, None, None)
     assert model.forwarded_item_counts == [2]
+    model._encoder_forward_context.assert_not_called()
     assert retained_output.data_ptr() != model.last_output.data_ptr()
     assert creator._dummy_encoder_inputs == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("collective", [False, True], ids=["local", "shared_encoder_tp"])
+def test_encoder_profiling_counts_gathered_inputs_of_shared_encoder_tp(collective, monkeypatch):
+    input_bytes = 4 << 20
+
+    class _Model(MultimodalModelMixin):
+        def encode_multimodal_inputs(self, multimodal_params):
+            self.allocated_in_forward = torch.cuda.memory_allocated()
+            return torch.zeros(4, 4, device="cuda")
+
+    model = _Model()
+    pixels = torch.zeros(input_bytes // 4, device="cuda")
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(model=model, mm_encoder_collective_required=collective)
+    creator._dummy_encoder_inputs = [
+        MultimodalParams(multimodal_data={"image": {"pixel_values": pixels}})
+    ]
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    # Free earlier tests' CUDA tensors now, so no collection runs inside the measured call.
+    gc.collect()
+    before = torch.cuda.memory_allocated()
+    with patch(
+        "tensorrt_llm._torch.pyexecutor._util.discard_nccl_window_tensor_outputs",
+        return_value=nullcontext(),
+    ):
+        creator._encode_dummy_inputs()
+
+    # A shared encoder TP pass holds this rank's inputs and the gathered group
+    # inputs at once, so the profiled forward holds one more copy of the inputs.
+    assert model.allocated_in_forward - before == (input_bytes if collective else 0)
 
 
 def _make_creator(

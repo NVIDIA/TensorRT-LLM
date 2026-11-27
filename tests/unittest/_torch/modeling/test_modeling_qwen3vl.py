@@ -20,6 +20,7 @@ from transformers import PretrainedConfig, Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
@@ -48,6 +49,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
@@ -2657,6 +2659,202 @@ def test_normalization_transport_partial_encoder_cache() -> None:
     assert params.multimodal_data["image"]["vision_normalization"] is spec
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("tp_size", "pp_size", "rank"), [(4, 1, 3), (2, 2, 3)])
+def test_qwen3vl_merger_mapping_is_unchanged(tp_size, pp_size, rank, monkeypatch):
+    monkeypatch.setattr("tensorrt_llm.mapping.mpi_disabled", lambda: False)
+    world_size = tp_size * pp_size
+    mapping = Mapping(
+        world_size=world_size, rank=rank, tp_size=tp_size, pp_size=pp_size, enable_attention_dp=True
+    )
+    config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            vision_config=SimpleNamespace(hidden_size=8, spatial_merge_size=2, out_hidden_size=8),
+            text_config=SimpleNamespace(rms_norm_eps=1e-6, dtype=None),
+        ),
+        mapping=mapping,
+        skip_create_weights_in_init=True,
+    )
+
+    actual = modeling_qwen3vl.Qwen3VLVisionPatchMerger(config).linear_fc2.mapping
+    expected = Mapping(world_size=world_size, rank=rank, tp_size=1, pp_size=world_size)
+    assert actual.to_dict() == expected.to_dict()
+    assert actual.tp_group == expected.tp_group
+    assert actual.pp_group == expected.pp_group
+
+
+def _make_qwen_vision_encoder(rank, attention_dp, encoder_dp, pretrained_config, weights):
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+        make_multimodal_encoder_model_config,
+    )
+
+    model = object.__new__(Qwen2_5_VLModel)
+    torch.nn.Module.__init__(model)
+    model.model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=Mapping(world_size=2, rank=rank, tp_size=2, enable_attention_dp=attention_dp),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=encoder_dp),
+        attn_backend="TRTLLM",
+        max_num_tokens=256,
+    )
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(
+            embed_tokens=torch.nn.Embedding(8, 64, dtype=torch.bfloat16, device="cuda")
+        )
+    )
+    model.mm_encoder = modeling_qwen2vl.Qwen2VisionModelBase(
+        make_multimodal_encoder_model_config(model.model_config),
+        modeling_qwen2vl.Qwen2_5_VisionModel,
+    ).cuda()
+    model.mm_encoder.load_weights(weights)
+    model.mm_encoder.visual.setup_attn_metadata(max_num_tokens=256)
+    return model
+
+
+def _make_qwen_vision_param(rank):
+    grids = [[1, 4, 4], [1, 4, 8]] if rank == 0 else [[1, 8, 4]]
+    lengths = [t * h * w // 4 for t, h, w in grids]
+    return MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.randn(
+                    sum(lengths) * 4, 24, generator=torch.Generator().manual_seed(100 + rank)
+                ).cuda(),
+                "image_grid_thw": torch.tensor(grids),
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                item_refs=[("image", i) for i in range(len(grids))],
+                encoder_token_lengths=[length * 4 for length in lengths],
+                output_embedding_lengths=lengths,
+            ),
+        }
+    )
+
+
+@torch.inference_mode()
+def _run_qwen_vision_parallel_rank(config):
+    from transformers import Qwen2_5_VLConfig
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        Qwen2_5_VisionTransformerPretrainedModel,
+    )
+
+    attention_dp, encoder_dp = config
+    rank = mpi_rank()
+    torch.cuda.set_device(rank)
+    torch.manual_seed(17)
+    pretrained_config = Qwen2_5_VLConfig(
+        vision_config=dict(
+            depth=2,
+            hidden_size=128,
+            intermediate_size=256,
+            num_heads=4,
+            patch_size=2,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=64,
+            window_size=8,
+            fullatt_block_indexes=[1],
+            dtype="bfloat16",
+        ),
+        text_config=dict(max_position_embeddings=2048, rms_norm_eps=1e-6),
+        dtype="bfloat16",
+    )
+    hf_tower = Qwen2_5_VisionTransformerPretrainedModel(pretrained_config.vision_config)
+    weights = {"visual." + name: value for name, value in hf_tower.state_dict().items()}
+    reference = _make_qwen_vision_encoder(rank, False, 2, pretrained_config, weights)
+    model = _make_qwen_vision_encoder(rank, attention_dp, encoder_dp, pretrained_config, weights)
+    parameter_bytes = sum(p.numel() * p.element_size() for p in model.mm_encoder.parameters())
+
+    # Different ADP owners have different image counts and token counts. TP
+    # ranks instead receive the same requests. Then test an empty/cache-hit
+    # owner and an iteration where every owner has no encoder work.
+    param = _make_qwen_vision_param(rank if attention_dp else 0)
+    lengths = param.item_metadata.output_embedding_lengths
+    expected = reference.encode_multimodal_inputs([param])
+    prepared = model.prepare_multimodal_encoder_inputs([(param, i) for i in range(len(lengths))])
+    actual = torch.cat(model.forward_multimodal_encoder_items(prepared), dim=0)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    if attention_dp:
+        # Both owners' batches fit one encoder step, so they run as one encoder call.
+        grouped = model._forward_multimodal_encoder_items(prepared, max_tokens=256, max_items=8)
+        torch.testing.assert_close(torch.cat(grouped), expected, atol=2e-2, rtol=2e-2)
+        outputs = model.forward_multimodal_encoder_items(prepared if rank == 0 else [])
+        if rank == 0:
+            torch.testing.assert_close(torch.cat(outputs), expected, atol=2e-2, rtol=2e-2)
+        else:
+            assert outputs == []
+        assert model.forward_multimodal_encoder_items([]) == []
+    # Exercise the production scheduler/cache publication boundary as well as
+    # the direct model API. ADP peers with no producers still participate.
+    from tensorrt_llm._torch.pyexecutor.engine.multimodal import MultimodalItemScheduler
+    from tensorrt_llm._torch.pyexecutor.llm_request import (
+        LlmRequest,
+        initialize_multimodal_encoder_request,
+        make_mm_encoder_transient_cache_key,
+    )
+    from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
+    from tensorrt_llm.bindings import SamplingConfig
+
+    model._multimodal_encoder_cache = TensorLRUCache(1 << 20)
+    scheduler = MultimodalItemScheduler(
+        model=model,
+        encoder_max_num_tokens=256,
+        encoder_batch_size=8,
+        bytes_per_embedding=model.embedding_dim * model.embedding_dtype.itemsize,
+        collective=model._encoder_parallel_layout.collective,
+    )
+    request = LlmRequest(
+        request_id=rank + 1,
+        max_new_tokens=1,
+        input_tokens=[1, 2, 3],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+        py_multimodal_data=param.multimodal_data,
+    )
+    initialize_multimodal_encoder_request(request, max_num_tokens=256)
+    state = request.py_mm_encoder_state
+    for item_idx, length in enumerate(lengths):
+        key = make_mm_encoder_transient_cache_key(request.request_id, item_idx)
+        assert model._multimodal_encoder_cache.acquire(
+            key, length * 128, retain_after_release=False
+        )
+        state.set_item_cache_key(item_idx, key, ready=False)
+    scheduled = {request.request_id: list(range(len(lengths)))}
+    if attention_dp and rank == 1:
+        # A rank with no scheduled work participates without publishing output.
+        scheduler.forward_items([], {})
+    else:
+        scheduler.forward_items([request], scheduled)
+        cached = torch.cat(
+            [model._multimodal_encoder_cache.get(key) for key in state.item_cache_keys]
+        )
+        torch.testing.assert_close(cached, expected, atol=2e-2, rtol=2e-2)
+        assert all(state.item_ready)
+    if attention_dp:
+        scheduler.forward_items([], {})
+    return parameter_bytes
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("attention_dp", [False, True], ids=["llm_tp", "llm_adp"])
+@pytest.mark.parametrize("encoder_dp", [1, 2], ids=["encoder_tp", "encoder_dp"])
+def test_qwen_vision_parallel_combinations(mpi_pool_executor, attention_dp, encoder_dp):
+    import pickle
+    import sys
+
+    import cloudpickle
+    from mpi4py import MPI
+
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
+    results = list(
+        mpi_pool_executor.map(_run_qwen_vision_parallel_rank, [(attention_dp, encoder_dp)] * 2)
+    )
+    assert results[0] == results[1] > 0
+
+
 class _RecordingVisionEncoder(torch.nn.Module):
     def __init__(self, model_config: ModelConfig) -> None:
         super().__init__()
@@ -2727,3 +2925,427 @@ def test_qwen_encoder_backend_declarations_preserve_fixed_hf_encoder() -> None:
             Qwen2VLModel,
             MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("distributes_items", [False, True])
+@pytest.mark.parametrize("model_name", ["Qwen2VLModelBase", "Exaone4_5_ForConditionalGeneration"])
+def test_qwen2vl_forward_encodes_mixed_items_in_prompt_order(
+    model_name: str, distributes_items: bool, monkeypatch: pytest.MonkeyPatch
+):
+    # Qwen2-VL, Qwen2.5-VL and EXAONE 4.5 have their own forward. It reaches the encoder only
+    # through the mixin entry. The distributed encoder gathers embeddings in prompt order.
+    from tensorrt_llm._torch.models import modeling_exaone4_5
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+        make_multimodal_encoder_model_config,
+    )
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+    )
+
+    module = modeling_exaone4_5 if model_name.startswith("Exaone") else modeling_qwen2vl
+    image_rows, video_rows = torch.full((2, 4), 1.0), torch.full((3, 4), 2.0)
+    param = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": torch.zeros(1)},
+            "video": {"pixel_values_videos": torch.zeros(1)},
+            # The prompt has the video first.
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("video", 0), ("image", 0)], output_embedding_lengths=[3, 2]
+            ),
+        }
+    )
+    model = object.__new__(getattr(module, model_name))
+
+    # Like the real vision encoder: one tensor per modality, images first.
+    def encode(params):
+        return [
+            embeds
+            for modality, embeds in (("image", image_rows), ("video", video_rows))
+            if any(modality in p.multimodal_data for p in params)
+        ]
+
+    model.mm_encoder = SimpleNamespace(forward=encode)
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=None), forward=MagicMock(return_value=torch.zeros(1))
+    )
+    model.model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(disable_fuse_rope=True),
+        mapping=Mapping(world_size=2, tp_size=2, rank=0),
+        multimodal_config=MultimodalConfig(
+            encoder_data_parallel_size=2 if distributes_items else None
+        ),
+    )
+    make_multimodal_encoder_model_config(model.model_config)
+    model._mm_token_ids = torch.tensor([1])
+    # One replica that gets every item stands in for the real DP split.
+    model._encode_multimodal_inputs_dp = MagicMock(
+        side_effect=lambda params, encode: list(encode(params).split([3, 2]))
+    )
+    fused = []
+
+    def fuse_input_embeds(_, input_ids, mm_embeds, **__):
+        fused.append(mm_embeds)
+        return input_ids, None
+
+    monkeypatch.setattr(module, "fuse_input_embeds", fuse_input_embeds)
+
+    def forward():
+        model.forward(
+            SimpleNamespace(num_contexts=1, num_generations=0),
+            input_ids=torch.zeros(5, dtype=torch.int32),
+            multimodal_params=[param],
+        )
+
+    if distributes_items:
+        forward()
+        torch.testing.assert_close(torch.cat(fused[0]), torch.cat([video_rows, image_rows]))
+    else:
+        # Inline vision returns two modality tensors, which cannot be sliced as one request.
+        with pytest.raises(ValueError, match="Number of mm_embeds"):
+            forward()
+    assert model._encode_multimodal_inputs_dp.called == distributes_items
+
+
+class _QwenWithProjectedPrimary(Qwen2_5_VLModel):
+    def encode_multimodal_inputs(
+        self, multimodal_params: list[MultimodalParams], **encoder_kwargs
+    ) -> torch.Tensor:
+        return super().encode_multimodal_inputs(list(multimodal_params), **encoder_kwargs) + 1
+
+
+@pytest.mark.cpu_only
+def test_qwen_inline_tower_returns_single_tensor():
+    embeds = torch.tensor([[13.0], [17.0]])
+    model = object.__new__(Qwen2_5_VLModel)
+    torch.nn.Module.__init__(model)
+    model.model_config = ModelConfig(pretrained_config=SimpleNamespace(disable_fuse_rope=True))
+    model.mm_encoder = SimpleNamespace(forward=lambda params: embeds)
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=torch.nn.Embedding(2, 1)),
+        forward=lambda inputs_embeds, **kwargs: inputs_embeds,
+    )
+    model._mm_token_ids = torch.tensor([1])
+
+    fused = model.forward(
+        SimpleNamespace(num_contexts=1, num_generations=0),
+        input_ids=torch.ones(2, dtype=torch.int32),
+        multimodal_params=[MultimodalParams(multimodal_data={"image": {"pixel_values": embeds}})],
+    )
+    torch.testing.assert_close(fused, embeds)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("video_record", "model_cls"),
+    [
+        (None, Qwen2_5_VLModel),
+        (MultimodalItemMetadata([("video", 0)]), Qwen2_5_VLModel),
+        (MultimodalItemMetadata([], [], []), Qwen2_5_VLModel),
+        (None, _QwenWithProjectedPrimary),
+    ],
+    ids=["no_record", "unknown_rows", "empty_record", "subclass_hook"],
+)
+def test_qwen2vl_inline_encoding_with_incomplete_item_layout(video_record, model_cls, monkeypatch):
+    from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
+
+    image_rows = torch.tensor([[11.0], [12.0]])
+    video_rows = torch.tensor([[21.0], [22.0], [23.0]])
+    image = {
+        "image": {"pixel_values": image_rows, "image_grid_thw": torch.tensor([[1, 2, 4]])},
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("image", 0)], output_embedding_lengths=[2]
+        ),
+    }
+    video = {
+        "video": {"pixel_values_videos": video_rows, "video_grid_thw": torch.tensor([[1, 2, 6]])}
+    }
+    if video_record is not None:
+        video[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = video_record
+    params = [
+        MultimodalParams(
+            multimodal_data=data,
+            multimodal_runtime=MultimodalRuntimeData(0, 1, torch.arange(1, length + 1)),
+        )
+        for data, length in ((video, 3), (image, 2))
+    ]
+    model = object.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.model_config = ModelConfig(pretrained_config=SimpleNamespace(disable_fuse_rope=True))
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=None), forward=MagicMock(return_value=torch.zeros(1))
+    )
+    model._mm_token_ids = torch.tensor([1])
+
+    model.mm_encoder = object.__new__(modeling_qwen2vl.Qwen2VisionModelBase)
+    torch.nn.Module.__init__(model.mm_encoder)
+    model.mm_encoder.visual = MagicMock(side_effect=lambda pixels, grid_thw: pixels)
+    model.mm_encoder.forward = MagicMock(wraps=model.mm_encoder.forward)
+    model._encoder_forward_context = MagicMock()
+    fusion = MagicMock(return_value=(None, None))
+    monkeypatch.setattr(modeling_qwen2vl, "fuse_input_embeds", fusion)
+
+    def active_rows(params):
+        model.forward(
+            SimpleNamespace(num_contexts=len(params), num_generations=0),
+            input_ids=torch.zeros(len(params), dtype=torch.int32),
+            multimodal_params=params,
+        )
+        return torch.cat(fusion.call_args.args[2])
+
+    # The inline tower emits image then video. Keep these two outputs separate so that the
+    # embedding helper does not store them against different request lengths.
+    if model_cls is _QwenWithProjectedPrimary:
+        torch.testing.assert_close(active_rows(params), torch.tensor([[12.0], [21.0]]))
+        torch.testing.assert_close(active_rows(params[1:]), image_rows[:1] + 1)
+        return
+    torch.testing.assert_close(active_rows(params), torch.tensor([[11.0], [21.0]]))
+    model.mm_encoder.forward.assert_called_once()
+    model._encoder_forward_context.assert_not_called()
+    assert all("multimodal_embedding" not in p.multimodal_data for p in params)
+    params[0].multimodal_runtime = MultimodalRuntimeData(1, 2, torch.arange(1, 4))
+    torch.testing.assert_close(active_rows(params[:1]), video_rows[1:2])
+    model.mm_encoder.forward.reset_mock()
+    torch.testing.assert_close(model._run_multimodal_encoder(params[:1]), video_rows)
+    model.mm_encoder.forward.assert_not_called()
+
+
+def pytest_generate_tests(metafunc):
+    if "encoder_dp_model_cls" not in metafunc.fixturenames:
+        return
+    from tensorrt_llm._torch.models._arch_index import MODEL_ARCH_TO_MODULE
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+
+    models = {get_registered_model_class(arch) for arch in MODEL_ARCH_TO_MODULE}
+    supported = sorted(
+        (cls for cls in models if getattr(cls, "supports_mm_encoder_data_parallel", False)),
+        key=lambda cls: cls.__name__,
+    )
+    assert supported
+    metafunc.parametrize("encoder_dp_model_cls", supported, ids=lambda cls: cls.__name__)
+
+
+@pytest.mark.cpu_only
+def test_encoder_dp_model_forward_encodes_only_replica_items(encoder_dp_model_cls, monkeypatch):
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+        make_multimodal_encoder_model_config,
+    )
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalItemPartition,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    # Exercise the registered model's forward up to the handoff to its decoder.
+    # Replacing the tower with tagged embeddings makes the local item assignment observable.
+    class EncoderFinished(Exception):
+        pass
+
+    values = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+    param = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": values},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", i) for i in range(4)],
+                [1] * 4,
+                [1] * 4,
+                input_partitions={"image": {"pixel_values": MultimodalItemPartition()}},
+            ),
+        }
+    )
+    for rank in range(2):
+        model = object.__new__(encoder_dp_model_cls)
+        torch.nn.Module.__init__(model)
+        model.model_config = ModelConfig(
+            mapping=Mapping(world_size=2, tp_size=2, rank=rank),
+            multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
+        )
+        make_multimodal_encoder_model_config(model.model_config)
+        model.llm = SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=torch.nn.Embedding(2, 1)),
+            model_config=SimpleNamespace(
+                pretrained_config=SimpleNamespace(hidden_size=1, torch_dtype=torch.float32)
+            ),
+        )
+        model.deepstack_num_level = 0
+        model.mm_encoder = MagicMock(
+            side_effect=AssertionError("Forward bypassed the encoder entry")
+        )
+        model.mm_encoder.forward.side_effect = AssertionError("Forward bypassed the encoder entry")
+
+        def encode(params):
+            return torch.cat([p.multimodal_data["image"]["pixel_values"] for p in params])
+
+        model.encode_multimodal_inputs = MagicMock(wraps=encode)
+        model._exchange_encoder_status = lambda status: [status, status]
+        expected_local = values[rank::2]
+
+        def gather(local, row_counts):
+            assert row_counts == [2, 2]
+            torch.testing.assert_close(local, expected_local)
+            return torch.cat((values[::2], values[1::2]))
+
+        model._allgather_encoder_dp_output = gather
+        run = model._run_multimodal_encoder
+
+        def finish_encoder(*args, **kwargs):
+            embeds = run(*args, **kwargs)
+            torch.testing.assert_close(embeds, values)
+            raise EncoderFinished
+
+        monkeypatch.setattr(model, "_run_multimodal_encoder", finish_encoder)
+        with pytest.raises(EncoderFinished):
+            model.forward(
+                SimpleNamespace(num_contexts=1, num_generations=0),
+                input_ids=torch.zeros(4, dtype=torch.int32),
+                multimodal_params=[param],
+            )
+        model.encode_multimodal_inputs.assert_called_once()
+        (local_params,) = model.encode_multimodal_inputs.call_args.args
+        torch.testing.assert_close(encode(local_params), expected_local)
+
+
+def _replicated_encoder(tower, config):
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4AudioConfig
+    from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+
+    from tensorrt_llm._torch.models.modeling_gemma4_audio import Gemma4AudioModel
+    from tensorrt_llm._torch.models.modeling_gemma4mm import (
+        Gemma4ForConditionalGeneration,
+        Gemma4MultimodalEmbedder,
+    )
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+        make_multimodal_encoder_model_config,
+    )
+
+    encoder_config = make_multimodal_encoder_model_config(config)
+    cls = Qwen2VLModel if tower == "qwen2_vision" else Gemma4ForConditionalGeneration
+    model = object.__new__(cls)
+    torch.nn.Module.__init__(model)
+    model.model_config = config
+    model.llm = SimpleNamespace(model=SimpleNamespace(embed_tokens=torch.nn.Embedding(2, 16)))
+    if tower == "qwen2_vision":
+        vision_config = Qwen2VLVisionConfig(
+            depth=1,
+            embed_dim=16,
+            hidden_size=16,
+            num_heads=2,
+            mlp_ratio=2,
+            patch_size=2,
+            temporal_patch_size=1,
+            spatial_merge_size=2,
+        )
+        vision_config._attn_implementation = "eager"
+        model.mm_encoder = object.__new__(modeling_qwen2vl.Qwen2VisionModelBase)
+        torch.nn.Module.__init__(model.mm_encoder)
+        model.mm_encoder.model_config = encoder_config
+        model.mm_encoder.visual = modeling_qwen2vl.Qwen2VisionTransformerPretrainedModel(
+            vision_config
+        )
+    else:
+        audio_config = Gemma4AudioConfig(
+            hidden_size=16,
+            output_proj_dims=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            subsampling_conv_channels=(8, 4),
+            dtype=torch.float32,
+        )
+        model.model_dtype = torch.float32
+        model.audio_tower = Gemma4AudioModel(
+            encoder_config.copy_with(pretrained_config=audio_config)
+        )
+        model.embed_audio = Gemma4MultimodalEmbedder(
+            16, 16, dtype=torch.float32, mapping=encoder_config.mapping
+        )
+    return model.eval()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tower,attention_dp", [("qwen2_vision", False), ("gemma4_audio", False), ("gemma4_audio", True)]
+)
+@torch.inference_mode()
+def test_replicated_encoder_rows_match_default(tower, attention_dp, monkeypatch):
+    from tensorrt_llm._torch.models import multimodal_encoder_data_parallel as dp
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalItemPartition,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    # The encoder produces one embedding per four image patches or two per eight audio frames.
+    rng = torch.Generator().manual_seed(73)
+    if tower == "qwen2_vision":
+        modality, output_length = "image", 1
+        data = {
+            "pixel_values": torch.randn(16, 12, generator=rng),
+            "image_grid_thw": torch.tensor([[1, 2, 2]] * 4),
+        }
+        parts = {
+            "pixel_values": MultimodalItemPartition(item_lengths=(4,) * 4),
+            "image_grid_thw": MultimodalItemPartition(),
+        }
+    else:
+        modality, output_length = "audio", 2
+        data = {"audio_features": torch.randn(4, 8, 8, generator=rng)}
+        parts = {"audio_features": MultimodalItemPartition()}
+    param = MultimodalParams(
+        multimodal_data={
+            modality: data,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [(modality, i) for i in range(4)],
+                [4] * 4,
+                [output_length] * 4,
+                input_partitions={modality: parts},
+            ),
+        }
+    )
+    tp = 2 if attention_dp else 4
+
+    def config(rank, size):
+        return ModelConfig(
+            mapping=Mapping(world_size=tp, tp_size=tp, rank=rank, enable_attention_dp=attention_dp),
+            multimodal_config=MultimodalConfig(encoder_data_parallel_size=size),
+        )
+
+    # Linear normally reserves a GPU workspace at construction. A replicated tower
+    # must never call the collective, including on nonzero TP ranks.
+    forbidden = MagicMock(side_effect=AssertionError("Replicated layer ran an all-reduce"))
+    monkeypatch.setattr("tensorrt_llm._torch.distributed.AllReduce", lambda **_: forbidden)
+    baseline = _replicated_encoder(tower, config(0, None))
+    for weight in baseline.parameters():
+        weight.uniform_(-0.2, 0.2, generator=rng)
+    expected = baseline._run_multimodal_encoder([param])
+    assert expected.shape == (4 * output_length, 16)
+    for rank in range(tp):
+        model = _replicated_encoder(tower, config(rank, 1 if attention_dp else 2))
+        model.load_state_dict(baseline.state_dict())
+        model._exchange_encoder_status = lambda status: [status] * tp
+        if attention_dp:
+            # Both attention ranks supply a full batch. They share one encoder TP pass for each owner.
+            monkeypatch.setattr(
+                dp.Distributed,
+                "get",
+                lambda _: SimpleNamespace(tp_allgather=lambda obj: [obj, obj]),
+            )
+            prepared = model.prepare_multimodal_encoder_inputs([(param, i) for i in range(4)])
+            with patch.object(
+                model, "encode_multimodal_inputs", wraps=model.encode_multimodal_inputs
+            ) as encode:
+                actual = torch.cat(model._forward_multimodal_encoder_items(prepared))
+            assert encode.call_count == 2
+        else:
+            by_replica = expected.reshape(4, output_length, 16)[[0, 2, 1, 3]].reshape(-1, 16)
+
+            def gather(local, row_counts):
+                assert row_counts == [2 * output_length] * 2
+                torch.testing.assert_close(local, by_replica.chunk(2)[rank // 2])
+                return by_replica
+
+            model._allgather_encoder_dp_output = gather
+            actual = model._run_multimodal_encoder([param])
+        torch.testing.assert_close(actual, expected)

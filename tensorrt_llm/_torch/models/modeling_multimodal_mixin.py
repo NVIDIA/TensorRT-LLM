@@ -17,7 +17,10 @@
 import contextlib
 import copy
 import itertools
+from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import cached_property, wraps
+from inspect import getattr_static
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -31,10 +34,12 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    final,
 )
 
 import torch
 
+from tensorrt_llm._torch.distributed import Distributed, allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
@@ -45,6 +50,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
+    get_multimodal_item_metadata,
     select_multimodal_fields,
 )
 from tensorrt_llm.logger import logger
@@ -53,15 +59,21 @@ from ..hostfunc import hostfuncs_pending
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 from .modeling_multimodal_utils import (
+    _concat_embeddings,
+    _normalize_encoder_embeddings,
     _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
-
-
-class MultimodalEncoderContractError(ValueError):
-    """A request-local MM encoder input or output contract violation."""
+from .multimodal_encoder_data_parallel import (
+    EncoderParallelLayout,
+    MultimodalEncoderContractError,
+    encoder_dp_error_guard,
+    execute_encoder_dp_items,
+    iter_encoder_rank_inputs,
+    release_error_frames,
+)
 
 
 def _assemble_multimodal_encoder_embeddings(
@@ -177,13 +189,15 @@ def _lengths_by_modality(
 def _reorder_embeds_by_manifest(
     item_layouts: Sequence[tuple[Sequence[tuple[str, int]], Sequence[int]]],
     per_modality_embeds: Dict[str, torch.Tensor],
-    per_modality_lengths: Dict[str, List[int]],
+    per_modality_lengths: Dict[str, List[int]] | None = None,
 ) -> torch.Tensor:
     """Slice per-modality tensors item-by-item and concat in prompt order.
 
     If only one modality has items and every request lists them in encoder
     order, that modality's tensor is returned as is, without a copy.
     """
+    if per_modality_lengths is None:
+        per_modality_lengths = _lengths_by_modality(item_layouts, tuple(per_modality_embeds))
     populated_modalities = [
         (modality, embedding)
         for modality, embedding in per_modality_embeds.items()
@@ -284,6 +298,184 @@ if TYPE_CHECKING:
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 _MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
+
+
+def _item_refs_cover_inputs(mm_data: dict, metadata: MultimodalItemMetadata) -> bool:
+    modalities = {modality for modality, _ in metadata.item_refs}
+    return all(
+        modality in modalities
+        for modality in _MM_DATA_INPUT_MODALITY_KEYS
+        if mm_data.get(modality) is not None
+    )
+
+
+def _use_tower_item_layout(
+    model: "MultimodalModelMixin", params: Sequence[MultimodalParams]
+) -> bool:
+    layout = _active_encoder_layout(model)
+    if layout is None:
+        return False
+    if layout.distributes_items:
+        return True
+    return bool(params) and all(
+        (metadata := param.item_metadata) is not None
+        and metadata.output_embedding_lengths
+        and param.multimodal_data.get("multimodal_embedding") is None
+        and _item_refs_cover_inputs(param.multimodal_data, metadata)
+        for param in params
+    )
+
+
+@dataclass
+class _LocalEncoderCall:
+    """A local hook call whose caller owns placement and timing."""
+
+    model: "MultimodalModelMixin"
+    keep_modality_outputs: bool = False
+    outputs: list[torch.Tensor] | None = None
+
+
+_local_encoder_call = ContextVar[_LocalEncoderCall | None]("mm_local_encoder_call", default=None)
+
+
+@contextlib.contextmanager
+def _local_encoder(
+    model: "MultimodalModelMixin", *, keep_modality_outputs: bool = False
+) -> Iterator[_LocalEncoderCall]:
+    call = _LocalEncoderCall(model, keep_modality_outputs)
+    token = _local_encoder_call.set(call)
+    try:
+        yield call
+    finally:
+        _local_encoder_call.reset(token)
+
+
+def _get_per_modality_tower_embeddings(
+    model: "MultimodalModelMixin",
+    *,
+    encoder_forward_fn: Callable[[Sequence[MultimodalParams]], torch.Tensor],
+    multimodal_params: list[MultimodalParams],
+) -> list[torch.Tensor]:
+    """Pass inline towers' separate modality outputs to the existing cache and chunk handler."""
+
+    def encode(params: list[MultimodalParams]) -> torch.Tensor | list[torch.Tensor]:
+        if _use_tower_item_layout(model, params):
+            return encoder_forward_fn(params)
+
+        with _local_encoder(model, keep_modality_outputs=True) as call:
+            primary = encoder_forward_fn(params)
+        if call.outputs is None:
+            return primary
+        if call.outputs:
+            # A model hook can transform the primary tensor after the tower returns.
+            call.outputs[0] = primary
+        return call.outputs
+
+    return get_multimodal_embeddings(encode, multimodal_params)
+
+
+def _encode_per_modality_tower(
+    model: "MultimodalModelMixin",
+    tower_forward: Callable[[list[MultimodalParams]], torch.Tensor | list[torch.Tensor]],
+    modalities: Sequence[str],
+    params: list[MultimodalParams],
+) -> torch.Tensor:
+    """Return the local tensor from a tower that emits one output per modality."""
+    call = _local_encoder_call.get()
+    if call is not None and call.model is model and call.keep_modality_outputs:
+        call.outputs = _normalize_encoder_embeddings(tower_forward(params))
+        return call.outputs[0] if call.outputs else torch.empty(0)
+    if not _use_tower_item_layout(model, params):
+        return get_multimodal_embeddings(tower_forward, params)[0]
+
+    outputs = _normalize_encoder_embeddings(tower_forward(params))
+    active = (m for m in modalities if any(p.multimodal_data.get(m) is not None for p in params))
+    return _reorder_embeds_by_manifest(
+        [param.get_item_layout() for param in params], dict(zip(active, outputs, strict=True))
+    )
+
+
+def _require_encoder_dp_metadata(mm_data: dict | None) -> MultimodalItemMetadata:
+    metadata = get_multimodal_item_metadata(mm_data)
+    if (
+        metadata is None
+        or not metadata.output_embedding_lengths
+        or not _item_refs_cover_inputs(mm_data or {}, metadata)
+    ):
+        raise MultimodalEncoderContractError(
+            "Encoder data parallelism requires item records with output_embedding_lengths "
+            "for every raw input modality."
+        )
+    return metadata
+
+
+def _built_encoder_layout(model: "MultimodalModelMixin") -> EncoderParallelLayout | None:
+    return model.model_config._mm_encoder_parallel_layout
+
+
+def _active_encoder_layout(model: "MultimodalModelMixin") -> EncoderParallelLayout | None:
+    """Return a layout only for a configured model that built an encoder."""
+    if getattr(model, "supports_mm_encoder_data_parallel", False) is not True:
+        return None
+    return _built_encoder_layout(model) if model._encoder_dp_configured else None
+
+
+def _has_encoder_dp_config(config: ModelConfig | None) -> bool:
+    mm_config = getattr(config, "multimodal_config", None)
+    return getattr(mm_config, "encoder_data_parallel_size", None) is not None
+
+
+class _PropertyConfigAllocator:
+    """Resolve a config property after the most-derived constructor has installed its backing."""
+
+    def __init__(self, new):
+        self.new = new
+
+    def __get__(self, instance, owner):
+        new = self.new
+
+        # Class decorators can generate the initializer after the class is defined.
+        @wraps(owner.__init__ if new is object.__new__ else new)
+        def allocate(cls, *args, **kwargs):
+            init = cls.__init__
+            if (
+                vars(cls).get("__new__") is self
+                and getattr(init, "_encoder_dp_owner", None) is not cls
+            ):
+
+                @wraps(init)
+                def initialize(model, *args, **kwargs):
+                    init(model, *args, **kwargs)
+                    if type(model) is cls:
+                        model._encoder_dp_configured = _has_encoder_dp_config(
+                            getattr(model, "model_config", None)
+                        )
+
+                initialize._encoder_dp_owner = cls
+                cls.__init__ = initialize
+            if new is object.__new__:
+                return new(cls)
+            return new(cls, *args, **kwargs)
+
+        return allocate
+
+
+def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConfig:
+    """Resolve encoder TP/DP independently of the language model mapping.
+
+    An omitted encoder setting preserves existing model-specific behavior.
+    Explicit DP divides the LLM TP group into encoder TP subgroups. The copied
+    config shares the engine's module registry with the language model.
+    """
+    encoder_config = copy.deepcopy(
+        model_config, {id(model_config.extra_attrs): model_config.extra_attrs}
+    )
+    if not _has_encoder_dp_config(model_config):
+        return encoder_config
+    layout = EncoderParallelLayout.from_config(model_config)
+    # Only workers that build an encoder publish a layout for item scheduling.
+    model_config._mm_encoder_parallel_layout = layout
+    return encoder_config.copy_with(mapping=layout.mapping)
 
 
 def _build_request_multimodal_input(
@@ -404,11 +596,23 @@ class EncoderCachePartition:
         return bool(self.looked_up) and not self.hits
 
 
+def _run_encoder_on_replica(
+    model: "MultimodalModelMixin", params: Sequence[MultimodalParams]
+) -> torch.Tensor:
+    """Run an already assigned batch, or a full local workspace profiling batch."""
+    with _local_encoder(model):
+        return model._run_multimodal_encoder(params)
+
+
 class MultimodalModelMixin:
     """Template-method mixin for PyTorch multimodal causal LM models.
 
     Concrete model forwards can call `prepare_multimodal_inputs` while keeping their explicit
     language-model delegation.
+
+    Models that support encoder data parallelism build their towers from the encoder config
+    and run them through `_run_multimodal_encoder`. The shared path assigns the items to
+    replicas and returns their embeddings in prompt order.
 
     Current limitations:
 
@@ -433,6 +637,8 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    supports_mm_encoder_data_parallel: ClassVar[bool] = False
+
     # TODO: Move capability declarations into the planned single
     # SupportsMultimodal Protocol; keep shared execution in this mixin
     # and encoder attention-metadata setup in MultimodalEncoderMixin.
@@ -440,8 +646,23 @@ class MultimodalModelMixin:
     """Public backends by logical encoder; an empty set marks fixed attention."""
 
     model_config: ModelConfig
+    _encoder_dp_configured: bool = False
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
     _encoder_forward_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if cls.supports_mm_encoder_data_parallel and isinstance(
+            getattr(cls, "model_config", None), property
+        ):
+            prior = getattr_static(cls, "__new__")
+            new = prior.new if isinstance(prior, _PropertyConfigAllocator) else cls.__new__
+            cls.__new__ = _PropertyConfigAllocator(new)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "model_config" and self.supports_mm_encoder_data_parallel:
+            self._encoder_dp_configured = _has_encoder_dp_config(value)
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
@@ -472,11 +693,12 @@ class MultimodalModelMixin:
         self,
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
-        """Run model-specific multimodal encoder work.
+        """Run model-specific multimodal encoder work (the local encode hook).
 
-        Returns the single primary multimodal embedding tensor for the supplied params. Rows are
-        expected to be concatenated in request order, and special multimodal tokens occupy token
-        positions but do not have rows here.
+        Returns a single primary embedding tensor in request order and, within each request,
+        in prompt order. Special multimodal tokens occupy token positions but contribute no
+        embeddings. Forward paths call this hook through `_run_multimodal_encoder`, which
+        assigns the items to encoder replicas.
         """
         raise NotImplementedError
 
@@ -491,11 +713,20 @@ class MultimodalModelMixin:
         """
         return None
 
+    @final
     def _run_multimodal_encoder(
         self,
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
-        """Run encoder work with optional runtime instrumentation after H2D."""
+        """Return the encoder embeddings for these requests in prompt order."""
+        call = _local_encoder_call.get()
+        if call is not None and call.model is self:
+            return self.encode_multimodal_inputs(multimodal_params)
+        layout = _active_encoder_layout(self)
+        if layout is not None and layout.distributes_items:
+            return _concat_embeddings(
+                self._encode_multimodal_inputs_dp(multimodal_params, self.encode_multimodal_inputs)
+            )
         if self._encoder_forward_context is None:
             return self.encode_multimodal_inputs(multimodal_params)
         with self._encoder_forward_context():
@@ -504,6 +735,15 @@ class MultimodalModelMixin:
     def prepare_multimodal_encoder_inputs(
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
+    ) -> list[tuple[MultimodalParams, Sequence[int], str]]:
+        """Slice the requested items in scheduler order before the input transfer."""
+        return self._prepare_multimodal_encoder_inputs(selected_items)
+
+    def _prepare_multimodal_encoder_inputs(
+        self,
+        selected_items: Sequence[tuple[MultimodalParams, int]],
+        *,
+        reuse_prepared_runs: bool = False,
     ) -> list[tuple[MultimodalParams, Sequence[int], str]]:
         """Build selected item encoder inputs before the caller performs H2D.
 
@@ -515,6 +755,8 @@ class MultimodalModelMixin:
 
         Args:
             selected_items: `(request params, item index)` pairs in scheduler-selected order.
+            reuse_prepared_runs: Allow reusing a previously sliced param when its full run
+                is selected in order.
 
         Returns:
             Tuples of `(sliced encoder params, per-item embedding row counts, modality)`, in
@@ -528,6 +770,11 @@ class MultimodalModelMixin:
             item_metadata,
         ) in self._runs_by_request_modality(selected_items):
             item_refs = item_metadata.item_refs
+            if reuse_prepared_runs and run_indices == list(range(len(item_refs))):
+                encoder_inputs.append(
+                    (multimodal_param, item_metadata.output_embedding_lengths, modality)
+                )
+                continue
             # The two slicers take different index spaces. The raw-tensor
             # slicer indexes the modality's own payload, so it gets the
             # modality-local indices (plus the modality, which also lets it
@@ -600,16 +847,130 @@ class MultimodalModelMixin:
         self,
         encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
     ) -> list[torch.Tensor]:
+        """Encode prepared inputs and return one tensor per item in scheduler order."""
+        return self._forward_multimodal_encoder_items(encoder_inputs)
+
+    def _forward_multimodal_encoder_items(
+        self,
+        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
+        *,
+        max_tokens: Optional[int] = None,
+        max_items: Optional[int] = None,
+        transfer_local_inputs: Callable[[Iterable[MultimodalParams]], None] | None = None,
+    ) -> list[torch.Tensor]:
         """Forward prepared MM encoder inputs in scheduler item order.
 
         Args:
             encoder_inputs: Tuples returned by `prepare_multimodal_encoder_inputs`. Consecutive
                 inputs with the same modality must be batch-compatible.
+            max_tokens: Encoder input tokens of one encoder step.
+            max_items: Items of one encoder step. With a shared encoder TP pass, the batches of
+                several ranks run as one encoder call while they fit both limits together.
+            transfer_local_inputs: Stages this DP replica's inputs after placement when provided.
 
         Returns:
             One encoder output tensor **per item** (not per input tuple). Each tensor has the
             declared embedding row count and retains scheduler input order.
         """
+        layout = _active_encoder_layout(self)
+        if layout is None or not layout.collective:
+            if layout is not None and layout.distributes_items and encoder_inputs:
+                return self._encode_prepared_multimodal_items(
+                    encoder_inputs, transfer_local_inputs=transfer_local_inputs
+                )
+            return self._forward_multimodal_encoder_items_local(encoder_inputs)
+
+        outputs: list[torch.Tensor] = []
+        owner_error: MultimodalEncoderContractError | None = None
+        # Visit one bounded group of owners' batches at a time. Cache state and
+        # returned embeddings remain on the rank that owns the original requests.
+        for group in iter_encoder_rank_inputs(
+            encoder_inputs,
+            mapping=self.model_config.mapping,
+            exchange_status=self._exchange_encoder_status,
+            max_tokens=max_tokens,
+            max_items=max_items,
+        ):
+            try:
+                group_outputs = self._forward_shared_encoder_group(group)
+            except MultimodalEncoderContractError as error:
+                # Only this rank's requests fail; the later groups still run.
+                # The error's frames must not keep this group's buffers alive.
+                owner_error = release_error_frames(error)
+            else:
+                if group_outputs is not None:
+                    outputs = group_outputs
+                # This rank's outputs keep at most one group's outputs alive.
+                del group_outputs
+            # Drop this group's inputs before the next group's are allocated.
+            del group
+        if owner_error is not None:
+            raise owner_error
+        return outputs
+
+    def _forward_shared_encoder_group(
+        self,
+        group: Sequence[tuple[int, Sequence[tuple[MultimodalParams, Sequence[int], str]]]],
+    ) -> Optional[list[torch.Tensor]]:
+        """Encode a group of owners' batches on every rank, one encoder call per modality run.
+
+        Returns this rank's outputs, or ``None`` when it owns no batch in the
+        group. A request error fails only the owner's requests: every rank
+        gets the error, and only the owner raises it. An error in a group of
+        several owners cannot be traced to one owner, so every rank then
+        encodes each owner alone.
+        """
+        tp_rank = self.model_config.mapping.tp_rank
+        encoder_inputs = [encoder_input for _, inputs in group for encoder_input in inputs]
+        # Each modality is its own encoder TP forward. Share failures after each
+        # one, so no rank starts the next forward while a peer has failed. With encoder
+        # DP, each replica runs its entire assigned batch through the model hook.
+        if self._encoder_parallel_layout.distributes_items:
+            runs = [encoder_inputs]
+            encode = self._encode_prepared_multimodal_items
+        else:
+            runs = [list(run) for _, run in itertools.groupby(encoder_inputs, key=lambda e: e[2])]
+            encode = self._forward_multimodal_encoder_items_local
+        shared_outputs: list[torch.Tensor] = []
+        try:
+            for run in runs:
+                with encoder_dp_error_guard(self._exchange_encoder_status):
+                    shared_outputs.extend(encode(run))
+        except MultimodalEncoderContractError:
+            shared_outputs.clear()
+            if len(group) == 1:
+                if group[0][0] == tp_rank:
+                    raise
+                return None
+            outputs, own_error = None, None
+            for entry in group:
+                try:
+                    entry_outputs = self._forward_shared_encoder_group([entry])
+                except MultimodalEncoderContractError as error:
+                    # Keep going: the other ranks still encode the later owners.
+                    own_error = release_error_frames(error)
+                else:
+                    outputs = entry_outputs if entry_outputs is not None else outputs
+            if own_error is not None:
+                raise own_error
+            return outputs
+        start = 0
+        for owner, inputs in group:
+            num_items = sum(len(lengths) for _, lengths, _ in inputs)
+            if owner == tp_rank:
+                own_outputs = shared_outputs[start : start + num_items]
+                if len(group) == 1:
+                    return own_outputs
+                # Copy this rank's embeddings so the group's output can be
+                # freed before the next group runs.
+                return list(torch.cat(own_outputs).split([o.shape[0] for o in own_outputs]))
+            start += num_items
+        return None
+
+    def _forward_multimodal_encoder_items_local(
+        self,
+        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
+    ) -> list[torch.Tensor]:
         outputs: list[torch.Tensor] = []
         group_params: list[MultimodalParams] = []
         group_lengths: list[int] = []
@@ -663,6 +1024,163 @@ class MultimodalModelMixin:
     def embedding_dtype(self) -> torch.dtype:
         """Return the dtype of each cached multimodal embedding row."""
         raise NotImplementedError
+
+    @cached_property
+    def _encoder_parallel_layout(self) -> EncoderParallelLayout:
+        """Use the tower's layout, or the LLM mapping on a worker without one."""
+        layout = _built_encoder_layout(self)
+        return layout if layout is not None else EncoderParallelLayout(self.model_config.mapping)
+
+    def _allgather_encoder_dp_output(
+        self, tensor: torch.Tensor, row_counts: list[int]
+    ) -> torch.Tensor:
+        mapping = self.model_config.mapping
+        tp_size = self._encoder_parallel_layout.tp_size
+        if tp_size > 1:
+            # Encoder TP ranks hold identical outputs. Send one copy per DP
+            # replica rather than multiplying the gathered output by TP size.
+            if mapping.tp_rank % tp_size:
+                tensor = tensor[:0]
+            row_counts = [
+                size if rank % tp_size == 0 else 0 for size in row_counts for rank in range(tp_size)
+            ]
+        return allgather(tensor, mapping, dim=0, sizes=row_counts)
+
+    def _exchange_encoder_status(self, values: Sequence[int]) -> Sequence[Sequence[int]]:
+        """Gather a small int vector from every TP rank. Row ``r`` is rank ``r``'s.
+
+        Encoder data parallelism shares status and errors with it. It runs on
+        the CPU, so it does not wait for encoder CUDA work and still works
+        after a CUDA error.
+        """
+        return Distributed.get(self.model_config.mapping).tp_allgather_int64(
+            values, prefer_cpu=True
+        )
+
+    @staticmethod
+    def _encoder_dp_items(
+        multimodal_params: Sequence[MultimodalParams],
+    ) -> tuple[list[tuple[MultimodalParams, int | None]], list[int], list[int]]:
+        """Return the `(param, item index)`, cost, and output length for each DP item.
+
+        The cost is the item's physical encoder input tokens. A request without
+        encoder token lengths stays one atomic item (index `None`) and uses its
+        output embedding count as the cost. The producer and admission
+        boundaries already validated the item metadata.
+        """
+        items: list[tuple[MultimodalParams, int | None]] = []
+        costs: list[int] = []
+        row_counts: list[int] = []
+        for param in multimodal_params:
+            metadata = _require_encoder_dp_metadata(param.multimodal_data)
+            lengths = metadata.output_embedding_lengths
+            assert lengths is not None
+            if metadata.encoder_token_lengths is None:
+                items.append((param, None))
+                costs.append(sum(lengths))
+                row_counts.append(sum(lengths))
+                continue
+            items.extend((param, index) for index in range(len(lengths)))
+            costs.extend(metadata.encoder_token_lengths)
+            row_counts.extend(lengths)
+        return items, costs, row_counts
+
+    def _prepare_encoder_dp_inputs(
+        self,
+        items: Sequence[tuple[MultimodalParams, int | None]],
+        *,
+        reuse_prepared_runs: bool,
+    ) -> list[MultimodalParams]:
+        """Slice this replica's items with one call; atomic requests pass through whole."""
+        local_params: list[MultimodalParams] = []
+        selected: list[tuple[MultimodalParams, int]] = []
+        for param, index in items:
+            if index is not None:
+                selected.append((param, index))
+                continue
+            local_params.extend(
+                p
+                for p, _, _ in self._prepare_multimodal_encoder_inputs(
+                    selected, reuse_prepared_runs=reuse_prepared_runs
+                )
+            )
+            selected.clear()
+            local_params.append(param)
+        local_params.extend(
+            p
+            for p, _, _ in self._prepare_multimodal_encoder_inputs(
+                selected, reuse_prepared_runs=reuse_prepared_runs
+            )
+        )
+        return local_params
+
+    def _encode_prepared_multimodal_items(
+        self,
+        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
+        *,
+        transfer_local_inputs: Callable[[Iterable[MultimodalParams]], None] | None = None,
+    ) -> list[torch.Tensor]:
+        return self._encode_multimodal_inputs_dp(
+            [param for param, _, _ in encoder_inputs],
+            lambda params: _run_encoder_on_replica(self, params),
+            prepared_runs=True,
+            transfer_local_inputs=transfer_local_inputs,
+        )
+
+    def _encode_multimodal_inputs_dp(
+        self,
+        multimodal_params: Sequence[MultimodalParams],
+        encode_local: Callable[[Sequence[MultimodalParams]], torch.Tensor],
+        *,
+        prepared_runs: bool = False,
+        transfer_local_inputs: Callable[[Iterable[MultimodalParams]], None] | None = None,
+    ) -> list[torch.Tensor]:
+        """Encode this replica's share and gather the embeddings in prompt order."""
+        items, costs, row_counts = self._encoder_dp_items(multimodal_params)
+        layout = self._encoder_parallel_layout
+        width = self.embedding_dim
+        empty_output = torch.empty(
+            (0, width),
+            dtype=self.embedding_dtype,
+            device=self.text_embedding_layer.weight.device,
+        )
+
+        def prepare_local(indices: list[int]) -> Callable[[], torch.Tensor]:
+            params = self._prepare_encoder_dp_inputs(
+                [items[index] for index in indices], reuse_prepared_runs=prepared_runs
+            )
+            if transfer_local_inputs is not None:
+                transfer_local_inputs(params)
+            return lambda: encode_local(params)
+
+        encoder_context = self._encoder_forward_context
+        with contextlib.ExitStack() as encoder_scope:
+
+            def start_encoder_timer() -> None:
+                if encoder_context is not None:
+                    encoder_scope.enter_context(encoder_context())
+
+            outputs = execute_encoder_dp_items(
+                costs,
+                row_counts,
+                layout=layout,
+                prepare_local=prepare_local,
+                exchange_status=self._exchange_encoder_status,
+                allgather=self._allgather_encoder_dp_output,
+                empty_output=empty_output,
+                on_prepared=start_encoder_timer if encoder_context is not None else None,
+            )
+
+        # An unsplittable request occupies one DP slot. The cache and
+        # scheduler still consume one view per logical item.
+        item_outputs: list[torch.Tensor] = []
+        for (param, index), output in zip(items, outputs, strict=True):
+            if index is None:
+                _, lengths = param.get_item_layout()
+                item_outputs.extend(output.split(lengths, dim=0))
+            else:
+                item_outputs.append(output)
+        return item_outputs or [empty_output]
 
     @property
     def encoder_cache_active(self) -> bool:
@@ -1281,12 +1799,7 @@ class MultimodalModelMixin:
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params without item output lengths."
             )
             return None
-        item_modalities = {modality for modality, _ in item_metadata.item_refs}
-        if any(
-            modality not in item_modalities
-            for modality in _MM_DATA_INPUT_MODALITY_KEYS
-            if mm_data.get(modality) is not None
-        ):
+        if not _item_refs_cover_inputs(mm_data, item_metadata):
             return None
         return cls.build_encoder_cache_item_keys(
             mm_input.multimodal_hashes,
@@ -1438,10 +1951,8 @@ class MultimodalModelMixin:
         """Encode only the miss items of each partial-hit param and stitch results.
 
         Miss residuals from all partial-hit params in the batch are encoded in a
-        single call and the concatenated output is split back per param, mirroring
-        how `get_multimodal_embeddings` batches full-miss params. After this returns,
-        each param's `multimodal_embedding` has the same shape as a full encoder run
-        so downstream `get_multimodal_embeddings` treats it as fully cached.
+        single call, mirroring how `get_multimodal_embeddings` batches full misses.
+        Attach each request's cached and newly encoded embeddings in prompt order.
         """
         if not partials:
             return
@@ -1460,9 +1971,13 @@ class MultimodalModelMixin:
         )
         # Keep one call across requests and modalities so EncoderGroup can
         # batch modalities that share an encoder.
-        batched_output = self._run_multimodal_encoder([param for param, _, _ in encoder_inputs])
-        output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
-        encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
+        layout = _active_encoder_layout(self)
+        if layout is not None and layout.distributes_items:
+            encoded_items = iter(self._encode_prepared_multimodal_items(encoder_inputs))
+        else:
+            batched_output = self._run_multimodal_encoder([param for param, _, _ in encoder_inputs])
+            output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
+            encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
 
         for param, partition in partials:
             miss_tensors = [next(encoded_items) for _ in partition.miss_indices]

@@ -88,7 +88,8 @@ from ..memory.monitor import settings as monitor_settings
 from ..memory.monitor import triggers as monitor_triggers
 from ..memory.monitor.ranks import RankReporter
 from ..models.modeling_multimodal_mixin import (
-    MultimodalModelMixin, maybe_prefetch_mm_encoder_for_next_iter)
+    MultimodalModelMixin, _active_encoder_layout, _require_encoder_dp_metadata,
+    maybe_prefetch_mm_encoder_for_next_iter)
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.dwdp.dense.manager import DenseDwdpManager
@@ -130,13 +131,17 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
 from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
+# yapf: disable
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
                           get_mm_context_chunk_start, get_mm_items_for_chunk,
                           get_mm_pending_items,
                           initialize_multimodal_encoder_request,
-                          is_mm_context_chunk_ready, release_consumed_mm_items)
+                          is_mm_context_chunk_ready,
+                          needs_multimodal_item_encoding,
+                          release_consumed_mm_items)
+# yapf: enable
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
@@ -1016,6 +1021,14 @@ class PyExecutor:
         # its loop paths branch on.
         self._mm_encoder_item_scheduling_enabled = (
             model_engine.mm_encoder_item_scheduling_enabled)
+        # Attention-DP ranks share one encoder TP pass, so all of them enter
+        # each encoder step. They skip it together while no rank can have MM
+        # encoder work: the can-queue vote and the new requests keep
+        # _mm_encoder_work_possible the same on every rank.
+        self._mm_encoder_collective = bool(
+            self._mm_encoder_item_scheduling_enabled
+            and model_engine.mm_encoder_collective_required)
+        self._mm_encoder_work_possible = True
         self.scheduler = scheduler
         # Warmup finalization checks disaggregation before request queues and
         # the hang-detector status provider are initialized.
@@ -4619,8 +4632,7 @@ class PyExecutor:
 
                 self._fail_scheduler_requests(scheduled_batch)
 
-                if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
+                if self._mm_encoder_item_scheduling_enabled:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -5873,6 +5885,15 @@ class PyExecutor:
             # selection, so never reuse their preceding agreement.
             runner.adp_shape_agreement = None
 
+        # With a shared encoder TP pass, the vote also carries whether this
+        # rank has MM encoder work. That decides if the next encoder step
+        # runs; _fetch_new_requests opens it for new requests.
+        mm_column = [
+            int(
+                any(
+                    getattr(request, "py_mm_encoder_state", None) is not None
+                    for request in self.active_requests))
+        ] if getattr(self, "_mm_encoder_collective", False) else []
         if getattr(self, "_enable_remote_tail_adp", False):
             # An idle execution row needs no active-request or sampler slot.
             # Still veto an all-empty fleet (e.g. cancellations after the vote).
@@ -5881,7 +5902,9 @@ class PyExecutor:
             if 0 not in self.model_engine.cuda_graph_runner.padding_dummy_requests:
                 effective_size = -1
             sizes = self.dist.tp_allgather_int64(
-                [effective_size, scheduled_batch.batch_size])
+                [effective_size, scheduled_batch.batch_size] + mm_column)
+            if mm_column:
+                self._mm_encoder_work_possible = bool(sizes[:, -1].any())
             if (sizes[:, 0] < 0).any():
                 raise RuntimeError(
                     "Conditional attention-DP execution lost its reserved "
@@ -5902,8 +5925,11 @@ class PyExecutor:
             # forward together, but their batch sizes can differ: one CP rank
             # can pad a dummy request that its peer failed to allocate. With
             # cp_size == 1 this is the TP gather.
-            batch_sizes = self.dist.tp_cp_allgather_int64(
-                [scheduled_batch.batch_size])[:, 0]
+            rows = self.dist.tp_cp_allgather_int64(
+                [scheduled_batch.batch_size] + mm_column)
+            if mm_column:
+                self._mm_encoder_work_possible = bool(rows[:, -1].any())
+            batch_sizes = rows[:, 0]
             can_queue = bool(batch_sizes.all())
             # Rows are TP-major, CP-minor. The CP peers of this DP rank decide
             # together whether to defer the previous batch.
@@ -5913,6 +5939,18 @@ class PyExecutor:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
         return can_queue, can_queue_this_rank
+
+    def _open_mm_encoder_step_for(
+            self, new_requests: Iterable[RequestQueueItem]) -> None:
+        """Open the next shared encoder step if a new request has raw MM inputs.
+
+        Every rank sees the same new requests, so all ranks agree.
+        """
+        if any(
+                needs_multimodal_item_encoding(
+                    getattr(item.request, "py_multimodal_data", None))
+                for item in new_requests):
+            self._mm_encoder_work_possible = True
 
     def _revert_unexecuted_alloc(self, scheduled_batch):
         """Revert the KV cache growth of a scheduled batch whose forward pass is skipped.
@@ -7327,8 +7365,7 @@ class PyExecutor:
                     self._flush_pending_transfer_responses()
                     continue
 
-                if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
+                if self._mm_encoder_item_scheduling_enabled:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -8473,8 +8510,7 @@ class PyExecutor:
                         self.kv_cache_manager.flush_deferred_closes()
                     continue
 
-                if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
+                if self._mm_encoder_item_scheduling_enabled:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -9255,10 +9291,16 @@ class PyExecutor:
         # handled batch-wide.
         mm_data = getattr(request, 'py_multimodal_data', None)
         if mm_data:
-            validate_mm = getattr(self.model_engine.model,
-                                  'validate_multimodal_request_data', None)
+            validate_mm = getattr(model, 'validate_multimodal_request_data',
+                                  None)
             if validate_mm is not None:
                 validate_mm(mm_data)
+            layout = _active_encoder_layout(model)
+            if (layout is not None and layout.distributes_items
+                    and needs_multimodal_item_encoding(mm_data)):
+                metadata = _require_encoder_dp_metadata(mm_data)
+                if not self._mm_encoder_item_scheduling_enabled:
+                    metadata.validate()
 
     def _idle_kv_transfer_poll_timeout(self) -> Optional[datetime.timedelta]:
         """Idle request-queue wait bound while context KV transfers are tracked.
@@ -10238,6 +10280,8 @@ class PyExecutor:
 
         # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
+            if getattr(self, "_mm_encoder_collective", False):
+                self._open_mm_encoder_step_for(new_requests)
             # Symmetric skip — after _pop_from_waiting_queue all ranks see identical new_requests.
             if self.adp_router.needs_prefix_matches and new_requests:
                 self.adp_router.gather_prefix_matches(new_requests)
@@ -11021,8 +11065,16 @@ class PyExecutor:
 
     def _forward_multimodal_encoder_step(
             self, scheduled_requests: ScheduledRequests) -> None:
-        """Update the MM cache and encode selected items before LLM prefill."""
+        """Update the MM cache and encode selected items before LLM prefill.
+
+        A rank with no items still enters when attention-DP ranks share one
+        encoder TP pass.
+        """
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items or {}
+        if not scheduled_items and not (
+                self.model_engine.mm_encoder_collective_required
+                and getattr(self, "_mm_encoder_work_possible", True)):
+            return
         try:
             self.model_engine.forward_multimodal_encoder_items(
                 self.active_requests, scheduled_items)

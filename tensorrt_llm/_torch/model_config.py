@@ -67,6 +67,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
     nvfp4_scaling_vector_size)
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import \
+        EncoderParallelLayout
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MoEImplRequest
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
@@ -457,6 +459,10 @@ class ModelConfig(Generic[TConfig]):
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
     _preserve_kv_cache_quant_algo: bool = field(default=False, repr=False)
+    # Set by tower construction on the composite config. A worker without a
+    # local encoder has no layout even when it shares a module registry.
+    _mm_encoder_parallel_layout: Optional["EncoderParallelLayout"] = field(
+        default=None, init=False, repr=False, compare=False)
 
     # Model-provided per-layer KV geometry. It is stored per config rather than
     # in extra_attrs because one-model drafters share extra_attrs with the
@@ -576,6 +582,7 @@ class ModelConfig(Generic[TConfig]):
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
                            'quant_config', '_kv_cache_layer_specs',
+                           '_mm_encoder_parallel_layout',
                            '_preserve_kv_cache_quant_algo'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
@@ -597,6 +604,7 @@ class ModelConfig(Generic[TConfig]):
                 "moe_backend and moe_tactic are one MoE selection: pass both "
                 f"or neither (got {sorted(changes)})")
         config = copy.copy(self)
+        config._mm_encoder_parallel_layout = None
         for name, value in changes.items():
             if not hasattr(self, name):
                 raise AttributeError(f"ModelConfig has no attribute {name!r}")

@@ -171,6 +171,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             },
             False,
         ),
+        (
+            generator.SERVE_SCHEMA,
+            {"tensor_parallel_size": 2, "multimodal_config": {"encoder_data_parallel_size": 2}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_data_parallel_size": 0}},
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
@@ -271,6 +281,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             generator.DISAGG_SCHEMA,
             {"context_servers": {"dwdp_config": {"dwdp_size": 12, "num_experts_per_worker": -1}}},
             False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {
+                "context_servers": {
+                    "tensor_parallel_size": 2,
+                    "multimodal_config": {"encoder_data_parallel_size": 2},
+                }
+            },
+            True,
         ),
         (
             generator.DISAGG_SCHEMA,
@@ -1235,6 +1255,147 @@ def test_deferred_release_launch_rule_matches_runtime(
                 assert validator.is_valid({section: config}) == valid, section
 
 
+_COMPARES_TWO_SIZES = "runtime-only: the rule compares two sizes"
+
+
+@pytest.mark.parametrize(
+    ("config", "runtime_only"),
+    [
+        ({"tensor_parallel_size": 2, "multimodal_config": {"encoder_data_parallel_size": 2}}, None),
+        (
+            {"pipeline_parallel_size": 2, "multimodal_config": {"encoder_data_parallel_size": 1}},
+            None,
+        ),
+        (
+            {"context_parallel_size": 2, "multimodal_config": {"encoder_data_parallel_size": 1}},
+            None,
+        ),
+        (
+            {
+                "pipeline_parallel_size": 2,
+                "multimodal_config": {"encoder_data_parallel_size": None},
+            },
+            None,
+        ),
+        ({"orchestrator_type": "ray", "multimodal_config": {}}, None),
+        (
+            {"orchestrator_type": "ray", "multimodal_config": {"encoder_data_parallel_size": None}},
+            None,
+        ),
+        (
+            {
+                "orchestrator_type": "ray",
+                "tensor_parallel_size": 2,
+                "multimodal_config": {"encoder_data_parallel_size": 1},
+            },
+            None,
+        ),
+        (
+            {
+                "orchestrator_type": "ray",
+                "tensor_parallel_size": 2,
+                "multimodal_config": {"encoder_data_parallel_size": 2},
+            },
+            None,
+        ),
+        (
+            {
+                "orchestrator_type": "ray",
+                "tensor_parallel_size": 4,
+                "multimodal_config": {"encoder_data_parallel_size": 2},
+            },
+            _COMPARES_TWO_SIZES,
+        ),
+        (
+            {
+                "tensor_parallel_size": 2,
+                "enable_attention_dp": True,
+                "mm_encoder_only": True,
+                "multimodal_config": {"encoder_data_parallel_size": 2},
+            },
+            None,
+        ),
+        (
+            {
+                "tensor_parallel_size": 2,
+                "enable_attention_dp": False,
+                "mm_encoder_only": True,
+                "multimodal_config": {"encoder_data_parallel_size": 2},
+            },
+            None,
+        ),
+        ({"mm_encoder_only": True, "multimodal_config": {"encoder_data_parallel_size": 1}}, None),
+        (
+            {
+                "tensor_parallel_size": 2,
+                "enable_attention_dp": False,
+                "multimodal_config": {
+                    "encoder_data_parallel_size": 2,
+                    "encoder_cuda_graph": {"image": {"max_batch_size": 1}},
+                },
+            },
+            None,
+        ),
+        (
+            {
+                "tensor_parallel_size": 2,
+                "enable_attention_dp": False,
+                "disable_mm_encoder": True,
+                "multimodal_config": {
+                    "encoder_data_parallel_size": 2,
+                    "encoder_side_stream_max_ahead": 1,
+                },
+            },
+            None,
+        ),
+        (
+            {"tensor_parallel_size": 3, "multimodal_config": {"encoder_data_parallel_size": 2}},
+            _COMPARES_TWO_SIZES,
+        ),
+        (
+            {
+                "tensor_parallel_size": 2,
+                "enable_attention_dp": True,
+                "multimodal_config": {
+                    "encoder_data_parallel_size": 1,
+                    "encoder_side_stream_max_ahead": 1,
+                },
+            },
+            None,
+        ),
+    ],
+)
+def test_encoder_parallel_launch_rules_match_runtime(
+    schemas: dict[str, dict], config: dict, runtime_only: str | None
+) -> None:
+    """Both schemas reject an encoder parallel config as TorchLlmArgs does, where they can tell."""
+    from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+
+    args = SimpleNamespace(
+        multimodal_config=MultimodalConfig(**config["multimodal_config"]),
+        tensor_parallel_size=config.get("tensor_parallel_size", 1),
+        pipeline_parallel_size=config.get("pipeline_parallel_size", 1),
+        context_parallel_size=config.get("context_parallel_size", 1),
+        orchestrator_type=config.get("orchestrator_type"),
+        enable_attention_dp=config.get("enable_attention_dp", False),
+        mm_encoder_only=config.get("mm_encoder_only", False),
+    )
+    try:
+        TorchLlmArgs._validate_encoder_data_parallel(args)
+    except ValueError:
+        valid = False
+    else:
+        valid = True
+    schema_valid = _schema_verdict(valid, runtime_only)
+
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == schema_valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == schema_valid, section
+
+
 _PROMPT_TAIL = {
     "gen_prompt_tail_tokens": 8192,
     "kv_cache_config": {"enable_block_reuse": False},
@@ -1328,6 +1489,16 @@ def test_encoder_attention_backend_schema(
 ) -> None:
     config = {"multimodal_config": {"encoder_attention_backend": {"vision": backend}}}
     errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("value,valid", [(None, True), (1, True), (0, False), (1.5, False)])
+def test_dflash_spec_dec_variant_schema(schemas, filename, value, valid) -> None:
+    config = {"speculative_config": {"decoding_type": "DFlash", "spec_dec_variant": value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 
 

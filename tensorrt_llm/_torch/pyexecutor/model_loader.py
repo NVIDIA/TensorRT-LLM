@@ -99,6 +99,24 @@ def _reject_unsupported_model_llm_args(llm_args: TorchLlmArgs,
             raise ValueError(f"{name} is not supported by {model_cls.__name__}")
 
 
+def _validate_multimodal_encoder_parallelism(config: ModelConfig) -> None:
+    mm_config = getattr(config, "multimodal_config", None)
+    if mm_config is None or mm_config.encoder_data_parallel_size is None:
+        return
+    if config.mm_encoder_only:
+        # The standalone tower uses the composite model's capability.
+        model_cls = get_registered_model_class(
+            config.pretrained_config.architectures[0])
+    else:
+        model_cls = AutoModelForCausalLM._resolve_class(config)
+    if model_cls is None:
+        return  # Model construction reports an unsupported architecture.
+    if not getattr(model_cls, "supports_mm_encoder_data_parallel", False):
+        raise NotImplementedError(
+            f"{model_cls.__name__} does not support multimodal encoder data parallelism."
+        )
+
+
 def _validate_encoder_attention_backend_support(
         model_cls: type | None, mm_config: MultimodalConfig | None) -> None:
     """Reject unsupported encoder selections before allocating model weights."""
@@ -1514,6 +1532,7 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config: ModelConfig = self._load_and_validate_config(
             checkpoint_dir, checkpoint_loader)
+        _validate_multimodal_encoder_parallelism(config)
         load_format = self.llm_args.load_format
         gms_loading.check_gms_locality_domain_compat(load_format, config)
         if os.environ.get("MEGAMOE_UGPU_LAYOUT", "none") != "none":

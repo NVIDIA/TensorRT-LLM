@@ -820,6 +820,56 @@ def test_model_validation_fails_only_the_request_it_rejects() -> None:
     assert executor._validate_request_budget.call_count == 2
 
 
+@pytest.mark.parametrize("replicas", [None, 1, 2])
+def test_inline_encoder_admission_rejects_only_incomplete_distributed_requests(replicas):
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+        MultimodalModelMixin,
+        make_multimodal_encoder_model_config,
+    )
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+    )
+    from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+    from tensorrt_llm.mapping import Mapping
+
+    config = ModelConfig(
+        mapping=Mapping(world_size=2, tp_size=2),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=replicas),
+    )
+    make_multimodal_encoder_model_config(config)
+    record = MultimodalItemMetadata([("image", 0)], output_embedding_lengths=[1])
+    payloads = [
+        {"image": {}, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: record},
+        {"image": {}},
+        {"image": {}, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata([("image", 0)])},
+        {"image": {}, "video": {}, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: record},
+        {"multimodal_embedding": torch.ones(1, 1)},
+    ]
+    requests = [_make_admission_request(i) for i in range(len(payloads))]
+    for request, data in zip(requests, payloads, strict=True):
+        request.py_multimodal_data = data
+
+    class Model(MultimodalModelMixin, torch.nn.Module):
+        supports_mm_encoder_data_parallel = True
+
+    model = Model()
+    model.model_config = config
+    executor = _make_admission_executor(torch.compile(model, backend="eager"), requests)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    if replicas == 2:
+        assert admitted == [requests[0], requests[4]]
+        errors = executor._handle_errors.call_args_list
+        assert [call.kwargs["requests"] for call in errors] == [[req] for req in requests[1:4]]
+        assert all("output_embedding_lengths" in call.args[0] for call in errors)
+    else:
+        assert admitted == requests
+        executor._handle_errors.assert_not_called()
+
+
 def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:
     requests = [_make_admission_request(i) for i in range(3)]
     for request, encoder_output_len in zip(requests, (16, 17, None)):

@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from _torch.pyexecutor.executor_test_utils import make_partial_executor
@@ -881,6 +884,190 @@ def test_forward_multimodal_encoder_step_propagates_system_errors():
 
     assert scheduled_requests.context_requests == [failed]
     assert scheduled_requests.scheduled_mm_encoder_items == {failed.request_id: [0]}
+
+
+@pytest.mark.parametrize("work_possible", [False, True])
+def test_shared_encoder_step_runs_only_while_a_rank_may_have_mm_work(work_possible):
+    engine = Mock(mm_encoder_collective_required=True)
+    executor = make_partial_executor(model_engine=engine, _mm_encoder_work_possible=work_possible)
+
+    executor._forward_multimodal_encoder_step(ScheduledRequests())
+
+    # Every rank has the same flag, so all ranks skip the step together.
+    assert engine.forward_multimodal_encoder_items.call_count == int(work_possible)
+
+
+def _executor_for_mm_vote(collective, has_mm_work, peer_has_mm_work, remote_tail=False):
+    request = make_mm_request(1, [8]) if has_mm_work else make_llm_request(1)
+    width = 1 + int(remote_tail) + int(collective)
+
+    def allgather(values):
+        # The peer rank has a batch, and MM work when asked.
+        assert len(values) == width
+        peer = [1] * width
+        if collective:
+            peer[-1] = int(peer_has_mm_work)
+        return np.array([values, peer])
+
+    return make_partial_executor(
+        enable_attention_dp=True,
+        _mm_encoder_collective=collective,
+        _mm_encoder_work_possible=not peer_has_mm_work,
+        _enable_remote_tail_adp=remote_tail,
+        model_engine=SimpleNamespace(
+            _dspark_confidence_enabled=False,
+            cuda_graph_runner=SimpleNamespace(padding_dummy_requests={0: None}),
+        ),
+        active_requests=[request],
+        dist=SimpleNamespace(
+            tp_size=2,
+            cp_size=1,
+            tp_rank=0,
+            tp_allgather_int64=Mock(side_effect=allgather),
+            tp_cp_allgather_int64=Mock(side_effect=allgather),
+        ),
+    )
+
+
+@pytest.mark.parametrize("remote_tail", [False, True], ids=["adp", "remote_tail_adp"])
+@pytest.mark.parametrize(
+    "has_mm_work,peer_has_mm_work", [(False, False), (True, False), (False, True)]
+)
+def test_can_queue_vote_carries_mm_work_for_shared_encoder_tp(
+    remote_tail, has_mm_work, peer_has_mm_work
+):
+    executor = _executor_for_mm_vote(True, has_mm_work, peer_has_mm_work, remote_tail)
+    batch = SimpleNamespace(batch_size=1, is_attention_dp_phase_idle=False)
+
+    can_queue, _ = executor._can_queue(batch)
+
+    gather = (
+        executor.dist.tp_allgather_int64 if remote_tail else executor.dist.tp_cp_allgather_int64
+    )
+    assert gather.call_args.args[0][-1] == int(has_mm_work)
+    assert executor._mm_encoder_work_possible == (has_mm_work or peer_has_mm_work)
+    assert can_queue
+
+
+@pytest.mark.parametrize("remote_tail", [False, True], ids=["adp", "remote_tail_adp"])
+def test_can_queue_vote_is_unchanged_without_shared_encoder_tp(remote_tail):
+    executor = _executor_for_mm_vote(False, True, True, remote_tail)
+    batch = SimpleNamespace(batch_size=1, is_attention_dp_phase_idle=False)
+
+    executor._can_queue(batch)
+
+    # The same vote as before: no MM column, and the step flag is not touched.
+    if remote_tail:
+        executor.dist.tp_allgather_int64.assert_called_once_with([1, 1])
+    else:
+        executor.dist.tp_cp_allgather_int64.assert_called_once_with([1])
+    assert executor._mm_encoder_work_possible is False
+
+
+def test_new_request_with_raw_mm_inputs_opens_the_shared_encoder_step():
+    executor = make_partial_executor(_mm_encoder_work_possible=False)
+    text = SimpleNamespace(request=SimpleNamespace(py_multimodal_data=None))
+    embedded = SimpleNamespace(
+        request=SimpleNamespace(
+            py_multimodal_data={"image": {}, "multimodal_embedding": torch.zeros(1)}
+        )
+    )
+    raw = SimpleNamespace(request=SimpleNamespace(py_multimodal_data={"image": {}}))
+
+    executor._open_mm_encoder_step_for([text, embedded])
+    assert executor._mm_encoder_work_possible is False
+    executor._open_mm_encoder_step_for([text, raw])
+    assert executor._mm_encoder_work_possible is True
+
+
+def test_shared_encoder_step_flag_keeps_the_ranks_together_over_iterations():
+    # Two attention-DP ranks run the executor's per-iteration steps in threads.
+    # A request with raw MM inputs arrives at iteration 1 and goes to rank 0,
+    # which encodes it at once; its prefill ends at iteration 2. A text-only
+    # request arrives at iteration 4. A rank that enters the shared encoder
+    # step alone breaks the barrier, as it would hang in a real run.
+    vote_barrier = threading.Barrier(2, timeout=10)
+    encoder_barrier = threading.Barrier(2, timeout=10)
+    slots = [None, None]
+    entered = [[], []]
+    raw = SimpleNamespace(request=SimpleNamespace(py_multimodal_data={"image": {}}))
+    text = SimpleNamespace(request=SimpleNamespace(py_multimodal_data=None))
+    new_requests = {1: [raw], 4: [text]}
+
+    def allgather(rank, values):
+        slots[rank] = list(values)
+        vote_barrier.wait()
+        rows = np.array(slots)
+        vote_barrier.wait()
+        return rows
+
+    def run_rank(rank):
+        iteration = [0]
+
+        def forward_items(requests, scheduled_items):
+            entered[rank].append(iteration[0])
+            encoder_barrier.wait()
+
+        executor = make_partial_executor(
+            enable_attention_dp=True,
+            _mm_encoder_collective=True,
+            _mm_encoder_work_possible=True,
+            model_engine=SimpleNamespace(
+                mm_encoder_collective_required=True,
+                forward_multimodal_encoder_items=forward_items,
+                _dspark_confidence_enabled=False,
+            ),
+            dist=SimpleNamespace(
+                tp_size=2,
+                cp_size=1,
+                tp_rank=rank,
+                tp_cp_allgather_int64=lambda values: allgather(rank, values),
+            ),
+        )
+        for iteration[0] in range(6):
+            arrivals = new_requests.get(iteration[0], [])
+            executor._open_mm_encoder_step_for(arrivals)
+            scheduled = ScheduledRequests()
+            if rank == 0 and arrivals and arrivals[0] is raw:
+                request = make_mm_request(1, [8])
+                executor.active_requests.append(request)
+                scheduled.scheduled_mm_encoder_items = {request.request_id: [0]}
+            executor._forward_multimodal_encoder_step(scheduled)
+            executor._can_queue(SimpleNamespace(batch_size=1))
+            if iteration[0] == 2:
+                # Prefill is done, so the request releases its MM state.
+                for request in executor.active_requests:
+                    request.py_mm_encoder_state = None
+
+    with ThreadPoolExecutor(2) as pool:
+        for result in [pool.submit(run_rank, rank) for rank in range(2)]:
+            result.result()
+
+    # Iteration 0 enters on the startup flag. Iteration 3 enters on the vote
+    # of iteration 2, before the release reached a vote.
+    assert entered[0] == entered[1] == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("collective", [False, True])
+def test_idle_rank_with_compiled_model_enters_shared_encoder_step(collective):
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+
+    # Whole-model torch.compile hides MultimodalModelMixin behind a wrapper.
+    # The gate must not depend on the wrapped model, or an idle rank skips
+    # the shared encoder pass while its peers wait for it.
+    scheduler = Mock(collective=collective)
+    engine = object.__new__(ModelEngine)
+    engine.model = torch.compile(torch.nn.Linear(1, 1))
+    engine._mm_item_scheduler = scheduler
+    engine.mm_encoder_collective_required = scheduler.collective
+    executor = make_partial_executor(model_engine=engine)
+
+    executor._forward_multimodal_encoder_step(ScheduledRequests())
+
+    assert not isinstance(engine.model, MultimodalModelMixin)
+    assert scheduler.forward_items.call_count == int(collective)
+    if collective:
+        scheduler.forward_items.assert_called_once_with([], {})
 
 
 def _executor_for_mm_admission(active_requests, *, max_batch_size=8, max_num_tokens=8):

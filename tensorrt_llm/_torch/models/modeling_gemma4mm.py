@@ -60,6 +60,7 @@ from .modeling_multimodal_mixin import (
     EncoderCachePartition,
     MultimodalModelMixin,
     PreparedLlmInputs,
+    make_multimodal_encoder_model_config,
 )
 from .modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME,
@@ -983,7 +984,13 @@ def _normalize_vision_patches(
 
 
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
-    """Shared multimodal encoder flow for Gemma4 conditional generation models."""
+    """Shared multimodal encoder flow for Gemma4 conditional generation models.
+
+    Gemma4 declares its item-major ``pixel_values`` and ``audio_features``
+    layouts, including their per-item position, length, and mask fields, through
+    ``get_multimodal_item_partitions``, so the mixin's
+    ``build_multimodal_encoder_input`` slices them without a Gemma4 override.
+    """
 
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
@@ -991,6 +998,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     }
 
     supports_encoder_cache = True
+    supports_mm_encoder_data_parallel = True
     supports_vision_gpu_normalize: ClassVar[bool] = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
@@ -1312,7 +1320,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
 
         Generation-only batches need no multimodal token-type ids for context masking.
         """
-        del position_ids, forward_kwargs
         mm_token_type_ids = None
         if (
             attn_metadata.num_contexts > 0
@@ -1453,6 +1460,11 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         model_config_cp = copy.deepcopy(model_config)
         model_config_cp.extra_attrs = model_config.extra_attrs
         self.model_config = model_config_cp
+        encoder_model_config = (
+            make_multimodal_encoder_model_config(model_config_cp)
+            if config.vision_config is not None or config.audio_config is not None
+            else model_config_cp
+        )
 
         # --- Language model ---
         # Remap quantization exclude_modules patterns from HF naming to
@@ -1474,7 +1486,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
 
         # --- Vision tower (native TRT-LLM, see modeling_gemma4_vision.py) ---
         if config.vision_config is not None:
-            vision_model_config = self.get_sub_model_config(model_config_cp, "vision_config")
+            vision_model_config = self.get_sub_model_config(encoder_model_config, "vision_config")
             self.vision_tower = Gemma4VisionModel(vision_model_config).eval().to(self._device)
             vision_hidden = config.vision_config.hidden_size
             text_hidden = config.text_config.hidden_size
@@ -1485,7 +1497,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
                     text_hidden_size=text_hidden,
                     eps=vision_eps,
                     dtype=self.model_dtype,
-                    mapping=model_config.mapping,
+                    mapping=encoder_model_config.mapping,
                 )
                 .eval()
                 .to(self._device)
@@ -1496,7 +1508,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
 
         # --- Audio tower (native TRT-LLM, see modeling_gemma4_audio.py) ---
         if config.audio_config is not None:
-            audio_model_config = self.get_sub_model_config(model_config_cp, "audio_config")
+            audio_model_config = self.get_sub_model_config(encoder_model_config, "audio_config")
             self.audio_tower = Gemma4AudioModel(audio_model_config).eval().to(self._device)
             audio_hidden = getattr(
                 config.audio_config, "output_proj_dims", config.audio_config.hidden_size
@@ -1509,7 +1521,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
                     text_hidden_size=text_hidden,
                     eps=audio_eps,
                     dtype=self.model_dtype,
-                    mapping=model_config.mapping,
+                    mapping=encoder_model_config.mapping,
                 )
                 .eval()
                 .to(self._device)

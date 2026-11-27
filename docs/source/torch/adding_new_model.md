@@ -11,6 +11,7 @@ Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 3. [Step-by-Step Guide](#step-by-step-guide)
     1. [Model Configuration](#model-configuration)
     2. [Model Definition](#model-definition)
+        1. [Multimodal Encoder Parallelism](#multimodal-encoder-parallelism)
     3. [Weight Loading](#weight-loading)
     4. [Model Registration](#model-registration)
         1. [Core Models](#core-models)
@@ -127,6 +128,27 @@ Optionally, you may replace the native PyTorch modules with our implementations 
 - `RMSNorm` (in `tensorrt_llm/_torch/modules/rms_norm.py`): Enables performant RMS norm.
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
+
+#### Multimodal Encoder Parallelism
+
+Set `supports_mm_encoder_data_parallel = True` on a `MultimodalModelMixin`
+model after implementing these two contracts.
+
+1. Build the encoder towers and projectors from
+   `make_multimodal_encoder_model_config(model_config)`. Layers that shard
+   weights use this config's mapping when building and loading those weights.
+   Unsharded towers run a full copy on each rank of the replica.
+2. Route encoder execution through the final mixin entry `_run_multimodal_encoder`.
+   The shared `prepare_multimodal_inputs` path already uses it. A model with
+   its own `forward` passes `encoder_forward_fn=self._run_multimodal_encoder`
+   to `get_multimodal_embeddings`. Implement `encode_multimodal_inputs` to
+   encode the items passed to the replica and return their embeddings in prompt
+   order. The mixin assigns items to replicas and gathers the output.
+
+The loader checks the flag when a user sets `encoder_data_parallel_size`.
+Sharing an encoder TP pass across attention-DP ranks also requires the
+existing `supports_mm_encoder_item_scheduling` contract.
+See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders).
 
 ### Weight Loading
 
