@@ -34,6 +34,7 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - examples/serve/test_decision_endpoints.py::TestQwenDecisions::test_text_protocols
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/spec/test_modeling_v2_mtp_step.py
   - unittest/_torch/models/test_qwen3_5_int4_loading.py
   - unittest/_torch/modules/test_linear_uneven_tp.py::TestW4A16AWQMLP::test_optional_pre_quant_scale

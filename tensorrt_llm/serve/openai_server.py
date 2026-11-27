@@ -100,6 +100,8 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
                                                 resolve_request_conversation_id)
+from tensorrt_llm.serve.decision.routes import (decision_route_handler,
+                                                mount_decision_endpoints)
 from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request,
     validate_subagent_affinity)
@@ -236,6 +238,12 @@ class _MsgspecRoute(KvHintsRoute):
     """Parse msgpack/JSON and apply hint trust policy before model validation."""
 
     request_type = _MsgspecRequest
+
+    def get_route_handler(self):
+        if self.path in ("/v1/systemone", "/v1/decisions"):
+            # Public decision schemas validate the original, uncompressed JSON body.
+            return decision_route_handler(self)
+        return super().get_route_handler()
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -983,11 +991,14 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_encode_batcher()
             if self.server_role is ServerRole.EMBEDDING:
                 self.register_embedding_routes()
+                mount_decision_endpoints(self.app, self)
             else:
                 self.register_rerank_routes()
         else:
             self._register_launcher_forwarding_routes()
             self.register_routes()
+            if self.server_role is None:
+                mount_decision_endpoints(self.app, self)
 
         if self._collect_perf_metrics:
             self.app.add_middleware(

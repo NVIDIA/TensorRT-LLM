@@ -39,6 +39,7 @@ CONTRACTS = (
         name="render core has no HTTP or executor dependency",
         importers=(
             "tensorrt_llm.serve.render.chat",
+            "tensorrt_llm.serve.render.decisions",
             "tensorrt_llm.serve.render.resources",
             "tensorrt_llm.serve.render.fingerprint",
             "tensorrt_llm.serve.render.prompt_types",
@@ -48,6 +49,17 @@ CONTRACTS = (
             "Keep HTTP code in serve/render/api_router.py or _http.py and pass engine data "
             "in through RenderResources."
         ),
+    ),
+    Contract(
+        name="decision protocol models do not import HTTP handlers",
+        importers=("tensorrt_llm.serve.decision.openai", "tensorrt_llm.serve.decision.systemone"),
+        forbidden=(
+            "fastapi",
+            "starlette",
+            "tensorrt_llm.serve.decision.routes",
+            "tensorrt_llm.serve.openai_server",
+        ),
+        fix="Keep HTTP handlers in serve/decision/routes.py.",
     ),
     Contract(
         name="gRPC frontends do not reach into serve",

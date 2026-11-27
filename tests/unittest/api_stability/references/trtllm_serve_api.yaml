@@ -1,10 +1,9 @@
 # Stability reference for the `trtllm-serve` HTTP request/response schemas.
 #
 # This YAML is the *single source of truth* for the stability status of every
-# field on the Pydantic request and response models in
-# `tensorrt_llm/serve/openai_protocol.py`. The models themselves carry no
-# inline stability annotations — `openai_protocol.py` is an internal module
-# that is not surfaced in any public document, so the metadata stays here.
+# field on the listed Pydantic request and response models. Bare model names
+# resolve in tensorrt_llm.serve.openai_protocol. Fully qualified names select
+# the module that owns the protocol.
 #
 # Field kinds
 # -----------
@@ -13,6 +12,8 @@
 #   * `openai`     — defined by OpenAI's HTTP API (matched against
 #                    https://github.com/openai/openai-openapi). We follow OAI's
 #                    contract for these; status is `stable` by default.
+#   * `typesafe`   — defined by TypeSafe System One (https://docs.typesafe.ai/api/system-one).
+#                    Status records the maturity of its TRT-LLM implementation.
 #   * `extension`  — TensorRT-LLM extension on top of the OAI schema. We own
 #                    the stability promise. Status is one of:
 #                        prototype | beta | stable | deprecated
@@ -1731,3 +1732,89 @@ models:
         default: null
         status: prototype
         required: false
+  tensorrt_llm.serve.decision.systemone.SystemOneRequest:
+    fields:
+      model:
+        kind: typesafe
+        type: str
+        default: null
+        status: prototype
+        required: true
+      state:
+        kind: typesafe
+        type: Text
+        default: null
+        status: prototype
+        required: true
+      questions:
+        kind: typesafe
+        type: dict[str, SystemQuestion]
+        default: null
+        status: prototype
+        required: true
+  tensorrt_llm.serve.decision.systemone.SystemOneResponse:
+    fields:
+      model:
+        kind: typesafe
+        type: str
+        default: null
+        status: prototype
+        required: true
+      answers:
+        kind: typesafe
+        type: dict[str, NoulAnswer | SystemChoiceAnswer | SystemScoreAnswer]
+        default: null
+        status: prototype
+        required: true
+      usage:
+        kind: typesafe
+        type: DecisionUsage
+        default: null
+        status: prototype
+        required: true
+  tensorrt_llm.serve.decision.openai.OpenAIDecisionRequest:
+    fields:
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      input:
+        kind: openai
+        type: InputText | list[UserMessage]
+        default: null
+        status: stable
+        required: true
+      questions:
+        kind: openai
+        type: list[OpenAIQuestion]
+        default: null
+        status: stable
+        required: true
+      safety_identifier:
+        kind: openai
+        type: Annotated[str, Field(max_length=128)] | None
+        default: null
+        status: stable
+        required: false
+  tensorrt_llm.serve.decision.openai.OpenAIDecisionResponse:
+    fields:
+      model:
+        kind: openai
+        type: str
+        default: null
+        status: stable
+        required: true
+      answers:
+        kind: openai
+        type: list[PredicateAnswer | OpenAIChoiceAnswer | OpenAIScoreAnswer]
+        default: null
+        status: stable
+        required: true
+      usage:
+        kind: openai
+        type: ResponseUsage
+        default: null
+        status: stable
+        required: true

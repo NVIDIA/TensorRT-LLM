@@ -33,6 +33,11 @@ distro==1.9.0
 # (pyyaml issue #891).
 pyyaml>=6.0.1,<6.0.3
 requests>=2.32.4,<3
+# Standalone Decisions is available in the OpenAI Python SDK from 3.26.0.
+openai>=3.26.0
+typesafe-sdk>=0.5.7
+# The request-encoding tests construct real zstd bodies.
+backports.zstd>=1.0.0; python_version < "3.14"
 boto3
 einops
 # Reference implementation for KDA kernel parity tests.
