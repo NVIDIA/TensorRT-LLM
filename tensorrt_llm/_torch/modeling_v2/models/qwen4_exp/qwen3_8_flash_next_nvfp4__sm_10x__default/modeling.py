@@ -5541,9 +5541,15 @@ def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p
             q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, p, gate
         )
     if _splitk_serves(core, q, kv.k, selected):
+        # A tep4 shard the op's table leaves out names its reach, so the first call compiles
+        # every plan up to it (`_TEP_SPLITK_MAX_ROWS`) and no later row count compiles one.
+        cap = None
+        if core.tep_fast:
+            cap = _TEP_SPLITK_MAX_ROWS.get((q.shape[1], kv.k.shape[1], kv.k.dtype))
         return qsa_sparse_gqa_splitk_cute(
-            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, gate
-        )
+            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, gate,
+            max_rows=cap,
+        )  # fmt: skip
     return None
 
 

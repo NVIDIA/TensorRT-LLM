@@ -89,12 +89,14 @@ class _GqaOp:
     def __init__(self, name: str, taken: bool, calls: list):
         self.name, self.taken, self.calls = name, taken, calls
         self.asked = []
+        self.kwargs = []
 
     def serves(self, *args, **kwargs) -> bool:
         self.asked.append(kwargs.get("min_groups"))
         return self.taken
 
-    def __call__(self, *args):
+    def __call__(self, *args, **kwargs):
+        self.kwargs.append(kwargs)
         rpr = args[-2] if self.name == "grouped" else None
         self.calls.append((self.name, args[-1] is not None, rpr))
         return self.name
@@ -151,8 +153,10 @@ def test_sparse_gqa_nvfp4_pool_keeps_its_kernels(monkeypatch):
 )
 def test_sparse_gqa_tep4_shard_on_splitk(monkeypatch, tep_fast, rows, dtype, selected, expected):
     """A tep4 rank's 6 q heads on its one e4m3 KV head take the split-K kernel up to 16 rows,
-    which the op's own table (the FP8 target's routing) leaves out."""
+    which the op's own table (the FP8 target's routing) leaves out, and name that reach so the
+    first call compiles every plan up to 16 rows."""
     calls = _gqa(monkeypatch, False, False)
+    splitk = M.qsa_sparse_gqa_splitk_cute
     core = SimpleNamespace(**{**vars(CORE), "tep_fast": tep_fast})
     k = torch.zeros(8, 1, 32, 256, dtype=dtype)
     kv = SimpleNamespace(k=k, v=k, k_scale=None)
@@ -163,6 +167,7 @@ def test_sparse_gqa_tep4_shard_on_splitk(monkeypatch, tep_fast, rows, dtype, sel
         assert out is None and calls == []
     else:
         assert out == expected and calls == [("splitk", True, None)]
+        assert splitk.kwargs == [{"max_rows": 16}]
 
 
 @pytest.mark.parametrize(
@@ -233,7 +238,9 @@ def test_sparse_gqa_dp_min_requests(monkeypatch, rows, floor, expected):
     gate = torch.zeros(rows, 1)
     out = M._sparse_gqa_decode(core, kv, torch.zeros(rows, 24, 256), None, None, None, 32, gate, 4)
     assert out == expected[0] and calls == [expected]
-    assert grouped.asked in ([floor], [])
+    # The grouped op is asked (at the floor) exactly when the row-count guard lets it be: a
+    # grouped launch never skips its `serves`, and a guarded count never reaches it.
+    assert grouped.asked == ([floor] if expected[0] == "grouped" else [])
 
 
 @pytest.mark.parametrize(

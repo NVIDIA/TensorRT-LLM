@@ -1199,6 +1199,7 @@ def sparse_gqa_decode(
     tokens_per_block: int,
     softmax_scale: float,
     output_gate: Optional[torch.Tensor] = None,
+    max_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """`QsaSparseGqaSplitkCute.__call__`: split pass, then the merge when there are splits."""
     rows, num_q_heads, head_dim = q.shape
@@ -1304,11 +1305,12 @@ def sparse_gqa_decode(
     # compiles the split pass and merge of every plan its rows can reach (`MAX_ROWS`), so no
     # serving step compiles one; a gated call also compiles the ungated flavours, which a mixed
     # step's generation rows (and a draft-extend step's) call at the geometry a decode step
-    # calls gated. The engine's warmup runs each captured decode batch eagerly first.
+    # calls gated. The engine's warmup runs each captured decode batch eagerly first. A caller
+    # that routes a geometry here past the op's table names its own reach (`max_rows`).
     form = geometry + (gated, gate_t.dim())
     if form not in _PLANNED:
         _PLANNED.add(form)
-        cap = max(rows, MAX_ROWS.get((num_q_heads, num_kv_heads, k_cache.dtype), 0))
+        cap = max(rows, MAX_ROWS.get((num_q_heads, num_kv_heads, k_cache.dtype), 0), max_rows or 0)
         for splits, per in reachable_plans(cap, num_kv_heads, width, elem):
             _compile_split(geometry, splits, per, gated and splits == 1, kern_kw, split_args)
             if splits == 1:
@@ -1521,7 +1523,11 @@ class QsaSparseGqaSplitkCute(OpWrapper):
         tokens_per_block: int,
         softmax_scale: float,
         output_gate: Optional[torch.Tensor] = None,
+        max_rows: Optional[int] = None,
     ) -> torch.Tensor:
+        """`max_rows`: the most rows the caller sends at this geometry, where it routes one the
+        op's `MAX_ROWS` does not list (the first call compiles every plan up to it); results do
+        not depend on it."""
         return sparse_gqa_decode(
             q,
             k_cache,
@@ -1532,6 +1538,7 @@ class QsaSparseGqaSplitkCute(OpWrapper):
             tokens_per_block,
             softmax_scale,
             output_gate=output_gate,
+            max_rows=max_rows,
         )
 
     def reference(
@@ -1545,6 +1552,7 @@ class QsaSparseGqaSplitkCute(OpWrapper):
         tokens_per_block: int,
         softmax_scale: float,
         output_gate: Optional[torch.Tensor] = None,
+        max_rows: Optional[int] = None,
     ) -> torch.Tensor:
         """fp32 sparse GQA over every resident selected token, rounded once (the
         composition entry's reference); with `output_gate`, then gated in fp32 over that

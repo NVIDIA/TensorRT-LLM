@@ -205,3 +205,33 @@ def test_splitk_serves_the_tep4_shard(rows):
     torch.cuda.synchronize()
     assert torch.equal(captured, op(**args))
     assert_within_ulp(captured, op.reference(**args), element_ulp=4.0, rms_ulp=2.0)
+
+
+@_GPU
+def test_draft_gate_view_through_the_dispatch():
+    """The draft layer's gate is the second half of each head's 512-wide q projection
+    (`_mtp_qkv`: `[rows, 6, 256]` at a head stride of 512). Through `_sparse_gqa_decode` at the
+    tep4 shard every head is gated by its own half: the result is the reference's with that view,
+    and not what the gate read as contiguous heads would give."""
+    rows = 4
+    op = M.qsa_sparse_gqa_splitk_cute
+    device = torch.device("cuda")
+    args = _tep4_call(rows, 3000, device)
+    gen = torch.Generator(device=device).manual_seed(3001)
+    qg = torch.randn(rows, _HQ, 2 * _D, generator=gen, device=device)
+    qg[:, :, _D:] += 2.0 * torch.arange(_HQ, device=device)[None, :, None] - 5.0  # per head
+    qg = qg.to(torch.bfloat16)
+    gate = qg[:, :, _D:]
+    assert gate.stride() == (2 * _HQ * _D, 2 * _D, 1)
+    core = SimpleNamespace(tep_fast=True, softmax_scale=args["softmax_scale"])
+    kv = SimpleNamespace(k=args["k_cache"], v=args["v_cache"], k_scale=None)
+    out = M._sparse_gqa_decode(
+        core, kv, args["q"], args["block_table"], args["selected_tokens"],
+        args["request_indices"], args["tokens_per_block"], gate, 4,
+    )  # fmt: skip
+    assert out is not None and out.shape == (rows, _HQ, _D)
+    assert_within_ulp(
+        out, op.reference(**dict(args, output_gate=gate)), element_ulp=4.0, rms_ulp=2.0
+    )
+    flat = torch.as_strided(gate, (rows, _HQ, _D), (2 * _HQ * _D, _D, 1))
+    assert not torch.equal(out, op.reference(**dict(args, output_gate=flat)))
