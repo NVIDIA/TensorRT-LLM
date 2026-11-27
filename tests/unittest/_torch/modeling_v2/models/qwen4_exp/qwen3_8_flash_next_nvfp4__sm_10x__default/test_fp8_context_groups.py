@@ -246,7 +246,9 @@ def test_attention_core_writes_each_group_into_its_rows(monkeypatch) -> None:
         one_rank=False,
         spec_rollback=None,
         _bound=SimpleNamespace(
-            pools=SimpleNamespace(kv={0: SimpleNamespace(k=None, v=None, k_scale=None)})
+            pools=SimpleNamespace(
+                kv={0: SimpleNamespace(k=None, v=None, k_scale=None)}, index_cache={0: None}
+            )
         ),
     )
     rows = torch.arange(physical, dtype=torch.int32)
@@ -270,11 +272,15 @@ def test_attention_core_writes_each_group_into_its_rows(monkeypatch) -> None:
     for name in ("_index_plane", "_store_kv", "_index_query", "_score_and_select"):
         monkeypatch.setattr(M, name, lambda *args, **kwargs: None)
     monkeypatch.setattr(M, "_attn_in_heads", lambda *args: (None, None, None))
-    calls = []
+    calls, min_rows = [], []
 
-    def sparse_gqa(core_, kv, q, table, selected, req, tpb, logical, pages, rowtile_out=None):
+    def sparse_gqa(
+        core_, kv, q, table, selected, req, tpb, logical, pages, rowtile_out=None,
+        rowtile_min_rows=None,
+    ):  # fmt: skip
         ids = req.tolist()
         calls.append((ids[0], ids[-1] + 1, logical is not None, pages, rowtile_out))
+        min_rows.append(rowtile_min_rows)
         # The row-tile pass writes `rowtile_out` when the scratch fits; otherwise (and for the
         # generation rows) the per-row kernel returns a tensor of its own.
         fits = logical is not None and pages <= budget
@@ -294,6 +300,9 @@ def test_attention_core_writes_each_group_into_its_rows(monkeypatch) -> None:
     assert calls[0][4].data_ptr() == attn_out[0].data_ptr()
     assert calls[1][4].data_ptr() == attn_out[6].data_ptr()
     assert calls[2][4] is None
+    # Each group is eligible for the row-tile pass from the groups' floor, not the step's.
+    g = M._FP8_GROUP_ROWTILE_MIN_ROWS
+    assert min_rows == [g, g, None]
     want = torch.cat(
         [
             1000.0 + torch.arange(0, 6.0),
@@ -303,3 +312,33 @@ def test_attention_core_writes_each_group_into_its_rows(monkeypatch) -> None:
         ]
     )
     assert torch.equal(attn_out, want[:, None].expand_as(attn_out))
+
+
+@pytest.mark.cpu_only
+def test_a_long_step_s_groups_take_the_row_tile_pass(monkeypatch) -> None:
+    """Three requests of 200,000 cached tokens and 800 new rows at 2 KV heads: the step's
+    18,825 pages pass one 1 GiB scratch, so it runs as groups of 1,600 and 800 rows, both below
+    `_ROWTILE_MIN_ROWS`. Each group fits its scratch and is past `_FP8_GROUP_ROWTILE_MIN_ROWS`,
+    so it takes the row-tile pass (the per-row kernel stubbed out of reach); a whole launch of
+    800 rows keeps the per-row kernel."""
+    assert M._ROWTILE_MIN_ROWS == 2048 and M._FP8_GROUP_ROWTILE_MIN_ROWS == 768
+    core = SimpleNamespace(**{**vars(_core()), "heads_kv": 2, "q_width": 24 * D})
+    md = _metadata([(200_000, 800)] * 3)
+    pages = M._fp8_context_pages(md, TPB)
+    groups = M._fp8_context_groups(core, md, TPB, pages)
+    assert pages == 18825 and groups == [(0, 1600, 12550), (1600, 2400, 6275)]
+    taken = []
+    monkeypatch.setattr(
+        M, "_sparse_gqa_rowtile", lambda core_, kv, q, *args: taken.append(("tile", len(q))) or q
+    )
+    monkeypatch.setattr(
+        M, "qsa_paged_sparse_gqa", lambda **kwargs: taken.append(("row", len(kwargs["q"]))) or 0
+    )
+    kv = SimpleNamespace(k=None, v=None, k_scale=None)
+    logical = torch.zeros(2400, dtype=torch.int32)
+    for lo, hi, n in groups:
+        q = torch.empty(hi - lo, 24, D)
+        M._sparse_gqa(core, kv, q, None, None, None, TPB, logical[lo:hi], n,
+                      rowtile_min_rows=M._FP8_GROUP_ROWTILE_MIN_ROWS)  # fmt: skip
+    M._sparse_gqa(core, kv, torch.empty(800, 24, D), None, None, None, TPB, logical[:800], 6275)
+    assert taken == [("tile", 1600), ("tile", 800), ("row", 800)]

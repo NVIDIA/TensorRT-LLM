@@ -673,6 +673,11 @@ _ROWTILE_MIN_ROWS = 2048  # capacity: fixed: a dispatch threshold, not a buffer 
 # Over an fp8 pool the launch reads its requests' pages widened into a bf16 scratch; a launch
 # whose scratch would pass this many bytes stays on the per-row kernel.
 _FP8_ROWTILE_MAX_SCRATCH = 1 << 30  # capacity: fixed: bounds a per-call scratch allocation
+# A step past `_ROWTILE_MIN_ROWS` context rows whose fp8 scratch is cut into groups
+# (`_fp8_context_groups`) runs a group of at least this many rows on the row-tile pass. GB300,
+# 24 q / 2 kv heads, 200k-token histories: the widen and the pass take 0.55-0.64 ms a group
+# whatever its rows, the per-row kernel about 0.8 us a row (0.49 ms at 512 rows, 0.69 ms at 768).
+_FP8_GROUP_ROWTILE_MIN_ROWS = 768  # capacity: fixed: a dispatch threshold, not a buffer size
 # A step with more context rows than this over an NVFP4 pool attends them on the row-tile pass
 # over a bf16 scratch of their requests' pages (`_sparse_gqa_nvfp4_context`): at one rank 16384
 # context rows 1.36 ms a layer there against 77-948 ms for the NVFP4 per-row kernel.
@@ -3702,15 +3707,18 @@ def _sparse_gqa(
     output_gate=None,
     rows_per_request=1,
     rowtile_out=None,
+    rowtile_min_rows=None,
 ):
     """Sparse GQA over the layer's paged pool. `query_positions` is a context row's bound on
     its scan (the prefill pair with `compress_ratio`), or None for decode rows. A context
-    launch of `_ROWTILE_MIN_ROWS` rows or more over a bf16 or fp8 pool takes the row-tile
-    pass (`fp8_pages`: see `_sparse_gqa_rowtile`), which writes `rowtile_out` (`[rows, Hq,
-    D]`, contiguous) when given and returns it. Over an NVFP4 pool context rows take the
-    prefill kernel and decode rows the split-K decode kernel."""
+    launch of `rowtile_min_rows` (default `_ROWTILE_MIN_ROWS`) rows or more over a bf16 or fp8
+    pool takes the row-tile pass (`fp8_pages`: see `_sparse_gqa_rowtile`), which writes
+    `rowtile_out` (`[rows, Hq, D]`, contiguous) when given and returns it. Over an NVFP4 pool
+    context rows take the prefill kernel and decode rows the split-K decode kernel."""
+    if rowtile_min_rows is None:
+        rowtile_min_rows = _ROWTILE_MIN_ROWS
     if kv.k_scale is None:
-        if query_positions is not None and q.shape[0] >= _ROWTILE_MIN_ROWS:
+        if query_positions is not None and q.shape[0] >= rowtile_min_rows:
             out = _sparse_gqa_rowtile(
                 core, kv, q, block_table, selected, request_indices, tpb, query_positions,
                 fp8_pages, rowtile_out,
@@ -4183,12 +4191,17 @@ class PrefillTarget:
                 # The context rows a scratch-sized group of requests at a time.
                 assert parts[0] == (0, num_ctx, True), (parts[0], num_ctx)
                 assert step.fp8_groups[-1][1] == num_ctx, (step.fp8_groups[-1], num_ctx)
-                parts = [(lo, hi, True, pages) for lo, hi, pages in step.fp8_groups] + [
-                    (lo, hi, context_rows, None) for lo, hi, context_rows in parts[1:]
-                ]
+                # The step passed `_ROWTILE_MIN_ROWS`; each group then launches on its own and
+                # takes the row-tile pass from `_FP8_GROUP_ROWTILE_MIN_ROWS` rows.
+                parts = [
+                    (lo, hi, True, pages, _FP8_GROUP_ROWTILE_MIN_ROWS)
+                    for lo, hi, pages in step.fp8_groups
+                ] + [(lo, hi, context_rows, None, None) for lo, hi, context_rows in parts[1:]]
             else:
-                parts = [(lo, hi, context_rows, step.fp8_pages) for lo, hi, context_rows in parts]
-            for lo, hi, context_rows, pages in parts:
+                parts = [
+                    (lo, hi, context_rows, step.fp8_pages, None) for lo, hi, context_rows in parts
+                ]
+            for lo, hi, context_rows, pages, rowtile_min_rows in parts:
                 # A context launch's row-tile pass writes its rows of `attn_out` itself.
                 direct = None
                 if context_rows and attn_out.is_contiguous():
@@ -4206,6 +4219,7 @@ class PrefillTarget:
                     logical[lo:hi] if context_rows else None,
                     pages,
                     rowtile_out=direct,
+                    rowtile_min_rows=rowtile_min_rows,
                 )
                 if direct is None or out.data_ptr() != direct.data_ptr():
                     attn_out[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
