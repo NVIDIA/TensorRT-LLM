@@ -174,7 +174,8 @@ class SparseHistoryVerifier:
             host_pages: Logical-to-physical page mapping for this request.
             arena: uint8 tensor [physical_slot, byte] viewing the attention pool.
             consumer_pool: Cached tensor [physical_slot, 1, byte] returned to the
-                PrimTS consumer; its storage and row layout must match arena.
+                PrimTS consumer. Layout violations fail in the worker; a different
+                backing pointer with matching layout is recorded for the parent.
             token_position: Absolute decode position that selected these rows.
         """
         import torch
@@ -183,14 +184,21 @@ class SparseHistoryVerifier:
         assert bool(((slots >= 0) & (slots < arena.shape[0])).all()), (
             f"layer {layer}, position {token_position}: slots outside arena of {arena.shape[0]} rows"
         )
-        if (
-            consumer_pool.device != arena.device
-            or consumer_pool.data_ptr() != arena.data_ptr()
-            or consumer_pool.element_size() != 1
-            or tuple(consumer_pool.shape) != (arena.shape[0], 1, arena.shape[1])
-            or consumer_pool.stride(0) != arena.shape[1]
-            or consumer_pool.stride(2) != 1
-        ):
+        expected_shape = (arena.shape[0], 1, arena.shape[1])
+        expected_stride = (arena.shape[1], arena.shape[1], 1)
+        assert (
+            consumer_pool.device == arena.device
+            and consumer_pool.element_size() == 1
+            and tuple(consumer_pool.shape) == expected_shape
+            and consumer_pool.stride() == expected_stride
+        ), (
+            f"layer {layer}, position {token_position}: Attention consumer pool layout differs; "
+            f"shape {tuple(consumer_pool.shape)}, strides {consumer_pool.stride()}, "
+            f"element bytes {consumer_pool.element_size()}, device {consumer_pool.device}; "
+            f"expected shape {expected_shape}, strides {expected_stride}, "
+            f"one-byte elements on {arena.device}"
+        )
+        if consumer_pool.data_ptr() != arena.data_ptr():
             self.pool_mismatches += 1
             if self._first_pool_mismatch is None:
                 self._first_pool_mismatch = {

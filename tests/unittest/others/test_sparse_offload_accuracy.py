@@ -4,9 +4,7 @@
 
 import copy
 import runpy
-import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -376,86 +374,31 @@ def test_history_verifier_defers_shared_physical_slot(expected: bytes) -> None:
         )
 
 
-@pytest.mark.parametrize("binding", ["same", "different_storage", "wrong_stride"])
-def test_history_observer_checks_consumer_pool_binding(
-    binding: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    helper_dir = Path(__file__).resolve().parents[2] / "integration/defs/accuracy"
-    monkeypatch.syspath_prepend(str(helper_dir))
-    integrity_helpers = runpy.run_path(str(helper_dir / "sparse_offload_integrity.py"))
-
+@pytest.mark.parametrize("binding", ["same", "same_fp8", "different_storage"])
+def test_history_verifier_defers_consumer_storage_mismatch(binding: str) -> None:
+    verifier = SparseHistoryVerifier()
     arena = torch.tensor([[11, 12], [21, 22]], dtype=torch.uint8)
     host_view = arena.clone().view(1, 2, 2)
     consumer_pool = arena[:, None, :]
     if binding == "different_storage":
-        consumer_pool = consumer_pool.flip(0)
-    elif binding == "wrong_stride":
-        consumer_pool = arena.as_strided((2, 1, 2), (1, 2, 1))
-    views = {host_view.data_ptr(): host_view, arena.data_ptr(): arena}
-    utils = ModuleType("tensorrt_llm._utils")
-    monkeypatch.setattr(utils, "TensorWrapper", lambda pointer, *args: pointer, raising=False)
-    monkeypatch.setattr(utils, "convert_to_torch_tensor", views.__getitem__, raising=False)
-    monkeypatch.setitem(sys.modules, "tensorrt_llm._utils", utils)
-    descriptor = SimpleNamespace(
-        data_buffer_index=0,
-        buffer_ids=[1],
-        unit_tokens=4,
-        arena_base_addresses=[arena.data_ptr()],
-        arena_row_counts=[2],
+        consumer_pool = consumer_pool.clone()
+    elif binding == "same_fp8":
+        consumer_pool = consumer_pool.view(torch.float8_e4m3fn)
+    verifier.check_tensors(
+        0,
+        torch.tensor([0, 1]),
+        torch.tensor([0, 1]),
+        host_view,
+        [0],
+        arena,
+        consumer_pool=consumer_pool,
+        token_position=8,
     )
-    host = SimpleNamespace(
-        size=4,
-        stride=4,
-        base=host_view.data_ptr(),
-        layer_group_id=0,
-        buffers=[SimpleNamespace(id=1, expansion=1)],
-    )
-    cache = SimpleNamespace(history_length=8, get_aggregated_page_indices=lambda group: [0])
-    manager = SimpleNamespace(
-        tokens_per_block=8,
-        _sparse_batch_members={1: SimpleNamespace(row=0, cache=cache)},
-        impl=SimpleNamespace(get_aggregated_pages=lambda buffers: [host]),
-        get_sparse_compress_buffers=lambda layer: (consumer_pool, None),
-    )
-    metadata = SimpleNamespace(
-        sparse_offload_state=SimpleNamespace(
-            layers={0: descriptor},
-            prepared=True,
-            batch=object(),
-            batch_rows=torch.tensor([0]),
-            active_request_count=torch.tensor([1]),
-        ),
-        kv_cache_manager=manager,
-        request_ids=[1],
-        num_contexts=0,
-        num_tokens=1,
-        max_compressed_indices={4: 2},
-        req_idx_per_token=torch.tensor([0]),
-        token_positions_cuda=torch.tensor([8]),
-        compressed_kv_lens_cuda={4: torch.tensor([2])},
-    )
-    attention = SimpleNamespace(
-        layer_idx=0,
-        compress_ratio=4,
-        _uses_nvfp4_compress=False,
-        head_dim=2,
-        sparse_attention_config=SimpleNamespace(window_size=2),
-    )
-    forward_args = SimpleNamespace(
-        sparse_runtime_params=SimpleNamespace(aux_kv_cache_pool_ptr=arena.data_ptr()),
-        sparse_backend_args=SimpleNamespace(topk_indices=torch.tensor([[0, 1]])),
-    )
-    try:
-        integrity_helpers["_verify_generation"](
-            attention, metadata, forward_args, torch.tensor([[0, 1, 0, 1]])
-        )
-    finally:
-        metrics = integrity_helpers["finish_request"](manager, 1, cache)
+    metrics = verifier.metrics()
     assert metrics["checked_rows"] == 2
     assert metrics["mismatched_rows"] == 0
-    if binding == "same":
-        assert metrics.get("pool_mismatches", 0) == 0
+    if binding != "different_storage":
+        assert metrics["pool_mismatches"] == 0
         assert_history_integrity(
             [_integrity_event(metrics)],
             prompt_lengths=[8],
@@ -477,6 +420,29 @@ def test_history_observer_checks_consumer_pool_binding(
         assert metrics["pool_mismatches"] == 1
         assert metrics["first_pool_mismatch"]["layer"] == 0
         assert metrics["first_pool_mismatch"]["position"] == 8
+
+
+@pytest.mark.parametrize("stride", [(1, 2, 1), (2, 1, 1)])
+def test_history_verifier_rejects_invalid_consumer_pool_layout(
+    stride: tuple[int, int, int],
+) -> None:
+    verifier = SparseHistoryVerifier()
+    arena = torch.tensor([[11, 12], [21, 22]], dtype=torch.uint8)
+    with pytest.raises(
+        AssertionError,
+        match="layer 0, position 8: Attention consumer pool layout differs",
+    ):
+        verifier.check_tensors(
+            0,
+            torch.tensor([0, 1]),
+            torch.tensor([0, 1]),
+            arena.clone().view(1, 2, 2),
+            [0],
+            arena,
+            consumer_pool=arena.as_strided((2, 1, 2), stride),
+            token_position=8,
+        )
+    assert verifier.metrics()["checked_rows"] == 0
 
 
 def _integrity_event(metrics: dict | None) -> dict:
