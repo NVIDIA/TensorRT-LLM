@@ -17,6 +17,8 @@
 import os
 from dataclasses import dataclass
 
+import numpy as np
+import PIL.Image
 import pytest
 import torch
 from defs.common import venv_check_call
@@ -387,3 +389,79 @@ def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
         ],
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_flux3_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the FLUX 3 Klein example with the supported single-GPU NVFP4 config."""
+    model_path = get_checkpoint("flux-3-image-klein")
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux3_example")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "flux3_output.png")
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux3.py")
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "flux3-fp4-1gpu.yaml")
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--num_inference_steps",
+            "4",
+            "--seed",
+            "42",
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    with PIL.Image.open(output_path) as image:
+        assert image.size == (1024, 1024), f"Unexpected FLUX 3 output size {image.size}"
+        pixels = np.asarray(image.convert("RGB"), dtype=np.float32)
+    assert pixels.std() > 5.0, "FLUX 3 example produced a blank image"
+
+
+def test_flux3_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp_path):
+    """Run the FLUX 3 Klein example with a reference image that is padded and cropped back."""
+    model_path = get_checkpoint("flux-3-image-klein")
+    # A 600 x 400 reference pads to a 608 x 400 canvas, and the output is cropped back to it.
+    pixels = np.random.default_rng(0).integers(0, 256, (400, 600, 3), dtype=np.uint8)
+    reference_path = tmp_path / "flux3_reference.png"
+    PIL.Image.fromarray(pixels).save(reference_path)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "flux3_reference_image_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "flux3_reference_image_output.png")
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux3.py")
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "flux3-fp4-1gpu.yaml")
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--image",
+            str(reference_path),
+            "--num_inference_steps",
+            "4",
+            "--seed",
+            "42",
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    with PIL.Image.open(output_path) as image:
+        assert image.size == (600, 400), f"Unexpected FLUX 3 edit size {image.size}"
+        output = np.asarray(image.convert("RGB"), dtype=np.float32)
+    assert output.std() > 5.0, "FLUX 3 reference-image example produced a blank image"
