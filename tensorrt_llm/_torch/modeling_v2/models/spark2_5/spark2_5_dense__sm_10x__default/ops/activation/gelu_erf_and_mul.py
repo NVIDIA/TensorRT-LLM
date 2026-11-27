@@ -12,11 +12,7 @@ from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: The published checkpoints' MLP widths (intermediate_size).
 _INTER_1_7B = 6656
-
-
-#: The width the fused gate_up GEMM produces: 2 * intermediate_size.
-def _width(inter: int) -> int:
-    return 2 * inter
+_INTER_4B = 10240
 
 
 class GeluErfAndMul(OpWrapper):
@@ -41,6 +37,14 @@ class GeluErfAndMul(OpWrapper):
         Cell(
             why="a token count that is not a multiple of any tile",
             spec=dict(tokens=17, inter=_INTER_1_7B, dtype=torch.bfloat16),
+        ),
+        Cell(
+            why="4B decode: one token",
+            spec=dict(tokens=1, inter=_INTER_4B, dtype=torch.bfloat16),
+        ),
+        Cell(
+            why="4B prefill-shaped",
+            spec=dict(tokens=2048, inter=_INTER_4B, dtype=torch.bfloat16),
         ),
     )
 

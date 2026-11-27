@@ -7,13 +7,12 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.spark2_5.ops.activation.gelu_erf_and_mul import (
+from tensorrt_llm._torch.modeling_v2.models.spark2_5.spark2_5_dense__sm_10x__default.ops.activation.gelu_erf_and_mul import (  # noqa: E501
     gelu_erf_and_mul as op,
 )
 
 __extra_import_path__ = ["../../.."]  # noqa: F841 -- repo's file-scoped import hook
 
-from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "the gelu_erf_and_mul test requires a CUDA device"
@@ -27,10 +26,7 @@ def _build(spec, seed):
     return (gate_up,)
 
 
-CELLS = certified_cells(op, {})
-
-
-@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by name
     certifying(op)
     (gate_up,) = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)

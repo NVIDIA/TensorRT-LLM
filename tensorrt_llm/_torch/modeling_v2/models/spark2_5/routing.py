@@ -79,7 +79,9 @@ def route(
         and not getattr(cfg, "attention_bias", False)
         and not getattr(cfg, "mlp_bias", False)
         and bool(getattr(cfg, "tie_word_embeddings", False))
-        and model_config.quant_config is None
+        # ModelConfig.quant_config defaults to an unquantized QuantConfig()
+        # object rather than None, so check the algo, not the object.
+        and getattr(model_config.quant_config, "quant_algo", None) is None
     )
 
     # One rank only: the target computes no collective. Pipeline and context
@@ -111,7 +113,7 @@ def route(
         f"speculative decoding "
         f"{type(spec_config).__name__ if spec_config is not None else 'off'}, "
         f"KV cache {kv_cache_quant_algo or 'bf16'}, "
-        f"quantization {model_config.quant_config.quant_algo if model_config.quant_config else 'none'}; "
+        f"quantization {getattr(model_config.quant_config, 'quant_algo', None) or 'none'}; "
         "the spark2_5 target is a published BF16 Spark-X2.5/X2.6 checkpoint "
         "(1.7B or 4B shape) on sm100 or sm103, on one rank, without speculative "
         "decoding, quantization or a quantized KV cache"

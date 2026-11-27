@@ -12,13 +12,12 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.spark2_5.ops.attention.headwise_output_gate import (
+from tensorrt_llm._torch.modeling_v2.models.spark2_5.spark2_5_dense__sm_10x__default.ops.attention.headwise_output_gate import (  # noqa: E501
     headwise_output_gate as op,
 )
 
 __extra_import_path__ = ["../../.."]  # noqa: F841 -- repo's file-scoped import hook
 
-from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "the headwise output gate test requires a CUDA device"
@@ -41,10 +40,9 @@ def _build(spec, seed):
 
 # The op's own CELLS already carry both published geometries (1.7B: 8 heads,
 # 4B: 16 heads, head_dim 256 each); no separate target cells to add.
-CELLS = certified_cells(op, {})
 
 
-@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by name
     certifying(op)
     attention_output, gate, num_heads, head_dim = _build(

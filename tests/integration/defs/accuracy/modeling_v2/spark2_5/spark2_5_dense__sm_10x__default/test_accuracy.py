@@ -36,11 +36,11 @@ from .....conftest import llm_models_root
 from ....accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 from ..._env import scoped_env_overrides
 
-# The target asserts its own SM at construction: certification is per GPU
-# architecture, and a receipt from another one says nothing here.
+# Routing admits sm_100/sm_103 only; on any other GPU the target is not
+# selected and modeling_v2="require" would fail, so skip instead.
 skip_not_sm10x = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
-    reason="modeling_v2 targets in this batch are certified on sm_100 and sm_103 only",
+    reason="the spark2_5 target is routed on sm_100 and sm_103 only",
 )
 
 _MODEL_PATH = f"{llm_models_root()}/spark/Spark-X2.5-1.7B"

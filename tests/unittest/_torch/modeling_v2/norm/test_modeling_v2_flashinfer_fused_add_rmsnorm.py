@@ -58,6 +58,14 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             why="spark prefill-shaped, hidden 2048",
             spec=dict(shape=(2048, 2048), dtype=torch.bfloat16, eps=1e-6),
         ),
+        Cell(
+            why="spark 4B decode-shaped, hidden 2560",
+            spec=dict(shape=(1, 2560), dtype=torch.bfloat16, eps=1e-6),
+        ),
+        Cell(
+            why="spark 4B prefill-shaped, hidden 2560",
+            spec=dict(shape=(2048, 2560), dtype=torch.bfloat16, eps=1e-6),
+        ),
     ),
 }
 

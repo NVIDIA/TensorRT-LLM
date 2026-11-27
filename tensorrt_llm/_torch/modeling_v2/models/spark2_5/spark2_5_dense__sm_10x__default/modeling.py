@@ -39,9 +39,9 @@ from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm i
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 
-from ..ops.activation.gelu_erf_and_mul import gelu_erf_and_mul
-from ..ops.attention.headwise_output_gate import headwise_output_gate
 from . import weights as _weights
+from .ops.activation.gelu_erf_and_mul import gelu_erf_and_mul
+from .ops.attention.headwise_output_gate import headwise_output_gate
 
 _CALL_CONSTANTS = dict(
     output_sf=None,
