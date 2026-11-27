@@ -24,6 +24,7 @@ from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
+    MultimodalItemPartition,
 )
 from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
 
@@ -66,6 +67,26 @@ def record_output(
     """Mark one item ready without materializing an output tensor."""
     del hidden, fill
     state.item_ready[item_idx] = True
+
+
+def make_packed_image_data() -> dict[str, Any]:
+    return {
+        "image": {
+            "pixel_values": torch.arange(5).unsqueeze(1),
+            "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
+        },
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            item_refs=[("image", 0), ("image", 1)],
+            encoder_token_lengths=[2, 3],
+            output_embedding_lengths=[2, 3],
+            input_partitions={
+                "image": {
+                    "pixel_values": MultimodalItemPartition(item_lengths=(2, 3)),
+                    "image_grid_thw": MultimodalItemPartition(),
+                }
+            },
+        ),
+    }
 
 
 def make_mm_request(

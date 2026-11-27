@@ -19,6 +19,7 @@ import enum
 import importlib
 import traceback
 from abc import ABC, abstractmethod
+from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -43,8 +44,8 @@ from .data import TextPrompt
 from .model_config import resolve_top_level_model_type
 # yapf: disable
 from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
-                         MultimodalItemMetadata, _as_cpu_tensor,
-                         _compute_mm_masks,
+                         MultimodalItemMetadata, MultimodalItemPartition,
+                         _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
@@ -97,6 +98,83 @@ def _merge_mm_item_metadata(
                 "Computed item output lengths do not match the prompt embedding slots"
             )
     return metadata
+
+
+def _apply_mm_input_partitions(
+    metadata: MultimodalItemMetadata,
+    processed: dict[str, Any],
+    partitions: dict[str, dict[str, MultimodalItemPartition]],
+) -> MultimodalItemMetadata:
+    """Check the declared axes on the host and derive costs in prompt order."""
+    costs_by_modality = {}
+    counts = Counter(modality for modality, _ in metadata.item_refs)
+    raw_modalities = {
+        m
+        for m in MEDIA_MODALITIES if isinstance(processed.get(m), dict)
+    }
+    if raw_modalities != counts.keys() or raw_modalities != partitions.keys():
+        raise ValueError(
+            "Input partitions and item references must cover all processed modalities"
+        )
+    for modality, count in counts.items():
+        fields = processed[modality]
+        declarations = partitions[modality]
+        missing = fields.keys() - declarations.keys()
+        if missing:
+            raise ValueError(
+                f"Missing input partitions for {modality}: {sorted(missing)}")
+
+        packed_lengths = None
+        has_item_axis = False
+        for name, value in fields.items():
+            partition = declarations[name]
+            if not isinstance(partition, MultimodalItemPartition):
+                raise TypeError(
+                    f"Expected MultimodalItemPartition for {modality}.{name}")
+            axis, lengths = partition
+            if axis is not None and (isinstance(axis, bool)
+                                     or not isinstance(axis, int)):
+                raise TypeError(
+                    f"Item axis for {modality}.{name} must be an integer or None"
+                )
+            if axis is None or value is None:
+                continue
+            if isinstance(value,
+                          torch.Tensor) and -value.ndim <= axis < value.ndim:
+                size = value.shape[axis]
+            elif isinstance(value, (list, tuple)) and axis == 0:
+                size = len(value)
+            else:
+                raise ValueError(
+                    f"Invalid item axis {axis} for {modality}.{name}")
+            has_item_axis = True
+            if lengths is not None and len(lengths) != count:
+                raise ValueError(
+                    f"Item lengths must align with {modality}.{name}")
+            if size != (count if lengths is None else sum(lengths)):
+                raise ValueError(
+                    f"Item partition does not cover {modality}.{name}")
+            if metadata.encoder_token_lengths is None and lengths is not None:
+                if packed_lengths is not None and packed_lengths != lengths:
+                    raise ValueError(
+                        f"Different packed lengths in {modality} require explicit encoder_token_lengths"
+                    )
+                packed_lengths = lengths
+        if metadata.encoder_token_lengths is None:
+            if not has_item_axis:
+                raise ValueError(
+                    f"Shared {modality} inputs require explicit encoder_token_lengths"
+                )
+            costs_by_modality[
+                modality] = packed_lengths if packed_lengths is not None else (
+                    1, ) * count
+    lengths = metadata.encoder_token_lengths
+    if lengths is None:
+        lengths = tuple(costs_by_modality[modality][index]
+                        for modality, index in metadata.item_refs)
+    return replace(metadata,
+                   encoder_token_lengths=lengths,
+                   input_partitions=partitions)
 
 
 class InputProcessor(Protocol):
@@ -292,10 +370,23 @@ class BaseMultimodalInputProcessor(ABC):
     ) -> Optional[MultimodalItemMetadata]:
         """Read the processed item record, independently of scheduling support.
 
-        The framework supplies prompt order and output rows during input
-        preparation. Model processors add encoder costs and input partitions.
+        Processors can supply prompt layout and override encoder token costs.
         """
         return get_multimodal_item_metadata(multimodal_data)
+
+    def get_mm_input_partitions(
+        self,
+        processed: dict[str, Any],
+    ) -> dict[str, dict[str, MultimodalItemPartition]] | None:
+        """Declare every field of each independently encodable modality.
+
+        The base processor keeps whole-request encoding. Implementations take
+        the processed multimodal_data and declare batched, packed or shared
+        fields. Packed lengths give the default encoder cost, or one per item
+        for a batched layout. Supply encoder_token_lengths in the item record
+        when the encoder uses different work units.
+        """
+        return None
 
     def __init__(self,
                  model_path,
@@ -1628,6 +1719,11 @@ def create_input_processor_with_hash(
             "get_mm_encoder_item_metadata() has been removed; implement "
             "get_mm_item_metadata() returning MultimodalItemMetadata instead.")
 
+    base_partitions = BaseMultimodalInputProcessor.get_mm_input_partitions
+    declares_partitions = getattr(type(input_processor),
+                                  "get_mm_input_partitions",
+                                  base_partitions) is not base_partitions
+
     def multimodal_hashing_process(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
@@ -1861,6 +1957,29 @@ def create_input_processor_with_hash(
             )
         item_metadata = _merge_mm_item_metadata(prepared_metadata,
                                                 item_metadata)
+        if (declares_partitions
+                and multimodal_data.get("multimodal_embedding") is None and any(
+                    isinstance(multimodal_data.get(m), dict)
+                    for m in MEDIA_MODALITIES)):
+            partitions = input_processor.get_mm_input_partitions(
+                multimodal_data)
+            if partitions is None:
+                # Keep the prompt layout for inline encoding. These inputs
+                # cannot have independently reusable encoder outputs.
+                multimodal_data.pop("mm_processor_kwargs_hash", None)
+                if item_metadata is None:
+                    multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = None
+                else:
+                    item_metadata = replace(item_metadata,
+                                            encoder_token_lengths=None,
+                                            input_partitions={})
+            elif item_metadata is None:
+                raise ValueError(
+                    "Declared input partitions require prompt-ordered multimodal item metadata"
+                )
+            else:
+                item_metadata = _apply_mm_input_partitions(
+                    item_metadata, multimodal_data, partitions)
         if item_metadata is None:
             return prompt_token_ids, extra_processed_inputs
         mm_item_order = inputs.get("mm_item_order")

@@ -14,6 +14,8 @@ import transformers
 import transformers.models.mistral3
 from _torch.helpers import create_mock_cuda_graph_runner
 from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -30,6 +32,7 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
+from tensorrt_llm.inputs import create_input_processor_with_hash
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.models import modeling_utils
 
@@ -740,6 +743,36 @@ def _make_text_only_native_processor() -> MistralNativeInputProcessor:
     return instance
 
 
+@pytest.mark.cpu_only
+def test_hf_pixtral_keeps_prompt_token_types_out_of_encoder_inputs(mistral_small_3_1_24b_config):
+    tokens = ["[UNK]", "[IMG]", "[IMG_BREAK]", "[IMG_END]"]
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({t: i for i, t in enumerate(tokens)}, unk_token="[UNK]")
+        ),
+        unk_token="[UNK]",
+        additional_special_tokens=tokens[1:],
+        return_mm_token_type_ids=True,
+    )
+    hf = transformers.PixtralProcessor(
+        image_processor=transformers.PixtralImageProcessor(do_resize=False),
+        tokenizer=tokenizer,
+        patch_size=_PATCH_SIZE,
+        spatial_merge_size=2,
+    )
+    images = [Image.new("RGB", (56, 56))]
+    assert "mm_token_type_ids" in hf(text="[IMG]", images=images)
+    config = transformers.Mistral3Config.from_dict(mistral_small_3_1_24b_config)
+    with mock.patch.object(transformers.AutoProcessor, "from_pretrained", return_value=hf):
+        processor = MistralHFInputProcessor("unused", config, tokenizer)
+    _, extra = create_input_processor_with_hash(processor)(
+        {"prompt": "[IMG]", "multi_modal_data": {"image": images}}, None
+    )
+    param = MultimodalParams(multimodal_data=extra["multimodal_data"])
+    assert set(param.multimodal_data["image"]) == {"pixel_values", "image_sizes"}
+    assert param.item_metadata.encoder_token_lengths == (16,)
+
+
 def test_dummy_mm_max_tokens_per_item_is_image_only():
     proc = _make_dummy_processor(patch_size=14, image_size=1540)
     demand = proc.get_mm_max_tokens_per_item()
@@ -763,6 +796,26 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     assert metadata.item_refs == (("image", 0), ("image", 1))
     assert metadata.encoder_token_lengths == (8, 16)
     assert metadata.output_embedding_lengths == (2, 4)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("prepared_partitions", [False, True])
+def test_pixtral_selected_images_drop_request_padding(prepared_partitions):
+    from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+    from tensorrt_llm.inputs.registry import _apply_mm_input_partitions
+
+    proc = _make_dummy_processor()
+    pixels = torch.arange(2 * 3 * 56 * 84).view(2, 3, 56, 84)
+    data = {"image": {"pixel_values": pixels, "image_sizes": [[28, 56], [56, 84]]}}
+    metadata = proc.get_mm_item_metadata([], data)
+    if prepared_partitions:
+        metadata = _apply_mm_input_partitions(metadata, data, proc.get_mm_input_partitions(data))
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+    model = object.__new__(modeling_mistral.Mistral3VLM)
+    selected = model.build_multimodal_encoder_input(MultimodalParams(multimodal_data=data), [0])
+    image = selected.multimodal_data["image"]
+    assert image["image_sizes"] == [[28, 56]]
+    assert torch.equal(image["pixel_values"], pixels[:1, :, :28, :56])
 
 
 @pytest.mark.cpu_only
@@ -911,13 +964,6 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract():
     assert batched_pixel_values.dtype == torch.float16
 
 
-# ---------------------------------------------------------------------------
-# MM encoder item scheduling is enabled from the *model* class
-# (`Mistral3VLM.supports_mm_encoder_item_scheduling`), but the contract it
-# implies is required of the *input processor*, and `create_input_processor`
-# picks the processor from `checkpoint_format` alone. Both Mistral frontends
-# therefore have to satisfy the contract.
-# ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "processor_cls, geometry_from_processor",
     [(MistralHFInputProcessor, False), (MistralNativeInputProcessor, True)],
@@ -956,6 +1002,7 @@ def test_both_mistral_processors_satisfy_item_scheduling_contract(
     assert dummy["image"]["pixel_values"].shape == (1, 3, 56, 56)
     assert dummy["image"]["pixel_values"].dtype == proc.dtype
     assert dummy["image"]["image_sizes"] == [[56, 56]]
+    assert set(proc.get_mm_input_partitions(dummy)["image"]) == set(dummy["image"])
     dummy_metadata = proc.get_mm_item_metadata([], dummy)
     assert dummy_metadata is not None
     dummy_metadata.validate()
@@ -973,6 +1020,7 @@ def test_both_mistral_processors_satisfy_item_scheduling_contract(
 def test_text_only_native_checkpoint_reports_no_encoder_geometry() -> None:
     proc = _make_text_only_native_processor()
 
+    assert proc.get_mm_input_partitions({"image": {}}) is None
     assert proc.get_mm_max_tokens_per_item() == {}
     assert proc.get_max_mm_encoder_output_embeddings(8192) is None
     assert proc.get_mm_encoder_attention_metadata_capacity(8192) is None

@@ -212,6 +212,8 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
     # The base class sizes encoder items for the vision tower's patch layout. The encoder-free
     # projections take merged patches instead, so this model keeps encoder memory profiling and
     # encoder item scheduling off.
+    get_mm_input_partitions = BaseMultimodalInputProcessor.get_mm_input_partitions
+
     def get_mm_max_tokens_per_item(
         self, max_num_encoder_tokens: int | None = None
     ) -> dict[str, int]:

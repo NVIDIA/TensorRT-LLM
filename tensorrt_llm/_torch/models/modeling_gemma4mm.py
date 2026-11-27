@@ -218,7 +218,7 @@ def _padded_patches_per_frame(processor) -> int:
 
 def _gemma4_input_partitions(
     multimodal_data: dict[str, Any],
-    metadata: MultimodalItemMetadata,
+    metadata: MultimodalItemMetadata | None = None,
 ) -> dict[str, dict[str, MultimodalItemPartition]]:
     """Declare item-major inputs and the packed frame spans of whole videos."""
     partitions = {}
@@ -230,31 +230,37 @@ def _gemma4_input_partitions(
         data = multimodal_data.get(modality)
         if not isinstance(data, dict):
             continue
-        item_count = sum(m == modality for m, _ in metadata.item_refs)
         frame_counts = data.get("num_frames") if modality == "video" else None
         item_lengths = tuple(frame_counts) if frame_counts is not None else None
-        field_count = sum(item_lengths) if item_lengths is not None else item_count
-        value = data.get(fields[0])
-        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == field_count:
-            modality_partitions = {}
+        if metadata is not None:
+            # Cache-only callers can have older payloads without producer validation.
+            count = (
+                sum(item_lengths)
+                if item_lengths is not None
+                else sum(m == modality for m, _ in metadata.item_refs)
+            )
+            primary = data.get(fields[0])
+            if not isinstance(primary, torch.Tensor) or primary.ndim == 0 or len(primary) != count:
+                continue
             for name in fields:
                 value = data.get(name)
                 if value is None:
                     continue
-                if isinstance(value, torch.Tensor):
-                    size = value.shape[0] if value.ndim > 0 else None
-                elif isinstance(value, (list, tuple)):
-                    size = len(value)
-                else:
-                    size = None
-                if size != field_count:
+                if (
+                    not isinstance(value, (torch.Tensor, list, tuple))
+                    or (isinstance(value, torch.Tensor) and value.ndim == 0)
+                    or len(value) != count
+                ):
                     raise ValueError(
-                        f"{modality}.{name} must have {field_count} entries on its leading axis"
+                        f"{modality}.{name} must have {count} entries on its leading axis"
                     )
-                modality_partitions[name] = MultimodalItemPartition(item_lengths=item_lengths)
-            if frame_counts is not None:
-                modality_partitions["num_frames"] = MultimodalItemPartition()
-            partitions[modality] = modality_partitions
+        partition = MultimodalItemPartition(item_lengths=item_lengths)
+        declared = {name: partition for name in fields if name in data}
+        if frame_counts is not None:
+            declared["num_frames"] = MultimodalItemPartition()
+        if "vision_normalization" in data:
+            declared["vision_normalization"] = MultimodalItemPartition(item_axis=None)
+        partitions[modality] = declared
     return partitions
 
 
@@ -453,6 +459,11 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         audio_seq_length = getattr(self._processor, "audio_seq_length", None)
         return None if audio_seq_length is None else int(audio_seq_length)
 
+    def get_mm_input_partitions(
+        self, processed: dict[str, Any]
+    ) -> dict[str, dict[str, MultimodalItemPartition]]:
+        return _gemma4_input_partitions(processed)
+
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
@@ -492,14 +503,11 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             item_refs = prepared.item_refs
         else:
             item_refs = [(modality, item_idx) for item_idx in range(len(encoder_token_lengths))]
-        metadata = MultimodalItemMetadata(
+        return MultimodalItemMetadata(
             item_refs=item_refs,
             encoder_token_lengths=[encoder_token_lengths[i] for _, i in item_refs],
             output_embedding_lengths=[output_embedding_lengths[i] for _, i in item_refs],
-            input_partitions=prepared.input_partitions if prepared is not None else None,
         )
-        metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
-        return metadata
 
     def _vision_item_lengths(self, modality_data: Dict[str, Any]) -> Tuple[List[int], List[int]]:
         """Return the patch cost and soft-token count of every image or video.
@@ -1101,6 +1109,14 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     ) -> dict[str, MultimodalItemPartition] | None:
         partitions = super().get_multimodal_item_partitions(param, modality)
         if partitions is not None:
+            if (
+                "vision_normalization" in param.multimodal_data[modality]
+                and "vision_normalization" not in partitions
+            ):
+                return {
+                    **partitions,
+                    "vision_normalization": MultimodalItemPartition(item_axis=None),
+                }
             return partitions
         metadata = param.item_metadata
         if metadata is None:
@@ -1405,7 +1421,6 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     # fmt: on
 
     build_mtp_draft_model_from_config = True
-    supports_mm_encoder_item_scheduling = True
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
         if _is_mm_disagg():

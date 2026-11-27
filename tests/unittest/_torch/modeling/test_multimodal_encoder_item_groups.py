@@ -31,6 +31,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
 )
+from tensorrt_llm.inputs.registry import _apply_mm_input_partitions
 
 HIDDEN = 4
 pytestmark = pytest.mark.cpu_only
@@ -58,6 +59,7 @@ def test_qwen_processor_produces_prompt_order_and_packed_partitions():
         },
     }
     metadata = processor.get_mm_item_metadata([12, 11, 13, 12, 10, 13], data)
+    metadata = _apply_mm_input_partitions(metadata, data, processor.get_mm_input_partitions(data))
     metadata.validate()
     assert metadata.item_refs == (("video", 0), ("image", 0))
     assert metadata.encoder_token_lengths == (16, 8)
@@ -166,7 +168,9 @@ def test_processors_use_the_common_metadata_hook(model, custom):
     image = {"pixel_values": torch.zeros(8, 2), "image_grid_thw": torch.tensor([[1, 2, 4]])}
     if model == "mistral":
         image = {"pixel_values": torch.zeros(1, 3, 4, 8), "image_sizes": [[4, 8]]}
-    metadata = processor.get_mm_item_metadata(prompt, {"image": image})
+    data = {"image": image}
+    metadata = processor.get_mm_item_metadata(prompt, data)
+    metadata = _apply_mm_input_partitions(metadata, data, processor.get_mm_input_partitions(data))
     assert calls == ([prompt] if custom else [])
     assert metadata.item_refs == (("image", 0),)
     assert metadata.output_embedding_lengths == (2,)
@@ -343,8 +347,6 @@ class _GroupedEncoderModel(MultimodalModelMixin):
     Mirrors the Qwen3-VL grouped encoder, including its prompt-order output
     assembly from the common item metadata.
     """
-
-    supports_mm_encoder_item_scheduling = True
 
     def get_multimodal_item_partitions(self, param, modality):
         if modality == "audio":
@@ -530,6 +532,9 @@ def test_declared_qwen_layout_keeps_shared_fields(indices):
     request = _make_request(["image", "image", "image"])
     shared = torch.arange(3)
     request.multimodal_data["image"]["shared_stats"] = shared
+    partitions = model.get_multimodal_item_partitions(request, "image")
+    partitions["shared_stats"] = MultimodalItemPartition(item_axis=None)
+    request.item_metadata.input_partitions["image"] = partitions
     expected = torch.cat([_expected_rows(request, i) for i in indices])
 
     encoder_inputs = model.prepare_multimodal_encoder_inputs([(request, i) for i in indices])

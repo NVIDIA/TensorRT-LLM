@@ -115,13 +115,11 @@ def test_field_layout_selects_item_sequences(sequence_type) -> None:
     assert MultimodalItemPartition().select(values, [2, 0]) == sequence_type(["c", "a"])
 
 
-def test_field_layout_keeps_shared_and_unlisted_values_even_when_sizes_match() -> None:
+def test_field_layout_keeps_shared_values_even_when_sizes_match() -> None:
     shared = torch.arange(3)
-    unlisted = ["a", "b", "c"]
     data = {
         "frames": torch.arange(6).reshape(3, 2),
         "shared": shared,
-        "other": unlisted,
         "nullable_mask": None,
     }
 
@@ -138,7 +136,6 @@ def test_field_layout_keeps_shared_and_unlisted_values_even_when_sizes_match() -
 
     torch.testing.assert_close(selected["frames"], data["frames"][[2, 0]])
     assert selected["shared"] is shared
-    assert selected["other"] is unlisted
     assert "optional_mask" not in selected
     assert selected["nullable_mask"] is None
     assert data["frames"].shape == (3, 2)
@@ -221,6 +218,87 @@ def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
         params.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY],
         MultimodalItemMetadata,
     )
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("packed", [False, True])
+def test_processor_partitions_supply_costs_and_preserve_shared_tensor(count, packed):
+    shared = torch.arange(count)
+    lengths = tuple(range(2, 2 + count)) if packed else (1,) * count
+
+    class Processor(_ItemMetadataFakeProcessor):
+        def __call__(self, inputs, sampling_params):
+            return [101, 102], {
+                "multimodal_data": {
+                    "image": {"pixels": torch.arange(sum(lengths)), "stats": shared},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", i) for i in reversed(range(count))],
+                        output_embedding_lengths=lengths,
+                    ),
+                }
+            }
+
+        def get_mm_item_metadata(self, *args):
+            return None
+
+        def get_mm_input_partitions(self, processed):
+            return {
+                "image": {
+                    "pixels": MultimodalItemPartition(item_lengths=lengths if packed else None),
+                    "stats": MultimodalItemPartition(item_axis=None),
+                }
+            }
+
+    _, extra = create_input_processor_with_hash(Processor(None))({"prompt": "unused"}, None)
+    data = extra["multimodal_data"]
+    metadata = data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.encoder_token_lengths == lengths[::-1]
+    subset = select_multimodal_fields(
+        data["image"], metadata.input_partitions["image"], [count - 1]
+    )
+    assert subset["stats"] is shared
+    torch.testing.assert_close(subset["pixels"], data["image"]["pixels"][-lengths[-1] :])
+
+
+def test_processor_can_decline_item_encoding_for_a_request():
+    class Processor(_ItemMetadataFakeProcessor):
+        def get_mm_input_partitions(self, processed):
+            return None
+
+        def __call__(self, inputs, sampling_params):
+            ids, extra = super().__call__(inputs, sampling_params)
+            extra["multimodal_data"]["mm_processor_kwargs_hash"] = "settings"
+            return ids, extra
+
+    _, extra = create_input_processor_with_hash(Processor([2]))({"prompt": "unused"}, None)
+    data = extra["multimodal_data"]
+    assert "mm_processor_kwargs_hash" not in data
+    assert data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] == MultimodalItemMetadata(
+        [("image", 0)], output_embedding_lengths=[2]
+    )
+
+
+@pytest.mark.parametrize(
+    ("partitions", "error"),
+    [
+        ({}, ValueError),
+        ({"sizes": MultimodalItemPartition(item_axis=False)}, TypeError),
+        ({"sizes": MultimodalItemPartition(item_axis=True)}, TypeError),
+        ({"sizes": MultimodalItemPartition(item_axis=1, item_lengths=(True,))}, ValueError),
+    ],
+)
+def test_processor_rejects_invalid_field_partition_even_for_one_item(partitions, error):
+    class Processor(_ItemMetadataFakeProcessor):
+        def __call__(self, inputs, sampling_params):
+            ids, extra = super().__call__(inputs, sampling_params)
+            extra["multimodal_data"]["image"]["sizes"] = torch.ones(1, 1)
+            return ids, extra
+
+        def get_mm_input_partitions(self, processed):
+            return {"image": partitions}
+
+    with pytest.raises(error, match="image.*sizes"):
+        create_input_processor_with_hash(Processor([2]))({"prompt": "unused"}, None)
 
 
 def test_mm_item_metadata_rejects_mismatched_embedding_lengths():

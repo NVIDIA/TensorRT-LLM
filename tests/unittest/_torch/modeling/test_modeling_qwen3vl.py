@@ -2457,14 +2457,10 @@ def _normalization_transport_spec():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("declared", [False, True])
 @pytest.mark.parametrize("modality", ["image", "video"])
-def test_normalization_transport_item_selection(declared: bool, modality: str) -> None:
+def test_normalization_transport_item_selection(modality: str) -> None:
     from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-    from tensorrt_llm.inputs.multimodal import (
-        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-        MultimodalItemPartition,
-    )
+    from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
 
     spec = _normalization_transport_spec()
     pixel_key, grid_key = (
@@ -2475,30 +2471,23 @@ def test_normalization_transport_item_selection(declared: bool, modality: str) -
     count = len(spec)
     pixels = torch.arange(count * 3, dtype=torch.uint8).view(count, 3)
     # Matching the tuple's field count must not turn shared metadata into item data.
-    param = MultimodalParams(
-        multimodal_data={
-            modality: {
-                pixel_key: pixels,
-                grid_key: torch.ones(count, 3, dtype=torch.int64),
-                "vision_normalization": spec,
-            },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [(modality, i) for i in range(count)],
-                output_embedding_lengths=[1] * count,
-                input_partitions={
-                    modality: {
-                        pixel_key: MultimodalItemPartition(),
-                        grid_key: MultimodalItemPartition(),
-                    }
-                },
-            ),
+    data = {
+        modality: {
+            pixel_key: pixels,
+            grid_key: torch.ones(count, 3, dtype=torch.int64),
+            "vision_normalization": spec,
         }
+    }
+    processor = object.__new__(modeling_qwen2vl.Qwen2VLInputProcessorBase)
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        [(modality, i) for i in range(count)],
+        output_embedding_lengths=[1] * count,
+        input_partitions=processor.get_mm_input_partitions(data),
     )
+    param = MultimodalParams(multimodal_data=data)
     copied_spec = copy.deepcopy(param).multimodal_data[modality]["vision_normalization"]
     assert type(copied_spec) is type(spec) and copied_spec == spec
     model = MultimodalModelMixin()
-    if not declared:
-        model.get_multimodal_item_partitions = lambda param, modality: None
     selected, lengths, selected_modality = model.prepare_multimodal_encoder_inputs(
         [(param, 3), (param, 1)]
     )[0]
@@ -2609,7 +2598,6 @@ def test_normalization_transport_shared_handles_and_process(producer_dtype) -> N
 
 @pytest.mark.cpu_only
 def test_normalization_transport_partial_encoder_cache() -> None:
-    from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
     from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -2626,11 +2614,13 @@ def test_normalization_transport_partial_encoder_cache() -> None:
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 [("image", 0), ("image", 1)],
                 output_embedding_lengths=[1, 1],
+                # Older prepared Qwen records omitted the shared normalization field.
                 input_partitions={"image": {"pixel_values": MultimodalItemPartition()}},
             ),
         }
     )
-    model = MultimodalModelMixin()
+    model = object.__new__(modeling_qwen2vl.Qwen2VLModelBase)
+    torch.nn.Module.__init__(model)
     cache = TensorLRUCache(64)
     cache.put("hit", torch.ones(1, 2))
     partition = model.partition_encoder_cache(params, cache, keys=["hit", "miss"])

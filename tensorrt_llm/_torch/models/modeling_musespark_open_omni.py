@@ -1130,11 +1130,8 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     exactly once, so :attr:`text_embedding_layer` must be the raw
     `Embedding`: a norm-wrapped module would norm the text twice.
 
-    The mixin's persistent cross-request encoder cache
-    (`supports_encoder_cache`) and encoder item scheduling
-    (`supports_mm_encoder_item_scheduling`) stay at their `False`
-    defaults. The per-request, per-chunk caching in
-    `get_multimodal_embeddings` applies as for any mixin model.
+    The processor keeps whole-request encoding. The mixin caches each
+    request's embeddings across prefill chunks.
     """
 
     # The vision tower derives its backend from the decoder's, and the audio

@@ -136,25 +136,19 @@ def select_multimodal_fields(
     item_partitions: dict[str, MultimodalItemPartition],
     item_indices: Sequence[int],
 ) -> dict[str, Any]:
-    """Select declared fields; unlisted and shared fields pass through.
-
-    Optional fields absent from the payload are ignored. A model declares
-    every per-item field explicitly, so matching a tensor dimension to the
-    item count never changes a shared field's meaning.
-    """
-    selected = dict(modality_data)
-    for name, partition in item_partitions.items():
-        if name in modality_data:
-            selected[name] = partition.select(modality_data[name], item_indices)
-    return selected
+    """Select present fields by their declared layout; optional fields may be absent."""
+    return {
+        name: item_partitions[name].select(value, item_indices)
+        for name, value in modality_data.items()
+    }
 
 
 @dataclass(frozen=True, slots=True, init=False)
 class MultimodalItemMetadata:
     """Prompt-ordered items and their partitions in processed model inputs.
 
-    Encoder costs and output rows are optional: their presence does not enable
-    item scheduling. Models keep their existing scheduling capabilities.
+    Encoder costs and output embedding lengths are optional. The processor
+    declares independent encoder items through its input partition hook.
 
     Request state shares this record, so refs and lengths cannot be reassigned.
     Input partitions are completed by producers before admission. This is a
@@ -221,7 +215,7 @@ class MultimodalItemMetadata:
             if modality not in indices_by_modality:
                 raise ValueError(
                     "Input partitions must refer to a present modality")
-            for partition in partitions.values():
+            for name, partition in partitions.items():
                 if not isinstance(partition, MultimodalItemPartition):
                     raise TypeError(
                         "Input partitions must be MultimodalItemPartition records"
@@ -230,10 +224,11 @@ class MultimodalItemMetadata:
                     if (partition.item_axis is None
                             or len(partition.item_lengths) != len(
                                 indices_by_modality[modality])
-                            or any(not isinstance(n, int) or n < 0
+                            or any(not isinstance(n, int)
+                                   or isinstance(n, bool) or n < 0
                                    for n in partition.item_lengths)):
                         raise ValueError(
-                            "Packed input lengths must align with modality items"
+                            f"Packed input lengths must align with modality items for {modality}.{name}"
                         )
 
     def select(self, item_indices: Sequence[int]) -> "MultimodalItemMetadata":

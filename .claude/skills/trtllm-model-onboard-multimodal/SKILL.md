@@ -248,11 +248,11 @@ per request.
 modalities, runs one encoder call, and restores request/prompt order from
 `param.item_metadata.item_refs` and `output_embedding_lengths`.
 `forward_multimodal_encoder_items` then splits the result into one tensor per atomic item using
-the processor-declared output lengths. Declare `item_metadata.input_partitions`
-with `MultimodalItemPartition` for batched, packed, or shared fields. Override
+the processor-declared output lengths. Return a `MultimodalItemPartition`
+for each batched, packed, or shared field in `get_mm_input_partitions`. Override
 `build_multimodal_encoder_input(param, local_item_indices, modality)` when those
 partitions cannot express the payload. The mixin separately selects metadata
-using prompt-global indices. New models should not rely on legacy layout inference.
+using prompt-global indices.
 
 **Audit.** Under load, compatible requests should share one wide encoder block per hook call,
 not one block per request. Item scheduling may produce multiple blocks per iteration when
@@ -291,8 +291,6 @@ class {Name}VisionModel(nn.Module):
 class {Name}Model(MultimodalModelMixin, PreTrainedModel):
     config_class = {Name}Config
     supports_encoder_cache = True
-    # Enable after implementing and validating the Phase 3 atomic-item contracts.
-    supports_mm_encoder_item_scheduling = False
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
@@ -362,8 +360,8 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
   embedding: include any extra features folded into each row (Qwen3-VL deepstack returns
   `hidden * (deepstack_num_level + 1)`). Item scheduling sizes cache entries from them and
   rejects item outputs with any other width or dtype.
-- Set `supports_mm_encoder_item_scheduling=True` only when the input processor emits valid atomic
-  item metadata and the model can slice and batch selected items. Set `supports_encoder_cache=True`
+- Implement `get_mm_input_partitions` on the processor when the encoder can run independent
+  items. Declare every field, including shared values. Set `supports_encoder_cache=True`
   only when the production forward consumes the mixin cache path. Do not construct or mutate a
   request-local encoder-output cache in the model.
 
@@ -401,17 +399,17 @@ The workspace dimension comes from `encoder_max_num_tokens`, falling back to the
 **Common item metadata.** Implement
 `get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)`
 and return `MultimodalItemMetadata`. The framework supplies prompt order and
-known output rows; the processor adds encoder costs and input partitions.
+output embedding lengths. A processor may supply physical encoder costs.
 Full-request models can leave unknown costs as `None`; grouped assembly still
 requires exact output row counts. Do not implement the removed
 `get_mm_encoder_item_metadata` hook: the registry rejects it at wrapper creation.
 
-**Atomic-item scheduling (optional).** Enable
-`supports_mm_encoder_item_scheduling` only when items can be encoded independently.
-Supply exact positive `encoder_token_lengths`, `output_embedding_lengths`, and
-item selection, and implement `get_max_mm_encoder_output_embeddings` to size
-the cache for one legal iteration. Missing scheduling metadata fails admission;
-it does not trigger a per-request fallback. Keep lengths and partitions on the
+**Atomic-item scheduling (optional).** Declare each processed field through
+`get_mm_input_partitions(processed)` to enable independent item encoding.
+Packed lengths supply the default costs. Batched items cost one. Provide
+`encoder_token_lengths` for other units and implement `get_max_mm_encoder_output_embeddings` to size
+the cache for one legal iteration. Return `None` for a layout that requires
+whole-request encoding. Keep lengths and partitions on the
 host: `.cpu().tolist()` can synchronize and does not belong in a forward path.
 
 Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model text-prompt path. **Don't override `__call__`**: the base class's concrete `__call__` dispatches here for text prompts, and also detokenizes `prompt_token_ids → prompt` and falls through to here for non-fast-path VLMs. `call_with_text_prompt` does:

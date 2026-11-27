@@ -64,6 +64,10 @@ class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
 
 
+class _MissingItemPartition(MultimodalEncoderContractError):
+    """A raw input has no declaration for per-item selection."""
+
+
 def _assemble_multimodal_encoder_embeddings(
     item_tensors: Dict[int, torch.Tensor], total_items: int
 ) -> torch.Tensor:
@@ -418,7 +422,7 @@ class MultimodalModelMixin:
     * A partially cached `MultimodalParams` is handled by encoding only its miss items
       and interleaving cached items back in original per-item order. The default
       `build_multimodal_encoder_input` selects fields declared by
-      `get_multimodal_item_partitions`. Undeclared models retain legacy stacked/packed inference.
+      the input processor.
     """
 
     supports_vision_gpu_normalize: ClassVar[bool] = False
@@ -426,12 +430,6 @@ class MultimodalModelMixin:
 
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
-
-    supports_mm_encoder_item_scheduling: ClassVar[bool] = False
-    """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
-    forward and pairs with a processor that overrides
-    `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
-    item scheduling."""
 
     # TODO: Move capability declarations into the planned single
     # SupportsMultimodal Protocol; keep shared execution in this mixin
@@ -885,8 +883,7 @@ class MultimodalModelMixin:
         """Declare how items occupy each field of one modality's payload.
 
         Models declare batched axes, packed item lengths, and shared values.
-        Unlisted fields pass through unchanged. Returning None retains legacy
-        layout inference for models that have not declared their fields.
+        The processor stores declarations in the common request metadata.
         """
         metadata = param.item_metadata
         return metadata.input_partitions.get(modality) if metadata is not None else None
@@ -921,11 +918,16 @@ class MultimodalModelMixin:
             )
         item_partitions = self.get_multimodal_item_partitions(param, modality)
         if item_partitions is None:
-            sliced = self._select_legacy_multimodal_fields(
-                modality_data, modality, local_item_indices
-            )
-        else:
+            raise _MissingItemPartition(f"Missing input partitions for {modality}")
+        try:
             sliced = select_multimodal_fields(modality_data, item_partitions, local_item_indices)
+        except KeyError as error:
+            missing = modality_data.keys() - item_partitions.keys()
+            if not missing:
+                raise
+            raise _MissingItemPartition(
+                f"Missing input partitions for {modality}: {sorted(missing)}"
+            ) from error
 
         # Metadata slicing must not rewrite the original request's hashes.
         residual_input = (
@@ -941,115 +943,6 @@ class MultimodalModelMixin:
             multimodal_data=residual_data,
             multimodal_input=residual_input,
         )
-
-    def _select_legacy_multimodal_fields(
-        self,
-        modality_data: Dict[str, Any],
-        modality: str,
-        item_indices: Sequence[int],
-    ) -> Dict[str, Any]:
-        """Select recognized packed/stacked layouts for undeclared models."""
-        indices = list(item_indices)
-        grid_key = {"image": "image_grid_thw", "video": "video_grid_thw"}.get(modality)
-        pixel_key = {"image": "pixel_values", "video": "pixel_values_videos"}.get(modality)
-
-        if (
-            (grid_key and pixel_key)
-            and (grid_key in modality_data)
-            and (pixel_key in modality_data)
-        ):
-            # Packed layout: prefix-sum patch counts to locate each item's slab, then
-            # concat the requested subset in item-index order.
-            grids = modality_data[grid_key]
-            n_items = grids.shape[0]
-            patch_counts = [int(c) for c in torch.prod(grids, dim=1).tolist()]
-            row_starts = list(itertools.accumulate(patch_counts, initial=0))
-            if indices == list(range(indices[0], indices[0] + len(indices))):
-                # Contiguous run: the concatenation is just a row range, so take
-                # a view instead of copying the payload. The common case for
-                # both callers -- a scheduler picks items in order, and cache
-                # misses cluster.
-                pixel_slice = modality_data[pixel_key][
-                    row_starts[indices[0]] : row_starts[indices[-1] + 1]
-                ]
-            else:
-                per_item = torch.split(modality_data[pixel_key], patch_counts, dim=0)
-                pixel_slice = torch.cat([per_item[i] for i in indices], dim=0)
-            sliced = {
-                pixel_key: pixel_slice,
-                grid_key: grids[indices],
-            }
-        elif (
-            modality == "image"
-            and "pixel_values" in modality_data
-            and "image_sizes" in modality_data
-        ):
-            # Stacked layout: dim-0 select from `pixel_values` and list-index `image_sizes`.
-            n_items = modality_data["pixel_values"].shape[0]
-            miss_sizes = [modality_data["image_sizes"][i] for i in indices]
-            miss_pixel = modality_data["pixel_values"][indices]
-            # `pixel_values` was padded to the request-wide max H/W by the input
-            # processor. After keeping only the miss subset, crop the trailing H/W back
-            # down to that subset's own max true size -- otherwise a downstream re-batch
-            # step (e.g. Mistral 3's `batch_pixel_values`) that pads to
-            # `max(residual.image_sizes)` would compute a negative pad amount whenever
-            # the omitted items were the largest in the original request.
-            if miss_sizes and miss_pixel.dim() >= 4:
-                max_h = max(int(s[0]) for s in miss_sizes)
-                max_w = max(int(s[1]) for s in miss_sizes)
-                miss_pixel = miss_pixel[..., :max_h, :max_w]
-            sliced = {
-                "pixel_values": miss_pixel,
-                "image_sizes": miss_sizes,
-            }
-        elif modality == "audio" and "input_features" in modality_data:
-            # Stacked layout: `input_features [B, mel_bins, T]` sliced on dim 0.
-            # Per-item masks (`input_features_mask`, `feature_attention_mask`, ...)
-            # are handled by the sibling-slice pass below.
-            n_items = modality_data["input_features"].shape[0]
-            sliced = {
-                "input_features": modality_data["input_features"][indices],
-            }
-        else:
-            raise NotImplementedError(
-                f"Default `build_multimodal_encoder_input` cannot slice {modality} layout "
-                f"with fields {sorted(modality_data)}; override this method."
-            )
-
-        # Sibling per-item fields (e.g. `second_per_grid_ts` on Qwen2.5-VL video)
-        # must be sliced alongside the load-bearing keys above, or the residual
-        # carries a shape-mismatched encoder input.
-        sliced = {
-            **modality_data,
-            **sliced,
-            **self._slice_per_item_sibling_fields(modality_data, n_items, indices, sliced.keys()),
-        }
-
-        return sliced
-
-    @staticmethod
-    def _slice_per_item_sibling_fields(
-        modality_data: Dict[str, Any],
-        n_items: int,
-        item_indices: Sequence[int],
-        already_sliced: Iterable[str],
-    ) -> Dict[str, Any]:
-        """Slice modality-dict siblings whose first axis is parallel to items.
-
-        Anything with `shape[0] == n_items` (tensor) or `len == n_items` (list) is
-        assumed to be per-item metadata and sliced by `item_indices`. Fields already
-        handled by the caller (`already_sliced`) and everything else pass through.
-        """
-        skip = set(already_sliced)
-        sliced: Dict[str, Any] = {}
-        for key, value in modality_data.items():
-            if key in skip:
-                continue
-            if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == n_items:
-                sliced[key] = value[item_indices]
-            elif isinstance(value, list) and len(value) == n_items:
-                sliced[key] = [value[i] for i in item_indices]
-        return sliced
 
     # A future optional mixin-owned forward can build on the same template method.
     def prepare_multimodal_inputs(
@@ -1155,7 +1048,7 @@ class MultimodalModelMixin:
         if partial_hits:
             # `encoder_cache` is non-None here because partitions are only produced when the cache
             # exists.
-            self._encode_with_partial_cache(partial_hits, encoder_cache)
+            cache_misses.extend(self._encode_with_partial_cache(partial_hits, encoder_cache))
 
         embeddings = get_multimodal_embeddings(
             encoder_forward_fn=self._run_multimodal_encoder,
@@ -1434,37 +1327,36 @@ class MultimodalModelMixin:
         self,
         partials: Sequence[tuple[MultimodalParams, EncoderCachePartition]],
         encoder_cache: TensorLRUCache,
-    ) -> None:
-        """Encode only the miss items of each partial-hit param and stitch results.
-
-        Miss residuals from all partial-hit params in the batch are encoded in a
-        single call and the concatenated output is split back per param, mirroring
-        how `get_multimodal_embeddings` batches full-miss params. After this returns,
-        each param's `multimodal_embedding` has the same shape as a full encoder run
-        so downstream `get_multimodal_embeddings` treats it as fully cached.
-        """
-        if not partials:
-            return
-
-        # Cross-iter prefetch may have staged some params' raw MM tensors on the aux
-        # stream. If a prefetch encoder call then raised, the request reaches this
-        # iteration with an `encoder_event` but no `multimodal_embedding`; slicing
-        # those tensors on the main stream before the event would race the aux-stream
-        # H2D copy. Wait per param up front, before any raw-tensor read.
-        for param, _ in partials:
+    ) -> list[MultimodalParams]:
+        """Stitch cached and newly encoded items, returning requests that need a full encode."""
+        encoder_inputs = []
+        selected_partials = []
+        full_misses = []
+        for param, partition in partials:
+            # A failed prefetch can leave raw tensors whose H2D copy is still pending.
             if param.encoder_event is not None:
                 torch.cuda.current_stream().wait_event(param.encoder_event)
+            try:
+                encoder_inputs.extend(
+                    self.prepare_multimodal_encoder_inputs(
+                        [(param, i) for i in partition.miss_indices]
+                    )
+                )
+            except _MissingItemPartition:
+                # Older cacheable requests can lack a declaration for a missing input.
+                full_misses.append(param)
+                continue
+            selected_partials.append((param, partition))
+        if not selected_partials:
+            return full_misses
 
-        encoder_inputs = self.prepare_multimodal_encoder_inputs(
-            [(param, i) for param, partition in partials for i in partition.miss_indices]
-        )
         # Keep one call across requests and modalities so EncoderGroup can
         # batch modalities that share an encoder.
         batched_output = self._run_multimodal_encoder([param for param, _, _ in encoder_inputs])
         output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
         encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
 
-        for param, partition in partials:
+        for param, partition in selected_partials:
             miss_tensors = [next(encoded_items) for _ in partition.miss_indices]
 
             by_item: Dict[int, torch.Tensor] = dict(partition.hits)
@@ -1489,6 +1381,8 @@ class MultimodalModelMixin:
                 f"cache_writes_inserted={inserted} "
                 f"cache_writes_rejected={rejected}"
             )
+
+        return full_misses
 
     @classmethod
     def _write_encoder_cache_entries(
@@ -1757,7 +1651,9 @@ def _dispatch_cross_iter_prefetch(
             # next iteration, so keep a clone rather than a view of a released window.
             with discard_nccl_window_tensor_outputs(params_to_transfer):
                 if partial_hits and encoder_cache is not None:
-                    model._encode_with_partial_cache(partial_hits, encoder_cache)
+                    cache_misses.extend(
+                        model._encode_with_partial_cache(partial_hits, encoder_cache)
+                    )
                 if cache_misses:
                     encoder_output = model._run_multimodal_encoder(cache_misses).clone()
                     _store_chunked_prefill_embeddings(cache_misses, [encoder_output])

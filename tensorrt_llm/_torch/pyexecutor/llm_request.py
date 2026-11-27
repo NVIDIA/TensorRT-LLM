@@ -15,9 +15,9 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
-from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
-                                            MultimodalParams,
-                                            get_multimodal_item_metadata)
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalEncoderRequestState,
+    MultimodalParams, get_multimodal_item_metadata)
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import EmbeddingBias, LogprobMode
@@ -1699,7 +1699,7 @@ def initialize_multimodal_encoder_request(
     """Initialize immutable request kind and mutable per-item encoder state.
 
     Raises `ValueError` (failing only this request) when raw encoder inputs
-    have missing or empty item metadata, an atomic item is larger than the
+    declare invalid item metadata, an atomic item is larger than the
     effective encoder token budget, the items' embedding rows do not match
     the prompt's embedding slots, or — when the encoder-output budget is
     supplied — the outputs that must be resident at once could never fit
@@ -1715,6 +1715,12 @@ def initialize_multimodal_encoder_request(
     token_lengths = (get_multimodal_encoder_token_lengths(request)
                      if needs_item_encoding else None)
     if needs_item_encoding and token_lengths is None:
+        metadata = get_multimodal_item_metadata(mm_data)
+        # A processor can decline independent encoding for this layout.
+        if MULTIMODAL_ENCODER_ITEM_METADATA_KEY in mm_data and (
+                metadata is None or not metadata.input_partitions):
+            request.py_mm_encoder_state = None
+            return
         raise ValueError(
             "Raw multimodal payload requires multimodal_encoder_item_metadata "
             "when item-level encoder scheduling is enabled")
