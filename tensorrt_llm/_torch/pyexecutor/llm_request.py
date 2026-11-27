@@ -1711,7 +1711,9 @@ def initialize_multimodal_encoder_request(
         for modality in ("image", "video", "audio"))
     has_full_embedding = (isinstance(mm_data, dict)
                           and mm_data.get("multimodal_embedding") is not None)
-    needs_item_encoding = has_raw_payload and not has_full_embedding
+    needs_item_encoding = (
+        has_raw_payload and not has_full_embedding
+        and not getattr(request, "is_generation_only_request", False))
     token_lengths = (get_multimodal_encoder_token_lengths(request)
                      if needs_item_encoding else None)
     if needs_item_encoding and token_lengths is None:

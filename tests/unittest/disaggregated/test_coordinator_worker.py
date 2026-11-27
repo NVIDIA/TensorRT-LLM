@@ -1071,7 +1071,7 @@ def test_coordinator_session_gives_up_idle_connections_before_the_server():
 
     for url, connector_name in (
         ("unix:/tmp/trtllm_disagg_coord_8333.sock", "UnixConnector"),
-        ("http://coordinator:8332", "TCPConnector"),
+        ("http://127.0.0.1:8332", "TCPConnector"),
     ):
         with (
             patch.object(dc.aiohttp, connector_name) as connector,
@@ -1157,6 +1157,7 @@ async def test_coordinator_tcp_listener_uses_the_prebound_socket(monkeypatch, ud
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     with sock:
+        sock.bind(("127.0.0.1", 0))
         await server("fe80::ac31:4bff:fee6:2d43", 8332, uds=uds, sockets=[sock])
 
         tcp_server.serve.assert_awaited_once_with(sockets=[sock])

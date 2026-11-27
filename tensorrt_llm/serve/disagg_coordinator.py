@@ -60,6 +60,7 @@ from tensorrt_llm.serve.cluster_storage import (
     create_cluster_storage,
     validate_http_cluster_storage_scope,
 )
+from tensorrt_llm.serve.coordinator_tls import coordinator_client_ssl
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
@@ -715,7 +716,11 @@ def make_coordinator_session(remote_url: str) -> aiohttp.ClientSession:
             )
         )
     return aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=0, keepalive_timeout=COORDINATOR_KEEPALIVE_TIMEOUT_S)
+        connector=aiohttp.TCPConnector(
+            limit=0,
+            keepalive_timeout=COORDINATOR_KEEPALIVE_TIMEOUT_S,
+            ssl=coordinator_client_ssl(remote_url),
+        )
     )
 
 

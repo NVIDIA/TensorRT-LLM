@@ -234,6 +234,12 @@ class HttpClusterStorageServer(ClusterStorage):
     # Granularity at which the expiry sweep samples the event loop.
     _OUTAGE_SAMPLE_SEC = 0.1
 
+    # Each record describes a worker. Bound both the individual record and the
+    # number retained by this process; existing workers can renew at capacity.
+    MAX_RECORDS = 4096
+    MAX_KEY_BYTES = 1024
+    MAX_VALUE_BYTES = 64 << 10
+
     def __init__(self,
                  cluster_uri,
                  cluster_name,
@@ -321,14 +327,25 @@ class HttpClusterStorageServer(ClusterStorage):
         return await self._set(storage_item)
 
     async def _set(self, storage_item: StorageItem) -> bool:
+        key = storage_item.key
+        value = storage_item.value or ""
+        if (len(key) > self.MAX_KEY_BYTES or len(value) > self.MAX_VALUE_BYTES
+                or (not key.isascii()
+                    and len(key.encode("utf-8")) > self.MAX_KEY_BYTES)
+                or (not value.isascii()
+                    and len(value.encode("utf-8")) > self.MAX_VALUE_BYTES)):
+            return False
         async with self._lock:
-            if storage_item.key in self._storage and not storage_item.overwrite_if_exists:
+            if key in self._storage:
+                if not storage_item.overwrite_if_exists:
+                    return False
+            elif len(self._storage) >= self.MAX_RECORDS:
                 return False
             if storage_item.expire_time < 0 and storage_item.ttl and storage_item.ttl > 0:
                 storage_item.expire_time = (self._service_now() +
                                             storage_item.ttl)
-            self._storage[storage_item.key] = storage_item
-            await self._notify_watch_event(storage_item.key, storage_item,
+            self._storage[key] = storage_item
+            await self._notify_watch_event(key, storage_item,
                                            WatchEventType.SET)
             return True
 

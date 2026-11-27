@@ -9896,13 +9896,10 @@ class PyExecutor:
         remaining_batch_slots = self.model_engine.encoder_batch_size
         remaining_tokens = self.model_engine.encoder_max_num_tokens
 
-        def consume_pending(costs, pending_indices=None):
+        def consume_pending(costs):
             nonlocal remaining_batch_slots, remaining_tokens
-            if pending_indices is None:
-                pending_indices = range(len(costs))
             progressed = False
-            for item_idx in pending_indices:
-                cost = costs[item_idx]
+            for cost in costs:
                 if remaining_batch_slots == 0 or cost > remaining_tokens:
                     break
                 remaining_batch_slots -= 1
@@ -9928,8 +9925,9 @@ class PyExecutor:
             else:
                 pending_item_indices = get_mm_pending_items(request)
             if pending_item_indices:
-                consume_pending(state.encoder_token_lengths,
-                                pending_item_indices)
+                consume_pending(
+                    map(state.encoder_token_lengths.__getitem__,
+                        pending_item_indices))
 
         admitted = []
         deferred = []
@@ -9939,9 +9937,13 @@ class PyExecutor:
                 deferred.append(queue_item)
                 continue
             mm_data = getattr(queue_item.request, "py_multimodal_data", None)
+            if not isinstance(mm_data, dict) or getattr(
+                    queue_item.request, "request_type",
+                    None) == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+                admitted.append(queue_item)
+                continue
             try:
-                item_metadata = (get_multimodal_item_metadata(mm_data)
-                                 if isinstance(mm_data, dict) else None)
+                item_metadata = get_multimodal_item_metadata(mm_data)
                 if item_metadata is not None:
                     item_metadata.validate()
             except (TypeError, ValueError):
@@ -9953,16 +9955,10 @@ class PyExecutor:
                 continue
             costs = (item_metadata.encoder_token_lengths
                      if item_metadata is not None else None)
-            has_full_embedding = (isinstance(mm_data, dict)
-                                  and mm_data.get("multimodal_embedding")
-                                  is not None)
-            if costs and any(cost > self.model_engine.encoder_max_num_tokens
-                             for cost in costs):
-                # Admit the invalid request so normal request validation can
-                # return an error instead of leaving the FCFS queue blocked.
-                admitted.append(queue_item)
-                continue
-            if costs and not has_full_embedding and not consume_pending(costs):
+            # An oversized item must reach request-scoped validation.
+            if (costs and mm_data.get("multimodal_embedding") is None
+                    and max(costs) <= self.model_engine.encoder_max_num_tokens
+                    and not consume_pending(costs)):
                 blocked = True
                 deferred.append(queue_item)
                 continue

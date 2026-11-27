@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import contextlib
 import subprocess
@@ -412,3 +415,22 @@ async def test_consecutive_outages_are_not_charged_to_ttl():
         assert await storage.get(key) is None
     finally:
         await storage.stop()
+
+
+@pytest.mark.asyncio
+async def test_registry_capacity_tracks_live_worker_records(monkeypatch):
+    store = HttpClusterStorageServer("", "")
+    monkeypatch.setattr(store, "MAX_RECORDS", 2)
+    monkeypatch.setattr(store, "MAX_KEY_BYTES", 4)
+    monkeypatch.setattr(store, "MAX_VALUE_BYTES", 4)
+    assert await store.set("a", "meta")
+    assert await store.set("b", "old")
+    assert not await store.set("c", "new")
+    assert await store.set("b", "new", overwrite_if_exists=True)
+    assert not await store.set("a", "large", overwrite_if_exists=True)
+    assert await store.get("a") == "meta"
+    assert await store.delete("a")
+    assert not await store.set("ééé", "old")
+    assert await store.set("éé", "éé")
+    assert not await store.set("éé", "ééé", overwrite_if_exists=True)
+    assert await store.get("éé") == "éé"

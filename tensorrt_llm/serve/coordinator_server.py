@@ -46,7 +46,8 @@ from fastapi.responses import Response
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
-from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
+from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer, is_loopback_host
+from tensorrt_llm.serve.coordinator_tls import CoordinatorTLS
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.output_length_predictor import MAX_TOKENS, RECORD_BATCH_MAX, is_token_count
 from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
@@ -327,6 +328,12 @@ class CoordinatorServer:
         # always refuses ("invalid argument"), since the scope id can only come
         # from an interface name.
         kwargs = dict(workers=1, log_level="info", timeout_keep_alive=keep_alive_timeout)
+        tls = CoordinatorTLS.from_env()
+        if tls is None:
+            hosts = [sock.getsockname()[0] for sock in sockets] if sockets else [host]
+            if not all(is_loopback_host(address) for address in hosts):
+                raise ValueError("A non-loopback coordinator listener requires mutual TLS")
+        tcp_options = tls.server_options() if tls is not None else {}
         if uds:
             # uvicorn.Config binds uds XOR host:port, so run two Servers: UDS for
             # the fleet (hot path) and TCP for health/external clients.
@@ -343,7 +350,9 @@ class CoordinatorServer:
                 uds_cfg = uvicorn.Config(
                     self.app, uds=uds, lifespan="off", backlog=COORDINATOR_UDS_BACKLOG, **kwargs
                 )
-                tcp_cfg = uvicorn.Config(self.app, host=host, port=port, lifespan="off", **kwargs)
+                tcp_cfg = uvicorn.Config(
+                    self.app, host=host, port=port, lifespan="off", **tcp_options, **kwargs
+                )
                 await self._serve(
                     [
                         (create_uvicorn_server(uds_cfg), None),
@@ -353,7 +362,7 @@ class CoordinatorServer:
             finally:
                 await self._coordinator.stop()
         else:
-            config = uvicorn.Config(self.app, host=host, port=port, **kwargs)
+            config = uvicorn.Config(self.app, host=host, port=port, **tcp_options, **kwargs)
             await self._serve([(create_uvicorn_server(config), sockets)])
 
     async def _serve(
