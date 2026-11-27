@@ -128,6 +128,34 @@ def delay_disk_write_behind_flushes_for_testing(seconds: float) -> None:
     _cpp().delay_disk_write_behind_flushes_for_testing(seconds)
 
 
+def disk_io_write_cap_stats_for_testing(reset: bool = False) -> dict[str, int]:
+    """How the async disk I/O pool shares its workers between reads and write pieces.
+
+    ``threads``, ``max_writers`` (workers that may run write pieces at once, 0: no cap), ``peak_writers`` (most
+    workers seen in write pieces at once), ``reads_past_capped_writes`` (reads started while a write waited at the
+    cap) and ``expired_write_holds`` (write pieces ``hold_disk_write_pieces_for_testing`` released at its deadline).
+    All 0 without the pool. ``reset`` zeroes the counters after reading them.
+    """
+    return {k: int(v) for k, v in _cpp().disk_io_write_cap_stats_for_testing(reset).items()}
+
+
+def set_disk_io_max_write_threads_for_testing(max_writers: int) -> int:
+    """Let at most ``max_writers`` async disk I/O workers run write pieces at once (0: no cap).
+
+    Returns the previous cap (0: none), or 0 without the pool.
+    """
+    return int(_cpp().set_disk_io_max_write_threads_for_testing(max_writers))
+
+
+def hold_disk_write_pieces_for_testing(seconds: float) -> None:
+    """For the next ``seconds``, an async disk I/O worker that starts a write piece waits before writing, as a
+    buffered write blocked in the kernel would; the deadline releases them (0: release now).
+
+    The deadline is kept in C++, so a test whose thread waits on the held writes is freed without a Python thread.
+    """
+    _cpp().hold_disk_write_pieces_for_testing(seconds)
+
+
 def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]) -> Any:
     """Create the private native padding codec used by cold-tier end-to-end tests."""
     return _cpp().create_test_padding_cold_page_codec(cold_page_bytes_by_layer)

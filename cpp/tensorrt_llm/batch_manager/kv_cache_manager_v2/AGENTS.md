@@ -460,6 +460,12 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   device-mapped host memory with `cuStreamWaitValue64`, or in a host function
   when that is unavailable or fails. Pieces are served reads first, then
   required writes, then background writes, with aging so no queue starves.
+  Write pieces (required writes, write-behind flushes, write-through copies) run
+  on at most half of the workers at once (`TLLM_KV_DISK_IO_MAX_WRITE_THREADS`
+  overrides the cap, 0 removes it): a buffered write can block for milliseconds
+  on the file's inode lock or dirty throttling, and without the cap a standing
+  write backlog parks every worker in a write, so restores read at the rate
+  writes complete.
 - Write-behind (`disk_write_behind_mib` -> `DiskCacheTierConfig::writeBehindBytes`,
   process-wide, needs the async pool): a host -> disk write that fits the staging
   bound completes once each page is copied into staging (stage pieces, served

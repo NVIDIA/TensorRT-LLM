@@ -2499,6 +2499,32 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "delay_background_disk_writes_for_testing",
         [](double seconds) { kv::delayBackgroundDiskWritesForTesting(seconds); }, nb::arg("seconds"),
         "The async disk I/O pool starts a background write piece only once it has been queued for `seconds`.");
+    mIntrospection.def(
+        "disk_io_write_cap_stats_for_testing",
+        [](bool reset)
+        {
+            auto const s = kv::diskIoWriteCapStatsForTesting(reset);
+            nb::dict stats;
+            stats["threads"] = s.threads;
+            stats["max_writers"] = s.maxWriters;
+            stats["peak_writers"] = s.peakWriters;
+            stats["reads_past_capped_writes"] = s.readsPastCappedWrites;
+            stats["expired_write_holds"] = s.expiredWriteHolds;
+            return stats;
+        },
+        nb::arg("reset") = false,
+        "The async disk I/O pool's write cap (max_writers, 0: none), the most workers seen in write pieces at once, "
+        "the reads started while a write waited at the cap and the held write pieces released by their deadline; "
+        "`reset` zeroes the counters.");
+    mIntrospection.def(
+        "set_disk_io_max_write_threads_for_testing",
+        [](size_t maxWriters) { return kv::setDiskIoMaxWriteThreadsForTesting(maxWriters); }, nb::arg("max_writers"),
+        "Cap the async disk I/O pool's workers in write pieces (0: no cap); returns the old cap.");
+    mIntrospection.def(
+        "hold_disk_write_pieces_for_testing", [](double seconds) { kv::holdDiskWritePiecesForTesting(seconds); },
+        nb::arg("seconds"),
+        "For the next `seconds`, an async disk I/O worker that starts a write piece waits before writing (0: "
+        "release).");
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
 

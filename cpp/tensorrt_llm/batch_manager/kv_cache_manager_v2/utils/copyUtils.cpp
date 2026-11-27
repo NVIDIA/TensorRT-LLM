@@ -1016,14 +1016,46 @@ public:
     }
 
     //! At most \p maxWriters workers run write pieces (required writes, write-behind flushes, write-through copies)
-    //! at once; the others are kept for reads. 0: no limit.
-    void setMaxWriters(size_t maxWriters)
+    //! at once; the others are kept for reads. 0: no limit. Returns the previous limit (0: none).
+    size_t setMaxWriters(size_t maxWriters)
     {
+        size_t previous = 0;
         {
             std::lock_guard<std::mutex> lock(mMutex);
+            previous = mMaxWriters == std::numeric_limits<size_t>::max() ? 0 : mMaxWriters;
             mMaxWriters = maxWriters == 0 ? std::numeric_limits<size_t>::max() : maxWriters;
         }
         mCv.notify_all();
+        return previous;
+    }
+
+    //! Testing only: the write cap and its counters (threads is filled in by the caller).
+    DiskIoWriteCapStats writeCapStats(bool reset)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        DiskIoWriteCapStats stats;
+        stats.maxWriters = mMaxWriters == std::numeric_limits<size_t>::max() ? 0 : mMaxWriters;
+        stats.peakWriters = mPeakWriters;
+        stats.readsPastCappedWrites = mReadsPastCappedWrites;
+        stats.expiredWriteHolds = mExpiredWriteHolds;
+        if (reset)
+        {
+            mPeakWriters = mWritersRunning;
+            mReadsPastCappedWrites = 0;
+            mExpiredWriteHolds = 0;
+        }
+        return stats;
+    }
+
+    //! Testing only: until \p until, a worker that took a write piece waits before running it; time_point::min()
+    //! releases the waiting workers now.
+    void holdWrites(std::chrono::steady_clock::time_point until)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mHoldWritesUntil = until;
+        }
+        mHoldCv.notify_all();
     }
 
     void delayBackground(std::chrono::steady_clock::duration delay)
@@ -1193,6 +1225,10 @@ private:
         if (!canStartWrite())
         {
             // hasWork(now): with no write allowed, reads are waiting.
+            if (!mWrites.empty() || flushReady(now) || backgroundReady(now))
+            {
+                ++mReadsPastCappedWrites;
+            }
             return mReads;
         }
         bool const readsWaiting = !mReads.empty();
@@ -1259,10 +1295,22 @@ private:
                 isWrite = &queue != &mStage && &queue != &mReads;
                 if (isWrite)
                 {
-                    ++mWritersRunning;
+                    mPeakWriters = std::max(mPeakWriters, ++mWritersRunning);
                 }
                 piece = std::move(queue.front());
                 queue.pop_front();
+                if (isWrite && std::chrono::steady_clock::now() < mHoldWritesUntil)
+                {
+                    // Testing only (holdDiskWritePiecesForTesting): the worker counts as a writer while it waits.
+                    auto const until = mHoldWritesUntil;
+                    mHoldCv.wait_until(lock, until,
+                        [this, until]
+                        { return mHoldWritesUntil != until || std::chrono::steady_clock::now() >= until; });
+                    if (mHoldWritesUntil == until)
+                    {
+                        ++mExpiredWriteHolds; // released by the deadline, not by the caller
+                    }
+                }
             }
             runOne(std::move(piece));
             if (isWrite)
@@ -1391,17 +1439,22 @@ private:
     std::mutex mMutex;
     std::condition_variable mCv;
     std::condition_variable mIdleCv;
+    std::condition_variable mHoldCv;                         // testing only: holdDiskWritePiecesForTesting
     size_t mInFlight = 0;                                    // pieces queued or running
     bool mServedAgedPiece = false;                           // the last piece jumped the queue while reads were waiting
     size_t mMaxWriters = std::numeric_limits<size_t>::max(); // workers that may run write pieces at once
     size_t mWritersRunning = 0;                              // workers running a write piece
-    std::chrono::steady_clock::duration mBackgroundDelay{0}; // testing only: delayBackgroundDiskWritesForTesting
-    std::chrono::steady_clock::duration mFlushDelay{0};      // testing only: delayDiskWriteBehindFlushesForTesting
-    std::deque<Piece> mStage;                                // write-behind: copy a page into staging
-    std::deque<Piece> mFlush;                                // write-behind: write a staged page to its file
-    std::deque<Piece> mReads;                                // restores: on the critical path
-    std::deque<Piece> mWrites;                               // required evictions to disk
-    std::deque<Piece> mBackground;                           // write-through copies
+    size_t mPeakWriters = 0;                                 // testing only: most of mWritersRunning seen
+    uint64_t mReadsPastCappedWrites = 0;                     // testing only: reads started while a write was capped
+    uint64_t mExpiredWriteHolds = 0;                         // testing only: held write pieces released by the deadline
+    std::chrono::steady_clock::time_point mHoldWritesUntil{}; // testing only: holdDiskWritePiecesForTesting
+    std::chrono::steady_clock::duration mBackgroundDelay{0};  // testing only: delayBackgroundDiskWritesForTesting
+    std::chrono::steady_clock::duration mFlushDelay{0};       // testing only: delayDiskWriteBehindFlushesForTesting
+    std::deque<Piece> mStage;                                 // write-behind: copy a page into staging
+    std::deque<Piece> mFlush;                                 // write-behind: write a staged page to its file
+    std::deque<Piece> mReads;                                 // restores: on the critical path
+    std::deque<Piece> mWrites;                                // required evictions to disk
+    std::deque<Piece> mBackground;                            // write-through copies
 };
 
 // Set once by configureAsyncDiskIo, before gAsyncDiskIoThreads. Intentionally leaked: detached workers may
@@ -1609,6 +1662,33 @@ void delayBackgroundDiskWritesForTesting(double seconds) noexcept
     }
 }
 
+DiskIoWriteCapStats diskIoWriteCapStatsForTesting(bool reset) noexcept
+{
+    if (!asyncDiskIo())
+    {
+        return {};
+    }
+    auto stats = diskIoPool().writeCapStats(reset);
+    stats.threads = gAsyncDiskIoThreads.load(std::memory_order_acquire);
+    return stats;
+}
+
+size_t setDiskIoMaxWriteThreadsForTesting(size_t maxWriters) noexcept
+{
+    return asyncDiskIo() ? diskIoPool().setMaxWriters(maxWriters) : 0;
+}
+
+void holdDiskWritePiecesForTesting(double seconds) noexcept
+{
+    if (asyncDiskIo())
+    {
+        diskIoPool().holdWrites(seconds > 0 ? std::chrono::steady_clock::now()
+                    + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::duration<double>(seconds))
+                                            : std::chrono::steady_clock::time_point::min());
+    }
+}
+
 void waitForDiskIo() noexcept
 {
     if (asyncDiskIo())
@@ -1732,7 +1812,18 @@ void configureAsyncDiskIo(size_t numThreads) noexcept
     size_t maxWriters = std::max<size_t>(1, started / 2);
     if (char const* env = std::getenv("TLLM_KV_DISK_IO_MAX_WRITE_THREADS"); env != nullptr && *env != '\0')
     {
-        maxWriters = static_cast<size_t>(std::strtoull(env, nullptr, 10));
+        char* end = nullptr;
+        unsigned long long const value = std::strtoull(env, &end, 10);
+        if (end != nullptr && *end == '\0' && *env != '-')
+        {
+            maxWriters = static_cast<size_t>(value);
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2Utils] ignoring TLLM_KV_DISK_IO_MAX_WRITE_THREADS=%s (not a non-negative integer)",
+                env);
+        }
     }
     pool->setMaxWriters(maxWriters);
     gAsyncDiskIoThreads.store(started, std::memory_order_release);

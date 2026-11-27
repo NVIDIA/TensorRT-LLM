@@ -12313,6 +12313,99 @@ class TestNoBatchingDiskWriteBehind(TestNoBatchingDiskOptions):
         self.manager.clear_reusable_blocks()
 
 
+class TestNoBatchingDiskIoWriteCap(TestNoBatchingDiskWriteBehind):
+    """The async disk I/O pool runs write pieces on at most half of its workers.
+
+    A buffered write of a KV page can block in the kernel for milliseconds (the file's inode lock, dirty-page
+    throttling) while a read takes tens of microseconds. Without a cap, a standing write backlog parks every worker in a
+    write and restores read only as fast as writes complete. The hold hook stands in for a blocked write: a worker that
+    starts a write piece waits there until it is released. Write-behind is on and write-through off, so every host ->
+    disk write completes once staged (a stage piece is a memory copy, not a write piece), and only the flushes, which
+    nothing on a stream waits for, are held.
+    """
+
+    disk_tier_options = {"num_io_threads": 4, "write_behind_bytes": _WRITE_BEHIND_BYTES}
+
+    def setUp(self) -> None:
+        if self._testMethodName not in type(self).__dict__:
+            self.skipTest("only this class's own tests")
+        TestNoBatching.setUp(self)
+
+    def tearDown(self) -> None:
+        _introspection.hold_disk_write_pieces_for_testing(0)
+        super().tearDown()
+
+    def _restore_while_writes_are_held(self, half_cap: bool, hold_s: float) -> dict:
+        """Restore a prefix from disk while every write piece is held.
+
+        Push the first request's pages to disk and flush them, then hold every write piece for `hold_s` seconds, cap
+        the writers at half the workers (`half_cap`) or not at all, push two more requests to disk (their flushes take
+        writer workers and stay there) and restore the first request's prefix from the file. Returns the pool's stats
+        once the restore is done, before the hold is released: `expired_write_holds` > 0 means the restore had to
+        wait for the deadline to release the held writes.
+        """
+        first, req_ids = self._push_first_request_to_disk()
+        # The prefix is in the file, so the restore below reads it there rather than from staging.
+        self._wait_for_flushes()
+        threads = _introspection.disk_io_write_cap_stats_for_testing()["threads"]
+        self.assertGreaterEqual(threads, 2)
+        previous_cap = _introspection.set_disk_io_max_write_threads_for_testing(
+            threads // 2 if half_cap else 0
+        )
+        _introspection.disk_io_write_cap_stats_for_testing(reset=True)
+        # The deadline lives in C++: a test thread blocked on a held write is freed without Python.
+        _introspection.hold_disk_write_pieces_for_testing(hold_s)
+        try:
+            for _ in range(2):
+                self._run_and_close(self.new_request(next(req_ids), None, 256, 32 * 22 - 256))
+            prompt = first.kv_cache.committed_tokens[: 32 * 11]
+            reuse = self.Request(
+                next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32
+            )
+            self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+            with TemporaryCudaStream([]) as s:
+                self.assertTrue(reuse.kv_cache.resume(cast(CudaStream, s.handle)))
+                # refcheck: the restored KV must be exactly what the first request computed.
+                self._run_by_block(reuse)
+                reuse.kv_cache.close()
+            s.take_finish_event().synchronize()
+            stats = _introspection.disk_io_write_cap_stats_for_testing()
+        finally:
+            _introspection.hold_disk_write_pieces_for_testing(0)
+            _introspection.set_disk_io_max_write_threads_for_testing(previous_cap)
+        self._wait_for_flushes()
+        self.manager.clear_reusable_blocks()
+        stats["expected_threads"] = threads
+        return stats
+
+    def test_reads_run_while_writes_hold_their_workers(self) -> None:
+        stats = self._restore_while_writes_are_held(half_cap=True, hold_s=120.0)
+        cap = stats["expected_threads"] // 2
+        self.assertEqual(
+            stats["expired_write_holds"], 0, "the restore waited for held write pieces"
+        )
+        self.assertEqual(stats["max_writers"], cap, stats)
+        # The backlog filled the writer share and no more: the other workers served the restore's reads.
+        self.assertEqual(stats["peak_writers"], cap, stats)
+        self.assertGreater(stats["reads_past_capped_writes"], 0, stats)
+
+    def test_without_a_cap_held_writes_take_every_worker(self) -> None:
+        # The previous scheduling (no cap): the flushes take every worker, so the restore waits until the deadline
+        # releases the writes, and is still correct afterwards (refcheck).
+        stats = self._restore_while_writes_are_held(half_cap=False, hold_s=3.0)
+        self.assertGreater(stats["expired_write_holds"], 0, stats)
+        self.assertEqual(stats["max_writers"], 0, stats)
+        self.assertEqual(stats["peak_writers"], stats["expected_threads"], stats)
+
+    def test_default_cap_is_half_the_workers(self) -> None:
+        if os.environ.get("TLLM_KV_DISK_IO_MAX_WRITE_THREADS"):
+            self.skipTest("TLLM_KV_DISK_IO_MAX_WRITE_THREADS overrides the default")
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        stats = _introspection.disk_io_write_cap_stats_for_testing()
+        self.assertGreaterEqual(stats["threads"], 1)
+        self.assertEqual(stats["max_writers"], max(1, stats["threads"] // 2), stats)
+
+
 class TestNoBatchingDiskCopyPathOptions(TestNoBatchingDiskOptions):
     """The disk-option tests again with host copy threads and busy-stream skipping on, plus the host free reserve.
 

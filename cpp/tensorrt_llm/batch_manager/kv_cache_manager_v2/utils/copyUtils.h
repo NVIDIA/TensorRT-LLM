@@ -19,6 +19,7 @@
 
 #include "kv_cache_manager_v2/common.h"
 
+#include <cstdint>
 #include <cuda.h>
 #include <memory>
 #include <sys/types.h>
@@ -82,6 +83,29 @@ void delayBackgroundDiskWritesForTesting(double seconds) noexcept;
 
 //! Whether host <-> disk copies run on the async I/O pool (configureAsyncDiskIo started it).
 [[nodiscard]] bool asyncDiskIoEnabled() noexcept;
+
+//! How the async I/O pool shares its workers between reads and write pieces (required writes, write-behind flushes,
+//! write-through copies). All zero without the pool.
+struct DiskIoWriteCapStats
+{
+    size_t threads = 0;                 //!< workers of the pool
+    size_t maxWriters = 0;              //!< workers that may run write pieces at once (0: no cap)
+    size_t peakWriters = 0;             //!< most workers seen running write pieces at once
+    uint64_t readsPastCappedWrites = 0; //!< read pieces started while a write waited at the cap
+    uint64_t expiredWriteHolds = 0;     //!< write pieces holdDiskWritePiecesForTesting released at its deadline
+};
+
+//! Testing only: the pool's write cap and its counters; \p reset zeroes the counters after reading them.
+[[nodiscard]] DiskIoWriteCapStats diskIoWriteCapStatsForTesting(bool reset) noexcept;
+
+//! Testing only: let at most \p maxWriters workers run write pieces at once (0: no cap). Returns the previous cap
+//! (0: none), or 0 without the pool.
+size_t setDiskIoMaxWriteThreadsForTesting(size_t maxWriters) noexcept;
+
+//! Testing only: for the next \p seconds, a worker that starts a write piece waits before writing, as a buffered
+//! write blocked in the kernel (the file's inode lock, dirty-page throttling) would; the deadline releases them. 0
+//! releases them now. The deadline frees a test that would otherwise wait for them forever, without a Python thread.
+void holdDiskWritePiecesForTesting(double seconds) noexcept;
 
 //! Background writes issued in one BackgroundDiskWriteScope on the async I/O pool. It does not keep them alive: once a
 //! write has finished, it is gone from here.
