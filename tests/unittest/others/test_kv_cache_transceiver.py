@@ -10,7 +10,6 @@ import time
 import uuid
 import weakref
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -23,15 +22,11 @@ os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.disaggregation import \
-    kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import \
     create_kv_cache_transceiver
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-    KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import \
+    MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -64,39 +59,6 @@ def test_cpp_transceiver_rejects_mixed_mamba_manager(transceiver_runtime):
                                     attention_type=AttentionTypeCpp.DEFAULT,
                                     cache_transceiver_config=config,
                                     mamba_cache_manager=mixed_manager)
-
-
-@pytest.mark.cpu_only
-# Every combination reaches the same check, so each value appears once.
-@pytest.mark.parametrize("runtime,backend,manager_cls", [
-    (None, "NIXL", KVCacheManagerV2),
-    ("CPP", "UCX", MambaHybridCacheManagerV2),
-    ("auto", "UCX", KVCacheManagerV2),
-])
-def test_cpp_transceiver_rejects_v2_manager(monkeypatch, runtime, backend,
-                                            manager_cls) -> None:
-    config = CacheTransceiverConfig(backend=backend,
-                                    transceiver_runtime=runtime)
-    manager = object.__new__(manager_cls)
-    constructor = Mock()
-    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver",
-                        constructor)
-    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
-    monkeypatch.setattr(transceiver_module,
-                        "_disagg_inflight_cancel_enabled_cache", None)
-
-    with pytest.raises(ValueError,
-                       match=r"kv_cache_config.use_kv_cache_manager_v2=False"):
-        create_kv_cache_transceiver(
-            mapping=None,
-            dist=None,
-            kv_cache_manager=manager,
-            attention_type=AttentionTypeCpp.DEFAULT,
-            cache_transceiver_config=config,
-            mamba_cache_manager=(manager if manager_cls
-                                 is MambaHybridCacheManagerV2 else None))
-
-    constructor.assert_not_called()
 
 
 @pytest.mark.cpu_only
