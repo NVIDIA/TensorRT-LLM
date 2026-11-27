@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 
 __all__ = ["ReadQuestion", "ReadResult", "score_decision_questions"]
 
-# Cap in-flight reads per HTTP request to bound live logit buffers and share engine slots.
+# Each generation read holds a full vocabulary row. This per-request scheduling
+# limit bounds those buffers even when the engine allows larger batches.
 _MAX_CONCURRENT_READS = 8
 
 

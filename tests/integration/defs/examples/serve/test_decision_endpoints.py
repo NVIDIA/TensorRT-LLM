@@ -3,6 +3,7 @@
 
 """Live decision API contracts and checkpoint readout checks on a single GPU."""
 
+import inspect
 import json
 import math
 import os
@@ -140,9 +141,13 @@ def check_openai_sdk(server):
 def check_typesafe_sdk(server):
     from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
 
-    with TypeSafeClient(
-        base_url=server.url, api_key="local", timeout=120, compression=False
-    ) as client:
+    # SDK versions with optional request compression need it disabled for plain JSON.
+    options = (
+        {"compression": False}
+        if "compression" in inspect.signature(TypeSafeClient).parameters
+        else {}
+    )
+    with TypeSafeClient(base_url=server.url, api_key="local", timeout=120, **options) as client:
         result = client.system_one(
             {"team": "billing", "severity": "high", "notes": "Account record. " * 80},
             {
