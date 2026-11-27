@@ -25,7 +25,7 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, KvCacheConfig,
                                           TorchLlmArgs)
 
 # isort: off
-from .test_llm import get_model_path
+from .model_paths import get_model_path
 # isort: on
 
 pytestmark = pytest.mark.threadleak(enabled=False)

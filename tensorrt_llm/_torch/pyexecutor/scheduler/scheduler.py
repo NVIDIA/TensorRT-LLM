@@ -88,6 +88,7 @@ class SchedulerOutput(
             # Multimodal encoder scheduling outputs.
             "scheduled_mm_encoder_items",
             "recompute_paused_requests",
+            "failed_requests",
         ],
     )
 ):
@@ -96,6 +97,7 @@ class SchedulerOutput(
     The optional multimodal fields default to ``None``. The V2-only
     ``recompute_paused_requests`` defaults to a fresh empty list so existing
     V1 schedulers can keep constructing the original six-field output.
+    ``failed_requests`` carries V2 admission failures for executor cleanup.
     """
 
     __slots__ = ()
@@ -110,6 +112,7 @@ class SchedulerOutput(
         num_fitting_requests: int,
         scheduled_mm_encoder_items: dict[int, list[int]] | None = None,
         recompute_paused_requests: RequestList | None = None,
+        failed_requests: RequestList | None = None,
     ):
         return super(SchedulerOutput, cls).__new__(
             cls,
@@ -121,6 +124,7 @@ class SchedulerOutput(
             num_fitting_requests,
             scheduled_mm_encoder_items,
             [] if recompute_paused_requests is None else recompute_paused_requests,
+            [] if failed_requests is None else failed_requests,
         )
 
 
@@ -257,6 +261,8 @@ class ScheduledRequests:
     """Requests whose KV cache was suspended without resetting request state."""
     recompute_paused_requests: RequestList
     """Requests that must release resources and restart from context."""
+    failed_requests: RequestList
+    """Requests that must fail through the executor's request error path."""
     added_inflight_req_ids: list[int]
     """Request ids this batch inserted into the executor's inflight set.
 
@@ -284,6 +290,7 @@ class ScheduledRequests:
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
         self.recompute_paused_requests: RequestList = []
+        self.failed_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
         self.paused_in_place_ids: frozenset[int] = frozenset()
@@ -414,6 +421,9 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
+    def set_transfer_held_requests(self, requests: RequestList) -> None:
+        pass
+
     def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
         """Requests whose KV pages a failed remote cache level took, which the
         executor must fail, with their error messages.
@@ -485,6 +495,8 @@ class SerializableSchedulerOutput:
     scheduled_mm_encoder_items: dict[int, list[int]] | None = None
     recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
     """Request ids of recompute-paused requests."""
+    failed_requests: list[int] = dataclasses.field(default_factory=list)
+    """Requests whose resource admission stalled past the scheduler limit."""
 
     @classmethod
     def from_scheduler_result(
@@ -513,6 +525,7 @@ class SerializableSchedulerOutput:
             recompute_paused_requests=[
                 req.request_id for req in scheduled_requests.recompute_paused_requests
             ],
+            failed_requests=[req.request_id for req in scheduled_requests.failed_requests],
         )
 
     def to_scheduler_result(
@@ -538,6 +551,9 @@ class SerializableSchedulerOutput:
         scheduled_requests.scheduled_mm_encoder_items = self.scheduled_mm_encoder_items
         scheduled_requests.recompute_paused_requests = [
             id_to_request[req_id] for req_id in self.recompute_paused_requests
+        ]
+        scheduled_requests.failed_requests = [
+            id_to_request[req_id] for req_id in self.failed_requests
         ]
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
@@ -816,6 +832,9 @@ class MultimodalScheduler(RequestScheduler):
 
     def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
         return self.scheduler.take_lost_kv_requests()
+
+    def set_transfer_held_requests(self, requests: RequestList) -> None:
+        self.scheduler.set_transfer_held_requests(requests)
 
     def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
         """Forward the local retirement probe to the wrapped scheduler.

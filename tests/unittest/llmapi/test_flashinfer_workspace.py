@@ -248,6 +248,7 @@ def test_mpi_pool_configures_worker_bootstrap(
     session = SimpleNamespace(
         n_workers=n_workers,
         _env_overrides=env_overrides,
+        _mpi_info=None,
         mpi_pool=None,
     )
 
@@ -288,6 +289,7 @@ def test_mpi_pool_distinguishes_managed_and_explicit_workspaces(
     session = SimpleNamespace(
         n_workers=n_workers,
         _env_overrides=env_overrides,
+        _mpi_info=None,
         mpi_pool=None,
     )
 

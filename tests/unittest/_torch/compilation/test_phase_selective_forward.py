@@ -46,6 +46,7 @@ def _create_compile_restricted_runner(
 @pytest.mark.parametrize("enabled", [False, True])
 def test_engine_passes_compile_policy_to_decoder_runner(enabled: bool) -> None:
     engine = Mock()
+    engine.model.runtime_hooks = None
     engine.llm_args.torch_compile_config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
     config = ModelEngine._decoder_runner_config(engine)
     runner_type = Mock()
