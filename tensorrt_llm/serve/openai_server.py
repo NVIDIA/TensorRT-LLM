@@ -1143,12 +1143,13 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _validate_internal_disagg_request(
             self, request, raw_request: Optional[Request]) -> None:
-        protected = request_requires_internal_disagg_auth(request)
-        if protected and not self._has_cache_transceiver_config():
+        if not request_requires_internal_disagg_auth(request):
+            return
+        if not self._has_cache_transceiver_config():
             raise ValueError("Protected disaggregated request fields require "
                              "cache_transceiver_config to be configured")
         key = getattr(self, "_internal_disagg_auth_key", None)
-        if protected and not key:
+        if not key:
             local_listener = getattr(self, "_internal_listener_is_loopback",
                                      None)
             if local_listener is None:

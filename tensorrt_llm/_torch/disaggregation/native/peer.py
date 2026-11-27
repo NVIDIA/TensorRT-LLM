@@ -94,7 +94,7 @@ class PeerRegistrar:
             )
         key = self._unique_key(peer_name, peer_rank)
         extractor = KVRegionExtractorV1(peer_ri.page_table)
-        mapping = self.get_pool_mapping(peer_ri)
+        mapping = self.validate_view_head_geometry(peer_ri)
 
         policy = self._get_policy(CacheKind.PAGED)
         self_page_table = self._self_ext_cache.page_table
@@ -272,7 +272,6 @@ class PeerRegistrar:
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
         self.validate_draft_layers_compatible(peer_ri)
-        self.validate_view_head_geometry(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -288,12 +287,13 @@ class PeerRegistrar:
 
         return True
 
-    def validate_view_head_geometry(self, peer_ri: RankInfo) -> None:
-        """Require matching per-view head geometry before registering the peer."""
+    def validate_view_head_geometry(self, peer_ri: RankInfo) -> dict[LGPoolKey, LGPoolKey]:
+        """Return the pool mapping after validating the matched views' head geometry."""
         self_page_table = self._self_ext_cache.page_table
         peer_page_table = peer_ri.page_table
         policy = self._get_policy(CacheKind.PAGED)
-        for (self_lg, self_pi), (peer_lg, peer_pi) in self.get_pool_mapping(peer_ri).items():
+        mapping = self.get_pool_mapping(peer_ri)
+        for (self_lg, self_pi), (peer_lg, peer_pi) in mapping.items():
             layer_group = self_page_table.layer_groups[self_lg]
             self_pv = layer_group.pool_views[self_pi]
             if layer_group.kind != CacheKind.PAGED or self_pv.mapper_kind == MapperKind.REPLICATED:
@@ -320,6 +320,8 @@ class PeerRegistrar:
                     f"{sorted(self_pv.pool_role)} (local={bytes_per_head[0]}, "
                     f"peer={bytes_per_head[1]})"
                 )
+
+        return mapping
 
     def get_pool_mapping(self, peer_ri: RankInfo) -> Dict[LGPoolKey, LGPoolKey]:
         """Get mapping from (self_lg_idx, self_pool_idx) -> (peer_lg_idx, peer_pool_idx).
