@@ -39,7 +39,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from glob import glob
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import pandas as pd
 import pytest
@@ -108,7 +108,7 @@ class ServerConfig:
     @property
     def url(self) -> str:
         """Get the server URL"""
-        return f"http://localhost:{self.port}"
+        return f"http://{self.host}:{self.port}"
 
 
 @dataclass(frozen=True)
@@ -947,7 +947,8 @@ def create_aiperf_command(model_name,
                           input_len_mean=PerformanceParams.input_len_mean,
                           input_len_std=PerformanceParams.input_len_std,
                           output_len_mean=PerformanceParams.output_len_mean,
-                          output_len_std=PerformanceParams.output_len_std):
+                          output_len_std=PerformanceParams.output_len_std,
+                          artifact_dir: Optional[str] = None):
     """
     Create a command list for aiperf with standardized parameters.
 
@@ -967,6 +968,7 @@ def create_aiperf_command(model_name,
         input_len_std: Standard deviation of input length
         output_len_mean: Mean output length
         output_len_std: Standard deviation of output length
+        artifact_dir: Optional per-run output directory.
 
     Returns:
         List of command-line arguments for aiperf
@@ -1003,7 +1005,7 @@ def create_aiperf_command(model_name,
         "--concurrency",
         str(concurrency),
         "--output-artifact-dir",
-        os.path.join(
+        artifact_dir if artifact_dir is not None else os.path.join(
             ARTIFACTS_DIR,
             f"{model_name}-openai-completions-concurrency{concurrency}"),
         # "--verbose",
@@ -1014,7 +1016,8 @@ def run_aiperf_process(cmd,
                        test_start_time,
                        test_timeout,
                        server_config,
-                       request_counter=None):
+                       request_counter=None,
+                       health_check: Optional[Callable[[], None]] = None):
     """
     Run a aiperf process and monitor both the process and server health.
 
@@ -1027,6 +1030,7 @@ def run_aiperf_process(cmd,
         test_timeout: Timeout for the test in seconds
         server_config: Server configuration object
         request_counter: Optional counter to track requests
+        health_check: Optional additional cluster check; raises on failure.
 
     Returns:
         Boolean indicating whether the process completed successfully
@@ -1069,6 +1073,8 @@ def run_aiperf_process(cmd,
         process_completed = False
 
         while process.poll() is None:
+            if health_check is not None:
+                health_check()
             current_time = time.time()
 
             elapsed_time = current_time - test_start_time
@@ -1095,6 +1101,8 @@ def run_aiperf_process(cmd,
 
             time.sleep(0.5)
 
+        if health_check is not None:
+            health_check()
         stdout_reader.join(timeout=5)
         stderr_reader.join(timeout=5)
 
@@ -1121,11 +1129,16 @@ def run_aiperf_process(cmd,
                 "aiperf did not complete normally, will terminate")
     finally:
         if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=GRACEFUL_TERMINATION_TIMEOUT)
-            except subprocess.TimeoutExpired:
+            if health_check is not None:
                 cleanup_process_tree(process, has_session=True)
+            else:
+                process.terminate()
+                try:
+                    process.wait(timeout=GRACEFUL_TERMINATION_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    cleanup_process_tree(process, has_session=True)
+        stdout_reader.join(timeout=5)
+        stderr_reader.join(timeout=5)
         if process.stdout:
             process.stdout.close()
         if process.stderr:

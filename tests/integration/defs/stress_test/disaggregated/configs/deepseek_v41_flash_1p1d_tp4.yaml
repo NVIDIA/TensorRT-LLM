@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+model: DeepSeek-V4.1-Flash-NVFP4
+
+hardware:
+  min_sm: 100
+  gpus_per_node: 4
+  min_gpu_memory_mib: 140000
+
+# All timeouts are in seconds.
+timeouts:
+  worker_startup: 7200
+  frontend_startup: 300
+  stress: 12600
+  accuracy: 7200
+  warmup: 600
+  post_stress_warmup: 30
+  peer_completion: 300
+
+worker_config:
+  tensor_parallel_size: 4
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 4
+  enable_attention_dp: true
+  attn_backend: TRTLLM
+  moe_config:
+    tactic: cutlass
+    disable_finalize_fusion: true
+  allreduce_strategy: NCCL
+  max_batch_size: 128
+  max_num_tokens: 10240
+  max_seq_len: 10240
+  enable_chunked_prefill: true
+  trust_remote_code: true
+  custom_tokenizer: deepseek_v41
+  speculative_config: null
+  sparse_attention_config:
+    algorithm: csa2
+    use_fp8_staging: true
+  enable_iter_perf_stats: true
+  print_iter_log: true
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON
+  kv_cache_config:
+    dtype: fp8_ds_mla
+    tokens_per_block: 128
+    free_gpu_memory_fraction: 0.8
+    host_cache_size: 2147483648
+    enable_block_reuse: false
+    enable_swa_scratch_reuse: false
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
+
+# Role-specific settings replace the corresponding top-level worker_config fields.
+context_config:
+  max_num_tokens: 16640
+  max_seq_len: 8232
+  cuda_graph_config: null
+  disable_overlap_scheduler: true
+
+generation_config:
+  speculative_config:
+    decoding_type: DSpark
+    max_draft_len: 5
+
+unset_env_prefixes: [TRTLLM_V41_]
+env:
+  OMPI_ALLOW_RUN_AS_ROOT: "1"
+  OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+  TRTLLM_NIXL_KVCACHE_BACKEND: UCX
+  TLLM_KV_CACHE_MANAGER_V2_THP: "0"
+
+stress:
+  request_count: 50000
+  concurrency: 512
+  input_len_mean: 8192
+  input_len_std: 0
+  output_len_mean: 1024
+  output_len_std: 102
+  max_error_rate: 0.01
+  extra_args:
+    - --tokenizer-trust-remote-code
+    - --extra-inputs
+    - ignore_eos:true
+    - --request-cancellation-rate
+    - "10"
+    - --request-cancellation-delay
+    - "0.5"
+
+# Accuracy threshold is a fraction in [0, 1].
+accuracy:
+  threshold: 0.90
+  num_samples: 200
+  num_fewshot: 32
+  concurrency: 8
+  max_gen_toks: 1024
+  max_length: 8192
+  request_timeout: 600
+  random_seed: 0
+  tokenizer: deepseek_v41
+  apply_chat_template: true
+  system_prompt: "Solve the problem carefully. End your response with a final line exactly in the form #### <answer>."
+  chat_template_kwargs:
+    enable_thinking: false
+  stop_strings: []
+
+# Omit this for models without speculative decoding.
+min_acceptance_length: 3.0
