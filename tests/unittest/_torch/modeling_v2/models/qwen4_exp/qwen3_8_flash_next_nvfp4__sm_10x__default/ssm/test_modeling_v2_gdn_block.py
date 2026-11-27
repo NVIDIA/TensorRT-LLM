@@ -284,7 +284,9 @@ def test_captured_one_rank_fp32_decode_block() -> None:
 def _prefill(core, L, x, step):
     tokens = x.shape[0]
     out = torch.empty([1, tokens, core.num_v_heads, V], dtype=BF16, device=DEV)
-    target = _target(M.PrefillTarget, core, L, types.SimpleNamespace(gdn=step, num_tokens=tokens))
+    target = _target(
+        M.PrefillTarget, core, L, types.SimpleNamespace(gdn=step, num_tokens=tokens, inforward=None)
+    )
     return target._gdn_block(x, 0, L, out)
 
 
