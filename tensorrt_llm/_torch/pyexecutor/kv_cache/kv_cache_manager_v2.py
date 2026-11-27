@@ -8420,7 +8420,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
-                draft_len = get_draft_token_length(req) if req.is_last_context_chunk else 0
+                draft_len = (
+                    get_draft_token_length(req)
+                    if req.is_last_context_chunk
+                    and req.request_id not in scheduled_batch.drop_context_draft_ids
+                    else 0
+                )
                 capacity = (
                     req.context_current_position
                     + req.context_chunk_size

@@ -4767,6 +4767,12 @@ class PyExecutor:
                     if self.kv_cache_manager is not None:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
+                    kv_scheduler = (self.scheduler.scheduler if isinstance(
+                        self.scheduler, MultimodalScheduler) else
+                                    self.scheduler)
+                    if isinstance(kv_scheduler, KVCacheV2Scheduler):
+                        kv_scheduler.set_pp_context_draft_plan(
+                            scheduled_batch.drop_context_draft_ids)
                     local_scheduler_output = self.scheduler.schedule_request(
                         self.active_requests, self.inflight_req_ids)
                     scheduled_batch.failed_requests.extend(
@@ -4827,6 +4833,7 @@ class PyExecutor:
                     self.micro_batches[microbatch_id] = None
                 else:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
+                    scheduled_batch.apply_context_draft_budget()
 
                     if not self.pp_async_broadcast_sample_state:
                         # Drain the relay isends whose recv is due before this
@@ -7638,6 +7645,7 @@ class PyExecutor:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 if can_queue:
+                    scheduled_batch.apply_context_draft_budget()
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None:
                         self.guided_decoder.add_batch(scheduled_batch)
@@ -8800,6 +8808,7 @@ class PyExecutor:
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
+                    scheduled_batch.apply_context_draft_budget()
                     if self.kv_cache_transceiver:
                         # Return the first token to the client. This
                         # iteration's transfer flush delivers it before any
@@ -11237,6 +11246,12 @@ class PyExecutor:
             scheduled_requests.attention_dp_phase = self._remote_tail_phase
         scheduled_requests.encoder_requests = scheduled_encoder_requests
         scheduled_requests.reset_context_requests(scheduled_context_requests)
+        drop_context_draft_ids = scheduler_output.drop_context_draft_ids
+        if drop_context_draft_ids:
+            scheduled_requests.drop_context_draft_ids = frozenset(
+                req.request_id
+                for req in scheduled_requests.context_requests_last_chunk
+                if req.request_id in drop_context_draft_ids)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
         scheduled_requests.scheduled_mm_encoder_items = (

@@ -89,6 +89,7 @@ class SchedulerOutput(
             "scheduled_mm_encoder_items",
             "recompute_paused_requests",
             "failed_requests",
+            "drop_context_draft_ids",
         ],
     )
 ):
@@ -113,6 +114,7 @@ class SchedulerOutput(
         scheduled_mm_encoder_items: dict[int, list[int]] | None = None,
         recompute_paused_requests: RequestList | None = None,
         failed_requests: RequestList | None = None,
+        drop_context_draft_ids: frozenset[int] = frozenset(),
     ):
         return super(SchedulerOutput, cls).__new__(
             cls,
@@ -125,6 +127,7 @@ class SchedulerOutput(
             scheduled_mm_encoder_items,
             [] if recompute_paused_requests is None else recompute_paused_requests,
             [] if failed_requests is None else failed_requests,
+            drop_context_draft_ids,
         )
 
 
@@ -282,6 +285,8 @@ class ScheduledRequests:
     left out of this batch, but their drafter state must be kept."""
     periodic_snapshot_tp: bool
     """Whether TP ranks agreed to expand this batch for periodic snapshots."""
+    drop_context_draft_ids: frozenset[int]
+    """Final contexts scheduled without draft rows to fit the token budget."""
 
     def __init__(self):
         self.attention_dp_phase: RemoteTailPhase | None = None
@@ -297,6 +302,19 @@ class ScheduledRequests:
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
         self.paused_in_place_ids: frozenset[int] = frozenset()
         self.periodic_snapshot_tp = False
+        self.drop_context_draft_ids: frozenset[int] = frozenset()
+
+    def apply_context_draft_budget(self) -> None:
+        """Drop optional drafts only for requests in the final forward batch."""
+        if not self.drop_context_draft_ids:
+            return
+        for request in self.context_requests_last_chunk:
+            if request.request_id in self.drop_context_draft_ids:
+                request.py_draft_tokens = []
+                request.draft_tokens = []
+                if request.py_draft_tokens_effective_len is not None:
+                    request.py_draft_tokens_effective_len = 0
+        self.drop_context_draft_ids = frozenset()
 
     @property
     def is_generation_only(self) -> bool:
@@ -500,6 +518,8 @@ class SerializableSchedulerOutput:
     """Request ids of recompute-paused requests."""
     failed_requests: list[int] = dataclasses.field(default_factory=list)
     """Requests whose resource admission stalled past the scheduler limit."""
+    drop_context_draft_ids: frozenset[int] = frozenset()
+    """Final context requests scheduled without their draft rows."""
 
     @classmethod
     def from_scheduler_result(
@@ -529,6 +549,7 @@ class SerializableSchedulerOutput:
                 req.request_id for req in scheduled_requests.recompute_paused_requests
             ],
             failed_requests=[req.request_id for req in scheduled_requests.failed_requests],
+            drop_context_draft_ids=scheduled_requests.drop_context_draft_ids,
         )
 
     def to_scheduler_result(
@@ -558,6 +579,7 @@ class SerializableSchedulerOutput:
         scheduled_requests.failed_requests = [
             id_to_request[req_id] for req_id in self.failed_requests
         ]
+        scheduled_requests.drop_context_draft_ids = self.drop_context_draft_ids
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
         ]

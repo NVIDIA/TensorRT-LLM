@@ -4858,16 +4858,48 @@ class TestDraftTokenFitting:
         # V2 does not trim drafts — full draft_len included
         req.discard_draft_tokens.assert_not_called()
 
-    def test_budget_limits_draft_space(self):
-        """chunk=100, draft=20, budget=110. V2 scheduler adds full draft_len
-        to chunk_tokens (100+20=120) which passes resize but budget tracks 120."""
-        mgr = make_kv_cache_manager(tokens_per_block=64)
-        sched = make_scheduler(mgr, max_num_tokens=110, ctx_chunk_config=(None, 64))
+    @pytest.mark.parametrize(
+        "draft_room, allocation_ok, expected_tokens",
+        [(0, True, 100), (10, True, 100), (10, False, 100), (20, True, 120)],
+    )
+    def test_final_chunk_fits_draft_budget_without_mutating_request(
+        self, draft_room: int, allocation_ok: bool, expected_tokens: int
+    ) -> None:
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64, resize_context_fn=lambda _req, _tokens: allocation_ok
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100 + draft_room, ctx_chunk_config=(None, 64))
         req = make_ctx_request(0, context_remaining_length=100, num_draft_tokens=20)
+        drafts = list(range(20))
+        req.py_draft_tokens = drafts.copy()
+        req.draft_tokens = drafts.copy()
+
         out = sched.schedule_request([req], set())
+
+        mgr.resize_context.assert_called_once_with(req, expected_tokens)
+        assert ids(out.context_requests) == ([0] if allocation_ok else [])
+        assert out.drop_context_draft_ids == (
+            frozenset({0}) if allocation_ok and expected_tokens == 100 else frozenset()
+        )
+        assert req.py_draft_tokens == req.draft_tokens == drafts
+
+    @pytest.mark.parametrize("driver_drops_drafts", [False, True])
+    def test_pp_follower_allocates_for_driver_draft_decision(self, driver_drops_drafts: bool):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        draft_room = 20 if driver_drops_drafts else 0
+        sched = make_scheduler(mgr, max_num_tokens=100 + draft_room, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=100, num_draft_tokens=20)
+        drop_ids = frozenset({req.request_id}) if driver_drops_drafts else frozenset()
+
+        sched.set_pp_context_draft_plan(drop_ids)
+        out = sched.schedule_request([req], set())
+
         assert ids(out.context_requests) == [0]
-        # V2 does not trim drafts — full draft_len included
-        req.discard_draft_tokens.assert_not_called()
+        mgr.resize_context.assert_called_once_with(req, 100 if driver_drops_drafts else 120)
+
+        mgr.resize_context.reset_mock()
+        sched.schedule_request([req], set())
+        mgr.resize_context.assert_called_once_with(req, 120 if driver_drops_drafts else 100)
 
     def test_draft_tokens_add_to_batch_budget(self):
         """Last chunk with draft: batch_num_tokens += chunk_size + num_draft_tokens."""

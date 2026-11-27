@@ -13,6 +13,7 @@ to PyExecutor, including:
 """
 
 import gc
+import pickle
 import threading
 import time
 import types
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedRequests
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -2786,7 +2788,7 @@ def test_each_pp_rank_schedules_once_per_iteration(
     executor.active_requests = [Mock()]
     executor.inflight_req_ids = set()
     executor.kv_cache_manager = Mock()
-    executor.scheduler = Mock()
+    executor.scheduler = Mock(spec=KVCacheV2Scheduler)
     executor.scheduler.schedule_request.return_value = types.SimpleNamespace(
         failed_requests=[], fitting_disagg_gen_init_requests=[]
     )
@@ -2795,7 +2797,9 @@ def test_each_pp_rank_schedules_once_per_iteration(
         if executor._pp_rank_schedules():
             # PyExecutor._schedule runs the scheduler.
             executor.scheduler.schedule_request(executor.active_requests, executor.inflight_req_ids)
-        return ScheduledRequests(), [], 0, False
+        batch = ScheduledRequests()
+        batch.drop_context_draft_ids = frozenset({11})
+        return batch, [], 0, False
 
     executor._pp_schedule_and_propagate = schedule_and_propagate
 
@@ -2807,7 +2811,13 @@ def test_each_pp_rank_schedules_once_per_iteration(
         PyExecutor._executor_loop_pp(executor)
 
     assert executor._pp_rank_schedules() is schedules_batch
-    executor.scheduler.schedule_request.assert_called_once()
+    executor.scheduler.schedule_request.assert_called_once_with(
+        executor.active_requests, executor.inflight_req_ids
+    )
+    if schedules_batch:
+        executor.scheduler.set_pp_context_draft_plan.assert_not_called()
+    else:
+        executor.scheduler.set_pp_context_draft_plan.assert_called_once_with(frozenset({11}))
     assert executor._pp_retry_until_can_schedule.called is not schedules_batch
 
 
@@ -3413,6 +3423,51 @@ def test_periodic_tp_fatal_response_requires_peer_and_cleanup_agreement(
         assert executor._response_channel.responses == {}
         result_queue.put_response.remote.assert_not_called()
         assert request_queue.get_request_queue().get_nowait().id == 2
+
+
+def test_context_draft_drop_plan_roundtrips_and_only_applies_to_final_forward_requests() -> None:
+    def make_request(request_id: int) -> LlmRequest:
+        req = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=8,
+            input_tokens=[1, 2, 3],
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            draft_tokens=None,
+        )
+        req.context_chunk_size = 3
+        req.py_draft_tokens = [7, 8, 9]
+        req.draft_tokens = [7, 8, 9]
+        req.py_draft_tokens_effective_len = 3
+        return req
+
+    driver = ScheduledRequests()
+    driver.reset_context_requests([make_request(11), make_request(12)])
+    driver.drop_context_draft_ids = frozenset({11, 12})
+
+    follower, deferred, generation = make_request(11), make_request(12), make_request(13)
+    generation.state = LlmRequestState.GENERATION_IN_PROGRESS
+    driver.generation_requests = [generation]
+    wire = SerializableSchedulerOutput.from_scheduler_result(driver, [], 3)
+    batch, _, _ = pickle.loads(pickle.dumps(wire)).to_scheduler_result(
+        [follower, deferred, generation]
+    )
+    assert follower.num_draft_tokens == deferred.num_draft_tokens == 3
+    assert batch.drop_context_draft_ids == frozenset({11, 12})
+
+    batch.reset_context_requests([follower])
+    batch.apply_context_draft_budget()
+
+    assert follower.num_draft_tokens == 0
+    assert follower.py_draft_tokens == []
+    assert follower.py_draft_tokens_effective_len == 0
+    assert deferred.num_draft_tokens == deferred.py_draft_tokens_effective_len == 3
+    assert deferred.py_draft_tokens == [7, 8, 9]
+    guided_batch = GuidedRequests.from_scheduled_requests(batch, max_num_draft_tokens=3)
+    assert [(req.request_id, req.draft_tokens) for req in guided_batch.requests] == [
+        (11, []),
+        (13, [7, 8, 9]),
+    ]
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
