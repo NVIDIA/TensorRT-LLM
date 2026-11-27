@@ -40,7 +40,12 @@ from tensorrt_llm._torch.visual_gen.attention.backends.utils import (
 )
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.deco_attention.runtime import num_sms
-from tensorrt_llm.visual_gen.args import AttentionConfig, DeCoAttentionConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    BaseQuantAttentionConfig,
+    DeCoAttentionConfig,
+    QuantAttentionConfig,
+)
 
 HEAD_DIM = 128
 V_DTYPES = ("fp8", "nvfp4")
@@ -226,7 +231,7 @@ def test_deco_selection(deco_recipe) -> None:
     # (supports_mask, supports_length, requires_trailing): a quantized FLASHINFER recipe rejects
     # a mask and a quantized TRTLLM recipe the valid prefix, which their classes alone do not say.
     # The configs skip the recipe validator, which binds a recipe to the GPU generation.
-    def config(backend: str, quant_attention_config: QuantAttentionConfig | None = None):
+    def config(backend: str, quant_attention_config: BaseQuantAttentionConfig | None = None):
         return AttentionConfig.model_construct(
             backend=backend, quant_attention_config=quant_attention_config
         )

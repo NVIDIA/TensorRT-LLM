@@ -25,13 +25,18 @@ from typing import NamedTuple, Optional, Type
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig, DeCoAttentionConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    BaseQuantAttentionConfig,
+    DeCoAttentionConfig,
+    QuantAttentionConfig,
+)
 
 from .interface import AttentionBackend
 
 
 def get_quant_algorithm(
-    quant_attention_config: Optional[QuantAttentionConfig],
+    quant_attention_config: Optional[BaseQuantAttentionConfig],
 ) -> Optional[str]:
     """
     Get the algorithm of a quantized attention config.
@@ -48,7 +53,10 @@ def get_quant_algorithm(
         return None
     if isinstance(quant_attention_config, DeCoAttentionConfig):
         return quant_attention_config.algorithm
-    if quant_attention_config.vc_attention:
+    if (
+        isinstance(quant_attention_config, QuantAttentionConfig)
+        and quant_attention_config.vc_attention
+    ):
         return "vc_attention"
     return None
 

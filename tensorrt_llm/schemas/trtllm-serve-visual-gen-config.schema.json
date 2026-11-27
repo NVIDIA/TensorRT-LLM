@@ -376,7 +376,7 @@
     },
     "DeCoAttentionConfig": {
       "additionalProperties": false,
-      "description": "DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.\n\nQ/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the\nfirst-order quantization error of the scores; V is smoothed over blocks of keys and\nquantized to FP8 or NVFP4. Self-attention with head dimension 128.\n\n* Compensation channels: ``q_channels`` of the Q-residual term, which compensates the\n  rounding residual of Q, and ``k_channels`` of the K-residual term, which compensates\n  that of K.\n* Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated\n  on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,\n  ``min_sample_rows``).\n* The recipe sets every scaling granularity and smooths V itself: the block sizes and the\n  smoothing and VC-Attention options of QuantAttentionConfig are not options of it and\n  take their defaults only.",
+      "description": "DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.\n\nQ/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the\nfirst-order quantization error of the scores; V is smoothed over blocks of keys and\nquantized to FP8 or NVFP4. Self-attention with head dimension 128.\n\n* Compensation channels: ``q_channels`` of the Q-residual term, which compensates the\n  rounding residual of Q, and ``k_channels`` of the K-residual term, which compensates\n  that of K.\n* Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated\n  on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,\n  ``min_sample_rows``).\n* The recipe sets its scaling granularity and smooths V itself: it has no block size,\n  smoothing or VC-Attention options.",
       "properties": {
         "algorithm": {
           "const": "deco_attention",
@@ -405,14 +405,6 @@
           "status": "prototype",
           "title": "Gram Weight",
           "type": "number"
-        },
-        "k_block_size": {
-          "const": 0,
-          "default": 0,
-          "description": "Not an option of DeCo-Attention, which sets its scaling granularity itself.",
-          "status": "prototype",
-          "title": "K Block Size",
-          "type": "integer"
         },
         "k_channels": {
           "anyOf": [
@@ -454,14 +446,6 @@
           "status": "prototype",
           "title": "Min Sample Rows"
         },
-        "q_block_size": {
-          "const": 0,
-          "default": 0,
-          "description": "Not an option of DeCo-Attention, which sets its scaling granularity itself.",
-          "status": "prototype",
-          "title": "Q Block Size",
-          "type": "integer"
-        },
         "q_channels": {
           "anyOf": [
             {
@@ -495,30 +479,6 @@
           "title": "Qk Dtype",
           "type": "string"
         },
-        "smooth_k": {
-          "const": false,
-          "default": false,
-          "description": "Not an option of DeCo-Attention.",
-          "status": "prototype",
-          "title": "Smooth K",
-          "type": "boolean"
-        },
-        "smooth_v": {
-          "const": false,
-          "default": false,
-          "description": "Not an option of DeCo-Attention, which smooths V itself.",
-          "status": "prototype",
-          "title": "Smooth V",
-          "type": "boolean"
-        },
-        "v_block_size": {
-          "const": 0,
-          "default": 0,
-          "description": "Not an option of DeCo-Attention, which sets its scaling granularity itself.",
-          "status": "prototype",
-          "title": "V Block Size",
-          "type": "integer"
-        },
         "v_dtype": {
           "default": "fp8",
           "description": "V quantization format, which is also the format of BMM2: fp8, or nvfp4 on a GPU whose kernels offer it.",
@@ -529,23 +489,6 @@
           "status": "prototype",
           "title": "V Dtype",
           "type": "string"
-        },
-        "vc_attention": {
-          "const": false,
-          "default": false,
-          "description": "Not an option of DeCo-Attention.",
-          "status": "prototype",
-          "title": "Vc Attention",
-          "type": "boolean"
-        },
-        "vc_repair_budget": {
-          "default": 0.0,
-          "description": "Not an option of DeCo-Attention.",
-          "maximum": 0.0,
-          "minimum": 0.0,
-          "status": "prototype",
-          "title": "Vc Repair Budget",
-          "type": "number"
         }
       },
       "title": "DeCoAttentionConfig",

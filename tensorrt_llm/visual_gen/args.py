@@ -55,17 +55,8 @@ CacheBackendName = Literal["teacache", "cache_dit", "seacache"]
 # =============================================================================
 
 
-class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).
-
-    Specifies Q/K and V quantization formats and their optional block sizes.
-
-    Bare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is
-    backend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V
-    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. DeCo-Attention has its own config,
-    DeCoAttentionConfig. Unsupported recipes are rejected by AttentionConfig's validator
-    with a ValueError.
-    """
+class BaseQuantAttentionConfig(StrictBaseModel):
+    """Base class for quantized attention configs: the Q/K and V quantization formats."""
 
     qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
         "bf16",
@@ -83,6 +74,20 @@ class QuantAttentionConfig(StrictBaseModel):
             "nvfp4 are block-scaled formats."
         ),
     )
+
+
+class QuantAttentionConfig(BaseQuantAttentionConfig):
+    """Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).
+
+    Specifies Q/K and V quantization formats and their optional block sizes.
+
+    Bare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is
+    backend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V
+    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. DeCo-Attention has its own config,
+    DeCoAttentionConfig. Unsupported recipes are rejected by AttentionConfig's validator
+    with a ValueError.
+    """
+
     q_block_size: int = Field(
         0,
         ge=0,
@@ -142,7 +147,7 @@ class QuantAttentionConfig(StrictBaseModel):
     )
 
 
-class DeCoAttentionConfig(QuantAttentionConfig):
+class DeCoAttentionConfig(BaseQuantAttentionConfig):
     """DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.
 
     Q/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the
@@ -155,9 +160,8 @@ class DeCoAttentionConfig(QuantAttentionConfig):
     * Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated
       on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,
       ``min_sample_rows``).
-    * The recipe sets every scaling granularity and smooths V itself: the block sizes and the
-      smoothing and VC-Attention options of QuantAttentionConfig are not options of it and
-      take their defaults only.
+    * The recipe sets its scaling granularity and smooths V itself: it has no block size,
+      smoothing or VC-Attention options.
     """
 
     algorithm: Literal["deco_attention"] = Field(
@@ -180,43 +184,6 @@ class DeCoAttentionConfig(QuantAttentionConfig):
             "V quantization format, which is also the format of BMM2: fp8, or nvfp4 on a GPU "
             "whose kernels offer it."
         ),
-    )
-    q_block_size: Literal[0] = Field(
-        0,
-        status="prototype",
-        description="Not an option of DeCo-Attention, which sets its scaling granularity itself.",
-    )
-    k_block_size: Literal[0] = Field(
-        0,
-        status="prototype",
-        description="Not an option of DeCo-Attention, which sets its scaling granularity itself.",
-    )
-    v_block_size: Literal[0] = Field(
-        0,
-        status="prototype",
-        description="Not an option of DeCo-Attention, which sets its scaling granularity itself.",
-    )
-    smooth_k: Literal[False] = Field(
-        False,
-        status="prototype",
-        description="Not an option of DeCo-Attention.",
-    )
-    smooth_v: Literal[False] = Field(
-        False,
-        status="prototype",
-        description="Not an option of DeCo-Attention, which smooths V itself.",
-    )
-    vc_attention: Literal[False] = Field(
-        False,
-        status="prototype",
-        description="Not an option of DeCo-Attention.",
-    )
-    vc_repair_budget: float = Field(
-        0.0,
-        ge=0.0,
-        le=0.0,
-        status="prototype",
-        description="Not an option of DeCo-Attention.",
     )
     q_channels: Optional[int] = Field(
         None,
@@ -580,10 +547,10 @@ class AttentionConfig(StrictBaseModel):
         # VC-Attention is a dense recipe of the PrimTS kernels and is not
         # composed with any sparse algorithm. DeCo-Attention has its own dense
         # kernels, which take no sparse configuration either.
-        if self.quant_attention_config.vc_attention:
-            raise ValueError("vc_attention does not compose with sparse_attention_config.")
         if isinstance(self.quant_attention_config, DeCoAttentionConfig):
             raise ValueError("DeCo-Attention does not compose with sparse_attention_config.")
+        if self.quant_attention_config.vc_attention:
+            raise ValueError("vc_attention does not compose with sparse_attention_config.")
         if self.backend == "TRTLLM":
             return self
         algorithm = self.sparse_attention_config.algorithm
@@ -1316,6 +1283,7 @@ class VisualGenArgs(StrictBaseModel):
 
 
 __all__ = [
+    "BaseQuantAttentionConfig",
     "QuantAttentionConfig",
     "DeCoAttentionConfig",
     "SparseAttentionConfig",

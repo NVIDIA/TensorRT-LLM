@@ -383,6 +383,12 @@ class TestAttentionConfigQuantValidation:
             ),
             (
                 "CUTEDSL",
+                dict(algorithm="deco_attention", v_block_size=0, vc_attention=False),
+                None,
+                "Extra inputs are not permitted",
+            ),
+            (
+                "CUTEDSL",
                 dict(algorithm="deco_attention", q_channels=96, k_channels=48),
                 None,
                 "at most 128 compensation channels",
@@ -399,6 +405,7 @@ class TestAttentionConfigQuantValidation:
             "sparse_attention",
             "unknown_algorithm",
             "fields_without_algorithm",
+            "recipe_fields_with_algorithm",
             "too_many_channels",
             "gram_weight_with_separate",
         ],
@@ -406,7 +413,8 @@ class TestAttentionConfigQuantValidation:
     def test_deco_attention_rejections(self, backend, quant, sparse, match):
         """One rejection per rule of the config: DeCo-Attention is CUTEDSL only and never
         composes with a sparse algorithm; an algorithm other than its own is unknown; a config
-        without an algorithm takes none of its fields; the two terms take at most 128
+        without an algorithm takes none of its fields, and its config none of the block size,
+        smoothing or VC-Attention fields of the other recipes; the two terms take at most 128
         compensation channels; the Gram weight belongs to the shared basis."""
         with pytest.raises(ValidationError, match=match):
             AttentionConfig(
