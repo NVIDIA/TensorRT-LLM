@@ -403,7 +403,8 @@ class PrometheusExposure:
                 "Hybrid recurrent models: process-lifetime total prompt "
                 "tokens of this rank whose prefix matched in the attention KV "
                 "cache. Not reported when the KV cache is paired with a draft "
-                "KV pool. Resets only when the serving process restarts."),
+                "KV pool or is mixed-precision without strict reuse. Resets "
+                "only when the serving process restarts."),
             labelnames=iteration_labelnames)
         self.kv_cache_prefix_snapshot_lost_tokens_total = Counter(
             name=self.metric_prefix +
@@ -414,7 +415,8 @@ class PrometheusExposure:
                 "recurrent-state snapshot covered them; its ratio to "
                 "kv_cache_prefix_matched_tokens_total is the share of prefix "
                 "reuse lost. Not reported when the KV cache is paired with a "
-                "draft KV pool. Resets only when the serving process restarts."),
+                "draft KV pool or is mixed-precision without strict reuse. "
+                "Resets only when the serving process restarts."),
             labelnames=iteration_labelnames)
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",

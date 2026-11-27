@@ -1771,9 +1771,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Whether this pool's own lookups show its prefix loss.
 
         A target paired with a draft KV pool claims only the depth both pools
-        hold, so its lookup does not reach its own match.
+        hold, so its lookup does not reach its own match. Neither does the
+        lookup that mixed-precision reuse repeats below a missing high-precision
+        window.
         """
-        return self.local_num_mamba_layers > 0 and not self.enable_joint_kv_cache_reuse
+        return (
+            self.local_num_mamba_layers > 0
+            and not self.enable_joint_kv_cache_reuse
+            and self.mixed_precision_reuse == "strict"
+        )
 
     def _record_prefix_loss(self, req: LlmRequest, kv_cache: _KVCache) -> None:
         """Keep the attention-matched prefix and the parts lost to a missing

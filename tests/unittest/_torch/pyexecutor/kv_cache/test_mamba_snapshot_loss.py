@@ -123,12 +123,25 @@ def test_counts_a_refused_admission_once() -> None:
     assert manager._page_pruned_tokens_total == 6_000
 
 
-def test_skips_a_target_paired_with_a_draft_pool() -> None:
+@pytest.mark.parametrize(
+    ("enable_joint_kv_cache_reuse", "mixed_precision_reuse", "kv_cache"),
+    [
+        # The claim stops at the depth both pools hold, so the target's own match is unknown.
+        (True, "strict", _fake_kv_cache(64, 64, 192)),
+        # The re-lookup below an evicted high-precision window: the snapshot at 10,000 exists,
+        # but the lookup capped at 9,984 finds none.
+        (False, "default", _fake_kv_cache(9_984, 0)),
+        (False, "recompute", _fake_kv_cache(9_984, 0)),
+    ],
+)
+def test_skips_lookups_that_stop_short_of_the_match(
+    enable_joint_kv_cache_reuse: bool, mixed_precision_reuse: str, kv_cache: SimpleNamespace
+) -> None:
     manager = _manager()
-    manager.enable_joint_kv_cache_reuse = True
+    manager.enable_joint_kv_cache_reuse = enable_joint_kv_cache_reuse
+    manager.mixed_precision_reuse = mixed_precision_reuse
     request = _fake_request()
-    # The claim stops at the depth both pools hold, so the target's own match is unknown.
-    manager._record_branch_snapshot_point(request, _fake_kv_cache(64, 64, 192), 64)
+    manager._record_branch_snapshot_point(request, kv_cache, 9_984)
     _commit(manager, request)
     assert manager._pending_prefix_loss == {}
     assert manager._prefix_matched_tokens_total == 0
