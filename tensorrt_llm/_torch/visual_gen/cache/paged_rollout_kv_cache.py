@@ -587,7 +587,7 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
         state.device.copy_(mirror.buffer, non_blocking=True)
         if mirror.uploaded is None:
             mirror.uploaded = torch.cuda.Event()
-        mirror.uploaded.record()
+        mirror.uploaded.record(torch.cuda.current_stream(state.device.device))
 
     def _write_layout(self, views: Dict[str, np.ndarray], size: int, layout: _Layout) -> None:
         """Every causal block of ``size``'s page list, lengths and private-slot sources."""
@@ -596,8 +596,8 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
         page_table = views[f"{size}.page_table"]
         seq_lens_kv = views[f"{size}.seq_lens_kv"]
         cu_seqlens_kv = views[f"{size}.cu_seqlens_kv"]
-        private_src = views[f"{size}.private_src"].reshape(-1, self.private_slots)
-        private_dst = views[f"{size}.private_dst"].reshape(-1, self.private_slots)
+        private_src = views[f"{size}.private_src"].reshape(layout.num_causal_blocks, -1)
+        private_dst = views[f"{size}.private_dst"].reshape(layout.num_causal_blocks, -1)
         page_table.fill(0)
         private_dst.fill(-1)
         ppb = self.private_pages_per_causal_block(tpb)

@@ -329,6 +329,9 @@ class SOLTrtllmAttention(TrtllmAttention):
     """Predict SOL routes inside the core prediction hook, then execute them
     through the generic block-sparse FMHA."""
 
+    def support_kv_cache(self) -> bool:
+        return False
+
     def __init__(self, *, sparse_params: SolParams | None = None, **kwargs) -> None:
         if not isinstance(sparse_params, SolParams):
             raise TypeError("SOLTrtllmAttention requires SolParams")

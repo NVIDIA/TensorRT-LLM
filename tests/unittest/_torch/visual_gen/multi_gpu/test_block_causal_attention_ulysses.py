@@ -360,6 +360,23 @@ def _logic_through_the_attention_module(rank, world_size, backend):
         cache.shutdown()
 
 
+def test_cache_upload_records_on_cache_device() -> None:
+    """Pinned mirror reuse is fenced on the destination device even off that device."""
+    cache = make_cache(40)
+    try:
+        other_device = (torch.cuda.current_device() + 1) % torch.cuda.device_count()
+        with torch.cuda.device(other_device):
+            for _ in range(2):
+                cache.open(cache.test_spec)
+                cache.close()
+        assert cache._state is not None
+        for mirror in cache._state.mirrors:
+            assert mirror.uploaded is not None
+            assert mirror.uploaded.device == cache._device
+    finally:
+        cache.shutdown()
+
+
 def _logic_all(rank, world_size, backend):
     """Every scenario in one process group per backend: spawning costs more than the tests."""
     _logic_rollout(rank, world_size, backend)

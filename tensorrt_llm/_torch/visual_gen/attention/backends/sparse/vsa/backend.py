@@ -90,6 +90,9 @@ def _get_unsupported_primts_reason(
 class VSATrtllmAttention(TrtllmAttention):
     """TRTLLM VSA backend using the generic block-sparse forward lifecycle."""
 
+    def support_kv_cache(self) -> bool:
+        return False
+
     def __init__(
         self,
         layer_idx: int = 0,
@@ -198,6 +201,9 @@ class VSATrtllmAttention(TrtllmAttention):
 
 class VSACuTeDSLAttention(CuTeDSLAttention):
     """CuTe DSL VSA backend reusing TRTLLM's predictor and post-processing."""
+
+    def support_kv_cache(self) -> bool:
+        return False
 
     def __init__(
         self,

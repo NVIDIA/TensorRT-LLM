@@ -267,7 +267,7 @@ public:
     // SageAttention) come with K/V of their own.
     [[nodiscard]] bool isQOnlySelfAttention(FmhaParams const& p) const
     {
-        return !p.is_cross && !p.key_input.has_value() && !p.value_input.has_value()
+        return !p.is_cross && !p.fwd.is_fused_qkv && !p.key_input.has_value() && !p.value_input.has_value()
             && p.getQueryInput().size(-1) == static_cast<int64_t>(num_heads) * getHeadSize();
     }
 

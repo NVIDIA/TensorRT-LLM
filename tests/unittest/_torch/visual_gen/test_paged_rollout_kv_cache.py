@@ -197,9 +197,9 @@ def test_page_lists_present_exactly_the_window(cache, pin, size):
 
 @pytest.mark.parametrize(
     "tpb, chunk, size, window",
-    [(8, 20, 5, 13), (8, 16, 8, 8), (16, 40, 10, 3), (8, 12, 1, 1), (32, 30, 3, 70)],
+    [(1, 6, 2, 3), (8, 20, 5, 13), (8, 16, 8, 8), (16, 40, 10, 3), (8, 12, 1, 1), (32, 30, 3, 70)],
 )
-def test_page_lists_in_odd_geometries(tpb, chunk, size, window):
+def test_page_lists_in_odd_geometries(tpb: int, chunk: int, size: int, window: int) -> None:
     """Causal blocks smaller than, equal to and larger than a page; windows shorter than a
     causal block, of one token, and longer than the pool's pages."""
     spec = spec_for(

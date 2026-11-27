@@ -632,6 +632,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 )
             return self._forward_padded_self_attention(q, k, v, valid_seq_len, timestep)
         if kv is not None:
+            if sparse_backend_args is not None:
+                raise NotImplementedError("Sparse attention is not supported over a K/V cache.")
             if batch_size != 1:
                 raise ValueError("K/V cache attention takes one video: batch_size must be 1.")
             if k is None and v is None:
@@ -789,10 +791,17 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         out = torch.empty_like(q)
         host = self._paged_kv_host_tensors(kv_pool, batch, seq_len, max_kv_len)
         rope = self.rope_params
-        # The dense paged-context layout upper-bounds the native op's Q-only workspace.
-        # Its FMHA scratch allocation is not used by the native dense context path.
+        # Include the native op's reserved workspace so it never resizes captured storage.
         required_bytes = thop.get_trtllm_gen_context_workspace_layout(
-            q.dtype, batch, num_tokens, num_heads, head_dim, rope.dim, True, False, True
+            q.dtype,
+            batch,
+            num_tokens,
+            num_heads,
+            head_dim,
+            rope.dim,
+            separate_q_kv_input=True,
+            fp8_context_fmha=False,
+            skip_fmha_workspace=False,
         )["total_size"]
         workspaces = self._paged_kv_workspaces.setdefault(q.device, {})
         workspace = next(

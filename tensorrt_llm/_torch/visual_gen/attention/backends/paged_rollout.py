@@ -54,6 +54,11 @@ def forward_over_paged_rollout(
         raise ValueError(
             f"k has {k.shape[2]} heads but the cache holds {cache.num_kv_heads} per rank."
         )
+    if head_dim != cache.head_dim or num_heads % cache.num_kv_heads:
+        raise ValueError(
+            f"q shape {tuple(q.shape)} does not fit cache heads={cache.num_kv_heads}, "
+            f"head_dim={cache.head_dim}."
+        )
     num_tokens = plan.num_tokens
     if num_tokens > num_rows:
         raise ValueError(

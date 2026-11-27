@@ -33,18 +33,24 @@ from utils.block_causal_reference import exact_reference as _exact_reference
 from utils.block_causal_reference import reference_attention
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
-from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionInputType,
+    PredefinedAttentionMask,
+)
 from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.flashinfer import FlashInferAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
 from tensorrt_llm._torch.visual_gen.cache import PagedRolloutKVCache, RolloutSpec
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SolAttentionConfig, VideoSparseAttentionConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -728,7 +734,7 @@ def test_backend_without_cache_support_refuses_a_cache(cache):
         attn._attn_impl(q, q, q, kv=cache.plan(CHUNK))
 
 
-def test_quantized_or_sparse_backends_report_no_cache_support():
+def test_quantized_or_sparse_backends_report_no_cache_support() -> None:
     """Configurations the cache path cannot run say so up front, so ``Attention`` refuses
     the cache before the backend's forward does."""
     cudnn = make_backend("cudnn")
@@ -750,6 +756,22 @@ def test_quantized_or_sparse_backends_report_no_cache_support():
     quantized_flashinfer = make_backend("flashinfer")
     quantized_flashinfer.quant_attention_config = SimpleNamespace()
     assert not quantized_flashinfer.support_kv_cache()
+    for backend, config in (
+        ("TRTLLM", VideoSparseAttentionConfig()),
+        ("CUTEDSL", VideoSparseAttentionConfig()),
+        ("TRTLLM", SolAttentionConfig()),
+    ):
+        sparse = create_attention(
+            backend,
+            layer_idx=0,
+            num_heads=4,
+            num_kv_heads=4,
+            head_dim=128,
+            dtype=DTYPE,
+            attention_config=AttentionConfig(backend=backend, sparse_attention_config=config),
+            attention_metadata_state={},
+        )
+        assert not sparse.support_kv_cache()
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -865,6 +887,19 @@ def test_cache_path_refusals(cache, backend):
         )
     with pytest.raises(ValueError, match="not declared"):
         cache.plan(CHUNK, 8)
+    for bad_q in (q[..., :-1], q[:, : NUM_KV_HEADS + 1]):
+        with pytest.raises(ValueError, match="q shape"):
+            attn.forward(bad_q[None], k[None], v[None], batch_size=1, **common)
+    if backend == "trtllm":
+        with pytest.raises(NotImplementedError, match="Sparse attention"):
+            attn.forward(
+                q[None],
+                k[None],
+                v[None],
+                batch_size=1,
+                sparse_backend_args=SimpleNamespace(),
+                **common,
+            )
 
 
 def _assert_attention_parity(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -914,13 +949,53 @@ def test_q_only_rejects_sparse_compaction_before_cache_write(monkeypatch, metada
         cache.shutdown()
 
 
+def test_q_only_rejects_invalid_reads_before_native_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Invalid read-only input contracts fail before either native phase can run."""
+    cache = make_cache(32)
+    try:
+        cache.open(cache.test_spec)
+        q, _, _ = rand_qkv(CHUNK)
+        native_attention = FallbackFmha.attention
+
+        def invalid_attention(**kwargs) -> None:
+            kwargs[field] = q.flatten(1) if field in ("k", "v") else value
+            native_attention(**kwargs)
+
+        def unexpected_launch(*args: object) -> None:
+            pytest.fail("invalid Q-only input reached native attention")
+
+        monkeypatch.setattr(FallbackFmha, "attention", staticmethod(invalid_attention))
+        monkeypatch.setattr(thop, "run_context", unexpected_launch)
+        monkeypatch.setattr(thop, "run_generation", unexpected_launch)
+        attention = make_backend("trtllm")
+        for field, value in (
+            ("k", None),
+            ("v", None),
+            ("is_mla_enable", True),
+            ("is_fused_qkv", True),
+            ("attention_input_type", AttentionInputType.generation_only),
+            ("attention_input_type", AttentionInputType.mixed),
+            ("update_kv_cache", True),
+            ("use_paged_context_fmha", False),
+            ("kv_cache_block_offsets", None),
+            ("host_kv_cache_pool_pointers", None),
+            ("host_kv_cache_pool_mapping", None),
+        ):
+            with pytest.raises(RuntimeError, match="Q-only|KV cache update can be disabled"):
+                attention.forward_paged_kv(
+                    q[None], cache.kv_buffer(0), cache.tables(cache.plan(CHUNK))
+                )
+    finally:
+        cache.shutdown()
+
+
 @pytest.mark.parametrize("backend", ["trtllm", BACKENDS[3]])
 def test_graph_replay_after_larger_plan_warmup(monkeypatch, backend: str) -> None:
     """T1: a captured paged-attention output still matches FP32 SDPA after scratch growth.
 
-    A larger plan crosses the counter's SM-count floor and increases query storage. Weak
-    references and saved addresses prove the captured allocation survives without test-owned
-    tensor references; allocator churn makes an accidentally released allocation observable.
+    TRTLLM reuses a workspace bucket for 40 then 48 tokens; FlashInfer grows its counters
+    past the SM-count floor. Weak references and saved addresses prove the captured allocation
+    survives; allocator churn makes an accidentally released allocation observable.
     """
     torch.manual_seed(15)
     buffers = []
@@ -953,8 +1028,7 @@ def test_graph_replay_after_larger_plan_warmup(monkeypatch, backend: str) -> Non
         monkeypatch.setattr(FallbackFmha, "attention", staticmethod(recording_attention))
 
     sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-    large_chunk = 1 << sm_count.bit_length()
-    small_chunk = 8
+    small_chunk, large_chunk = (40, 48) if backend == "trtllm" else (8, 1 << sm_count.bit_length())
     small = make_cache(32, spec=spec_for(chunk=small_chunk, causal_blocks={small_chunk: 1}))
     large = make_cache(32, spec=spec_for(chunk=large_chunk, causal_blocks={1: large_chunk}))
     try:
@@ -977,7 +1051,10 @@ def test_graph_replay_after_larger_plan_warmup(monkeypatch, backend: str) -> Non
             output = run(attention, small, q, k, v)
         captured_ref, captured_ptr, captured_size = buffers[-1]
         run(attention, large, *rand_qkv(large_chunk), causal_block_size=1)
-        assert buffers[-1][2] > captured_size, "larger plan must require a larger allocation"
+        if backend == "trtllm":
+            assert buffers[-1][1] == captured_ptr, "larger plan must reuse the captured bucket"
+        else:
+            assert buffers[-1][2] > captured_size, "larger plan must require a larger allocation"
         assert captured_ref() is not None, "captured scratch allocation was released"
         assert captured_ref().data_ptr() == captured_ptr, "captured scratch storage moved"
         scratch = torch.empty(captured_size, dtype=torch.uint8, device=DEVICE)
