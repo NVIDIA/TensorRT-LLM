@@ -833,7 +833,7 @@ class MultimodalModelMixin:
 
     def forward_multimodal_encoder_items(
         self,
-        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
+        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str | None]],
     ) -> list[torch.Tensor]:
         """Forward prepared MM encoder inputs in scheduler item order.
 
@@ -866,7 +866,8 @@ class MultimodalModelMixin:
             group_lengths.clear()
 
         for multimodal_param, embedding_lengths, modality in encoder_inputs:
-            if (
+            # An intact payload can consume every attention sequence slot in one call.
+            if modality is None or (
                 group_modality is not None
                 and modality != group_modality
                 and not any(
@@ -880,6 +881,8 @@ class MultimodalModelMixin:
             group_modality = modality
             group_params.append(multimodal_param)
             group_lengths.extend(embedding_lengths)
+            if modality is None:
+                flush_group()
         flush_group()
         return outputs
 
@@ -1142,10 +1145,18 @@ class MultimodalModelMixin:
             is not MultimodalModelMixin.build_multimodal_encoder_input
         ):
             return True
-        return all(
-            self.get_multimodal_item_partitions(param, modality) is not None
-            for modality in modalities
-        )
+        for modality in modalities:
+            partitions = self.get_multimodal_item_partitions(param, modality)
+            fields = {
+                name
+                for name, value in param.multimodal_data.get(modality, {}).items()
+                if value is not None
+            }
+            if not partitions or not fields.issubset(partitions):
+                return False
+            if all(partitions[name].is_shared for name in fields):
+                return False
+        return True
 
     def build_multimodal_encoder_input(
         self,

@@ -4,7 +4,7 @@
 
 from types import SimpleNamespace
 from typing import get_args
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -25,11 +25,31 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
+    BaseMultimodalInputProcessor,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
 )
+from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_disaggregated_encoder_rejects_prepared_media_without_output_lengths():
+    encoder = Mock()
+    encoder._encode_only = False
+    encoder._executor.is_shutdown.return_value = False
+    encoder.args.mm_encoder_only = True
+    encoder.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+    params = MultimodalParams(
+        multimodal_data={
+            "audio": {"input_features": torch.ones(1, 2)},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata([("audio", 0)]),
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"output_embedding_lengths.*LLM\.preprocess\(\)"):
+        BaseLLM.generate_async(encoder, PreprocessedInputs([1, 2], params))
+    encoder._executor.generate_async.assert_not_called()
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
@@ -698,7 +718,10 @@ def test_mixed_hashing_uses_processor_metadata_without_frontend_order() -> None:
 
 
 @pytest.mark.parametrize("hashing_enabled", [False, True])
-def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool) -> None:
+@pytest.mark.parametrize("hook_returns_metadata", [False, True])
+def test_mm_item_metadata_rejects_conflicting_prompt_order(
+    hashing_enabled: bool, hook_returns_metadata: bool
+) -> None:
     class Processor(_KwargsHashFakeProcessor):
         multimodal_hashing_supported = hashing_enabled
 
@@ -718,8 +741,10 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
 
         def get_mm_item_metadata(
             self, prompt_token_ids: list[int], multimodal_data: dict, mm_item_order=None
-        ) -> MultimodalItemMetadata:
-            return MultimodalItemMetadata([("video", 0), ("image", 0)], [4, 4], [2, 2])
+        ) -> MultimodalItemMetadata | None:
+            if hook_returns_metadata:
+                return MultimodalItemMetadata([("video", 0), ("image", 0)], [4, 4], [2, 2])
+            return None
 
     processor = Processor()
     inputs = {
@@ -731,9 +756,14 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
         "mm_item_order": [{"modality": "image", "index": 0}, {"modality": "video", "index": 0}],
     }
 
+    wrapped = create_input_processor_with_hash(processor)
     with pytest.raises(ValueError, match="item references do not match the prompt item order"):
-        create_input_processor_with_hash(processor)(inputs, None)
-
+        wrapped(inputs, None)
+    inputs["mm_item_order"].reverse()
+    _, extra = wrapped(inputs, None)
+    metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.item_refs == (("video", 0), ("image", 0))
+    assert metadata.output_embedding_lengths == (2, 2)
     assert processor.multimodal_hashing_supported is hashing_enabled
 
 

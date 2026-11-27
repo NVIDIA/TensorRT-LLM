@@ -103,13 +103,12 @@ def test_text_requests_do_not_allocate_multimodal_params():
     assert request.py_multimodal_params is None
 
 
-@pytest.mark.parametrize(
-    ("costs", "partitions"),
-    [(None, {"image": {"pixel_values": MultimodalItemPartition.batched()}}), ([1], None)],
-    ids=["no-cost", "no-partitions"],
-)
-def test_incomplete_metadata_uses_whole_request_encoding(costs, partitions):
-    metadata = MultimodalItemMetadata([("image", 0)], costs, [1], input_partitions=partitions)
+def test_raw_encoder_input_requires_a_known_physical_cost():
+    metadata = MultimodalItemMetadata(
+        [("image", 0)],
+        output_embedding_lengths=[1],
+        input_partitions={"image": {"pixel_values": MultimodalItemPartition.batched()}},
+    )
     request = make_llm_request(
         1,
         {
@@ -118,8 +117,8 @@ def test_incomplete_metadata_uses_whole_request_encoding(costs, partitions):
         },
     )
     assert request.py_mm_encoder_state is None
-    assert get_multimodal_encoder_token_lengths(request) == metadata.encoder_token_lengths
-    initialize_multimodal_encoder_request(request, 32, model=MultimodalModelMixin())
+    with pytest.raises(ValueError, match="cost"):
+        initialize_multimodal_encoder_request(request, 32, model=MultimodalModelMixin())
     assert request.py_mm_encoder_state is None
     request.py_multimodal_data["multimodal_embedding"] = torch.zeros(1, 2)
     initialize_multimodal_encoder_request(request, 32)
@@ -403,26 +402,32 @@ def test_scheduler_defers_items_beyond_output_byte_budget():
 
 
 def test_referenced_outputs_block_new_admissions_until_explicit_release():
-    scheduler = _scheduler(max_batch_size=8, max_num_tokens=1 << 20, cache_capacity=4)
-    holder = make_mm_request(1, [3])
-    newcomer = make_mm_request(2, [3])
+    scheduler = _scheduler(max_batch_size=8, max_num_tokens=32, cache_capacity=12)
+    holder, newcomer = [
+        make_mm_request(i, [3, 6], embedding_lengths=[1, 2], interleaved=True) for i in (1, 2)
+    ]
+    for request in (holder, newcomer):
+        initialize_multimodal_encoder_request(request, 32, model=MultimodalModelMixin())
+        assert tuple(request.py_mm_encoder_state.encoder_token_lengths) == (9,)
 
-    first_output = scheduler.schedule_request([holder], set())
+    first_output = scheduler.schedule_request([holder, newcomer], set())
     assert first_output.scheduled_mm_encoder_items == {1: [0]}
+    assert first_output.context_requests == [holder]
+    assert scheduler.encoder_cache.stats().reserved_bytes == 12
     holder_cache_key = holder.py_mm_encoder_state.item_cache_keys[0]
     assert holder_cache_key is not None
-    scheduler.encoder_cache.commit(holder_cache_key, torch.ones(1, dtype=torch.float32))
+    scheduler.encoder_cache.commit(holder_cache_key, torch.ones(3, dtype=torch.float32))
     holder.py_mm_encoder_state.mark_cache_key_ready(holder_cache_key)
 
+    holder.context_current_position = 2  # The first image has reached prefill.
+    release_consumed_mm_items(holder, scheduler.encoder_cache)
     output = scheduler.schedule_request([holder, newcomer], set())
     assert output.scheduled_mm_encoder_items is None
 
-    drained = holder.py_mm_encoder_state.pop_all_cache_keys()
-    assert drained == [holder_cache_key]
-    scheduler.encoder_cache.release(holder_cache_key)
+    holder.context_current_position = holder.prompt_len
+    release_consumed_mm_items(holder, scheduler.encoder_cache)
     assert scheduler.encoder_cache.get(holder_cache_key, record_stats=False) is None
-    holder.py_mm_encoder_state = None
-    output = scheduler.schedule_request([holder, newcomer], set())
+    output = scheduler.schedule_request([newcomer], set())
     assert output.scheduled_mm_encoder_items == {2: [0]}
 
 
@@ -516,12 +521,13 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
     assert output.context_requests == [request]
 
 
-def test_request_rejects_item_above_effective_startup_maximum():
-    request = make_mm_request(1, [9])
-    request.py_multimodal_data["image"] = {"pixel_values": torch.empty(1)}
+@pytest.mark.parametrize("costs", [[9], [3, 6]], ids=["one-item", "unpartitioned"])
+def test_request_rejects_item_above_effective_startup_maximum(costs):
+    request = make_mm_request(1, costs)
+    model = MultimodalModelMixin() if len(costs) > 1 else None
 
     with pytest.raises(ValueError, match="exceeding the effective startup maximum 8"):
-        initialize_multimodal_encoder_request(request, max_num_tokens=8)
+        initialize_multimodal_encoder_request(request, max_num_tokens=8, model=model)
 
 
 def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():

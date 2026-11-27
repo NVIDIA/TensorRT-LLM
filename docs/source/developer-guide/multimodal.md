@@ -113,11 +113,12 @@ and uses the declared output lengths to recover each item's embeddings.
 Processors implement
 `get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)` and
 return `MultimodalItemMetadata`. Generic preparation supplies prompt order and
-known output rows; model processors add encoder costs and input partitions.
-Partial model records retain known output lengths. Conflicting order or output
-lengths fail at input preparation. For caller-prepared media tensors,
-`generate_async` uses the same hook to fill missing item metadata. Inputs
-exported by `preprocess` already carry its result.
+known output lengths. Model processors add encoder costs and input partitions.
+For prepared media the worker runs the same hook after restoring the tensors.
+It matches inferred values to caller-supplied items by modality and local index,
+preserves the caller's order, and rejects conflicting values.
+In E+PD deployments, hand-built prepared media inputs must supply
+`item_metadata.output_embedding_lengths` so the encoder frontend can export the prefill layout.
 
 Unknown costs or row counts remain `None`. Common metadata does not enable item
 scheduling: models can supply order and output rows with
@@ -182,9 +183,11 @@ To opt in, the model sets `supports_mm_encoder_item_scheduling = True`, supports
 item selection, and either declares encoder groups or overrides
 `encode_multimodal_inputs`. The engine also checks `disable_mm_encoder`, the
 scheduling policy, and supported combinations in `mm_item_scheduling_enabled()` and
-`validate_mm_encoder_scheduling_compatibility()`. When a request has output
-lengths but lacks encoder costs or usable item partitions, prefill encodes the
-whole payload. Its complete output must fit the resident embedding budget.
+`validate_mm_encoder_scheduling_compatibility()`. If individual items cannot
+be selected or costed, the scheduler reserves space for the complete output
+and schedules the payload as one item. Admission requires a known physical
+encoder cost and enough capacity for one call. Prefill consumes the embeddings
+in the caller's item order and releases the reservation after its last use.
 
 ### Selecting Unusual Payloads
 
@@ -213,8 +216,9 @@ index `1`.
 Returning `None` from `get_multimodal_item_partitions` uses the existing
 packed/stacked compatibility selector. New models should declare partitions or
 override selection explicitly; the compatibility selector cannot describe an
-arbitrary model layout. An empty partition dict means every field is shared,
-so it is appropriate only when selecting an item requires no payload changes.
+arbitrary model layout. The default selector supports item scheduling when
+every populated field has a partition and at least one field has an item
+axis. An incomplete or shared-only declaration schedules the payload whole.
 
 ### Item Boundaries and Model Hooks
 

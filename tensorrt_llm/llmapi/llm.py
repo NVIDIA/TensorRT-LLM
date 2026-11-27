@@ -33,8 +33,8 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
-                                          _set_mm_item_metadata)
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -890,11 +890,6 @@ class BaseLLM:
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
             multimodal_params = inputs.multimodal_params
-            if multimodal_params is not None and multimodal_params.multimodal_data:
-                _set_mm_item_metadata(self.input_processor,
-                                      prompt_token_ids,
-                                      multimodal_params.multimodal_data,
-                                      fill_missing_only=True)
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
                 preprocessed_encoder_input_token_ids = self._normalize_token_ids(
@@ -921,6 +916,15 @@ class BaseLLM:
         if (self.args.mm_encoder_only
                 and multimodal_params is not None and isinstance(
                     self.input_processor, BaseMultimodalInputProcessor)):
+            data = multimodal_params.multimodal_data or {}
+            if isinstance(inputs, PreprocessedInputs) and any(
+                    modality in data for modality in MEDIA_MODALITIES):
+                metadata = multimodal_params.item_metadata
+                if metadata is None or not metadata.output_embedding_lengths:
+                    raise ValueError(
+                        "Prepared media inputs for a disaggregated encoder require "
+                        "item_metadata.output_embedding_lengths. Inputs from "
+                        "LLM.preprocess() include these lengths.")
             encoder_layout = self.input_processor.get_disagg_prefill_inputs(
                 prompt_token_ids, multimodal_params)
             if encoder_layout is not None:

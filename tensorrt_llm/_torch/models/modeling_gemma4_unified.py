@@ -86,6 +86,7 @@ from .modeling_gemma4mm import (
     Gemma4MultimodalEmbedder,
     Gemma4MultimodalModelBase,
     _gemma4_input_partitions,
+    _gemma4_video_frame_counts,
 )
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -229,13 +230,21 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
         metadata = BaseMultimodalInputProcessor.get_mm_item_metadata(
             self, prompt_token_ids, multimodal_data, mm_item_order
         )
-        if metadata is None:
-            # Unhashed inputs still need lengths for the encoder-free projections.
+        if multimodal_data.get("multimodal_embedding") is None:
             lengths = {}
             for modality in ("image", "video"):
                 data = multimodal_data.get(modality, {})
                 pixels = data.get("pixel_values")
                 if pixels is not None and pixels.ndim == 3:
+                    if (
+                        modality == "video"
+                        and metadata is not None
+                        and data.get("num_frames") is None
+                    ):
+                        counts = _gemma4_video_frame_counts(data, metadata)
+                        if counts is None:
+                            return metadata
+                        data = {**data, "num_frames": counts}
                     # Each merged patch projects directly to a text embedding.
                     _, lengths[modality] = self._vision_item_lengths(data, pooling_area=1)
             if (audio := multimodal_data.get("audio")) is not None:
@@ -248,7 +257,7 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
                     else mask.reshape(clips, -1).bool().sum(dim=-1).tolist()
                 )
             if not lengths:
-                return None
+                return metadata
             refs = (
                 [(entry["modality"], entry["index"]) for entry in mm_item_order]
                 if mm_item_order
@@ -257,7 +266,8 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
             metadata = MultimodalItemMetadata(
                 refs, output_embedding_lengths=[lengths[m][i] for m, i in refs]
             )
-        metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
+        if metadata is not None:
+            metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
         return metadata
 
 

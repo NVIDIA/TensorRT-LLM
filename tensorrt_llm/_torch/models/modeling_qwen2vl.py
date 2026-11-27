@@ -2358,6 +2358,7 @@ def _qwen_vision_input_partitions(
         pixel_key: MultimodalItemPartition.packed(patch_counts),
         grid_key: MultimodalItemPartition.batched(),
         "second_per_grid_ts": MultimodalItemPartition.batched(),
+        "vision_normalization": MultimodalItemPartition.shared(),
     }
 
 

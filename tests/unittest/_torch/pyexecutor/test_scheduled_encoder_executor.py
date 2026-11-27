@@ -564,6 +564,7 @@ def test_only_rank_0_of_a_multimodal_encoder_exports(monkeypatch, rank, exports)
         runner=_Runner(1, multimodal=True),
         model_config=SimpleNamespace(is_generation=False),
         model_loader=Mock(),
+        input_processor=Mock(),
         max_batch_size=1,
         max_num_tokens=64,
         max_seq_len=32,
@@ -591,6 +592,7 @@ def test_only_rank_0_of_a_multimodal_encoder_exports(monkeypatch, rank, exports)
         mapping=Mapping(world_size=2, rank=rank, tp_size=2),
         dist=SimpleNamespace(rank=rank, world_size=2, has_pp=False, barrier=lambda: None),
     )
+    assert executor.input_processor is built.input_processor
     request = SimpleNamespace(py_result=PyResult(prompt_len=1, max_new_tokens=1))
 
     executor._completion.store(

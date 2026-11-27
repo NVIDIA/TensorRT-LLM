@@ -226,7 +226,12 @@ def test_gemma_unified_processor_rejects_misaligned_sibling_items(
         ),
     }
 
-    with pytest.raises(ValueError, match=rf"{modality}\.{field} must have 1 "):
+    error = (
+        "vision input has 1 frames, but declares 2 frame lengths"
+        if modality == "image"
+        else rf"{modality}\.{field} must have 1 "
+    )
+    with pytest.raises(ValueError, match=error):
         processor.get_mm_item_metadata([], data)
 
 

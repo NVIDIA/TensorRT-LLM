@@ -5,10 +5,12 @@ import gc
 import os
 import unittest
 from abc import ABC, abstractmethod
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Type
+from unittest import mock
 
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
@@ -30,6 +32,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import CppMambaHybridCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.inputs import (
     create_input_processor,
     create_input_processor_with_hash,
@@ -39,6 +43,28 @@ from tensorrt_llm.inputs import (
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.sampling_params import SamplingParams
+
+
+def submit_prepared(param, processor, prompt_token_ids=None):
+    """Pass prepared media through worker admission and capture the engine input."""
+    if prompt_token_ids is None:
+        prompt_token_ids = [1] * sum(param.get_item_layout()[1])
+    worker = SimpleNamespace(
+        engine=SimpleNamespace(
+            model_engine=SimpleNamespace(input_processor=processor),
+            enqueue_request=mock.Mock(),
+            is_generation_model=True,
+        ),
+        _lora_manager=None,
+        max_seq_len=None,
+    )
+    request = GenerationRequest(
+        prompt_token_ids, SamplingParams(max_tokens=1), multimodal_params=copy(param)
+    ).set_id(1)
+    BaseWorker._enqueue_request(worker, request)
+    param.multimodal_data = worker.engine.enqueue_request.call_args.args[0].inputs.multimodal_data
+    return param
 
 
 @dataclass(repr=False)

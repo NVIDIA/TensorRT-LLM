@@ -9943,6 +9943,9 @@ class PyExecutor:
                 continue
             costs = (item_metadata.encoder_token_lengths
                      if item_metadata is not None else None)
+            if (costs is None and item_metadata is not None
+                    and item_metadata._encoder_payload_size is not None):
+                costs = (item_metadata._encoder_payload_size[0], )
             has_full_embedding = (isinstance(mm_data, dict)
                                   and mm_data.get("multimodal_embedding")
                                   is not None)
@@ -10428,6 +10431,8 @@ class PyExecutor:
                     initialize_multimodal_encoder_request(
                         request,
                         max_num_tokens=self.model_engine.encoder_max_num_tokens,
+                        attention_metadata_capacity=self.model_engine.
+                        _mm_item_scheduler.attention_metadata_capacity,
                         model=self.model_engine.model,
                         max_output_bytes=self.model_engine.
                         mm_encoder_output_budget_bytes,

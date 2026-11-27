@@ -3,7 +3,7 @@
 
 import copy
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -14,7 +14,7 @@ import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from PIL import Image
-from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
+from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal, submit_prepared
 from test_modeling_qwen2vl import _make_vision_attention
 from transformers import PretrainedConfig, Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
@@ -1408,6 +1408,54 @@ def test_qwen_vl_inline_encoder_capacity(model_cls, encoder_cls, grids, expected
     calls.clear()
     torch.testing.assert_close(prefill(cases), expected, rtol=0, atol=0)
     assert calls == expected_calls
+
+
+@pytest.mark.cpu_only
+def test_prepared_qwen_vl_keeps_caller_image_order_at_prefill():
+    grids = [{"image_grid_thw": [1, 2, 2]}] * 2
+    data, lengths, _, encoder, _ = _qwen_vl_item_grid_case(Qwen3VisionModelBase, grids)
+    data["image"]["pixel_values"][:4].fill_(11)
+    data["image"]["pixel_values"][4:].fill_(22)
+    refs = [("image", 1), ("image", 0)]
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        refs, output_embedding_lengths=lengths
+    )
+    prompt = [11, 12, 13] * 2
+    processor, _ = _make_qwen_vl_embedding_processor("qwen3", prompt)
+    param = MultimodalParams(multimodal_data=data)
+    param.to_handle("multimodal_data")
+    param = submit_prepared(param, processor, prompt)
+    assert param.item_metadata.item_refs == tuple(refs)
+    assert param.item_metadata.encoder_token_lengths == (4, 4)
+    _, prefill = modeling_multimodal_utils.fuse_input_embeds(
+        torch.nn.Embedding(15, 3),
+        torch.tensor(prompt),
+        encoder.forward([param]),
+        mm_token_ids=torch.tensor([12]),
+    )
+    assert prefill[[1, 4]].tolist() == [[22.0] * 3, [11.0] * 3]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "field", ["encoder_token_lengths", "output_embedding_lengths", "input_partitions"]
+)
+def test_prepared_qwen_vl_rejects_contradictory_metadata(field):
+    from tensorrt_llm.executor.utils import RequestError
+    from tensorrt_llm.inputs.multimodal import MultimodalItemPartition
+
+    prompt = [11, 12, 13]
+    processor, _ = _make_qwen_vl_embedding_processor("qwen3", prompt)
+    data, *_ = _qwen_vl_item_grid_case(Qwen3VisionModelBase, [{"image_grid_thw": [1, 2, 2]}])
+    wrong = (
+        {"image": {"pixel_values": MultimodalItemPartition.batched()}}
+        if field == "input_partitions"
+        else [5]
+    )
+    key = MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+    data[key] = replace(data[key], **{field: wrong})
+    with pytest.raises(RequestError, match=field):
+        submit_prepared(MultimodalParams(multimodal_data=data), processor, prompt)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

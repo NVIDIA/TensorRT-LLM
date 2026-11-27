@@ -29,7 +29,6 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor, nn
-from torch.utils._pytree import tree_any
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
@@ -77,27 +76,52 @@ def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
     return hasher.hexdigest()
 
 
+def _merge_mm_value(name, supplied, computed):
+    if supplied is None:
+        return computed
+    if isinstance(supplied, dict) and isinstance(computed, dict):
+        if not supplied:
+            return computed
+        return {
+            **computed,
+            **{
+                key: _merge_mm_value(f"{name}.{key}", value, computed.get(key))
+                for key, value in supplied.items()
+            }
+        }
+    if computed is not None and supplied != computed:
+        raise ValueError(
+            f"Computed {name} values do not match the supplied metadata")
+    return supplied
+
+
 def _merge_mm_item_metadata(
     prepared: MultimodalItemMetadata | None,
     metadata: MultimodalItemMetadata | None,
 ) -> MultimodalItemMetadata | None:
-    """Combine prompt layout with model costs and partitions at input preparation."""
+    """Merge the processor's physical layout into the caller's prompt order."""
     if metadata is None:
         return prepared
     if prepared is None or prepared is metadata:
         return metadata
-    if metadata.item_refs != prepared.item_refs:
+    if set(metadata.item_refs) != set(prepared.item_refs):
         raise ValueError(
-            "Multimodal item references do not match the prompt item order")
-    known_rows = prepared.output_embedding_lengths
-    if known_rows is not None:
-        if metadata.output_embedding_lengths is None:
-            return replace(metadata, output_embedding_lengths=known_rows)
-        if metadata.output_embedding_lengths != known_rows:
-            raise ValueError(
-                "Computed item output lengths do not match the prompt embedding slots"
-            )
-    return metadata
+            "Multimodal item references do not match the processed payload")
+
+    def lengths(name):
+        values = getattr(metadata, name)
+        if values is not None and metadata.item_refs != prepared.item_refs:
+            by_ref = dict(zip(metadata.item_refs, values, strict=True))
+            values = tuple(by_ref[ref] for ref in prepared.item_refs)
+        return _merge_mm_value(name, getattr(prepared, name), values)
+
+    return replace(metadata,
+                   item_refs=prepared.item_refs,
+                   encoder_token_lengths=lengths("encoder_token_lengths"),
+                   output_embedding_lengths=lengths("output_embedding_lengths"),
+                   input_partitions=_merge_mm_value("input_partitions",
+                                                    prepared.input_partitions,
+                                                    metadata.input_partitions))
 
 
 class InputProcessor(Protocol):
@@ -1612,27 +1636,22 @@ def _set_mm_item_metadata(
     prompt_token_ids: List[int],
     multimodal_data: Dict[str, Any],
     mm_item_order: Optional[List[Dict[str, Any]]] = None,
-    *,
-    fill_missing_only: bool = False,
 ) -> None:
     """Fill the item record from the model's processed inputs."""
     prepared_metadata = get_multimodal_item_metadata(multimodal_data)
-    if fill_missing_only:
-        if (multimodal_data.get("multimodal_embedding") is not None
-                or not any(m in multimodal_data for m in MEDIA_MODALITIES)):
-            return
-        if (prepared_metadata is not None
-                and prepared_metadata.output_embedding_lengths is not None
-                and prepared_metadata.encoder_token_lengths is not None
-                and all(m in prepared_metadata.input_partitions
-                        for m, _ in prepared_metadata.item_refs)):
-            return
-        # The worker owns exported tensors. Only local inputs can be inspected here.
-        is_handle = multimodal.MultimodalParams._is_shared_tensor_dict
-        if tree_any(is_handle, multimodal_data, is_leaf=is_handle):
-            return
+    # Hooks may populate partitions in place. Compare their result with the
+    # untouched caller record, including on a repeated submission.
+    hook_data = multimodal_data.copy()
+    if prepared_metadata is not None:
+        prepared_metadata.validate()
+        hook_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = replace(
+            prepared_metadata,
+            input_partitions={
+                m: fields.copy()
+                for m, fields in prepared_metadata.input_partitions.items()
+            })
     get_item_metadata = getattr(input_processor, "get_mm_item_metadata", None)
-    item_metadata = (get_item_metadata(prompt_token_ids, multimodal_data,
+    item_metadata = (get_item_metadata(prompt_token_ids, hook_data,
                                        mm_item_order)
                      if get_item_metadata is not None else prepared_metadata)
     if item_metadata is not None and not isinstance(item_metadata,
@@ -1640,25 +1659,32 @@ def _set_mm_item_metadata(
         raise TypeError(
             "get_mm_item_metadata() must return a MultimodalItemMetadata or None"
         )
-    item_metadata = _merge_mm_item_metadata(prepared_metadata, item_metadata)
-    if item_metadata is None:
+    if item_metadata is not None:
+        item_metadata.validate()
+    if mm_item_order:
+        prompt_refs = tuple(
+            (entry["modality"], entry["index"]) for entry in mm_item_order)
+        if any(record is not None and record.item_refs != prompt_refs
+               for record in (prepared_metadata, item_metadata)):
+            raise ValueError(
+                "Multimodal item references do not match the prompt item order")
+    merged = _merge_mm_item_metadata(prepared_metadata, item_metadata)
+    if merged is None:
         return
-    if mm_item_order and item_metadata.item_refs != tuple(
-        (entry["modality"], entry["index"]) for entry in mm_item_order):
-        raise ValueError(
-            "Multimodal item references do not match the prompt item order")
-    if (fill_missing_only and prepared_metadata is not None
-            and prepared_metadata is not item_metadata):
-        partitions = item_metadata.input_partitions.copy()
-        for modality, fields in prepared_metadata.input_partitions.items():
-            partitions[modality] = {**partitions.get(modality, {}), **fields}
-        item_metadata = replace(
-            item_metadata,
-            encoder_token_lengths=(prepared_metadata.encoder_token_lengths
-                                   or item_metadata.encoder_token_lengths),
-            input_partitions=partitions)
-    item_metadata.validate()
-    multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
+    aux_key = "multimodal_embedding_metadata"
+    auxiliary = hook_data.get(aux_key)
+    supplied = multimodal_data.get(aux_key)
+    if item_metadata is not None and auxiliary is not supplied:
+        by_ref = dict(zip(item_metadata.item_refs, auxiliary, strict=True))
+        aligned = [by_ref[ref] for ref in merged.item_refs]
+        if supplied is not None:
+            aligned = [
+                _merge_mm_value(aux_key, given, inferred)
+                for given, inferred in zip(supplied, aligned, strict=True)
+            ]
+        hook_data[aux_key] = aligned
+    hook_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = merged
+    multimodal_data.update(hook_data)
 
 
 def create_input_processor_with_hash(
@@ -1742,11 +1768,11 @@ def create_input_processor_with_hash(
         # manifest.
         mm_item_order = inputs.get("mm_item_order")
         metadata = get_multimodal_item_metadata(multimodal_data)
-        if mm_item_order:
+        if metadata is not None:
+            item_refs = metadata.item_refs
+        elif mm_item_order:
             item_refs = tuple(
                 (entry["modality"], entry["index"]) for entry in mm_item_order)
-        elif metadata is not None:
-            item_refs = metadata.item_refs
         else:
             present = [
                 m for m, lengths in num_mm_tokens_by_key.items() if lengths

@@ -286,6 +286,8 @@ def _gemma4_input_partitions(
                 )
             if data.get("num_frames") is not None:
                 modality_partitions["num_frames"] = MultimodalItemPartition.batched()
+            if "vision_normalization" in data:
+                modality_partitions["vision_normalization"] = MultimodalItemPartition.shared()
             partitions[modality] = modality_partitions
     return partitions
 
@@ -511,19 +513,28 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             )
         modality = modalities[0]
         data = multimodal_data[modality]
+        payload_size = None
         if modality == "audio":
             encoder_token_lengths, output_embedding_lengths = self._audio_item_lengths(data)
         else:
+            frames, patches = data["pixel_values"].shape[:2]
+            payload_size = (frames * patches, frames)
             if modality == "video" and data.get("num_frames") is None:
                 counts = _gemma4_video_frame_counts(data, prepared)
                 if counts is None:
-                    return prepared
+                    if prepared is None:
+                        return None
+                    if prepared.output_embedding_lengths is not None:
+                        _, lengths = self._vision_item_lengths(data)
+                        if sum(lengths) != sum(prepared.output_embedding_lengths):
+                            raise ValueError(
+                                "Declared output lengths do not match the video payload"
+                            )
+                    return dataclasses.replace(prepared, _encoder_payload_size=payload_size)
                 data = {**data, "num_frames": counts}
             encoder_token_lengths, output_embedding_lengths = self._vision_item_lengths(data)
         if mm_item_order:
             item_refs = [(entry["modality"], entry["index"]) for entry in mm_item_order]
-        elif prepared is not None:
-            item_refs = prepared.item_refs
         else:
             item_refs = [(modality, item_idx) for item_idx in range(len(encoder_token_lengths))]
         metadata = MultimodalItemMetadata(
@@ -531,6 +542,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             encoder_token_lengths=[encoder_token_lengths[i] for _, i in item_refs],
             output_embedding_lengths=[output_embedding_lengths[i] for _, i in item_refs],
             input_partitions=prepared.input_partitions.copy() if prepared is not None else None,
+            _encoder_payload_size=payload_size,
         )
         metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
         return metadata
