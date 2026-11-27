@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TRTLLM generation attention over a long INT8 KV cache with XQA multi-block mode.
+"""TRTLLM generation attention over quantized KV caches with XQA multi-block mode.
 
 The generation step runs on a paged INT8 cache and, as a control, on a BF16 cache that holds the
 same dequantized values (the KV scale is a power of two, so ``int8 * scale`` is exact in BF16).
 Each case checks that the XQA kernel splits every sequence into more than one sub-sequence, that
 the INT8 output matches the BF16-cache output and a float64 reference, that the appended tokens
 are stored exactly, and that repeated steps are bitwise identical.
+The SM89 FP8 case checks the same split and compares against its dequantized cache.
 """
 
 import json
@@ -89,14 +90,15 @@ def _pool(manager, int8):
     return buf.view(torch.int8) if int8 else buf
 
 
-def _fill(manager, cached_k, cached_v, int8):
+def _fill(manager, cached_k, cached_v, kv_dtype):
     """Write the cached prefix of every sequence; the rest of the pool is zero."""
+    int8 = kv_dtype == DataType.INT8
     buf = _pool(manager, int8)
     buf.zero_()
     blocks = manager.get_batch_cache_indices(list(range(len(cached_k))), 0)
     for i, (k, v) in enumerate(zip(cached_k, cached_v, strict=True)):
-        if int8:
-            k, v = k.to(torch.int8), v.to(torch.int8)
+        if kv_dtype in (DataType.INT8, DataType.FP8):
+            k, v = k.to(buf.dtype), v.to(buf.dtype)
         else:
             k, v = (k * KV_SCALE).to(buf.dtype), (v * KV_SCALE).to(buf.dtype)
         for n, block in enumerate(blocks[i][: math.ceil(k.shape[0] / PAGE)]):
@@ -106,10 +108,11 @@ def _fill(manager, cached_k, cached_v, int8):
             buf[block, 1, :, :num].copy_(v[tokens].transpose(0, 1))
 
 
-def _cached_kv(manager, total, int8):
+def _cached_kv(manager, total, kv_dtype):
     """Dequantized cache contents per sequence, ``[2, total_len, num_kv_heads, head_dim]``."""
+    int8 = kv_dtype == DataType.INT8
     buf = _pool(manager, int8)
-    kv_scale = KV_SCALE if int8 else 1.0
+    kv_scale = KV_SCALE if kv_dtype in (DataType.INT8, DataType.FP8) else 1.0
     blocks = manager.get_batch_cache_indices(list(range(len(total))), 0)
     result = []
     for i, length in enumerate(total):
@@ -143,6 +146,7 @@ def _generation_step(kv_dtype, num_heads, num_kv_heads, head_dim, cached, q_len,
     """One generation step; returns (output, cache after the step, XQA grids, repeat outputs)."""
     q, cached_k, cached_v, new_k, new_v = inputs
     int8 = kv_dtype == DataType.INT8
+    quantized = kv_dtype in (DataType.INT8, DataType.FP8)
     pool_dtype = DataType.FP8 if int8 else kv_dtype
     num_seqs = len(cached)
     request_ids = list(range(num_seqs))
@@ -155,9 +159,13 @@ def _generation_step(kv_dtype, num_heads, num_kv_heads, head_dim, cached, q_len,
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.INT8) if int8 else None,
+        quant_config=(
+            QuantConfig(kv_cache_quant_algo=QuantAlgo.INT8 if int8 else QuantAlgo.FP8)
+            if quantized
+            else None
+        ),
     )
-    if int8:
+    if quantized:
         attn.kv_cache_scaling_factor.fill_(KV_SCALE)
         attn.kv_scale_quant_orig = attn.kv_cache_scaling_factor
         attn.kv_scale_orig_quant = 1.0 / attn.kv_cache_scaling_factor
@@ -176,7 +184,7 @@ def _generation_step(kv_dtype, num_heads, num_kv_heads, head_dim, cached, q_len,
     )
     try:
         manager.add_dummy_requests(request_ids, total)
-        _fill(manager, cached_k, cached_v, int8)
+        _fill(manager, cached_k, cached_v, kv_dtype)
 
         metadata = TrtllmAttentionMetadata(
             num_contexts=0,
@@ -217,7 +225,7 @@ def _generation_step(kv_dtype, num_heads, num_kv_heads, head_dim, cached, q_len,
 
         output = step().clone()
         torch.cuda.synchronize()
-        cache = _cached_kv(manager, total, int8)
+        cache = _cached_kv(manager, total, kv_dtype)
 
         # The step rewrites the same new tokens into the same slots, so it can be repeated.
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
@@ -293,3 +301,46 @@ def test_int8_kv_generation_uses_multi_block(
     torch.testing.assert_close(out_int8.double(), reference, atol=2e-2, rtol=2e-2)
     # Both kernels read the same values; they differ only in rounding of the partial results.
     torch.testing.assert_close(out_int8, out_bf16, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 89,
+    reason="FP8 KV multi-block regression targets SM89",
+)
+@pytest.mark.parametrize(
+    "cached",
+    [[4096], [2048, 4096]],
+    ids=["batch1", "batch2-mixed"],
+)
+def test_fp8_kv_generation_uses_multi_block(tmp_path, cached):
+    num_heads, num_kv_heads, head_dim = 32, 8, 128
+    inputs = _inputs(num_heads, num_kv_heads, head_dim, cached, q_len=1, seed=0)
+    output, cache, grids, repeats = _generation_step(
+        DataType.FP8,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        cached,
+        1,
+        inputs,
+        tmp_path,
+    )
+
+    assert grids and all(grid[0] > 1 for grid in grids), grids
+    assert all(torch.equal(repeat, output) for repeat in repeats)
+    assert not output.isnan().any()
+
+    for i, kv in enumerate(cache):
+        expected = torch.stack(
+            [
+                torch.cat([inputs[1][i], inputs[3][i : i + 1]]),
+                torch.cat([inputs[2][i], inputs[4][i : i + 1]]),
+            ]
+        )
+        expected = expected.to(torch.float8_e4m3fn).double() * KV_SCALE
+        torch.testing.assert_close(kv, expected, atol=0, rtol=0)
+
+    reference = _reference(inputs[0], cache, cached, q_len=1)
+    rel_err = ((output.double() - reference).norm() / reference.norm()).item()
+    assert rel_err < 1e-2, rel_err
+    torch.testing.assert_close(output.double(), reference, atol=2e-2, rtol=2e-2)
