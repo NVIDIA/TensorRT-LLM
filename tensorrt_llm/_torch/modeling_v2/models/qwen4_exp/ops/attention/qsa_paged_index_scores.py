@@ -220,8 +220,13 @@ def _qsa_index_scores_visible_split(
     num_warps: int = _SPLIT_NUM_WARPS,
     num_stages: int = 2,
     wide: bool = False,
+    group_slots: int | None = None,
 ) -> torch.Tensor:
-    """One launch of the visible-split kernel after the callable's own checks."""
+    """One launch of the visible-split kernel after the callable's own checks. `group_slots`
+    (default `rows_per_tile`): the request slots a row tile launches, which must be at least the
+    distinct requests any of its row tiles holds (a caller that knows its rows come `p` a
+    request, consecutive and tile-aligned, passes `rows_per_tile // p`); `split` then counts
+    only those slots, so the device's programs go to requests that exist."""
     if index_cache.ndim != 4 or index_cache.shape[2] != 1:
         raise ValueError("QSA index cache must have shape [pages, tokens, 1, dim]")
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
@@ -260,11 +265,12 @@ def _qsa_index_scores_visible_split(
         )
     # Every (row tile, group slot) pair gets `split` programs; slots past a tile's request
     # count exit at once.
+    slots = rows_per_tile if group_slots is None else max(1, min(int(group_slots), rows_per_tile))
     split = min(
         triton.cdiv(max_compressed_blocks, block_n),
-        max(1, triton.cdiv(programs_per_sm * _sm_count(q.device), row_tiles * rows_per_tile)),
+        max(1, triton.cdiv(programs_per_sm * _sm_count(q.device), row_tiles * slots)),
     )
-    _qsa_index_scores_visible_split_kernel[(row_tiles, rows_per_tile, split)](
+    _qsa_index_scores_visible_split_kernel[(row_tiles, slots, split)](
         q,
         index_cache,
         block_table,
@@ -1510,7 +1516,11 @@ class QsaPagedIndexScores(OpWrapper):
         rows_per_request: int = 1,
         prefill_query_tile: bool = False,
         wide_split: bool = False,
+        split_shape: tuple[int, int] | None = None,
     ) -> torch.Tensor:
+        """`split_shape` = `(programs a SM, request slots a row tile)` overrides the
+        visible-split launch's shape (`_qsa_index_scores_visible_split`'s `programs_per_sm` and
+        `group_slots`); the scores do not depend on it. Other kernels ignore it."""
         if rows_per_request < 1:
             raise ValueError("QSA index scoring requires rows_per_request >= 1")
         if _takes_request_groups_prefetch(
@@ -1537,6 +1547,8 @@ class QsaPagedIndexScores(OpWrapper):
                 compress_ratio,
                 use_pdl,
                 wide=wide_split,
+                programs_per_sm=None if split_shape is None else split_shape[0],
+                group_slots=None if split_shape is None else split_shape[1],
             )
         if _takes_request_groups(q, only_visible_blocks, context_rows, prefetch, rows_per_request):
             return _qsa_index_scores_request_groups(

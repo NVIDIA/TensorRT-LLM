@@ -917,6 +917,40 @@ TEP_INDEX_PREFETCH_ENV = "TRTLLM_QWEN4_EXP_TEP_INDEX_PREFETCH"
 #: at 1 / 2 requests; at 12 and 16 rows the scores are bandwidth-bound and the prefetching
 #: program, one tile, cost +0.8..+2.8 us a layer in the op micro).
 _TEP_INDEX_PREFETCH_ROWS = frozenset({4, 8})  # capacity: fixed: a dispatch table
+#: Off by default (opt-in: a launch shape). At a tep4 rank with its fast forms, a generation step's
+#: index scores on the visible-split kernel over more than one row tile (the rows of `p` > 1 a
+#: request outside `_TEP_INDEX_PREFETCH_ROWS` and the grouped rows: the trunk's 3 and 4 requests of
+#: four verify rows, and a draft-extend pass's under IndexShare; one row tile keeps the default
+#: launch, which was not measured against it) launch one request slot a row tile instead of
+#: `rows_per_tile` (a row tile is one request's rows, so the other slots only exit) and `<n>`
+#: programs an SM instead of 16, which the split then spends on the requests that exist. The same
+#: tiles and dots: bitwise the default launch. GB300 tep4 (one-node aggregated server, forced
+#: acceptance 1.32, ~100k-token contexts, alternating on / off arms): n = 16, -0.009 / -0.016 ms a
+#: step at 3 / 4 requests, 0 at 1-2 (single runs: n = 8 -0.007 / -0.010, n = 32 -0.008 / 0.000).
+#: `TRTLLM_QWEN4_EXP_TEP_INDEX_SPLIT=<n>`, n in 1..64. Read once, when the target is built; set
+#: where it cannot apply it warns and does nothing.
+TEP_INDEX_SPLIT_ENV = "TRTLLM_QWEN4_EXP_TEP_INDEX_SPLIT"
+#: The visible-split kernel's dot width (`qsa_paged_index_scores._SPLIT_DOT_WIDTH`): its row tile
+#: is `dot width / index heads` rows.
+_INDEX_SPLIT_DOT_WIDTH = 16  # capacity: fixed: the kernel's dot width
+
+
+def _tep_index_split(core) -> int:
+    """`TEP_INDEX_SPLIT_ENV` at this core: the visible-split programs an SM (0 = off)."""
+    raw = os.environ.get(TEP_INDEX_SPLIT_ENV, "").strip()
+    if not raw or raw == "0":
+        return 0
+    if not raw.isdigit() or not 1 <= int(raw) <= 64:
+        raise ValueError(f"{TEP_INDEX_SPLIT_ENV}={raw!r}: expected programs an SM in 1..64")
+    if core.tep_fast:
+        return int(raw)
+    logger.warning(
+        f"{TEP_INDEX_SPLIT_ENV} is set but ignored: it serves a tep4 rank with "
+        f"{TEP_FAST_DECODE_ENV} on"
+    )
+    return 0
+
+
 #: - Request groups from which grouped scoring takes the CuTe kernel
 #:   (`qsa_index_scores_groups_cute__decode`, 2 or 3 rows a request). It sums in another order
 #:   (~7e-8 relative), so a row's top-k can differ only at a near-tie.
@@ -2139,6 +2173,7 @@ def _decode_forms(core) -> str:
             "attn inplace": getattr(core, "tep_attn_inplace", False),
             "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
             "tp sum lamport": getattr(core, "_tep_tpsum", None) is not None,
+            "index split": getattr(core, "tep_index_split", 0),
         }
     return f"{head}: " + ", ".join(f"{k} {v}" for k, v in forms.items())
 
@@ -2739,6 +2774,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.tep_proj = _tep_proj(self)
         # A tep4 rank's verify-step index keys before the PDL wait (`TEP_INDEX_PREFETCH_ENV`).
         self.tep_index_prefetch = _tep_index_prefetch(self)
+        # A tep4 rank's visible-split index launch shape (`TEP_INDEX_SPLIT_ENV`).
+        self.tep_index_split = _tep_index_split(self)
         # A tep4 rank's decode GQA on the e4m3 entry (`TEP_GQA_E4M3_ENV`).
         self.tep_gqa_e4m3 = _tep_gqa_e4m3(self, device)
         # A tep4 rank's in-place attention prologue (`TEP_ATTN_INPLACE_ENV`), built below.
@@ -6529,6 +6566,14 @@ def _decode_index_scores(
             q, index_cache, block_table, logical, req_idx, tpb, core.compress_ratio,
             _INDEX_SCORES_PDL, rpr,
         )  # fmt: skip
+    kw = {}
+    pps = getattr(core, "tep_index_split", 0)
+    if pps and rpr == 1 and p > 1 and rows % p == 0:
+        # `TEP_INDEX_SPLIT_ENV`: one slot a row tile when each row tile is one request's rows,
+        # past one row tile only (where it was measured).
+        tile = min(rows, _INDEX_SPLIT_DOT_WIDTH // q.shape[1]) if q.dim() == 3 else 0
+        if tile and rows > tile and tile % p == 0:
+            kw["split_shape"] = (pps, tile // p)
     return qsa_paged_index_scores(
         q=q,
         index_cache=index_cache,
@@ -6542,6 +6587,7 @@ def _decode_index_scores(
         use_pdl=_INDEX_SCORES_PDL,
         rows_per_request=rpr,
         wide_split=True,
+        **kw,
     )
 
 
