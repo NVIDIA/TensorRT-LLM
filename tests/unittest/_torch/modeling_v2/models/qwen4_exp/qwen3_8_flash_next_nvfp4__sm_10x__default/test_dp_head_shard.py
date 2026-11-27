@@ -309,8 +309,8 @@ def test_build_agrees_when_a_group_is_missing(monkeypatch, where):
 
 def test_check_runs_with_grad_on_and_a_weight_that_requires_grad():
     """The build check runs in `post_load_weights`, with grad mode on, over the head's weight,
-    which still requires grad there: its `torch.mm(..., out=)` must not see autograd (dep8 GSM8K
-    on the full-stack3 image: `mm(): functions with out=... arguments don't support automatic
+    which still requires grad there: its `torch.mm(..., out=)` must not see autograd (a dep8 GSM8K
+    run: `mm(): functions with out=... arguments don't support automatic
     differentiation`, so the heads were declined on every rank)."""
     vocab, hidden, g, lo, n = 16, 8, 2, 8, 8
     full = torch.nn.Parameter(torch.randn(vocab, hidden).to(torch.bfloat16))

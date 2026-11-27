@@ -154,8 +154,8 @@ def test_tm64x2_is_one_rounding_from_the_default_plan(rows) -> None:
     every cell does, and moves `low` and `inject` by at most one bf16 step of the default plan's
     wherever a lane is not cancelling (at least `eps / 16` of the tensor's largest value, the
     band's absolute term). A cancelling lane can move further: the two fp32 sums of 10240 terms
-    differ by a few fp32 ulps of the row's scale, many bf16 steps of a value near 0 (full-stack3
-    GPU gate: 1 lane at 65 rows, 2 at 80, |low| about 1e-4, both plans inside the band). Its
+    differ by a few fp32 ulps of the row's scale, many bf16 steps of a value near 0 (a GB300
+    GPU run: 1 lane at 65 rows, 2 at 80, |low| about 1e-4, both plans inside the band). Its
     graph replay is bitwise its eager call."""
     normed, first, rank, c, wi = _build(dict(rows=rows), seed=1100 + rows)
     ref = op(normed, first, rank, c, wi)
