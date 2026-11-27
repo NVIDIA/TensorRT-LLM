@@ -34,7 +34,10 @@ its output).
 
 Collective: every rank of the group launches the same kernel at the same point with the same
 rows and slot, and every CTA of a launch must be resident on every rank at once (5 x 16 CTAs of
-64 threads at most).
+64 threads at most). A rank whose window holds no FC2 row (`[0, 2560]`, every slot -1) still
+takes part: it launches over a one-row zero stand-in that no slot names, so its partial is 0 and
+no load reads past an FC2 allocation. Routing weights at a 2-byte offset are copied to aligned storage
+first (the kernel reads them in 32-bit pairs); the copy is rank-local, every rank still launches.
 """
 
 from __future__ import annotations
@@ -442,6 +445,8 @@ class TepFinar:
     peers: tuple
     state: torch.Tensor
     fn: object
+    #: `[1, 2560]` bf16 zeros: the FC2 operand of a rank whose window is empty.
+    empty_fc2: torch.Tensor | None = None
 
     @property
     def workspace_bytes(self) -> int:
@@ -472,6 +477,14 @@ class TepFinar:
                 f"{fc2.dtype} {tuple(fc2.shape)} strides {tuple(fc2.stride())}, wts {wts.dtype} "
                 f"{tuple(wts.shape)}, perm {perm.dtype} {tuple(perm.shape)}, rows {rows}, slot {slot}"
             )
+        if fc2.shape[0] == 0:
+            # No FC2 row to read: every slot is -1, the partial is 0, and the rank still
+            # publishes and reduces with its peers.
+            if self.empty_fc2 is None or self.empty_fc2.device != fc2.device:
+                self.empty_fc2 = torch.zeros((1, HIDDEN), dtype=torch.bfloat16, device=fc2.device)
+            fc2 = self.empty_fc2
+        if wts.data_ptr() % 4:
+            wts = wts.clone()  # the kernel loads the weights in 32-bit pairs
         out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=fc2.device)
         self.fn(
             fc2.data_ptr(),
@@ -517,14 +530,17 @@ def build(rank: int, use_pdl: bool, early: bool = False, chunk: int = CHUNK) -> 
     dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
     torch.cuda.synchronize(dev)
     early = bool(use_pdl) and bool(early)
-    return TepFinar(rank, int(chunk), bool(use_pdl), early, buffer, peer_buffers, peers, state, fn)
+    empty_fc2 = torch.zeros((1, HIDDEN), dtype=torch.bfloat16, device=dev)
+    return TepFinar(
+        rank, int(chunk), bool(use_pdl), early, buffer, peer_buffers, peers, state, fn, empty_fc2
+    )
 
 
 def _finalize(fc2: torch.Tensor, wts: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
     """`finalizeKernel` over one rank's window: fp32, slot order, one bf16 rounding, -0.0 as
     +0.0 (the transport's marker)."""
     acc = torch.zeros((perm.shape[0], fc2.shape[1]), dtype=torch.float32, device=fc2.device)
-    for k in range(perm.shape[1]):
+    for k in range(perm.shape[1] if fc2.shape[0] else 0):  # an empty window adds nothing
         idx = perm[:, k].long()
         live = (idx >= 0) & (idx < fc2.shape[0])
         rows = fc2[idx.clamp(0, fc2.shape[0] - 1)].float()

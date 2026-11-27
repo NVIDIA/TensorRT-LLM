@@ -18,6 +18,10 @@ row has no local slot), with -0.0 lanes and values over 2^-12..2^8. For each cel
   another still reads the slot before it: every launch of every replay equals the reference
   (counted on the device, read once at the end).
 
+* with one rank's window empty (`[0, 2560]` FC2 rows, every slot -1) and the others' not, and
+  with routing weights at a 2-byte offset: eagerly on slots 0, 1, 2 and replayed from one graph,
+  every rank's output equals the reference (the empty rank adds 0) and every rank finishes.
+
 Both release points (`early` False / True) run. `QWEN4_EXP_FINAR_REPLAYS` raises the replays
 (default 300 a cell and release point) for a longer stress run.
 """
@@ -87,6 +91,44 @@ def _same_on_every_rank(name: str, got: torch.Tensor) -> None:
     dist.all_gather(everyone, got)
     for r, other in enumerate(everyone):
         _check(f"{name}: rank {r}", got, other)
+
+
+def _empty_window(gen, rank: int, rows: int, finar, device, tag: str) -> None:
+    """Rank `rows % WORLD` holds no FC2 row; every other rank's routing weights sit at a 2-byte
+    offset into their storage."""
+    empty = rows % WORLD
+
+    def operands():
+        fc2, wts, perm = _operands(gen, rank, rows, device)
+        if rank == empty:
+            fc2 = torch.empty((0, op.HIDDEN), dtype=torch.bfloat16, device=device)
+            perm = torch.full_like(perm, -1)
+        else:
+            storage = torch.empty(wts.numel() + 1, dtype=torch.bfloat16, device=device)
+            shifted = storage[1:].view(rows, op.TOP_K)
+            shifted.copy_(wts)
+            assert shifted.data_ptr() % 4 == 2 and finar.takes(fc2, shifted, perm, rows)
+            wts = shifted
+        assert finar.takes(fc2, wts, perm, rows)
+        return fc2, wts, perm
+
+    for slot in range(op.SLOTS):
+        ops_mine = operands()
+        got = op.tep_finalize_allreduce(*ops_mine, rows, slot, finar)
+        _check(f"empty window {tag}, slot {slot}", got, _reference(ops_mine))
+        _same_on_every_rank(f"empty window {tag}, slot {slot}", got)
+    static = [operands() for _ in range(op.SLOTS)]
+    want = [_reference(ops) for ops in static]
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        outs = [op.tep_finalize_allreduce(*static[s], rows, s, finar) for s in range(op.SLOTS)]
+    torch.cuda.current_stream().wait_stream(stream)
+    for i in range(max(REPLAYS // 10, 10)):
+        graph.replay()
+        for s in range(op.SLOTS):
+            _check(f"empty window replay {i} {tag}, slot {s}", outs[s], want[s])
 
 
 def _back_to_back(gen, rank: int, rows: int, finar, device, tag: str) -> None:
@@ -159,6 +201,7 @@ def _rank_main(rank: int, port: int) -> None:
                     for s in range(op.SLOTS):
                         _check(f"replay {i} {tag}, slot {s}", outs[s], _reference(static[s]))
                 _back_to_back(gen, rank, rows, finar, device, tag)
+                _empty_window(gen, rank, rows, finar, device, tag)
         torch.cuda.synchronize(device)
     finally:
         dist.destroy_process_group()
