@@ -15,7 +15,7 @@
   rows come in multiples of the row-tile pass's groups (10 rows at 24 / 2 heads, 20 at 6 / 1),
   so a launch per group splits none of them and every row takes the same pass as in the one
   launch. At 6 / 1 heads the pass agrees with the NVFP4 per-row prefill kernel.
-* **MTP IndexShare.** The draft selection (`_selection`) in its fused and its two-launch form,
+* **MTP IndexShare.** The selection (`_selection`) in its cluster, one-CTA and two-launch forms,
   the capture of each request's draft-extend row into the shared buffers (decode and
   mixed-batch forms), and the reuse entry's order over canonical captures. The targets are
   built without weights: the capture methods read only their arguments, the metadata and the
@@ -300,10 +300,15 @@ def _select(scores, starts, ends) -> torch.Tensor:
 
 @_cuda
 @pytest.mark.parametrize("width", [2080, 65600])
-@pytest.mark.parametrize("fused", [False, True])
-def test_selection_matches_the_canonical_composition(width, fused, monkeypatch):
-    """The draft selection keeps the canonical tie order and expansion in the fused launch
-    and in the selection and the expansion apart."""
+@pytest.mark.parametrize("form", ["cluster", "fused", "apart"])
+def test_selection_matches_the_canonical_composition(width, form, monkeypatch):
+    """The selection keeps the canonical tie order and expansion in each of its three forms:
+    the cluster launch (`qsa_topk_expand_cluster`, where its table widths reach), the
+    one-CTA-a-row launch, and the selection and the expansion apart."""
+    if form == "cluster" and not M._topk_expand_cluster_supports(
+        torch.empty((4, width), device=DEV)
+    ):
+        pytest.skip("the cluster launch does not serve this table width")
     positions = torch.tensor([2043, 2047, 84000, 99999], dtype=torch.int64, device=DEV)
     visible = ((positions + 1) // 4).to(torch.int32)
     visible.clamp_(max=width)
@@ -320,7 +325,9 @@ def test_selection_matches_the_canonical_composition(width, fused, monkeypatch):
     expected_tokens = M.qsa_expand_block_indices(
         expected, positions, lengths, compress_ratio=4, token_topk=2048
     )
-    if not fused:
+    if form != "cluster":
+        monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores: False)
+    if form == "apart":
         monkeypatch.setattr(M, "_topk_expand_supports", lambda scores: False)
     result = torch.full_like(expected, -7)
     selected = torch.full_like(expected_tokens, -7)

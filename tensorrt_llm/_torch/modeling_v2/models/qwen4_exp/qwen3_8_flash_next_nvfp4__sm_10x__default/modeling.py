@@ -70,7 +70,11 @@ projections and heads (`_ONE_RANK_SWITCHES`: `_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP
 cross `dense_seq_len_threshold` later without rebuilding its prefix; above it the sparse
 core (index scores, block top-k and expansion, sparse GQA) replaces the dense op, and the
 main K/V append becomes this layer's own call. The raw index key is stored before anything
-normalizes it: the compression applies the norm and the rotation itself.
+normalizes it: the compression applies the norm and the rotation itself. Past one rank a
+generation step's sparse core runs on the family's decode ops, which the FP8 target runs too,
+at its row table: request-grouped index scores, the cluster top-k, and the CuTe sparse GQA over
+a bf16 or e4m3 pool with the output gate in its store (`_decode_index_scores`, `_selection`,
+`_sparse_gqa_decode`).
 
 **KV storage.** The paged K/V pool holds the checkpoint's bf16, fp8-e4m3 under
 `kv_cache_config.dtype: fp8` (`QM_FP8_KV_CACHE`) or NVFP4 under `nvfp4` (`QM_NVFP4_KV_CACHE`,
@@ -188,6 +192,12 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonica
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_groups_cute__decode import (  # noqa: E501
+    index_scores_groups as index_scores_groups_cute,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_groups_cute__decode import (  # noqa: E501
+    serves as _index_groups_cute_serves,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_mtp_reuse_topk import (
     qsa_mtp_reuse_topk,
 )
@@ -237,8 +247,20 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback
     qsa_rollback_gather,
     qsa_rollback_restore,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_grouped_cute,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_rowtile import (
     qsa_sparse_gqa_rowtile as one_rank_sparse_gqa_rowtile,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
+    qsa_sparse_gqa_splitk_cute,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    qsa_topk_expand_cluster,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    supports as _topk_expand_cluster_supports,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
@@ -655,6 +677,25 @@ _HC_RSTD_MIN_ROWS = 3072  # capacity: fixed: a dispatch threshold, not a buffer 
 #: Decode rows up to which a bf16 pool's gated sparse GQA runs the one-launch decode kernel
 #: (`qsa_paged_sparse_gqa_decode`) at one rank, and the index scores prefetch their block table.
 _SPARSE_DECODE_MAX_ROWS = 64  # capacity: fixed: a dispatch threshold
+#: The other layouts' sparse generation steps (trunk verify and draft rows) score, select and
+#: attend on the family's decode ops at the FP8 target's row table (`_decode_index_scores`,
+#: `_selection`, `_sparse_gqa_decode`):
+#: - Whether their index scoring launches with PDL (its kernels wait before their first read);
+#:   off with TRTLLM_ENABLE_PDL=0.
+_INDEX_SCORES_PDL = get_env_enable_pdl()
+#: - Rows from which a step with several rows a request scores over request groups
+#:   (`qsa_paged_index_scores`' `rows_per_request`: one key gather serves a request's rows,
+#:   bitwise its row-wise kernel); smaller steps keep the entry's own choice.
+_INDEX_GROUP_MIN_ROWS = 17  # capacity: fixed: a dispatch threshold, not a buffer size
+#: - Request groups from which grouped scoring takes the CuTe kernel
+#:   (`qsa_index_scores_groups_cute__decode`, 2 or 3 rows a request). It sums in another order
+#:   (~7e-8 relative), so a row's top-k can differ only at a near-tie.
+_INDEX_SCORES_CUTE_MIN_GROUPS = 8  # capacity: fixed: a dispatch threshold
+#: - Requests from which rows over an e4m3 pool take `qsa_sparse_gqa_grouped_cute` (each selected
+#:   K/V token loaded and widened once for a request's rows, over the union of their selections)
+#:   instead of the per-row `qsa_sparse_gqa_splitk_cute`. Both run within the decode op's band of
+#:   the fp32 reference, not bitwise `qsa_paged_sparse_gqa`, which keeps every call they decline.
+_GROUPED_DECODE_MIN_REQUESTS = 32  # capacity: fixed: a dispatch threshold
 _QSA_POSITION_AXES = _pool.QSA_POSITION_AXES
 # The compressed index keys rotate at coordinate 0 alone (no mRoPE section), as the index
 # query does.
@@ -3364,10 +3405,23 @@ def _selection(
     context=False,
 ):
     """The selected token indices of `scores`' rows into `out` `[rows, token_topk +
-    compress_ratio - 1]`: the canonical block top-k and its expansion in one launch (a context
-    chunk's rows, `context`, on the op's context launch), or, for a score table that kernel
-    does not serve, the selection and the expansion apart (the rewrite bounded by
-    `live_cols`, `_select`). They all give the same selection."""
+    compress_ratio - 1]`: the canonical block top-k and its expansion in one launch (a cluster
+    of CTAs a row up to `qsa_topk_expand_cluster`'s rows, else one CTA a row; a context
+    chunk's rows, `context`, on the one-CTA op's context launch), or, for a score table neither
+    serves, the selection and the expansion apart (the rewrite bounded by `live_cols`,
+    `_select`). They all give the same selection."""
+    if _topk_expand_cluster_supports(scores):
+        qsa_topk_expand_cluster(
+            scores,
+            visible_blocks,
+            logical,
+            seq_lens_q,
+            topk_indices,
+            core.compress_ratio,
+            core.token_topk,
+            out=out,
+        )
+        return
     if _topk_expand_supports(scores):
         qsa_topk_expand_decode(
             scores,
@@ -3777,6 +3831,63 @@ def _sparse_gqa(
         query_positions=query_positions,
         compress_ratio=core.compress_ratio,
     )
+
+
+def _decode_index_scores(core, q, index_cache, block_table, logical, req_idx, tpb, p: int):
+    """`qsa_paged_index_scores` (visible blocks only) of a sparse generation step's rows, `p`
+    consecutive rows a request: from `_INDEX_GROUP_MIN_ROWS` rows one key gather a request, and
+    from `_INDEX_SCORES_CUTE_MIN_GROUPS` groups on the CuTe kernel where it serves them."""
+    rows = q.shape[0]
+    rpr = p if p > 1 and rows >= _INDEX_GROUP_MIN_ROWS else 1
+    if (
+        rpr > 1
+        and rows >= _INDEX_SCORES_CUTE_MIN_GROUPS * rpr
+        and logical.dtype == torch.int64
+        and req_idx.dtype == torch.int32
+        and _index_groups_cute_serves(q, index_cache, rpr)
+    ):
+        return index_scores_groups_cute(
+            q, index_cache, block_table, logical, req_idx, tpb, core.compress_ratio,
+            _INDEX_SCORES_PDL, rpr,
+        )  # fmt: skip
+    return qsa_paged_index_scores(
+        q=q,
+        index_cache=index_cache,
+        block_table=block_table,
+        query_positions=logical,
+        request_indices=req_idx,
+        tokens_per_block=tpb,
+        compress_ratio=core.compress_ratio,
+        only_visible_blocks=True,
+        context_rows=False,
+        use_pdl=_INDEX_SCORES_PDL,
+        rows_per_request=rpr,
+        wide_split=True,
+    )
+
+
+def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p: int):
+    """The gated sparse GQA `bf16(attn) * sigmoid(gate)` (`[rows, heads_q, head_dim]`) of a
+    generation step's rows over a bf16 or e4m3 pool on the family's CuTe decode kernels: the
+    request-grouped one from `_GROUPED_DECODE_MIN_REQUESTS` requests of `p` rows, else the
+    per-row split-K one up to its rows. None where neither serves the call (an NVFP4 pool, a
+    head geometry or row count they were not measured at): the caller then runs `_sparse_gqa`
+    and the gate apart."""
+    if kv.k_scale is not None:
+        return None
+    if (
+        p > 1
+        and q.shape[0] >= _GROUPED_DECODE_MIN_REQUESTS * p
+        and qsa_sparse_gqa_grouped_cute.serves(q, kv.k, selected, p)
+    ):
+        return qsa_sparse_gqa_grouped_cute(
+            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, p, gate
+        )
+    if qsa_sparse_gqa_splitk_cute.serves(q, kv.k, selected):
+        return qsa_sparse_gqa_splitk_cute(
+            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, gate
+        )
+    return None
 
 
 def _copy_positions(position_ids: torch.Tensor) -> torch.Tensor:
@@ -5703,20 +5814,21 @@ class DecodeTarget:
             if not self._kv_probe.observe(i, k_rows, v_rows):
                 self._kv_probe = None
 
+        gated = False
         if sparse:
             kv = pools.kv[i]
+            p = step["predicted_tokens_per_seq"]
             if not prologue:
                 _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
-            scores = qsa_paged_index_scores(
-                q=_index_query(core, index_scratch),
-                index_cache=core._bound.pools.index_cache[i],
-                block_table=block_table,
-                query_positions=logical,
-                request_indices=req_idx,
-                tokens_per_block=tokens_per_block,
-                compress_ratio=core.compress_ratio,
-                only_visible_blocks=True,
-                context_rows=False,
+            scores = _decode_index_scores(
+                core,
+                _index_query(core, index_scratch),
+                core._bound.pools.index_cache[i],
+                block_table,
+                logical,
+                req_idx,
+                tokens_per_block,
+                p,
             )
             selected = torch.empty(
                 [num_tokens, core.token_topk + core.compress_ratio - 1],
@@ -5733,16 +5845,15 @@ class DecodeTarget:
                 topk_row_starts,
                 selected,
             )
-            attn = _sparse_gqa(
-                core,
-                kv,
-                _packed_q(core, qkv),
-                block_table,
-                selected,
-                req_idx,
-                tokens_per_block,
-                None,
+            q = _packed_q(core, qkv)
+            attn = _sparse_gqa_decode(
+                core, kv, q, block_table, selected, req_idx, tokens_per_block, gate, p
             )
+            gated = attn is not None
+            if not gated:
+                attn = _sparse_gqa(
+                    core, kv, q, block_table, selected, req_idx, tokens_per_block, None
+                )
             out = torch.reshape(attn, [num_tokens, core.q_width])
         else:
             out = thop_attention(
@@ -5758,7 +5869,8 @@ class DecodeTarget:
                 **step,
                 **_CALL_CONSTANTS,
             )
-        fused_sigmoid_mul_inplace(out, gate)
+        if not gated:
+            fused_sigmoid_mul_inplace(out, gate)
         return core.tp_sum(_dense_mm(out, L.o, L.o8, core.decode_mm, "out", L.o_g, mid=L.o_m))
 
     def _hc_site(self, hc, block_out, inject, norm, first, up, with_inject, normed=None, moe=None):
@@ -6769,16 +6881,15 @@ class DecodeTarget:
                     )
                 )
             else:
-                scores = qsa_paged_index_scores(
-                    q=q_index,
-                    index_cache=draft.index_cache,
-                    block_table=block_table,
-                    query_positions=logical,
-                    request_indices=req_idx,
-                    tokens_per_block=tokens_per_block,
-                    compress_ratio=core.compress_ratio,
-                    only_visible_blocks=True,
-                    context_rows=False,
+                scores = _decode_index_scores(
+                    core,
+                    q_index,
+                    draft.index_cache,
+                    block_table,
+                    logical,
+                    req_idx,
+                    tokens_per_block,
+                    p,
                 )
                 _selection(
                     core,
@@ -6792,20 +6903,18 @@ class DecodeTarget:
                 )
                 if share:
                     self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
-            attn = torch.reshape(
-                _sparse_gqa(
-                    core,
-                    kv,
-                    _packed_q(core, qkv),
-                    block_table,
-                    selected,
-                    req_idx,
-                    tokens_per_block,
-                    None,
-                ),
-                [rows, core.q_width],
+            q = _packed_q(core, qkv)
+            attn = _sparse_gqa_decode(
+                core, kv, q, block_table, selected, req_idx, tokens_per_block, gate, p
             )
+            gated = attn is not None
+            if not gated:
+                attn = _sparse_gqa(
+                    core, kv, q, block_table, selected, req_idx, tokens_per_block, None
+                )
+            attn = torch.reshape(attn, [rows, core.q_width])
         else:
+            gated = False
             attn = thop_attention(
                 q=qkv,
                 output=torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device),
@@ -6819,7 +6928,8 @@ class DecodeTarget:
                 **step,
                 **_CALL_CONSTANTS,
             )
-        fused_sigmoid_mul_inplace(attn, gate)
+        if not gated:
+            fused_sigmoid_mul_inplace(attn, gate)
         return _mtp_tail(core, M, x, attn, inject, pad_rows)
 
 
