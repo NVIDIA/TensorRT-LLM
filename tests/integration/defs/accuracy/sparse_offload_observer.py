@@ -65,7 +65,7 @@ def _observe(module: ModuleType) -> None:
                 hits, misses = state.batch.peek_hit_miss_counter()
                 units = unit_lengths.detach().cpu().flatten().tolist()
                 for request_id, member in new_members:
-                    starts[id(self), request_id, id(member.cache)] = {
+                    record = {
                         "rank": mpi_rank(),
                         "request_id": request_id,
                         "first_fetch_ns": time.monotonic_ns(),
@@ -76,6 +76,9 @@ def _observe(module: ModuleType) -> None:
                         "hits": int(hits),
                         "misses": int(misses),
                     }
+                    if os.environ.get("TLLM_TEST_SPARSE_OFFLOAD_INTEGRITY") == "1":
+                        record["offload_layers"] = sorted(state.layers)
+                    starts[id(self), request_id, id(member.cache)] = record
         return fetch(self, state, layer_idx, topk_indices, request_indices, unit_lengths)
 
     @functools.wraps(release)
@@ -95,6 +98,13 @@ def _observe(module: ModuleType) -> None:
                     hits, misses = self._sparse_batch.peek_hit_miss_counter()
                     record["hits"] = int(hits) - record["hits"]
                     record["misses"] = int(misses) - record["misses"]
+                    if os.environ.get("TLLM_TEST_SPARSE_OFFLOAD_INTEGRITY") == "1":
+                        if TYPE_CHECKING:
+                            from .sparse_offload_integrity import finish_request
+                        else:
+                            from sparse_offload_integrity import finish_request
+
+                        record["integrity"] = finish_request(self, request_id, member.cache)
                     record["release_ns"] = time.monotonic_ns()
                     with (directory / f"rank-{os.getpid()}.jsonl").open("a") as output:
                         output.write(json.dumps(record) + "\n")

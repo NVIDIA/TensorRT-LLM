@@ -60,9 +60,11 @@ from .accuracy_core import (GSM8K, MMLU, QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS,
                             GSM8KInferenceX, LlmapiAccuracyTestHarness,
                             LongBenchV2, acceptance_length_from_iteration_stats,
                             assert_acceptance_length, get_accuracy_task)
-from .sparse_offload_accuracy import (LONGBENCH_CASES, assert_host_fetches,
-                                      assert_token_parity, read_fetch_events,
-                                      wait_for_fetch_events)
+from .sparse_offload_accuracy import (LONGBENCH_CASES,
+                                      assert_forced_token_parity,
+                                      assert_history_integrity,
+                                      assert_host_fetches, assert_token_parity,
+                                      read_fetch_events, wait_for_fetch_events)
 
 
 class Result(GenerationResultBase):
@@ -743,17 +745,20 @@ def _test_sparse_offload_long_context(
     index_topk: int,
     unit_tokens: int,
     block_reuse: bool = False,
+    verify_offload_integrity: bool = False,
     server_waiting_timeout: int = 1200,
 ) -> None:
-    """Require exact resident/offload tokens and real host fetches on LongBench v2.
+    """Check resident/offload completions and real host fetches on LongBench v2.
 
     Six complete documents cover the benchmark's domains. A repeated request
     checks determinism (all six repeat when testing block reuse), and two
     concurrent 256-token continuations cover sustained decode under eviction.
     The same prefill worker serves both generation configurations.
 
-    Exact comparisons use eager, deterministic TP attention. CUDA graph replay
-    and request remapping remain covered by the native offload component tests.
+    Comparisons use eager, deterministic TP attention. With integrity verification,
+    forced continuations require exact ordinary-prefix tokens and matching native
+    history bytes rather than post-stop token equality. CUDA graph replay and
+    request remapping remain covered by the native offload component tests.
     """
     output_len = 256
     tokens_per_block = 128
@@ -878,10 +883,14 @@ def _test_sparse_offload_long_context(
         (Path(directory) / "sitecustomize.py").write_text(
             "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n"
             "# SPDX-License-Identifier: Apache-2.0\n"
-            "from sparse_offload_observer import install\ninstall()\n")
+            "from sparse_offload_observer import install\ninstall()\n" +
+            ("import sparse_offload_integrity\nsparse_offload_integrity.install()\n"
+             if verify_offload_integrity else ""))
         observer_env = {
             "TLLM_TEST_SPARSE_OFFLOAD_EVENTS":
             str(observer_dir),
+            "TLLM_TEST_SPARSE_OFFLOAD_INTEGRITY":
+            "1" if verify_offload_integrity else "0",
             "PYTHONPATH":
             os.pathsep.join([
                 directory,
@@ -987,6 +996,24 @@ def _test_sparse_offload_long_context(
                             world_size=world_size,
                             index_topk=index_topk,
                             unit_tokens=unit_tokens)
+                        if verify_offload_integrity:
+                            assert_history_integrity(
+                                current,
+                                prompt_lengths=[
+                                    len(prompts[index]) for index in group
+                                ],
+                                completion_lengths=[
+                                    len(row["token_ids"])
+                                    for row in rows[-len(group):]
+                                ],
+                                world_size=world_size,
+                                require_eviction=stress)
+                            print(
+                                "Offload data integrity: "
+                                f"rows={sum(event['integrity']['checked_rows'] for event in current)}, "
+                                f"evictions={sum(event['integrity']['evictions'] for event in current)}, "
+                                f"refetches={sum(event['integrity']['refetches'] for event in current)}"
+                            )
                         print(
                             f"Native offload evidence: {len(group)} requests, {world_size} ranks, "
                             f"minimum batch-counter miss delta={min(e['misses'] for e in current)}"
@@ -998,6 +1025,10 @@ def _test_sparse_offload_long_context(
                             "numGenRequests", 0) > 1 for stat in stats)
                     assert batched_steps >= tokens_per_block, (
                         f"Only {batched_steps} batched decode iterations")
+                    if verify_offload_integrity:
+                        print(
+                            f"Forced decode {mode}: {batched_steps} batched iterations"
+                        )
                 return rows, stats
 
             for mode in ("resident", "offload"):
@@ -1030,17 +1061,29 @@ def _test_sparse_offload_long_context(
                     assert not read_fetch_events(
                         observer_dir), "Resident baseline used offload"
             differences = []
-            for resident, offloaded in zip(results["resident"],
-                                           results["offload"],
-                                           strict=True):
+            for pair_index, (resident, offloaded) in enumerate(
+                    zip(results["resident"], results["offload"], strict=True)):
                 try:
-                    assert_token_parity(resident,
-                                        offloaded,
-                                        label=f"offload {resident['id']}")
+                    if verify_offload_integrity and pair_index >= len(
+                            results["resident"]) - 2:
+                        sample_index = pair_index - (len(results["resident"]) -
+                                                     2)
+                        assert_forced_token_parity(
+                            resident,
+                            offloaded,
+                            ordinary_reference=results["resident"]
+                            [sample_index],
+                            ordinary_candidate=results["offload"][sample_index],
+                            label=f"offload forced {resident['id']}")
+                    else:
+                        assert_token_parity(resident,
+                                            offloaded,
+                                            label=f"offload {resident['id']}")
                 except AssertionError as error:
                     differences.append(str(error))
             assert not differences, "\n".join(differences)
-    print(f"Sparse offload exact parity: {len(results['resident'])} requests, "
+    comparison = "prefix and history integrity" if verify_offload_integrity else "exact parity"
+    print(f"Sparse offload {comparison}: {len(results['resident'])} requests, "
           f"total {time.monotonic() - started:.1f}s including model loading")
 
 
@@ -2958,13 +3001,15 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(1800)
     @pytest.mark.skip_less_device(4)
     def test_kv_cache_offload(self) -> None:
-        """LongBench v2 tokens match with FP8 ratio-4 history offloaded.
+        """LongBench v2 valid prefixes and offloaded FP8 ratio-4 history match.
 
         Each decode step fetches the indexer-selected units into a GPU cache.
         Only a decode-only worker can offload, so the context server keeps its
         history resident.
         """
-        self._run_kv_cache_offload(kv_dtype="fp8", block_reuse=False)
+        self._run_kv_cache_offload(kv_dtype="fp8",
+                                   block_reuse=False,
+                                   verify_offload_integrity=True)
 
     @pytest.mark.timeout(3600)
     @pytest.mark.skip_less_device(4)
@@ -2972,8 +3017,11 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         """Repeated LongBench v2 prompts match and reuse the offloaded NVFP4 cache."""
         self._run_kv_cache_offload(kv_dtype="nvfp4", block_reuse=True)
 
-    def _run_kv_cache_offload(self, *, kv_dtype: str,
-                              block_reuse: bool) -> None:
+    def _run_kv_cache_offload(self,
+                              *,
+                              kv_dtype: str,
+                              block_reuse: bool,
+                              verify_offload_integrity: bool = False) -> None:
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
@@ -3014,14 +3062,16 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
-        _test_sparse_offload_long_context(disaggregated_server_config,
-                                          ctx_server_config,
-                                          gen_server_config,
-                                          self.MODEL_PATH,
-                                          model_name=self.MODEL_NAME,
-                                          index_topk=512,
-                                          unit_tokens=4,
-                                          block_reuse=block_reuse)
+        _test_sparse_offload_long_context(
+            disaggregated_server_config,
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            model_name=self.MODEL_NAME,
+            index_topk=512,
+            unit_tokens=4,
+            block_reuse=block_reuse,
+            verify_offload_integrity=verify_offload_integrity)
 
 
 @pytest.mark.timeout(14400)
