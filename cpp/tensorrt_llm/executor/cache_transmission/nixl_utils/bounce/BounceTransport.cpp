@@ -1213,16 +1213,17 @@ bool BounceSender::progressPostedChunks()
     std::vector<std::pair<std::uint64_t, BounceFailReason>> toFail;
     for (auto& [rid, req] : mRequests)
     {
+        bool gatherFailed = false;
         for (auto& p : req.posted)
         {
-            if (p.state == PostState::Sent)
+            if (p.state == PostState::Writing || p.state == PostState::Sent)
             {
                 continue;
             }
             if (p.state == PostState::GatherFailed)
             {
                 // Gather launch / event-record failed in pumpRequest -> never trust the event; fail.
-                toFail.emplace_back(rid, BounceFailReason::kGatherFailed);
+                gatherFailed = true;
                 break;
             }
             if (p.state == PostState::Gathering)
@@ -1237,7 +1238,7 @@ bool BounceSender::progressPostedChunks()
                 {
                     // Gather kernel / stream error -> fail the request deterministically (never hang).
                     (void) cudaGetLastError();
-                    toFail.emplace_back(rid, BounceFailReason::kGatherFailed);
+                    gatherFailed = true;
                     break;
                 }
                 // Gather done — return the exec context immediately for another chunk to reuse (the
@@ -1270,7 +1271,19 @@ bool BounceSender::progressPostedChunks()
                 didWork = true;
                 req.lastProgress = std::chrono::steady_clock::now();
             }
-            // A completed write can already be scattered while later chunks are being posted.
+        }
+        if (gatherFailed)
+        {
+            toFail.emplace_back(rid, BounceFailReason::kGatherFailed);
+            continue;
+        }
+        // Drive this request's writes together, then notify its receiver before posting another request.
+        for (auto& p : req.posted)
+        {
+            if (p.state != PostState::Writing)
+            {
+                continue;
+            }
             // wait(0) is one non-blocking status query: IN_PROGRESS / SUCCESS / FAILURE.
             // A failed post left p.xfer null -> report FAILURE.
             TransferState const st = p.xfer != nullptr ? p.xfer->wait(0) : TransferState::kFAILURE;

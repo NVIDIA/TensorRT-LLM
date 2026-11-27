@@ -301,8 +301,8 @@ public:
     /// The receiver reported it cannot complete a chunk/request: fail the request now (kPeerNack)
     /// instead of waiting out requestTimeoutMs. Unknown / wrong-peer NACKs are dropped like ACKs.
     void onNack(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope);
-    /// Advance each chunk from gather and credit through the RDMA write, sending DATA as soon as
-    /// the write completes. Poll each event and handle once without blocking the IO thread.
+    /// Post each request's ready chunks together and send DATA for completed writes before moving
+    /// to the next request. Poll each event and handle once without blocking the IO thread.
     /// Returns true when a chunk advances or a request fails, for the IO loop's idle backoff.
     bool progressPostedChunks();
     /// Free local regions whose failed request still had an RDMA write in flight, once that write
