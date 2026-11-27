@@ -19,6 +19,8 @@ from tensorrt_llm._torch.models.modeling_parakeet import (
     ProjectedParakeet,
     _subsampling_output_length,
 )
+from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
+from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 
 
 def _make_extractor_config(**overrides):
@@ -176,6 +178,7 @@ class TestProjectedParakeet:
         dtype = torch.bfloat16
         model = ProjectedParakeet(sound_cfg, llm_hidden_size=llm_hidden, dtype=dtype)
         model.to(device).eval()
+        initialize_dummy_weights(model, low=0.01, high=0.05)
 
         batch, time_steps = 2, 200
         features = torch.randn(
@@ -188,3 +191,31 @@ class TestProjectedParakeet:
         assert out.shape[0] == batch
         assert out.shape[2] == llm_hidden
         assert out.dtype == torch.bfloat16
+
+        # Compare replay to the same dense batch/time shape, including an unused clip
+        # between two full batches.
+        encoder = model.encoder
+        encoder.enable_blocks_cuda_graph(
+            MultimodalEncoderCudaGraphConfig(buckets=[(64, 2)]),
+            dummy_encode=lambda: model(features, mask),
+        )
+        hidden = encoder.subsampling(features, mask) * encoder.input_scale
+        for n, t in [(2, hidden.shape[1]), (1, 11), (2, hidden.shape[1])]:
+            live = hidden[:n, :t]
+            validity = torch.ones(n, t, dtype=torch.bool, device=device)
+            if n > 1:
+                validity[-1, -2:] = False
+            padded = torch.zeros(2, 32, hidden.shape[-1], dtype=dtype, device=device)
+            padded[:n, :t].copy_(live)
+            padded_mask = torch.zeros(2, 32, dtype=torch.bool, device=device)
+            padded_mask[:n, :t].copy_(validity)
+            ref = encoder._encoder_graph_fn(
+                {"hidden_states": padded, "attention_mask": padded_mask}, None
+            )
+            inputs = {"hidden_states": live}
+            if n > 1:
+                inputs["attention_mask"] = validity
+            replay = encoder._run_blocks(inputs, None)
+            torch.testing.assert_close(
+                replay["hidden_states"], ref["hidden_states"][:n, :t], atol=0, rtol=0
+            )

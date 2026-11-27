@@ -140,7 +140,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (
             generator.SERVE_SCHEMA,
-            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {}}}},
             True,
         ),
         (

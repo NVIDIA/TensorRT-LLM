@@ -28,6 +28,7 @@ from PIL import Image
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
     MultimodalItemPartition,
     MultimodalParams,
@@ -692,10 +693,6 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         }
         self.vision_model.load_weights(vision_encoder_weights)
 
-    def enable_radio_cuda_graph(self) -> None:
-        """Enable CUDA graph replay for RADIO transformer blocks."""
-        self.vision_model.enable_blocks_cuda_graph()
-
     @torch.compile
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -1163,6 +1160,157 @@ class NemotronHMultimodalInputProcessor(
         if getattr(self, "_audio_extractor", None) is None:
             return modalities - {"audio"}
         return modalities
+
+    def _profile_vision_geometry(
+        self, modality: str, budget: int | None
+    ) -> tuple[int, int, int, int]:
+        """Return attention tokens, segments, height and width for one dummy item."""
+        args = self.config.vision_config.args
+        cls = (
+            len({teacher["name"] for teacher in args["teachers"]})
+            if args.get("cls_token_per_teacher")
+            else 1
+        )
+        multiple = args.get("register_multiple") or 0
+        prefix = cls + (
+            args.get("cpe_num_registers") or (multiple - cls % multiple if multiple else 0)
+        )
+        size = self.image_size
+        height = width = size
+        if modality == "image" and self.dynamic_tiler is not None:
+            patches = self.dynamic_tiler._max_num_patches
+            if budget is not None:
+                patches = min(patches, budget - prefix)
+            merge = int(1 / self.downsample_ratio)
+            max_side = args["cpe_max_size"] // self.spatial_merge_size
+            cells = int(max(0, min(patches, (max_side * merge) ** 2))) // merge**2
+            if not cells:
+                return 0, 0, 0, 0
+            # Choose the largest legal rectangle, preferring a near-square image on ties.
+            h, w = max(
+                ((h, min(max_side, cells // h)) for h in range(1, math.isqrt(cells) + 1)),
+                key=lambda hw: (hw[0] * hw[1], hw[0]),
+            )
+            return (
+                h * w * merge**2 + prefix,
+                1,
+                h * self.spatial_merge_size,
+                w * self.spatial_merge_size,
+            )
+        if modality == "video" and self.video_target_num_patches:
+            width, height, _ = get_video_target_size_and_feature_size(
+                size,
+                size,
+                self.video_target_num_patches,
+                self.video_maintain_aspect_ratio,
+                self.patch_size,
+                self.downsample_ratio,
+            )
+        segment_tokens = height * width // self.patch_size**2 + prefix
+        count = max(1, budget // segment_tokens) if budget is not None else 1
+        if modality == "image":
+            max_tiles = self.processor.max_num_tiles
+            thumbnail = max_tiles > 1 and self.processor.use_thumbnail
+            cap = max_tiles + int(thumbnail)
+            count = cap if budget is None else min(count, cap)
+            if thumbnail and count == 2:
+                count = 1
+        return segment_tokens * count, count, height, width
+
+    def _profile_audio_geometry(self, budget: int | None) -> tuple[int, int, int]:
+        """Return dense attention tokens, clips and mel frames for one dummy recording."""
+        ext = self._audio_extractor
+        cfg = ext.config
+        # STFT produces a terminal frame that is excluded from the valid-length mask.
+        clip_frames = ext._clip_target_samples // cfg.hop_length + 1
+        clip_steps = math.ceil(clip_frames / cfg.subsampling_factor)
+        steps = min(clip_steps, budget) if budget is not None else clip_steps
+        clips = max(1, budget // clip_steps) if budget is not None else 1
+        frames = min(clip_frames, steps * cfg.subsampling_factor)
+        if frames - 1 < ext._tail_min_samples // cfg.hop_length:
+            return 0, 0, 0
+        return steps * clips, clips, frames
+
+    def get_mm_max_tokens_per_item(
+        self, max_num_encoder_tokens: int | None = None
+    ) -> dict[str, int]:
+        budget = max_num_encoder_tokens
+        sizes = {m: self._profile_vision_geometry(m, budget)[0] for m in ("image", "video")}
+        if self._audio_extractor is not None:
+            sizes["audio"] = self._profile_audio_geometry(budget)[0]
+        return {m: n for m, n in sizes.items() if n > 0 and (budget is None or n <= budget)}
+
+    def get_dummy_mm_data(
+        self,
+        *,
+        max_num_encoder_tokens: int,
+        mm_counts: Mapping[str, int],
+        dtype: torch.dtype | None = None,
+    ) -> dict[str, Any]:
+        """Materialize the requested encoder batch and its grouped output lengths."""
+        counts = {m: n for m, n in mm_counts.items() if n}
+        if not counts:
+            return {}
+        if any(n < 0 for n in counts.values()):
+            raise ValueError("Multimodal item counts must be nonnegative")
+        budget = max_num_encoder_tokens // sum(counts.values())
+        supported = self.get_mm_max_tokens_per_item(budget)
+        if counts.keys() == {"vision"}:
+            modality = "image" if "image" in supported else "video"
+            counts = {modality: counts["vision"]}
+        data: dict[str, Any] = {}
+        refs, output_lengths = [], []
+        dtype = dtype or self.dtype
+        for modality, count in counts.items():
+            if modality not in supported:
+                raise ValueError(
+                    f"Cannot build {modality} dummy inputs at {budget} tokens per item"
+                )
+            if modality == "audio":
+                _, clips, frames = self._profile_audio_geometry(budget)
+                cfg = self._audio_extractor.config
+                total = count * clips
+                mask = torch.ones(total, frames, dtype=torch.bool)
+                mask[:, -1] = False
+                lengths = self._audio_extractor.audio_token_count((frames - 1) * cfg.hop_length)
+                data[modality] = {
+                    "input_audio_features": torch.zeros(
+                        total, frames, cfg.feature_size, dtype=dtype
+                    ),
+                    "feature_attention_mask": mask,
+                    "audio_num_clips": torch.full((count,), clips, dtype=torch.int64),
+                    "audio_output_lengths": torch.full((total,), lengths, dtype=torch.int32),
+                }
+                length = lengths * clips
+            else:
+                _, segments, height, width = self._profile_vision_geometry(modality, budget)
+                length = int(
+                    segments * height * width / self.patch_size**2 * self.downsample_ratio**2
+                )
+                pixels = (3, height, width)
+                if modality == "image" and self.dynamic_tiler is not None:
+                    data[modality] = {
+                        "pixel_values": [torch.zeros(pixels)] * count,
+                        "image_sizes": [(height, width)] * count,
+                    }
+                elif modality == "image":
+                    data[modality] = {
+                        "pixel_values": torch.zeros(count * segments, *pixels, dtype=dtype)
+                    }
+                else:
+                    frames = segments * self.video_temporal_patch_size
+                    sizes = [(frames, 1, height, width)] * count
+                    data[modality] = {
+                        "pixel_values": torch.zeros(count * frames, *pixels, dtype=dtype),
+                        "video_size": sizes,
+                    }
+                    length = sum(self._compute_token_numbers_per_video(sizes[:1])[0])
+            refs.extend((modality, i) for i in range(count))
+            output_lengths.extend([length] * count)
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+            item_refs=refs, output_embedding_lengths=output_lengths
+        )
+        return data
 
     def get_mm_item_metadata(
         self,

@@ -10,6 +10,7 @@ The runner has two layers worth testing:
 from __future__ import annotations
 
 import contextlib
+import weakref
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Mapping, Optional, Sequence
 from unittest import mock
@@ -23,6 +24,7 @@ from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey,
     EncoderGraphTensorSpec,
     MultimodalEncoderGraphRunner,
+    PackedEncoderGraphIOAdapter,
     _CapturedGraph,
 )
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
@@ -261,18 +263,21 @@ def _make_logic_runner(
 )
 def test_select_bucket(enable_padding, real_contexts, real_tokens, expected_bucket):
     runner = _make_logic_runner(enable_padding=enable_padding)
-    assert (
-        runner._select_bucket(real_contexts=real_contexts, real_tokens=real_tokens)
-        == expected_bucket
-    )
+    lengths = [real_tokens - real_contexts + 1] + [1] * (real_contexts - 1)
+    assert runner._select_bucket(real_contexts, real_tokens, lengths) == expected_bucket
 
 
-def test_padded_seq_lengths_appends_dummy_context():
-    runner = _make_logic_runner()
-    bucket = EncoderGraphKey(num_contexts=1, total_tokens=512)
-    padded = runner._padded_seq_lengths([300], bucket=bucket)
-    # Slack (512 - 300) plus the runner's 1-token padding reservation.
-    assert padded == [300, 213]
+@pytest.mark.cpu_only
+def test_padded_lengths_preserve_real_segments_at_partial_occupancy():
+    bucket = EncoderGraphKey(total_tokens=512, num_contexts=4)
+    runner = _make_logic_runner(buckets=[bucket])
+    assert runner._select_bucket(2, 300, [120, 180]) == bucket
+    assert runner._padded_seq_lengths([120, 180], bucket=bucket) == [120, 180, 1, 1, 214]
+    key = runner._padded_key_for_bucket(bucket)
+    assert runner._dummy_padded_seq_lengths(bucket, key) == [1, 1, 1, 1, 512]
+    assert key == (516, 5)
+    assert runner._select_bucket(0, 0, []) is None
+    assert runner._select_bucket(1, 0, [0]) is None
 
 
 def test_padded_seq_lengths_reserves_one_token_on_exact_fit():
@@ -422,6 +427,47 @@ def test_automatic_buckets_include_intermediate_token_capacities() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cap,count,contexts",
+    [(129, 1, 1), (2048, 13, 8), (8192, 21, 32), (16384, 25, 32), (16385, 26, 32)],
+)
+def test_packed_automatic_budgets(cap: int, count: int, contexts: int) -> None:
+    config = MultimodalEncoderCudaGraphConfig(max_num_tokens=cap)
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=_NeverInvokedEncoder(),
+        metadata_provider=_NoopMetadataProvider(),
+        input_specs={},
+        output_specs={},
+        config=config,
+    )
+    budgets = [bucket.total_tokens for bucket in runner._buckets]
+    assert len(budgets) == count
+    assert budgets[-1] == cap
+    if cap >= 512:
+        assert budgets[:5] == [256, 320, 384, 448, 512]
+    assert [bucket.num_contexts for bucket in runner._buckets] == [
+        min(contexts, max(1, budget // 128)) for budget in budgets
+    ]
+
+
+@pytest.mark.cpu_only
+def test_exact_packed_budgets_keep_the_per_count_ladder() -> None:
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=_NeverInvokedEncoder(),
+        metadata_provider=_NoopMetadataProvider(),
+        io_adapter=PackedEncoderGraphIOAdapter({}),
+        config=MultimodalEncoderCudaGraphConfig(
+            max_batch_size=3, max_num_tokens=512, enable_padding=False
+        ),
+    )
+    assert runner._buckets == [(256, 1), (512, 1), (512, 2), (512, 3)]
+    assert runner._select_bucket(2, 256, [128, 128]) is None
+    assert runner._select_bucket(2, 512, [0, 512]) is None
+    assert runner._select_bucket(3, 512, [0, 2, 510]) == (512, 3)
+    assert runner._select_bucket(3, 512, [-1, 3, 510]) is None
+
+
+@pytest.mark.cpu_only
 def test_automatic_buckets_use_encoder_adapter_shape_rules() -> None:
     class AlignedAdapter(_BatchedFramesIOAdapter):
         def capture_buckets(
@@ -439,25 +485,26 @@ def test_automatic_buckets_use_encoder_adapter_shape_rules() -> None:
 
 
 @pytest.mark.cpu_only
-def test_capture_all_processes_largest_bucket_first() -> None:
-    runner = _make_logic_runner(
-        buckets=[
-            EncoderGraphKey(num_contexts=1, total_tokens=256),
-            EncoderGraphKey(num_contexts=1, total_tokens=1024),
-            EncoderGraphKey(num_contexts=1, total_tokens=512),
-        ]
+def test_packed_inputs_share_the_largest_physical_allocation() -> None:
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=_NeverInvokedEncoder(),
+        metadata_provider=_NoopMetadataProvider(),
+        input_specs={"x": EncoderGraphTensorSpec((4,), torch.float32, token_dim=1)},
+        output_specs={"y": 1},
+        config=MultimodalEncoderCudaGraphConfig(buckets=[(1050, 1), (1024, 128)]),
     )
-    captured_keys = []
+    buffers = []
 
-    def record_capture(
-        key: EncoderGraphKey, padded_seq_lengths: list[int], device: torch.device
-    ) -> None:
-        captured_keys.append(key)
+    def allocate(key, lengths, device, capture_stream):
+        buffers.append(runner._io_adapter.allocate_inputs(key, device)["x"])
 
-    with mock.patch.object(runner, "_capture_key", side_effect=record_capture):
+    with mock.patch.object(runner, "_capture_key", side_effect=allocate):
         runner.capture_all(torch.device("cpu"))
-
-    assert [key.total_tokens for key in captured_keys] == [1025, 513, 257]
+    assert [tensor.shape for tensor in buffers] == [(4, 1152), (4, 1051)]
+    assert all(tensor.is_contiguous() for tensor in buffers)
+    assert buffers[0].data_ptr() == buffers[1].data_ptr()
+    with pytest.raises(ValueError, match="dtype|float"):
+        runner._io_adapter.copy_inputs({"x": buffers[0]}, {"x": torch.ones(4, 1).double()}, [1])
 
 
 def test_metadata_buffer_snapshot_records_declared_attrs():
@@ -530,7 +577,7 @@ def test_encoder_graph_tensor_spec_materialize(token_dim, expected_shape):
 
 
 def test_clear_resets_graphs_before_releasing_pool_owner():
-    runner = MultimodalEncoderGraphRunner.__new__(MultimodalEncoderGraphRunner)
+    runner = _make_logic_runner()
     events = []
     first_graph = mock.Mock()
     second_graph = mock.Mock()
@@ -559,7 +606,7 @@ def test_clear_resets_graphs_before_releasing_pool_owner():
 
 
 def test_uncoordinated_clear_does_not_release_pool_owner():
-    runner = MultimodalEncoderGraphRunner.__new__(MultimodalEncoderGraphRunner)
+    runner = _make_logic_runner()
     graph = mock.Mock()
     runner._captured = {EncoderGraphKey(total_tokens=8, num_contexts=1): mock.Mock(graph=graph)}
     runner._memory_pool = (12345, 67890)
@@ -572,6 +619,40 @@ def test_uncoordinated_clear_does_not_release_pool_owner():
     graph.reset.assert_called_once_with()
     release_owner.assert_not_called()
     assert runner._memory_pool is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("completed", [0, 1])
+def test_capture_failure_abandons_partial_graphs(monkeypatch, completed):
+    from tensorrt_llm._torch import nccl_window_graph
+
+    pool = (90001, 91)
+    graphs = []
+
+    def capture(graph, graph_pool, **kwargs):
+        graphs.append(graph)
+        return nccl_window_graph.nccl_window_graph_owner(graph_pool)
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", mock.Mock)
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: pool)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(encoder_graph_module, "nccl_window_graph_capture", capture)
+    monkeypatch.setattr(torch.ops.trtllm, "set_nccl_window_graph_owner", lambda owner: None)
+    release = mock.Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "release_nccl_window_graph_owner", release)
+    runner = _make_logic_runner()
+    snapshots = [{}] * completed + [RuntimeError("snapshot failed")]
+    monkeypatch.setattr(runner, "_snapshot_metadata_tensor_ptrs", mock.Mock(side_effect=snapshots))
+
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        runner.capture_all(torch.device("cpu"))
+    assert len(graphs) == completed + 1
+    for graph in graphs:
+        graph.reset.assert_called_once_with()
+    assert not runner._captured and runner._memory_pool is None
+    assert not runner._io_adapter._static_inputs
+    assert pool not in nccl_window_graph._pool_owners
+    release.assert_not_called()
 
 
 def test_capture_scopes_warmup_and_captured_encoder_calls(monkeypatch):
@@ -672,6 +753,8 @@ def test_custom_io_adapter_updates_masks_and_collects_downsampled_outputs() -> N
 @pytest.mark.cpu_only
 def test_custom_layout_skips_bucket_whose_time_axis_is_too_small() -> None:
     runner = _make_batched_frames_runner(torch.device("cpu"))
+    assert runner._select_bucket(1, 4, [4]) is None
+    assert runner._select_bucket(3, 4, [1, 2, 1]) is None
     lengths = [5, 1]
     assert runner._select_bucket(2, sum(lengths), lengths) == EncoderGraphKey(12, 2)
     runner._buckets = [EncoderGraphKey(8, 2)]
@@ -853,27 +936,65 @@ def test_startup_capture_misses_partial_fit_without_padding(cuda_device, make_cu
 
 
 @pytestmark_cuda
-@pytest.mark.parametrize("real_tokens", [10, 64, 127, 300])
-def test_replay_matches_eager_across_sizes(cuda_device, make_cuda_runner, real_tokens):
-    buckets = [
-        EncoderGraphKey(num_contexts=1, total_tokens=128),
-        EncoderGraphKey(num_contexts=1, total_tokens=512),
-    ]
-    runner = make_cuda_runner(buckets=buckets)
+def test_flashinfer_replay_across_shared_buckets(cuda_device):
+    from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttention
+    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import prepare_encoder_attn_metadata
+
+    width = 8 * 64
+    layer = FlashInferAttention(layer_idx=0, num_heads=8, num_kv_heads=8, head_dim=64)
+    eager = layer.Metadata(max_num_requests=4, max_num_tokens=131, kv_cache_manager=None)
+    eager.max_seq_len = 32
+
+    def attention(inputs, metadata):
+        x = inputs["x"]
+        return {"y": layer.forward(x, x, x, metadata, attention_mask=PredefinedAttentionMask.FULL)}
+
+    adapter = PackedEncoderGraphIOAdapter(
+        {"x": EncoderGraphTensorSpec((width,), torch.bfloat16)}, attn_metadata=eager
+    )
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=attention,
+        metadata_provider=adapter,
+        io_adapter=adapter,
+        config=MultimodalEncoderCudaGraphConfig(buckets=[(64, 3), (128, 3)]),
+    )
+    runner.capture_all(cuda_device)
+    workspaces = {
+        capture.metadata.workspace_buffer.data_ptr() for capture in runner._captured.values()
+    }
+    assert len(workspaces) == 1
+    assert len({c.inputs["x"].data_ptr() for c in runner._captured.values()}) == 1
+    input_buffer = weakref.ref(adapter._static_inputs["x"])
+    pool = next(iter(runner._captured.values())).metadata.cuda_graph_buffers
+    workspace = weakref.ref(pool.buffers["workspace_buffer"][0].buffer)
+    runner.clear()
+    assert input_buffer() is None and workspace() is None
     runner.capture_all(cuda_device)
 
-    torch.manual_seed(2)
-    x = torch.randn(real_tokens, HIDDEN, device=cuda_device, dtype=torch.float32)
-    out = runner.maybe_run(seq_lengths=[real_tokens], inputs={"x": x})
-    assert out is not None
-    assert tuple(out["y"].shape) == (real_tokens, HIDDEN)
+    generator = torch.Generator(device=cuda_device).manual_seed(2)
+    replays = []
+    for lengths, capacity in [([49, 40], 128), ([19], 64), ([30, 32, 33], 128)]:
+        padded = [*lengths, *([1] * (3 - len(lengths))), capacity - sum(lengths) + len(lengths)]
+        x = torch.randn(
+            capacity + 3, width, device=cuda_device, dtype=torch.bfloat16, generator=generator
+        )
+        prepare_encoder_attn_metadata(padded, eager, max_seq_len=128)
+        expected = attention({"x": x}, eager)["y"][: sum(lengths)]
+        replays.append((lengths, x[: sum(lengths)], expected, torch.empty_like(expected)))
 
-    # Eager reference uses the same dummy-context layout: slack plus the
-    # runner's 1-token padding reservation.
-    bucket = next(b for b in buckets if b.total_tokens >= real_tokens)
-    padded = [real_tokens, (bucket.total_tokens - real_tokens) + 1]
-    expected = _eager_reference(x, padded_seq_lengths=padded, scale=SCALE)
-    torch.testing.assert_close(out["y"], expected, rtol=0, atol=0)
+    # Keep uploads in flight as the larger bucket is submitted a second time.
+    replay_stream = torch.cuda.Stream(device=cuda_device)
+    replay_stream.wait_stream(torch.cuda.current_stream(cuda_device))
+    with torch.cuda.stream(replay_stream):
+        torch.cuda._sleep(20_000_000)
+        for lengths, x, _, actual in replays:
+            outputs = runner.maybe_run(seq_lengths=lengths, inputs={"x": x})
+            assert outputs is not None
+            actual.copy_(outputs["y"])
+    torch.cuda.current_stream(cuda_device).wait_stream(replay_stream)
+    for _, _, expected, actual in replays:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _probing_encoder_fn(probe: Callable[[], bool], sink: List[bool]):
@@ -1021,3 +1142,37 @@ def test_dummy_padding_isolates_real_tokens(cuda_device, make_cuda_runner):
     )
     captured_meta = runner._captured[captured_key].metadata
     assert captured_meta.seq_lens_cuda.tolist() == padded_seq_lengths
+
+
+@pytest.mark.cpu_only
+def test_batched_encoder_graph_masks_unused_items_and_time():
+    from tensorrt_llm._torch.models.multimodal_encoder_graph import BatchedEncoderGraphIOAdapter
+
+    inputs = {
+        "features": torch.ones(2, 350, 2),
+        "attention_mask": torch.ones(2, 350, dtype=torch.bool),
+    }
+    adapter = BatchedEncoderGraphIOAdapter(inputs)
+    buckets = adapter.capture_buckets(2, 700)
+    assert [b.total_tokens for b in buckets if b.num_contexts == 2] == [512, 640, 700]
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=lambda tensors, _: tensors,
+        io_adapter=adapter,
+        metadata_provider=adapter,
+        config=MultimodalEncoderCudaGraphConfig(buckets=[(6, 1), (12, 2)]),
+    )
+    bucket = runner._select_bucket(2, 12, [6, 6])
+    assert bucket == EncoderGraphKey(12, 2)
+    assert runner._select_bucket(1, 7, [7]) is None
+    assert adapter.can_replay(bucket, [5])
+    assert not adapter.can_replay(bucket, [7])
+    key = adapter.graph_key(bucket, enable_padding=True)
+    assert key == (2, 6)
+    static = adapter.allocate_inputs(key, torch.device("cpu"))
+    for batch, time in [(2, 6), (1, 5), (2, 6)]:
+        live = {name: tensor[:batch, :time] for name, tensor in inputs.items()}
+        adapter.copy_inputs(static, live, [time] * batch)
+        assert static["attention_mask"].sum() == batch * time
+        torch.testing.assert_close(
+            adapter.collect_outputs(static, [time] * batch)["features"], live["features"]
+        )

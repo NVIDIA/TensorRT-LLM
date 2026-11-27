@@ -1,29 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Generic CUDA-graph runner for multimodal vision/audio encoder stacks.
+"""Capture multimodal encoder block loops and replay them on compatible input shapes.
 
-The runner captures the GPU-heavy block loop of a multimodal encoder for a fixed set of
-(total_tokens, num_contexts) buckets and replays the captured graphs at inference time. It is
-intentionally agnostic to the encoder model: the caller supplies an `encoder_fn` (the block loop),
-tensor specs for the inputs/outputs, and small factory/prepare callbacks for the attention metadata
-that the captured graph reads from.
-
-Design highlights:
-
-* The default packed adapter uses an isolated dummy padding context, never an extension of the
-  last real context. Other encoder layouts supply their own shape, mask, and padding rules.
-  Full-attention vision encoders would otherwise let real tokens attend to padding rows.
-* When `enable_padding=True`, the runner reserves one extra token beyond each bucket's real-token
-  budget so the dummy padding context is always non-empty (the attention backend rejects
-  zero-length contexts). Bucket specs from callers therefore describe real tokens only; the
-  runner adds the reservation internally and the captured graph buffers are sized to
-  `bucket.total_tokens + 1`.
-* The runner owns the static input buffers and the metadata instance it hands to `encoder_fn` during
-  capture, so replay never reallocates the tensors whose addresses are baked into the graph.
+The adapter owns input layout, padding and output slicing. Packed encoders place padding
+in independent attention contexts and share a single set of input buffers across captures.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -42,22 +27,32 @@ from typing import (
 
 import torch
 
+from ..._utils import current_cuda_stream, prefer_pinned, wait_event
 from ...logger import logger
-from ..nccl_window_graph import nccl_window_graph_capture, release_nccl_window_graph_owner
+from ..memory_buffer_utils import Buffers
+from ..nccl_window_graph import (
+    abandon_nccl_window_graph_owner,
+    nccl_window_graph_capture,
+    release_nccl_window_graph_owner,
+)
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..utils import make_weak_ref, torch_compiling
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
+    from ..attention.backends.interface import AttentionMetadata
 
 _MetadataT = TypeVar("_MetadataT")
 
-# Single token kept aside for the dummy padding context when `enable_padding=True`.
-# The attention backend rejects zero-length contexts, so the dummy must contain at least one token
-# even when the workload exactly fills the bucket's real-token budget. This constant participates
-# in both buffer sizing (`_padded_key_for_bucket`) and per-replay length assignment
-# (`_padded_seq_lengths`, `_dummy_padded_seq_lengths`).
-_PADDING_TOKEN_RESERVE: int = 1
+
+def _token_budgets(cap: int) -> list[int]:
+    """Token budgets with three significant binary digits, plus the exact cap."""
+    budget = min(256, cap)
+    budgets = []
+    while budget < cap:
+        budgets.append(budget)
+        budget += 1 << (budget.bit_length() - 3)
+    return [*budgets, cap]
 
 
 class EncoderGraphKey(NamedTuple):
@@ -66,10 +61,10 @@ class EncoderGraphKey(NamedTuple):
     The fields' meaning depends on how the key is used:
 
     * As a configured bucket, `total_tokens` is the maximum number of real block-input tokens
-      the bucket is meant to cover, and `num_contexts` is the number of real contexts.
+      the bucket is meant to cover, and `num_contexts` is its real context capacity.
       Neither includes any padding reservation; the runner adds that internally.
     * As a captured graph key, both fields describe the adapter's fixed capture capacity.
-      The default packed adapter adds one token and one context when padding is enabled.
+      The packed adapter reserves one token per context slot and one extra context for slack.
     """
 
     total_tokens: int
@@ -153,14 +148,14 @@ class EncoderGraphIOAdapter(ABC):
         """Return output views for the live workload, including any masks."""
 
     def can_replay(self, bucket: EncoderGraphKey, seq_lengths: Sequence[int]) -> bool:
-        """Whether a workload fitting ``bucket`` also fits this encoder's layout."""
-        return True
+        """Check layout compatibility. Custom predicates receive exact context counts."""
+        return len(seq_lengths) == bucket.num_contexts
 
     def graph_key(self, bucket: EncoderGraphKey, *, enable_padding: bool) -> EncoderGraphKey:
         """Map a configured bucket to its fixed capture capacity."""
         if enable_padding:
             return EncoderGraphKey(
-                total_tokens=bucket.total_tokens + _PADDING_TOKEN_RESERVE,
+                total_tokens=bucket.total_tokens + 1,
                 num_contexts=bucket.num_contexts + 1,
             )
         return bucket
@@ -171,7 +166,7 @@ class EncoderGraphIOAdapter(ABC):
         """Describe the contexts passed to the metadata provider before replay."""
         if not enable_padding:
             return list(seq_lengths)
-        padding = bucket.total_tokens - sum(seq_lengths) + _PADDING_TOKEN_RESERVE
+        padding = bucket.total_tokens - sum(seq_lengths) + 1
         return [*seq_lengths, padding]
 
     def capture_seq_lengths(self, bucket: EncoderGraphKey, key: EncoderGraphKey) -> list[int]:
@@ -193,26 +188,126 @@ class EncoderGraphIOAdapter(ABC):
 class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
     """Use token-axis tensor specs for packed, length-preserving encoder blocks.
 
+    One active runner owns the shared input and workspace buffers until it clears its captures.
+
     Args:
         input_specs: Non-token dimensions, dtype, and token axis of each graph input.
         output_specs: Token axis of each graph output; outputs preserve the real input token count.
     """
 
+    graph_critical_attrs = ("seq_lens_cuda", "cu_q_seqlens", "cu_kv_seqlens")
+    _enable_padding: bool = True
+
     def __init__(
         self,
         input_specs: Mapping[str, EncoderGraphTensorSpec],
-        output_specs: Mapping[str, int],
+        output_specs: Mapping[str, int] | None = None,
+        *,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> None:
         self._input_specs = dict(input_specs)
-        self._output_specs = dict(output_specs)
+        self._output_specs = output_specs
+        self._static_inputs: dict[str, torch.Tensor] = {}
+        self._eager_metadata = attn_metadata
+        self._buffers: tuple[Buffers, dict[int, Callable[[Sequence[int]], None]]] = Buffers(), {}
+
+    def capture_buckets(self, max_batch_size: int, max_num_tokens: int) -> list[EncoderGraphKey]:
+        if not self._enable_padding:
+            return super().capture_buckets(max_batch_size, max_num_tokens)
+        return [
+            EncoderGraphKey(t, min(max_batch_size, max(1, t // 128)))
+            for t in _token_budgets(max_num_tokens)
+        ]
+
+    def can_replay(self, bucket: EncoderGraphKey, seq_lengths: Sequence[int]) -> bool:
+        if not self._enable_padding:
+            # An empty segment can leave more tokens in a peer than the exact graph captured.
+            return (
+                super().can_replay(bucket, seq_lengths)
+                and min(seq_lengths) >= 0
+                and max(seq_lengths) <= bucket.total_tokens - bucket.num_contexts + 1
+            )
+        return 1 <= len(seq_lengths) <= bucket.num_contexts and min(seq_lengths) > 0
+
+    def graph_key(self, bucket: EncoderGraphKey, *, enable_padding: bool) -> EncoderGraphKey:
+        if enable_padding:
+            return EncoderGraphKey(
+                bucket.total_tokens + bucket.num_contexts, bucket.num_contexts + 1
+            )
+        return bucket
+
+    def padded_seq_lengths(
+        self, seq_lengths: Sequence[int], *, bucket: EncoderGraphKey, enable_padding: bool
+    ) -> list[int]:
+        if not enable_padding:
+            return list(seq_lengths)
+        unused = bucket.num_contexts - len(seq_lengths)
+        slack = bucket.total_tokens - sum(seq_lengths) + len(seq_lengths)
+        return [*seq_lengths, *([1] * unused), slack]
+
+    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
+        eager = self._eager_metadata
+        assert eager is not None
+        workspace, refreshers = self._buffers
+        metadata = type(eager)(
+            max_num_requests=key.num_contexts,
+            max_num_tokens=key.total_tokens,
+            kv_cache_manager=None,
+            kv_layout=eager.kv_layout,
+            is_cuda_graph=True,
+            cuda_graph_buffers=workspace,
+        )
+        metadata.max_seq_len = max(eager.max_seq_len or 0, key.total_tokens - key.num_contexts + 1)
+        n = key.num_contexts
+        host = torch.empty(2 * n + 1, dtype=torch.int32, pin_memory=prefer_pinned())
+        device = torch.empty_like(host, device="cuda")
+        values = memoryview(host.numpy())
+        values[n] = 0  # First exclusive offset.
+        metadata.request_ids = list(range(1, n + 1))
+        metadata.cu_q_seqlens = metadata.cu_kv_seqlens = device[n:]
+        metadata.bind_encoder_cuda_graph_seq_lens(host[:n], n, seq_lens_cuda=device[:n])
+        host_offsets = host[n:]
+        uploaded = torch.cuda.Event()
+        device_index = device.device.index
+
+        def refresh(lengths: Sequence[int]) -> None:
+            wait_event(uploaded)
+            offset = 0
+            for i, length in enumerate(lengths):
+                values[i] = length
+                offset += length
+                values[n + i + 1] = offset
+            device.copy_(host, non_blocking=True)
+            try:
+                metadata.prepare_encoder_only(host_offsets=host_offsets)
+            finally:
+                # Also protect the host planner's reusable schedule until its upload completes.
+                uploaded.record(current_cuda_stream(device_index))
+
+        refreshers[id(metadata)] = refresh
+        return metadata
+
+    def refresh_in_place(
+        self, metadata: AttentionMetadata, padded_seq_lengths: Sequence[int]
+    ) -> None:
+        self._buffers[1][id(metadata)](padded_seq_lengths)
 
     def allocate_inputs(
         self, key: EncoderGraphKey, device: torch.device
     ) -> dict[str, torch.Tensor]:
-        return {
-            name: spec.materialize(key.total_tokens, device)
-            for name, spec in self._input_specs.items()
-        }
+        # capture_all allocates the largest physical shape first, including its padding slots.
+        if not self._static_inputs:
+            self._static_inputs = {
+                name: spec.materialize(key.total_tokens, device)
+                for name, spec in self._input_specs.items()
+            }
+        inputs = {}
+        for name, spec in self._input_specs.items():
+            buffer = self._static_inputs[name]
+            shape = buffer.narrow(spec.token_dim, 0, key.total_tokens).shape
+            # Preserve a contiguous layout even when the token axis is not leading.
+            inputs[name] = buffer.view(-1)[: shape.numel()].view(shape)
+        return inputs
 
     def copy_inputs(
         self,
@@ -226,6 +321,10 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
                 raise KeyError(f"Missing graph input '{name}' for multimodal encoder runner.")
             src = inputs[name]
             dst = static_inputs[name]
+            if src.dtype != dst.dtype:
+                raise ValueError(
+                    f"Encoder graph input {name} requires {dst.dtype}, got {src.dtype}."
+                )
             for dim, (d_size, s_size) in enumerate(zip(dst.shape, src.shape, strict=True)):
                 if dim != spec.token_dim and d_size != s_size:
                     raise ValueError(
@@ -246,9 +345,94 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
     ) -> dict[str, torch.Tensor]:
         real_tokens = sum(seq_lengths)
         return {
-            name: tensor.narrow(self._output_specs[name], 0, real_tokens)
+            name: tensor.narrow(
+                0 if self._output_specs is None else self._output_specs[name], 0, real_tokens
+            )
             for name, tensor in outputs.items()
         }
+
+
+class BatchedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
+    """Capture dense [items, time, ...] tensors with a boolean [items, time] mask.
+
+    The startup sample spans the tower's longest supported time window. Padding stays
+    within each item's window, so temporal convolutions cannot cross item boundaries.
+    For a fixed time window, configure buckets as (items * window, items) for the
+    desired item capacities. This captures just that time length. A replay returns the
+    live dense extent. The tower uses its clip lengths to trim each item's output.
+    """
+
+    graph_critical_attrs = ()
+
+    def __init__(self, inputs: Mapping[str, torch.Tensor]) -> None:
+        self._max_time = next(iter(inputs.values())).shape[1]
+        self._specs = {name: (tensor.shape[2:], tensor.dtype) for name, tensor in inputs.items()}
+        self._specs.setdefault("attention_mask", (torch.Size([]), torch.bool))
+
+    def capture_buckets(self, max_batch_size: int, max_num_tokens: int) -> list[EncoderGraphKey]:
+        return sorted(
+            EncoderGraphKey(count * time, count)
+            for count in range(1, min(max_batch_size, max_num_tokens) + 1)
+            for time in _token_budgets(min(self._max_time, max_num_tokens // count))
+        )
+
+    def can_replay(self, bucket: EncoderGraphKey, seq_lengths: Sequence[int]) -> bool:
+        return (
+            0 < len(seq_lengths) <= bucket.num_contexts
+            and max(seq_lengths) <= bucket.total_tokens // bucket.num_contexts
+        )
+
+    def graph_key(self, bucket: EncoderGraphKey, *, enable_padding: bool) -> EncoderGraphKey:
+        return EncoderGraphKey(bucket.num_contexts, bucket.total_tokens // bucket.num_contexts)
+
+    def capture_seq_lengths(self, bucket: EncoderGraphKey, key: EncoderGraphKey) -> list[int]:
+        items, time = key
+        return [time] * items
+
+    def padded_seq_lengths(
+        self, seq_lengths: Sequence[int], *, bucket: EncoderGraphKey, enable_padding: bool
+    ) -> list[int]:
+        return [*seq_lengths, *([0] * (bucket.num_contexts - len(seq_lengths)))]
+
+    def allocate_inputs(
+        self, key: EncoderGraphKey, device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        items, time = key
+        return {
+            name: torch.zeros((items, time, *shape), dtype=dtype, device=device)
+            for name, (shape, dtype) in self._specs.items()
+        }
+
+    def copy_inputs(
+        self,
+        static_inputs: Mapping[str, torch.Tensor],
+        inputs: Mapping[str, torch.Tensor],
+        seq_lengths: Sequence[int],
+    ) -> None:
+        for name, dst in static_inputs.items():
+            if name == "attention_mask" and name not in inputs:
+                dst.zero_()
+                for mask, length in zip(dst, seq_lengths):
+                    mask[:length].fill_(True)
+                continue
+            src = inputs[name]
+            if dst.dtype != src.dtype:
+                raise ValueError(f"Encoder graph input {name} expects {dst.dtype}, got {src.dtype}")
+            dst.zero_()
+            dst[: src.shape[0], : src.shape[1]].copy_(src)
+
+    def collect_outputs(
+        self, outputs: Mapping[str, torch.Tensor], seq_lengths: Sequence[int]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            name: tensor[: len(seq_lengths), : max(seq_lengths)] for name, tensor in outputs.items()
+        }
+
+    def build(self, key: EncoderGraphKey) -> None:
+        """Dense attention consumes the mask directly."""
+
+    def refresh_in_place(self, metadata: None, padded_seq_lengths: Sequence[int]) -> None:
+        """The mask is refreshed along with the other graph inputs."""
 
 
 @dataclass(frozen=True)
@@ -349,18 +533,20 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         elif input_specs is not None or output_specs is not None:
             raise ValueError("io_adapter cannot be combined with input_specs or output_specs.")
         self._io_adapter = io_adapter
+        if isinstance(io_adapter, PackedEncoderGraphIOAdapter):
+            io_adapter._enable_padding = config.enable_padding
         self._config = config
-        # Adopted from the first captured graph so subsequent bucket captures share the pool.
+        # All bucket captures share one pool for this runner.
         self._memory_pool = None
 
         buckets = config.buckets
         if buckets is None:
-            if config.max_batch_size is None or config.max_num_tokens is None:
+            if config.max_num_tokens is None:
                 raise ValueError(
-                    "Automatic encoder graphs require max_batch_size and a resolved "
-                    "max_num_tokens budget."
+                    "Automatic encoder graphs require a resolved max_num_tokens budget."
                 )
-            buckets = io_adapter.capture_buckets(config.max_batch_size, config.max_num_tokens)
+            max_batch_size = config.max_batch_size or max(1, min(32, config.max_num_tokens // 256))
+            buckets = io_adapter.capture_buckets(max_batch_size, config.max_num_tokens)
         if not buckets:
             raise ValueError(
                 "MultimodalEncoderCudaGraphConfig.buckets is empty; the runner has "
@@ -395,12 +581,16 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         # metadata variants; warming up a later, larger workload can resize that workspace and
         # invalidate pointers captured by an earlier graph. This matches the ordering used by the
         # LLM CUDA-graph runners and also lets smaller graphs reuse the larger graph's memory pool.
-        for bucket in reversed(self._buckets):
-            key = self._padded_key_for_bucket(bucket)
-            if key in self._captured:
-                continue
-            padded_seq_lengths = self._dummy_padded_seq_lengths(bucket, key)
-            self._capture_key(key, padded_seq_lengths, device)
+        with torch.cuda.device(device if device.type == "cuda" else -1), ExitStack() as cleanup:
+            capture_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+            cleanup.callback(self.clear, release_nccl_window_owners=False)
+            for bucket in sorted(self._buckets, key=self._padded_key_for_bucket, reverse=True):
+                key = self._padded_key_for_bucket(bucket)
+                if key in self._captured:
+                    continue
+                padded_seq_lengths = self._dummy_padded_seq_lengths(bucket, key)
+                self._capture_key(key, padded_seq_lengths, device, capture_stream)
+            cleanup.pop_all()
 
     def maybe_run(
         self,
@@ -414,9 +604,9 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         returns `None` when no captured graph applies, in which case the caller is expected to fall
         back to eager.
 
-        Returned tensors are borrowed views into graph-owned static output buffers. A later replay
-        of the same graph may overwrite those buffers, so callers must consume the tensors before
-        the next replay or explicitly clone values they need to keep.
+        Returned tensors are borrowed views into graph-owned buffers. A later replay on this
+        runner may overwrite them. Consume the tensors before replaying another call or clone
+        values that must live longer.
 
         Misses happen when:
         (a) no configured bucket can host the request shape or
@@ -447,10 +637,9 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
                     f"{bucket=} with {key=}, but no graph has been captured."
                 )
             return None
-        self._io_adapter.copy_inputs(captured.inputs, inputs, seq_lengths)
-        # Capture ran under inference_mode, so buffers the attention backend allocated during its
-        # first plan are inference tensors and may only be refreshed in place under it.
+        # Startup may create the input and attention buffers under inference mode.
         with torch.inference_mode():
+            self._io_adapter.copy_inputs(captured.inputs, inputs, seq_lengths)
             self._metadata_provider.refresh_in_place(captured.metadata, padded_seq_lengths)
         self._assert_metadata_buffers_stable(captured.metadata, captured.metadata_tensor_ptrs)
         captured.graph.replay()
@@ -467,9 +656,17 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         for captured in self._captured.values():
             captured.graph.reset()
         self._captured.clear()
+        if isinstance(self._io_adapter, PackedEncoderGraphIOAdapter):
+            self._io_adapter._static_inputs.clear()
+        if isinstance(self._metadata_provider, PackedEncoderGraphIOAdapter):
+            workspace, refreshers = self._metadata_provider._buffers
+            workspace.buffers.clear()
+            refreshers.clear()
         if self._memory_pool is not None:
             if release_nccl_window_owners:
                 release_nccl_window_graph_owner(self._memory_pool)
+            else:
+                abandon_nccl_window_graph_owner(self._memory_pool)
             self._memory_pool = None
 
     # ------------------------------------------------------------------
@@ -480,20 +677,23 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         self,
         real_contexts: int,
         real_tokens: int,
-        seq_lengths: Sequence[int] | None = None,
+        seq_lengths: Sequence[int],
     ) -> Optional[EncoderGraphKey]:
+        # Custom predicates may rely on exact context counts before checking their layout.
+        allows_partial_count = type(self._io_adapter).can_replay in (
+            PackedEncoderGraphIOAdapter.can_replay,
+            BatchedEncoderGraphIOAdapter.can_replay,
+        )
         for bucket in self._buckets:
-            if bucket.num_contexts != real_contexts:
+            if not allows_partial_count and real_contexts != bucket.num_contexts:
                 continue
             if real_tokens > bucket.total_tokens:
                 continue
-            if seq_lengths is not None and not self._io_adapter.can_replay(bucket, seq_lengths):
+            if not self._io_adapter.can_replay(bucket, seq_lengths):
                 continue
             if self._config.enable_padding:
-                # Padding path: exact num_contexts match and real_tokens <= bucket budget.
                 return bucket
-            # No padding: require an exact match on both num_contexts and total_tokens.
-            if real_tokens == bucket.total_tokens:
+            if real_tokens == bucket.total_tokens and real_contexts == bucket.num_contexts:
                 return bucket
         if not self._warned_no_bucket_match:
             self._warned_no_bucket_match = True
@@ -535,6 +735,7 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         key: EncoderGraphKey,
         padded_seq_lengths: Sequence[int],
         device: torch.device,
+        capture_stream: torch.cuda.Stream | None = None,
     ) -> None:
         padded_seq_lengths = list(padded_seq_lengths)
         logger.info(f"Capturing multimodal encoder CUDA graph for key={key} on device={device}.")
@@ -544,7 +745,8 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         self._metadata_provider.refresh_in_place(metadata, padded_seq_lengths)
 
         graph = torch.cuda.CUDAGraph()
-        graph_pool = self._memory_pool or torch.cuda.graph_pool_handle()
+        if self._memory_pool is None:
+            self._memory_pool = torch.cuda.graph_pool_handle()
         # `torch_compiling(False)` for the same reason as `inference_mode`: ambient state the encoder
         # region must not inherit from whoever called us. Capture can be driven from `load_weights`,
         # outside any engine forward, so the process-global compile flag may still carry a previous
@@ -553,29 +755,29 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         # only an engine forward binds.
         # Capture can run from `load_weights`, outside any engine forward or `ModelCaller` scope, so
         # NCCL-window tensors produced by a TP-sharded tower need a local lease scope here.
-        with torch.inference_mode(), torch_compiling(False):
-            for _ in range(self._config.warmup_steps):
-                with discard_nccl_window_tensor_outputs(static_inputs):
-                    self._encoder_fn(static_inputs, metadata)
-            torch.cuda.synchronize()
+        with ExitStack() as cleanup:
+            cleanup.callback(graph.reset)
+            with torch.inference_mode(), torch_compiling(False):
+                for _ in range(self._config.warmup_steps):
+                    with discard_nccl_window_tensor_outputs(static_inputs):
+                        self._encoder_fn(static_inputs, metadata)
+                torch.cuda.synchronize()
 
-            with nccl_window_graph_capture(graph, graph_pool):
-                with discard_nccl_window_tensor_outputs(static_inputs):
-                    outputs = self._encoder_fn(static_inputs, metadata)
+                with nccl_window_graph_capture(graph, self._memory_pool, stream=capture_stream):
+                    with discard_nccl_window_tensor_outputs(static_inputs):
+                        outputs = self._encoder_fn(static_inputs, metadata)
 
-        captured_outputs = {name: make_weak_ref(tensor) for name, tensor in outputs.items()}
-        self._captured[key] = _CapturedGraph(
-            graph=graph,
-            inputs=static_inputs,
-            metadata=metadata,
-            outputs=captured_outputs,
-            metadata_tensor_ptrs=self._snapshot_metadata_tensor_ptrs(
-                metadata, self._metadata_provider.graph_critical_attrs
-            ),
-        )
-        # Adopt the pool from the first captured graph so subsequent captures share it and reuse
-        # memory.
-        self._memory_pool = graph_pool
+            captured_outputs = {name: make_weak_ref(tensor) for name, tensor in outputs.items()}
+            self._captured[key] = _CapturedGraph(
+                graph=graph,
+                inputs=static_inputs,
+                metadata=metadata,
+                outputs=captured_outputs,
+                metadata_tensor_ptrs=self._snapshot_metadata_tensor_ptrs(
+                    metadata, self._metadata_provider.graph_critical_attrs
+                ),
+            )
+            cleanup.pop_all()
 
     @staticmethod
     def _snapshot_metadata_tensor_ptrs(metadata: object, attrs: Sequence[str]) -> Dict[str, int]:

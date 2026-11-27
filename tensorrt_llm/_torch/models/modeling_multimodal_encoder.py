@@ -16,7 +16,8 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/blob/main/llava/model/multimodal_encoder/
 
 import os
-from typing import TYPE_CHECKING, Optional, Type, cast
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Literal, Optional, Type
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,8 @@ from transformers import AutoConfig, AutoModel
 
 from ..._utils import prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
+from ..attention.backends.vanilla import VanillaAttentionMetadata
+from ..utils import torch_compiling
 from .modeling_multimodal_utils import multiscale_forward
 
 if TYPE_CHECKING:
@@ -143,6 +146,7 @@ class MultimodalEncoderMixin:
     metadata_cls: Type[AttentionMetadata]
     attn_metadata: Optional[AttentionMetadata] = None
     encoder_cuda_graph_modality: str | None = None
+    encoder_cuda_graph_layout: Literal["packed", "batched"] = "packed"
     _encoder_cuda_graph_config: "MultimodalEncoderCudaGraphConfig | None" = None
     _blocks_graph_runner: "MultimodalEncoderGraphRunner | None" = None
 
@@ -175,31 +179,90 @@ class MultimodalEncoderMixin:
             if graph_configs is not None
             and self.encoder_cuda_graph_modality is not None else None)
 
-    def _build_blocks_graph_runner(
-        self, config: "MultimodalEncoderCudaGraphConfig"
-    ) -> "MultimodalEncoderGraphRunner":
-        """Describe the block function, tensor specs, and metadata provider.
+    def _encoder_graph_fn(
+            self, inputs: Mapping[str, torch.Tensor],
+            attn_metadata: AttentionMetadata | None) -> dict[str, torch.Tensor]:
+        """Run the graphable blocks without reading device values on the host.
 
-        Encoders opting into graphs override this factory. Model-specific
-        preprocessing and output assembly stay in the encoder forward.
+        Packed inputs use token axis zero. Each segment must be independent,
+        including quantization scales and normalization statistics.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not support encoder CUDA graphs")
+
+    def _run_blocks(
+        self,
+        inputs: dict[str, torch.Tensor],
+        attn_metadata: AttentionMetadata | None,
+        *,
+        seq_lengths: list[int] | None = None,
+        max_seq_len: int = 0,
+    ) -> dict[str, torch.Tensor]:
+        """Packed towers can pass host lengths to prepare eager metadata only on a miss."""
+        with torch_compiling(False):
+            runner = self._blocks_graph_runner
+            if runner is not None and (seq_lengths is None or
+                                       (seq_lengths
+                                        and max(seq_lengths) <= max_seq_len)):
+                lengths = seq_lengths
+                if lengths is None:
+                    if attn_metadata is None:
+                        batch, time = next(iter(inputs.values())).shape[:2]
+                        lengths = [time] * batch
+                    else:
+                        lengths = attn_metadata.seq_lens.tolist()
+                outputs = runner.maybe_run(seq_lengths=lengths, inputs=inputs)
+                if outputs is not None:
+                    return outputs
+            if seq_lengths is not None:
+                if attn_metadata is None:
+                    raise RuntimeError(
+                        "Encoder attention metadata must be initialized before forward"
+                    )
+                prepare_encoder_attn_metadata(seq_lengths,
+                                              attn_metadata,
+                                              max_seq_len=max_seq_len)
+            return self._encoder_graph_fn(inputs, attn_metadata)
+
+    def _build_blocks_graph_runner(
+        self,
+        config: "MultimodalEncoderCudaGraphConfig",
+        inputs: Mapping[str, torch.Tensor],
+        attn_metadata: AttentionMetadata | None,
+    ) -> "MultimodalEncoderGraphRunner":
+        """Use the shapes and dtypes produced by the tower's ordinary input preparation."""
+        from .multimodal_encoder_graph import (EncoderGraphTensorSpec,
+                                               MultimodalEncoderGraphRunner,
+                                               PackedEncoderGraphIOAdapter)
+        if isinstance(attn_metadata, VanillaAttentionMetadata):
+            raise ValueError(
+                "VANILLA attention does not support multimodal encoder CUDA graphs."
+            )
+        if self.encoder_cuda_graph_layout == "batched":
+            from .multimodal_encoder_graph import BatchedEncoderGraphIOAdapter
+            adapter = BatchedEncoderGraphIOAdapter(inputs)
+        else:
+            specs = {
+                name: EncoderGraphTensorSpec(tuple(tensor.shape[1:]),
+                                             tensor.dtype)
+                for name, tensor in inputs.items()
+            }
+            adapter = PackedEncoderGraphIOAdapter(specs,
+                                                  attn_metadata=attn_metadata)
+        return MultimodalEncoderGraphRunner(encoder_fn=self._encoder_graph_fn,
+                                            metadata_provider=adapter,
+                                            io_adapter=adapter,
+                                            config=config)
 
     def enable_blocks_cuda_graph(
         self,
         config: "MultimodalEncoderCudaGraphConfig | None" = None,
         *,
+        dummy_encode: Callable[[], object] | None = None,
         device: torch.device | None = None,
         max_num_tokens: int | None = None,
     ) -> None:
-        """Capture configured block graphs once, after weights and metadata are ready.
-
-        The engine drives this lifecycle for every local multimodal encoder.
-        Standalone callers may provide an explicit config and device. Automatic
-        configs use their own token cap or the engine's original encoder budget;
-        raising the scheduling budget for an oversized item does not enlarge captures.
-        """
+        """Observe block inputs during one startup encode, then capture before KV sizing."""
         config = config if config is not None else self._encoder_cuda_graph_config
         if config is None or self._blocks_graph_runner is not None:
             return
@@ -209,9 +272,43 @@ class MultimodalEncoderMixin:
                                  "from the config or engine.")
             config = config.model_copy(
                 update={"max_num_tokens": max_num_tokens})
-        runner = self._build_blocks_graph_runner(config)
-        if device is None:
-            device = next(cast(nn.Module, self).parameters()).device
+        if type(self
+                )._encoder_graph_fn is MultimodalEncoderMixin._encoder_graph_fn:
+            raise ValueError(
+                f"{type(self).__name__} must implement _encoder_graph_fn")
+        if dummy_encode is None:
+            raise ValueError(
+                f"{type(self).__name__} needs a dummy encode to capture block graphs"
+            )
+
+        runner = None
+        run_blocks = self._run_blocks
+
+        def observe_blocks(
+            inputs: dict[str, torch.Tensor],
+            attn_metadata: AttentionMetadata | None,
+            **kwargs,
+        ) -> dict[str, torch.Tensor]:
+            nonlocal runner, device
+            if runner is None:
+                runner = self._build_blocks_graph_runner(
+                    config, inputs, attn_metadata)
+                if device is None:
+                    device = next(iter(inputs.values())).device
+            return run_blocks(inputs, attn_metadata, **kwargs)
+
+        # Observe the eager prelude only during this encode. Serving has no pending capture state.
+        self._run_blocks = observe_blocks
+        try:
+            # Eager attention wrappers may update their buffers on later no-grad calls.
+            with torch.no_grad():
+                dummy_encode()
+        finally:
+            del self._run_blocks
+        if runner is None:
+            raise ValueError(
+                f"Dummy encode did not execute the blocks of {type(self).__name__}"
+            )
         runner.capture_all(device)
         self._blocks_graph_runner = runner
 
@@ -247,6 +344,8 @@ class MultimodalEncoderMixin:
         attention_metadata_capacity: Optional[dict[str, int]] = None,
     ) -> None:
         """Map encoder item/token budgets to attention metadata capacity."""
+        if self.encoder_cuda_graph_layout == "batched":
+            return
         capacities = (
             attention_metadata_capacity
             if attention_metadata_capacity is not None else

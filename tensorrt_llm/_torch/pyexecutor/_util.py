@@ -60,6 +60,7 @@ from ..memory.monitor.providers.kv_cache import \
     KvCacheProvider as MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_multimodal_utils import _is_mm_disagg
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
@@ -1866,17 +1867,18 @@ class KvCacheCreator:
 
     def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
         """Build one processed MM encoder batch at its scheduling limits."""
-        if not isinstance(self._model_engine.model, MultimodalModelMixin):
+        model = self._model_engine.model
+        model = getattr(model, "_orig_mod", model)
+        if not isinstance(model, MultimodalModelMixin):
             return []
         if isinstance(
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
-        if self._llm_args.disable_mm_encoder:
+        # With encoder/prefill handoff, the KV worker consumes precomputed embeddings.
+        if self._llm_args.disable_mm_encoder or _is_mm_disagg():
             return []
-        # MM E/P disaggregation may remove an otherwise exposed encoder.
-        if (hasattr(self._model_engine.model, "mm_encoder")
-                and self._model_engine.model.mm_encoder is None):
+        if hasattr(model, "mm_encoder") and model.mm_encoder is None:
             return []
 
         input_processor = self._model_engine.input_processor
@@ -1913,7 +1915,7 @@ class KvCacheCreator:
             mm_data = input_processor.get_dummy_mm_data(
                 max_num_encoder_tokens=encoder_max_num_tokens,
                 mm_counts={modality: num_items},
-                dtype=self._model_engine.model.dtype,
+                dtype=model.dtype,
             )
         except NotImplementedError:
             logger.info("Multimodal memory profiling skipped: "

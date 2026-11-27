@@ -397,6 +397,7 @@ class ModelEngine:
             mm_item_scheduler.attention_metadata_capacity
             if mm_item_scheduler is not None
             else None,
+            multimodal_config=self.llm_args.multimodal_config,
         )
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
         self._init_model_capacity()
@@ -452,6 +453,7 @@ class ModelEngine:
         setup_mm_encoder_cuda_graphs(
             self.model,
             mm_config.encoder_cuda_graph if mm_config is not None else None,
+            input_processor=self.input_processor,
             max_num_tokens=configured_encoder_max_num_tokens,
         )
         self._model_caller = compiled.caller

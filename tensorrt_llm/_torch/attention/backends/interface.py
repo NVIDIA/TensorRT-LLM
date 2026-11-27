@@ -529,11 +529,32 @@ class AttentionMetadata:
         """Undo _swap_mixed_precision_kv."""
         self.kv_cache_manager, self.kv_layout = saved
 
-    def prepare_encoder_only(self) -> None:
+    def bind_encoder_cuda_graph_seq_lens(
+            self,
+            seq_lens_host: torch.Tensor,
+            padded_batch_size: int,
+            *,
+            seq_lens_cuda: Optional[torch.Tensor] = None) -> None:
+        """Bind stable length views for an encoder capture.
+
+        A packed graph supplies its own device view. Every replay of that key
+        fills the same token budget, including padding.
+        """
+        self._seq_lens = seq_lens_host[:padded_batch_size]
+        self._num_contexts = padded_batch_size
+        self._num_generations = 0
+        if seq_lens_cuda is not None:
+            self._seq_lens_cuda = seq_lens_cuda
+            self._num_ctx_tokens = self._num_tokens = self.max_num_tokens
+
+    def prepare_encoder_only(self,
+                             *,
+                             host_offsets: Optional[torch.Tensor] = None
+                             ) -> None:
         """Hook for encoder-only (no-KV-cache) forward setup.
 
-        Defaults to the full ``prepare()``; backends with a leaner encoder-only
-        path override this.
+        A packed graph supplies host offsets after uploading its bound length
+        and offset views. Other callers prepare lengths through the eager path.
         """
         self.prepare()
 

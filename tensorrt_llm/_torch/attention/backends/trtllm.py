@@ -2062,8 +2062,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     num_seqs,
                     max_blocks=max_blocks)
 
-    def prepare_encoder_only(self) -> None:
+    def prepare_encoder_only(self,
+                             *,
+                             host_offsets: Optional[torch.Tensor] = None
+                             ) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
+        if host_offsets is not None:
+            # Packed graph state was bound once. FMHA reads the uploaded device views.
+            return
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
@@ -2096,12 +2102,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 host_request_types=self.host_request_types[:n],
             )
 
-    def bind_encoder_cuda_graph_seq_lens(self, seq_lens_host: torch.Tensor,
-                                         padded_batch_size: int) -> None:
-        """Bind stable seq_lens storage for one encoder CUDA graph key."""
-        self._seq_lens = seq_lens_host[:padded_batch_size]
-        self._num_contexts = padded_batch_size
-        self._num_generations = 0
+    def bind_encoder_cuda_graph_seq_lens(
+            self,
+            seq_lens_host: torch.Tensor,
+            padded_batch_size: int,
+            *,
+            seq_lens_cuda: Optional[torch.Tensor] = None) -> None:
+        super().bind_encoder_cuda_graph_seq_lens(seq_lens_host,
+                                                 padded_batch_size,
+                                                 seq_lens_cuda=seq_lens_cuda)
 
         self.host_request_types[:padded_batch_size].fill_(0)
         self._bind_runtime_views(
@@ -2112,6 +2121,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:padded_batch_size],
         )
         self.host_total_kv_lens[1] = 0
+        if seq_lens_cuda is not None:
+            self.prepare_encoder_only()
 
     def prepare_encoder_cuda_graph_replay(self, seq_lens: List[int],
                                           padded_num_tokens: int) -> None:

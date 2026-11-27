@@ -733,8 +733,8 @@ CudaGraphConfigType: TypeAlias = Annotated[
 class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
     """CUDA graph capture for multimodal vision / audio encoders.
 
-    Set `max_batch_size` to generate capture shapes automatically. Advanced users can instead
-    specify `buckets`. Replay falls back to eager when no captured shape fits the live workload.
+    An empty config captures shapes automatically from the encoder token budget. Set
+    `buckets` to choose explicit capacities. Workloads outside those capacities run eagerly.
 
     NOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for
     `buckets` corresponding to lesser compute.
@@ -743,11 +743,9 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
     max_batch_size: Optional[PositiveInt] = Field(
         default=None,
         description=
-        ("Maximum number of encoder contexts per CUDA graph. Automatically captures every "
-         "context count from 1 to this limit, with token capacities derived from the encoder "
-         "token budget. Contexts are encoder sequences, such as image or video frame groups "
-         "and audio chunks; they are not concurrent requests. Mutually exclusive with buckets."
-         ),
+        ("Maximum number of real encoder contexts (image segments, frames or audio clips) "
+         "per call. Defaults to max(1, min(32, max_num_tokens // 256)) using the resolved "
+         "encoder token budget. Mutually exclusive with buckets."),
         status="prototype",
     )
 
@@ -765,20 +763,19 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
         default=None,
         min_length=1,
         description=
-        ("Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair "
-         "captures one graph sized for up to `total_tokens` real encoder tokens across exactly "
-         "`num_contexts` real contexts."),
+        ("Explicit encoder graph capacities as `(total_tokens, num_contexts)` pairs. "
+         "These replace the automatic budgets. Packed encoders with padding accept up "
+         "to both limits. Dense encoders must also fit the captured time dimension."
+         ),
         status="prototype",
     )
 
     enable_padding: bool = Field(
         default=True,
         description=
-        ("Capture a padded variant of each bucket so partial buckets can replay. Padding works "
-         "only when the request has exactly the bucket's `num_contexts` real contexts and no "
-         "more than the bucket's `total_tokens` real encoder tokens. The runner appends one "
-         "dummy padding context and one reserved padding token internally, so bucket values "
-         "should describe only the real workload."),
+        ("Allow workloads smaller than a capture to replay. Packed encoders isolate unused "
+         "tokens in padding contexts. With padding disabled, capture per context count "
+         "and require an exact fit."),
         status="prototype",
     )
 
@@ -799,8 +796,6 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
     @model_validator(mode='after')
     def _normalize(self) -> 'MultimodalEncoderCudaGraphConfig':
         if self.buckets is None:
-            if self.max_batch_size is None:
-                raise ValueError("Set max_batch_size or explicit buckets.")
             return self
         if self.max_batch_size is not None or self.max_num_tokens is not None:
             raise ValueError("Explicit buckets cannot be combined with "
@@ -900,11 +895,9 @@ class MultimodalConfig(StrictBaseModel):
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,
         description=
-        ("CUDA graph capture for multimodal encoders, keyed by modality name. "
-         "This config is not applied automatically - each model must read "
-         "`model_config.multimodal_config.encoder_cuda_graph` and implement capture + replay "
-         "via `MultimodalEncoderCudaGraphRunner` (see "
-         "`tensorrt_llm/_torch/models/multimodal_encoder_graph.py`)."),
+        ("CUDA graph capture for supported encoder towers, keyed by modality name. "
+         "Set a tower's value to {} to capture its block stack at startup using "
+         "automatic budgets."),
         status="prototype",
     )
 

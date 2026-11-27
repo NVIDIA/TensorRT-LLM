@@ -2960,8 +2960,7 @@ class TestMultimodalEncoderCudaGraphConfig:
         assert config.buckets is None
 
     def test_automatic_buckets_accept_token_cap(self):
-        config = MultimodalEncoderCudaGraphConfig(max_batch_size=8,
-                                                  max_num_tokens=1024)
+        config = MultimodalEncoderCudaGraphConfig(max_num_tokens=1024)
         assert config.max_num_tokens == 1024
 
     @pytest.mark.parametrize("kwargs", [
@@ -2974,9 +2973,6 @@ class TestMultimodalEncoderCudaGraphConfig:
         {
             "max_batch_size": 8,
             "max_num_tokens": 0
-        },
-        {
-            "max_num_tokens": 1024
         },
         {
             "buckets": [(256, 1)],
@@ -2992,17 +2988,15 @@ class TestMultimodalEncoderCudaGraphConfig:
             MultimodalEncoderCudaGraphConfig(**kwargs)
 
     def test_both_modalities_accept_automatic_config(self):
-        config = MultimodalConfig(
-            encoder_cuda_graph={
-                "vision": {
-                    "max_batch_size": 8
-                },
-                "audio": {
-                    "max_batch_size": 4,
-                    "max_num_tokens": 2048
-                },
-            })
-        assert config.encoder_cuda_graph["vision"].max_batch_size == 8
+        config = MultimodalConfig(encoder_cuda_graph={
+            "vision": {},
+            "audio": {
+                "max_batch_size": 4,
+                "max_num_tokens": 2048
+            },
+        })
+        assert config.encoder_cuda_graph[
+            "vision"] == MultimodalEncoderCudaGraphConfig()
         assert config.encoder_cuda_graph["audio"].max_num_tokens == 2048
 
     def test_minimal_required_fields(self):
@@ -3027,13 +3021,9 @@ class TestMultimodalEncoderCudaGraphConfig:
             buckets=[[2069, 2], [1035, 1]])
         assert config.buckets == [(1035, 1), (2069, 2)]
 
-    @pytest.mark.parametrize("kwargs", [{
-        "buckets": []
-    }, {}],
-                             ids=["empty", "missing"])
-    def test_rejects_absent_buckets(self, kwargs):
+    def test_rejects_empty_buckets(self):
         with pytest.raises(ValidationError):
-            MultimodalEncoderCudaGraphConfig(**kwargs)
+            MultimodalEncoderCudaGraphConfig(buckets=[])
 
     @pytest.mark.parametrize("buckets", [[(0, 1)], [(1, -2)], [(3, 0)]])
     def test_rejects_non_positive_buckets(self, buckets):

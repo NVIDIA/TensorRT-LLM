@@ -26,7 +26,7 @@ version is documented in the deployment guide.
 
 import copy
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,7 +35,6 @@ from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
-from tensorrt_llm._utils import prefer_pinned
 
 from ...inputs import (
     ContentFormat,
@@ -64,7 +63,6 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoad
 from ..modules.rms_norm import RMSNorm
 from ..modules.swiglu import swiglu
 from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
-from ..utils import torch_compiling
 
 if IS_FLASHINFER_AVAILABLE:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
@@ -72,7 +70,7 @@ else:  # pragma: no cover - CPU / no-flashinfer environments
     flashinfer_apply_rope_with_cos_sin_cache_inplace = None
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_glm5_next import Glm5NextForCausalLM, glm5_next_attention_mapping
-from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalModelMixin,
@@ -86,15 +84,8 @@ from .modeling_utils import (
     register_auto_model,
     register_vision_encoder,
 )
-from .multimodal_encoder_graph import (
-    EncoderGraphKey,
-    EncoderGraphTensorSpec,
-    EncoderMetadataProvider,
-    MultimodalEncoderGraphRunner,
-)
 
 if TYPE_CHECKING:
-    from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
     from ..recurrent_state_spec import RecurrentStateSpec
 
 _VISION_WEIGHT_PREFIX = "model.visual"
@@ -435,70 +426,23 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         # `enable_blocks_cuda_graph`); opted in through
         # `multimodal_config.encoder_cuda_graph["image"]`.
         self.configure_encoder_cuda_graph(model_config.multimodal_config)
-        self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    # -- block-stack CUDA graphs ---------------------------------------------
-    def _build_blocks_graph_runner(
-        self, config: "MultimodalEncoderCudaGraphConfig"
-    ) -> MultimodalEncoderGraphRunner:
-        dtype = self.patch_embed.proj.weight.dtype
-        return MultimodalEncoderGraphRunner(
-            encoder_fn=self._encoder_graph_fn,
-            metadata_provider=_Glm5NextVisionGraphMetadataProvider(self),
-            input_specs={
-                "x": EncoderGraphTensorSpec(shape=(self.config.hidden_size,), dtype=dtype),
-                "cos": EncoderGraphTensorSpec(shape=(self.head_dim,), dtype=torch.float32),
-                "sin": EncoderGraphTensorSpec(shape=(self.head_dim,), dtype=torch.float32),
-            },
-            output_specs={"x": 0},
-            config=config,
-        )
-
     def _encoder_graph_fn(
         self, inputs: Mapping[str, torch.Tensor], attn_metadata: AttentionMetadata
     ) -> Dict[str, torch.Tensor]:
+        hidden_states = inputs["x"]
         position_embeddings = (inputs["cos"], inputs["sin"])
-        return {"x": self._run_blocks_eager(inputs["x"], position_embeddings, attn_metadata)}
-
-    def _run_blocks_eager(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
                 attn_metadata=attn_metadata,
                 position_embeddings=position_embeddings,
             )
-        return hidden_states
-
-    def _run_blocks(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        seq_lens: List[int],
-    ) -> torch.Tensor:
-        # The tower runs outside the compiled LM region with explicit
-        # metadata; keep both graph replay and eager off the custom-op path.
-        with torch_compiling(False):
-            if self._blocks_graph_runner is not None:
-                cos, sin = position_embeddings
-                out = self._blocks_graph_runner.maybe_run(
-                    seq_lengths=seq_lens,
-                    inputs={"x": hidden_states, "cos": cos, "sin": sin},
-                )
-                if out is not None:
-                    return out["x"]
-            self.attn_metadata = prepare_encoder_attn_metadata(
-                seq_lens, self.attn_metadata, max_seq_len=self._fixed_max_seq_len
-            )
-            return self._run_blocks_eager(hidden_states, position_embeddings, self.attn_metadata)
+        return {"x": hidden_states}
 
     # -- engine setup contract (MultimodalEncoderMixin) --------------------
     def setup_attn_metadata(
@@ -577,9 +521,14 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         for t, h, w in grid_rows:
             seq_lens.extend([h * w] * t)
 
-        position_embeddings = self.rot_pos_emb(grid_rows)
+        cos, sin = self.rot_pos_emb(grid_rows)
         hidden_states = self.patch_embed(pixel_values.to(device=self.device))
-        hidden_states = self._run_blocks(hidden_states, position_embeddings, seq_lens)
+        hidden_states = self._run_blocks(
+            {"x": hidden_states, "cos": cos, "sin": sin},
+            self.attn_metadata,
+            seq_lengths=seq_lens,
+            max_seq_len=self._fixed_max_seq_len,
+        )["x"]
         return self.project_merged(hidden_states)
 
     def project_merged(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -596,47 +545,6 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
                 self._downsample_gemm_weight = cached
         hidden_states = nn.functional.linear(rows, cached, self.downsample.bias)
         return self.merger(hidden_states)
-
-
-class _Glm5NextVisionGraphMetadataProvider(EncoderMetadataProvider[AttentionMetadata]):
-    """Graph-owned TRTLLM metadata for the block-stack runner.
-
-    Per bucket one metadata instance with ``is_cuda_graph=True`` so the
-    ``seq_lens`` setter copies into the captured ``_seq_lens_cuda`` buffer
-    instead of reallocating; the packed cumulative lengths the FMHA reads
-    live in a fixed ``cu_q_seqlens`` buffer refreshed in place. Host lengths
-    and runtime views are bound once per bucket and updated before replay.
-    """
-
-    graph_critical_attrs: Sequence[str] = ("_seq_lens_cuda", "cu_q_seqlens")
-
-    def __init__(self, vit: "Glm5NextVisionModel") -> None:
-        self._vit = vit
-
-    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
-        vit = self._vit
-        metadata = vit.metadata_cls(
-            max_num_requests=key.num_contexts,
-            max_num_tokens=key.total_tokens,
-            kv_cache_manager=None,
-        )
-        metadata.is_cuda_graph = True
-        metadata.cu_q_seqlens = torch.zeros(
-            key.num_contexts + 1, dtype=torch.int32, device=vit.device
-        )
-        metadata.cu_kv_seqlens = metadata.cu_q_seqlens
-        metadata.seq_lens = torch.zeros(
-            key.num_contexts, dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        metadata.bind_encoder_cuda_graph_seq_lens(metadata.seq_lens, key.num_contexts)
-        return metadata
-
-    def refresh_in_place(
-        self, metadata: AttentionMetadata, padded_seq_lengths: Sequence[int]
-    ) -> None:
-        prepare_encoder_attn_metadata(
-            list(padded_seq_lengths), metadata, max_seq_len=self._vit._fixed_max_seq_len
-        )
 
 
 class Glm5NextVisionModelBase(nn.Module):
@@ -701,9 +609,14 @@ class Glm5NextVisionModelBase(nn.Module):
             allow_partial_loading=allow_partial_loading,
         )
 
-    def enable_blocks_cuda_graph(self, *, device: Optional[torch.device] = None) -> None:
-        """Capture the configured encoder CUDA graphs (no-op when not configured)."""
-        self.visual.enable_blocks_cuda_graph(device=device)
+    def enable_blocks_cuda_graph(
+        self,
+        *,
+        dummy_encode: Callable[[], object] | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        """Capture the configured encoder graphs during a standalone tower's dummy encode."""
+        self.visual.enable_blocks_cuda_graph(dummy_encode=dummy_encode, device=device)
 
     @torch.inference_mode()
     def encode_batched(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:

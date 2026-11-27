@@ -336,11 +336,11 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
             item_count = mm_counts["image"]
             return {"image": {"item_count": item_count}}
 
-    class _Model(MultimodalModelMixin):
+    class _Model(MultimodalModelMixin, torch.nn.Module):
         dtype = torch.float16
-        mm_encoder = object()
 
         def __init__(self):
+            super().__init__()
             self.forwarded_item_counts = []
             self.last_output = None
 
@@ -375,6 +375,12 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert input_processor.calls == []
     assert all(getattr(request, "py_multimodal_data", None) is None for request in requests)
 
+    with monkeypatch.context() as epd:
+        epd.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+        assert creator._create_dummy_encoder_inputs() == []
+        assert input_processor.calls == []
+
+    creator._model_engine.model = torch.compile(model, backend="eager")
     creator._dummy_encoder_inputs = creator._create_dummy_encoder_inputs()
     encoder_inputs = creator._dummy_encoder_inputs
     assert input_processor.calls == [(8192, {"image": 2}, torch.float16)]

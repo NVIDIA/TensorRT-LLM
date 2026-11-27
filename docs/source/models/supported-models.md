@@ -196,49 +196,40 @@ The following optimizations are available to models that implement
 
 ### Encoder CUDA graphs
 
-For encoders with CUDA graph support, set a maximum batch size in the model's
-modality configuration. For example, pass this YAML through `trtllm-serve --config`:
+Enable a supported tower by adding its modality to `multimodal_config.encoder_cuda_graph`.
+For example, this `trtllm-serve --config` YAML enables both local towers of Nemotron Nano Omni.
+Its standalone encoder worker handles images and video and accepts only the `vision` entry.
 
 ```yaml
 multimodal_config:
   encoder_cuda_graph:
-    vision:
-      max_batch_size: 8
+    vision: {}
+    audio: {}
 ```
 
-The encoder adapter automatically generates capture shapes for batch sizes 1 through 8,
-within `encoder_max_num_tokens` (or `max_num_tokens` when unset). Use the optional
-per-modality `max_num_tokens` to limit capture memory and startup work. Batch size counts
-independent encoder contexts: images, video frame groups, or audio chunks as defined by
-the encoder. It does not count concurrent API requests or the scheduler's atomic items.
-Larger or unsupported shapes fall back to eager execution. Graphs remain disabled by default.
+Qwen3-VL and related Qwen vision encoders and RADIO use `vision`. GLM5-Next uses `image`.
+Parakeet uses `audio`. Each configured tower captures its block stack at startup, before KV
+cache sizing. An omitted tower runs eagerly.
 
-Each supported tower reads its own modality entry. An audio adapter uses the same settings,
-with its own shape, mask, and output rules:
+The token budget defaults to `encoder_max_num_tokens`, falling back to `max_num_tokens`.
+Use a per-modality `max_num_tokens` to limit capture memory and startup work.
+`max_batch_size` counts independent encoder contexts, such as vision segments or audio
+clips. Its default is the resolved token budget divided by 256, rounded down and clamped
+to the range 1–32.
 
-```yaml
-multimodal_config:
-  encoder_cuda_graph:
-    vision:
-      max_batch_size: 8
-    audio:
-      max_batch_size: 4
-      max_num_tokens: 2048
-```
+With padding enabled, packed encoders share each token budget across context counts.
+The budgets start at 256 (or the cap if smaller), grow through 320, 384, 448, 512, 640,
+and continue with the same three significant binary digits up to the cap. Each automatic
+budget `T` fits up to `min(max_batch_size, max(1, T // 128))` contexts. A video with
+many short frames may need a larger budget to fit its frame count. Use an explicit
+bucket to capture that frame count at a smaller token budget. Parakeet pads the item
+and time axes separately so convolutions stay within a clip.
 
-The second example requires a model with graph-enabled vision and audio towers. The current
-production integrations are Qwen3-VL and related Qwen vision encoders, RADIO (`vision`), and
-GLM5-Next (`image` instead of `vision`). The shared audio adapter interface is available,
-but production audio towers still need an implementation and model validation. Requesting an
-unsupported modality fails before any graphs are captured.
-
-Advanced users can supply `buckets: [[256, 1], [512, 2]]` instead of `max_batch_size`
-and `max_num_tokens`. Each pair specifies total real encoder tokens and an exact context count.
-Automatic shapes use per-context capacities starting at 256 tokens (or the available budget
-when smaller), doubling up to each batch size's token budget. Adapters can override these
-shapes for additional alignment constraints. Padded replay is enabled by default; disabling it
-requires an exact token-count match. Encoder graphs and encoder side-stream prefetch are
-mutually exclusive.
+To choose capacities explicitly, set `buckets` to pairs of real token and context
+capacities, for example `[[256, 1], [512, 2]]`. Explicit buckets replace the automatic
+budgets. Disabling padding requires an exact token and context count. Workloads that
+exceed the captured shapes run eagerly. Encoder graphs and encoder side-stream prefetch
+are mutually exclusive.
 
 ### Side streams and embeddings cache
 

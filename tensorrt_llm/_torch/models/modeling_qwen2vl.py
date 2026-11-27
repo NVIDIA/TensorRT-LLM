@@ -954,6 +954,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Build processed Qwen tensors for the profiler-selected items."""
+        vision_dummy = mm_counts.keys() == {"vision"}
         if max_num_encoder_tokens <= 0:
             raise ValueError("max_num_encoder_tokens must be positive")
 
@@ -962,6 +963,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         item_refs: list[tuple[str, int]] = []
         encoder_token_lengths: list[int] = []
         for modality, num_items in mm_counts.items():
+            if vision_dummy:
+                modality = "image"
             if modality not in ("image", "video"):
                 raise ValueError(f"Unsupported vision modality: {modality}")
             if num_items < 0:
@@ -973,6 +976,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
             grid = self._get_dummy_grid_for_modality(modality,
                                                      max_num_encoder_tokens)
+            if grid is None and vision_dummy:
+                modality = "video"
+                grid = self._get_dummy_grid_for_modality(
+                    modality, max_num_encoder_tokens)
             if grid is None:
                 raise ValueError(
                     f"Qwen {modality} dummy does not fit within "
