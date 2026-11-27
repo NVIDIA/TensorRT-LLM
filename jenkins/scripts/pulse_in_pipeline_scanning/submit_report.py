@@ -7,7 +7,7 @@ from typing import NotRequired, TypedDict
 
 sys.path.append(os.path.abspath(".."))
 from utils.common import is_permissive, load_json
-from utils.es import es_post, get_triaged_deps, save_triage_records
+from utils.es import es_post, get_reported, get_triaged_deps, save_reported, save_triage_records
 from utils.report import diff_licenses, get_preapproved_deps_map, get_vulns, is_preapproved
 from utils.triage import call_triage_agent, extract_ticket_refs, format_risks_for_agent
 
@@ -40,6 +40,20 @@ def _triage_branch(build_metadata: BuildMetadata) -> str:
     if build_metadata.get("scan_mode") == "pre_merge":
         return "main"
     return build_metadata["ref"]
+
+
+def _reported(scan_type: str, build_metadata: BuildMetadata) -> set:
+    """Return {(name, version)} already reported; empty in release mode, which reports all."""
+    if build_metadata.get("scan_mode") == "release":
+        return set()
+    return get_reported(scan_type, _triage_branch(build_metadata))
+
+
+def mark_reported(scan_type: str, build_metadata: BuildMetadata, ts: int, docs: list):
+    """Record risks as reported so later runs skip them (monitor mode only)."""
+    if build_metadata.get("scan_mode") != "monitor":
+        return
+    save_reported(ES_POST_URL, scan_type, build_metadata["ref"], ts, docs)
 
 
 def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -> tuple[dict, dict]:
@@ -107,6 +121,7 @@ def submit_source_code_vulns(
     """Triage untriaged source-code vulnerabilities, save all docs to ES, return untriaged risks."""
     SCAN_TYPE = "source_code_vulnerability"
     triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
+    reported = _reported(SCAN_TYPE, build_metadata)
     ts = int(start_datetime.timestamp() * 1000)
 
     bulk_documents = []
@@ -144,7 +159,7 @@ def submit_source_code_vulns(
                 "s_license_ids": "N/A",
                 "s_ticket_url": triaged_deps.get(package_name, ""),
             }
-            if package_name not in triaged_deps:
+            if (package_name, package_version) not in reported:
                 risks_to_report.append(doc)
             bulk_documents.append(doc)
         # if risks_to_report:
@@ -182,6 +197,7 @@ def submit_source_code_licenses(
     """
     SCAN_TYPE = "source_code_license"
     triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
+    reported = _reported(SCAN_TYPE, build_metadata)
     ts = int(start_datetime.timestamp() * 1000)
 
     map_preapproved = get_preapproved_deps_map(SCAN_TYPE)
@@ -243,7 +259,9 @@ def submit_source_code_licenses(
                 "s_package_type": component.get("type"),
                 "s_ticket_url": triaged_deps.get(package_name, ""),
             }
-            if not is_preapproved(map_preapproved, package_name, component.get("type")):
+            if (package_name, package_version) not in reported and not is_preapproved(
+                map_preapproved, package_name, component.get("type")
+            ):
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
 
@@ -285,6 +303,7 @@ def submit_container_vulns(
     """Triage untriaged container vulnerabilities, save all docs to ES, return untriaged risks."""
     SCAN_TYPE = "container_vulnerability"
     triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
+    reported = _reported(SCAN_TYPE, build_metadata)
     ts = int(start_datetime.timestamp() * 1000)
 
     release_data = load_json(input_file)
@@ -319,7 +338,7 @@ def submit_container_vulns(
             "s_package_paths": ",".join(v.get("package_paths", [])),
             "s_ticket_url": triaged_deps.get(package_name, ""),
         }
-        if package_name not in triaged_deps:
+        if (package_name, package_version) not in reported:
             risks_to_report.append(doc)
         docs.append(doc)
     # if risks_to_report:
@@ -361,6 +380,7 @@ def submit_container_licenses(
     triaged_deps = get_triaged_deps(
         SCAN_TYPE, _triage_branch(build_metadata), container=release_image
     )
+    reported = _reported(SCAN_TYPE, build_metadata)
     ts = int(start_datetime.timestamp() * 1000)
 
     trtllm_deps = diff_licenses(SCAN_TYPE, input_file, base_input_file)
@@ -409,7 +429,9 @@ def submit_container_licenses(
             "s_license_ids": ",".join(license_ids),
             "s_ticket_url": triaged_deps.get(package_name, ""),
         }
-        if not is_preapproved(map_preapproved, package_name, (v.get("type") or "unknown").lower()):
+        if (package_name, package_version) not in reported and not is_preapproved(
+            map_preapproved, package_name, (v.get("type") or "unknown").lower()
+        ):
             risks_to_report.append(doc)
         docs.append(doc)
 
