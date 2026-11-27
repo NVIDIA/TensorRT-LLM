@@ -3,10 +3,9 @@
 
 import asyncio
 import base64
-import functools
 import threading
 import weakref
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from functools import partial
 from io import BytesIO
 from pathlib import Path
@@ -812,6 +811,16 @@ def _resolve_content_format(model_type: str,
     return ContentFormat.STRING
 
 
+def _infer_mm_modality(placeholder: str) -> str:
+    """Infer OpenAI content modality from a multimodal placeholder string."""
+    lower = placeholder.lower()
+    if "video" in lower:
+        return "video"
+    if "audio" in lower or "so_embedding" in lower:
+        return "audio"
+    return "image"
+
+
 def _build_openai_content(
         conv: ConversationMessage,
         mm_placeholder_count: dict[str, int]) -> list[dict[str, Any]]:
@@ -836,13 +845,7 @@ def _build_openai_content(
         if text:
             content_list.append({"type": "text", "text": text})
         for placeholder, count in mm_placeholder_count.items():
-            # Infer modality from placeholder (e.g. "<image>" -> "image")
-            modality = "image"
-            if "video" in placeholder.lower():
-                modality = "video"
-            elif "audio" in placeholder.lower(
-            ) or "so_embedding" in placeholder.lower():
-                modality = "audio"
+            modality = _infer_mm_modality(placeholder)
             for _ in range(count):
                 content_list.append({"type": modality})
 
@@ -882,12 +885,170 @@ class _DeveloperRolePolicy(NamedTuple):
     drops_late_developer: bool = False
 
 
+_CACHE_MISS = object()
+_UNHASHABLE = object()
+_JINJA_CACHE_MAXSIZE = 256
+_NATIVE_PER_TOKENIZER_CACHE_MAXSIZE = 128
+
+_JINJA_ROLE_BLOCKS_CACHE: "OrderedDict[tuple[Any, ...], bool]" = OrderedDict()
+_JINJA_DEVELOPER_POLICY_CACHE: "OrderedDict[tuple[Any, ...], _DeveloperRolePolicy]" = (
+    OrderedDict())
+_JINJA_LATE_SYSTEM_CACHE: "OrderedDict[tuple[Any, ...], bool]" = OrderedDict()
+_JINJA_CACHE_LOCK = threading.Lock()
+
 # Per tokenizer that renders in Python: developer-role and late-system policy.
-_NATIVE_DEVELOPER_POLICY: "weakref.WeakKeyDictionary[Any, dict[tuple[str, bool], _DeveloperRolePolicy]]" = (
+_NATIVE_DEVELOPER_POLICY: "weakref.WeakKeyDictionary[Any, OrderedDict[tuple[Any, ...], _DeveloperRolePolicy]]" = (
     weakref.WeakKeyDictionary())
-_NATIVE_ACCEPTS_LATE_SYSTEM: "weakref.WeakKeyDictionary[Any, dict[tuple[bool, str, bool], bool]]" = (
+_NATIVE_ACCEPTS_LATE_SYSTEM: "weakref.WeakKeyDictionary[Any, OrderedDict[tuple[Any, ...], bool]]" = (
     weakref.WeakKeyDictionary())
 _NATIVE_RENDERER_DROPS_DEVELOPER_LOCK = threading.Lock()
+
+
+def _freeze_probe_option(value: Any) -> Any:
+    """Convert nested JSON/Python rendering options into a hashable cache key."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return (type(value), value)
+    if isinstance(value, dict):
+        items = []
+        for k, v in value.items():
+            fk = _freeze_probe_option(k)
+            fv = _freeze_probe_option(v)
+            if fk is _UNHASHABLE or fv is _UNHASHABLE:
+                return _UNHASHABLE
+            items.append((fk, fv))
+        return ("dict", tuple(items))
+    if isinstance(value, (list, tuple)):
+        frozen = []
+        for v in value:
+            fv = _freeze_probe_option(v)
+            if fv is _UNHASHABLE:
+                return _UNHASHABLE
+            frozen.append(fv)
+        return (type(value).__name__, tuple(frozen))
+    if isinstance(value, (set, frozenset)):
+        frozen = []
+        for v in value:
+            fv = _freeze_probe_option(v)
+            if fv is _UNHASHABLE:
+                return _UNHASHABLE
+            frozen.append(fv)
+        return (type(value).__name__, frozenset(frozen))
+    return _UNHASHABLE
+
+
+def _contains_substring(value: Any, needle: str) -> bool:
+    if isinstance(value, str):
+        return needle in value
+    if isinstance(value, dict):
+        return any(
+            _contains_substring(k, needle) or _contains_substring(v, needle)
+            for k, v in value.items())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_substring(item, needle) for item in value)
+    return False
+
+
+_PROBE_BASE = "trtllm-chat-template-"
+
+
+def _pick_probe_prefix(*option_values: Any) -> str:
+    """Return a probe prefix that cannot collide with real render options."""
+    if not any(_contains_substring(v, _PROBE_BASE) for v in option_values):
+        return _ROLE_PROBE
+    counter = 1
+    while True:
+        candidate = f"{_PROBE_BASE}c{counter}-"
+        if not any(_contains_substring(v, candidate) for v in option_values):
+            return candidate
+        counter += 1
+
+
+def _probe_marker(prefix: str, index: int) -> str:
+    """Return a prefix-free, collision-free probe marker for ``index``."""
+    if prefix == _ROLE_PROBE:
+        if index == 0:
+            return _ROLE_PROBE
+        if index == 1:
+            return _SECOND_ROLE_PROBE
+        return f"{_PROBE_BASE}role-m{index + 1}-probe"
+    return f"{prefix}m{index + 1}-probe"
+
+
+def _probe_options_cache_key(
+    tools: Optional[list[dict[str, Any]]],
+    documents: Optional[list[dict[str, str]]],
+    add_generation_prompt: bool,
+    chat_template_kwargs: Optional[dict[str, Any]],
+) -> Any:
+    frozen = _freeze_probe_option(
+        (tools, documents, add_generation_prompt, chat_template_kwargs or None))
+    return None if frozen is _UNHASHABLE else frozen
+
+
+def _lru_get(cache: "OrderedDict[Any, Any]", key: Any) -> Any:
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    return _CACHE_MISS
+
+
+def _lru_put(cache: "OrderedDict[Any, Any]", key: Any, value: Any,
+             maxsize: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > maxsize:
+        cache.popitem(last=False)
+
+
+def _jinja_cached_probe(
+    cache: "OrderedDict[Any, Any]",
+    key: Any,
+    compute: Callable[[], Any],
+) -> Any:
+    if key is None:
+        return compute()
+    with _JINJA_CACHE_LOCK:
+        cached = _lru_get(cache, key)
+        if cached is not _CACHE_MISS:
+            return cached
+    value = compute()
+    with _JINJA_CACHE_LOCK:
+        _lru_put(cache, key, value, _JINJA_CACHE_MAXSIZE)
+    return value
+
+
+def _native_cached_probe(
+    store: "weakref.WeakKeyDictionary[Any, OrderedDict[Any, Any]]",
+    tokenizer: Any,
+    key: Any,
+    compute: Callable[[], Any],
+) -> Any:
+    if key is None:
+        return compute()
+    with _NATIVE_RENDERER_DROPS_DEVELOPER_LOCK:
+        try:
+            cache = store.get(tokenizer)
+        except TypeError:
+            cacheable = False
+        else:
+            cacheable = True
+            if cache is not None:
+                cached = _lru_get(cache, key)
+                if cached is not _CACHE_MISS:
+                    return cached
+    value = compute()
+    if not cacheable:
+        return value
+    with _NATIVE_RENDERER_DROPS_DEVELOPER_LOCK:
+        try:
+            cache = store.get(tokenizer)
+            if cache is None:
+                cache = OrderedDict()
+                store[tokenizer] = cache
+            _lru_put(cache, key, value, _NATIVE_PER_TOKENIZER_CACHE_MAXSIZE)
+        except TypeError:
+            pass
+    return value
 
 
 def _probe_msg(role: str,
@@ -916,6 +1077,7 @@ def _renders_role(
     role: str,
     *,
     role_as_blocks: Optional[Callable[[str], bool]] = None,
+    probe_prefix: str = _ROLE_PROBE,
 ) -> bool:
     """Whether ``render`` shows the content of a ``role`` message.
 
@@ -924,13 +1086,14 @@ def _renders_role(
     role only to reject it. A renderer that raises shows nothing.
     """
     is_blocks = role_as_blocks or (lambda _role: False)
+    marker = _probe_marker(probe_prefix, 0)
     return _renders_conversation(
         render,
         [
-            _probe_msg(role, _ROLE_PROBE, as_blocks=is_blocks(role)),
+            _probe_msg(role, marker, as_blocks=is_blocks(role)),
             _probe_msg("user", "hi", as_blocks=is_blocks("user")),
         ],
-        (_ROLE_PROBE, ),
+        (marker, ),
         f"a {role} message",
     )
 
@@ -940,6 +1103,7 @@ def _probe_developer_policy(
     renderer: str,
     *,
     role_as_blocks: Optional[Callable[[str], bool]] = None,
+    probe_prefix: str = _ROLE_PROBE,
 ) -> _DeveloperRolePolicy:
     """Probe whether ``render`` drops developer messages and accepts >1 system message.
 
@@ -951,18 +1115,20 @@ def _probe_developer_policy(
     message instead of triggering template errors.
     """
     is_blocks = role_as_blocks or (lambda _role: False)
-    if _renders_role(render, "developer", role_as_blocks=is_blocks):
+    m0 = _probe_marker(probe_prefix, 0)
+    m1 = _probe_marker(probe_prefix, 1)
+    if _renders_role(render,
+                     "developer",
+                     role_as_blocks=is_blocks,
+                     probe_prefix=probe_prefix):
         nonleading_ok = _renders_conversation(
             render,
             [
-                _probe_msg("system", _ROLE_PROBE,
-                           as_blocks=is_blocks("system")),
-                _probe_msg("developer",
-                           _SECOND_ROLE_PROBE,
-                           as_blocks=is_blocks("developer")),
+                _probe_msg("system", m0, as_blocks=is_blocks("system")),
+                _probe_msg("developer", m1, as_blocks=is_blocks("developer")),
                 _probe_msg("user", "hi", as_blocks=is_blocks("user")),
             ],
-            (_ROLE_PROBE, _SECOND_ROLE_PROBE),
+            (m0, m1),
             "a non-leading developer message",
         )
         late_ok = nonleading_ok and _renders_conversation(
@@ -970,11 +1136,10 @@ def _probe_developer_policy(
             [
                 _probe_msg("user", "hi", as_blocks=is_blocks("user")),
                 _probe_msg("assistant", "ok", as_blocks=is_blocks("assistant")),
-                _probe_msg(
-                    "developer", _ROLE_PROBE, as_blocks=is_blocks("developer")),
+                _probe_msg("developer", m0, as_blocks=is_blocks("developer")),
                 _probe_msg("user", "next", as_blocks=is_blocks("user")),
             ],
-            (_ROLE_PROBE, ),
+            (m0, ),
             "a late developer message",
         )
         if nonleading_ok and late_ok:
@@ -985,18 +1150,18 @@ def _probe_developer_policy(
         accepts_multi_sys = _renders_conversation(
             render,
             [
-                _probe_msg("system", _ROLE_PROBE,
-                           as_blocks=is_blocks("system")),
-                _probe_msg("system",
-                           _SECOND_ROLE_PROBE,
-                           as_blocks=is_blocks("system")),
+                _probe_msg("system", m0, as_blocks=is_blocks("system")),
+                _probe_msg("system", m1, as_blocks=is_blocks("system")),
                 _probe_msg("user", "hi", as_blocks=is_blocks("user")),
             ],
-            (_ROLE_PROBE, _SECOND_ROLE_PROBE),
+            (m0, m1),
             "multiple system messages",
         )
         can_use_sys = accepts_multi_sys or _renders_role(
-            render, "system", role_as_blocks=is_blocks)
+            render,
+            "system",
+            role_as_blocks=is_blocks,
+            probe_prefix=probe_prefix)
         return _DeveloperRolePolicy(
             drops_developer=False,
             accepts_multiple_system=accepts_multi_sys,
@@ -1006,17 +1171,19 @@ def _probe_developer_policy(
     if _renders_conversation(
             render,
         [
-            _probe_msg("system", _ROLE_PROBE, as_blocks=is_blocks("system")),
-            _probe_msg(
-                "system", _SECOND_ROLE_PROBE, as_blocks=is_blocks("system")),
+            _probe_msg("system", m0, as_blocks=is_blocks("system")),
+            _probe_msg("system", m1, as_blocks=is_blocks("system")),
             _probe_msg("user", "hi", as_blocks=is_blocks("user")),
         ],
-        (_ROLE_PROBE, _SECOND_ROLE_PROBE),
+        (m0, m1),
             "multiple system messages",
     ):
         return _DeveloperRolePolicy(drops_developer=True,
                                     accepts_multiple_system=True)
-    if _renders_role(render, "system", role_as_blocks=is_blocks):
+    if _renders_role(render,
+                     "system",
+                     role_as_blocks=is_blocks,
+                     probe_prefix=probe_prefix):
         return _DeveloperRolePolicy(drops_developer=True,
                                     accepts_multiple_system=False)
     logger.warning(
@@ -1027,213 +1194,378 @@ def _probe_developer_policy(
                                 accepts_multiple_system=True)
 
 
-def _probe_accepts_late_system(
+_SystemLayoutEntry = tuple[str, tuple[str, ...], Optional[int]]
+
+
+def _system_role_layout(
+    conversation: list[ConversationMessage],
+) -> tuple[_SystemLayoutEntry, ...]:
+    """Extract role sequence, per-call tool argument shapes, and tool-call link indices."""
+    call_id_to_index: dict[str, int] = {}
+    next_call_index = 0
+    next_unmatched_tool = 0
+    layout: list[_SystemLayoutEntry] = []
+    for message in conversation:
+        role = str(message.get("role") or "user")
+        if role == "assistant":
+            tool_calls = message.get("tool_calls")
+            styles: list[str] = []
+            if isinstance(tool_calls, (list, tuple)) and tool_calls:
+                for tool_call in tool_calls:
+                    style = "dict"
+                    tc_id: Optional[str] = None
+                    if isinstance(tool_call, dict):
+                        raw_id = tool_call.get("id")
+                        if isinstance(raw_id, str) and raw_id:
+                            tc_id = raw_id
+                        fn = tool_call.get("function")
+                        if isinstance(fn, dict) and "arguments" in fn:
+                            style = ("dict" if isinstance(
+                                fn["arguments"], dict) else "str")
+                    if tc_id is not None:
+                        call_id_to_index[tc_id] = next_call_index
+                    next_call_index += 1
+                    styles.append(style)
+            layout.append((role, tuple(styles), None))
+        elif role == "tool":
+            raw_tc_id = message.get("tool_call_id")
+            if isinstance(raw_tc_id, str) and raw_tc_id in call_id_to_index:
+                matched_idx = call_id_to_index[raw_tc_id]
+            else:
+                matched_idx = (next_unmatched_tool
+                               if next_unmatched_tool < next_call_index else 0)
+            next_unmatched_tool += 1
+            layout.append((role, (), matched_idx))
+        else:
+            layout.append((role, (), None))
+    return tuple(layout)
+
+
+def _probe_accepts_system_layout(
     render: Callable[[list[dict[str, Any]]], Any],
+    role_layout: tuple[_SystemLayoutEntry, ...],
     *,
-    with_leading_system: bool = True,
     role_as_blocks: Optional[Callable[[str], bool]] = None,
+    probe_prefix: str = _ROLE_PROBE,
 ) -> bool:
-    """Whether ``render`` renders a system message placed after a user/assistant turn."""
+    """Whether ``render`` accepts and emits every system/developer message in ``role_layout``."""
     is_blocks = role_as_blocks or (lambda _role: False)
-    if with_leading_system:
-        conversation = [
-            _probe_msg("system", _ROLE_PROBE, as_blocks=is_blocks("system")),
-            _probe_msg("user", "hi", as_blocks=is_blocks("user")),
-            _probe_msg("assistant", "ok", as_blocks=is_blocks("assistant")),
-            _probe_msg("system",
-                       _SECOND_ROLE_PROBE,
-                       as_blocks=is_blocks("system")),
-            _probe_msg("user", "next", as_blocks=is_blocks("user")),
-        ]
-        expected: tuple[str, ...] = (_ROLE_PROBE, _SECOND_ROLE_PROBE)
-    else:
-        conversation = [
-            _probe_msg("user", "hi", as_blocks=is_blocks("user")),
-            _probe_msg("assistant", "ok", as_blocks=is_blocks("assistant")),
-            _probe_msg("system", _ROLE_PROBE, as_blocks=is_blocks("system")),
-            _probe_msg("user", "next", as_blocks=is_blocks("user")),
-        ]
-        expected = (_ROLE_PROBE, )
-    return _renders_conversation(render, conversation, expected,
-                                 "a late system message")
+    conversation: list[dict[str, Any]] = []
+    expected: list[str] = []
+    marker_idx = 0
+    call_idx = 0
+    for role, tool_arg_styles, tool_ref_idx in role_layout:
+        if role in ("system", "developer"):
+            marker = _probe_marker(probe_prefix, marker_idx)
+            marker_idx += 1
+            expected.append(marker)
+            conversation.append(
+                _probe_msg(role, marker, as_blocks=is_blocks(role)))
+        elif role == "assistant":
+            msg = _probe_msg(
+                "assistant",
+                "" if tool_arg_styles else "ok",
+                as_blocks=is_blocks("assistant"),
+            )
+            if tool_arg_styles:
+                probe_calls = []
+                for style in tool_arg_styles:
+                    probe_calls.append({
+                        "id": f"call_{call_idx}",
+                        "type": "function",
+                        "function": {
+                            "name": "probe",
+                            "arguments": {} if style == "dict" else "{}",
+                        },
+                    })
+                    call_idx += 1
+                msg["tool_calls"] = probe_calls
+            conversation.append(msg)
+        elif role == "tool":
+            msg = _probe_msg("tool", "ok", as_blocks=is_blocks("tool"))
+            msg["tool_call_id"] = f"call_{tool_ref_idx or 0}"
+            msg["name"] = "probe"
+            conversation.append(msg)
+        else:
+            conversation.append(
+                _probe_msg(role, "hi", as_blocks=is_blocks(role)))
+    return _renders_conversation(render, conversation, tuple(expected),
+                                 "system message layout")
 
 
-_PROBE_TOOLS: list[dict[str, Any]] = [{
-    "type": "function",
-    "function": {
-        "name": "probe",
-        "description": "",
-        "parameters": {
-            "type": "object",
-            "properties": {}
-        },
-    },
-}]
-
-
-def _tools_probe_mode(tools: Optional[list[dict[str, Any]]]) -> str:
-    if tools is None:
-        return "none"
-    return "nonempty" if tools else "empty"
-
-
-def _probe_tools_arg(tools_mode: str) -> Optional[list[dict[str, Any]]]:
-    if tools_mode == "none":
-        return None
-    if tools_mode == "empty":
-        return []
-    return _PROBE_TOOLS
-
-
-def _render_jinja_for_probe(template: str,
-                            conversation: list[dict[str, Any]],
-                            *,
-                            tools_mode: str = "none",
-                            add_generation_prompt: bool = True) -> str:
+def _render_jinja_for_probe(
+    template: str,
+    conversation: list[dict[str, Any]],
+    *,
+    tools: Optional[list[dict[str, Any]]] = None,
+    documents: Optional[list[dict[str, str]]] = None,
+    add_generation_prompt: bool = True,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+) -> str:
     rendered, _ = render_jinja_template(
         conversations=[conversation],
         chat_template=template,
         add_generation_prompt=add_generation_prompt,
-        tools=_probe_tools_arg(tools_mode),
+        tools=tools,
+        documents=documents,
+        **(chat_template_kwargs or {}),
     )
     return rendered[0]
 
 
-@functools.lru_cache(maxsize=256)
-def _template_role_needs_blocks(template: str,
-                                role: str,
-                                tools_mode: str = "none",
-                                add_generation_prompt: bool = True) -> bool:
+def _template_role_needs_blocks(
+    template: str,
+    role: str,
+    *,
+    tools: Optional[list[dict[str, Any]]] = None,
+    documents: Optional[list[dict[str, str]]] = None,
+    add_generation_prompt: bool = True,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+) -> bool:
     """Whether ``role`` in ``template`` renders block-list content but not plain strings."""
-    render = lambda conversation: _render_jinja_for_probe(  # noqa: E731
-        template,
-        conversation,
-        tools_mode=tools_mode,
-        add_generation_prompt=add_generation_prompt,
-    )
-    if role == "user":
-        make = lambda as_blocks: [  # noqa: E731
-            _probe_msg("user", _ROLE_PROBE, as_blocks=as_blocks)
-        ]
-    elif role == "assistant":
-        user_blocks = _template_role_needs_blocks(template, "user", tools_mode,
-                                                  add_generation_prompt)
-        make = lambda as_blocks: [  # noqa: E731
-            _probe_msg("user", "hi", as_blocks=user_blocks),
-            _probe_msg("assistant", _ROLE_PROBE, as_blocks=as_blocks),
-            _probe_msg("user", "next", as_blocks=user_blocks),
-        ]
-    else:
-        user_blocks = _template_role_needs_blocks(template, "user", tools_mode,
-                                                  add_generation_prompt)
-        make = lambda as_blocks: [  # noqa: E731
-            _probe_msg(role, _ROLE_PROBE, as_blocks=as_blocks),
-            _probe_msg("user", "hi", as_blocks=user_blocks),
-        ]
-    string_ok = _renders_conversation(render, make(False), (_ROLE_PROBE, ),
-                                      f"string {role}")
-    if string_ok:
-        return False
-    return _renders_conversation(render, make(True), (_ROLE_PROBE, ),
-                                 f"block {role}")
+    opt_key = _probe_options_cache_key(tools, documents, add_generation_prompt,
+                                       chat_template_kwargs)
+    cache_key = None if opt_key is None else (template, role, opt_key)
+
+    def _compute() -> bool:
+        probe_prefix = _pick_probe_prefix(tools, documents,
+                                          chat_template_kwargs)
+        marker = _probe_marker(probe_prefix, 0)
+        render = lambda conversation: _render_jinja_for_probe(  # noqa: E731
+            template,
+            conversation,
+            tools=tools,
+            documents=documents,
+            add_generation_prompt=add_generation_prompt,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        if role == "user":
+            make = lambda as_blocks: [  # noqa: E731
+                _probe_msg("user", marker, as_blocks=as_blocks)
+            ]
+        elif role == "assistant":
+            user_blocks = _template_role_needs_blocks(
+                template,
+                "user",
+                tools=tools,
+                documents=documents,
+                add_generation_prompt=add_generation_prompt,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+            make = lambda as_blocks: [  # noqa: E731
+                _probe_msg("user", "hi", as_blocks=user_blocks),
+                _probe_msg("assistant", marker, as_blocks=as_blocks),
+                _probe_msg("user", "next", as_blocks=user_blocks),
+            ]
+        else:
+            user_blocks = _template_role_needs_blocks(
+                template,
+                "user",
+                tools=tools,
+                documents=documents,
+                add_generation_prompt=add_generation_prompt,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+            make = lambda as_blocks: [  # noqa: E731
+                _probe_msg(role, marker, as_blocks=as_blocks),
+                _probe_msg("user", "hi", as_blocks=user_blocks),
+            ]
+        string_ok = _renders_conversation(render, make(False), (marker, ),
+                                          f"string {role}")
+        if string_ok:
+            return False
+        return _renders_conversation(render, make(True), (marker, ),
+                                     f"block {role}")
+
+    return _jinja_cached_probe(_JINJA_ROLE_BLOCKS_CACHE, cache_key, _compute)
 
 
-@functools.lru_cache(maxsize=128)
 def _template_developer_policy(
-        template: str,
-        per_role_blocks: bool = False,
-        tools_mode: str = "none",
-        add_generation_prompt: bool = True) -> _DeveloperRolePolicy:
-    """`_probe_developer_policy` for a Jinja chat template, once per template."""
-    role_blocks = ((lambda role: _template_role_needs_blocks(
-        template, role, tools_mode, add_generation_prompt))
-                   if per_role_blocks else None)
-    return _probe_developer_policy(
-        lambda conversation: _render_jinja_for_probe(
+    template: str,
+    per_role_blocks: bool = False,
+    *,
+    tools: Optional[list[dict[str, Any]]] = None,
+    documents: Optional[list[dict[str, str]]] = None,
+    add_generation_prompt: bool = True,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+) -> _DeveloperRolePolicy:
+    """`_probe_developer_policy` for a Jinja chat template, once per template context."""
+    opt_key = _probe_options_cache_key(tools, documents, add_generation_prompt,
+                                       chat_template_kwargs)
+    cache_key = None if opt_key is None else (template, per_role_blocks,
+                                              opt_key)
+
+    def _compute() -> _DeveloperRolePolicy:
+        probe_prefix = _pick_probe_prefix(tools, documents,
+                                          chat_template_kwargs)
+        role_blocks = ((lambda role: _template_role_needs_blocks(
             template,
-            conversation,
-            tools_mode=tools_mode,
+            role,
+            tools=tools,
+            documents=documents,
             add_generation_prompt=add_generation_prompt,
-        ),
-        "the chat template",
-        role_as_blocks=role_blocks,
-    )
+            chat_template_kwargs=chat_template_kwargs,
+        )) if per_role_blocks else None)
+        return _probe_developer_policy(
+            lambda conversation: _render_jinja_for_probe(
+                template,
+                conversation,
+                tools=tools,
+                documents=documents,
+                add_generation_prompt=add_generation_prompt,
+                chat_template_kwargs=chat_template_kwargs,
+            ),
+            "the chat template",
+            role_as_blocks=role_blocks,
+            probe_prefix=probe_prefix,
+        )
+
+    return _jinja_cached_probe(_JINJA_DEVELOPER_POLICY_CACHE, cache_key,
+                               _compute)
 
 
-@functools.lru_cache(maxsize=128)
-def _template_accepts_late_system(template: str,
-                                  with_leading_system: bool = True,
-                                  per_role_blocks: bool = False,
-                                  tools_mode: str = "none",
-                                  add_generation_prompt: bool = True) -> bool:
-    """`_probe_accepts_late_system` for a Jinja chat template, once per template."""
-    role_blocks = ((lambda role: _template_role_needs_blocks(
-        template, role, tools_mode, add_generation_prompt))
-                   if per_role_blocks else None)
-    return _probe_accepts_late_system(
-        lambda conversation: _render_jinja_for_probe(
+def _template_accepts_late_system(
+    template: str,
+    role_layout: tuple[_SystemLayoutEntry, ...],
+    per_role_blocks: bool = False,
+    *,
+    tools: Optional[list[dict[str, Any]]] = None,
+    documents: Optional[list[dict[str, str]]] = None,
+    add_generation_prompt: bool = True,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+) -> bool:
+    """`_probe_accepts_system_layout` for a Jinja chat template, once per template context."""
+    layout = tuple(role_layout)
+    opt_key = _probe_options_cache_key(tools, documents, add_generation_prompt,
+                                       chat_template_kwargs)
+    cache_key = None if opt_key is None else (template, layout, per_role_blocks,
+                                              opt_key)
+
+    def _compute() -> bool:
+        probe_prefix = _pick_probe_prefix(tools, documents,
+                                          chat_template_kwargs)
+        role_blocks = ((lambda role: _template_role_needs_blocks(
             template,
-            conversation,
-            tools_mode=tools_mode,
+            role,
+            tools=tools,
+            documents=documents,
             add_generation_prompt=add_generation_prompt,
-        ),
-        with_leading_system=with_leading_system,
-        role_as_blocks=role_blocks,
-    )
+            chat_template_kwargs=chat_template_kwargs,
+        )) if per_role_blocks else None)
+        return _probe_accepts_system_layout(
+            lambda conversation: _render_jinja_for_probe(
+                template,
+                conversation,
+                tools=tools,
+                documents=documents,
+                add_generation_prompt=add_generation_prompt,
+                chat_template_kwargs=chat_template_kwargs,
+            ),
+            layout,
+            role_as_blocks=role_blocks,
+            probe_prefix=probe_prefix,
+        )
+
+    return _jinja_cached_probe(_JINJA_LATE_SYSTEM_CACHE, cache_key, _compute)
 
 
 def _native_developer_policy(
-        tokenizer: Any,
-        tools_mode: str = "none",
-        add_generation_prompt: bool = True) -> _DeveloperRolePolicy:
-    """`_probe_developer_policy` for a tokenizer's own renderer, per tokenizer."""
-    probe_tools = _probe_tools_arg(tools_mode)
-    key = (tools_mode, add_generation_prompt)
-    with _NATIVE_RENDERER_DROPS_DEVELOPER_LOCK:
-        cache = _NATIVE_DEVELOPER_POLICY.get(tokenizer)
-        if cache is None:
-            cache = {}
-            _NATIVE_DEVELOPER_POLICY[tokenizer] = cache
-        policy = cache.get(key)
-        if policy is None:
-            policy = _probe_developer_policy(
-                lambda conversation: tokenizer.apply_chat_template(
-                    conversation,
-                    tools=probe_tools,
-                    tokenize=False,
-                    add_generation_prompt=add_generation_prompt,
-                ),
-                f"the chat renderer of {type(tokenizer).__name__}",
-            )
-            cache[key] = policy
-    return policy
+    tokenizer: Any,
+    *,
+    tools: Optional[list[dict[str, Any]]] = None,
+    add_generation_prompt: bool = True,
+    native_kwargs: Optional[dict[str, Any]] = None,
+) -> _DeveloperRolePolicy:
+    """`_probe_developer_policy` for a tokenizer's own renderer, per tokenizer context."""
+    kwargs = native_kwargs or {}
+    opt_key = _probe_options_cache_key(tools, None, add_generation_prompt,
+                                       kwargs)
+
+    def _compute() -> _DeveloperRolePolicy:
+        probe_prefix = _pick_probe_prefix(tools, kwargs)
+        return _probe_developer_policy(
+            lambda conversation: tokenizer.apply_chat_template(
+                conversation,
+                tools=tools,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                **kwargs,
+            ),
+            f"the chat renderer of {type(tokenizer).__name__}",
+            probe_prefix=probe_prefix,
+        )
+
+    return _native_cached_probe(_NATIVE_DEVELOPER_POLICY, tokenizer, opt_key,
+                                _compute)
 
 
-def _native_accepts_late_system(tokenizer: Any,
-                                with_leading_system: bool = True,
-                                tools_mode: str = "none",
-                                add_generation_prompt: bool = True) -> bool:
-    """`_probe_accepts_late_system` for a tokenizer's own renderer, per tokenizer."""
-    probe_tools = _probe_tools_arg(tools_mode)
-    key = (with_leading_system, tools_mode, add_generation_prompt)
-    with _NATIVE_RENDERER_DROPS_DEVELOPER_LOCK:
-        cache = _NATIVE_ACCEPTS_LATE_SYSTEM.get(tokenizer)
-        if cache is None:
-            cache = {}
-            _NATIVE_ACCEPTS_LATE_SYSTEM[tokenizer] = cache
-        accepts = cache.get(key)
-        if accepts is None:
-            accepts = _probe_accepts_late_system(
-                lambda conversation: tokenizer.apply_chat_template(
-                    conversation,
-                    tools=probe_tools,
-                    tokenize=False,
-                    add_generation_prompt=add_generation_prompt,
-                ),
-                with_leading_system=with_leading_system,
-            )
-            cache[key] = accepts
-    return accepts
+def _native_accepts_late_system(
+    tokenizer: Any,
+    role_layout: tuple[_SystemLayoutEntry, ...],
+    *,
+    tools: Optional[list[dict[str, Any]]] = None,
+    add_generation_prompt: bool = True,
+    native_kwargs: Optional[dict[str, Any]] = None,
+) -> bool:
+    """`_probe_accepts_system_layout` for a tokenizer's own renderer, per tokenizer context."""
+    layout = tuple(role_layout)
+    kwargs = native_kwargs or {}
+    opt_key = _probe_options_cache_key(tools, None, add_generation_prompt,
+                                       kwargs)
+    cache_key = None if opt_key is None else (layout, opt_key)
+
+    def _compute() -> bool:
+        probe_prefix = _pick_probe_prefix(tools, kwargs)
+        return _probe_accepts_system_layout(
+            lambda conversation: tokenizer.apply_chat_template(
+                conversation,
+                tools=tools,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                **kwargs,
+            ),
+            layout,
+            probe_prefix=probe_prefix,
+        )
+
+    return _native_cached_probe(_NATIVE_ACCEPTS_LATE_SYSTEM, tokenizer,
+                                cache_key, _compute)
+
+
+def _message_to_content_parts(
+    message: ConversationMessage,
+    counts: Optional[dict[str, int]],
+) -> list[Union[str, dict[str, Any]]]:
+    """Normalize a message to ordered content_parts matching `_build_openai_content`."""
+    existing = message.get("content_parts")
+    if existing:
+        return [
+            dict(part) if isinstance(part, dict) else part for part in existing
+        ]
+    parts: list[Union[str, dict[str, Any]]] = []
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    if item.get("text"):
+                        parts.append(item["text"])
+                elif item.get("type"):
+                    parts.append({"type": item["type"]})
+        return parts
+    media_idx = 0
+    num_media = len(message.get("media") or [])
+    for placeholder, count in (counts or {}).items():
+        modality = _infer_mm_modality(placeholder)
+        for _ in range(count):
+            part: dict[str, Any] = {"type": modality}
+            if media_idx < num_media:
+                part["media_index"] = media_idx
+                media_idx += 1
+            parts.append(part)
+    return parts
 
 
 def _merge_messages(
@@ -1270,6 +1602,24 @@ def _merge_messages(
     elif s_content is not None:
         merged["content"] = t_content if t_content is not None else s_content
 
+    t_tools = target.get("tools")
+    s_tools = source.get("tools")
+    if t_tools is not None and s_tools is not None:
+        if isinstance(t_tools, list) and isinstance(s_tools, list):
+            combined_tools = list(t_tools)
+            for tool in s_tools:
+                if tool not in combined_tools:
+                    combined_tools.append(tool)
+            merged["tools"] = combined_tools
+        else:
+            merged["tools"] = t_tools
+    elif s_tools is not None:
+        merged["tools"] = list(s_tools) if isinstance(s_tools,
+                                                      list) else s_tools
+    elif t_tools is not None:
+        merged["tools"] = list(t_tools) if isinstance(t_tools,
+                                                      list) else t_tools
+
     t_media = list(target.get("media") or [])
     s_media = list(source.get("media") or [])
     media_offset = len(t_media)
@@ -1277,12 +1627,8 @@ def _merge_messages(
         merged["media"] = t_media + s_media
 
     if "content_parts" in target or "content_parts" in source:
-        t_parts = list(
-            target.get("content_parts") or
-            ([t_content] if isinstance(t_content, str) and t_content else []))
-        raw_s_parts = list(
-            source.get("content_parts") or
-            ([s_content] if isinstance(s_content, str) and s_content else []))
+        t_parts = _message_to_content_parts(target, target_counts)
+        raw_s_parts = _message_to_content_parts(source, source_counts)
         s_parts = []
         for part in raw_s_parts:
             if isinstance(part, dict) and isinstance(part.get("media_index"),
@@ -1314,8 +1660,10 @@ def _message_has_media(message: ConversationMessage,
 def _merge_developers_into_leading_system(
     conversation: list[ConversationMessage],
     mm_placeholder_counts: Optional[list[dict[str, int]]],
+    *,
+    rewrite_indices: Optional[Collection[int]] = None,
 ) -> tuple[list[ConversationMessage], Optional[list[dict[str, int]]]]:
-    """Collapse system and developer messages into a single leading system message at index 0.
+    """Collapse system and selected developer messages into a single leading system message.
 
     If a late developer/system message carries media after an earlier non-system
     message already carried media, moving it ahead would invert the prompt's
@@ -1337,10 +1685,13 @@ def _merge_developers_into_leading_system(
     absorbed_into_last_user = False
     seen_rest_media = False
 
-    for message, counts in zip(conversation, counts_seq):
+    for idx, (message, counts) in enumerate(zip(conversation, counts_seq)):
         role = message.get("role")
         msg_has_media = _message_has_media(message, counts)
-        if role in ("system", "developer"):
+        absorb = role == "system" or (role == "developer" and
+                                      (rewrite_indices is None
+                                       or idx in rewrite_indices))
+        if absorb:
             if seen_rest_media and msg_has_media:
                 as_user: ConversationMessage = {**message, "role": "user"}
                 if pending_user is not None:
@@ -1431,72 +1782,69 @@ def _merge_developers_into_leading_system(
 def _developer_as_system(
     conversation: list[ConversationMessage],
     get_policy: Callable[[Any], _DeveloperRolePolicy],
-    accepts_late_system: Callable[[Any, bool], bool],
+    accepts_late_system: Callable[[Any, tuple[_SystemLayoutEntry, ...]], bool],
     renderer: Any,
     mm_placeholder_counts: Optional[list[dict[str, int]]] = None,
 ) -> tuple[list[ConversationMessage], Optional[list[dict[str, int]]]]:
     """``conversation`` with developer messages rewritten to system, if needed.
 
-    When ``get_policy(renderer).drops_developer`` is true, developer messages
-    are renamed to ``system`` in place if the renderer accepts the resulting
-    system-message positions. On strict templates that accept only a single
-    leading system message (rejecting a second or late system message), the
-    rewritten developer messages are merged into the single leading system
+    When ``get_policy(renderer)`` indicates that one or more developer messages
+    will be dropped, only those developer messages are renamed to ``system`` in
+    place if the renderer accepts the resulting system-message positions. On
+    strict templates that reject multiple or late system messages, the
+    rewritten developer messages are merged into a single leading system
     message at index 0 so the prompt preserves every instruction without
     raising a template error.
     """
     if not any(message.get("role") == "developer" for message in conversation):
         return conversation, mm_placeholder_counts
     policy = get_policy(renderer)
-    has_nonleading_developer = any(i > 0 and message.get("role") == "developer"
-                                   for i, message in enumerate(conversation))
+    rewrite_indices: set[int] = set()
     seen_turn = False
-    has_late_developer = False
-    for message in conversation:
+    for i, message in enumerate(conversation):
         role = message.get("role")
         if role == "developer":
-            if seen_turn:
-                has_late_developer = True
-                break
+            if (policy.drops_developer
+                    or (policy.drops_nonleading_developer and i > 0)
+                    or (policy.drops_late_developer and seen_turn)):
+                rewrite_indices.add(i)
         elif role != "system":
             seen_turn = True
-    needs_rewrite = (policy.drops_developer
-                     or (policy.drops_nonleading_developer
-                         and has_nonleading_developer)
-                     or (policy.drops_late_developer and has_late_developer))
-    if not needs_rewrite:
+    if not rewrite_indices:
         return conversation, mm_placeholder_counts
 
     renamed = [{
         **message, "role": "system"
-    } if message.get("role") == "developer" else message
-               for message in conversation]
+    } if i in rewrite_indices else message
+               for i, message in enumerate(conversation)]
 
-    system_indices = [
-        i for i, message in enumerate(renamed)
-        if message.get("role") == "system"
-    ]
-    needs_multiple = len(system_indices) > 1
+    total_system_count = 0
     seen_non_system = False
-    has_late_system = False
+    has_nonleading_system = False
     for message in renamed:
         role = message.get("role")
         if role == "system":
+            total_system_count += 1
             if seen_non_system:
-                has_late_system = True
-                break
+                has_nonleading_system = True
         else:
             seen_non_system = True
 
     must_merge = False
-    if needs_multiple and not policy.accepts_multiple_system:
-        must_merge = True
-    elif has_late_system and not accepts_late_system(renderer, needs_multiple):
+    if has_nonleading_system or total_system_count > 2:
+        if not accepts_late_system(renderer, _system_role_layout(renamed)):
+            must_merge = True
+    elif total_system_count == 2 and not policy.accepts_multiple_system:
         must_merge = True
 
     if must_merge:
-        return _merge_developers_into_leading_system(conversation,
-                                                     mm_placeholder_counts)
+        merge_indices: Optional[set[int]] = rewrite_indices
+        if policy.drops_nonleading_developer:
+            # Placing a leading system at index 0 shifts any kept index-0 developer
+            # to a non-leading position where the renderer would drop it.
+            merge_indices = None
+        return _merge_developers_into_leading_system(
+            conversation, mm_placeholder_counts, rewrite_indices=merge_indices)
     return renamed, mm_placeholder_counts
 
 
@@ -1593,18 +1941,21 @@ def apply_chat_template(
         native_kwargs = dict(chat_template_kwargs or {})
         if documents is not None:
             native_kwargs["documents"] = documents
-        tools_mode = _tools_probe_mode(tools)
         native_conversation, _ = _developer_as_system(
             conversation,
-            lambda tok: _native_developer_policy(tok,
-                                                 tools_mode=tools_mode,
-                                                 add_generation_prompt=
-                                                 add_generation_prompt),
-            lambda tok, with_lead: _native_accepts_late_system(
+            lambda tok: _native_developer_policy(
                 tok,
-                with_leading_system=with_lead,
-                tools_mode=tools_mode,
-                add_generation_prompt=add_generation_prompt),
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                native_kwargs=native_kwargs,
+            ),
+            lambda tok, layout: _native_accepts_late_system(
+                tok,
+                layout,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                native_kwargs=native_kwargs,
+            ),
             tokenizer,
         )
         return tokenizer.apply_chat_template(
@@ -1623,43 +1974,64 @@ def apply_chat_template(
     validate_chat_template_kwargs(hf_chat_template,
                                   chat_template_kwargs,
                                   injected_keys=injected_chat_template_kwargs)
+    has_developer = any(
+        message.get("role") == "developer" for message in conversation)
     # Determine content format before probing so OpenAI-format block templates
     # receive list-of-blocks content during the role probe.
     content_format = _resolve_content_format(model_type, hf_chat_template)
     per_role_blocks = (content_format == ContentFormat.OPENAI or any(
         isinstance(m.get("content"), list) for m in conversation))
-    tools_mode = _tools_probe_mode(tools)
     conversation, mm_placeholder_counts = _developer_as_system(
         conversation,
-        lambda tmpl: _template_developer_policy(tmpl,
-                                                per_role_blocks=per_role_blocks,
-                                                tools_mode=tools_mode,
-                                                add_generation_prompt=
-                                                add_generation_prompt),
-        lambda tmpl, with_lead: _template_accepts_late_system(
+        lambda tmpl: _template_developer_policy(
             tmpl,
-            with_leading_system=with_lead,
             per_role_blocks=per_role_blocks,
-            tools_mode=tools_mode,
-            add_generation_prompt=add_generation_prompt),
+            tools=tools,
+            documents=documents,
+            add_generation_prompt=add_generation_prompt,
+            chat_template_kwargs=chat_template_kwargs,
+        ),
+        lambda tmpl, layout: _template_accepts_late_system(
+            tmpl,
+            layout,
+            per_role_blocks=per_role_blocks,
+            tools=tools,
+            documents=documents,
+            add_generation_prompt=add_generation_prompt,
+            chat_template_kwargs=chat_template_kwargs,
+        ),
         hf_chat_template,
         mm_placeholder_counts=mm_placeholder_counts,
     )
 
     if content_format == ContentFormat.OPENAI:
         # Path OPENAI: reconstruct content as list of dicts for the template.
-        # Roles that only iterate over block dicts (no string-content branch)
-        # also need plain-text messages wrapped on a per-role basis.
+        # On the developer-role compatibility path, roles that only iterate over
+        # block dicts (no string-content branch) also need plain-text messages
+        # wrapped on a per-role basis, without mutating the caller's dicts.
+        converted: list[ConversationMessage] = []
         for conv, mm_placeholder_count in zip(conversation,
                                               mm_placeholder_counts):
             role = conv.get("role")
-            if mm_placeholder_count or (isinstance(conv.get("content"), str)
-                                        and isinstance(role, str)
-                                        and _template_role_needs_blocks(
-                                            hf_chat_template, role, tools_mode,
-                                            add_generation_prompt)):
-                conv["content"] = _build_openai_content(conv,
-                                                        mm_placeholder_count)
+            needs_wrap = bool(mm_placeholder_count) or (
+                has_developer and isinstance(conv.get("content"), str)
+                and isinstance(role, str) and _template_role_needs_blocks(
+                    hf_chat_template,
+                    role,
+                    tools=tools,
+                    documents=documents,
+                    add_generation_prompt=add_generation_prompt,
+                    chat_template_kwargs=chat_template_kwargs,
+                ))
+            if needs_wrap:
+                converted.append({
+                    **conv,
+                    "content":
+                    _build_openai_content(conv, mm_placeholder_count),
+                })
+            else:
+                converted.append(conv)
+        conversation = converted
     # STRING path: placeholders already inserted in content by caller
 
     template_renderer = tokenizer.apply_chat_template
