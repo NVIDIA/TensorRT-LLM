@@ -156,9 +156,13 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.block_reuse_config.policy` | `literal` | `categorical` | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` | `int` | `value` |  |
 | `kv_cache_config.cold_tier_offload_min_priority` | `int\|none` | `value` |  |
+| `kv_cache_config.context_claim_ahead` | `int` | `value` |  |
+| `kv_cache_config.context_prefetch_blocks` | `int` | `value` |  |
 | `kv_cache_config.copy_on_partial_reuse` | `bool` | `value` |  |
 | `kv_cache_config.copy_stream_busy_skip` | `int` | `value` |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `float\|none` | `value` |  |
+| `kv_cache_config.defer_context_only_release` | `bool` | `value` |  |
+| `kv_cache_config.deferred_release_thread` | `bool` | `value` |  |
 | `kv_cache_config.disk_cache_size` | `int\|none` | `value` |  |
 | `kv_cache_config.disk_io_threads` | `int` | `value` |  |
 | `kv_cache_config.disk_keep_copy_after_restore` | `bool` | `value` |  |
@@ -319,6 +323,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning` | `bool` | `value` |  |
 | `scheduler_config.enable_prefix_aware_scheduling` | `bool` | `value` |  |
 | `scheduler_config.gen_handoff_seat` | `bool` | `value` |  |
+| `scheduler_config.gen_init_pause_after_release` | `bool` | `value` |  |
 | `scheduler_config.gen_preemption.target_output_tps` | `float\|none` | `value` |  |
 | `scheduler_config.gen_preemption.tpot_budget` | `float\|none` | `value` |  |
 | `scheduler_config.max_gen_init_admissions_per_pass` | `int\|none` | `value` |  |
