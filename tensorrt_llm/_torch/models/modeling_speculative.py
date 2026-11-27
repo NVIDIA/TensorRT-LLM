@@ -2294,6 +2294,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def post_load_weights(self) -> None:
         super().post_load_weights()
         if self.spec_worker is not None:
+            self.spec_worker.bind_score_lm_head(self.lm_head)
             # Collective over the TP group; every rank loads in step.
             self.spec_worker.prepare_vocab_sharded_sampling(self.lm_head)
 

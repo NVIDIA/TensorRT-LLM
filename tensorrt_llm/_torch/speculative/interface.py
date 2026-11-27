@@ -2269,6 +2269,14 @@ class SpecWorkerBase(nn.Module, ABC):
                 f"guarantees spec-dec attn-metadata cleanup when a forward "
                 f"fails (https://nvbugs/6442074).")
 
+    # The target model's LM head, kept in a tuple so that torch does not register it as a submodule of the worker.
+    _score_lm_head: tuple = ()
+
+    def bind_score_lm_head(self, lm_head: nn.Module) -> None:
+        """Give the worker the target LM head. It supplies the tensor-parallel mapping, the shard width and the
+        vocabulary size that scoring needs when the target logits are vocabulary shards."""
+        self._score_lm_head = (lm_head, )
+
     def forward(self, *args, **kwargs):
         """Run _forward_impl with guaranteed spec-dec metadata cleanup.
 
@@ -2301,7 +2309,9 @@ class SpecWorkerBase(nn.Module, ABC):
                 args[3] if len(args) > 3 else None)
             publish_target_logprobs(outputs, logits,
                                     bool(kwargs.get("vocab_sharded_logits")),
-                                    spec_metadata)
+                                    spec_metadata,
+                                    self._score_lm_head[0]
+                                    if self._score_lm_head else None)
         return outputs
 
     @abstractmethod

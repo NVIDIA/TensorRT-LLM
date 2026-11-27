@@ -5,7 +5,11 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.target_logprobs import target_logprobs
+from tensorrt_llm._torch.speculative.target_logprobs import (
+    combine_shard_stats,
+    shard_stats,
+    target_logprobs,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -95,3 +99,41 @@ def test_target_logprobs_masked_vocab_and_padding():
         rtol=1e-6,
     )
     assert out[0, 2] == 0
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_sharded_scores_equal_dense_scores(tp):
+    """Vocabulary shards (with padding columns in the last one) combine to exactly the dense result."""
+    torch.manual_seed(1)
+    vocab, width, num_contexts, num_gens = 1003, 4, 2, 3
+    batch = num_contexts + num_gens
+    rows = num_contexts + num_gens * width
+    shard = -(-vocab // tp)
+    full = torch.randn(rows, shard * tp, device="cuda") * 4
+    full[:, vocab:] = 0  # padding columns hold zeros, not -inf
+    tokens = torch.randint(0, vocab, (batch, width), dtype=torch.int32, device="cuda")
+    lens = torch.tensor([1, 1, 4, 2, 3], dtype=torch.int32, device="cuda")
+    temperature = torch.tensor([1.0, 0.7, 1.0, 0.0, 0.7], device="cuda")
+    dense = target_logprobs(
+        full[:, :vocab].contiguous(),
+        tokens,
+        lens,
+        temperature,
+        num_contexts=num_contexts,
+        width=width,
+    )
+    stats = [
+        shard_stats(
+            full[:, r * shard : (r + 1) * shard].contiguous(),
+            tokens,
+            lens,
+            temperature,
+            num_contexts=num_contexts,
+            width=width,
+            col_base=r * shard,
+            vocab_size=vocab,
+        )
+        for r in range(tp)
+    ]
+    sharded = combine_shard_stats(torch.cat(stats), batch, width)
+    torch.testing.assert_close(sharded, dense, atol=1e-5, rtol=1e-6)
