@@ -14,7 +14,8 @@
 
 import copy
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple,
+                    Union)
 
 import torch
 from PIL.Image import Image
@@ -60,11 +61,15 @@ from ..moe.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
                              MoEWeightLoadingMode, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (full_image_prefill_defaults,
+                                        fuse_input_embeds)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, moe_experts_quant_config,
                              register_auto_model)
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -1543,6 +1548,10 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
     # The vision encoder uses the Hugging Face implementation.
     supported_encoder_attention_backends = {"vision": frozenset()}
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return full_image_prefill_defaults(cls.__name__, llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(

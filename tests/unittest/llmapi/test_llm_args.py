@@ -1472,11 +1472,16 @@ class TestModelDefaults:
             kwargs["kv_cache_config"] = (KvCacheConfig(
                 **kv_config) if kv_setting == "object" else kv_config)
         args = TorchLlmArgs(model="/tmp/dummy_model", **kwargs)
-        if hasattr(model_cls, "get_model_defaults"):
-            with patch("tensorrt_llm.logger.logger.info") as log_info:
-                defaults = model_cls.get_model_defaults(args)
-            log_info.assert_not_called()
-            apply_model_defaults_to_llm_args(args, defaults)
+        if model_cls is Gemma3VLM and kv_setting != "omitted" and enable_block_reuse:
+            with pytest.raises(ValueError,
+                               match="Gemma3VLM.*enable_block_reuse"):
+                model_cls.get_model_defaults(args)
+            return
+
+        with patch("tensorrt_llm.logger.logger.info") as log_info:
+            defaults = model_cls.get_model_defaults(args)
+        log_info.assert_not_called()
+        apply_model_defaults_to_llm_args(args, defaults)
 
         assert args.attn_backend == expected_backend
         assert args.kv_cache_config.enable_swa_scratch_reuse == (
@@ -1484,6 +1489,48 @@ class TestModelDefaults:
             and not args.kv_cache_config.enable_block_reuse)
         if kv_setting != "omitted":
             assert args.kv_cache_config.enable_block_reuse is enable_block_reuse
+
+    @pytest.mark.parametrize("model", ["Gemma3", "Llama4"])
+    @pytest.mark.parametrize("kwargs,error_field", [
+        ({}, None),
+        ({
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.75
+            }
+        }, None),
+        ({
+            "enable_chunked_prefill": False,
+            "kv_cache_config": KvCacheConfig(enable_block_reuse=False)
+        }, None),
+        ({
+            "enable_chunked_prefill": True
+        }, "enable_chunked_prefill"),
+        ({
+            "kv_cache_config": {
+                "enable_block_reuse": True
+            }
+        }, "kv_cache_config.enable_block_reuse"),
+    ])
+    def test_legacy_multimodal_prefill_defaults(
+            self, model: str, kwargs: dict, error_field: str | None) -> None:
+        args = TorchLlmArgs(model="/tmp/dummy_model", **kwargs)
+        loader = create_autospec(HfCheckpointLoader, instance=True)
+        loader.load_config.return_value = ModelConfig(
+            pretrained_config=PretrainedConfig(
+                architectures=[f"{model}ForConditionalGeneration"]))
+        if error_field:
+            with pytest.raises(ValueError,
+                               match=rf"{model}.*{re.escape(error_field)}"):
+                model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+                    args.model, args, loader)
+            return
+
+        memory_fraction = args.kv_cache_config.free_gpu_memory_fraction
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            args.model, args, loader)
+        assert args.enable_chunked_prefill is False
+        assert args.kv_cache_config.enable_block_reuse is False
+        assert args.kv_cache_config.free_gpu_memory_fraction == memory_fraction
 
     @pytest.mark.parametrize("model", ["gemma3", "gemma4"])
     @pytest.mark.parametrize("kv_setting", ["dict", "object"])

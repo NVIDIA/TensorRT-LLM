@@ -19,8 +19,8 @@
 import functools
 import math
 import os
-from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Tuple,
-                    TypedDict, Union, cast)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
+                    Optional, Tuple, TypedDict, Union, cast)
 
 import numpy as np
 import torch
@@ -32,9 +32,13 @@ from PIL import Image
 from torchvision.transforms import Normalize, Resize, ToTensor
 from transformers.image_processing_backends import TorchvisionBackend
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 class VisionNormalization(NamedTuple):
@@ -637,6 +641,28 @@ def find_input_mm_embeds(
         sliced = [mm_embeds[0][start:end] for start, end in slices]
         return [_join_embeddings(sliced)]
     return [mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)]
+
+
+def full_image_prefill_defaults(model_name: str,
+                                llm_args: "TorchLlmArgs") -> dict:
+    """These models fuse the full image even when prefill receives only a prompt slice."""
+    if ("enable_chunked_prefill" in llm_args.model_fields_set
+            and llm_args.enable_chunked_prefill):
+        raise UnsupportedError(
+            f"{model_name} requires the full image prompt. Set enable_chunked_prefill=False."
+        )
+    kv_config = llm_args.kv_cache_config
+    if ("enable_block_reuse" in kv_config.model_fields_set
+            and kv_config.enable_block_reuse):
+        raise UnsupportedError(
+            f"{model_name} requires the full image prompt. Set kv_cache_config.enable_block_reuse=False."
+        )
+    return {
+        "enable_chunked_prefill": False,
+        "kv_cache_config": {
+            "enable_block_reuse": False
+        },
+    }
 
 
 def filter_mm_token_from_input_ids(

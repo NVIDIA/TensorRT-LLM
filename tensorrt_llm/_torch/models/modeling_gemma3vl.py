@@ -3,7 +3,7 @@
 
 import copy
 import dataclasses
-from typing import Any, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
 
 import torch
 from transformers import (AutoProcessor, AutoTokenizer, Gemma3Config,
@@ -27,9 +27,13 @@ from ..modules.rms_norm import RMSNorm
 from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_multimodal_utils import (_MULTIMODAL_ENV_NAME, _is_mm_disagg,
+                                        full_image_prefill_defaults,
                                         fuse_input_embeds)
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 class Gemma3InputProcessor(BaseMultimodalInputProcessor,
@@ -185,6 +189,10 @@ class Gemma3VLM(PreTrainedModel):
     supported_encoder_attention_backends = {"vision": frozenset()}
 
     lora_owner = DecoderLoraOwner(module_path="language_model")
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return full_image_prefill_defaults(cls.__name__, llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,

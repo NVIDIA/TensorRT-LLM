@@ -115,13 +115,10 @@ def _get_default_values_for_config(config_path: Path) -> dict:
     if not model_cls or not hasattr(model_cls, "get_model_defaults"):
         return global_default
 
-    base_args = llm_args_module.TorchLlmArgs(model=model, skip_tokenizer_init=True).model_dump(
-        mode="json"
-    )
-
-    model_defaults = model_cls.get_model_defaults(base_args)
-    base_args.update(model_defaults)
-    return base_args
+    base_args = llm_args_module.TorchLlmArgs(model=model, skip_tokenizer_init=True)
+    default_values = base_args.model_dump(mode="json")
+    default_values.update(model_cls.get_model_defaults(base_args))
+    return default_values
 
 
 @pytest.fixture(autouse=True)

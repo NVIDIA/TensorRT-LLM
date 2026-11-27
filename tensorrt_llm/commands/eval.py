@@ -188,8 +188,9 @@ def main(ctx, model: str, tokenizer: Optional[str],
         translate=_CLICK_TO_LLM_ARG)
 
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
-        enable_block_reuse=not disable_kv_cache_reuse)
+        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
+    if disable_kv_cache_reuse:
+        kv_cache_config.enable_block_reuse = False
 
     llm_args = {
         "model":
