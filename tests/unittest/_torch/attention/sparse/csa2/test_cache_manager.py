@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.page_table_bounds import PageTableBounds
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     read_index_rows,
@@ -548,10 +549,10 @@ def _metadata(manager, request, metadata=None):
 
 
 @pytest.mark.cpu_only
-def test_swa_publication_is_scoped_transaction_with_exact_request_and_destination():
+def test_swa_publication_is_scoped_transaction_with_exact_request_and_destination(monkeypatch):
     manager = CSA2CacheManager.__new__(CSA2CacheManager)
     manager._swa_publication_token = manager._swa_publication = None
-    manager._block_offsets_live = {}
+    manager._block_offsets_live = PageTableBounds(track_overlaps=True)
     manager.pp_layers = [0, 1]
     manager.max_blocks_per_seq = 4
     state = {"fail": False, "offset": 0}
@@ -573,7 +574,9 @@ def test_swa_publication_is_scoped_transaction_with_exact_request_and_destinatio
         ).reshape(2, len(request_ids), 4)
         if swa_out is not None:
             swa_out.copy_(manager._batch_page_tables[: swa_out.shape[0], :, : swa_out.shape[2]])
+        return np.full(len(request_ids), 3, dtype=np.int64)
 
+    monkeypatch.setattr(manager, "_wait_for_page_table_conversion", lambda: None)
     manager.compute_batch_page_tables = compute
     destination = torch.full((2, 4, 2, 4), 99, dtype=torch.int32)
     ids = [3, 3, 1]  # Repeated padding IDs retain packed row order.
@@ -885,11 +888,13 @@ def test_logical_page_tables_and_null_pointers(monkeypatch) -> None:
             [[r + layer, 88] + [BAD_PAGE_INDEX] * 6 for r in request_ids] for layer in range(20)
         ]
         swa_out.copy_(torch.tensor(tables, dtype=torch.int32))
+        return np.full(len(request_ids), 2, dtype=np.int64)
 
+    monkeypatch.setattr(manager, "_wait_for_page_table_conversion", lambda: None)
     manager.compute_batch_page_tables = compute
     destination = torch.full((40, 2, 2, 8), 99, dtype=torch.int32)
     manager._swa_publication_token = manager._swa_publication = None
-    manager._block_offsets_live = {}
+    manager._block_offsets_live = PageTableBounds(track_overlaps=True)
     manager.copy_batch_block_offsets(destination, [1], 1, 1, 1)
     assert destination[:20, 0, 0, 0].tolist() == list(range(1, 21))
     assert torch.all(destination[20:] == BAD_PAGE_INDEX)
