@@ -1992,8 +1992,6 @@ class MiniMaxM3VLInputProcessor:
         if isinstance(media, torch.Tensor):
             return int(media.shape[-2]), int(media.shape[-1])
         if isinstance(media, np.ndarray):
-            # HWC uint8 from ImageMediaIO's "np" format, the format
-            # ``get_preferred_media_io_kwargs`` asks for.
             return int(media.shape[0]), int(media.shape[1])
         return int(media.height), int(media.width)
 
@@ -2035,15 +2033,6 @@ class MiniMaxM3VLInputProcessor:
         merge = int(self.processor.video_processor.merge_size)
         per_patch = (grid[:, 1] * grid[:, 2]) // (merge * merge) + 2
         return int((grid[:, 0] * per_patch).sum().item())
-
-    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # uint8 HWC arrays for both modalities: the form the checkpoint's
-        # processors rescale themselves, at a quarter of the bytes of
-        # media_io's default "pt" float tensors (which ``_prepare_media``
-        # also accepts). trtllm-serve seeds its media_io defaults from this
-        # method, so no --media_io_kwargs flag is needed; an explicit flag
-        # still wins.
-        return {"image": {"format": "np"}, "video": {"format": "np"}}
 
     @staticmethod
     def _video_frames(video: Any) -> List[Any]:

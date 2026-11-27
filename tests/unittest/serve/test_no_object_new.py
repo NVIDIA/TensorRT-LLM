@@ -137,7 +137,7 @@ BASELINE = {
     "tests/unittest/llmapi/test_kv_hints.py": [
         "test_http_handlers_forward_hints OpenAIServer",
     ],
-    "tests/unittest/llmapi/test_llm.py": [
+    "tests/unittest/llmapi/test_llm_serving.py": [
         "test_openai_completion_list_prompt_stream_reuses_stream_metadata.run_request OpenAIServer",
         "test_startup_metrics_by_server_info OpenAIServer",
     ],

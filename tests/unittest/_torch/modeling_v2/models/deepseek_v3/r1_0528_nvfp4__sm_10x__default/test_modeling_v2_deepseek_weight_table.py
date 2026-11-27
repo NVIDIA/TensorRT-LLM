@@ -55,8 +55,9 @@ def _core(mtp: bool):
     """The configuration surface the table reads, at the dep4 layout: attention DP over
     four ranks, the experts split four ways, this rank the second.
 
-    `dims` derives the expert window from the mapping; the reference below hard-codes
-    the hand-written `local_experts`, so the comparison also checks that the two agree.
+    `dims` derives the expert slots from the mapping; the reference below hard-codes
+    the hand-written expert count per rank, so the comparison also checks that the two
+    agree.
     """
     cfg = SimpleNamespace(**_CFG)
     mapping = SimpleNamespace(

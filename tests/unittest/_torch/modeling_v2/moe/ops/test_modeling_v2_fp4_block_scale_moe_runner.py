@@ -97,13 +97,35 @@ def _dsr1_at(inter: int):
     return _DSR1_SLICE[inter]
 
 
+# DeepSeek-R1's routed experts in 288 slots, as static EPLB places them: every expert
+# once and 32 of them again. The kernel sees a slot as an expert, so the slot stack is
+# the 256-expert stack's own rows gathered by the placement.
+_DSR1_SLOTS = None
+
+
+def _dsr1_slots():
+    global _DSR1_SLOTS
+    if _DSR1_SLOTS is None:
+        args, ref = _dsr1()
+        g = torch.Generator().manual_seed(288)
+        held = torch.cat([torch.arange(256), torch.randperm(256, generator=g)[:32]]).to(DEV)
+        slot_args = {
+            k: (v[held].contiguous() if torch.is_tensor(v) else v) for k, v in args.items()
+        }
+        slot_ref = dict(ref, num_experts=288)
+        for k in ("up", "gate", "down"):
+            slot_ref[k] = (ref[k][0][held].contiguous(), ref[k][1][held].contiguous())
+        _DSR1_SLOTS = (slot_args, slot_ref)
+    return _DSR1_SLOTS
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _release_reference_layers() -> Iterator[None]:
-    global _DSV3, _DSR1
+    global _DSV3, _DSR1, _DSR1_SLOTS
     try:
         yield
     finally:
-        _DSV3 = _DSR1 = None
+        _DSV3 = _DSR1 = _DSR1_SLOTS = None
         _DSR1_SLICE.clear()
 
 
@@ -1864,6 +1886,8 @@ def _cell_layer(spec: dict, layer_factory: Callable[[], tuple[dict, dict]]) -> t
         return layer_factory()
     if key == (256, 7168, 2048):
         return _dsr1()
+    if key == (288, 7168, 2048):
+        return _dsr1_slots()
     assert key[:2] == (256, 7168), f"no shared layer for cell geometry {key}"
     return _dsr1_at(key[2])
 
@@ -1931,6 +1955,24 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
                 local_expert_offset=112,
                 local_num_experts=16,
                 **Fp4BlockScaleMoeRunner.R1,
+            ),
+        ),
+        Cell(
+            why="deepseek default under static EPLB at dep4: the last 72 of 288 slots",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=216,
+                local_num_experts=72,
+                **dict(Fp4BlockScaleMoeRunner.R1, num_experts=288),
+            ),
+        ),
+        Cell(
+            why="deepseek default under static EPLB at dep8: a 36-slot window of 288",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=108,
+                local_num_experts=36,
+                **dict(Fp4BlockScaleMoeRunner.R1, num_experts=288),
             ),
         ),
     ),
