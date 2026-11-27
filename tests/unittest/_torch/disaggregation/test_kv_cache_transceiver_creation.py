@@ -21,6 +21,7 @@ only when no preference was expressed). Everything else must fail loudly at
 transceiver creation — these tests pin those creation-time errors.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -29,16 +30,22 @@ from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as transceiv
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor import _util as util_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
     MixedMambaHybridCacheManager,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, SchedulerConfig
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
+
+
+class _CreationReached(Exception):
+    """Stops the resource factory at its call of the transceiver creation."""
 
 
 @pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
@@ -181,3 +188,53 @@ def test_python_runtime_rejects_separate_legacy_mamba_manager() -> None:
         transceiver_module.create_kv_cache_transceiver(
             None, None, manager, None, config, mamba_cache_manager=legacy_mamba
         )
+
+
+@pytest.mark.parametrize(
+    ("manager_cls", "keeps_recurrent_state"),
+    [
+        (KVCacheManager, False),
+        (KVCacheManagerV2, False),
+        (CppMambaHybridCacheManager, True),
+        (MixedMambaHybridCacheManager, True),
+        (MambaHybridCacheManagerV2, True),
+    ],
+)
+def test_resource_factory_names_a_recurrent_cache_as_the_mamba_manager(
+    manager_cls: type, keeps_recurrent_state: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The creation rejects the hybrid managers it cannot serve by its ``mamba_cache_manager``
+    argument, and the C++ transceiver takes the recurrent layers of the rank from it, so the
+    executor's resource factory passes a cache that keeps recurrent state there and no other."""
+    manager = object.__new__(manager_cls)
+    manager.impl = Mock()
+    creation = Mock(side_effect=_CreationReached)
+    monkeypatch.setattr(util_module, "set_low_latency_dispatch", lambda enabled: None)
+    monkeypatch.setattr(util_module, "KVCacheV2Scheduler", Mock())
+    monkeypatch.setattr(util_module, "SimpleUnifiedScheduler", Mock())
+    monkeypatch.setattr(util_module, "create_kv_cache_transceiver", creation)
+    engine = SimpleNamespace(
+        mm_encoder_item_scheduling_enabled=False,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=SimpleNamespace(model_type="llama"), is_encoder_decoder=False
+            )
+        ),
+    )
+
+    with pytest.raises(_CreationReached):
+        util_module.create_py_executor_resources(
+            dist=SimpleNamespace(),
+            resources={ResourceManagerType.KV_CACHE_MANAGER: manager},
+            mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+            llm_args=SimpleNamespace(extra_resource_managers={}),
+            ctx_chunk_config=None,
+            model_engine=engine,
+            max_batch_size=2,
+            max_num_tokens=128,
+            max_num_sequences=4,
+            scheduler_config=SchedulerConfig(use_python_scheduler=True),
+        )
+
+    assert creation.call_args.args[2] is manager
+    assert creation.call_args.args[5] is (manager if keeps_recurrent_state else None)

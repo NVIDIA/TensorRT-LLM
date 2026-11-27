@@ -59,7 +59,7 @@ from ..memory.monitor import settings as monitor_settings
 from ..memory.monitor import startup as monitor_startup
 from ..memory.monitor import tagging as monitor_tagging
 from ..memory.monitor import triggers as monitor_triggers
-from ..models.modeling_utils import timing_metric
+from ..models.modeling_utils import declares_recurrent_state, timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
                            should_use_separate_draft_kv_cache)
@@ -68,7 +68,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
                     instantiate_sampler, is_agg_helix, is_disagg_enabled,
                     is_mla)
-from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
+from .config_utils import (is_decode_only, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -129,7 +129,8 @@ def _fp4_mla_block_reuse_blocker(pretrained_config, *,
     reuse tied to chunked prefill, the only combination validated with
     their recurrent-state snapshots.
     """
-    if is_hybrid_linear(pretrained_config) and not enable_chunked_prefill:
+    if declares_recurrent_state(
+            pretrained_config) and not enable_chunked_prefill:
         return ("hybrid linear-attention models reuse FP4 MLA cache blocks "
                 "only with chunked prefill; set enable_chunked_prefill=True")
     return None
@@ -1285,7 +1286,7 @@ def _create_py_executor(
     else:
         ctx_chunk_config = None
 
-    if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
+    if kv_cache_config.enable_block_reuse and declares_recurrent_state(config):
         # Snapshot boundaries come from expect_snapshot_points.  The unit is
         # only used to align chunks shortened by the scheduling budget.
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
@@ -1467,7 +1468,7 @@ def _create_py_executor(
         f"[create_py_executor] Created execution_stream: {execution_stream}")
 
     is_disagg = is_disagg_enabled(cache_transceiver_config)
-    is_hybrid = is_hybrid_linear(
+    is_hybrid = declares_recurrent_state(
         model_engine.model.model_config.pretrained_config)
 
     if is_disagg and is_hybrid:

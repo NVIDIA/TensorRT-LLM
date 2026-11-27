@@ -67,6 +67,18 @@ class _V1LikeManager:
     """A non-V2 manager: predates the appended-draft layer specs."""
 
 
+class _TargetFactorManager(KVCacheManagerV2):
+    """A manager outside the hybrid family whose appended draft layers take its kv_factor."""
+
+    @classmethod
+    def accepts_appended_draft_layers(cls) -> bool:
+        return True
+
+    @classmethod
+    def appended_draft_layers_use_target_kv_factor(cls) -> bool:
+        return True
+
+
 def _mla_model_config(*, kv_quant_algo=None):
     """An MLA target: one K-only head per rank holding the latent."""
     pretrained = SimpleNamespace(
@@ -226,7 +238,9 @@ def test_non_v2_target_manager_keeps_separate_cache(is_disagg: bool) -> None:
 
 
 @pytest.mark.parametrize(
-    "manager_cls", [KVCacheManagerV2, KimiK3HybridCacheManager], ids=["plain_v2", "mamba_hybrid"]
+    "manager_cls",
+    [KVCacheManagerV2, KimiK3HybridCacheManager, _TargetFactorManager],
+    ids=["plain_v2", "mamba_hybrid", "declared_target_factor"],
 )
 @pytest.mark.parametrize("target_is_mla", [True, False])
 @pytest.mark.parametrize("is_disagg", [False, True])

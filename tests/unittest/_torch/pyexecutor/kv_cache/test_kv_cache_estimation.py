@@ -1273,6 +1273,44 @@ def test_creator_uses_v2_affine_cache_cost():
     assert cost == CacheCost(slope=20, intercept=21)
 
 
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_creator_costs_a_recurrent_manager_with_its_family_estimate_kwargs(is_draft):
+    """A target manager that keeps recurrent state is costed with the keyword arguments its family takes from the
+    built model; a draft manager is built without the model and is costed without them."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        MambaHybridCacheManagerV2,
+    )
+
+    model = object()
+    costed_with = []
+
+    class FakeRecurrentManager(MambaHybridCacheManagerV2):
+        @classmethod
+        def family_estimate_kwargs(cls, model):
+            return {"selected_by_model": model}
+
+        @staticmethod
+        def get_cache_size_per_token(model_config, mapping, **kwargs):
+            costed_with.append(kwargs.get("selected_by_model"))
+            return 20, 21
+
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = Mock()
+    creator._tokens_per_block = 64
+    creator._max_seq_len = 1024
+    creator._max_batch_size = 3
+    creator._max_num_tokens = 1024
+    creator._kv_cache_config = KvCacheConfig()
+    creator._speculative_config = None
+    creator._is_disagg = False
+    creator._disable_overlap_scheduler = False
+    creator._model_engine = SimpleNamespace(model=model)
+
+    creator._per_manager_cache_cost(FakeRecurrentManager, Mock(), is_draft=is_draft)
+
+    assert costed_with == [None if is_draft else model]
+
+
 def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
     windowed = KVCacheStorageLayerSpec(
         global_layer_id=0,
@@ -2441,7 +2479,14 @@ def test_derive_v2_windows_skip_hybrid_linear_configs() -> None:
     manager indexes them by global layer id, so the two would disagree."""
     model_config = Mock()
     model_config.pretrained_config = _mixed_schedule_pretrained(
-        [_SLIDING, _FULL, _SLIDING, _FULL], hybrid_override_pattern="M*M*"
+        [_SLIDING, _FULL, _SLIDING, _FULL],
+        architectures=["NemotronHForCausalLM"],
+        hybrid_override_pattern="M*M*",
+        ssm_state_size=16,
+        conv_kernel=4,
+        mamba_num_heads=4,
+        n_groups=1,
+        mamba_head_dim=8,
     )
 
     assert (

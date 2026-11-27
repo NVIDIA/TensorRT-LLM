@@ -207,9 +207,10 @@ def _other_pp_stage_indexer() -> Mock:
 
 
 class _StandInMambaCacheManager:
-    """Concrete stand-in for the abstract Mamba cache-manager type check."""
+    """Stand-in for a cache manager that keeps recurrent state."""
 
     is_context_only_cache = False
+    keeps_recurrent_state = True
 
     def __init__(self, available_tokens: int = 8) -> None:
         self._available_tokens = available_tokens
@@ -307,7 +308,6 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderWa
 
 def _run_mamba_warmup(engine: DecoderWarmup, resource_manager: object) -> None:
     with (
-        mock.patch.object(warmup_module, "MambaHybridCacheManager", _StandInMambaCacheManager),
         mock.patch.object(
             warmup_module.Mamba2Metadata,
             "force_initial_states_for_warmup",
@@ -834,6 +834,7 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     warmup = decoder_warmup(config, dummy_requests=requests, forward_warmup=forward_warmup)
     kv_cache_manager = Mock()
     kv_cache_manager.get_num_available_tokens.return_value = 8
+    kv_cache_manager.keeps_recurrent_state = phase == "mamba"
     resource_manager = Mock()
     resource_manager.get_resource_manager.return_value = kv_cache_manager
     if phase == "general":
@@ -841,8 +842,7 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     elif phase == "attention":
         warmup._run_attention_warmup(resource_manager)
     elif phase == "mamba":
-        with patch.object(decoder_warmup_module, "MambaHybridCacheManager", type(kv_cache_manager)):
-            warmup._run_mamba_hybrid_warmup(resource_manager)
+        warmup._run_mamba_hybrid_warmup(resource_manager)
     else:
         warmup._graphs._capture_prefill_cuda_graphs(resource_manager)
     jit_warmup = {"trtllm_gen_jit_warmup": True} if phase == "attention" else {}
@@ -1346,6 +1346,24 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         self.assertIn("mamba_hybrid", calls)
         self.assertNotIn("general_warmup", calls)
+
+    def test_cache_keeping_recurrent_state_skips_general_and_context_warmup(self) -> None:
+        """A cache manager that declares recurrent state runs neither the general warmup (the
+        memory-pool prepopulation included) nor the attention warmup's context shapes."""
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
+        manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+        manager.keeps_recurrent_state = True
+        tracker = _Tracker()
+        with (
+            patch.object(model_engine, "_run_attention_warmup", side_effect=tracker("attention")),
+            patch.object(
+                model_engine, "_run_mamba_hybrid_warmup", side_effect=tracker("mamba_hybrid")
+            ),
+        ):
+            calls, _ = _run_warmup_tracked(model_engine, resource_manager, tracker=tracker)
+        self.assertNotIn("general_warmup", calls, calls)
+        self.assertEqual(tracker.call_args["attention"], [((resource_manager, False), {})])
+        self.assertEqual(calls.count("mamba_hybrid"), 1, calls)
 
     def _run_stubbed_autotuner_warmup(
         self, **kwargs: AutotunerWarmupMode

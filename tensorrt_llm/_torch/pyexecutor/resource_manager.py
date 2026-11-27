@@ -177,6 +177,15 @@ def is_context_only_kv_cache(
     return kv_cache_manager is not None and kv_cache_manager.is_context_only_cache is True
 
 
+def cache_keeps_recurrent_state(kv_cache_manager: object) -> bool:
+    """Whether a cache manager, or a cache manager class, keeps recurrent (conv/SSM) state.
+
+    The manager answers for the model and not for its rank: a hybrid manager
+    whose rank holds no recurrent layer still answers ``True``.
+    """
+    return getattr(kv_cache_manager, "keeps_recurrent_state", False) is True
+
+
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
 
@@ -215,6 +224,9 @@ class BaseResourceManager(ABC):
     # A cache that omits generation-only state overrides this; see
     # is_context_only_kv_cache.
     is_context_only_cache: bool = False
+    # A cache that holds recurrent (conv/SSM) state overrides this; see
+    # cache_keeps_recurrent_state.
+    keeps_recurrent_state: bool = False
 
     @abstractmethod
     def get_max_resource_count(self) -> int:
@@ -416,12 +428,6 @@ class KVCacheManager(BaseResourceManager):
     # prepare_resources reads it on such test-built instances. Zero disables
     # the spec recompute tail.
     _spec_recompute_tail: int = 0
-    # Whether this manager also holds recurrent (conv/SSM) state. Hybrid
-    # Mamba/GDN managers override this: a reused request's recurrent slot
-    # already summarizes the matched prefix, so a partial rewind would apply
-    # the tokens between the rewind target and the matched length to that
-    # state a second time. Only a full re-prefill (rewind target 0) is safe.
-    _has_recurrent_state: bool = False
 
     @property
     def spec_recompute_tail(self) -> int:
@@ -595,10 +601,10 @@ class KVCacheManager(BaseResourceManager):
         # silently serving a degraded drafter.
         tail = getattr(spec_config, "context_recompute_tail", 0)
         tail = -1 if tail is None else int(tail)
-        if tail > 0 and self._has_recurrent_state:
+        if tail > 0 and self.keeps_recurrent_state:
             # A partial rewind double-applies the rewound span to the
-            # recurrent state (see _has_recurrent_state); only a full
-            # re-prefill rebuilds that state from scratch.
+            # recurrent state, which already summarizes the matched prefix;
+            # only a full re-prefill rebuilds that state from scratch.
             logger.warning(
                 "context_recompute_tail > 0 is unsupported on recurrent-state "
                 "cache managers: a partial rewind would apply reused tokens "

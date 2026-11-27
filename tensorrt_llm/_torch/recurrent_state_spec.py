@@ -46,6 +46,7 @@ __all__ = [
     "PlaneShard",
     "RecurrentStateSpec",
     "StatePlaneSpec",
+    "mamba_params_from_recurrent_state_spec",
     "recurrent_state_spec_from_mamba_params",
 ]
 
@@ -165,26 +166,10 @@ class RecurrentStateSpec:
         return tuple(layer.kind is LayerKind.ATTENTION for layer in self.layers)
 
 
-def recurrent_state_spec_from_mamba_params(
-    params: MambaKVCacheParams,
-    *,
-    conv_sections: Literal["x_b_c", "q_k_v"],
-    extra_planes: Mapping[int, tuple[StatePlaneSpec, ...]] | None = None,
-) -> RecurrentStateSpec:
-    """Declare the state of a model whose recurrent layers share one Mamba-style geometry.
-
-    Each recurrent layer gets a convolution plane ``[inner + 2 * grouped, conv_kernel - 1]`` and
-    an SSM plane ``[num_heads, head_dim, state_size]``, where ``inner = head_dim * num_heads`` and
-    ``grouped = n_groups * state_size``. Both are split across ranks along their first axis.
-
-    Args:
-        params: Geometry, target-layer masks and dtypes of the model.
-        conv_sections: Order of the channel sections of the convolution plane: ``"x_b_c"`` is
-            ``(inner, grouped, grouped)`` and ``"q_k_v"`` is ``(grouped, grouped, inner)``.
-        extra_planes: Further planes of individual layers, keyed by layer index.
-
-    Returns:
-        The declaration of the target-model layers.
+def _mamba_base_planes(
+    params: MambaKVCacheParams, conv_sections: Literal["x_b_c", "q_k_v"]
+) -> tuple[StatePlaneSpec, StatePlaneSpec]:
+    """Return the convolution and SSM planes of a recurrent layer with the geometry of ``params``.
 
     Raises:
         ValueError: If ``conv_sections`` is neither order.
@@ -215,6 +200,34 @@ def recurrent_state_spec_from_mamba_params(
         ),
         shard=PlaneShard(axis=0),
     )
+    return conv_plane, ssm_plane
+
+
+def recurrent_state_spec_from_mamba_params(
+    params: MambaKVCacheParams,
+    *,
+    conv_sections: Literal["x_b_c", "q_k_v"],
+    extra_planes: Mapping[int, tuple[StatePlaneSpec, ...]] | None = None,
+) -> RecurrentStateSpec:
+    """Declare the state of a model whose recurrent layers share one Mamba-style geometry.
+
+    Each recurrent layer gets a convolution plane ``[inner + 2 * grouped, conv_kernel - 1]`` and
+    an SSM plane ``[num_heads, head_dim, state_size]``, where ``inner = head_dim * num_heads`` and
+    ``grouped = n_groups * state_size``. Both are split across ranks along their first axis.
+
+    Args:
+        params: Geometry, target-layer masks and dtypes of the model.
+        conv_sections: Order of the channel sections of the convolution plane: ``"x_b_c"`` is
+            ``(inner, grouped, grouped)`` and ``"q_k_v"`` is ``(grouped, grouped, inner)``.
+        extra_planes: Further planes of individual layers, keyed by layer index.
+
+    Returns:
+        The declaration of the target-model layers.
+
+    Raises:
+        ValueError: If ``conv_sections`` is neither order.
+    """
+    conv_plane, ssm_plane = _mamba_base_planes(params, conv_sections)
 
     extra_planes = extra_planes or {}
     layers = []
@@ -229,3 +242,69 @@ def recurrent_state_spec_from_mamba_params(
             kind, planes = LayerKind.NONE, ()
         layers.append(LayerStateSpec(kind, planes + tuple(extra_planes.get(layer_idx, ()))))
     return RecurrentStateSpec(layers=tuple(layers))
+
+
+def mamba_params_from_recurrent_state_spec(
+    spec: RecurrentStateSpec, *, num_draft_layers: int = 0
+) -> MambaKVCacheParams:
+    """Return the Mamba-style cache parameters of a declaration.
+
+    The inverse of :func:`recurrent_state_spec_from_mamba_params`: it accepts the convolution and
+    SSM planes that function declares, in either section order, and no others. The cache managers
+    take one geometry for all recurrent layers, so these layers must declare the same two planes.
+
+    Args:
+        spec: Declaration of the target-model layers.
+        num_draft_layers: Number of layers appended for one-model speculative decoding.
+
+    Returns:
+        The geometry, target-layer masks and dtypes the cache managers are built from.
+
+    Raises:
+        ValueError: If no layer is recurrent, the recurrent layers differ in their convolution or
+            SSM plane, or these planes are not the ones
+            :func:`recurrent_state_spec_from_mamba_params` declares for some parameters.
+    """
+    from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaRole
+
+    def base_planes(layer: LayerStateSpec) -> tuple[StatePlaneSpec | None, StatePlaneSpec | None]:
+        planes = {plane.role: plane for plane in layer.planes}
+        return planes.get(MambaRole.CONV_STATE), planes.get(MambaRole.SSM_STATE)
+
+    recurrent_layers = [layer for layer in spec.layers if layer.kind is LayerKind.RECURRENT]
+    if not recurrent_layers:
+        raise ValueError("A declaration without a recurrent layer carries no state geometry")
+    conv, ssm = base_planes(recurrent_layers[0])
+    if conv is None or ssm is None:
+        raise ValueError("A recurrent layer declares no convolution or no SSM plane")
+    if any(base_planes(layer) != (conv, ssm) for layer in recurrent_layers[1:]):
+        raise ValueError("Recurrent layers declare different convolution or SSM planes")
+
+    inexpressible = ValueError(
+        f"The cache parameters cannot express the base state {conv} and {ssm}: these are not the "
+        "planes that recurrent_state_spec_from_mamba_params declares"
+    )
+    sections = conv.shard.sections
+    if len(conv.shape) != 2 or len(ssm.shape) != 3 or len(sections) != 3 or ssm.shape[2] < 1:
+        raise inexpressible
+    num_heads, head_dim, state_size = ssm.shape
+    params = MambaKVCacheParams(
+        state_size=state_size,
+        conv_kernel=conv.shape[1] + 1,
+        num_heads=num_heads,
+        n_groups=sections[1] // state_size,
+        head_dim=head_dim,
+        mamba_layer_mask=list(spec.recurrent_layer_mask),
+        target_full_attention_layer_mask=list(spec.attention_layer_mask),
+        num_mamba_layers=sum(spec.recurrent_layer_mask),
+        num_draft_layers=num_draft_layers,
+        dtype=conv.dtype,
+        mamba_ssm_cache_dtype=ssm.dtype,
+    )
+    if (conv, ssm) not in (
+        _mamba_base_planes(params, "x_b_c"),
+        _mamba_base_planes(params, "q_k_v"),
+    ):
+        raise inexpressible
+    return params

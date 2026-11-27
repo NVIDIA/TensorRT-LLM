@@ -2446,6 +2446,13 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         return recurrent_state_spec_from_mamba_params(params,
                                                       conv_sections="q_k_v")
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the cache manager that holds the GDN state."""
+        from ..modules.fla.cache_manager import Qwen35HybridCacheManager
+
+        return Qwen35HybridCacheManager
+
     def load_weights(self,
                      weights: dict,
                      weight_mapper: BaseWeightMapper,

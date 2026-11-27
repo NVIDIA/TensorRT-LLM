@@ -300,7 +300,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     monkeypatch.setattr(
         model_engine, "resolve_mrope_position_deltas_cache", Mock(return_value=None)
     )
-    monkeypatch.setattr(model_engine, "is_hybrid_linear", Mock(return_value=False))
+    monkeypatch.setattr(model_engine, "declares_recurrent_state", Mock(return_value=False))
     scheduler = (
         SimpleNamespace(
             encoder_max_num_tokens=65536,

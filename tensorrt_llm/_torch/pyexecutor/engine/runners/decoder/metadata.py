@@ -12,11 +12,11 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
     KVCacheManager,
     ResourceManagerType,
+    cache_keeps_recurrent_state,
 )
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
@@ -125,7 +125,7 @@ class DecoderMetadata:
             max_total_draft_tokens=self._config.max_total_draft_tokens,
             enable_ragged_verification=self._ragged_verification_enabled,
         )
-        if isinstance(kv_cache_manager, BaseMambaCacheManager):
+        if cache_keeps_recurrent_state(kv_cache_manager):
             self.attn_metadata.mamba_chunk_size = getattr(
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )

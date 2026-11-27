@@ -5118,7 +5118,7 @@ def test_recurrent_state_managers_allow_only_a_full_reprefill_tail(
     torch.cuda.init()
 
     class _RecurrentManager(KVCacheManagerV2):
-        _has_recurrent_state = True
+        keeps_recurrent_state = True
 
     manager_cls = _RecurrentManager if has_recurrent_state else KVCacheManagerV2
     manager = _make_spec_recompute_manager(

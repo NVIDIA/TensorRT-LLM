@@ -901,6 +901,37 @@ class DecoderModelForCausalLM(nn.Module,
         return None
 
     @classmethod
+    def requires_kv_cache_manager_v2(cls,
+                                     pretrained_config: Any = None) -> bool:
+        """Return whether KV cache manager V2 is the model's only supported route.
+
+        Such a model is never demoted to V1: an explicit
+        ``kv_cache_config.use_kv_cache_manager_v2=False`` and a route that
+        cannot keep V2 are rejected.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config.
+        """
+        return False
+
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(
+            cls, pretrained_config: Any) -> Optional[type]:
+        """Return the V2 cache manager class of the model's recurrent family.
+
+        An architecture that overrides :meth:`get_recurrent_state_spec`
+        overrides this too. A VLM wrapper forwards to the class of its
+        language model.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config.
+
+        Returns:
+            ``None`` for an architecture without recurrent layers.
+        """
+        return None
+
+    @classmethod
     def get_recurrent_state_spec(
         cls,
         pretrained_config: Any,
@@ -1371,6 +1402,18 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     return MODEL_CLASS_MAPPING.get(model_arch)
 
 
+def resolve_model_class(pretrained_config: Any) -> Optional[type]:
+    """Return the model class registered for a config's architecture name.
+
+    The name is ``pretrained_config.architectures[0]``. ``None`` means the
+    config names no architecture, or the name is not registered.
+    """
+    architectures = getattr(pretrained_config, 'architectures', None)
+    if not architectures:
+        return None
+    return get_registered_model_class(architectures[0])
+
+
 def resolve_recurrent_state_spec(
     pretrained_config: Any,
     *,
@@ -1378,19 +1421,39 @@ def resolve_recurrent_state_spec(
 ) -> Optional['RecurrentStateSpec']:
     """Return the recurrent-state declaration of the model class of a config.
 
-    The class is the one registered for ``pretrained_config.architectures[0]``.
-    ``None`` means that class declares no recurrent state, or that no class
-    can be found: the config names no architecture, or the name is not
-    registered.
+    The class is the one :func:`resolve_model_class` finds. ``None`` means
+    that class declares no recurrent state, or that no class can be found.
     """
-    architectures = getattr(pretrained_config, 'architectures', None)
-    if not architectures:
-        return None
-    model_cls = get_registered_model_class(architectures[0])
+    model_cls = resolve_model_class(pretrained_config)
     get_spec = getattr(model_cls, 'get_recurrent_state_spec', None)
     if get_spec is None:
         return None
     return get_spec(pretrained_config, quant_config=quant_config)
+
+
+def declares_recurrent_state(pretrained_config: Any) -> bool:
+    """Whether the model class of a config declares recurrent state.
+
+    True for every declaration :func:`resolve_recurrent_state_spec` returns,
+    including one without a recurrent layer. False when that class declares
+    no recurrent state, or when no class can be found.
+    """
+    return resolve_recurrent_state_spec(pretrained_config) is not None
+
+
+def resolve_recurrent_kv_cache_manager_cls(
+        pretrained_config: Any) -> Optional[type]:
+    """Return the V2 cache manager class of the recurrent family of a config.
+
+    The model class that :func:`resolve_model_class` finds declares it.
+    ``None`` means that class has no recurrent family, or that no class can
+    be found.
+    """
+    model_cls = resolve_model_class(pretrained_config)
+    get_cls = getattr(model_cls, 'get_recurrent_kv_cache_manager_cls', None)
+    if get_cls is None:
+        return None
+    return get_cls(pretrained_config)
 
 
 def is_model_arch_known(model_arch: str) -> bool:

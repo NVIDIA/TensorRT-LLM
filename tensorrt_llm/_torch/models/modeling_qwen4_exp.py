@@ -1244,6 +1244,13 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
             },
         )
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the cache manager that holds the GDN state and the PLE state."""
+        from ..modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
+
+        return Qwen4ExpHybridCacheManager
+
     def load_weights(
         self,
         weights: dict,
@@ -1324,6 +1331,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
         """Return the text core's declaration, read from ``text_config``."""
         text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
         return Qwen4ExpForCausalLM.get_recurrent_state_spec(text_config, quant_config=quant_config)
+
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the text core's cache manager class."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return Qwen4ExpForCausalLM.get_recurrent_kv_cache_manager_cls(text_config)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs) -> None:
         kwargs["vision_model_class"] = Qwen3VisionModel

@@ -1105,6 +1105,15 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
             pretrained_config, quant_config=quant_config
         )
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the text decoder's cache manager class."""
+        return Glm5NextForCausalLM.get_recurrent_kv_cache_manager_cls(pretrained_config)
+
+    @classmethod
+    def requires_kv_cache_manager_v2(cls, pretrained_config: Any = None) -> bool:
+        return Glm5NextForCausalLM.requires_kv_cache_manager_v2(pretrained_config)
+
     @property
     def mamba_metadata_cls(self):
         # The engine resolves the Mamba metadata class from the top-level model.

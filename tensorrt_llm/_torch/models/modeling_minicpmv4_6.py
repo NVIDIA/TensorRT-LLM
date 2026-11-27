@@ -69,6 +69,7 @@ from .modeling_utils import (
     QuantConfig,
     _load_weights_impl,
     register_auto_model,
+    resolve_recurrent_kv_cache_manager_cls,
     resolve_recurrent_state_spec,
 )
 
@@ -928,6 +929,12 @@ class MiniCPMV4_6Model(PreTrainedModel):
         """Return the declaration of the language model that ``text_config`` selects."""
         text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
         return resolve_recurrent_state_spec(text_config, quant_config=quant_config)
+
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> Optional[type]:
+        """Return the cache manager class of the language model that ``text_config`` selects."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return resolve_recurrent_kv_cache_manager_cls(text_config)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config

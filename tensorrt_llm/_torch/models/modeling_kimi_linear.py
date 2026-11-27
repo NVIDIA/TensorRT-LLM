@@ -3739,6 +3739,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         params = get_kimi_cache_params(pretrained_config, quant_config=quant_config)
         return recurrent_state_spec_from_mamba_params(params, conv_sections="q_k_v")
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the cache manager that holds the KDA state beside the MLA cache."""
+        from ..modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+
+        return KimiK3HybridCacheManager
+
     # ------------------------------------------------------------------
     # Weight loading (streams the 1.5TB checkpoint; only the rank-local
     # expert slice of each MoE layer is kept: whole experts under MoE EP,
