@@ -1133,7 +1133,8 @@ class OpenAIServer(_VideoRoutesMixin):
         return int(self.tokenizer.tokenizer.vocab_size)
 
     @staticmethod
-    def _is_loopback_listener(host: str, sockets: Optional[list[socket.socket]]) -> bool:
+    def _is_loopback_listener(host: str,
+                              sockets: Optional[list[socket.socket]]) -> bool:
         if sockets:
             return all(
                 isinstance(address := sock.getsockname(), tuple)
@@ -1148,7 +1149,8 @@ class OpenAIServer(_VideoRoutesMixin):
                              "cache_transceiver_config to be configured")
         key = getattr(self, "_internal_disagg_auth_key", None)
         if protected and not key:
-            local_listener = getattr(self, "_internal_listener_is_loopback", None)
+            local_listener = getattr(self, "_internal_listener_is_loopback",
+                                     None)
             if local_listener is None:
                 host = getattr(self, "host", None)
                 if raw_request is not None:
@@ -4629,7 +4631,8 @@ class OpenAIServer(_VideoRoutesMixin):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
-        self._internal_listener_is_loopback = self._is_loopback_listener(host, sockets)
+        self._internal_listener_is_loopback = self._is_loopback_listener(
+            host, sockets)
         self.port = port
         # Without graceful_shutdown_timeout, uvicorn keeps its default and
         # waits for every request handler during graceful shutdown.

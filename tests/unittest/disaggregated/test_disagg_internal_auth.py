@@ -247,6 +247,7 @@ def test_worker_uses_the_actual_prebound_socket():
 
 def test_worker_admission_uses_bound_listener_scope():
     from types import SimpleNamespace
+
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
     server = object.__new__(OpenAIServer)

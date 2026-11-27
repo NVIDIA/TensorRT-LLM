@@ -82,7 +82,9 @@ class PeerRegistrar:
         ] = {}  # key: (peer_key, self_lg_pool_key, peer_lg_pool_key)
         self._self_ext_cache = self_extractor
         self._overlap_cache: dict[tuple[str, int, int], tuple[RankInfo, PeerOverlap]] = {}
-        self._aux_transfer_layout_cache: dict[tuple[str, int], tuple[Optional[RankInfo], AuxTransferLayout]] = {}
+        self._aux_transfer_layout_cache: dict[
+            tuple[str, int], tuple[Optional[RankInfo], AuxTransferLayout]
+        ] = {}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
         assert self._self_ext_cache is not None
@@ -170,13 +172,20 @@ class PeerRegistrar:
         return cached[1] if cached is not None and cached[0] is expected_info else None
 
     def cache_aux_transfer_layout(
-        self, peer_name: str, peer_rank: int, layout: AuxTransferLayout, expected_info: Optional[RankInfo] = None
+        self,
+        peer_name: str,
+        peer_rank: int,
+        layout: AuxTransferLayout,
+        expected_info: Optional[RankInfo] = None,
     ) -> None:
         key = self._unique_key(peer_name, peer_rank)
         current = self._registered.get(key)
         if expected_info is not None and (current is None or current.info is not expected_info):
             return
-        self._aux_transfer_layout_cache[key] = (current.info if current is not None else None, layout)
+        self._aux_transfer_layout_cache[key] = (
+            current.info if current is not None else None,
+            layout,
+        )
 
     @property
     def self_rank_info(self) -> RankInfo:

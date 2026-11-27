@@ -924,7 +924,10 @@ def test_peer_registrar_caches_and_invalidates_aux_transfer_layout():
     extractor = reg.peer_extractor("peer", 1, expected_info=peer_ri)
     assert extractor.page_table is peer_ri.page_table
     reg.cache_aux_transfer_layout("peer", 1, layout, expected_info=peer_ri)
-    assert reg.get_aux_transfer_layout("peer", 1, expected_info=replacement_peer_ri) is replacement_layout
+    assert (
+        reg.get_aux_transfer_layout("peer", 1, expected_info=replacement_peer_ri)
+        is replacement_layout
+    )
     assert reg.get_aux_transfer_layout("peer", 1, expected_info=peer_ri) is None
 
     reg.unregister("peer", 1)
