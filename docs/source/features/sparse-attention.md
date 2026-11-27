@@ -479,7 +479,7 @@ kv_cache_config:
   dtype: nvfp4  # fp8 is also supported
   tokens_per_block: 128
   use_kv_cache_manager_v2: true
-  enable_block_reuse: true
+  enable_block_reuse: true  # text-only deployments; see below
 sparse_attention_config:
   algorithm: minimax_m3
   implementation: msa
@@ -505,7 +505,12 @@ when unset, sizing follows the shared sparse offload memory planner. CUDA graphs
 reuse the same arena and page-table allocations across batch changes.
 
 KV cache manager V2 supports reuse of received prompt blocks on MSA generation
-workers, including with offload enabled. Repeated prompts reuse sparse K/V and
+workers, including with offload enabled, for text-only deployments. The
+`trtllm-serve` handoff from the context worker to the generation worker does not
+carry the hashes of image and video inputs, so a generation worker cannot
+distinguish prompts whose token IDs match but whose images or videos differ.
+When the deployment serves image or video inputs, keep `enable_block_reuse: false`
+on the generation worker. Repeated prompts reuse sparse K/V and
 NVFP4 scales from host pages together with the resident dense K/V and index
 keys. The KV transfer skips reused full blocks and transfers the remaining
 suffix, including any partial block. Offloaded generation history is not
