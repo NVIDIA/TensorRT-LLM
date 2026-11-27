@@ -4,14 +4,16 @@
 balancer (512 slots, home route tables, no runtime), at decode (8 / 64 / 128 rows per rank, the one-round router;
 on SM107 the generation-phase kernel up to 1024) and prefill (1024 / 4096 / 8192, the metadata-push router) sizes.
 
-Bit for bit: an adaptive layer whose dispatch router maps and counts its routes returns what the same layer returns
-on the staged route, and what a layer without the balancer returns; its statistics are the routing's picks of the
-live rows, nothing while the recording flag is clear; the picks a malformed table drops add nothing and are not
-waited for. A graph captured on home tables replays an install as eager routes it, and the server's mixed forward
-captures after its warmup and replays as eager. Under ``balance`` off the 512-slot layers return what the layers
-without a balancer return and launch the same kernels.
+Bit for bit where both layers add the top-k picks in one fixed order (_same): an adaptive layer whose dispatch
+router maps and counts its routes returns what the same layer returns on the staged route, and what a layer without
+the balancer returns; its statistics are the routing's picks of the live rows, nothing while the recording flag is
+clear; the picks a malformed table drops add nothing and are not waited for. A graph captured on home tables
+replays an install as eager routes it, and the server's mixed forward captures after its warmup and replays as
+eager. Under ``balance`` off the 512-slot layers return what the layers without a balancer return and launch the
+same kernels.
 """
 
+import functools
 import pickle
 import sys
 from typing import Optional
@@ -57,13 +59,95 @@ def _assert_on_all_ranks(problem: Optional[str]) -> None:
     assert not any(problems), problems
 
 
-def _same(backend, rows: int, got, want) -> bool:
-    """Bit for bit, except in a bucket whose kernel sums the top-k picks in its FC2 epilogue (the SM107
-    32-row bucket): there the picks add in arrival order, so the outputs agree within bf16 rounding."""
-    bucket = backend._select_launch_max_tokens(rows)
-    if not backend._use_in_kernel_fc2_reduce(bucket):
+# Unit roundoff of bf16 (8 significand bits): a rounding moves a value by at most 2^-8 of it.
+_BF16_UNIT_ROUNDOFF = 2.0**-8
+
+
+def _fixed_order(backend, rows: int, other=None) -> bool:
+    """Whether two runs of ``rows`` rows, on ``backend`` and on ``other`` (default the same layer), add
+    each row's top-k terms in one fixed order: neither sums them in its FC2 epilogue in arrival order
+    (the SM107 32-row bucket), and both run one kernel tactic (on SM107 the layer without a balancer,
+    96 experts per GPU, takes combine dedup at 8192 rows where the 128-slot layer does not)."""
+    if backend._use_in_kernel_fc2_reduce(backend._select_launch_max_tokens(rows)):
+        return False
+    return (
+        other is None
+        or other is backend
+        or backend._decode_tactic(rows) == other._decode_tactic(rows)
+    )
+
+
+def _pick_terms(backends, run) -> list:
+    """The terms the top-k reduce adds, as the kernels compute them: ``run()``'s outputs once per pick
+    position j, with every other pick of every row set to -1, which the route drops. A row's FC2 output
+    depends on no other row or pick, so the j-th output is the j-th pick's term of each row. The fused
+    route also wrote the picks into the launch bucket, which the launch then reads as they are: both
+    are masked."""
+    terms = []
+    for j in range(_TOP_K):
+        fused = [backend.try_fused_route_quant for backend in backends]
+
+        def keep_one(*args, _fused, _j=j, **kwargs):
+            backend = _fused.__self__
+            result = _fused(*args, **kwargs)
+            assert result is not None, "splitting the reduce into terms needs the fused route"
+            ids = result.token_selected_experts
+            picks = [ids]
+            staged = backend._prestaged
+            if staged is not None and staged[1] is ids:
+                picks.append(staged[0][: ids.shape[0]])
+            for tensor in picks:
+                kept = tensor[:, _j].clone()
+                tensor.fill_(-1)
+                tensor[:, _j] = kept
+            return result
+
+        for backend, original in zip(backends, fused):
+            backend.try_fused_route_quant = functools.partial(keep_one, _fused=original)
+        try:
+            terms.append(run())
+        finally:
+            for backend, original in zip(backends, fused):
+                backend.try_fused_route_quant = original
+    return terms
+
+
+def _order_bound(terms, layer: int) -> torch.Tensor:
+    """Elementwise bound on the difference of two bf16 sums of one row's k = top-k terms (the test
+    builds no shared expert) taken in different orders. Each sum rounds at most k times: k - 1
+    additions and its conversion to the output, or, for a layer that adds the terms in fp32, the
+    terms' own roundings. Each rounding moves the partial result by at most u times its magnitude,
+    and every partial result is at most sum |t_j|, so each sum lies within gamma_k * sum |t_j| of the
+    exact sum, gamma_k = k u / (1 - k u) (Higham, Accuracy and Stability of Numerical Algorithms,
+    Lemma 3.1 and Section 4.2), and the two within twice that. The terms come back from the kernel
+    rounded to bf16 (|t| <= |t_hat| / (1 - u))."""
+    u, k = _BF16_UNIT_ROUNDOFF, _TOP_K
+    gamma = k * u / (1 - k * u)
+    magnitude = torch.stack([t[layer].float().abs() for t in terms]).sum(0)
+    return 2 * gamma / (1 - u) * magnitude
+
+
+def _same(got, want, terms=None) -> bool:
+    """Bit for bit; with ``terms`` (_pick_terms of the run that gave ``want``) within _order_bound."""
+    if terms is None:
         return all(torch.equal(a, b) for a, b in zip(got, want))
-    return all(torch.allclose(a, b, rtol=1.6e-2, atol=1e-5) for a, b in zip(got, want))
+    return all(
+        bool(((a.float() - b.float()).abs() <= _order_bound(terms, i)).all())
+        for i, (a, b) in enumerate(zip(got, want))
+    )
+
+
+def _check_terms(terms, want) -> Optional[str]:
+    """The split is right and the bound discriminates: the terms add up to ``want`` within the bound,
+    and ``want`` without its first pick (what a pick summed into the wrong slot loses) breaks it."""
+    for i, out in enumerate(want):
+        bound = _order_bound(terms, i)
+        total = torch.stack([t[i].float() for t in terms]).sum(0)
+        if not bool(((total - out.float()).abs() <= bound).all()):
+            return "the pick terms do not add up to the output"
+        if not bool((terms[0][i].float().abs() > bound).any()):
+            return "dropping a pick stays within the order bound"
+    return None
 
 
 def _replica_row(packed: list) -> torch.Tensor:
@@ -185,6 +269,8 @@ def _run() -> None:
         balancer.finalize_model()
         prepare_layers(find_backends(adaptive, balancer.layers), balancer.layers, device)
         backends = [layer.experts.backend for layer in adaptive]
+        plain_backend = plain[0].experts.backend
+        plain_backends = [layer.experts.backend for layer in plain[:2]]
         router_route = type(backends[0]).routes_adaptive_in_router
 
         def use_router(on: bool) -> None:
@@ -233,9 +319,20 @@ def _run() -> None:
                 )
             picks = torch.bincount(picked[0].reshape(-1).long(), minlength=_NUM_EXPERTS).float()
             problem = None
+            # Outside one fixed order, and at the smallest bucket on every arch so the split and the bound
+            # are checked where the comparison is exact too: the terms of the router's route.
+            terms = None
+            if rows == _DECODE_ROWS[0] or not _fixed_order(backends[0], rows, plain_backend):
+                terms = _pick_terms(backends[:2], lambda: forward(adaptive, x, counts))
+                problem = _check_terms(terms, routed)
+                problem = problem and f"{rows} rows: {problem}"
             for name, got in (("staged", staged), ("router", routed)):
-                if not _same(backends[0], rows, got, want):
+                exact = _fixed_order(backends[0], rows, plain_backend)
+                if problem is None and not _same(got, want, None if exact else terms):
                     problem = f"{rows} rows: the {name} route's output differs from the layer without a balancer"
+            exact = _fixed_order(backends[0], rows)
+            if problem is None and not _same(routed, staged, None if exact else terms):
+                problem = f"{rows} rows: the router route's output differs from the staged route's"
             if problem is None and not torch.equal(stats["rows"][0].cpu(), picks.cpu()):
                 problem = f"{rows} rows: the router's statistics differ from the routing's picks"
             if problem is None and int(stats["forwards"][0].item()) != 1:
@@ -245,9 +342,10 @@ def _run() -> None:
             _assert_on_all_ranks(problem)
 
         # balance off: layers of the 512-slot configuration run as the layers without a balancer, on their
-        # home slots: the same outputs bit for bit and the same kernel launches (name, grid, block, shared
-        # memory), with no route op, statistics or runtime. Before any capture: their home kernel's first
-        # eager launch fences the adaptive layers' shared workspace.
+        # home slots: the same outputs (bit for bit in one fixed order, else within the order bound of the
+        # plain layers' terms) and the same kernel launches (name, grid, block, shared memory), with no
+        # route op, statistics or runtime. Before any capture: their home kernel's first eager launch
+        # fences the adaptive layers' shared workspace.
         off_config = model_config(False)
         off_config.moe_load_balancer = MoeAdaptiveLoadBalancerConfig(
             num_slots=_NUM_SLOTS, balance="off"
@@ -265,7 +363,12 @@ def _run() -> None:
             counts = [rows] * world_size
             x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
             want, got = forward(plain, x, counts), forward(off, x, counts)
-            if problem is None and not all(torch.equal(a, b) for a, b in zip(got, want)):
+            terms = None
+            if problem is None and not _fixed_order(off[0].experts.backend, rows, plain_backend):
+                terms = _pick_terms(plain_backends, lambda: forward(plain, x, counts))
+                problem = _check_terms(terms, want)
+                problem = problem and f"{rows} rows: balance off: {problem}"
+            if problem is None and not _same(got, want, terms):
                 problem = f"{rows} rows: balance off differs from the layer without a balancer"
         for rows in _DECODE_ROWS:
             if problem is None and _launches(off[0], rows) != _launches(plain[0], rows):
@@ -298,9 +401,12 @@ def _run() -> None:
                 got["dropped", router] = forward(adaptive, x, counts)
             torch.cuda.synchronize()
             problem = None
-            if _same(backends[0], rows, got["dropped", False], got["full", False]):
+            assert _fixed_order(backends[0], rows), (
+                "the malformed-table rows sum in one fixed order"
+            )
+            if _same(got["dropped", False], got["full", False]):
                 problem = f"{rows} rows: the malformed table dropped no pick"
-            elif not _same(backends[0], rows, got["dropped", True], got["dropped", False]):
+            elif not _same(got["dropped", True], got["dropped", False]):
                 problem = f"{rows} rows: the router's dropped picks add to the output"
             _assert_on_all_ranks(problem)
         tables.copy_(home_tables)
@@ -350,7 +456,15 @@ def _run() -> None:
             torch.cuda.synchronize()
             eager = adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size).clone()
             torch.cuda.synchronize()
-            same = _same(backends[0], rows, [slot], [eager])
+            terms = None
+            if not _fixed_order(backends[0], rows):
+                terms = _pick_terms(
+                    backends[:1],
+                    lambda rows=rows: [
+                        adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size).clone()
+                    ],
+                )
+            same = _same([slot], [eager], terms)
             _assert_on_all_ranks(
                 None if same else f"{rows} rows: the replay after an install differs from eager"
             )
@@ -381,7 +495,10 @@ def _run() -> None:
             if problem is None:
                 graph.replay()
                 torch.cuda.synchronize()
-                if not _same(backends[0], rows, got, want):
+                assert _fixed_order(backends[0], rows), (
+                    "the mixed-forward rows sum in one fixed order"
+                )
+                if not _same(got, want):
                     problem = f"{rows} rows: the captured mixed forward differs from eager"
             del graph
             _assert_on_all_ranks(problem)
