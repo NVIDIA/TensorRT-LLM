@@ -1668,7 +1668,9 @@ class BaseLLM:
             sampling_params,
             fused_sampling=bool(mode is not None and mode.is_fused),
             logit_edits_unsupported=spec_sampler_base.
-            logit_edits_unsupported_reason(self.args.speculative_config))
+            logit_edits_unsupported_reason(self.args.speculative_config),
+            target_logprobs_unsupported=spec_sampler_base.
+            target_logprobs_unsupported_reason(self.args.speculative_config))
         if reason is not None:
             raise RequestError(reason)
 
