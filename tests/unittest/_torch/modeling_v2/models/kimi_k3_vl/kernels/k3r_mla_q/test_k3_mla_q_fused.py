@@ -207,7 +207,6 @@ def _fp4_case(n, kv, seed):
         _paged_kv_indptr=indptr,
         paged_kv_indptr_decode=indptr.clone(),
         num_sequences=n,
-        num_blocks=None,
         num_context_blocks=n * stride,
         num_generation_blocks=0,
     )
@@ -240,6 +239,7 @@ def _fp4_case(n, kv, seed):
     md.num_contexts = 0
     state.num_context_blocks = 0
     state.num_generation_blocks = n * stride
+    state.generation_max_pages = stride
     md.kv_lens_cuda_runtime = torch.tensor(seq_lens, dtype=torch.int32, device=dev)
     md.prompt_lens_cuda_runtime = torch.full((n,), Q_LEN, dtype=torch.int32, device=dev)
     md.prompt_lens_cpu_runtime = torch.full((n,), Q_LEN, dtype=torch.int32)
