@@ -35,6 +35,7 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -77,12 +78,12 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //                                    arena region + ExecCtx and launch gather. postWrite is deferred
 //                                    to drainGatherReady() until both gather completion and credit
 //                                    availability have been observed.
-//        [S] ACK(rid, chunk, h)   -> releaseLocal() that chunk's region; acked++;
+//        [S] ACK(rid, chunk, h)   -> count the completed remote scatter;
 //                                    all acked -> resolve the request's future SUCCESS.
 //        [R] WANT(rid, sizes[])   -> scheduler.onWant(peer:rid, sizes) -> send GRANT(s).
 //        [R] DATA(rid, chunk, h, plan) -> enqueue a scatter job over region `h`.
 //   2. poll every in-flight write (TransferStatus::wait(0)); on Done send DATA (data has
-//      landed at the remote) and mark on-wire. THIS is why no notifMsg is needed.
+//      landed at the remote) and recycle the local staging region after the handle is released.
 //   3. drain scatter completions posted by workers: release receiver regions and re-GRANT.
 //
 // Scatter workers (receiver): pop a job, scatter region->dst via the kernel, synchronize the
@@ -312,7 +313,7 @@ public:
     /// stream is idle (non-blocking cudaStreamQuery), and return the exec context. Returns true if
     /// any freed. Keeps failRequest off the GPU: the IO thread never blocks on a stream sync.
     bool drainOrphanGather();
-    /// Retry parked credits for every request (called on the IO loop after ACKs free regions).
+    /// Retry parked credits after local staging regions or gather contexts become available.
     void drainPendingPosts();
     /// Fail requests that have made no progress within requestTimeoutMs (e.g. peer never granted).
     void checkTimeouts();
@@ -347,7 +348,7 @@ private:
                       // (an unrecorded event queries as "complete", so its event must NOT be trusted)
         Gathered,     // gather event signalled, exec ctx returned; waiting for the credit (eager gather)
         Writing,      // gather done; RDMA write issued (xfer valid); polling getXferStatus
-        Sent,         // getXferStatus==Done -> DATA emitted; xfer released; awaiting ACK
+        Sent,         // DATA emitted; local staging is returned or owned by an orphan; awaiting scatter ACK
     };
 
     friend class BounceSenderStateTest;
@@ -355,7 +356,7 @@ private:
     struct Posted
     {
         std::uint32_t chunkIdx{};
-        std::uint64_t localOffset{};          // shared-arena region held for gather/write until ACK (OUTGOING_HELD)
+        std::uint64_t localOffset{};          // shared-arena region owned by the chunk only before Sent
         ExecCtx* ctx{nullptr};                // gather exec context, borrowed while the gather runs (until Gathered)
         std::unique_ptr<TransferStatus> xfer; // in-flight RDMA write (set once state == Writing;
                                               // nullptr after release, or if the post itself failed)
@@ -415,7 +416,7 @@ private:
         // start (no gather region / exec context free — the shared arena is used across peers and can
         // be oversubscribed) or, with eager gather, the chunk posted before its GRANT arrived and the
         // credit is about to be attached. The IO thread NEVER blocks on acquire; it parks the credit
-        // here and retries each loop iteration as ACKs free regions. FIFO: paired with chunks in order.
+        // here and retries each loop iteration as regions become available. FIFO: paired with chunks in order.
         std::deque<BounceCreditEntry> pendingCredits;
         std::shared_ptr<std::promise<BounceResult>> promise;
         // Set by the abandon sites (GRANT mispair / plan overflow): the request then dies through
@@ -433,10 +434,8 @@ private:
         std::uint64_t nvtxArenaStarved{0};  // credits parked: no local region / exec ctx -> parked credits drain
     };
 
-    // Regions of a FAILED request whose RDMA write was still in flight (state == Writing).
-    // The NIC may still be reading the source region, so recycling is deferred until the write reaches
-    // a terminal state — drainOrphanLocal() polls and only then releases the xfer handle + returns the
-    // region. IO-thread-only (no lock). (xfer handle, arena offset).
+    // Local staging retained by an in-flight write of a failed request, or by a completed write
+    // whose backend refused to release its handle. The IO thread returns the region after release.
     struct OrphanLocal
     {
         std::unique_ptr<TransferStatus> xfer;
@@ -444,6 +443,7 @@ private:
         std::uint64_t rid{};
         std::chrono::steady_clock::time_point since{}; // when the write was orphaned (age for the stall warning)
         bool warned{false};                            // stall WARNING already emitted once
+        std::chrono::steady_clock::time_point retryReleaseAfter{};
     };
 
     // Staging regions of a FAILED request whose gather may still be running (state == Gathering, or
@@ -498,7 +498,7 @@ private:
     RequestTable mRequests;
     std::atomic<std::uint64_t> mNextRid{1};
 
-    std::vector<OrphanLocal> mOrphanLocal;
+    std::list<OrphanLocal> mOrphanLocal;
     std::vector<OrphanGather> mOrphanGather;
     // A failed request's cancel (empty WANT) must be DEFERRED while any of its RDMA writes are still
     // in flight: those writes are landing on the RECEIVER's regions, and an early cancel would let the

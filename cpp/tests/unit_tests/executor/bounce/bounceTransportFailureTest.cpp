@@ -100,6 +100,37 @@ private:
     bool mReleased{false};
 };
 
+// Retain a real NIXL write handle on demand while leaving its transfer and completion query intact.
+class ControlledReleaseStatus final : public kvc::TransferStatus
+{
+public:
+    ControlledReleaseStatus(std::unique_ptr<kvc::TransferStatus> status, std::shared_ptr<XferControls> controls)
+        : mStatus(std::move(status))
+        , mControls(std::move(controls))
+    {
+    }
+
+    bool isCompleted() const override
+    {
+        return mStatus->isCompleted();
+    }
+
+    kvc::TransferState wait(int64_t timeout) const override
+    {
+        return mStatus->wait(timeout);
+    }
+
+    bool release() override
+    {
+        ++mControls->releaseCount;
+        return mControls->releaseSucceeds && mStatus->release();
+    }
+
+private:
+    std::unique_ptr<kvc::TransferStatus> mStatus;
+    std::shared_ptr<XferControls> mControls;
+};
+
 // The fault-injection seam: a REAL NixlTransferAgent (control plane / metadata untouched) whose
 // low-level write primitive is overridden per XferControls — real NIXL cannot be coerced into a
 // deterministic write failure.
@@ -119,7 +150,12 @@ public:
         mCtl->postCount.fetch_add(1, std::memory_order_relaxed);
         if (mCtl->useNixl.load(std::memory_order_acquire))
         {
-            return kvc::NixlTransferAgent::postXferRequest(op, local, remote, peer, notification);
+            auto status = kvc::NixlTransferAgent::postXferRequest(op, local, remote, peer, notification);
+            if (status && !mCtl->releaseSucceeds)
+            {
+                return std::make_unique<ControlledReleaseStatus>(std::move(status), mCtl);
+            }
+            return status;
         }
         return std::make_unique<FakeXferStatus>(mCtl);
     }
@@ -376,6 +412,97 @@ TEST(BounceTransportFailure, SealedWindowAllowsTheOriginalWriterToDrain)
 {
     checkFailedWriteDrain(true);
 }
+
+class BounceLocalStaging : public ::testing::TestWithParam<bool>
+{
+};
+
+TEST_P(BounceLocalStaging, ReusesTheOnlySlotAfterHandleRelease)
+{
+    using namespace std::chrono_literals;
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    auto config = cfg(15000);
+    auto senderConfig = config;
+    capRegions(senderConfig, 1);
+    auto controls = std::make_shared<XferControls>();
+    controls->useNixl = true;
+    bool const holdHandle = GetParam();
+    controls->releaseSucceeds = !holdHandle;
+    auto sender = makeFakeNode("stagingA", senderConfig, controls);
+    std::promise<void> reached;
+    auto queued = reached.get_future();
+    std::promise<void> resume;
+    auto delayed = bounce_test::makeNode("stagingB", config, 1024, nullptr,
+        std::make_unique<PauseAfterData>("stagingB", std::move(reached), resume.get_future()));
+    auto other = bounce_test::makeNode("stagingC", config, 1024);
+    if (!sender || !delayed || !other)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    bounce_test::wirePair(*sender, *delayed);
+    bounce_test::wirePair(*sender, *other);
+    std::vector<b::ExecCtx*> held;
+    while (auto* ctx = delayed->exec->tryAcquire())
+    {
+        held.push_back(ctx);
+    }
+    auto releaseScatter = [&]
+    {
+        for (auto* ctx : held)
+        {
+            delayed->exec->release(ctx);
+        }
+        held.clear();
+    };
+    auto firstBuffers = bounce_test::makeXferBufs(8, 256, 17);
+    auto secondBuffers = bounce_test::makeXferBufs(8, 256, 23);
+    auto first = bounce_test::submitTransfer(*sender, *delayed, firstBuffers);
+    EXPECT_EQ(queued.wait_for(5s), std::future_status::ready);
+    resume.set_value();
+    EXPECT_EQ(first.wait_for(0s), std::future_status::timeout);
+
+    auto second = bounce_test::submitTransfer(*sender, *other, secondBuffers);
+    if (holdHandle)
+    {
+        // Even a genuine scatter ACK cannot free a slot whose NIXL handle is still retained.
+        releaseScatter();
+        EXPECT_EQ(first.wait_for(5s), std::future_status::ready);
+        EXPECT_EQ(second.wait_for(200ms), std::future_status::timeout);
+        EXPECT_EQ(controls->postCount.load(), 1U);
+        EXPECT_GT(controls->releaseCount.load(), 0U);
+        controls->releaseSucceeds = true;
+    }
+    auto secondReady = second.wait_for(5s);
+    EXPECT_EQ(secondReady, std::future_status::ready);
+    if (secondReady == std::future_status::ready)
+    {
+        EXPECT_EQ(second.get().state, kvc::TransferState::kSUCCESS);
+        EXPECT_TRUE(bounce_test::verifyXferBufs(secondBuffers));
+    }
+    if (!holdHandle)
+    {
+        // The second write reused the first write's staging slot before its destination scattered.
+        EXPECT_EQ(first.wait_for(0s), std::future_status::timeout);
+    }
+    releaseScatter();
+    auto firstReady = first.wait_for(5s);
+    EXPECT_EQ(firstReady, std::future_status::ready);
+    if (firstReady == std::future_status::ready)
+    {
+        EXPECT_EQ(first.get().state, kvc::TransferState::kSUCCESS);
+        EXPECT_TRUE(bounce_test::verifyXferBufs(firstBuffers));
+    }
+    sender->tx->shutdown();
+    delayed->tx->shutdown();
+    other->tx->shutdown();
+    bounce_test::freeXferBufs(firstBuffers);
+    bounce_test::freeXferBufs(secondBuffers);
+}
+
+INSTANTIATE_TEST_SUITE_P(ImmediateOrDeferredRelease, BounceLocalStaging, ::testing::Bool());
 
 class BounceCapacityFailure : public ::testing::TestWithParam<bool>
 {

@@ -57,6 +57,7 @@ char const* toString(BounceFailReason reason)
 namespace
 {
 constexpr char kSep = '\x1f'; // unit separator: agent names won't contain it
+constexpr auto kMinSweepInterval = std::chrono::milliseconds(50);
 
 // Split large copy runs into pieces of this size when building the batched-copy plan arrays. The
 // copy kernel assigns ONE thread block per plan entry, so a plan of a few huge coalesced runs would
@@ -497,8 +498,7 @@ void BounceReceiver::checkTimeouts()
         return;
     }
     mNextSweep = now
-        + std::clamp(
-            std::chrono::milliseconds(smallestMs / 10), std::chrono::milliseconds(50), std::chrono::milliseconds(1000));
+        + std::clamp(std::chrono::milliseconds(smallestMs / 10), kMinSweepInterval, std::chrono::milliseconds(1000));
     // Quarantine over for any expired region: no write posted before its flow's lease expired can
     // plausibly still be in flight, so it may re-enter circulation (and may grant a waiter).
     mCtx.sendGrants(mCtx.scheduler.reapQuarantine());
@@ -1057,7 +1057,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         }
         // Non-blocking: borrow an exec context (cheap to return), then a gather-staging region sized
         // to this chunk from the SHARED arena. If either is unavailable, leave the credit parked and
-        // bail; the IO loop retries via drainPendingPosts() once an ACK frees a region / context —
+        // bail; the IO loop retries via drainPendingPosts() when a region or context becomes available —
         // never blocks here, so an oversubscribed arena (many peers, or both roles) degrades to
         // backpressure, not deadlock. Credit-less (eager) staging is additionally capped by the
         // scheduler's eager budget (half the arena) so it can never starve incoming grants.
@@ -1198,7 +1198,7 @@ void BounceSender::drainPendingPosts()
     for (auto& [rid, req] : mRequests)
     {
         // Retry parked credits, and (with eager gather) chunks that couldn't start earlier because
-        // the arena/ExecPool/eager budget was exhausted — ACKs may have freed resources since.
+        // the arena/ExecPool/eager budget was exhausted; writes or gathers may have finished since.
         if (!req.pendingCredits.empty() || (mCtx.cfg.enableEagerGather && req.nextPost < req.numChunks))
         {
             pumpRequest(rid, req);
@@ -1242,7 +1242,7 @@ bool BounceSender::drainGatherReady()
                 }
                 // Gather done — return the exec context immediately for another chunk to reuse (the
                 // write path never needs it: postXferReq is not stream-ordered). The region stays
-                // held until ACK.
+                // held until the backend releases the completed write.
                 bounceRangeEnd(p.nvtxGather);
                 mCtx.exec->release(p.ctx);
                 p.ctx = nullptr;
@@ -1320,17 +1320,23 @@ bool BounceSender::pollSenderHandles()
                         signBounceFrame(encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns),
                             req.windowKey, req.windowId));
                 }
-                if (!p.xfer->release())
+                bool const released = p.xfer->release();
+                if (released)
                 {
-                    // The write is terminal, so progress is safe; the status object keeps the
-                    // handle and its destructor retries the backend release.
-                    TLLM_LOG_WARNING("BounceTransport(%s): terminal write handle release deferred rid=%llu chunk=%u",
-                        mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), p.chunkIdx);
+                    p.xfer.reset();
                 }
-                p.xfer.reset();
+                else
+                {
+                    // A refused release retains the source and its handle until the backend accepts release.
+                    mOrphanLocal.emplace_back(std::move(p.xfer), p.localOffset, rid, std::chrono::steady_clock::now());
+                }
                 p.state = PostState::Sent;
                 p.nvtxAckWait = bounceRangeStart(
                     kNvtxAckWait, "ackWait rid=%llu chunk=%u", static_cast<unsigned long long>(rid), p.chunkIdx);
+                if (released)
+                {
+                    mCtx.sendGrants(mCtx.scheduler.releaseLocal(p.localOffset));
+                }
                 didWork = true;
             }
             else if (st == TransferState::kFAILURE)
@@ -1395,12 +1401,7 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h, std:
         return;
     }
     Request& req = it->second;
-    if (!req.acknowledge(h.chunkIdx, h.regionHandle,
-            [&](Posted& post)
-            {
-                bounceRangeEnd(post.nvtxAckWait);
-                mCtx.sendGrants(mCtx.scheduler.releaseLocal(post.localOffset));
-            }))
+    if (!req.acknowledge(h.chunkIdx, h.regionHandle, [](Posted& post) { bounceRangeEnd(post.nvtxAckWait); }))
     {
         TLLM_LOG_WARNING("BounceTransport(%s): dropping stale/invalid ACK peer=%s rid=%llu chunk=%u region=%llu",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
@@ -1466,15 +1467,20 @@ void BounceSender::checkTimeouts()
 
 bool BounceSender::drainOrphanLocal()
 {
-    if (mOrphanLocal.empty())
+    if (mOrphanLocal.empty() && mPendingCancel.empty())
     {
         return false;
     }
     bool didWork = false;
-    std::vector<OrphanLocal> keep;
-    keep.reserve(mOrphanLocal.size());
-    for (auto& o : mOrphanLocal)
+    for (auto it = mOrphanLocal.begin(); it != mOrphanLocal.end();)
     {
+        auto& o = *it;
+        if (o.retryReleaseAfter != std::chrono::steady_clock::time_point{}
+            && std::chrono::steady_clock::now() < o.retryReleaseAfter)
+        {
+            ++it;
+            continue;
+        }
         if (o.xfer != nullptr && o.xfer->wait(0) == TransferState::kIN_PROGRESS)
         {
             // Warn once when an orphaned write outlives requestTimeoutMs: nothing gives up on it
@@ -1491,22 +1497,27 @@ bool BounceSender::drainOrphanLocal()
                     mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid),
                     static_cast<unsigned long long>(o.offset), static_cast<long long>(ageMs));
             }
-            keep.push_back(std::move(o)); // write still in flight -> the NIC may still read the region; wait
+            ++it;
             continue;
         }
-        // Terminal (Done or Failed): the NIC is finished with the region (source AND the receiver's
-        // destination) -> recycle the local source now.
         if (o.xfer != nullptr && !o.xfer->release())
         {
-            // The write is terminal, so recycling is safe; only the backend handle remains retained
-            // (the status object's destructor retries the release).
-            TLLM_LOG_WARNING("BounceTransport(%s): terminal orphan handle release deferred rid=%llu",
-                mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid));
+            if (!o.warned)
+            {
+                TLLM_LOG_WARNING("BounceTransport(%s): retaining staging region after handle release refusal rid=%llu",
+                    mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid));
+                o.warned = true;
+            }
+            // Retry refused cleanup on the same cadence as the receiver's minimum maintenance sweep.
+            o.retryReleaseAfter = std::chrono::steady_clock::now() + kMinSweepInterval;
+            ++it;
+            continue;
         }
-        mCtx.sendGrants(mCtx.scheduler.releaseLocal(o.offset));
+        auto const offset = o.offset;
+        it = mOrphanLocal.erase(it);
+        mCtx.sendGrants(mCtx.scheduler.releaseLocal(offset));
         didWork = true;
     }
-    mOrphanLocal.swap(keep);
     // Send any deferred cancel whose flow now has NO in-flight write left: the receiver may safely
     // reclaim its regions (the writes have landed/failed, no more DMA targets them).
     for (auto it = mPendingCancel.begin(); it != mPendingCancel.end();)
@@ -1603,8 +1614,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     //     its stream can). Park it in mOrphanGather; drainOrphanGather() returns the ctx + region once
     //     cudaStreamQuery(ctx->stream) reports the stream idle.
     //   - Gathered: gather done (event observed), ctx already returned -> recycle now.
-    //   - Sent: write landed (poll==kDone), xfer already released in pollSenderHandles, NIC done
-    //     reading -> recycle now.
+    //   - Sent: the local region has already been returned or handed to the retained handle.
     auto const mayScatter = std::any_of(
         req.posted.begin(), req.posted.end(), [](auto const& chunk) { return chunk.state == PostState::Sent; });
     BounceResult result{TransferState::kFAILURE, reason, !mayScatter};
@@ -1613,17 +1623,21 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
         result.remoteDrain = std::make_shared<BounceDrain>();
         mAwaitingDrain.try_emplace(rid, PendingDrain{req.peer, result.remoteDrain, req.windowKey});
     }
-    bool deferredWrite = false;
+    bool deferredWrite
+        = std::any_of(mOrphanLocal.begin(), mOrphanLocal.end(), [rid](auto const& o) { return o.rid == rid; });
     for (auto& p : req.posted)
     {
         // Close this chunk's NVTX spans (whichever leg it died in); 0 handles are no-ops.
         bounceRangeEnd(p.nvtxGather);
         bounceRangeEnd(p.nvtxWrite);
         bounceRangeEnd(p.nvtxAckWait);
+        if (p.state == PostState::Sent)
+        {
+            continue;
+        }
         if (p.state == PostState::Writing)
         {
-            mOrphanLocal.push_back(
-                OrphanLocal{std::move(p.xfer), p.localOffset, rid, std::chrono::steady_clock::now(), false});
+            mOrphanLocal.emplace_back(std::move(p.xfer), p.localOffset, rid, std::chrono::steady_clock::now());
             deferredWrite = true;
             continue;         // do NOT release xfer or recycle the region yet
         }
@@ -2116,7 +2130,7 @@ void BounceTransport::tick(std::string& peer, std::string& blob)
     work |= mSender.drainOrphanLocal();  // recycle failed-but-in-flight write regions once their write ends
     work |= mSender.drainOrphanGather(); // recycle failed-but-still-gathering regions once their exec stream is idle
     drainForgets();
-    mSender.drainPendingPosts();         // retry credits parked when the arena was full (onAck freed regions)
+    mSender.drainPendingPosts();         // retry credits parked when the arena was full
     mSender.checkTimeouts();
     mReceiver.checkTimeouts();           // expire grant leases of silent senders + free post-quarantine regions
     // Idle backoff: when there IS in-flight work (busy → 0ms poll) but nothing actually advanced
