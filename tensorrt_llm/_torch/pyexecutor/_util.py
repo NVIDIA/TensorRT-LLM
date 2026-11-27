@@ -60,6 +60,10 @@ from ..memory.monitor.providers.kv_cache import \
     KvCacheProvider as MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_utils import (declares_recurrent_state,
+                                     resolve_model_class,
+                                     resolve_recurrent_kv_cache_manager_cls,
+                                     resolve_recurrent_state_spec)
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
@@ -80,11 +84,13 @@ from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
 from .engine.multimodal import is_multimodal, use_mrope
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from .kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
                                            KVCacheManagerV2, Role,
                                            _resolve_v2_max_attention_window_vec)
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
+                                           MambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
@@ -108,6 +114,7 @@ from .seq_slot_manager import SeqSlotManager
 if TYPE_CHECKING:
     from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 
+    from ..recurrent_state_spec import RecurrentStateSpec
     from .kv_cache.remote_donor import RemoteMemDonor
     from .resource_manager import BaseResourceManager
 
@@ -322,8 +329,9 @@ def get_kv_cache_manager_cls(
 
     For hybrid mamba models the choice between
     ``MambaHybridCacheManagerV2`` and compatibility managers is made here.
-    Callers that don't care about disagg can omit ``is_disagg`` and get the
-    unified-pool default.
+    The V2 class is the one the model class declares for its recurrent
+    family. Callers that don't care about disagg can omit ``is_disagg`` and
+    get the unified-pool default.
 
     Model loading resolves ``use_kv_cache_manager_v2="auto"`` to V2 for
     supported hybrid Mamba models. An explicit ``False`` selects a
@@ -336,6 +344,35 @@ def get_kv_cache_manager_cls(
       * ``TLLM_MAMBA_MANAGER_PREFERENCE`` — explicit manager preference.
     """
     config = model_config.pretrained_config
+    family_cls = None
+    if is_hybrid_linear(config):
+        # The model class declares the layer kinds that the selection counts
+        # and the V2 manager of its family.
+        family_cls = resolve_recurrent_kv_cache_manager_cls(config)
+        architectures = getattr(config, 'architectures', None)
+        if family_cls is None:
+            model_cls = resolve_model_class(config)
+            if model_cls is None:
+                raise ValueError(
+                    "No model class is registered for this hybrid Mamba / "
+                    "linear-attention config (architectures="
+                    f"{architectures!r}); the model class declares the "
+                    "recurrent state and its cache manager.")
+            raise ValueError(
+                f"{model_cls.__name__} declares no recurrent cache manager "
+                "for this hybrid Mamba / linear-attention config "
+                f"(architectures={architectures!r}). A model class declares "
+                "it with get_recurrent_kv_cache_manager_cls, beside "
+                "get_recurrent_state_spec.")
+        # A missing declaration counts no recurrent layer, which the routes
+        # below take for a model without recurrent layers.
+        if (model_config.get_num_mamba_layers() == 0
+                and not declares_recurrent_state(config)):
+            raise ValueError(
+                f"{family_cls.__name__} is declared for this hybrid Mamba / "
+                "linear-attention config, but its model class declares no "
+                f"recurrent state (architectures={architectures!r}). A model "
+                "class declares it with get_recurrent_state_spec.")
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
     # An algorithm that keeps the dense KV cache, such as Skip Softmax, takes
@@ -362,30 +399,25 @@ def get_kv_cache_manager_cls(
                     "cache_transceiver_config backend='NIXL' with "
                     "transceiver_runtime='PYTHON' (got "
                     f"backend={backend!r}, transceiver_runtime={runtime!r}).")
-        if (is_hybrid_linear(config)
-                and model_config.get_num_mamba_layers() > 0):
-            # Kimi K3 is the hybrid linear-attention family with an FP4 MLA
-            # cache layout: its manager composes the layout with the
-            # recurrent-state lifecycle and the KDA replay caches used by
-            # fused speculative verification, and its disaggregation
-            # declarations cover both the MLA and the recurrent-state roles.
-            # The other families are not MLA models, or (glm5_next) NoPE ones,
-            # which is_mla() excludes.
-            if not is_kimi_linear(config):
+        if family_cls is not None and model_config.get_num_mamba_layers() > 0:
+            # A family manager that runs the FP4 MLA layout hooks keeps the
+            # layout with the recurrent-state lifecycle and its replay caches,
+            # and its disaggregation declarations cover both the MLA and the
+            # recurrent-state roles.
+            if not issubclass(family_cls, Fp4MlaLayoutHooks):
                 raise ValueError(
-                    "An NVFP4 MLA KV cache is supported for hybrid "
-                    "linear-attention models only on Kimi K3 (kimi_linear); "
-                    f"got model_type={getattr(config, 'model_type', None)!r}.")
+                    "An NVFP4 MLA KV cache is not supported for this hybrid "
+                    f"linear-attention model: {family_cls.__name__} does not "
+                    "compose the FP4 MLA cache layout (model_type="
+                    f"{getattr(config, 'model_type', None)!r}).")
             _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
-            from ..modules.kimi_kda.cache_manager import \
-                KimiK3HybridCacheManager
-            return KimiK3HybridCacheManager
+            return family_cls
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
 
         return Fp4MlaKVCacheManagerV2
     use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
-    if is_hybrid_linear(config):
+    if family_cls is not None:
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid routes.
         if model_config.get_num_mamba_layers() == 0:
@@ -415,34 +447,35 @@ def get_kv_cache_manager_cls(
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
 
-        if config_utils.is_glm5_next(config):
-            # glm5_next indexer state is a V2 extra buffer: reject any knob
-            # that would select a non-V2 manager.
+        model_cls = resolve_model_class(config)
+        get_requires_v2 = getattr(model_cls, "requires_kv_cache_manager_v2",
+                                  None)
+        if get_requires_v2 is not None and get_requires_v2(config):
+            # The model has no V1 route: reject any knob that would select a
+            # non-V2 manager.
+            model_name = model_cls.__name__
             if use_py_mamba_cache_manager() or os.environ.get(
                     'TLLM_MAMBA_MANAGER_PREFERENCE'):
                 raise ValueError(
-                    "glm5_next supports only its V2 cache manager; unset "
+                    f"{model_name} supports only KV cache manager V2; unset "
                     "TRTLLM_USE_PY_MAMBA / TLLM_MAMBA_MANAGER_PREFERENCE.")
             if is_disagg:
-                # Only the Python NIXL transceiver moves KDA and indexer state.
+                # Only the Python NIXL transceiver moves the V2 state.
                 backend, runtime = _resolve_disagg_transceiver_route(
                     cache_transceiver_config)
                 if runtime != "PYTHON" or backend != "NIXL":
                     raise ValueError(
-                        "glm5_next disaggregated serving requires "
-                        "cache_transceiver_config backend='NIXL' with "
-                        "transceiver_runtime='PYTHON' (got "
+                        f"{model_name} supports only KV cache manager V2, "
+                        "which disaggregated serving keeps only on "
+                        "backend='NIXL' with transceiver_runtime='PYTHON' (got "
                         f"backend={backend!r}, transceiver_runtime={runtime!r})."
                     )
             if not use_v2:
                 raise ValueError(
-                    "glm5_next requires KV cache manager V2 (the sparse-layer "
-                    "indexer state is a V2 extra buffer). Leave "
+                    f"{model_name} requires KV cache manager V2. Leave "
                     "kv_cache_config.use_kv_cache_manager_v2='auto' or set it "
                     "to True.")
-            from ..attention.backends.sparse.glm_kpool import \
-                Glm5NextCacheManager
-            return Glm5NextCacheManager
+            return family_cls
 
         # Helix x speculation bookkeeping (per-token verify groups on the
         # superblock ledger, py_helix_decode_group_index advancement) exists
@@ -571,19 +604,7 @@ def get_kv_cache_manager_cls(
         if sparse_attn_algorithm == "qsa":
             return get_sparse_attn_kv_cache_manager(
                 sparse_attn_config, use_kv_cache_manager_v2=True)
-        if is_kimi_linear(config):
-            from ..modules.kimi_kda.cache_manager import \
-                KimiK3HybridCacheManager
-            return KimiK3HybridCacheManager
-        if is_qwen4_exp(config):
-            from ..modules.qwen4_exp.cache_manager import \
-                Qwen4ExpHybridCacheManager
-            return Qwen4ExpHybridCacheManager
-        if is_qwen3_hybrid(config):
-            from ..modules.fla.cache_manager import Qwen35HybridCacheManager
-            return Qwen35HybridCacheManager
-        from ..modules.mamba.cache_manager import NemotronHybridCacheManager
-        return NemotronHybridCacheManager
+        return family_cls
     elif uses_sparse_kv_cache_manager:
         if sparse_attn_algorithm == "qsa":
             # The QSA manager extends the hybrid manager because it must retain
@@ -1049,7 +1070,7 @@ def _derive_v2_layer_type_attention_windows(
             config, max_seq_len)
     if derived_windows is None:
         return None
-    if is_hybrid_linear(config):
+    if declares_recurrent_state(config):
         return None
     pool_ratio = kv_cache_config.pool_ratio
     num_layer_groups = len(set(derived_windows))
@@ -1111,7 +1132,7 @@ def _get_num_pool_groups_for_estimation(
             model_config):
         attention_windows = _derive_v2_layer_type_attention_windows(
             kv_cache_config, KVCacheManagerV2, model_config, max_seq_len)
-    if attention_windows is not None and not is_hybrid_linear(config):
+    if attention_windows is not None and not declares_recurrent_state(config):
         normalized_windows = _normalize_attention_windows(
             attention_windows, max_seq_len)
         return 1 if normalized_windows is None else len(set(normalized_windows))
@@ -1392,14 +1413,15 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._validate_or_fallback_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
-        if is_hybrid_linear(model_config.pretrained_config):
+        is_hybrid = declares_recurrent_state(model_config.pretrained_config)
+        if is_hybrid:
             logger.info_once(
                 f"Selected hybrid KV cache manager: {cls.__name__}",
                 key=f"hybrid_kv_cache_manager_{cls.__name__}")
         # Compatibility managers do not support MTP block reuse. Warn at the
         # routing site so users see the concrete manager selected for the
         # incompatible combination.
-        if is_hybrid_linear(model_config.pretrained_config) \
+        if is_hybrid \
                 and kv_cache_config.enable_block_reuse \
                 and self._speculative_config is not None:
             if not issubclass(cls, MambaHybridCacheManagerV2):
@@ -1429,6 +1451,7 @@ class KvCacheCreator:
             fp4_mla = (sparse_attn_config is None and is_mla(config)
                        and quant_config is not None
                        and quant_config.quant_mode.has_fp4_kv_cache())
+            is_hybrid = declares_recurrent_state(config)
             incompat = kv_cache_manager_v2_incompatible_features(
                 self._max_beam_width,
                 enable_sleep=self._llm_args.sleep_config is not None)
@@ -1443,8 +1466,7 @@ class KvCacheCreator:
             # The C++ V2 cache expands beams after receive completion, copying
             # the prompt's partial tail before the first generation step.
             if (self._max_beam_width is not None and self._max_beam_width > 1
-                    and (is_hybrid_linear(config)
-                         or uses_sparse_kv_cache_manager or fp4_mla)
+                    and (is_hybrid or uses_sparse_kv_cache_manager or fp4_mla)
                     and "max_beam_width > 1" not in incompat):
                 incompat.append("max_beam_width > 1")
             if incompat:
@@ -1480,7 +1502,7 @@ class KvCacheCreator:
                         "FP4 MLA requires Fp4MlaKVCacheManagerV2, which is "
                         f"not yet supported with {incompat_str}. Disable these "
                         "features to run FP4 MLA.")
-                if is_hybrid_linear(config):
+                if is_hybrid:
                     raise NotImplementedError(
                         "Hybrid Mamba KVCacheManagerV2 does not support "
                         f"{incompat_str}; automatic fallback is unavailable "
@@ -1544,10 +1566,11 @@ class KvCacheCreator:
                     update={"max_attention_window": derived_windows})
         if (not is_draft and isinstance(manager_cls, type)
                 and issubclass(manager_cls, MambaHybridCacheManagerV2)
-                and self._model_engine is not None
-                and _uses_gdn_mtp_replay(self._model_engine.model)):
-            # Cost the GDN replay region of the state the manager will select.
-            extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
+                and self._model_engine is not None):
+            from ..modules.fla.cache_manager import uses_gdn_mtp_replay
+            if uses_gdn_mtp_replay(self._model_engine.model):
+                # Cost the GDN replay region of the state the manager will select.
+                extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
         cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
@@ -4716,21 +4739,89 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
-def _uses_gdn_mtp_replay(model: torch.nn.Module) -> bool:
-    """Whether ``model``'s GDN layers can verify drafts with the GDN MTP replay kernels.
+def _validate_recurrent_manager_cls(
+    kv_cache_manager_cls: type,
+    recurrent_state_spec: "RecurrentStateSpec",
+    config: object,
+) -> None:
+    """Reject a cache manager class that cannot hold the state a model declares.
 
-    They must be the PyTorch GDN mixer, and none may verify with the fused
-    kernels into an FP8 out_proj input (gdn_verify_tcgen05 / trtllm::gdn_verify),
-    which keep the cached replay history.
+    Args:
+        kv_cache_manager_cls: The class about to be constructed.
+        recurrent_state_spec: What the model class declares for ``config``.
+        config: Pretrained config of the model.
+
+    Raises:
+        ValueError: The model declares no recurrent layer, or it declares
+            recurrent layers and the class holds no recurrent state.
     """
-    from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-    layers = [
-        module for module in model.modules()
-        if isinstance(module, Qwen3NextGatedDeltaNet)
-    ]
-    return bool(layers) and not any(
-        layer.fused_verify and layer.norm.fp8_scale is not None
-        for layer in layers)
+    architectures = getattr(config, 'architectures', None)
+    if not any(recurrent_state_spec.recurrent_layer_mask):
+        raise ValueError(
+            "A hybrid Mamba / linear-attention model without a recurrent "
+            f"layer is not supported (architectures={architectures!r}).")
+    if not issubclass(kv_cache_manager_cls, MambaHybridCacheManager):
+        raise ValueError(
+            f"{kv_cache_manager_cls.__name__} holds no recurrent state, but "
+            f"the model declares recurrent layers (architectures={architectures!r})."
+        )
+
+
+def _legacy_recurrent_manager_arguments(
+    kv_cache_manager_cls: type,
+    config: object,
+    quant_config: QuantConfig | None,
+    mamba_params: MambaKVCacheParams,
+    model: torch.nn.Module | None,
+    *,
+    num_kv_heads: int | list[int],
+    head_dim: int | list[int],
+) -> tuple[object, int | list[int], int | list[int], dict[str, object]]:
+    """Attention geometry and family keyword arguments of a V1 hybrid manager.
+
+    A V2 manager class answers both itself (``attention_cache_geometry`` and
+    ``family_init_kwargs``).
+
+    Returns:
+        The cache type, KV head counts and head dimension of the attention
+        layers, and the keyword arguments the family adds to the constructor
+        call.
+    """
+    cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType
+    if is_kimi_linear(config):
+        # The MLA layers keep the absorbed latent cache: one head of the
+        # latent and RoPE widths.
+        return (cache_type.SELFKONLY, 1,
+                config.kv_lora_rank + config.qk_rope_head_dim,
+                _mamba_conv_layout_kwargs(kv_cache_manager_cls, "kimi_linear"))
+    if is_nemotron_hybrid(config):
+        family_kwargs = _mamba_conv_layout_kwargs(kv_cache_manager_cls,
+                                                  "nemotron_hybrid")
+        stochastic_rounding = getattr(quant_config,
+                                      "mamba_ssm_stochastic_rounding", False)
+        family_kwargs.update(
+            use_replay_state_update=None,
+            # The manager keeps the rounding seeds whenever rounding can fire
+            # on the fp16 SSM cache, which is the condition the mixer applies
+            # (`_stochastic_rounding_for_flashinfer` and
+            # `_stochastic_rounding_for_replay` of `Mamba2Mixer`).
+            mamba_ssm_stochastic_rounding=(
+                stochastic_rounding
+                and mamba_params.mamba_ssm_cache_dtype == torch.float16))
+        return cache_type.SELF, num_kv_heads, head_dim, family_kwargs
+    if is_qwen3_hybrid(config) or is_qwen4_exp(config):
+        family_kwargs = _mamba_conv_layout_kwargs(kv_cache_manager_cls,
+                                                  "qwen3_next")
+        family_kwargs["use_replay_state_update"] = None
+        if model is not None and issubclass(kv_cache_manager_cls,
+                                            CppMambaHybridCacheManager):
+            from ..modules.fla.cache_manager import uses_gdn_fused_verify
+            family_kwargs["gdn_fused_verify"] = uses_gdn_fused_verify(model)
+        return cache_type.SELF, num_kv_heads, head_dim, family_kwargs
+    raise ValueError(
+        f"{kv_cache_manager_cls.__name__} does not hold the recurrent state "
+        "of this model (architectures="
+        f"{getattr(config, 'architectures', None)!r}).")
 
 
 def _create_kv_cache_manager(
@@ -4955,29 +5046,17 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
-    if config_utils.is_glm5_next(config) or is_kimi_linear(config):
-        # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on
-        # the mamba side of the hybrid manager, absorbed-MQA MLA latent cache
-        # (num_kv_heads=1, head_dim = kv_lora_rank + qk_rope_head_dim,
-        # SELFKONLY) on the paged-KV side. Must come before the is_mla(...)
-        # route: the kimi_linear config carries MLA fields, but only 24 of
-        # its 93 layers are MLA. glm5_next has the same layout (11 of its 45
-        # layers are sparse MLA) plus paged indexer state; both families use
-        # sequential verify when replay is unavailable.
-        is_glm5_next = config_utils.is_glm5_next(config)
-        text_config = config_utils.unwrap_glm5_next_text_config(
-            config) if is_glm5_next else config
+    recurrent_state_spec = resolve_recurrent_state_spec(
+        config, quant_config=quant_config)
+    if recurrent_state_spec is not None:
+        # One construction for every recurrent family. It precedes the
+        # is_mla(...) route: the Kimi K3 and GLM5-next configs carry MLA
+        # fields, but only some of their layers are MLA.
+        _validate_recurrent_manager_cls(kv_cache_manager_cls,
+                                        recurrent_state_spec, config)
         if max_beam_width > 1:
             raise ValueError(
-                "glm5_next + beam search is not supported yet."
-                if is_glm5_next else
                 "MambaHybridCacheManager + beam search is not supported yet.")
-        if not estimating_kv_cache and kv_connector_manager is not None:
-            raise NotImplementedError(
-                "Connector manager is not supported for glm5_next."
-                if is_glm5_next else
-                "Connector manager is not supported for MambaHybridCacheManager."
-            )
         mamba_params = extract_mamba_kv_cache_params(
             config,
             spec_config=spec_config,
@@ -4992,32 +5071,31 @@ def _create_kv_cache_manager(
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
-        # KDA state sharding follows the attention-family TP
-        # semantics (Qwen3-Next pattern): replicated under attention-DP,
-        # head-sharded across tp_size otherwise. That is exactly the cache
-        # manager's own internal gate (`tp_size = 1 if enable_attention_dp
-        # else tp_size`, then num_heads / n_groups / conv_dim divide by
-        # it), so the params pass through unscaled.
-        kda_extra_kwargs = _mamba_conv_layout_kwargs(kv_cache_manager_cls,
-                                                     "kimi_linear")
-        backbone = getattr(getattr(model_engine, "model", None), "model", None)
-        if (spec_config is not None
-                and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
-                and getattr(backbone, "kda_draft_records", False)):
-            kda_extra_kwargs["kda_draft_records"] = True
-        if (not is_glm5_next and issubclass(kv_cache_manager_cls,
-                                            MambaHybridCacheManagerV2)):
-            # The V2 manager reads the MLA geometry and the per-layer KV
-            # dtype policy from the model config when it composes the FP4
-            # MLA cache layout (NVFP4 KV cache).
-            kda_extra_kwargs["pretrained_config"] = config
-        if is_glm5_next:
-            from ..attention.backends.sparse.glm_kpool import \
-                glm_kpool_index_state_dim
-            kda_extra_kwargs["index_state_dim"] = glm_kpool_index_state_dim(
-                _model_config)
+        model = model_engine.model if model_engine is not None else None
+        # The state geometry is shared; the attention geometry and the
+        # remaining keyword arguments are the family's.
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            (attention_cache_type, attention_num_kv_heads, attention_head_dim
+             ) = kv_cache_manager_cls.attention_cache_geometry(
+                 config, num_kv_heads=per_layer_num_kv_heads, head_dim=head_dim)
+            family_kwargs = kv_cache_manager_cls.family_init_kwargs(
+                model_config=_model_config,
+                spec_config=spec_config,
+                sparse_attention_config=sparse_attention_config,
+                mamba_params=mamba_params,
+                model=model)
+        else:
+            (attention_cache_type, attention_num_kv_heads, attention_head_dim,
+             family_kwargs) = _legacy_recurrent_manager_arguments(
+                 kv_cache_manager_cls,
+                 config,
+                 quant_config,
+                 mamba_params,
+                 model,
+                 num_kv_heads=per_layer_num_kv_heads,
+                 head_dim=head_dim)
         kv_cache_manager = kv_cache_manager_cls(
-            # mamba (KDA) cache parameters
+            # recurrent-state parameters
             mamba_params.state_size,
             mamba_params.conv_kernel,
             mamba_params.num_heads,
@@ -5027,16 +5105,13 @@ def _create_kv_cache_manager(
             mamba_layer_mask,
             mamba_params.dtype,
             mamba_params.mamba_ssm_cache_dtype,
-            # kv cache parameters (MLA latent cache)
+            # kv cache parameters
             kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            attention_cache_type,
             num_layers=sum(full_attention_layer_mask),
             layer_mask=full_attention_layer_mask,
-            num_kv_heads=1,
-            head_dim=(int(text_config.kv_lora_rank) +
-                      int(getattr(text_config, "qk_rope_head_dim", 0) or 0)
-                      if is_glm5_next else config.kv_lora_rank +
-                      config.qk_rope_head_dim),
+            num_kv_heads=attention_num_kv_heads,
+            head_dim=attention_head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_num_tokens=max_num_tokens,
@@ -5047,7 +5122,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            **kda_extra_kwargs,
+            **family_kwargs,
             **manager_extra_kwargs,
         )
     elif (getattr(sparse_attention_config, "algorithm", None) == "csa2"
@@ -5087,160 +5162,6 @@ def _create_kv_cache_manager(
             layer_mask=layer_mask,
             is_disagg=is_disagg,
             **manager_extra_kwargs,
-        )
-    elif is_nemotron_hybrid(config):
-        if max_beam_width > 1:
-            raise ValueError(
-                "MambaHybridCacheManager + beam search is not supported yet.")
-
-        if not estimating_kv_cache and kv_connector_manager is not None:
-            raise NotImplementedError(
-                "Connector manager is not supported for MambaHybridCacheManager."
-            )
-
-        mamba_params = extract_mamba_kv_cache_params(
-            config,
-            spec_config=spec_config,
-            quant_config=quant_config,
-        )
-        mamba_layer_mask, full_attention_layer_mask = (
-            _get_mamba_cache_layer_masks(
-                mamba_params,
-                mapping,
-                spec_config,
-                is_draft,
-            ))
-        num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
-                            else mamba_params.num_mamba_layers)
-
-        stochastic_rounding = getattr(
-            quant_config, 'mamba_ssm_stochastic_rounding',
-            False) if quant_config is not None else False
-        # Stochastic-rounding seeds must live on the cache manager (not be
-        # re-created with torch.randint per forward) whenever SR can fire
-        # on the fp16 SSM cache.  This mirrors the predicate the mixer uses
-        # internally (`_stochastic_rounding_for_flashinfer` /
-        # `_stochastic_rounding_for_replay`) so allocation matches consumption.
-        mamba_ssm_stochastic_rounding = (stochastic_rounding
-                                         and mamba_params.mamba_ssm_cache_dtype
-                                         == torch.float16)
-        mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        mamba_manager_extra_kwargs.update(
-            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
-        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            # The manager tells its draft layers apart by the model's layer count.
-            mamba_manager_extra_kwargs["pretrained_config"] = config
-        kv_cache_manager = kv_cache_manager_cls(
-            # mamba cache parameters
-            mamba_params.state_size,
-            mamba_params.conv_kernel,
-            mamba_params.num_heads,
-            mamba_params.n_groups,
-            mamba_params.head_dim,
-            num_mamba_layers,
-            mamba_layer_mask,
-            mamba_params.dtype,
-            mamba_params.mamba_ssm_cache_dtype,
-            # kv cache parameters
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=sum(full_attention_layer_mask),
-            layer_mask=full_attention_layer_mask,
-            num_kv_heads=per_layer_num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_num_tokens=max_num_tokens,
-            is_draft=is_draft,
-            max_batch_size=max_batch_size,
-            mapping=mapping,
-            dtype=kv_cache_dtype,
-            spec_config=spec_config,
-            is_estimating_kv_cache=estimating_kv_cache,
-            execution_stream=execution_stream,
-            use_replay_state_update=None,
-            mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
-            **mamba_manager_extra_kwargs,
-        )
-    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
-        if max_beam_width > 1:
-            raise ValueError(
-                "MambaHybridCacheManager + beam search is not supported yet.")
-
-        if not estimating_kv_cache and kv_connector_manager is not None:
-            raise NotImplementedError(
-                "Connector manager is not supported for MambaHybridCacheManager."
-            )
-        mamba_params = extract_mamba_kv_cache_params(
-            config,
-            spec_config=spec_config,
-            quant_config=quant_config,
-        )
-        mamba_layer_mask, full_attention_layer_mask = (
-            _get_mamba_cache_layer_masks(
-                mamba_params,
-                mapping,
-                spec_config,
-                is_draft,
-            ))
-        num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
-                            else mamba_params.num_mamba_layers)
-        mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        mamba_manager_extra_kwargs.update(
-            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
-        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            # The manager tells its draft layers apart by the model's layer count.
-            mamba_manager_extra_kwargs["pretrained_config"] = config
-        if (issubclass(kv_cache_manager_cls,
-                       (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
-                and model_engine is not None):
-            from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-            mamba_manager_extra_kwargs["gdn_fused_verify"] = any(
-                module.fused_verify for module in model_engine.model.modules()
-                if isinstance(module, Qwen3NextGatedDeltaNet))
-            if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-                mamba_manager_extra_kwargs["gdn_mtp_replay"] = (
-                    _uses_gdn_mtp_replay(model_engine.model))
-        if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
-                                               MambaHybridCacheManagerV2):
-            mamba_manager_extra_kwargs.update(
-                pretrained_config=config,
-                sparse_attention_config=sparse_attention_config)
-            # Set by a model that implements the in-forward snapshot split.
-            if model_engine is not None:
-                mamba_manager_extra_kwargs["inforward_snapshot_min_main"] = int(
-                    getattr(model_engine.model, "inforward_snapshot_min_main",
-                            0) or 0)
-        kv_cache_manager = kv_cache_manager_cls(
-            # mamba cache parameters
-            mamba_params.state_size,
-            mamba_params.conv_kernel,
-            mamba_params.num_heads,
-            mamba_params.n_groups,
-            mamba_params.head_dim,
-            num_mamba_layers,
-            mamba_layer_mask,
-            mamba_params.dtype,
-            mamba_params.mamba_ssm_cache_dtype,
-            # kv cache parameters
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=sum(full_attention_layer_mask),
-            layer_mask=full_attention_layer_mask,
-            num_kv_heads=per_layer_num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_num_tokens=max_num_tokens,
-            is_draft=is_draft,
-            max_batch_size=max_batch_size,
-            mapping=mapping,
-            dtype=kv_cache_dtype,
-            spec_config=spec_config,
-            is_estimating_kv_cache=estimating_kv_cache,
-            execution_stream=execution_stream,
-            use_replay_state_update=None,
-            **mamba_manager_extra_kwargs,
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager

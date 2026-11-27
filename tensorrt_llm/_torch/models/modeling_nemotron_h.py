@@ -966,6 +966,13 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         return recurrent_state_spec_from_mamba_params(params,
                                                       conv_sections="x_b_c")
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the cache manager that holds the Mamba2 state."""
+        from ..modules.mamba.cache_manager import NemotronHybridCacheManager
+
+        return NemotronHybridCacheManager
+
     @staticmethod
     def lora_config(model_dir: str):
         """Nemotron-H-specific LoRA configuration.

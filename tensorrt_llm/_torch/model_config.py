@@ -32,11 +32,8 @@ from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
-from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
-    get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
-    is_qwen4_exp, load_pretrained_config)
+from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
+                                                         load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -68,6 +65,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MoEImplRequest
+    from tensorrt_llm._torch.recurrent_state_spec import RecurrentStateSpec
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                               KvCacheCompressionConfig,
@@ -2409,39 +2407,34 @@ class ModelConfig(Generic[TConfig]):
         """Number of full-attention layers in the model.
 
         Pure model property: independent of which KV cache manager will run.
-        For non-hybrid models this equals num_hidden_layers. For hybrid Mamba
-        models (Nemotron-hybrid, Qwen3-hybrid, Qwen4-Exp) it returns only the attention
-        count derived from the layer pattern; mamba layers are reported by
-        ``get_num_mamba_layers``.
+        For a model that declares recurrent state it counts the attention
+        layers of the declaration; recurrent layers are reported by
+        ``get_num_mamba_layers``. Otherwise it equals num_hidden_layers.
+        The model class builds the declaration from the whole config, so the
+        config needs the state geometry fields beside the layer pattern.
         """
-        cfg = self.pretrained_config
-        if is_nemotron_hybrid(cfg):
-            return cfg.hybrid_override_pattern.count("*")
-        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
-            return get_qwen3_hybrid_num_attention_layers(cfg)
-        if is_kimi_linear(cfg):
-            return get_kimi_linear_num_attention_layers(cfg)
-        if is_glm5_next(cfg):
-            return get_glm5_next_num_attention_layers(cfg)
-        return cfg.num_hidden_layers
+        spec = self._recurrent_state_spec()
+        if spec is None:
+            return self.pretrained_config.num_hidden_layers
+        return sum(spec.attention_layer_mask)
 
     def get_num_mamba_layers(self) -> int:
-        """Number of Mamba / linear-attention layers (0 for non-hybrid)."""
-        cfg = self.pretrained_config
-        if is_nemotron_hybrid(cfg):
-            return cfg.hybrid_override_pattern.count("M")
-        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
-            return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
-                cfg)
-        if is_kimi_linear(cfg):
-            return cfg.num_hidden_layers - get_kimi_linear_num_attention_layers(
-                cfg)
-        if is_glm5_next(cfg):
-            # From the literal layer_types list: the composite config may not
-            # carry num_hidden_layers at the top level before normalization.
-            _, kda_mask = get_glm5_next_layer_masks(cfg)
-            return sum(kda_mask)
-        return 0
+        """Number of Mamba / linear-attention layers (0 for non-hybrid).
+
+        Counted on the model's declaration; ``get_num_attention_layers`` says
+        what the config has to carry.
+        """
+        spec = self._recurrent_state_spec()
+        if spec is None:
+            return 0
+        return sum(spec.recurrent_layer_mask)
+
+    def _recurrent_state_spec(self) -> Optional["RecurrentStateSpec"]:
+        """Layer kinds that the model class of ``pretrained_config`` declares."""
+        # Imported lazily: the model registry imports this module.
+        from tensorrt_llm._torch.models.modeling_utils import \
+            resolve_recurrent_state_spec
+        return resolve_recurrent_state_spec(self.pretrained_config)
 
 
 def _mirror_text_subconfig_attrs(

@@ -32,7 +32,10 @@ from tensorrt_llm._torch.models.modeling_kimi_k3_vl import (
 )
 from tensorrt_llm._torch.models.modeling_kimi_k25 import _vision_requires_replication
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+from tensorrt_llm._torch.models.modeling_utils import (
+    get_registered_model_class,
+    resolve_recurrent_state_spec,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_kimi_k3_multimodal_config,
     load_pretrained_config,
@@ -160,6 +163,26 @@ class TestKimiK3LoaderRouting(unittest.TestCase):
         self.assertEqual(config.text_config.model_type, "kimi_linear")
         self.assertIsNotNone(config.vision_config)
         self.assertEqual(config.vision_config.vt_num_attention_heads, 12)
+
+    def test_text_config_of_composite_checkpoint_resolves_recurrent_state(self) -> None:
+        """The wrapper leaves ``text_config`` on its model config once it is built."""
+        cfg = _composite_config()
+        cfg["text_config"].update(
+            num_hidden_layers=2,
+            linear_attn_config={
+                "head_dim": 8,
+                "num_heads": 4,
+                "short_conv_kernel_size": 4,
+                "kda_layers": [1],
+                "full_attn_layers": [2],
+            },
+        )
+        config = _load_config_from_dict(cfg)
+
+        spec = resolve_recurrent_state_spec(config.text_config)
+
+        self.assertEqual(spec.recurrent_layer_mask, (True, False))
+        self.assertEqual(spec, resolve_recurrent_state_spec(config))
 
     def test_language_model_only_checkpoint_flattens_to_text(self) -> None:
         cfg = _composite_config()

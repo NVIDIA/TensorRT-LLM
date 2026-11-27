@@ -489,8 +489,10 @@ def _materialize_meta(module: torch.nn.Module) -> None:
 
 def _config():
     config = PretrainedConfig(
+        architectures=["Glm5NextForConditionalGeneration"],
         model_type="glm5_next",
         text_config=PretrainedConfig(
+            architectures=["Glm5NextForCausalLM"],
             model_type="glm5_next_text",
             dtype="bfloat16",
             rms_norm_eps=1e-05,
@@ -1035,8 +1037,22 @@ def test_cache_manager_routing_guards(route, monkeypatch):
         assert get_kv_cache_manager_cls(config, kv) is Glm5NextCacheManager
         assert get_kv_cache_manager_cls(config, kv, True, transceiver) is Glm5NextCacheManager
     else:
-        with pytest.raises(ValueError, match="glm5_next"):
+        with pytest.raises(ValueError, match="Glm5NextVLM .* KV cache manager V2"):
             get_kv_cache_manager_cls(config, kv, True, transceiver)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_cls", [Glm5NextForCausalLM, Glm5NextVLM])
+def test_explicit_kv_cache_manager_v1_is_rejected_at_load(model_cls):
+    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model", kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False)
+    )
+    with pytest.raises(ValueError, match=f"{model_cls.__name__} requires KV cache manager v2"):
+        _resolve_kv_cache_manager_v2_auto(args, model_cls, _config())
 
 
 @pytest.mark.cpu_only
@@ -1047,6 +1063,7 @@ def test_cache_manager_routing_guards(route, monkeypatch):
 def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel):
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextCacheManager
     from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+    from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
     from tensorrt_llm.bindings import DataType
     from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
     from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1098,6 +1115,12 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
     allocate.assert_called_once()
     assert allocate.call_args.kwargs["dtype"] == (DataType.FP8 if fp8_kv_cache else DataType.BF16)
     assert allocate.call_args.kwargs["conv_state_layout"] == "q_k_v"
+    # The sparse MLA layers keep one key-only head of the latent width (kv_lora_rank 512, no
+    # RoPE part); an indexer row holds three fields of index_head_dim 128.
+    assert allocate.call_args.args[10] == CacheTypeCpp.SELFKONLY
+    assert allocate.call_args.kwargs["num_kv_heads"] == 1
+    assert allocate.call_args.kwargs["head_dim"] == 512
+    assert allocate.call_args.kwargs["index_state_dim"] == 384
     assert "kda_replay_num_spec" not in allocate.call_args.kwargs
     manager = object.__new__(Glm5NextCacheManager)
     manager._requested_num_spec = None

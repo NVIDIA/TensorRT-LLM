@@ -3,29 +3,56 @@
 """The recurrent state a model declares, against the geometry the cache managers use."""
 
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+    Glm5NextCacheManager,
+    get_glm5_next_cache_params,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import resolve_recurrent_state_spec
+from tensorrt_llm._torch.models.modeling_utils import (
+    MODEL_CLASS_MAPPING,
+    declares_recurrent_state,
+    resolve_recurrent_kv_cache_manager_cls,
+    resolve_recurrent_state_spec,
+)
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    Qwen35HybridCacheManager,
+    get_gdn_cache_params,
+)
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KimiK3HybridCacheManager,
+    get_kimi_cache_params,
+)
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    NemotronHybridCacheManager,
+    get_nemotron_cache_params,
+)
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     PLE_CONV_STATE,
     PLE_NGRAM_CONTEXT,
+    Qwen4ExpHybridCacheManager,
     _qwen4_exp_ple_state_bytes_per_rank,
 )
 from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
+    is_hybrid_linear,
     mamba_effective_tp_size,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaRole
 from tensorrt_llm._torch.recurrent_state_spec import (
     LayerKind,
     LayerStateSpec,
     PlaneShard,
+    RecurrentStateSpec,
     StatePlaneSpec,
+    mamba_params_from_recurrent_state_spec,
     recurrent_state_spec_from_mamba_params,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -41,6 +68,24 @@ _TEXT_MODELS = {
     "qwen4": ("Qwen4ExpForCausalLM", "qwen4_exp_text"),
     "kimi": ("KimiLinearForCausalLM", "kimi_linear"),
     "glm": ("Glm5NextForCausalLM", "glm5_next_text"),
+}
+
+# Family -> function of its cache manager module that reads the geometry from a text config.
+_FAMILY_CACHE_PARAMS = {
+    "nemotron": get_nemotron_cache_params,
+    "gdn": get_gdn_cache_params,
+    "qwen4": get_gdn_cache_params,
+    "kimi": get_kimi_cache_params,
+    "glm": get_glm5_next_cache_params,
+}
+
+# Family -> V2 cache manager class that holds its recurrent state.
+_FAMILY_MANAGERS = {
+    "nemotron": NemotronHybridCacheManager,
+    "gdn": Qwen35HybridCacheManager,
+    "qwen4": Qwen4ExpHybridCacheManager,
+    "kimi": KimiK3HybridCacheManager,
+    "glm": Glm5NextCacheManager,
 }
 
 # Every architecture name registered for a text model of a recurrent family.
@@ -103,6 +148,25 @@ _WRAPPERS = {
         "glm5_next",
     ),
 }
+
+# (wrapper architecture, whether the composite config mirrors the text fields).
+_WRAPPER_CASES = [
+    (architecture, mirrored)
+    for architecture, (_, _, field, _) in sorted(_WRAPPERS.items())
+    for mirrored in ((False, True) if field == "text_config" else (False,))
+]
+
+# Wrappers that declare state while `is_hybrid_linear` does not recognise their composite config.
+_PREDICATE_BLIND_WRAPPERS = frozenset(
+    {
+        "NemotronH_Nano_VL_V2",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "MiniCPMV4_6ForConditionalGeneration",
+    }
+)
 
 # Family -> (conv dtype, SSM dtype, {ranks sharing a request: (conv shape, conv sections, SSM
 # shape)}) of the state buffers the V2 managers allocate for `_text_config(family)`.
@@ -288,6 +352,55 @@ def test_malformed_declaration_is_rejected(build, message):
         build()
 
 
+# Planes of a layer with 4 heads of dimension 8, state size 8 and one group.
+_CONV_PLANE = StatePlaneSpec(
+    MambaRole.CONV_STATE, (48, 3), torch.bfloat16, PlaneShard(axis=0, sections=(32, 8, 8))
+)
+_SSM_PLANE = StatePlaneSpec(MambaRole.SSM_STATE, (4, 8, 8), torch.bfloat16, PlaneShard(axis=0))
+
+
+@pytest.mark.parametrize(
+    "layers, message",
+    [
+        ([(_SSM_PLANE,)], "no convolution or no SSM plane"),
+        (
+            [(_CONV_PLANE, _SSM_PLANE), (_CONV_PLANE, replace(_SSM_PLANE, dtype=torch.float32))],
+            "different convolution or SSM planes",
+        ),
+        (
+            [(replace(_CONV_PLANE, shard=PlaneShard(axis=0, sections=(40, 8))), _SSM_PLANE)],
+            "cannot express",
+        ),
+        (
+            [(replace(_CONV_PLANE, shard=PlaneShard(axis=0, sections=(32, 6, 10))), _SSM_PLANE)],
+            "cannot express",
+        ),
+        # Two groups of state size 8 would stand for 64 channels, not the declared 48.
+        (
+            [(replace(_CONV_PLANE, shard=PlaneShard(axis=0, sections=(16, 16, 16))), _SSM_PLANE)],
+            "cannot express",
+        ),
+        # The parameters split the heads across ranks; this plane is whole on every rank.
+        ([(_CONV_PLANE, replace(_SSM_PLANE, shard=PlaneShard()))], "cannot express"),
+    ],
+    ids=[
+        "missing_plane",
+        "layers_differ",
+        "two_sections",
+        "ungrouped_section",
+        "no_inner_section",
+        "ssm_not_sharded",
+    ],
+)
+def test_cache_params_need_one_mamba_style_geometry(layers, message):
+    spec = RecurrentStateSpec(
+        layers=tuple(LayerStateSpec(LayerKind.RECURRENT, planes) for planes in layers)
+    )
+
+    with pytest.raises(ValueError, match=message):
+        mamba_params_from_recurrent_state_spec(spec)
+
+
 @pytest.mark.parametrize("family, architecture", _TEXT_ARCHITECTURES)
 @pytest.mark.parametrize("recurrent", [True, False])
 @pytest.mark.parametrize("ssm_cache_dtype", [None, "float32"])
@@ -296,13 +409,23 @@ def test_declaration_matches_cache_params_and_state_budget(
 ):
     config = _text_config(family, architecture=architecture, recurrent=recurrent)
     quant_config = QuantConfig(mamba_ssm_cache_dtype=ssm_cache_dtype)
-    params = extract_mamba_kv_cache_params(config, quant_config=quant_config)
+    params = _FAMILY_CACHE_PARAMS[family](config, quant_config=quant_config)
 
     spec = resolve_recurrent_state_spec(config, quant_config=quant_config)
 
+    assert is_hybrid_linear(config)
+    assert declares_recurrent_state(config)
     assert list(spec.recurrent_layer_mask) == params.mamba_layer_mask
     assert list(spec.attention_layer_mask) == params.target_full_attention_layer_mask
     assert any(spec.recurrent_layer_mask) == recurrent
+    model_config = ModelConfig(pretrained_config=config)
+    assert model_config.get_num_mamba_layers() == sum(params.mamba_layer_mask)
+    assert model_config.get_num_attention_layers() == sum(params.target_full_attention_layer_mask)
+    if recurrent:
+        assert extract_mamba_kv_cache_params(config, quant_config=quant_config) == params
+    else:
+        with pytest.raises(ValueError, match="carries no state geometry"):
+            extract_mamba_kv_cache_params(config, quant_config=quant_config)
     for layer in spec.layers:
         if layer.kind is not LayerKind.RECURRENT:
             assert layer.planes == ()
@@ -382,14 +505,7 @@ def test_qwen4_exp_declares_ple_state_on_its_ple_layer():
     )
 
 
-@pytest.mark.parametrize(
-    "architecture, mirrored",
-    [
-        (architecture, mirrored)
-        for architecture, (_, _, field, _) in sorted(_WRAPPERS.items())
-        for mirrored in ((False, True) if field == "text_config" else (False,))
-    ],
-)
+@pytest.mark.parametrize("architecture, mirrored", _WRAPPER_CASES)
 def test_wrapper_declares_the_state_of_its_language_model(architecture, mirrored):
     config = _wrapper_config(architecture, mirrored=mirrored)
     text_config = getattr(config, _WRAPPERS[architecture][2])
@@ -397,7 +513,14 @@ def test_wrapper_declares_the_state_of_its_language_model(architecture, mirrored
     spec = resolve_recurrent_state_spec(config, quant_config=QuantConfig())
 
     assert spec is not None
+    assert declares_recurrent_state(config)
+    # A reader that moves from the predicate to the declaration changes its answer for the
+    # composite configs the predicate does not recognise.
+    assert is_hybrid_linear(config) == (architecture not in _PREDICATE_BLIND_WRAPPERS)
     assert spec == resolve_recurrent_state_spec(text_config, quant_config=QuantConfig())
+    assert ModelConfig(pretrained_config=config).get_num_mamba_layers() == 2
+    family = _WRAPPERS[architecture][0]
+    assert resolve_recurrent_kv_cache_manager_cls(config) is _FAMILY_MANAGERS[family]
 
 
 @pytest.mark.parametrize(
@@ -412,6 +535,125 @@ def test_wrapper_declares_the_state_of_its_language_model(architecture, mirrored
 )
 def test_no_declaration_without_a_recurrent_model_class(config):
     assert resolve_recurrent_state_spec(config) is None
+    assert resolve_recurrent_kv_cache_manager_cls(config) is None
+
+
+class _ManagerOnlyModel:
+    """A model class that names a recurrent cache manager and declares no recurrent state."""
+
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: object) -> type:
+        return NemotronHybridCacheManager
+
+
+@pytest.mark.parametrize(
+    "architectures, params_message, selection_message",
+    [
+        (None, "No model class is registered", "No model class is registered"),
+        (
+            ["NoSuchArchitectureForCausalLM"],
+            "No model class is registered",
+            "No model class is registered",
+        ),
+        (
+            ["LlamaForCausalLM"],
+            "not a supported hybrid",
+            "LlamaForCausalLM declares no recurrent cache manager",
+        ),
+        (
+            ["ManagerOnlyForCausalLM"],
+            "not a supported hybrid",
+            "NemotronHybridCacheManager is declared .* its model class declares no recurrent state",
+        ),
+    ],
+    ids=["architectures_none", "unregistered", "no_declaration", "manager_only"],
+)
+def test_hybrid_config_without_a_declaring_model_class_is_rejected(
+    monkeypatch, architectures, params_message, selection_message
+):
+    monkeypatch.setitem(MODEL_CLASS_MAPPING, "ManagerOnlyForCausalLM", _ManagerOnlyModel)
+    config = _text_config("nemotron")
+    config.architectures = architectures
+
+    with pytest.raises(ValueError, match=params_message):
+        extract_mamba_kv_cache_params(config)
+    with pytest.raises(ValueError, match=selection_message):
+        get_kv_cache_manager_cls(
+            SimpleNamespace(
+                pretrained_config=config,
+                sparse_attention_config=None,
+                # What `ModelConfig` counts for a class without a declaration.
+                get_num_mamba_layers=lambda: 0,
+            ),
+            KvCacheConfig(),
+        )
+
+
+@pytest.mark.parametrize("family, architecture", _TEXT_ARCHITECTURES)
+def test_v2_selection_returns_the_cache_manager_the_model_class_declares(
+    monkeypatch, family, architecture
+):
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    config = _text_config(family, architecture=architecture)
+
+    manager_cls = resolve_recurrent_kv_cache_manager_cls(config)
+
+    assert manager_cls is _FAMILY_MANAGERS[family]
+    assert (
+        get_kv_cache_manager_cls(
+            ModelConfig(pretrained_config=config),
+            KvCacheConfig(use_kv_cache_manager_v2=True, enable_block_reuse=False),
+        )
+        is manager_cls
+    )
+
+
+def _kv_cache_config() -> KvCacheConfig:
+    return KvCacheConfig(
+        use_kv_cache_manager_v2=True, enable_block_reuse=False, max_tokens=256, tokens_per_block=64
+    )
+
+
+def _create_manager(model_config: ModelConfig, manager_cls: type):
+    """Build ``manager_cls`` for ``model_config`` through the executor's construction."""
+    kv_cache_config = _kv_cache_config()
+    return _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=manager_cls,
+        mapping=model_config.mapping,
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=kv_cache_config.tokens_per_block,
+        max_seq_len=2048,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=model_config.sparse_attention_config,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+
+def test_construction_rejects_a_model_without_a_recurrent_layer():
+    """The class selection gives such a model a manager that holds no recurrent state."""
+    model_config = ModelConfig(
+        pretrained_config=_text_config("nemotron", recurrent=False), quant_config=QuantConfig()
+    )
+
+    with pytest.raises(ValueError, match="without a recurrent layer is not supported"):
+        _create_manager(model_config, KVCacheManagerV2)
+
+
+def test_construction_rejects_a_manager_class_that_holds_no_recurrent_state():
+    model_config = ModelConfig(
+        pretrained_config=_text_config("nemotron"), quant_config=QuantConfig()
+    )
+
+    with pytest.raises(ValueError, match="KVCacheManagerV2 holds no recurrent state"):
+        _create_manager(model_config, KVCacheManagerV2)
 
 
 @skip_no_cuda
@@ -427,28 +669,11 @@ def test_manager_state_buffers_match_declaration(monkeypatch, family, mapping_kw
     model_config = ModelConfig(
         pretrained_config=config, mapping=mapping, quant_config=QuantConfig()
     )
-    kv_cache_config = KvCacheConfig(
-        use_kv_cache_manager_v2=True, enable_block_reuse=False, max_tokens=256, tokens_per_block=64
-    )
     spec = resolve_recurrent_state_spec(config, quant_config=model_config.quant_config)
     num_shards = mamba_effective_tp_size(mapping)
 
-    manager = _create_kv_cache_manager(
-        model_engine=None,
-        kv_cache_manager_cls=get_kv_cache_manager_cls(model_config, kv_cache_config),
-        mapping=mapping,
-        kv_cache_config=kv_cache_config,
-        tokens_per_block=kv_cache_config.tokens_per_block,
-        max_seq_len=2048,
-        max_batch_size=4,
-        spec_config=None,
-        sparse_attention_config=model_config.sparse_attention_config,
-        max_num_tokens=256,
-        max_beam_width=1,
-        kv_connector_manager=None,
-        model_config=model_config,
-        dtype=torch.bfloat16,
-        is_draft=False,
+    manager = _create_manager(
+        model_config, get_kv_cache_manager_cls(model_config, _kv_cache_config())
     )
     try:
         recurrent_layers = [

@@ -158,14 +158,6 @@ def test_invalid_sliding_window_falls_back_to_default():
 # dependency of ``_util`` (the module under test imports it at load time).
 # ---------------------------------------------------------------------------
 
-_FAMILY_PREDICATES = (
-    "is_kimi_linear",
-    "is_mla",
-    "is_nemotron_hybrid",
-    "is_qwen3_hybrid",
-    "is_qwen4_exp",
-)
-
 
 def _make_recording_manager(base):
     """A ``base`` subclass whose constructor records its config and does no work.
@@ -211,11 +203,11 @@ def _pretrained_config(**overrides):
 def _run_create_kv_cache_manager(
     monkeypatch, manager_cls, kv_cache_config, *, is_draft, config_overrides=None
 ):
-    # Force the generic (non-hybrid-family) construction path so the recording
-    # stub is what gets built; the derivation under test runs before this
-    # dispatch and is independent of the model family.
-    for name in _FAMILY_PREDICATES:
-        monkeypatch.setattr(util, name, lambda _config: False)
+    # The config names no architecture, so no model class declares recurrent
+    # state and the generic construction path builds the recording stub. The
+    # MLA route of that path is switched off; the derivation under test runs
+    # before this dispatch and is independent of the model family.
+    monkeypatch.setattr(util, "is_mla", lambda _config: False)
 
     pretrained_config = _pretrained_config(**(config_overrides or {}))
     model_config = SimpleNamespace(pretrained_config=pretrained_config, quant_config=None)

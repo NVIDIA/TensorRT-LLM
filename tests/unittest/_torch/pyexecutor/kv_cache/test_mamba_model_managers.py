@@ -2631,12 +2631,15 @@ def test_fp4_mla_route_rejects_a_hybrid_family_other_than_kimi_k3():
 
     # A Nemotron-H hybrid pattern with MLA attention geometry.
     config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
         model_type="nemotron_h",
         hybrid_override_pattern="M*",
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
-    with pytest.raises(ValueError, match="only on Kimi K3"):
+    with pytest.raises(
+        ValueError, match="NemotronHybridCacheManager does not compose the FP4 MLA cache layout"
+    ):
         get_kv_cache_manager_cls(
             _hybrid_fp4_mla_model_config(config),
             KvCacheConfig(use_kv_cache_manager_v2=True, enable_kv_pool_rebalance=False),
@@ -2648,6 +2651,7 @@ def test_fp4_mla_route_builds_the_kimi_k3_manager():
     from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 
     config = SimpleNamespace(
+        architectures=["KimiLinearForCausalLM"],
         model_type="kimi_linear",
         linear_attn_config={"full_attn_layers": [2]},
         kv_lora_rank=512,

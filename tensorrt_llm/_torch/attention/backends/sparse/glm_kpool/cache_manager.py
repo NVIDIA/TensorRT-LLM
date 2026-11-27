@@ -33,6 +33,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     _is_disagg_context_server,
     get_kda_replay_num_spec,
+    kda_family_init_kwargs,
 )
 from tensorrt_llm._torch.modules.kimi_kda.replay_region import REPLAY_STATE_REGION, KDAReplayRegion
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -47,7 +48,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
-from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -88,6 +89,38 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @override
     def is_context_only_cache(self) -> bool:
         return self.kda_context_only is True
+
+    @classmethod
+    @override
+    def attention_cache_geometry(
+        cls,
+        pretrained_config: object,
+        *,
+        num_kv_heads: int | list[int],
+        head_dim: int | list[int],
+    ) -> tuple[CacheTypeCpp, int, int]:
+        # The sparse MLA layers keep one head of the latent and RoPE widths.
+        text_config = unwrap_glm5_next_text_config(pretrained_config)
+        return (
+            CacheTypeCpp.SELFKONLY,
+            1,
+            int(text_config.kv_lora_rank) + int(getattr(text_config, "qk_rope_head_dim", 0) or 0),
+        )
+
+    @classmethod
+    @override
+    def family_init_kwargs(
+        cls,
+        *,
+        model_config: ModelConfig,
+        spec_config: object,
+        sparse_attention_config: object,
+        mamba_params: object,
+        model: torch.nn.Module | None,
+    ) -> dict[str, object]:
+        init_kwargs = kda_family_init_kwargs(spec_config, model)
+        init_kwargs["index_state_dim"] = glm_kpool_index_state_dim(model_config)
+        return init_kwargs
 
     @override
     def __init__(
@@ -706,9 +739,10 @@ def get_glm5_next_cache_params(config, *, spec_config=None, quant_config=None):
         quant_config=quant_config,
     )
     if params.mamba_ssm_cache_dtype != torch.float32:
-        logger.info(
+        logger.info_once(
             f"glm5_next KDA: overriding mamba_ssm_cache_dtype "
-            f"{params.mamba_ssm_cache_dtype} -> torch.float32"
+            f"{params.mamba_ssm_cache_dtype} -> torch.float32",
+            key=f"glm5_next_kda_ssm_cache_dtype_{params.mamba_ssm_cache_dtype}",
         )
         params.mamba_ssm_cache_dtype = torch.float32
     return params

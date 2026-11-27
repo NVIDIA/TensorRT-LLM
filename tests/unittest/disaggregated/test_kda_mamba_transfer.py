@@ -106,6 +106,7 @@ def _kimi_linear_config():
     kda_layers = [i + 1 for i, m in enumerate(_KDA_MASK) if m]
     full_attn_layers = [i + 1 for i, m in enumerate(_KDA_MASK) if not m]
     return SimpleNamespace(
+        architectures=["KimiLinearForCausalLM"],
         model_type="kimi_linear",
         linear_attn_config={
             "head_dim": KDA_HEAD_DIM,
