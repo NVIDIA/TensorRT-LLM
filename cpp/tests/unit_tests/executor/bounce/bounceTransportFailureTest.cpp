@@ -223,6 +223,66 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     bounce_test::freeXferBufs(followup);
 }
 
+TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    auto c = cfg(/*timeoutMs=*/1500);
+    auto sender = bounce_test::makeNode("drainA", c, 1024);
+    auto receiver = bounce_test::makeNode("drainB", c, 1024);
+    if (!sender || !receiver)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    bounce_test::wirePair(*sender, *receiver);
+    ASSERT_TRUE(sender->tx->registerPeerHandshake(receiver->name, receiver->tx->localHandshakeBlob()));
+    ASSERT_TRUE(receiver->tx->registerPeerHandshake(sender->name, sender->tx->localHandshakeBlob()));
+
+    auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/7);
+    std::vector<b::ExecCtx*> held;
+    while (auto* ctx = receiver->exec->tryAcquire())
+    {
+        held.push_back(ctx);
+    }
+    auto result = bounce_test::submitTransfer(*sender, *receiver, bufs);
+    std::shared_future<bool> drain;
+    if (result.wait_for(std::chrono::seconds(10)) == std::future_status::ready)
+    {
+        EXPECT_EQ(result.get().state, kvc::TransferState::kFAILURE);
+        EXPECT_EQ(result.get().reason, b::BounceFailReason::kNoProgressTimeout);
+        EXPECT_FALSE(result.get().remoteDrained);
+        if (result.get().remoteDrain)
+        {
+            drain = result.get().remoteDrain->result;
+        }
+    }
+    EXPECT_TRUE(drain.valid());
+    if (drain.valid())
+    {
+        EXPECT_EQ(drain.wait_for(std::chrono::milliseconds(c.requestTimeoutMs + 100)), std::future_status::timeout);
+    }
+    EXPECT_FALSE(bounce_test::verifyXferBufs(bufs));
+    for (auto* ctx : held)
+    {
+        receiver->exec->release(ctx);
+    }
+    if (drain.valid())
+    {
+        auto const ready = drain.wait_for(std::chrono::seconds(5));
+        EXPECT_EQ(ready, std::future_status::ready);
+        if (ready == std::future_status::ready)
+        {
+            EXPECT_TRUE(drain.get());
+            EXPECT_TRUE(bounce_test::verifyXferBufs(bufs));
+        }
+    }
+    sender->tx->shutdown();
+    receiver->tx->shutdown();
+    bounce_test::freeXferBufs(bufs);
+}
+
 class BounceCapacityFailure : public ::testing::TestWithParam<bool>
 {
 };

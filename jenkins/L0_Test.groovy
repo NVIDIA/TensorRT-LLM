@@ -3877,6 +3877,12 @@ def cbtsResizeSplits(configs) {
     }
 }
 
+// Groovy's native sort must not call a CPS-transformed key closure.
+@NonCPS
+def sortCbtsStageNames(List names, Map configs) {
+    return names.sort { configs[it][2] as int }
+}
+
 // CBTS can only narrow the stages selected by the command. A null decision
 // leaves that same scope intact, including on selector failure.
 def filterCbtsStageJobs(parallelJobsFiltered, testFilter) {
@@ -3904,7 +3910,7 @@ def filterCbtsStageJobs(parallelJobsFiltered, testFilter) {
         !preserveCbtsShardScope() && cbtsStageConfigs.containsKey(key)
     }
     narrowedJobs.keySet().groupBy { it.replaceFirst(/-\d+-cbts$/, "") }.each { _, names ->
-        def ordered = names.sort { cbtsStageConfigs[it][2] as int }
+        def ordered = sortCbtsStageNames(names, cbtsStageConfigs)
         def original = ordered.first() - CBTS_STAGE_SUFFIX
         int splits = Math.min(ordered.size(), Math.max(1, cbts.affected_stage_split_counts[original] as int))
         ordered.eachWithIndex { name, index ->

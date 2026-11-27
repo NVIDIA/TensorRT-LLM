@@ -15,6 +15,7 @@
 
 import os
 import time
+from collections.abc import Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -31,6 +32,7 @@ from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (  # noqa: E402
 from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
     NixlTransferAgent as CppNixlTransferAgent,
 )
+from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferStatus as CppTransferStatus
 
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
 
@@ -41,24 +43,48 @@ class BindingsNixlTransferStatus(TransferStatus):
     def __init__(self, cpp_status, agent_name: str = "?"):
         self._cpp_status = cpp_status
         self._agent_name = agent_name
+        self.in_progress = True
 
     def is_completed(self) -> bool:
         """Check if transfer is completed (releases GIL)."""
         return self._cpp_status.is_completed()
 
     @nvtx_range("BindingsNixlTransferStatus.wait")
-    def wait(self, timeout_ms=None) -> bool:
-        """Wait for transfer to complete (releases GIL)."""
+    def wait(self, timeout_ms=None, *, stop_requested: Callable[[], bool] | None = None) -> bool:
+        """Poll a transfer, optionally stopping when its agent is fenced.
+
+        A False result can still be IN_PROGRESS. Callers must retain the handle
+        and its memory until a later wait observes a terminal native result.
+        """
         start_time = time.time()
         if timeout_ms is None:
             timeout_ms = -1
-        result = self._cpp_status.wait(timeout_ms)
+        if stop_requested is None:
+            result = self._cpp_status.wait(timeout_ms)
+        else:
+            deadline = None if timeout_ms < 0 else time.monotonic() + timeout_ms / 1000
+            result = TransferState.IN_PROGRESS
+            while not stop_requested():
+                poll_ms = 100
+                if deadline is not None:
+                    poll_ms = max(0, min(poll_ms, int((deadline - time.monotonic()) * 1000)))
+                result = self._cpp_status.wait(poll_ms)
+                if result != TransferState.IN_PROGRESS or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
+                    break
+        self.in_progress = result == TransferState.IN_PROGRESS
         if result != TransferState.SUCCESS:
-            logger.error(
+            log = logger.debug if self.in_progress else logger.error
+            log(
                 f"NIXL (cpp binding) wait returned non-SUCCESS state={result} "
                 f"after {time.time() - start_time:.3f}s (agent={self._agent_name})."
             )
         return result == TransferState.SUCCESS
+
+    def wait_for_bounce_scatter_drain(self, timeout_ms: int) -> bool:
+        wait = getattr(self._cpp_status, "wait_for_bounce_scatter_drain", None)
+        return wait is not None and wait(timeout_ms)
 
     def last_status_str(self) -> str:
         get = getattr(self._cpp_status, "get_last_status_str", None)
@@ -98,6 +124,16 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
     The nixl_bindings module is independent from the main trtllm bindings,
     so trtllm can function normally even without NIXL.
     """
+
+    supports_handle_retirement = hasattr(CppTransferStatus, "release")
+
+    @staticmethod
+    def normalize_backend(backend: str) -> str:
+        normalize = getattr(CppNixlTransferAgent, "normalize_backend", None)
+        if normalize is None:
+            # Older bindings support these same two native backends.
+            return "LIBFABRIC" if backend == "LIBFABRIC" else "UCX"
+        return normalize(backend)
 
     def __init__(
         self,
@@ -230,8 +266,15 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             peer, endpoint, key, slots, base, stride, slot_bytes, num_slots, offsets, lengths
         )
 
+    def seal_bounce_window(self, key: bytes) -> None:
+        self._cpp_agent.seal_bounce_window(key)
+
     def revoke_bounce_window(self, key: bytes) -> None:
         self._cpp_agent.revoke_bounce_window(key)
+
+    def peer_supports_bounce(self, name: str) -> bool:
+        supports = getattr(self._cpp_agent, "peer_supports_bounce", None)
+        return self.bounce_enabled if supports is None else supports(name)
 
     @property
     def bounce_enabled(self) -> bool:
@@ -290,6 +333,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         request should be a C++ TransferRequest (from tensorrt_llm_transfer_agent_binding).
         """
         cpp_status = self._cpp_agent.submit_transfer_requests(request)
+        if cpp_status is None:
+            raise RuntimeError("NIXL could not create a transfer request")
         return BindingsNixlTransferStatus(cpp_status, agent_name=self.name)
 
     def _convert_reg_memory_descs(self, descs: RegMemoryDescs) -> "MemoryDescs":

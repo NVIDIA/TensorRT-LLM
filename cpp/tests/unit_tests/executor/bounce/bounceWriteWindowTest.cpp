@@ -144,3 +144,16 @@ TEST(BounceReceiveWindow, InvalidSlotLayoutDoesNotPublishAWindow)
     EXPECT_THROW(windows.addSlots("writer", "endpoint", key, slots, layout), std::invalid_argument);
     EXPECT_EQ(windows.find(b::bounceWindowId(key), "writer"), nullptr);
 }
+
+TEST(BounceReceiveWindow, SealedWindowRetainsItsWriterUntilRetirement)
+{
+    b::BounceWriteWindows windows;
+    auto window = windows.add("writer", "endpoint", std::string(16, 'a'), {{32, 16}});
+    windows.seal(window->id());
+    auto sealed = windows.find(window->id(), "writer");
+    ASSERT_EQ(sealed, window);
+    EXPECT_FALSE(sealed->acquire().owns_lock());
+    EXPECT_EQ(windows.find(window->id(), "other-writer"), nullptr);
+    windows.remove(window->id());
+    EXPECT_EQ(windows.find(window->id(), "writer"), nullptr);
+}

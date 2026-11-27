@@ -116,6 +116,26 @@ def _count_prims_ts_phase_calls(mocker):
     return calls
 
 
+def _enable_dense_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run a multi-GPU MLA accuracy case on dense PrimTS attention.
+
+    Dense PrimTS MLA decode is opt-in on SM100 and SM103. The MPI workers read
+    TLLM_FMHA_LIBS from this process when the LLM starts them. Other GPUs never
+    select PrimTS, so the variable stays unset there: session reuse respawns
+    its cached MPI pool whenever the environment changes.
+    """
+    if is_sm_100f():
+        monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
+
+
+# The only TestDeepSeekV3Lite four-GPU case on dense PrimTS MLA decode, with
+# MTP, attention DP, CUDA graphs and the overlap scheduler. It is registered in
+# l0_dgx_b300, l0_gb200_multi_gpus and l0_gb300_multi_gpus.
+_DENSE_PRIMS_TS_BF16_4GPUS_ID = (
+    "ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False"
+)
+
+
 # MPI session reuse cannot safely reset Userbuffers between Engines. Tests
 # using this helper must keep ``torch_compile=True`` in their node id; tests
 # with unconditional compile configs must keep ``piecewise_cuda_graph`` in
@@ -646,9 +666,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
-    def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
-                            attention_dp, cuda_graph, overlap_scheduler,
-                            torch_compile):
+    def test_bfloat16_4gpus(self, request: pytest.FixtureRequest,
+                            monkeypatch: pytest.MonkeyPatch, tp_size, pp_size,
+                            ep_size, mtp_nextn, attention_dp, cuda_graph,
+                            overlap_scheduler, torch_compile):
+        if request.node.callspec.id == _DENSE_PRIMS_TS_BF16_4GPUS_ID:
+            _enable_dense_prims_ts(monkeypatch)
         if pp_size > 1 and mtp_nextn > 0:
             num_hidden_layers = 30
             pp_partition = [num_hidden_layers // pp_size + 1] * pp_size
@@ -6221,6 +6244,72 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @pytest.mark.timeout(3600)
+    @skip_no_sm100f
+    @pytest.mark.parametrize("mode", ["baseline", "mtp3", "dflash7"])
+    def test_gpqa_diamond(
+        self,
+        mode: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Evaluate sampled reasoning with CUDA graphs and speculative decoding."""
+        model_root = Path(llm_models_root())
+        model_path = Path(self.MODEL_PATH)
+        assert model_path.is_dir(), f"Missing target checkpoint: {model_path}"
+
+        spec_config = None
+        if mode == "mtp3":
+            spec_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                            use_rejection_sampling=False)
+        elif mode == "dflash7":
+            draft_path = model_root / "Qwen3.6-35B-A3B-DFlash"
+            assert draft_path.is_dir(
+            ), f"Missing DFlash checkpoint: {draft_path}"
+            spec_config = DFlashDecodingConfig(
+                speculative_model=str(draft_path), max_draft_len=7)
+
+        monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+        max_seq_len = GPQADiamond.MAX_INPUT_LEN + GPQADiamond.MAX_OUTPUT_LEN
+        with LLM(
+                str(model_path),
+                trust_remote_code=True,
+                tensor_parallel_size=1,
+                moe_expert_parallel_size=1,
+                max_batch_size=16,
+                max_seq_len=max_seq_len,
+                max_num_tokens=8192,
+                enable_chunked_prefill=True,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                  max_batch_size=16),
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    free_gpu_memory_fraction=0.9,
+                    dtype="fp8",
+                    mamba_ssm_cache_dtype="bfloat16",
+                    use_kv_cache_manager_v2=False,
+                ),
+                moe_config=MoeConfig(backend="TRTLLM"),
+                speculative_config=spec_config,
+        ) as llm:
+            task = GPQADiamond(self.MODEL_NAME)
+            # Caller temperature and top_p take precedence over the task's greedy defaults.
+            task.EVALUATE_KWARGS = dict(getattr(task, "EVALUATE_KWARGS", {}),
+                                        sampling_override=True)
+            task.evaluate(
+                llm,
+                sampling_params=SamplingParams(
+                    temperature=1.0,
+                    top_p=0.95,
+                    seed=0,
+                    max_tokens=GPQADiamond.MAX_OUTPUT_LEN,
+                    truncate_prompt_tokens=GPQADiamond.MAX_INPUT_LEN,
+                ),
+                extra_evaluator_kwargs=dict(
+                    apply_chat_template=True,
+                    chat_template_kwargs=dict(enable_thinking=True),
+                ),
+            )
 
 
 @skip_pre_blackwell

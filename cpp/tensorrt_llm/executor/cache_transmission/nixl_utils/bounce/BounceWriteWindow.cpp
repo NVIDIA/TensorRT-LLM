@@ -273,6 +273,21 @@ void BounceWriteWindows::remove(std::string const& id)
     window->close();
 }
 
+void BounceWriteWindows::seal(std::string const& id)
+{
+    std::shared_ptr<BounceWriteWindow> window;
+    {
+        std::lock_guard lock(mMutex);
+        auto it = mWindows.find(id);
+        if (it == mWindows.end())
+        {
+            return;
+        }
+        window = it->second;
+    }
+    window->close();
+}
+
 void BounceWriteWindows::removeIntersecting(std::uint64_t address, std::uint64_t length)
 {
     std::vector<std::shared_ptr<BounceWriteWindow>> retired;

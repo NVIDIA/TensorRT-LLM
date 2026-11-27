@@ -208,6 +208,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         // holds for the whole metadata load. BindingsNixlTransferStatus.__del__ (nixl/_agent_cpp.py)
         // calls this before the status is destroyed, so that wait does not hold the GIL.
         .def("release", &kvc::TransferStatus::release, nb::call_guard<nb::gil_scoped_release>())
+        .def("wait_for_bounce_scatter_drain", &kvc::TransferStatus::waitForBounceScatterDrain, nb::arg("timeout_ms"),
+            nb::call_guard<nb::gil_scoped_release>())
         // Failure detail for the last terminal state (empty if unavailable). Named to match the
         // lookup in BindingsNixlTransferStatus.last_status_str (nixl/_agent_cpp.py), which is what
         // the Python transceiver's error log reads.
@@ -290,6 +292,7 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
 
     // NixlTransferAgent class
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
+        .def_static("normalize_backend", &kvc::NixlTransferAgent::normalizeBackend, nb::arg("backend"))
         .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &kvc::NixlTransferAgent::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"),
@@ -356,6 +359,13 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             nb::arg("peer"), nb::arg("endpoint"), nb::arg("key"), nb::arg("slots").noconvert(), nb::arg("base"),
             nb::arg("stride"), nb::arg("slot_bytes"), nb::arg("num_slots"), nb::arg("offsets").noconvert(),
             nb::arg("lengths").noconvert())
+        .def("seal_bounce_window",
+            [](kvc::NixlTransferAgent& agent, nb::bytes token)
+            {
+                std::string key(token.c_str(), token.size());
+                nb::gil_scoped_release release;
+                agent.sealBounceWindow(key);
+            })
         .def("revoke_bounce_window",
             [](kvc::NixlTransferAgent& agent, nb::bytes token)
             {
@@ -364,6 +374,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
                 agent.revokeBounceWindow(key);
             })
         .def_prop_ro("bounce_enabled", &kvc::NixlTransferAgent::isBounceEnabled)
+        .def("peer_supports_bounce", &kvc::NixlTransferAgent::peerSupportsBounce, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("bounce_submit_count", &kvc::NixlTransferAgent::getBounceSubmitCount)
         .def_prop_ro("bounce_reject_count", &kvc::NixlTransferAgent::getBounceRejectCount)
         .def_prop_ro("bounce_reject_counts",

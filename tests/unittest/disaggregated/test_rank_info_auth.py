@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import msgpack
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger
@@ -15,6 +16,7 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import NATIVE_TRANSFER_
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     _RANK_INFO_CHALLENGE_TTL_S,
     MessageType,
+    PeerIncompatibleError,
     RankInfoAuthenticationError,
     RankInfoServer,
     Receiver,
@@ -123,6 +125,27 @@ def test_rank_info_server_rejects_wrong_key_and_consumes_challenge():
     server._messenger.send.assert_called_once_with([b"client", MessageType.AUTHENTICATION_ERROR])
     assert b"client" not in server._rank_info_auth_challenges
     server._rank_info.to_bytes.assert_not_called()
+
+
+def test_receiver_rejects_pre_recovery_protocol_before_registration() -> None:
+    receiver = _make_receiver()
+    receiver._rank_info_timeout_s = 60.0
+    receiver._rank_info_auth_key = None
+    receiver._incompatible_peers = {}
+    receiver._extract_info_endpoint = Mock(return_value=_ENDPOINT)
+    receiver._should_register_peer = Mock(return_value=True)
+    receiver._registrar = Mock()
+    receiver._get_or_connect_dealer = Mock()
+    messenger = Mock()
+    messenger.receive.return_value = [msgpack.packb({"protocol_version": 3})]
+
+    with patch(f"{_TRANSFER_MODULE}.ZMQMessenger", return_value=messenger):
+        with pytest.raises(PeerIncompatibleError, match="local=4, peer=3"):
+            receiver._get_sender_info(Mock())
+
+    assert _ENDPOINT in receiver._incompatible_peers
+    assert not receiver._registrar.mock_calls
+    receiver._get_or_connect_dealer.assert_not_called()
 
 
 @pytest.mark.parametrize("key", [None, _AUTH_KEY])

@@ -288,6 +288,12 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     {
         return;
     }
+    bool const cancel = isCancelWant(chunkBytes);
+    auto admission = window->acquire();
+    if (!cancel && !admission.owns_lock())
+    {
+        return;
+    }
     // Self-bootstrap the reverse control path. Disaggregated serving supports one-directional
     // metadata exchange: the KV sender may load our agent metadata without us loading the sender's.
     // In that case we have no reverse route for GRANT/ACK, so register the sender endpoint carried
@@ -307,7 +313,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
             "BounceTransport(%s): rejected WANT from peer %s: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
     }
     auto const key = makeKey(peer, window->id(), h.requestId);
-    if (isCancelWant(chunkBytes))
+    if (cancel)
     {
         // Explicit cancel/abort (the sender failed or retracted): precisely free this flow's
         // granted-but-unwritten regions now — otherwise they stay held until peer loss and a
@@ -319,6 +325,12 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
         // (mPendingCancel / drainOrphanLocal), so nothing can still be writing these regions.
         reclaimAndFlagDeferred(
             [&](auto const& busy, auto& deferred) { return mCtx.scheduler.reclaimFlow(key, busy, deferred); });
+        if (reversePathReady)
+        {
+            auto const rid = h.requestId;
+            mDrainAcks.insert_or_assign(key, std::pair{window, rid});
+            acknowledgeDrained(key);
+        }
         return;
     }
     if (!reversePathReady)
@@ -408,8 +420,24 @@ bool BounceReceiver::drainScatterDone()
         {
             mCtx.sendGrants(mCtx.scheduler.onScatterDone(d.key, d.offset));
         }
+        mScatterDrainUnproven |= !d.destinationDrained;
+        acknowledgeDrained(d.key);
     }
     return true;
+}
+
+void BounceReceiver::acknowledgeDrained(std::string const& key)
+{
+    auto const pending = mDrainAcks.find(key);
+    if (pending != mDrainAcks.end() && !mScattering.hasFlow(key))
+    {
+        if (!mScatterDrainUnproven)
+        {
+            auto const& [window, rid] = pending->second;
+            mCtx.channel->sendTo(window->peer(), signBounceFrame(encodeDrainAck(rid), window->key(), window->id()));
+        }
+        mDrainAcks.erase(pending);
+    }
 }
 
 void BounceReceiver::forget(std::string const& peer)
@@ -439,6 +467,7 @@ void BounceReceiver::forget(std::string const& peer)
     }
     mScattering.forgetPeer(mCtx.scheduler, peer + kSep, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)),
         orphanedOffsets, [&](auto const& grants) { mCtx.sendGrants(grants); });
+    std::erase_if(mDrainAcks, [&](auto const& entry) { return entry.second.first->peer() == peer; });
 }
 
 void BounceReceiver::checkTimeouts()
@@ -501,8 +530,8 @@ void BounceReceiver::checkTimeouts()
     }
 }
 
-void BounceReceiver::recoverScatterJob(
-    ScatterJob const& job, ExecCtx* ctx, bool acked, bool nackSent, bool donePushed, char const* what)
+void BounceReceiver::recoverScatterJob(ScatterJob const& job, ExecCtx* ctx, bool acked, bool nackSent, bool donePushed,
+    bool destinationDrained, char const* what)
 {
     TLLM_LOG_WARNING(
         "BounceTransport(%s): scatter worker exception rid=%llu chunk=%u: %s (acked=%d nackSent=%d "
@@ -513,7 +542,7 @@ void BounceReceiver::recoverScatterJob(
     {
         // A scatter kernel may still be reading the region: drain the stream before the ScatterDone
         // below lets the scheduler re-grant it. Best effort — the error (if any) is already logged.
-        (void) cudaStreamSynchronize(ctx->stream);
+        destinationDrained = cudaStreamSynchronize(ctx->stream) == cudaSuccess;
         (void) cudaGetLastError();
         mCtx.exec->release(ctx);
     }
@@ -536,7 +565,7 @@ void BounceReceiver::recoverScatterJob(
     if (!donePushed) // donePushed is set only after a successful push, so this never duplicates it
     {
         std::lock_guard<std::mutex> lk(mDoneMu);
-        mDone.push_back(ScatterDone{job.key, job.offset});
+        mDone.push_back(ScatterDone{job.key, job.offset, destinationDrained});
     }
 }
 
@@ -569,6 +598,7 @@ void BounceReceiver::scatterWorkerLoop()
         bool acked = false;      // set BEFORE the ACK send: an attempted ACK must never be followed by a NACK
         bool nackSent = false;   // set BEFORE the NACK send: never NACK twice
         bool donePushed = false; // set AFTER the push: the handler pushes iff the push did not happen
+        bool destinationDrained = true;
         // A throw out of a worker thread would std::terminate the process; on any exception the
         // handler below releases the context, NACKs the chunk and still queues the ScatterDone so
         // the region is never leaked.
@@ -705,6 +735,8 @@ void BounceReceiver::scatterWorkerLoop()
                     static_cast<unsigned long long>(job.rid), job.chunkIdx);
                 syncErr = cudaStreamSynchronize(ctx->stream);
             }
+            destinationDrained
+                = syncErr == cudaSuccess && (launchErr == cudaSuccess || cudaStreamQuery(ctx->stream) == cudaSuccess);
             bool const ok = inBounds && launchErr == cudaSuccess && syncErr == cudaSuccess;
             if (!ok)
             {
@@ -745,17 +777,17 @@ void BounceReceiver::scatterWorkerLoop()
             }
             {
                 std::lock_guard<std::mutex> lk(mDoneMu);
-                mDone.push_back(ScatterDone{job.key, job.offset});
+                mDone.push_back(ScatterDone{job.key, job.offset, destinationDrained});
                 donePushed = true;
             }
         }
         catch (std::exception const& e)
         {
-            recoverScatterJob(job, ctx, acked, nackSent, donePushed, e.what());
+            recoverScatterJob(job, ctx, acked, nackSent, donePushed, destinationDrained, e.what());
         }
         catch (...)
         {
-            recoverScatterJob(job, ctx, acked, nackSent, donePushed, "non-std exception");
+            recoverScatterJob(job, ctx, acked, nackSent, donePushed, destinationDrained, "non-std exception");
         }
     }
 }
@@ -796,7 +828,7 @@ std::shared_future<BounceResult> BounceSender::submit(
         // silently absorbed as a slow success. Whether to retry is the caller's decision.
         TLLM_LOG_WARNING(
             "BounceTransport(%s): plan build for peer %s rejected: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
-        promise->set_value({TransferState::kFAILURE, BounceFailReason::kPlanRejected});
+        promise->set_value({TransferState::kFAILURE, BounceFailReason::kPlanRejected, true});
         return fut;
     }
     auto const numChunks = static_cast<std::uint32_t>(plan.numChunks());
@@ -1337,6 +1369,21 @@ void BounceSender::onNack(std::string const& peer, BounceMsgHeader const& h)
     failRequest(h.requestId, req, BounceFailReason::kPeerNack);
 }
 
+void BounceSender::onDrainAck(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope)
+{
+    std::lock_guard<std::mutex> lk(mReqMu);
+    auto const pending = mAwaitingDrain.find(h.requestId);
+    if (pending != mAwaitingDrain.end() && pending->second.peer == peer && h.payloadBytes == 0
+        && !mPendingCancel.contains(h.requestId) && verifyBounceFrame(envelope, pending->second.windowKey))
+    {
+        if (auto drain = pending->second.drain.lock())
+        {
+            drain->completion.set_value(true);
+        }
+        mAwaitingDrain.erase(pending);
+    }
+}
+
 void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
 {
     // Starts BEFORE taking mReqMu: the span exposes ACK-processing latency INCLUDING lock wait —
@@ -1399,6 +1446,7 @@ void BounceSender::checkTimeouts()
     std::vector<std::uint64_t> stuck;
     {
         std::lock_guard<std::mutex> lk(mReqMu);
+        std::erase_if(mAwaitingDrain, [](auto const& entry) { return entry.second.drain.expired(); });
         for (auto& [rid, req] : mRequests)
         {
             if (now - req.lastProgress > limit)
@@ -1560,6 +1608,14 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     //   - Gathered: gather done (event observed), ctx already returned -> recycle now.
     //   - Sent: write landed (poll==kDone), xfer already released in pollSenderHandles, NIC done
     //     reading -> recycle now.
+    auto const mayScatter = std::any_of(
+        req.posted.begin(), req.posted.end(), [](auto const& chunk) { return chunk.state == PostState::Sent; });
+    BounceResult result{TransferState::kFAILURE, reason, !mayScatter};
+    if (mayScatter)
+    {
+        result.remoteDrain = std::make_shared<BounceDrain>();
+        mAwaitingDrain.try_emplace(rid, PendingDrain{req.peer, result.remoteDrain, req.windowKey});
+    }
     bool deferredWrite = false;
     for (auto& p : req.posted)
     {
@@ -1602,7 +1658,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     bounceRangeEnd(req.nvtxReq);
     try
     {
-        req.promise->set_value({TransferState::kFAILURE, reason});
+        req.promise->set_value(std::move(result));
     }
     catch (...)
     {
@@ -1762,6 +1818,14 @@ void BounceSender::failAll()
     // sync (they're NIXL, not CUDA-stream), so a cancel could still race a write. The receiver
     // reclaims those regions via its own teardown / peer-loss path.
     mPendingCancel.clear();
+    for (auto& [rid, pending] : mAwaitingDrain)
+    {
+        if (auto drain = pending.drain.lock())
+        {
+            drain->completion.set_value(false);
+        }
+    }
+    mAwaitingDrain.clear();
 }
 
 // ============================================================================
@@ -2110,8 +2174,17 @@ void BounceTransport::dispatch(std::string const& peer, std::string const& envel
         }
         else
         {
-            mReceiver.onData(peer, h, envelope, window);
+            auto admission = window->acquire();
+            if (admission.owns_lock())
+            {
+                mReceiver.onData(peer, h, envelope, window);
+            }
         }
+        return;
+    }
+    if (type == BounceMsgType::kDRAIN_ACK)
+    {
+        mSender.onDrainAck(peer, h, envelope);
         return;
     }
     if (!mSender.verifyReply(peer, h.requestId, envelope))

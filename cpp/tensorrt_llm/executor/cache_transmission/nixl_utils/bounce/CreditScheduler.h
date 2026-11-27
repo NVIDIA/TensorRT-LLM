@@ -294,6 +294,7 @@ class ScatterReservations
 {
 public:
     [[nodiscard]] bool begin(CreditScheduler const& scheduler, std::string const& flow, std::uint64_t offset);
+    [[nodiscard]] bool hasFlow(std::string const& flow) const;
     [[nodiscard]] std::unordered_set<std::uint64_t> offsets() const;
     void markOrphaned(std::vector<std::uint64_t> const& deferred);
 
@@ -320,7 +321,12 @@ public:
     }
 
 private:
-    std::unordered_map<std::uint64_t, bool> mRegions;
+    struct ActiveScatter
+    {
+        std::string flow;
+        bool orphaned{false};
+    };
+    std::unordered_map<std::uint64_t, ActiveScatter> mRegions;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

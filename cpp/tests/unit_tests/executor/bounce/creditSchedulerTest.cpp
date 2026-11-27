@@ -621,6 +621,41 @@ TEST(CreditScheduler, OneScatterReservationPerGrantedRegion)
     EXPECT_EQ(freeRegions(scheduler), 2U);
 }
 
+TEST(CreditScheduler, DrainWaitsForEveryScatterInItsOwnFlow)
+{
+    auto scheduler = makeSched(4, 2);
+    std::string const first = "writer/1";
+    std::string const second = "writer/2";
+    auto firstGrants = scheduler.onWant(first, want(2));
+    auto secondGrants = scheduler.onWant(second, want(1));
+    ASSERT_EQ(firstGrants.size(), 2U);
+    ASSERT_EQ(secondGrants.size(), 1U);
+
+    b::ScatterReservations scatters;
+    ASSERT_TRUE(scatters.begin(scheduler, first, firstGrants[0].offset));
+    ASSERT_TRUE(scatters.begin(scheduler, first, firstGrants[1].offset));
+    ASSERT_TRUE(scatters.begin(scheduler, second, secondGrants[0].offset));
+
+    std::vector<std::uint64_t> deferred;
+    EXPECT_TRUE(scheduler.reclaimFlow(first, scatters.offsets(), deferred).empty());
+    ASSERT_EQ(deferred.size(), 2U);
+    scatters.markOrphaned(deferred);
+    EXPECT_TRUE(scatters.hasFlow(first));
+    EXPECT_TRUE(scatters.finish(firstGrants[0].offset));
+    EXPECT_TRUE(scheduler.freeOrphanRegion(firstGrants[0].offset).empty());
+    EXPECT_TRUE(scatters.hasFlow(first));
+    EXPECT_TRUE(scatters.hasFlow(second));
+
+    EXPECT_TRUE(scatters.finish(firstGrants[1].offset));
+    EXPECT_TRUE(scheduler.freeOrphanRegion(firstGrants[1].offset).empty());
+    EXPECT_FALSE(scatters.hasFlow(first));
+    EXPECT_TRUE(scatters.hasFlow(second));
+    EXPECT_FALSE(scatters.finish(secondGrants[0].offset));
+    EXPECT_TRUE(scheduler.onScatterDone(second, secondGrants[0].offset).empty());
+    EXPECT_FALSE(scatters.hasFlow(second));
+    EXPECT_EQ(freeRegions(scheduler), 4U);
+}
+
 TEST(CreditScheduler, ExpiredGrantCannotStartScatterAfterRegionReuse)
 {
     using namespace std::chrono_literals;

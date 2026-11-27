@@ -8,6 +8,24 @@ run, based on what the PR changed. New rules are added in Python only.
 
 ---
 
+## Groovy CPS regression test
+
+Run the stage-sharding regression from the repository root with Java and a
+test-only classpath containing `groovy-all:2.4.21`, `groovy-cps:1.31`, and
+`guava:11.0.1` (Maven groups `org.codehaus.groovy`, `com.cloudbees`, and
+`com.google.guava`, respectively):
+
+```bash
+java -cp '/path/to/test-jars/*' groovy.ui.GroovyMain \
+    jenkins/scripts/cbts/tests/test_stage_sharding.groovy
+```
+
+The test extracts the production CBTS stage functions and runs them through
+`CpsTransformer` and `Continuable`, including numeric shard ordering, split
+resizing, scope preservation, explicit selectors, and fallback. Ordinary Groovy
+execution does not reproduce CPS closure/sort failures. Pass an optional path to
+an older `L0_Test.groovy` to verify that the same test fails before the fix.
+
 ## Selection tiers
 
 | Tier | Where | Basis |

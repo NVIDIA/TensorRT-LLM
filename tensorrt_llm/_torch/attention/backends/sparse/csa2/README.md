@@ -200,7 +200,7 @@ sits between the mask and the finalize launch, so exact, self-sampling and
 temporal GVR TopK all select over the same masked scores; a temporal prior that
 lands on a masked column is dropped before the GVR kernel seeds its threshold.
 
-On SM100/SM103, split-row decode batches without temporal GVR hints skip that
+On SM100/SM103/SM107, split-row decode batches without temporal GVR hints skip that
 chain from more than 64 rows on the candidate source (of 8-position candidate
 blocks) and from 256 rows on other Full layers: one `block_select.py` launch
 selects from the scorer's maxima of every 32 visible positions and, on the

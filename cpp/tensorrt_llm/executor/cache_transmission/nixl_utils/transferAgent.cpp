@@ -35,7 +35,6 @@
 #include <netinet/in.h>
 #include <nixl_types.h>
 #include <numeric>
-#include <set>
 #include <shared_mutex>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -124,6 +123,20 @@ public:
             return mFut.get().state;
         }
         return TransferState::kIN_PROGRESS;
+    }
+
+    [[nodiscard]] bool waitForBounceScatterDrain(int64_t timeoutMs) const override
+    {
+        if (!mFut.valid() || mFut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            return false;
+        }
+        auto const& result = mFut.get();
+        return result.state == TransferState::kSUCCESS || result.remoteDrained
+            || (result.remoteDrain != nullptr
+                && result.remoteDrain->result.wait_for(std::chrono::milliseconds(timeoutMs))
+                    == std::future_status::ready
+                && result.remoteDrain->result.get());
     }
 
     /// Failure cause recorded by the bounce transport (empty while in flight / on success).
@@ -864,14 +877,11 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 
-    std::string nixlBackend = common::getEnvNixlBackend();
-    // List of supported backends - extend this list as new backends are added
-    static std::set<std::string> const kSUPPORTED_BACKENDS = {"UCX", "LIBFABRIC"};
-
-    if (kSUPPORTED_BACKENDS.find(nixlBackend) == kSUPPORTED_BACKENDS.end())
+    auto const requestedBackend = common::getEnvNixlBackend();
+    auto const nixlBackend = normalizeBackend(requestedBackend);
+    if (nixlBackend != requestedBackend)
     {
-        TLLM_LOG_WARNING("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
-        nixlBackend = "UCX";
+        TLLM_LOG_WARNING("Unsupported NIXL backend: %s, fallback to UCX", requestedBackend.c_str());
     }
 
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent using NIXL backend: %s", nixlBackend.c_str());
@@ -953,6 +963,22 @@ void NixlTransferAgent::revokeBounceWindow(std::string const& key)
     if (mBounce)
     {
         mBounce->transport->receiveWindows().remove(bounce::bounceWindowId(key));
+    }
+#endif
+}
+
+std::string NixlTransferAgent::normalizeBackend(std::string const& backend)
+{
+    return backend == "LIBFABRIC" ? "LIBFABRIC" : "UCX";
+}
+
+void NixlTransferAgent::sealBounceWindow(std::string const& key)
+{
+#ifdef TLLM_BOUNCE_V2
+    std::shared_lock lock(mLock);
+    if (mBounce)
+    {
+        mBounce->transport->receiveWindows().seal(bounce::bounceWindowId(key));
     }
 #endif
 }
@@ -1100,6 +1126,16 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
 #endif
     mRawAgent->invalidateRemoteMD(name);
+}
+
+bool NixlTransferAgent::peerSupportsBounce(std::string const& name) const
+{
+#ifdef TLLM_BOUNCE_V2
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    return mBounce && mBounce->transport && mBounce->transport->hasPeerHandshake(name);
+#else
+    return false;
+#endif
 }
 
 [[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)

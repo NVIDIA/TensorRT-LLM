@@ -533,7 +533,12 @@ std::vector<Grant> CreditScheduler::releaseLocal(std::uint64_t offset)
 
 bool ScatterReservations::begin(CreditScheduler const& scheduler, std::string const& flow, std::uint64_t offset)
 {
-    return scheduler.heldByFlow(flow, offset) && mRegions.emplace(offset, false).second;
+    return scheduler.heldByFlow(flow, offset) && mRegions.emplace(offset, ActiveScatter{flow}).second;
+}
+
+bool ScatterReservations::hasFlow(std::string const& flow) const
+{
+    return std::any_of(mRegions.begin(), mRegions.end(), [&](auto const& entry) { return entry.second.flow == flow; });
 }
 
 std::unordered_set<std::uint64_t> ScatterReservations::offsets() const
@@ -551,14 +556,14 @@ void ScatterReservations::markOrphaned(std::vector<std::uint64_t> const& deferre
 {
     for (auto offset : deferred)
     {
-        mRegions.at(offset) = true;
+        mRegions.at(offset).orphaned = true;
     }
 }
 
 bool ScatterReservations::finish(std::uint64_t offset)
 {
     auto region = mRegions.extract(offset);
-    return !region.empty() && region.mapped();
+    return !region.empty() && region.mapped().orphaned;
 }
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

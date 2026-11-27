@@ -107,6 +107,8 @@ private:
 class NixlTransferAgent : public BaseTransferAgent
 {
 public:
+    static std::string normalizeBackend(std::string const& backend);
+
     NixlTransferAgent(BaseAgentConfig const& config);
     ~NixlTransferAgent();
 
@@ -180,6 +182,8 @@ public:
     void registerBounceWindowSlots(std::string const& peer, std::string const& endpoint, std::string const& key,
         std::span<std::int64_t const> slots, bounce::BounceSlotLayout const& layout);
     void revokeBounceWindow(std::string const& key);
+    void sealBounceWindow(std::string const& key);
+    [[nodiscard]] bool peerSupportsBounce(std::string const& name) const;
 
     /// Number of transfer requests routed to the bounce fast path so far.
     [[nodiscard]] std::uint64_t getBounceSubmitCount() const noexcept

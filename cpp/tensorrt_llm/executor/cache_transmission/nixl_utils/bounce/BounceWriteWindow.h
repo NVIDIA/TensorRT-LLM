@@ -93,6 +93,8 @@ public:
     std::shared_ptr<BounceWriteWindow> addSlots(std::string peer, std::string endpoint, std::string key,
         std::span<std::int64_t const> slots, BounceSlotLayout const& layout);
     [[nodiscard]] std::shared_ptr<BounceWriteWindow> find(std::string const& id, std::string const& peer) const;
+    //! Stop destination writes while the owner waits for the writer's cancellation acknowledgement.
+    void seal(std::string const& id);
     void remove(std::string const& id);
     void removeIntersecting(std::uint64_t address, std::uint64_t length);
 
