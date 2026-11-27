@@ -78,6 +78,8 @@ from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
+    get_vision_context_params,
+    validate_encoderless_vision_request,
 )
 from .modeling_utils import (
     MetaInitException,
@@ -1816,14 +1818,11 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
-    @torch.inference_mode()
-    def validate_multimodal_request_data(self, mm_data: dict) -> None:
-        if DISAGG and (
-            mm_data.get("multimodal_embedding") is not None
-            or any(mm_data.get(key) is not None for key in ("image", "video", "audio"))
-        ):
-            raise ValueError("This model requires a local encoder for multimodal requests")
+    def validate_request(self, request) -> None:
+        if DISAGG:
+            validate_encoderless_vision_request(request, video_pixel_alias="pixel_values")
 
+    @torch.inference_mode()
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1838,10 +1837,13 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         mm_embeds: List[torch.Tensor] = []
         mm_token_ids = None
 
-        if len(multimodal_params) > 0:
+        if multimodal_params and (
+            mm_ctx_params := get_vision_context_params(
+                multimodal_params, attn_metadata.num_contexts, video_pixel_alias="pixel_values"
+            )
+        ):
             if DISAGG:
                 raise NotImplementedError("Disaggregated inference not yet supported for K2.5.")
-            mm_ctx_params = multimodal_params[: attn_metadata.num_contexts]
             mm_embeds = get_multimodal_embeddings(
                 encoder_forward_fn=self.mm_encoder.forward,
                 multimodal_params=mm_ctx_params,

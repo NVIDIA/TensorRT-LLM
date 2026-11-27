@@ -791,6 +791,70 @@ def test_model_validation_fails_only_the_request_it_rejects() -> None:
     assert executor._validate_request_budget.call_count == 2
 
 
+@pytest.mark.parametrize("family", ["qwen", "kimi", "hyperclovax", "exaone"])
+@pytest.mark.parametrize("local_encoder", [True, False], ids=["local", "encoderless"])
+def test_vision_worker_admits_only_supported_requests(family, local_encoder, monkeypatch):
+    from tensorrt_llm._torch.models import (
+        modeling_exaone4_5,
+        modeling_hyperclovax,
+        modeling_kimi_k25,
+        modeling_qwen2vl,
+    )
+
+    model_cls = {
+        "qwen": modeling_qwen2vl.Qwen2_5_VLModel,
+        "kimi": modeling_kimi_k25.KimiK25ForConditionalGeneration,
+        "hyperclovax": modeling_hyperclovax.HCXVisionForCausalLM,
+        "exaone": modeling_exaone4_5.Exaone4_5_ForConditionalGeneration,
+    }[family]
+    monkeypatch.setattr(modeling_kimi_k25, "DISAGG", not local_encoder)
+    monkeypatch.setattr(modeling_hyperclovax, "DISAGG", not local_encoder)
+    model = model_cls.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.mm_encoder = torch.nn.Identity() if local_encoder else None
+
+    def request(request_id, data, generation_only=False):
+        req = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=2,
+            input_tokens=[1, 2, 3],
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            draft_tokens=None,
+            llm_request_type=(
+                LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+                if generation_only
+                else LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION
+            ),
+        )
+        req.py_multimodal_data = data
+        return req
+
+    image = {"image": {"pixel_values": torch.ones(1, 4)}}
+    video_key = "pixel_values" if family == "kimi" else "pixel_values_videos"
+    text = request(0, None)
+    raw = request(1, image)
+    attached = request(2, {"multimodal_embedding": torch.ones(1, 4)})
+    generation = request(3, image, generation_only=True)
+    metadata = request(4, {"mrope_config": {"mrope_position_deltas": 1}})
+    video = request(5, {"video": {video_key: torch.ones(1, 4)}})
+    requests = [text, raw, attached, generation, metadata, video]
+    executor = _make_admission_executor(model, requests)
+
+    accepted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    rejected = [] if local_encoder else [raw, video]
+    if not local_encoder and family != "qwen":
+        rejected.insert(1, attached)
+    assert accepted == executor.active_requests == [req for req in requests if req not in rejected]
+    assert [
+        call.kwargs["requests"][0] for call in executor._handle_errors.call_args_list
+    ] == rejected
+    assert all(
+        "local vision encoder" in call.args[0] for call in executor._handle_errors.call_args_list
+    )
+
+
 def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:
     requests = [_make_admission_request(i) for i in range(3)]
     for request, encoder_output_len in zip(requests, (16, 17, None)):

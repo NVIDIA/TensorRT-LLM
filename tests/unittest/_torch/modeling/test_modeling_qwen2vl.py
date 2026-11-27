@@ -232,33 +232,9 @@ def test_language_model_inherits_top_level_tie_word_embeddings(
     assert getattr(built["config"], "tie_word_embeddings", None) is tie_word_embeddings
 
 
-@pytest.mark.parametrize(
-    "generation_only,precomputed,accepted",
-    [
-        (False, False, False),
-        (False, True, True),
-        (True, False, True),
-    ],
-)
-def test_qwen2vl_admission_without_local_encoder(generation_only, precomputed, accepted):
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLModelBase
-
-    model = SimpleNamespace(mm_encoder=None, support_mm_disagg=True)
-    media = {"image": {"pixel_values": object()}}
-    if precomputed:
-        media["multimodal_embedding"] = object()
-    request = SimpleNamespace(is_generation_only_request=generation_only, py_multimodal_data=media)
-    if accepted:
-        Qwen2VLModelBase.validate_request(model, request)
-    else:
-        with pytest.raises(ValueError, match="precomputed"):
-            Qwen2VLModelBase.validate_request(model, request)
-
-
-@pytest.mark.parametrize("name", ["kimi", "hyperclovax", "exaone"])
-def test_disaggregated_model_validates_media_at_admission(name, monkeypatch):
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("family", ["qwen", "kimi", "hyperclovax", "exaone"])
+def test_vision_forward_preserves_metadata_only_text(family, monkeypatch):
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.models import (
@@ -266,17 +242,38 @@ def test_disaggregated_model_validates_media_at_admission(name, monkeypatch):
         modeling_hyperclovax,
         modeling_kimi_k25,
     )
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-    if name == "kimi":
-        monkeypatch.setattr(modeling_kimi_k25, "DISAGG", True)
-        model_class = modeling_kimi_k25.KimiK25ForConditionalGeneration
-    elif name == "hyperclovax":
-        monkeypatch.setattr(modeling_hyperclovax, "DISAGG", True)
-        model_class = modeling_hyperclovax.HCXVisionForCausalLM
-    else:
-        monkeypatch.setattr(modeling_exaone4_5, "_is_mm_disagg", lambda: True)
-        model_class = modeling_exaone4_5.Exaone4_5_ForConditionalGeneration
-    model = SimpleNamespace(mm_encoder=None)
-    model_class.validate_multimodal_request_data(model, {})
-    with pytest.raises(ValueError, match="local encoder"):
-        model_class.validate_multimodal_request_data(model, {"image": {"pixel_values": object()}})
+    model_cls = {
+        "qwen": modeling_qwen2vl.Qwen2_5_VLModel,
+        "kimi": modeling_kimi_k25.KimiK25ForConditionalGeneration,
+        "hyperclovax": modeling_hyperclovax.HCXVisionForCausalLM,
+        "exaone": modeling_exaone4_5.Exaone4_5_ForConditionalGeneration,
+    }[family]
+    monkeypatch.setattr(modeling_kimi_k25, "DISAGG", True)
+    monkeypatch.setattr(modeling_hyperclovax, "DISAGG", True)
+    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+
+    class TextModel:
+        model = SimpleNamespace(embed_tokens=torch.nn.Embedding(8, 4))
+
+        def forward(self, attn_metadata, input_ids, *args, **kwargs):
+            assert torch.is_inference_mode_enabled()
+            return input_ids
+
+    model = SimpleNamespace(
+        mm_encoder=None,
+        llm=TextModel(),
+        model_config=SimpleNamespace(pretrained_config=SimpleNamespace(disable_fuse_rope=True)),
+        mm_token_ids=torch.tensor([7]),
+    )
+    context = MultimodalParams(multimodal_data={"image": {"image_grid_thw": torch.ones(1, 3)}})
+    decode = MultimodalParams(multimodal_data={"mrope_config": {"mrope_position_deltas": 1}})
+    input_ids = torch.tensor([1, 2, 3])
+    out = model_cls.forward(
+        model,
+        SimpleNamespace(num_contexts=1, num_generations=1),
+        input_ids=input_ids,
+        multimodal_params=[context, decode],
+    )
+    torch.testing.assert_close(out, input_ids)

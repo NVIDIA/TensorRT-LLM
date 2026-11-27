@@ -28,6 +28,7 @@ from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
+    get_vision_context_params,
 )
 from .modeling_qwen2vl import (
     Qwen2_5_VisionModel,
@@ -245,14 +246,6 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         ]
 
     @torch.inference_mode()
-    def validate_multimodal_request_data(self, mm_data: dict) -> None:
-        if _is_mm_disagg() and (
-            mm_data.get("multimodal_embedding") is not None
-            or mm_data.get("image", {}).get("pixel_values") is not None
-            or mm_data.get("video", {}).get("pixel_values_videos") is not None
-        ):
-            raise ValueError("EXAONE4.5-VL requires a local encoder for multimodal requests")
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -265,7 +258,9 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
 
-        mm_multimodal_params = self._get_requests_with_mm_data(multimodal_params)
+        mm_multimodal_params = get_vision_context_params(
+            multimodal_params, attn_metadata.num_contexts
+        )
 
         if len(mm_multimodal_params) > 0:
             if not _is_mm_disagg():
