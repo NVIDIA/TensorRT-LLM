@@ -543,6 +543,7 @@ def make_kv_cache_manager(
     # The backoff lives in KVCacheManagerV2; the scheduler only clips the two
     # already-backed-off probe depths against each other.
     mgr.reuse_match_backoff = 0
+    mgr.fp8_ctx_mla_kv_len_cap = None
     mgr.probe_context_reuse.side_effect = lambda req: None
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
@@ -4330,6 +4331,28 @@ class TestChunkedContext:
 
         assert ids(out.context_requests) == [0]
         assert first.context_chunk_size == 1024
+
+    def test_periodic_snapshot_preserves_forced_boundary_under_context_kv_cap(self) -> None:
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.fp8_ctx_mla_kv_len_cap = 0
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+        req.expect_snapshot_points = list(range(256, 2049, 256))
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 256
+        mgr.reserve_periodic_snapshots.assert_not_called()
 
     def test_periodic_snapshot_chunk_can_share_a_batch_with_decode(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)

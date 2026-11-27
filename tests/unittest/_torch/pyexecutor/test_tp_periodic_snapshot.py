@@ -382,6 +382,9 @@ def _make_executor(dist, batch, request, manager, wrapped, mm_active, mm_model=F
     scheduler.chunking_enabled = True
     scheduler.chunking_policy = ContextChunkingPolicy.FORCE_CHUNK
     scheduler._ctx_starvation_iterations = None
+    scheduler.kv_cache_manager = manager
+    scheduler.draft_kv_cache_manager = None
+    scheduler.cross_kv_cache_manager = None
     scheduler.periodic_snapshot_tp_enabled = False
     scheduler.periodic_snapshot_extra_budget = 768
     scheduler.max_context_length = 1024
@@ -1173,17 +1176,18 @@ def test_two_gpu_native_cache_reservation_with_nccl(tmp_path):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "peer_capacity, wrapped, mm_rank, embedding_rank, expected",
+    "peer_capacity, wrapped, mm_rank, embedding_rank, expected, kv_cap_rank",
     [
-        (4, False, None, None, 1024),
-        (1, False, None, None, 256),
-        (4, True, None, None, 1024),
-        (4, True, 1, None, 256),
-        (4, True, None, 1, 256),
-        (4, False, None, 1, 256),
-        (4, True, None, "decode", 1024),
-        (4, (True, False), None, None, 1024),
-        (4, (True, False), 0, None, 256),
+        (4, False, None, None, 1024, None),
+        (1, False, None, None, 256, None),
+        (4, True, None, None, 1024, None),
+        (4, True, 1, None, 256, None),
+        (4, True, None, 1, 256, None),
+        (4, False, None, 1, 256, None),
+        (4, True, None, "decode", 1024, None),
+        (4, (True, False), None, None, 1024, None),
+        (4, (True, False), 0, None, 256, None),
+        (4, False, None, None, 256, 1),
     ],
 )
 def test_executor_coordinates_periodic_snapshots_with_scheduler(
@@ -1192,6 +1196,7 @@ def test_executor_coordinates_periodic_snapshots_with_scheduler(
     mm_rank,
     embedding_rank,
     expected,
+    kv_cap_rank,
 ):
     requests = [_Context(), _Context()]
     batches = [ScheduledRequests(), ScheduledRequests()]
@@ -1201,6 +1206,8 @@ def test_executor_coordinates_periodic_snapshots_with_scheduler(
     schedulers = []
     caps_at_schedule = []
     for rank, (batch, request, manager) in enumerate(zip(batches, requests, managers)):
+        if rank == kv_cap_rank:
+            manager.fp8_ctx_mla_kv_len_cap = 0
         if rank == embedding_rank:
             request.py_multimodal_data = {"multimodal_embedding": object()}
         batch.append_context_request(request)
@@ -1247,19 +1254,21 @@ def test_executor_coordinates_periodic_snapshots_with_scheduler(
     assert not any(thread.is_alive() for thread in threads)
     assert not errors, errors
     assert [request.context_chunk_size for request in requests] == [expected, expected]
-    expected_cap = peer_capacity > 1 and mm_rank is None and embedding_rank in (None, "decode")
+    capability = peer_capacity > 1 and kv_cap_rank is None
+    expected_cap = capability and mm_rank is None and embedding_rank in (None, "decode")
     assert caps_at_schedule == [[expected_cap], [expected_cap]]
     assert [scheduler.periodic_snapshot_tp_enabled for scheduler in schedulers] == [
         expected_cap,
         expected_cap,
     ]
     assert [getattr(ex, "_periodic_snapshot_tp_used", False) for ex in executors] == [
-        peer_capacity > 1,
-        peer_capacity > 1,
+        capability,
+        capability,
     ]
     cache_refs = [weakref.ref(manager) for manager in managers]
-    for ex in executors:
+    for ex, scheduler in zip(executors, schedulers):
         ex.kv_cache_manager = None
+        del scheduler.kv_cache_manager
     managers.clear()
     del manager
     gc.collect()
@@ -1277,6 +1286,7 @@ def test_executor_backs_off_snapshot_budget_after_one_rank_refuses_resources():
     def run(rank):
         try:
             manager = managers[rank]
+            manager.is_speculative = Mock(return_value=False)
             executor, scheduler, _ = _make_executor(
                 exchange.for_rank(rank), ScheduledRequests(), _Context(), manager, False, False
             )
@@ -1311,6 +1321,7 @@ def test_executor_backs_off_snapshot_budget_after_one_rank_refuses_resources():
                         else 0,
                     )
                 )
+            manager.is_speculative.assert_called_once_with()
         except Exception as error:
             errors.append(error)
 

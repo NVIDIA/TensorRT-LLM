@@ -10,6 +10,15 @@ if TYPE_CHECKING:
     from ...llm_request import LlmRequest
 
 
+def periodic_snapshot_allows_context(request: "LlmRequest") -> bool:
+    """The common request-level restrictions for snapshot expansion."""
+    return (
+        not request.is_dummy_request
+        and not getattr(request, "py_multimodal_data", None)
+        and not getattr(request, "py_draft_tokens", None)
+    )
+
+
 def periodic_snapshot_allows_decode(
     generation_requests: Sequence["LlmRequest"], mixed_decode_supported: bool
 ) -> bool:

@@ -53,7 +53,6 @@ from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import (get_multimodal_item_metadata,
                                             strip_mm_data_for_generation)
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
-                                          ContextChunkingPolicy,
                                           ExecutorMemoryType,
                                           GenPreemptionConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend,
@@ -6478,33 +6477,30 @@ class PyExecutor:
                 and not self.enable_attention_dp):
             manager = self.kv_cache_manager
             mm_scheduler = isinstance(self.scheduler, MultimodalScheduler)
-            model = self.model_engine.model
-            model = getattr(model, "_orig_mod", model)
-            mm_capable = mm_scheduler or isinstance(model, MultimodalModelMixin)
             scheduler = self.scheduler.scheduler if mm_scheduler else self.scheduler
             supported_scheduler = isinstance(scheduler, KVCacheV2Scheduler)
-            enabled = (
-                supported_scheduler and scheduler.chunking_enabled and
-                scheduler.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
-                and scheduler._ctx_starvation_iterations is None
-                and manager.periodic_snapshot_requires_consensus
-                and manager._supports_periodic_snapshots
-                and manager._periodic_snapshot_supports_tp
-                and manager.enable_block_reuse and not manager.is_draft
-                and not manager.is_speculative() and self.drafter is None
-                and not self.model_engine.is_spec_decode
-                and self.kv_connector_manager is None
-                and self.kv_cache_transceiver is None
-                and not self.is_encoder_decoder
-                and self.ctx_decoder_batcher is None
-                and self._get_ctx_mla_kv_len_cap() is None
-                and getattr(scheduler, "draft_kv_cache_manager", None) is None
-                and getattr(scheduler, "cross_kv_cache_manager", None) is None)
             manager_ref = self.__dict__.get("_periodic_tp_cache_manager_ref")
             if manager_ref is None or manager_ref() is not manager:
+                # Static eligibility follows the bound cache and scheduler;
+                # per-step multimodal activity is voted on separately.
+                model = self.model_engine.model
+                model = getattr(model, "_orig_mod", model)
+                mm_capable = mm_scheduler or isinstance(model,
+                                                        MultimodalModelMixin)
+                enabled = (supported_scheduler
+                           and scheduler.supports_periodic_snapshot_schedule
+                           and scheduler._ctx_starvation_iterations is None
+                           and manager.periodic_snapshot_requires_consensus
+                           and not manager.is_speculative()
+                           and self.drafter is None
+                           and not self.model_engine.is_spec_decode
+                           and self.kv_connector_manager is None
+                           and self.kv_cache_transceiver is None
+                           and not self.is_encoder_decoder
+                           and self.ctx_decoder_batcher is None)
                 try:
                     rank_support = self.dist.tp_allgather_int64([
-                        int(enabled and manager.periodic_snapshot_capacity > 1),
+                        int(enabled),
                         int(mm_capable),
                         int(enabled and PeriodicSnapshotFailureGroup.supported(
                             self.dist)),
@@ -6539,8 +6535,7 @@ class PyExecutor:
                          is not None) or (request.is_context_init_state
                                           and bool(request.py_multimodal_data))
                         for request in self.active_requests)
-                    votes = self.dist.tp_allgather_int64(
-                        [int(enabled and not mm_active)])
+                    votes = self.dist.tp_allgather_int64([int(not mm_active)])
                     periodic_tp_enabled = all(row[0] for row in votes)
             attempt_expansion = periodic_tp_enabled and not self._periodic_tp_backoff
             if supported_scheduler:
@@ -6551,8 +6546,7 @@ class PyExecutor:
                 # After a rank-agreed resource refusal, leave enough room
                 # for ordinary scheduling on the next pass that has prefill.
                 # Keep baseline comparisons even while expansion is disabled.
-                periodic_tp_context = (manager, scheduler, enabled
-                                       and attempt_expansion)
+                periodic_tp_context = (manager, scheduler, attempt_expansion)
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
         )

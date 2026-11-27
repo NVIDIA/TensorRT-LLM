@@ -28,6 +28,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
 from ...disaggregation import diagnostics as disagg_diagnostics
 from ..kv_cache.mamba_cache_manager.multi_snapshot import (
+    periodic_snapshot_allows_context,
     periodic_snapshot_allows_decode,
     plan_periodic_snapshot_chunk,
 )
@@ -1030,7 +1031,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._periodic_snapshot_request_id = None
         periodic_batch_eligible = (
             bool(pending_ctx)
-            and self.kv_cache_manager.periodic_snapshot_capacity > 1
+            and self.supports_periodic_snapshot_schedule
             and (
                 not scheduled_gen
                 or (
@@ -1809,6 +1810,19 @@ class KVCacheV2Scheduler(RequestScheduler):
                 manager.free_resources(req)
         rewind_context_after_cache_drop(req, self.tokens_per_block)
 
+    @property
+    def supports_periodic_snapshot_schedule(self) -> bool:
+        """Whether this scheduler can consume the cache manager's snapshot staging."""
+        return (
+            self.chunking_enabled
+            and self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+            and self.kv_cache_manager.periodic_snapshot_capacity > 1
+            and self.draft_kv_cache_manager is None
+            and self.cross_kv_cache_manager is None
+            # Leave context-KV-cap admission to the ordinary scheduler.
+            and getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None) is None
+        )
+
     def _tp_periodic_snapshot_can_extend(
         self, req: LlmRequest, remaining_tokens: int | None, interval: int
     ) -> bool:
@@ -2046,10 +2060,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
                 and not req.py_periodic_snapshot_fallback
                 and not has_recovery
-                and not req.is_dummy_request
-                and not getattr(req, "py_multimodal_data", None)
-                and get_draft_token_length(req) == 0
-                and self.draft_kv_cache_manager is None
+                and periodic_snapshot_allows_context(req)
                 and self._pregrown_context_tokens(req) == 0
             ):
                 desired = context_remaining

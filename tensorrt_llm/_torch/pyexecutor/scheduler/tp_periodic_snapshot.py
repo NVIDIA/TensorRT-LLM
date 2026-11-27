@@ -9,6 +9,7 @@ import struct
 from typing import TYPE_CHECKING
 
 from ..kv_cache.mamba_cache_manager.multi_snapshot import (
+    periodic_snapshot_allows_context,
     periodic_snapshot_allows_decode,
     plan_periodic_snapshot_chunk,
 )
@@ -146,9 +147,7 @@ def coordinate_periodic_snapshot(
         if (
             cache is not None
             and cache.is_active
-            and not req.is_dummy_request
-            and not req.py_multimodal_data
-            and not getattr(req, "py_draft_tokens", None)
+            and periodic_snapshot_allows_context(req)
             and req.py_mamba_inforward_snapshot_point is None
             and manager.context_replay_tokens(req) is None
             and not any(start < point < baseline_end for point in points)
