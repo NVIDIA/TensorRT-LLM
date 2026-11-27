@@ -233,10 +233,6 @@ def test_layouts_pick_a_resident_grid():
     for c in CELLS:
         if c.spec["fin"]:
             assert op.fin_resident(c.spec["rows"], HC, op.LAYOUTS[c.spec["world"]], 152), c.why
-    assert op.parse_layouts("1:304,2:608") == ((1, 304), (2, 608))
-    for bad in ("", "3:100", "1:x", "1"):
-        with pytest.raises(ValueError):
-            op.parse_layouts(bad)
 
 
 _COMPILE = """

@@ -278,7 +278,6 @@ def test_fin_layouts_end_at_one_resident_wave(monkeypatch, value, dp_size, expec
     )
 
     monkeypatch.delenv(M.DP_RS_INJECT_ENV, raising=False)
-    monkeypatch.delenv(M.DP_RS_INJECT_LAYOUTS_ENV, raising=False)
     _set(monkeypatch, value)
     seen = {}
 

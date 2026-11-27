@@ -698,17 +698,6 @@ def fin_resident(rows: int, hc_count: int, layouts, sm_count: int) -> bool:
     return rows * (hc_count // spp) <= FIN_CTAS_PER_SM * sm_count
 
 
-def parse_layouts(raw: str) -> tuple:
-    """`"1:304,2:608"` -> `((1, 304), (2, 608))`; ValueError on another spelling."""
-    try:
-        out = tuple(tuple(int(v) for v in p.split(":")) for p in raw.split(",") if p.strip())
-    except ValueError:
-        out = ()
-    if not out or any(len(p) != 2 or p[0] not in (1, 2) or p[1] < 1 for p in out):
-        raise ValueError(f"{raw!r}: expected `spp:limit` pairs, spp 1 or 2, such as 1:304,2:608")
-    return out
-
-
 def _aligned(t: torch.Tensor) -> bool:
     return t.data_ptr() % 16 == 0
 

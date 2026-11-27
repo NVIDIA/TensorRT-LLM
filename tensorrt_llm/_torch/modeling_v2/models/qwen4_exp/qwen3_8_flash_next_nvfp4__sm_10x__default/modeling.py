@@ -1473,7 +1473,6 @@ _ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (10
 #:   rank, where `streams_per_cta`'s two-streams-a-CTA layout would run two waves: its layouts end
 #:   at one resident wave (`_DP_HICAP_FIN_CTAS`), so from there every stream of a row shares one
 #:   CTA and the grid stays resident (any layout reads the same bytes and computes the same bits).
-#:   Ignored where `DP_RS_INJECT_LAYOUTS_ENV` names the layouts.
 #: - `head` (class S, as the head shard itself): the sharded verify head (`DP_HEAD_SHARD_ENV`) to
 #:   `_DP_HICAP_HEAD_VERIFY` requests a rank (the full-vocabulary head and the stock sampler
 #:   past 32 today).
@@ -3666,11 +3665,6 @@ def _draft_moe_tactic(core, rows: int) -> tuple | None:
 #: (the launch and its HBM round trip, 47 sites a step). `0` keeps the two launches. Read once,
 #: after load.
 DP_RS_INJECT_ENV = "TRTLLM_QWEN4_EXP_DP_RS_INJECT"
-#: With `DP_RS_INJECT_ENV`: the `(streams a CTA, CTA limit)` table the fused launch picks its grid
-#: from (`dep_lamport_rs_inject.streams_per_cta`), as `1:304,2:608`. Unset: the measured table of the
-#: group size (`dep_lamport_rs_inject.LAYOUTS`: dep8 keeps four CTAs a row up to 76 rows, dep4 up
-#: to 48). Any table reads the same bytes and computes the same bits. For A/Bs.
-DP_RS_INJECT_LAYOUTS_ENV = "TRTLLM_QWEN4_EXP_DP_RS_INJECT_LAYOUTS"
 #: Rows a rank the fused launch serves (4 rows a request under MTP-3): the micro's range.
 _DP_RS_INJECT_ROWS = (4, 256)  # capacity: fixed: dispatch thresholds
 #: Switch, on by default, with `DP_RS_INJECT_ENV`: where the decode route front serves the
@@ -3868,14 +3862,15 @@ def _dp_rs_inject_check(core, rs, rows: int, fin: bool, gen, device, draft: bool
 
 
 def _dp_rs_inject_build(core, device) -> "_DpRsInject | None":
-    """`DP_RS_INJECT_ENV` (+ `DP_MOE_FIN_RS_ENV`, `DP_MOE_FIN_RS_PDL_ENV`,
-    `DP_RS_INJECT_LAYOUTS_ENV`), read once at build (`post_load_weights`, after the route and
-    router fronts). None where it is off or cannot take
-    effect: not a dep4 / dep8 rank on SM103 on the Lamport transport, another geometry, no
-    CUDA-graph row count in range. Otherwise every layout's launch is compiled now (no serving step
-    or capture meets a compile), the group agrees the compiles, and every row count is checked
-    (`_dp_rs_inject_check`, collective) and agreed: a row count that differs on any rank is dropped
-    on every rank, with one warning. Collective: every rank of the group runs it."""
+    """`DP_RS_INJECT_ENV` (+ `DP_MOE_FIN_RS_ENV`, `DP_MOE_FIN_RS_PDL_ENV`), read once at build
+    (`post_load_weights`, after the route and router fronts). The fused launch picks its grid from
+    the measured `(streams a CTA, CTA limit)` table of the group size
+    (`dep_lamport_rs_inject.LAYOUTS`: dep8 keeps four CTAs a row up to 76 rows, dep4 up to 48). None
+    where it is off or cannot take effect: not a dep4 / dep8 rank on SM103 on the Lamport transport,
+    another geometry, no CUDA-graph row count in range. Otherwise every layout's launch is compiled
+    now (no serving step or capture meets a compile), the group agrees the compiles, and every row
+    count is checked (`_dp_rs_inject_check`, collective) and agreed: a row count that differs on any
+    rank is dropped on every rank, with one warning. Collective: every rank of the group runs it."""
     if not _switch(DP_RS_INJECT_ENV, default=True):
         return None
     trip = core._lamport_trip
@@ -3892,9 +3887,8 @@ def _dp_rs_inject_build(core, device) -> "_DpRsInject | None":
             f"(2048, 4096] and up to 8 streams (this model: {core.hidden} x {core.hc_count})"
         )
         return None
-    raw = os.environ.get(DP_RS_INJECT_LAYOUTS_ENV, "").strip()
-    layouts = _rs_inject_op.parse_layouts(raw) if raw else _rs_inject_op.LAYOUTS[core.dp_size]
-    if not raw and "fin" in _dp_hicap(core):
+    layouts = _rs_inject_op.LAYOUTS[core.dp_size]
+    if "fin" in _dp_hicap(core):
         # `DP_HICAP_ENV`'s `fin`: every layout ends at one resident wave, so past it a row's
         # streams share one CTA (the same bits) and the fused finalize stays resident.
         layouts = tuple((spp, min(limit, _DP_HICAP_FIN_CTAS)) for spp, limit in layouts)

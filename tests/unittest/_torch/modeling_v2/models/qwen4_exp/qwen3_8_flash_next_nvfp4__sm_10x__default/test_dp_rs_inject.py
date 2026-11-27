@@ -294,7 +294,6 @@ def _patch_build(monkeypatch, dist, checks=None, compile_error=None):
         supported=lambda h, c: True,
         LAYOUTS={4: ((1, 192), (2, 608)), 8: ((1, 304), (2, 608))},
         MAX_ROWS=511,
-        parse_layouts=lambda raw: ((1, 100),),
         fin_resident=lambda rows, hc, layouts, sms: rows <= 40,
     )
 
@@ -335,7 +334,6 @@ def test_build_off_and_ignored(monkeypatch):
 
 def test_build_keeps_rows_every_rank_holds(monkeypatch):
     monkeypatch.delenv(M.DP_RS_INJECT_ENV, raising=False)
-    monkeypatch.delenv(M.DP_RS_INJECT_LAYOUTS_ENV, raising=False)
     monkeypatch.delenv(M.DP_HICAP_ENV, raising=False)
     # Trunk rows 4 / 8 / 12, draft rows 2..3 below the floor of 4: checked 4, 8, 12.
     peer_bad = [(8, "", "finalize: normed differ", ""), (12, "fused: hc_out differ", "", "")]
@@ -361,7 +359,6 @@ def test_build_finalize_only_on_a_resident_grid(monkeypatch):
     the fused launch twice and the block keeps the runner's finalize."""
     monkeypatch.delenv(M.DP_RS_INJECT_ENV, raising=False)
     monkeypatch.delenv(M.DP_MOE_FIN_RS_ENV, raising=False)
-    monkeypatch.delenv(M.DP_RS_INJECT_LAYOUTS_ENV, raising=False)
     dist = _Dist([[""] * 7, [[]] * 7])
     checked = _patch_build(monkeypatch, dist)
     core = _build_core(monkeypatch, sizes=(1, 10, 11))  # trunk rows 4, 40, 44
@@ -384,7 +381,6 @@ def test_build_drops_draft_rows_whose_fused_launch_is_not_the_draft_paths(monkey
     """A draft row count whose fused launch differs from `mtp_moe_combine_inject` + the head's
     norm on any rank keeps the draft combine on every rank; the trunk keeps the fused launch."""
     monkeypatch.delenv(M.DP_RS_INJECT_ENV, raising=False)
-    monkeypatch.delenv(M.DP_RS_INJECT_LAYOUTS_ENV, raising=False)
     peer = [(4, "", "", "draft: head norm differ"), (8, "", "", "")]
     dist = _Dist([[""] * 7, [peer] + [[]] * 6])
     checked = _patch_build(monkeypatch, dist)
@@ -393,15 +389,6 @@ def test_build_drops_draft_rows_whose_fused_launch_is_not_the_draft_paths(monkey
     assert built.rows == frozenset({4, 8, 16, 32})
     assert built.draft_rows == frozenset({8})
     assert [(r, d) for r, _, d in checked] == [(4, True), (8, True), (16, False), (32, False)]
-
-
-def test_build_layouts_env(monkeypatch):
-    monkeypatch.delenv(M.DP_RS_INJECT_ENV, raising=False)
-    monkeypatch.setenv(M.DP_RS_INJECT_LAYOUTS_ENV, "1:100")
-    dist = _Dist([[""] * 7, [[]] * 7])
-    _patch_build(monkeypatch, dist)
-    built = M._dp_rs_inject_build(_build_core(monkeypatch, world=4), "cuda")
-    assert built.rs.layouts == ((1, 100),)
 
 
 # ------------------------------------------------------------------- the draft
