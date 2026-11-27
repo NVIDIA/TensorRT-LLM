@@ -36,9 +36,21 @@ One plan of another K split (opt-in at the call site): `tm64x2=True` (65..128 ro
 `TILE64X2_ROWS`) runs two 64-row M tiles on an 8-way K split (`_TILE64X2`), the split the
 default plan takes past 128 rows, so the logits are summed in another order than the
 128-row tile's 16-way split at these rows.
+
+The deferred-rstd form (`ss`, `Qwen4ExpHcDecodeTcFirstSs`): the operand is
+`y = bf16(hc * (1 + w))`, the site's stream before its rstd, as the output projection's GEMM in
+inject mode (`mid_rows_mm.mid_mm_inject`) writes it with the partial sums of squares `ss` of
+`hc`. Every plan above has a K split that is a multiple of the stream count, so a CTA's K slice
+lies in one stream: after the grid-dependency wait its epilogue threads form that stream's
+`rstd = rsqrt(sum(ss) / H + eps)` of the tile's rows (`qwen4_exp_hc_inject_norm`'s
+instructions), and the cluster reduce forms `L[t, n] = sum_s rstd[t, s] * (stream s's slice
+partials in slice order)`: the same products with rstd factored out of each stream's sum. One
+CTA a (row tile, stream) also writes rstd `[rows, C]` for the up projection.
 """
 
 from __future__ import annotations
+
+import struct
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -97,6 +109,104 @@ def _mapa(addr, rank, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ldg_v4f(addr, *, loc=None, ip=None):
+    """16 bytes from global as four fp32, by a coherent load (read after the grid-dependency
+    wait, so never `ld.global.nc`)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [cutlass.Int64(addr)],
+        "ld.global.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        loc,
+        ip,
+        side_effects=True,
+    )
+    return [cutlass.Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _add_rn(a, b, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(a), cutlass.Float32(b)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _mul_rn(a, b, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(a), cutlass.Float32(b)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _rstd(ss, eps, hidden_hex: str, *, loc=None, ip=None):
+    """`rsqrt(ss / hidden + eps)` with `qwen4_exp_hc_inject_norm`'s instructions (`div.full`,
+    `add`, `rsqrt.approx.ftz`); `hidden_hex` is the fp32 hidden size as a PTX hex literal."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(ss), cutlass.Float32(eps)],
+            "{ .reg .f32 t; div.full.f32 t, $1, " + hidden_hex + "; add.f32 t, t, $2; "
+            "rsqrt.approx.ftz.f32 $0, t; }",
+            "=f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_f32(addr, v, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int64(addr), cutlass.Float32(v)],
+        "{ st.global.f32 [$1], $2; mov.u32 $0, 0; }",
+        "=r,l,f",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+@dsl_user_op
+def _sts_f32(saddr, v, *, loc=None, ip=None):
+    _asm(
+        T.i32(),
+        [cutlass.Int32(saddr), cutlass.Float32(v)],
+        "{ st.shared.f32 [$1], $2; mov.u32 $0, 0; }",
+        "=r,r,f",
+        loc,
+        ip,
+        side_effects=True,
+    )
+
+
+def _ss_config(ss, ks, hc, k):
+    """`(units, hidden, eps, hidden hex)` of the deferred-rstd form's compile-time `ss`
+    (`(units, hidden, eps)`: the producer's partial sums a (row, stream), the stream width, the
+    norm's epsilon), checked against the plan; None without it."""
+    if ss is None:
+        return None
+    units, hidden, eps = int(ss[0]), int(ss[1]), float(ss[2])
+    assert ks % hc == 0 and units % 4 == 0 and k == hc * hidden, (ks, hc, ss, k)
+    return units, hidden, eps, "0f%08X" % struct.unpack("<I", struct.pack("<f", float(hidden)))[0]
+
+
+@dsl_user_op
 def _ld_dsmem_f32(addr, *, loc=None, ip=None):
     """`ld.shared::cluster.f32`; volatile so it stays behind the cluster barrier."""
     return cutlass.Float32(
@@ -140,9 +250,12 @@ class HcDecodeTcFirstKernel:
     rows). Runtime: the row count (one grid-z M tile per `tm` rows) and the pointers.
     """
 
-    def __init__(self, bn, ks, hc, rank, n_cols, k, with_inject, epi_cols=16, tm=128):
+    def __init__(self, bn, ks, hc, rank, n_cols, k, with_inject, epi_cols=16, tm=128, ss=None):
         assert tm in (64, 128)
         self.tm = tm
+        # The deferred-rstd form (module docstring): `(units, hidden, eps)`, or None.
+        self.ss = _ss_config(ss, ks, hc, k)
+        assert self.ss is None or (with_inject and bn <= 128), "ss: with the injection"
         assert bn % epi_cols == 0 and bn % 16 == 0 and 16 <= bn <= 256
         assert k % (64 * ks) == 0, "K must split into 64-wide tiles per CTA"
         self.bn, self.ks, self.hc, self.rank, self.n_cols, self.k = bn, ks, hc, rank, n_cols, k
@@ -186,7 +299,7 @@ class HcDecodeTcFirstKernel:
         self.k_tiles = self.k // self.mma_tiler[2] // self.ks
         # The fp32 partial, one padded row per accumulator row (conflict-free row stores).
         self.p_stride = self.bn + 1
-        p_bytes = self.tm * self.p_stride * 4
+        p_bytes = self.tm * self.p_stride * 4 + (1024 if self.ss is not None else 0)
         self.num_ab_stage = max(2, min(self.k_tiles, (smem_capacity - 2048 - p_bytes) // ab_bytes))
         self.n_pre = min(self.num_ab_stage, self.k_tiles)
         self.a_smem_layout_staged = utils.sm100.make_smem_layout_a(
@@ -208,6 +321,8 @@ class HcDecodeTcFirstKernel:
         b_ptr: cute.Pointer,
         low_t: cute.Tensor,
         inj_ptr: cute.Pointer,
+        ss_ptr: cute.Pointer,
+        rstd_ptr: cute.Pointer,
         stream: cuda.CUstream,
     ):
         k, ks = self.k, self.ks
@@ -243,6 +358,8 @@ class HcDecodeTcFirstKernel:
             low,
             inj,
             m,
+            ss_ptr.toint(),
+            rstd_ptr.toint(),
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -266,6 +383,8 @@ class HcDecodeTcFirstKernel:
         mLow: cute.Tensor,
         mInj: cute.Tensor,
         m: cutlass.Int32,
+        ss_base: cutlass.Int64,
+        rstd_base: cutlass.Int64,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -340,6 +459,13 @@ class HcDecodeTcFirstKernel:
             layout=cute.make_layout((self.tm, self.bn), stride=(self.p_stride, 1)),
             byte_alignment=16,
         )
+        r_base = cutlass.Int32(0)
+        if cutlass.const_expr(self.ss is not None):
+            # This CTA's stream's rstd, one fp32 an activation row of the tile.
+            sR = smem.allocate_tensor(
+                element_type=self.acc_dtype, layout=cute.make_layout((128,)), byte_alignment=16
+            )
+            r_base = cutlass.Int32(sR.iterator.toint())
 
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
@@ -467,6 +593,35 @@ class HcDecodeTcFirstKernel:
             tTR_rAcc = cute.make_rmem_tensor(frag_shape, self.acc_dtype)
             tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
             tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+            if cutlass.const_expr(self.ss is not None):
+                # Deferred rstd: this CTA's K slice lies in one stream; its epilogue threads
+                # form that stream's rstd of the tile's rows from the producer's partial sums
+                # of squares (read after the grid-dependency wait: the producer wrote them),
+                # one row a thread, in a fixed order: ((v0 + v1) + (v2 + v3)) a 16-byte
+                # vector, the vectors in unit order. The cluster reduce reads them.
+                cute.arch.griddepcontrol_wait()
+                units, _, eps, hidden_hex = self.ss
+                q_ss: cutlass.Constexpr = self.ks // self.hc
+                arow = mt * self.tm + tidx
+                rv = cutlass.Float32(0.0)
+                if (arow < m) & (tidx < self.tm):
+                    sb = ss_base + (cutlass.Int64(arow) * self.hc + cutlass.Int64(kr // q_ss)) * (
+                        units * 4
+                    )
+                    tot = cutlass.Float32(0.0)
+                    for t4 in cutlass.range_constexpr(units // 4):
+                        v4 = _ldg_v4f(sb + t4 * 16)
+                        tot = _add_rn(tot, _add_rn(_add_rn(v4[0], v4[1]), _add_rn(v4[2], v4[3])))
+                    rv = _rstd(tot, cutlass.Float32(eps), hidden_hex)
+                    if (nt == 0) & (kr % q_ss == 0):
+                        # One CTA a (row tile, stream) hands the rstd to the up projection.
+                        _stg_f32(
+                            rstd_base
+                            + (cutlass.Int64(arow) * self.hc + cutlass.Int64(kr // q_ss)) * 4,
+                            rv,
+                        )
+                if tidx < 128:
+                    _sts_f32(r_base + tidx * 4, rv)
             acc_pipeline.consumer_wait(acc_consumer_state)
             for sub in cutlass.range_constexpr(self.bn // self.epi_cols):
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, sub)], tTR_rAcc)
@@ -499,6 +654,10 @@ class HcDecodeTcFirstKernel:
         vals = cute.make_rmem_tensor((self.red_iters * self.ks,), self.acc_dtype)
         p_base = cutlass.Int32(sP.iterator.toint())
         peers = [_mapa(p_base, j) for j in range(self.ks)]
+        if cutlass.const_expr(self.ss is not None):
+            # Stream s's rstd sits in the shared memory of its first K slice.
+            rs = cute.make_rmem_tensor((self.red_iters * self.hc,), self.acc_dtype)
+            rpeers = [_mapa(r_base, s * (self.ks // self.hc)) for s in range(self.hc)]
         for it in cutlass.range_constexpr(self.red_iters):
             fs = cutlass.min(base + tidx + it * nthr, total - 1)
             row = fs // self.bn
@@ -506,6 +665,9 @@ class HcDecodeTcFirstKernel:
             off = (row * self.p_stride + col) * 4
             for j in cutlass.range_constexpr(self.ks):
                 vals[it * self.ks + j] = _ld_dsmem_f32(peers[j] + off)
+            if cutlass.const_expr(self.ss is not None):
+                for s in cutlass.range_constexpr(self.hc):
+                    rs[it * self.hc + s] = _ld_dsmem_f32(rpeers[s] + row * 4)
         inv_hc = cutlass.Float32(1.0 / self.hc)
         for it in cutlass.range_constexpr(self.red_iters):
             local = tidx + it * nthr
@@ -515,8 +677,22 @@ class HcDecodeTcFirstKernel:
                 col = f - row * self.bn
                 n = nt * self.bn + col
                 acc = vals[it * self.ks]
-                for j in cutlass.range_constexpr(1, self.ks):
-                    acc = acc + vals[it * self.ks + j]
+                if cutlass.const_expr(self.ss is None):
+                    for j in cutlass.range_constexpr(1, self.ks):
+                        acc = acc + vals[it * self.ks + j]
+                else:
+                    # A stream's slices in slice order, times the stream's rstd, the streams
+                    # in order (fp32, explicit rounding: no contraction).
+                    qs: cutlass.Constexpr = self.ks // self.hc
+                    for s in cutlass.range_constexpr(self.hc):
+                        part = vals[it * self.ks + s * qs]
+                        for j in cutlass.range_constexpr(1, qs):
+                            part = _add_rn(part, vals[it * self.ks + s * qs + j])
+                        term = _mul_rn(part, rs[it * self.hc + s])
+                        if cutlass.const_expr(s == 0):
+                            acc = term
+                        else:
+                            acc = _add_rn(acc, term)
                 z = acc * inv_hc
                 sg = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-z))
                 if n < self.rank:
@@ -553,9 +729,12 @@ class HcDecodeTcFirstRowsNKernel:
     rows). Runtime: the row count (one grid-z M tile per `tm` rows) and the pointers.
     """
 
-    def __init__(self, bn, ks, hc, rank, n_cols, k, with_inject, epi_cols=16, tm=128):
+    def __init__(self, bn, ks, hc, rank, n_cols, k, with_inject, epi_cols=16, tm=128, ss=None):
         assert tm in (64, 128)
         self.tm = tm
+        # The deferred-rstd form (module docstring): `(units, hidden, eps)`, or None.
+        self.ss = _ss_config(ss, ks, hc, k)
+        assert self.ss is None or (with_inject and bn <= 128), "ss: with the injection"
         assert bn % epi_cols == 0 and bn % 16 == 0 and 16 <= bn <= 256
         assert k % (64 * ks) == 0, "K must split into 64-wide tiles per CTA"
         self.bn, self.ks, self.hc, self.rank, self.n_cols, self.k = bn, ks, hc, rank, n_cols, k
@@ -600,7 +779,7 @@ class HcDecodeTcFirstRowsNKernel:
         self.k_tiles = self.k // self.mma_tiler[2] // self.ks
         # The fp32 partial, one padded row per accumulator row (conflict-free row stores).
         self.p_stride = self.bn + 1
-        p_bytes = self.tm * self.p_stride * 4
+        p_bytes = self.tm * self.p_stride * 4 + (1024 if self.ss is not None else 0)
         self.num_ab_stage = max(2, min(self.k_tiles, (smem_capacity - 2048 - p_bytes) // ab_bytes))
         self.n_pre = min(self.num_ab_stage, self.k_tiles)
         self.a_smem_layout_staged = utils.sm100.make_smem_layout_a(
@@ -622,6 +801,8 @@ class HcDecodeTcFirstRowsNKernel:
         b_ptr: cute.Pointer,
         low_t: cute.Tensor,
         inj_ptr: cute.Pointer,
+        ss_ptr: cute.Pointer,
+        rstd_ptr: cute.Pointer,
         stream: cuda.CUstream,
     ):
         k, ks = self.k, self.ks
@@ -658,6 +839,8 @@ class HcDecodeTcFirstRowsNKernel:
             low,
             inj,
             m,
+            ss_ptr.toint(),
+            rstd_ptr.toint(),
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -681,6 +864,8 @@ class HcDecodeTcFirstRowsNKernel:
         mLow: cute.Tensor,
         mInj: cute.Tensor,
         m: cutlass.Int32,
+        ss_base: cutlass.Int64,
+        rstd_base: cutlass.Int64,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -755,6 +940,13 @@ class HcDecodeTcFirstRowsNKernel:
             layout=cute.make_layout((self.tm, self.bn), stride=(self.p_stride, 1)),
             byte_alignment=16,
         )
+        r_base = cutlass.Int32(0)
+        if cutlass.const_expr(self.ss is not None):
+            # This CTA's stream's rstd, one fp32 an activation row of the tile.
+            sR = smem.allocate_tensor(
+                element_type=self.acc_dtype, layout=cute.make_layout((128,)), byte_alignment=16
+            )
+            r_base = cutlass.Int32(sR.iterator.toint())
 
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
@@ -882,6 +1074,35 @@ class HcDecodeTcFirstRowsNKernel:
             tTR_rAcc = cute.make_rmem_tensor(frag_shape, self.acc_dtype)
             tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
             tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+            if cutlass.const_expr(self.ss is not None):
+                # Deferred rstd: this CTA's K slice lies in one stream; its epilogue threads
+                # form that stream's rstd of the tile's rows from the producer's partial sums
+                # of squares (read after the grid-dependency wait: the producer wrote them),
+                # one row a thread, in a fixed order: ((v0 + v1) + (v2 + v3)) a 16-byte
+                # vector, the vectors in unit order. The cluster reduce reads them.
+                cute.arch.griddepcontrol_wait()
+                units, _, eps, hidden_hex = self.ss
+                q_ss: cutlass.Constexpr = self.ks // self.hc
+                arow = tidx
+                rv = cutlass.Float32(0.0)
+                if (arow < m) & (tidx < self.bn):
+                    sb = ss_base + (cutlass.Int64(arow) * self.hc + cutlass.Int64(kr // q_ss)) * (
+                        units * 4
+                    )
+                    tot = cutlass.Float32(0.0)
+                    for t4 in cutlass.range_constexpr(units // 4):
+                        v4 = _ldg_v4f(sb + t4 * 16)
+                        tot = _add_rn(tot, _add_rn(_add_rn(v4[0], v4[1]), _add_rn(v4[2], v4[3])))
+                    rv = _rstd(tot, cutlass.Float32(eps), hidden_hex)
+                    if (mt == 0) & (kr % q_ss == 0):
+                        # One CTA a (row tile, stream) hands the rstd to the up projection.
+                        _stg_f32(
+                            rstd_base
+                            + (cutlass.Int64(arow) * self.hc + cutlass.Int64(kr // q_ss)) * 4,
+                            rv,
+                        )
+                if tidx < 128:
+                    _sts_f32(r_base + tidx * 4, rv)
             acc_pipeline.consumer_wait(acc_consumer_state)
             for sub in cutlass.range_constexpr(self.bn // self.epi_cols):
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, sub)], tTR_rAcc)
@@ -914,6 +1135,10 @@ class HcDecodeTcFirstRowsNKernel:
         vals = cute.make_rmem_tensor((self.red_iters * self.ks,), self.acc_dtype)
         p_base = cutlass.Int32(sP.iterator.toint())
         peers = [_mapa(p_base, j) for j in range(self.ks)]
+        if cutlass.const_expr(self.ss is not None):
+            # Stream s's rstd sits in the shared memory of its first K slice.
+            rs = cute.make_rmem_tensor((self.red_iters * self.hc,), self.acc_dtype)
+            rpeers = [_mapa(r_base, s * (self.ks // self.hc)) for s in range(self.hc)]
         for it in cutlass.range_constexpr(self.red_iters):
             fs = cutlass.min(base + tidx + it * nthr, total - 1)
             row = fs // self.bn
@@ -926,6 +1151,9 @@ class HcDecodeTcFirstRowsNKernel:
                 live = cutlass.Int32(1)
             for j in cutlass.range_constexpr(self.ks):
                 vals[it * self.ks + j] = _ld_dsmem_f32_if(peers[j] + off, live)
+            if cutlass.const_expr(self.ss is not None):
+                for s in cutlass.range_constexpr(self.hc):
+                    rs[it * self.hc + s] = _ld_dsmem_f32_if(rpeers[s] + col * 4, live)
         inv_hc = cutlass.Float32(1.0 / self.hc)
         for it in cutlass.range_constexpr(self.red_iters):
             local = tidx + it * nthr
@@ -935,8 +1163,22 @@ class HcDecodeTcFirstRowsNKernel:
                 col = f - row * self.bn
                 n = row0 + row  # rows-on-N: the weight row; `col` is the normed row
                 acc = vals[it * self.ks]
-                for j in cutlass.range_constexpr(1, self.ks):
-                    acc = acc + vals[it * self.ks + j]
+                if cutlass.const_expr(self.ss is None):
+                    for j in cutlass.range_constexpr(1, self.ks):
+                        acc = acc + vals[it * self.ks + j]
+                else:
+                    # A stream's slices in slice order, times the stream's rstd, the streams
+                    # in order (fp32, explicit rounding: no contraction).
+                    qs: cutlass.Constexpr = self.ks // self.hc
+                    for s in cutlass.range_constexpr(self.hc):
+                        part = vals[it * self.ks + s * qs]
+                        for j in cutlass.range_constexpr(1, qs):
+                            part = _add_rn(part, vals[it * self.ks + s * qs + j])
+                        term = _mul_rn(part, rs[it * self.hc + s])
+                        if cutlass.const_expr(s == 0):
+                            acc = term
+                        else:
+                            acc = _add_rn(acc, term)
                 z = acc * inv_hc
                 sg = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-z))
                 if n < self.rank and col < m:
@@ -970,6 +1212,9 @@ def _launcher(bn, ks, hc, rank, n_cols, k, with_inject, ptrs, tm=128):
             make_ptr(cutlass.BFloat16, ptrs[1], gmem, assumed_align=16),
             from_dlpack(ptrs[2], assumed_align=16).mark_layout_dynamic(leading_dim=1),
             make_ptr(cutlass.BFloat16, ptrs[3], gmem, assumed_align=2),
+            # The deferred-rstd form's `ss` / `rstd`: never read by the plain kernel.
+            make_ptr(cutlass.Float32, ptrs[1], gmem, assumed_align=16),
+            make_ptr(cutlass.Float32, ptrs[1], gmem, assumed_align=16),
         ]
         fn = cute.compile(
             kern,
@@ -998,7 +1243,9 @@ def hc_decode_tc_first(normed, first, rank, hc_count, with_inject, bn, ks, tm=12
             low,
             (inject if with_inject else low).data_ptr(),
         )
-        _launcher(bn, ks, hc_count, rank, n_cols, k, with_inject, ptrs, tm)(rows, *ptrs)
+        _launcher(bn, ks, hc_count, rank, n_cols, k, with_inject, ptrs, tm)(
+            rows, *ptrs, ptrs[1], ptrs[1]
+        )
     return low, inject
 
 
@@ -1027,6 +1274,9 @@ def _launcher_rowsn(bn, ks, hc, rank, n_cols, k, with_inject, ptrs, tm=64):
             make_ptr(cutlass.BFloat16, ptrs[1], gmem, assumed_align=16),
             from_dlpack(ptrs[2], assumed_align=16).mark_layout_dynamic(leading_dim=1),
             make_ptr(cutlass.BFloat16, ptrs[3], gmem, assumed_align=2),
+            # The deferred-rstd form's `ss` / `rstd`: never read by the plain kernel.
+            make_ptr(cutlass.Float32, ptrs[1], gmem, assumed_align=16),
+            make_ptr(cutlass.Float32, ptrs[1], gmem, assumed_align=16),
         ]
         fn = cute.compile(
             kern,
@@ -1056,7 +1306,9 @@ def hc_first_rowsn(normed, first, rank, hc_count, with_inject, bn):
         low,
         (inject if with_inject else low).data_ptr(),
     )
-    _launcher_rowsn(bn, ks, hc_count, rank, n_cols, k, with_inject, ptrs, tm)(rows, *ptrs)
+    _launcher_rowsn(bn, ks, hc_count, rank, n_cols, k, with_inject, ptrs, tm)(
+        rows, *ptrs, ptrs[1], ptrs[1]
+    )
     return low, inject
 
 
@@ -1336,3 +1588,183 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
 
 
 qwen4_exp_hc_decode_tc_first = Qwen4ExpHcDecodeTcFirst()
+
+
+# ------------------------------------------------------------------- the deferred-rstd form
+_COMPILED_SS: dict = {}
+
+
+def ss_plan(rows: int, tm: int, rows_on_n: bool, tm64x2: bool) -> tuple:
+    """`(kind, bn, ks, tm)` of the launch `Qwen4ExpHcDecodeTcFirst` gives the same plan
+    arguments at `rows` rows: "tc" is `HcDecodeTcFirstKernel`, "rowsn" the rows-on-N kernel."""
+    if tm64x2:
+        return ("tc", *_TILE64X2, 64)
+    if rows_on_n:
+        return ("rowsn", -(-rows // 16) * 16, *ROWSN_PLAN)
+    if tm == 64:
+        return ("tc", *_TILE64, 64)
+    return ("tc", *_tile(rows), 128)
+
+
+def _launcher_ss(kind, bn, ks, hc, rank, k, tm, ss, ptrs):
+    """Compile once per static configuration, with the injection, on the deferred-rstd form.
+    `ptrs` is `(y, weight, low tensor, inject, ss, rstd)`."""
+    key = (kind, bn, ks, hc, rank, k, tm, ss)
+    fn = _COMPILED_SS.get(key)
+    if fn is None:
+        cls = HcDecodeTcFirstKernel if kind == "tc" else HcDecodeTcFirstRowsNKernel
+        kern = cls(bn, ks, hc, rank, rank + hc, k, True, tm=tm, ss=ss)
+        gmem = cute.AddressSpace.gmem
+        cptrs = [
+            make_ptr(cutlass.BFloat16, ptrs[0], gmem, assumed_align=16),
+            make_ptr(cutlass.BFloat16, ptrs[1], gmem, assumed_align=16),
+            from_dlpack(ptrs[2], assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            make_ptr(cutlass.BFloat16, ptrs[3], gmem, assumed_align=2),
+            make_ptr(cutlass.Float32, ptrs[4], gmem, assumed_align=16),
+            make_ptr(cutlass.Float32, ptrs[5], gmem, assumed_align=16),
+        ]
+        fn = cute.compile(
+            kern,
+            MAX_ROWS if kind == "tc" else bn,
+            *cptrs,
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+        _COMPILED_SS[key] = fn
+    return fn
+
+
+def hc_first_ss(y, ss, first, rank, hc_count, eps, plan, compile_only=False):
+    """The first projection with the injection on the deferred-rstd form (module docstring):
+    `y [T, K]` bf16, `ss [T, C, units]` fp32, `plan` from `ss_plan`. Returns `(low, inject,
+    rstd)`; `rstd` is fp32 `[T rounded up to 128, C]`, rows past T unwritten. `compile_only`:
+    compile and launch nothing (placeholder operands of the right shapes)."""
+    rows, k = y.shape
+    kind, bn, ks, tm = plan
+    hidden = k // hc_count
+    dev, dt = y.device, y.dtype
+    low = torch.empty((rows, rank), dtype=dt, device=dev)
+    inject = torch.empty((rows, hc_count), dtype=dt, device=dev)
+    rstd = torch.empty((-(-rows // 128) * 128, hc_count), dtype=torch.float32, device=dev)
+    ptrs = (y.data_ptr(), first.data_ptr(), low, inject.data_ptr(), ss.data_ptr(), rstd.data_ptr())
+    key = (int(ss.shape[2]), hidden, float(eps))
+    fn = _launcher_ss(kind, bn, ks, hc_count, rank, k, tm, key, ptrs)
+    if not compile_only and rows > 0:
+        fn(rows, *ptrs)
+    return low, inject, rstd
+
+
+class Qwen4ExpHcDecodeTcFirstSs(OpWrapper):
+    """`Qwen4ExpHcDecodeTcFirst` with the injection on the deferred-rstd form. With `y` the
+    `[T, C*H]` stream before its rstd, `bf16(hc * (1 + w))`, and `ss` the fp32 `[T, C, U]`
+    partial sums of squares of `hc` (`U` units a stream), `rstd[t, s] = rsqrt(sum_u ss[t, s, u]
+    / H + eps)` and::
+
+        L = sum_s rstd[:, s] * (y[:, s] @ first[s])  # fp32
+        low = silu(L[:, :R] / C)  # [T, R], bf16
+        inject = 2 * sigmoid(L[:, R : R + C] / C)  # [T, C], bf16
+
+    Returns fresh `(low, inject, rstd)`, `rstd` fp32 `[T rounded up to 128, C]` (its first T
+    rows written). Against `qwen4_exp_hc_inject_norm` + `Qwen4ExpHcDecodeTcFirst` the
+    activation is rounded to bf16 once in both, before the rstd factor here and after it
+    there, and rstd is summed in another order: rounding level, not bitwise. Fusion boundary:
+    the first projection of a site whose norm the previous output projection folded
+    (`mid_rows_mm.mid_mm_inject`).
+    """
+
+    ARCHS = SERVED_ARCHS
+
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(why=why, spec=dict(rows=t, **plan))
+        for t, plan, why in (
+            (48, dict(), "128-row tile, 48 rows: dep8 at 12 requests a rank, 16-way K"),
+            (20, dict(tm=64), "64-row tile, 20 rows: dep8 at 5 requests a rank"),
+            (64, dict(tm=64), "64-row tile, 64 rows: dep8 at 16 requests a rank"),
+            (8, dict(rows_on_n=True), "rows on N, 8 rows: MMA N 16 (dep8 at 2 requests)"),
+            (80, dict(rows_on_n=True), "rows on N, 80 rows: dep8 at 20 requests a rank"),
+            (96, dict(tm64x2=True), "two 64-row tiles, 8-way K, 96 rows: dep8 at 24"),
+            (144, dict(), "two 128-row tiles, 8-way K, 144 rows: the fold's last row count"),
+        )
+    )
+    note = """
+    Tier 6 (CuTe DSL), the kernels of `Qwen4ExpHcDecodeTcFirst` with a compile-time `ss`.
+    Metadata consumed: none. Call site: `_siteb_site`, the MoE-side site of a trunk layer whose
+    output projection ran `mid_mm_inject` (`DP_OUT_PROJ_INJECT_ENV`). Preconditions (bf16
+    `y`, `first` as `Qwen4ExpHcDecodeTcFirst`'s; `ss` fp32 contiguous `[T, C, U]`, U a
+    multiple of 4, 16-byte aligned): the plan's K split a multiple of C (every plan but the
+    10-way split of up to 4 rows). `ss` and `y` are read after `griddepcontrol.wait`, with
+    coherent loads.
+    Certified: the cells, against the float64 reference of the same formula (rstd from `ss`
+    in fp64, `y * rstd` unrounded).
+    """
+
+    def __call__(
+        self,
+        y: torch.Tensor,
+        ss: torch.Tensor,
+        first: torch.Tensor,
+        rank: int,
+        hc_count: int,
+        eps: float,
+        tm: int = 128,
+        rows_on_n: bool = False,
+        tm64x2: bool = False,
+    ):
+        plan = ss_plan(y.shape[0], tm, rows_on_n, tm64x2)
+        return hc_first_ss(y, ss, first, rank, hc_count, eps, plan)
+
+    def reference(
+        self,
+        y: torch.Tensor,
+        ss: torch.Tensor,
+        first: torch.Tensor,
+        rank: int,
+        hc_count: int,
+        eps: float,
+        tm: int = 128,
+        rows_on_n: bool = False,
+        tm64x2: bool = False,
+    ):
+        """float64: rstd from `ss`, the projection of `y * rstd`, one rounding an output. The
+        plan arguments move no value: ignored. `rstd` is returned unpadded, `[T, C]` fp32."""
+        rows, k = y.shape
+        hidden = k // hc_count
+        rstd = torch.rsqrt(ss.double().sum(-1) / hidden + eps)
+        x = y.double().view(rows, hc_count, hidden) * rstd[:, :, None]
+        lg = x.view(rows, k) @ first[:, : rank + hc_count].double()
+        low = F.silu(lg[:, :rank] / hc_count).to(y.dtype)
+        inject = (2.0 * torch.sigmoid(lg[:, rank:] / hc_count)).to(y.dtype)
+        return low, inject, rstd.float()
+
+    def is_valid(
+        self,
+        y: torch.Tensor,
+        ss: torch.Tensor,
+        first: torch.Tensor,
+        rank: int,
+        hc_count: int,
+        eps: float,
+        tm: int = 128,
+        rows_on_n: bool = False,
+        tm64x2: bool = False,
+    ) -> None:
+        rows, k = y.shape
+        assert 0 < rows <= MAX_ROWS, f"1..{MAX_ROWS} rows"
+        assert tm == 128 or (tm == 64 and rows <= TILE64_MAX_ROWS), "tm: 128, or 64 up to 64 rows"
+        assert not rows_on_n or rows <= ROWSN_ROWS[1], "rows on N: 1..96 rows"
+        assert not tm64x2 or TILE64X2_ROWS[0] <= rows <= TILE64X2_ROWS[1], "two 64-row tiles"
+        assert sum((tm != 128, rows_on_n, tm64x2)) <= 1, "one plan a call"
+        _, _, ks, _ = ss_plan(rows, tm, rows_on_n, tm64x2)
+        assert ks % hc_count == 0, "the plan's K split must be a multiple of the stream count"
+        assert y.dtype == first.dtype == torch.bfloat16 and ss.dtype == torch.float32
+        assert y.stride() == (k, 1) and ss.is_contiguous(), "contiguous y and ss"
+        assert ss.shape[0] == rows and ss.shape[1] == hc_count and ss.shape[2] % 4 == 0
+        assert k == hc_count * (k // hc_count) and k % _K_ALIGN == 0
+        assert (
+            first.shape[0] == k and first.shape[1] >= rank + hc_count and first.stride() == (1, k)
+        )
+        for t in (y, first, ss):
+            assert t.data_ptr() % 16 == 0, "16-byte aligned operands"
+
+
+qwen4_exp_hc_decode_tc_first_ss = Qwen4ExpHcDecodeTcFirstSs()
