@@ -90,7 +90,7 @@ class KimiK3ToolParser(BaseToolParser):
         attrs_pattern = r"(?:(?!<\|).)*?"
         self._call_open_regex = re.compile(r"<\|open\|>call(?![a-zA-Z])")
         self._call_header_regex = re.compile(
-            r"<\|open\|>call(?P<attrs>" + attrs_pattern + r")<\|sep\|>", re.DOTALL
+            r"<\|open\|>call(?=\s|<\|sep\|>)(?P<attrs>" + attrs_pattern + r")<\|sep\|>", re.DOTALL
         )
         # A complete argument or json block; a value ends at its first close tag.
         self._element_regex = re.compile(
@@ -100,6 +100,17 @@ class KimiK3ToolParser(BaseToolParser):
         )
         self._open_element_regex = re.compile(
             r"\s*<\|open\|>(?P<kind>argument|json)" + attrs_pattern + r"<\|sep\|>", re.DOTALL
+        )
+        # A call header followed straight by an element opener: used inside a
+        # matched element so an unclosed value does not swallow the next call's
+        # close tag, without tripping on a literal quoted `<|open|>call` value.
+        self._next_call_in_element_regex = re.compile(
+            r"<\|open\|>call(?=\s|<\|sep\|>)(?P<attrs>"
+            + attrs_pattern
+            + r")<\|sep\|>\s*<\|open\|>(?P<kind>argument|json)(?=\s|<\|sep\|>)(?P<elem_attrs>"
+            + attrs_pattern
+            + r")<\|sep\|>",
+            re.DOTALL,
         )
         # Where a call can end: before the next call, or at the end of the
         # section, close tags included.
@@ -262,10 +273,11 @@ class KimiK3ToolParser(BaseToolParser):
     def _read_calls(self, section: str) -> Iterator[Tuple[str, str, str]]:
         """Yield ``(attrs, body, missing)`` for each call block in ``section``.
 
-        A call ends at the first ``<|close|>call<|sep|>`` after its header.
-        Where the model left close tags out, a call is read only where its end
-        is not in doubt; ``missing`` names the tags it lacks, and ``body`` has
-        the value's close tag restored:
+        A call ends at the first ``<|close|>call<|sep|>`` after its header,
+        provided no next call starts before it. Where the model left close tags
+        out, a call is read only where its end is not in doubt; ``missing``
+        names the tags it lacks, and ``body`` has the value's close tag
+        restored:
 
         - a call whose last element is complete, followed straight by the
           next call, or by close tags that end the section, the section's own
@@ -276,24 +288,50 @@ class KimiK3ToolParser(BaseToolParser):
           ``<|close|>response<|sep|>`` and the message framing.
 
         A call that stops inside a value or after an element is not read,
-        since it may be cut off. Nor is a value that the section's close tag
-        follows: the value may quote that tag, and the section ends there.
+        since it may be cut off; if another call follows, scanning resumes at
+        that next call rather than letting the incomplete call swallow it. Nor
+        is a value that the section's close tag follows: the value may quote
+        that tag, and the section ends there.
         """
         pos = 0
         while (header := self._call_header_regex.search(section, pos)) is not None:
             attrs, start = header.group("attrs"), header.end()
             close = section.find(self._CALL_CLOSE, start)
             limit = len(section) if close == -1 else close
-            # The call's complete elements, up to a call header outside them.
+            # The call's complete elements, stopping at any next call opener.
             last = start
             next_call = None
             for element in self._element_regex.finditer(section, start, limit):
                 next_call = self._call_open_regex.search(section, last, element.start())
+                if next_call is None:
+                    kind = element.group("kind")
+                    for candidate in self._next_call_in_element_regex.finditer(
+                        section, element.start(), element.end()
+                    ):
+                        if (
+                            candidate.group("kind") == kind
+                            and _parse_attrs(candidate.group("attrs")).get("tool")
+                            and (
+                                kind != "argument"
+                                or "key" in _parse_attrs(candidate.group("elem_attrs"))
+                            )
+                        ):
+                            next_call = candidate
+                            break
                 if next_call is not None:
                     break
                 last = element.end()
             else:
-                next_call = self._call_open_regex.search(section, last, limit)
+                if self._open_element_regex.match(section, last, limit):
+                    if close != -1:
+                        for candidate in self._call_header_regex.finditer(section, last, limit):
+                            if not section[candidate.end() : limit].strip() and _parse_attrs(
+                                candidate.group("attrs")
+                            ).get("tool"):
+                                next_call = candidate
+                                break
+                else:
+                    next_call = self._call_open_regex.search(section, last, limit)
             if (
                 next_call is not None
                 and last > start
@@ -307,7 +345,7 @@ class KimiK3ToolParser(BaseToolParser):
             if next_call is None:
                 value = self._open_element_regex.match(section, last, limit)
             value_close = f"<|close|>{value.group('kind')}<|sep|>" if value else ""
-            if close != -1:
+            if close != -1 and next_call is None:
                 pos = close + len(self._CALL_CLOSE)
                 if value and self._call_end_regex.match(section, pos):
                     yield attrs, section[start:close] + value_close, value_close

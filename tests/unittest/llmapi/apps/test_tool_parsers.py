@@ -6838,6 +6838,100 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
             assert all("location" not in arguments
                        for _, _, arguments in calls), tail
 
+    @pytest.mark.parametrize("left_open, next_call, expected_calls", [
+        pytest.param(
+            WEATHER + LOCATION + "LA",
+            SEARCH,
+            [(0, "search_web", {
+                "query": "AI"
+            })],
+            id="unclosed-value-before-next-call",
+        ),
+        pytest.param(
+            WEATHER + LOCATION_LA + LOCATION + "NYC",
+            SEARCH,
+            [(0, "search_web", {
+                "query": "AI"
+            })],
+            id="complete-then-unclosed-value-before-next-call",
+        ),
+        pytest.param(
+            WEATHER + LOCATION + "LA",
+            '<|open|>call tool="search_web" index="2"<|sep|>'
+            "<|close|>call<|sep|>",
+            [(0, "search_web", {})],
+            id="unclosed-value-before-empty-next-call",
+        ),
+    ])
+    def test_unclosed_value_before_next_call_does_not_swallow_next_call(
+            self, sample_tools, left_open, next_call, expected_calls):
+        """A call left open inside a value is skipped without swallowing the next call."""
+        generation = (self.PREFIX + self.BOT + left_open + next_call +
+                      self.EOT + self.MESSAGE_END)
+        assert self._read_chained(generation,
+                                  sample_tools) == ("Checking.", expected_calls)
+
+    @pytest.mark.parametrize("quoted_value", [
+        pytest.param("print <|open|>call here", id="literal-call-opener"),
+        pytest.param(
+            'print <|open|>call tool="search_web"<|sep|>',
+            id="quoted-call-header",
+        ),
+        pytest.param(
+            'print <|open|>call tool="search_web"<|sep|><|open|>json<|sep|>',
+            id="quoted-call-header-with-mismatched-element",
+        ),
+        pytest.param(
+            "print <|open|>callback<|sep|><|open|>argument<|sep|> here",
+            id="quoted-callback-tag-prefix",
+        ),
+        pytest.param(
+            "print <|open|>call<|sep|><|open|>argument<|sep|> here",
+            id="quoted-call-without-tool-attr",
+        ),
+        pytest.param(
+            'print <|open|>call tool="search_web"<|sep|>'
+            "<|open|>argument<|sep|> here",
+            id="quoted-call-with-keyless-argument",
+        ),
+        pytest.param(
+            'print <|open|>call_foo tool="search_web"<|sep|>'
+            '<|open|>argument key="query"<|sep|> here',
+            id="quoted-call-underscore-tag-prefix",
+        ),
+        pytest.param(
+            'print <|open|>call tool="search_web"<|sep|>'
+            '<|open|>argument2 key="query"<|sep|> here',
+            id="quoted-argument-digit-tag-prefix",
+        ),
+    ])
+    def test_closed_value_quoting_call_opener_is_preserved(
+            self, sample_tools, quoted_value):
+        """A normally closed argument value quoting `<|open|>call` stays intact."""
+        generation = (self.PREFIX + self.BOT + self.WEATHER + self.LOCATION +
+                      quoted_value + "<|close|>argument<|sep|>" +
+                      "<|close|>call<|sep|>" + self.EOT + self.MESSAGE_END)
+        assert self._read_chained(generation, sample_tools) == (
+            "Checking.",
+            [(0, "get_weather", {
+                "location": quoted_value
+            })],
+        )
+
+    def test_unclosed_value_quoting_call_header_with_prose_is_preserved(
+            self, sample_tools):
+        """An unclosed value quoting a call header followed by prose is not a blank next call."""
+        quoted = 'print <|open|>call tool="search_web"<|sep|> here'
+        generation = (self.PREFIX + self.BOT + self.WEATHER + self.LOCATION +
+                      quoted + "<|close|>call<|sep|>" + self.EOT +
+                      self.MESSAGE_END)
+        assert self._read_chained(generation, sample_tools) == (
+            "Checking.",
+            [(0, "get_weather", {
+                "location": quoted
+            })],
+        )
+
     def test_call_read_without_close_tags_is_logged(self, sample_tools, parser,
                                                     monkeypatch):
         """A call read without its close tags is logged with the tags it lacks."""
