@@ -80,10 +80,13 @@ accepts lists. Encoder state references this record without copying its lengths.
 Producers fill input partitions before admission and validate contracts at
 producer/admission boundaries, avoiding repeated validation per forward.
 
-Partitions describe how to select processed fields: shared fields have no item
-axis, batched fields have an item axis, and packed fields also provide host-side
-per-item lengths. Contiguous tensor selections can share storage; reordered
-selections may copy. Treat shared input storage as read-only.
+Use `MultimodalItemPartition.batched(axis)` when each index selects one item.
+Use `MultimodalItemPartition.packed(item_lengths, axis)` for concatenated items
+with host-side lengths. Both default to axis zero. Use
+`MultimodalItemPartition.shared()` for a value that passes through unsliced
+and must match across payloads to batch. Contiguous tensor selections can
+share storage. Reordered selections may copy. Treat shared input storage as
+read-only.
 
 The default `MultimodalModelMixin.encode_multimodal_inputs` runs the model's
 `mm_encoder_groups`.
@@ -181,9 +184,9 @@ For example, two audio items with two and one clips use:
 ```python
 input_partitions = {
     "audio": {
-        "input_audio_features": MultimodalItemPartition(item_lengths=(2, 1)),
-        "feature_attention_mask": MultimodalItemPartition(item_lengths=(2, 1)),
-        "audio_num_clips": MultimodalItemPartition(),
+        "input_audio_features": MultimodalItemPartition.packed((2, 1)),
+        "feature_attention_mask": MultimodalItemPartition.packed((2, 1)),
+        "audio_num_clips": MultimodalItemPartition.batched(),
     },
 }
 ```

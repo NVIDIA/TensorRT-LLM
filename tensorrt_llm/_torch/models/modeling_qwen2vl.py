@@ -2320,9 +2320,6 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         return hidden_states
 
 
-_QWEN_VISION_BATCHED_FIELD = MultimodalItemPartition()
-
-
 def _qwen_vision_item_partitions(
     param: MultimodalParams,
     modality: str,
@@ -2357,9 +2354,9 @@ def _qwen_vision_input_partitions(
     else:
         patch_counts = tuple(t * h * w for t, h, w in grids.tolist())
     return {
-        pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
-        grid_key: _QWEN_VISION_BATCHED_FIELD,
-        "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+        pixel_key: MultimodalItemPartition.packed(patch_counts),
+        grid_key: MultimodalItemPartition.batched(),
+        "second_per_grid_ts": MultimodalItemPartition.batched(),
     }
 
 

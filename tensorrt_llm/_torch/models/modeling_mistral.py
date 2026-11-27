@@ -428,8 +428,8 @@ class MistralCommonImageProcessor:
 
 
 _MISTRAL_IMAGE_PARTITIONS = {
-    "pixel_values": MultimodalItemPartition(),
-    "image_sizes": MultimodalItemPartition(),
+    "pixel_values": MultimodalItemPartition.batched(),
+    "image_sizes": MultimodalItemPartition.batched(),
 }
 
 

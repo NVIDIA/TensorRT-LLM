@@ -95,6 +95,7 @@ def test_item_partition_selects_packed_items_and_preserves_contiguous_views(
     if axis != 0:
         values = values.T
     layout = MultimodalItemPartition(item_axis=axis, item_lengths=(2, 3, 1))
+    assert MultimodalItemPartition.packed([2, 3, 1], axis) == layout
 
     selected = layout.select(values, indices)
 

@@ -1182,15 +1182,15 @@ class NemotronHMultimodalInputProcessor(
                 return metadata
             clip_counts = clip_counts.cpu()
             audio["audio_num_clips"] = clip_counts
-            clips = tuple(clip_counts.tolist())
+            clips = clip_counts.tolist()
             item_count = sum(m == "audio" for m, _ in metadata.item_refs)
             if len(clips) == item_count:
-                packed = MultimodalItemPartition(item_lengths=clips)
+                packed = MultimodalItemPartition.packed(clips)
                 metadata.input_partitions["audio"] = {
                     "input_audio_features": packed,
                     "feature_attention_mask": packed,
                     "audio_output_lengths": packed,
-                    "audio_num_clips": MultimodalItemPartition(),
+                    "audio_num_clips": MultimodalItemPartition.batched(),
                 }
         return metadata
 

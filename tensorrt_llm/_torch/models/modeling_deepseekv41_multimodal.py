@@ -233,9 +233,10 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
         device = self.text_embedding_layer.weight.device
         partitions = {
             "image": {
-                "pixel_values": MultimodalItemPartition(),
-                "image_grid_hw": MultimodalItemPartition(None),
-                "llm_grid_hw": MultimodalItemPartition(None),
+                "pixel_values": MultimodalItemPartition.batched(),
+                # Each view holds one image, so its grid belongs to the whole view.
+                "image_grid_hw": MultimodalItemPartition.shared(),
+                "llm_grid_hw": MultimodalItemPartition.shared(),
             }
         }
         for param in multimodal_params:

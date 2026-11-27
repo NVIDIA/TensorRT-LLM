@@ -258,9 +258,13 @@ def _gemma4_input_partitions(
                     raise ValueError(
                         f"{modality}.{name} must have {field_count} entries on its leading axis"
                     )
-                modality_partitions[name] = MultimodalItemPartition(item_lengths=item_lengths)
+                modality_partitions[name] = (
+                    MultimodalItemPartition.packed(item_lengths)
+                    if item_lengths is not None
+                    else MultimodalItemPartition.batched()
+                )
             if frame_counts is not None:
-                modality_partitions["num_frames"] = MultimodalItemPartition()
+                modality_partitions["num_frames"] = MultimodalItemPartition.batched()
             partitions[modality] = modality_partitions
     return partitions
 
@@ -1033,13 +1037,13 @@ def _gemma4_encode_view(param: MultimodalParams, modality: str) -> MultimodalPar
         if positions is not None:
             payload["image_position_ids"] = positions
 
-    partition = MultimodalItemPartition()
+    partition = MultimodalItemPartition.batched()
     if modality == "video" and (metadata := param.item_metadata) is not None:
         recorded = metadata.input_partitions.get("video", {}).get("pixel_values")
         if recorded is not None:
             partition = recorded
         elif (frame_counts := data.get("num_frames")) is not None:
-            partition = MultimodalItemPartition(item_lengths=tuple(frame_counts))
+            partition = MultimodalItemPartition.packed(frame_counts)
     refs, lengths = param.get_item_layout()
     layout = MultimodalItemMetadata(
         refs,

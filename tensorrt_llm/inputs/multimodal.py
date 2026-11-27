@@ -46,17 +46,37 @@ _HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
 
 
 class MultimodalItemPartition(NamedTuple):
-    """How one processed input is partitioned into multimodal items.
+    """How one processed field maps to multimodal items.
 
-    ``item_axis`` identifies the item axis of a batched tensor, or is ``None``
-    for a value shared by every item. Lists and tuples have item axis zero.
-    ``item_lengths`` partitions a packed input along that axis, for example
-    patch counts for vision or frame counts for audio. Lengths are host-side
-    metadata, independent of the payload tensor's device.
+    Batched fields have one item per index along the item axis. Packed fields
+    concatenate items along that axis, with host-side lengths for each span.
+    Shared fields pass through unsliced and must match across payloads to batch.
     """
 
     item_axis: int | None = 0
     item_lengths: tuple[int, ...] | None = None
+
+    @classmethod
+    def batched(cls, axis: int = 0) -> "MultimodalItemPartition":
+        return cls(axis)
+
+    @classmethod
+    def packed(cls,
+               item_lengths: Sequence[int],
+               axis: int = 0) -> "MultimodalItemPartition":
+        return cls(axis, tuple(item_lengths))
+
+    @classmethod
+    def shared(cls) -> "MultimodalItemPartition":
+        return cls(None)
+
+    @property
+    def is_shared(self) -> bool:
+        return self.item_axis is None
+
+    @property
+    def is_packed(self) -> bool:
+        return self.item_lengths is not None
 
     def select(self, value: Any, item_indices: Sequence[int]) -> Any:
         """Select items in the requested order, preserving tensor dtype/device.
@@ -69,11 +89,11 @@ class MultimodalItemPartition(NamedTuple):
         retain identity.
         """
         axis, lengths = self
-        if axis is None or value is None:
+        if self.is_shared or value is None:
             return value
         if isinstance(value, torch.Tensor):
             offsets = None
-            if lengths is not None:
+            if self.is_packed:
                 offsets = list(accumulate(lengths, initial=0))
                 if offsets[-1] != value.shape[axis]:
                     raise ValueError(
@@ -117,7 +137,7 @@ class MultimodalItemPartition(NamedTuple):
             return value[tuple(index)]
 
         if isinstance(value, (list, tuple)) and axis == 0:
-            if lengths is None:
+            if not self.is_packed:
                 return type(value)(value[i] for i in item_indices)
             offsets = list(accumulate(lengths, initial=0))
             if offsets[-1] != len(value):
@@ -226,10 +246,9 @@ class MultimodalItemMetadata:
                     raise TypeError(
                         "Input partitions must be MultimodalItemPartition records"
                     )
-                if partition.item_lengths is not None:
-                    if (partition.item_axis is None
-                            or len(partition.item_lengths) != len(
-                                indices_by_modality[modality])
+                if partition.is_packed:
+                    if (partition.is_shared or len(partition.item_lengths)
+                            != len(indices_by_modality[modality])
                             or any(not isinstance(n, int) or n < 0
                                    for n in partition.item_lengths)):
                         raise ValueError(
@@ -259,9 +278,10 @@ class MultimodalItemMetadata:
                 {} if partitions is None else {
                     modality: {
                         name:
-                        partition if partition.item_lengths is None else
-                        MultimodalItemPartition(partition.item_axis, (
-                            partition.item_lengths[local_index], ))
+                        partition if not partition.is_packed else
+                        MultimodalItemPartition.packed(
+                            (partition.item_lengths[local_index], ),
+                            partition.item_axis)
                         for name, partition in partitions.items()
                     }
                 },
@@ -277,11 +297,10 @@ class MultimodalItemMetadata:
         for modality, indices in local_indices.items():
             if modality in self.input_partitions:
                 partitions[modality] = {
-                    name: (partition if partition.item_lengths is None else
-                           MultimodalItemPartition(
-                               partition.item_axis,
+                    name: (partition if not partition.is_packed else
+                           MultimodalItemPartition.packed(
                                tuple(partition.item_lengths[i]
-                                     for i in indices)))
+                                     for i in indices), partition.item_axis))
                     for name, partition in
                     self.input_partitions[modality].items()
                 }
