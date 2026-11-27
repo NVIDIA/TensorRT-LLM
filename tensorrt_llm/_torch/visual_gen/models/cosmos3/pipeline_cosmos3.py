@@ -359,6 +359,8 @@ class _ResolvedRequest:
     action_content_height: Optional[int]
     action_content_width: Optional[int]
     schedule: SamplingSchedule
+    action_row_domain_ids: Optional[tuple[int, ...]] = None
+    """One embodiment id per action row, for a trajectory that switches embodiment."""
 
 
 @dataclass
@@ -376,6 +378,7 @@ class _PreparedLatents:
     action_frame_offset: int = 1
     action_state_rows: int = 0
     raw_action_dim: Optional[int] = None
+    action_row_domain_ids: Optional[tuple[int, ...]] = None
 
 
 @register_pipeline(
@@ -608,11 +611,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 if PipelineComponent.VAE.value in self.offloader.requested_components()
                 else device
             )
-            self.vae = load_wan_vae(
-                checkpoint_dir,
-                vae_device,
-                dtype=torch.bfloat16,
-            )
+            self.vae = self._load_vae(checkpoint_dir, vae_device)
 
             self.transformer.temporal_compression_factor = self.vae_scale_factor_temporal
 
@@ -672,6 +671,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         if self.vae_scale_factor_spatial is not None:
             self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+
+    def _load_vae(self, checkpoint_dir: str, device: torch.device) -> nn.Module:
+        return load_wan_vae(checkpoint_dir, device, dtype=torch.bfloat16)
 
     @property
     def default_warmup_resolutions(self):
@@ -1152,18 +1154,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         top = max((resize_h - height) // 2, 0)
         return image.crop((left, top, left + width, top + height))
 
-    @nvtx_range("_tokenize_prompt", color="blue")
-    def _tokenize_prompt(
+    def _prompt_token_ids(
         self,
         text: str,
         max_sequence_length: int,
         use_system_prompt: bool = False,
         system_prompt: Optional[str] = None,
-    ):
-        """Tokenize a prompt using the Qwen2 chat template.
-
-        Returns (input_ids, attention_mask) as [1, S] tensors on device.
-        """
+    ) -> list[int]:
+        """Token ids of a prompt under the Qwen2 chat template, cut to
+        ``max_sequence_length`` including the two closing tokens. Unpadded."""
         conversations = (
             [{"role": "system", "content": system_prompt or COSMOS3_DEFAULT_SYSTEM_PROMPT}]
             if use_system_prompt
@@ -1186,6 +1185,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         token_ids = token_ids[: max_sequence_length - reserved_tokens]
         token_ids.append(self.tokenizer.eos_token_id)  # 151645
         token_ids.append(self.tokenizer.convert_tokens_to_ids("<|vision_start|>"))  # 151652
+        return token_ids
+
+    @nvtx_range("_tokenize_prompt", color="blue")
+    def _tokenize_prompt(
+        self,
+        text: str,
+        max_sequence_length: int,
+        use_system_prompt: bool = False,
+        system_prompt: Optional[str] = None,
+    ):
+        """Tokenize a prompt using the Qwen2 chat template.
+
+        Returns (input_ids, attention_mask) as [1, S] tensors on device.
+        """
+        token_ids = self._prompt_token_ids(
+            text, max_sequence_length, use_system_prompt, system_prompt
+        )
         seq_len = len(token_ids)
 
         # Pad to max_sequence_length. TRT's shared denoiser concatenates CFG
@@ -1331,9 +1347,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     # VAE decode
     # =========================================================================
 
-    def _decode_latents_raw(self, latents):
+    def _scale_latents_for_decode(self, latents):
+        """Latents as the VAE decoder expects them: the checkpoint's per-channel
+        statistics undone, or its scaling factor."""
         latents = latents.to(self.vae.dtype)
-
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
             if not hasattr(self, "_latents_mean"):
                 self._latents_mean = (
@@ -1346,11 +1363,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     .view(1, -1, 1, 1, 1)
                     .to(self.device, self.vae.dtype)
                 )
-            latents = (latents * self._latents_std) + self._latents_mean
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latents = latents / scaling_factor
+            return (latents * self._latents_std) + self._latents_mean
+        scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        return latents / scaling_factor
 
+    def _decode_latents_raw(self, latents):
+        latents = self._scale_latents_for_decode(latents)
         with self.offloader.context_if_requested(PipelineComponent.VAE.value):
             return self.vae.decode(latents, return_dict=False)[0]
 
@@ -1869,7 +1887,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             torch.distributed.broadcast(text_blocked, src=0)
         return bool(text_blocked.item())
 
-    def _tokenize_request_prompts(
+    def _request_prompts(
         self,
         request: _ResolvedRequest,
         prompt: list[str],
@@ -1877,15 +1895,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         *,
         use_duration_template: bool,
         use_resolution_template: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply request metadata and tokenize the conditional pair."""
-        if negative_prompt is None:
-            negative_prompt = (
-                ""
-                if request.action_mode == ACTION_MODE_POLICY
-                else default_negative_prompt(request.output_type)
-            )
-
+    ) -> tuple[list[str], Optional[str], str]:
+        """``(prompt, negative_prompt, system_prompt)`` as the tokenizer takes them, with
+        the request's metadata applied to both prompts. A ``negative_prompt`` of
+        ``None`` stays ``None``."""
         if not request.do_action:
             duration_template = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
             if use_resolution_template:
@@ -1897,16 +1910,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             else:
                 resolution_template = None
 
-            negative_prompt = self._apply_metadata_templates(
-                negative_prompt,
-                height=request.height,
-                width=request.width,
-                num_frames=request.num_frames,
-                frame_rate=request.frame_rate,
-                duration_template=duration_template,
-                resolution_template=resolution_template,
-                force_duration_template=False,
-            )
+            if negative_prompt is not None:
+                negative_prompt = self._apply_metadata_templates(
+                    negative_prompt,
+                    height=request.height,
+                    width=request.width,
+                    num_frames=request.num_frames,
+                    frame_rate=request.frame_rate,
+                    duration_template=duration_template,
+                    resolution_template=resolution_template,
+                    force_duration_template=False,
+                )
             prompt = [
                 self._format_prompt_with_metadata(
                     value,
@@ -1923,6 +1937,31 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         logger.info(f"Prompt with metadata: '{prompt}'")
         system_prompt = (
             COSMOS3_T2I_SYSTEM_PROMPT if request.is_t2i else COSMOS3_DEFAULT_SYSTEM_PROMPT
+        )
+        return prompt, negative_prompt, system_prompt
+
+    def _tokenize_request_prompts(
+        self,
+        request: _ResolvedRequest,
+        prompt: list[str],
+        negative_prompt: Optional[str],
+        *,
+        use_duration_template: bool,
+        use_resolution_template: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply request metadata and tokenize the conditional pair."""
+        if negative_prompt is None:
+            negative_prompt = (
+                ""
+                if request.action_mode == ACTION_MODE_POLICY
+                else default_negative_prompt(request.output_type)
+            )
+        prompt, negative_prompt, system_prompt = self._request_prompts(
+            request,
+            prompt,
+            negative_prompt,
+            use_duration_template=use_duration_template,
+            use_resolution_template=use_resolution_template,
         )
         cond_ids, cond_mask = self._tokenize_prompt(
             prompt[0],

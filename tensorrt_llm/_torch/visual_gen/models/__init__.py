@@ -33,7 +33,7 @@ Example structure:
 
 from ..pipeline import BasePipeline
 from ..pipeline_registry import AutoPipeline, register_pipeline
-from .cosmos3 import Cosmos3OmniMoTPipeline
+from .cosmos3 import Cosmos3OmniMoTPipeline, Cosmos3SimPipeline
 from .flux import Flux2Pipeline, FluxPipeline
 from .glm_image import GlmImagePipeline
 from .hunyuan_video1_5 import HunyuanVideo15Pipeline
@@ -58,6 +58,7 @@ __all__ = [
     "WanDMDPipeline",
     "WanImageToVideoPipeline",
     "Cosmos3OmniMoTPipeline",
+    "Cosmos3SimPipeline",
     "LTX23Pipeline",
     "LTX23RetakePipeline",
     "register_pipeline",

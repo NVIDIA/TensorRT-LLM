@@ -20,6 +20,7 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
 - [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone with no audio tower. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
 - [`nvidia/Cosmos3-Edge-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) — state-conditioned DROID policy on the Edge Nemotron-dense backbone. Its `checkpoint.json` selects policy mode and supplies the 32-action horizon, 15 FPS, and `droid_lerobot` domain. TensorRT-LLM supplies the remaining reference recipe: an 8-D current state followed by 32 generated 8-D joint-position/gripper actions, 33 rollout frames, four UniPC steps at flow shift 5, guidance 3 only at the highest-noise step, empty unconditional text, and the native Cosmos3 VAE. The prompt and observation layout remain request-owned; no RoboLab/OpenPI adapter runs in the model pipeline.
+- [`nvidia/Cosmos3-Nano-Sim-Bimanual`](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Bimanual) — autoregressive simulator for bimanual manipulation: a first frame plus a recorded action trajectory produce the video the actions cause (`--action_mode forward_dynamics`). The video is generated chunk by chunk; each chunk attends to the prompt and the finished frames through a paged K/V cache. The rollout settings are read from the checkpoint: the chunk size, the fixed few-step schedule (guidance baked in), the history window, and the embodiment table (for each robot body its name, its domain id and the number of values in an action row). A request names the embodiment with `domain_name` or `domain_id`. Either may be one value, or one per action row for a trajectory that switches embodiment; the pipeline resolves names against the checkpoint's table. A request that names none gets the checkpoint's default embodiment. Action values are sent already in the checkpoint's normalized space. Each latent frame after the first takes `action_tokens_per_frame` action rows (4 in this checkpoint), so send a multiple of that: rows left over at the end are dropped. A prompt longer than the checkpoint's text cache (`text_cache_max_len` tokens) is rejected. A request is a prompt alone, or forward dynamics from a first frame: the other action modes, transfer controls, a reference video and audio are rejected when the request is validated, and `VisualGen.extra_param_specs` lists the parameters this checkpoint takes. Use with `../../configs/cosmos3-nano-sim-1gpu.yaml`: the default attention backend cannot read the K/V cache (see [Deployment configs](#deployment-configs)). Guardrails apply as for every Cosmos3 checkpoint.
 
 ### Static FP8 checkpoints
 
@@ -104,6 +105,10 @@ See `examples/visual_gen/configs/`:
 - `cosmos3-nano-1gpu.yaml` — 1 GPU
 - `cosmos3-super-4gpu.yaml` — 4 GPU, CFG + Ulysses + parallel VAE
 - `cosmos3-t2i-1gpu.yaml` — 1 GPU, text-to-image deployments (base or distilled): warms the deployed 1024×1024 single-frame shape instead of the omni video shape.
+- `cosmos3-nano-sim-1gpu.yaml` — 1 GPU, `Cosmos3-Nano-Sim-Bimanual`. Selects an attention backend that can read the K/V cache (`CUDNN`; `TRTLLM` is the other one) and turns on CUDA graphs for the chunk forward. Warmup sends requests as clients do (a first frame and action rows), with a first frame of each size listed under `compilation_config.resolutions`: 832×480, the first frame of the example below. List the first-frame sizes your clients send; a first frame of another size is served, but its first request captures graphs and compiles kernels. A script that generates once can set `compilation_config.skip_warmup: true`: the first request then does that work, and the K/V cache is sized from the memory free when it starts instead of from the measured peak. The Sim settings are `pipeline_config` keys, fixed for the lifetime of the engine:
+  - `kv_cache_free_gpu_memory_fraction` — the share of the GPU memory left after the warmup requests' peak that the K/V cache takes.
+  - `kv_cache_inference_size: 64` with `attention_sink_size: 8` — the history window the cosmos-framework example runs this checkpoint with: each latent frame sees the first 8 latent frames of the video and the 55 before it. Remove both keys to run what the checkpoint declares. With a window, the cache does not limit how long a request may be, but the window has to fit the cache at the request's frame size, or the request is refused. With full history it does: a request whose frames do not fit the cache is refused.
+  - `vae_decode_device` (commented out in the file) — a second GPU, such as `cuda:1`, that decodes each finished chunk while the rollout continues. Without it, the chunk is decoded on the generator's GPU before the next one denoises. Either way the decode happens during the rollout, so the request metrics count it under `denoise`; `post_denoise` is left with the video guardrail when guardrails are on.
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
 
@@ -264,6 +269,27 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --domain_name av \
     --action_json action_trajectory.json \
     --output_path forward_dynamics.safetensors
+
+# Cosmos3 Nano Sim — forward dynamics over the causal K/V cache (first frame +
+# recorded actions -> the video they cause). actions.json is either [T, D] rows
+# (D the checkpoint's row width for the embodiment) or the object
+# {"action": [T, D], "domain_names": [T]}; other keys of the object are ignored.
+# The per-row names let the trajectory switch embodiment: the pipeline resolves
+# them against the checkpoint's embodiment table, and they replace --domain_name.
+# --action_chunk_size is the number of rows (900 here: a 901-frame video) and
+# --frame_rate the rate they were recorded at (30 fps here). Left out, both fall
+# back to the domain preset, and [T, D] rows past the preset length are cut.
+# With per-row names, --action_chunk_size must equal the number of names.
+python cosmos3.py --model nvidia/Cosmos3-Nano-Sim-Bimanual \
+    --prompt "Smooth out a messy brown shorts with both arms and spread it flat." \
+    --visual_gen_args ../../configs/cosmos3-nano-sim-1gpu.yaml \
+    --image_path first_frame_832x480.png \
+    --action_mode forward_dynamics \
+    --domain_name agibotworld \
+    --action_json actions.json \
+    --action_chunk_size 900 \
+    --frame_rate 30 \
+    --output_path sim_rollout.safetensors
 
 # Action — inverse dynamics (video -> predicted action)
 python cosmos3.py --model nvidia/Cosmos3-Nano \

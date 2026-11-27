@@ -115,12 +115,19 @@ class WinoVaeOptions:
     # send/receive and the unpack copy; "nccl": batched point-to-point sends; "auto":
     # "direct" where the ranks can map each other's memory, else "nccl".
     halo_exchange: Literal["auto", "nccl", "direct"] = "auto"
+    # Whether cuDNN picks the conv algorithms of the encoder and of image decodes by timing
+    # them at first use. The winner can differ from one process to the next, and the low
+    # bits of the output with it; False keeps cuDNN's heuristics, whose choice is the same
+    # in every process.
+    conv_autotuning: bool = True
 
     def __post_init__(self) -> None:
         for name in ("encoder_chunk_frames", "frame_buffer_chunks"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"{name} must be an int, got {value!r}")
+        if not isinstance(self.conv_autotuning, bool):
+            raise TypeError(f"conv_autotuning must be a bool, got {self.conv_autotuning!r}")
         if self.halo_exchange not in ("auto", "nccl", "direct"):
             raise ValueError(
                 f"halo_exchange must be 'auto', 'nccl' or 'direct', got {self.halo_exchange!r}"
@@ -1977,9 +1984,10 @@ class WinoVae(WanVAE):
     ``encode`` / ``decode`` raise ``TypeError`` otherwise).
 
     Beyond the ``AutoencoderKLWan`` interface: ``encode_mode(x)`` returns the posterior mean
-    directly, and ``fold_latent_affine(mean, std)`` folds the
+    directly, ``fold_latent_affine(mean, std)`` folds the
     latent de-normalization into ``post_quant_conv`` so ``decode`` takes the model's raw
-    latents.
+    latents, and ``decode_stream_start`` / ``decode_stream_step`` / ``decode_stream_end``
+    decode a clip a few latent frames at a time.
     """
 
     _encoder_cls = WinoVaeEncoder3d
@@ -2015,11 +2023,21 @@ class WinoVae(WanVAE):
                 module.frame_buffer.chunks = options.frame_buffer_chunks
         self._folded_tail: dict[int | None, tuple[tuple, WinoVaeCausalConv3d]] = {}
         self._post_quant_folded: tuple[torch.Tensor, torch.Tensor] | None = None
+        # The clip opened by decode_stream_start: the decoder's causal-conv cache list (None:
+        # no clip is open) and what its steps' latents share, (batch and channels, height and
+        # width, device), taken from the first step (None: that step is still to come).
+        self._stream_feat_map: list[CacheEntry] | None = None
+        self._stream_layout: tuple[torch.Size, torch.Size, torch.device] | None = None
 
     def _benchmark_convs(self, *, frames: int, encoder: bool) -> bool:
-        """cuDNN autotuning for the encoder and image decodes, except on a spatial shard, where the heuristics'
-        choice is the same in every process (autotuning could pick different engines per rank)."""
-        return self.shard is None and _benchmark_convs(encoder=encoder, frames=frames)
+        """cuDNN autotuning for the encoder and image decodes, unless the options turn it off, and
+        not on a spatial shard, where the heuristics' choice is the same in every process
+        (autotuning could pick different engines per rank)."""
+        return (
+            self.options.conv_autotuning
+            and self.shard is None
+            and _benchmark_convs(encoder=encoder, frames=frames)
+        )
 
     def set_shard(self, shard: Shard | None) -> None:
         """Run on one spatial slice of the frames, exchanging border lines with the
@@ -2114,11 +2132,10 @@ class WinoVae(WanVAE):
         folded.shard = conv_out.shard
         return folded
 
-    def _video_for(self, chunk: torch.Tensor, latent_frames: int) -> torch.Tensor:
-        """The uninitialized channels-last output video ``[1, C, T, H, W]`` of a decode of
-        ``latent_frames`` latents, shaped from its first decoded (patchified) chunk."""
+    def _video_for(self, chunk: torch.Tensor, frames: int) -> torch.Tensor:
+        """The uninitialized channels-last output video ``[1, C, frames, H, W]`` that decoded
+        (patchified) chunks shaped like ``chunk`` are unpatchified into."""
         patch = self.config.patch_size
-        frames = (latent_frames - 1) * self.config.scale_factor_temporal + 1
         return torch.empty(
             (
                 1,
@@ -2194,6 +2211,11 @@ class WinoVae(WanVAE):
         temporal_chunk_size: int = 1,
     ) -> DecoderOutput | tuple[torch.Tensor]:
         self._check_dtype(z)
+        if self._stream_feat_map is not None:
+            raise RuntimeError(
+                "decode would overwrite the temporal context of the clip opened by "
+                "decode_stream_start; call decode_stream_end first"
+            )
         _, _, num_frame, _, _ = z.shape
 
         self.clear_cache()
@@ -2215,7 +2237,8 @@ class WinoVae(WanVAE):
     def fold_latent_affine(self, latents_mean: torch.Tensor, latents_std: torch.Tensor) -> None:
         """Fold the latent de-normalization into ``decode``: ``latents_mean`` and
         ``latents_std`` are per-channel (``z_dim`` elements each); afterwards ``decode(z)``
-        behaves as ``decode(std * z + mean)`` until ``clear_latent_affine``. The registered
+        and ``decode_stream_step(z)`` behave as on ``std * z + mean`` until
+        ``clear_latent_affine``. The registered
         weights are unchanged (the folded tensors are plain attributes, not buffers), so call
         this after loading, moving or casting the weights, and again after any such change."""
         # P' = P diag(std), b' = P mean + b, composed in fp32 and rounded once to the weight dtype.
@@ -2236,6 +2259,12 @@ class WinoVae(WanVAE):
 
     def clear_latent_affine(self) -> None:
         self._post_quant_folded = None
+
+    @property
+    def latent_affine_folded(self) -> bool:
+        """Whether ``decode`` and ``decode_stream_step`` take the model's normalized
+        latents: ``fold_latent_affine`` is in effect."""
+        return self._post_quant_folded is not None
 
     def _post_quant(self, z: torch.Tensor) -> torch.Tensor:
         if self._post_quant_folded is None:
@@ -2268,7 +2297,8 @@ class WinoVae(WanVAE):
                 # Unpatchify + clamp of this chunk straight into the preallocated video.
                 out_chunk = _channels_last_3d_if_needed(out_chunk)
                 if out is None:
-                    out = self._video_for(out_chunk, num_frame)
+                    frames = (num_frame - 1) * self.config.scale_factor_temporal + 1
+                    out = self._video_for(out_chunk, frames)
                 from .kernels.frame_ops import unpatchify_clamp_into
 
                 unpatchify_clamp_into(out_chunk, out, frames_done, self.config.patch_size)
@@ -2289,3 +2319,94 @@ class WinoVae(WanVAE):
         if not return_dict:
             return (out,)
         return DecoderOutput(sample=out)
+
+    def decode_stream_start(self) -> None:
+        """Open a clip that ``decode_stream_step`` decodes a few latent frames at a time.
+
+        Joined along time, the steps' frames match the video ``decode`` returns for the whole
+        clip to rounding, the way ``decode`` results match across ``temporal_chunk_size``
+        values. Until ``decode_stream_end``, ``decode`` on this model raises; ``encode`` is
+        unaffected.
+
+        Raises:
+            RuntimeError: If a clip is already open.
+            ValueError: If the model is spatially sharded.
+        """
+        if self._stream_feat_map is not None:
+            raise RuntimeError(
+                "decode_stream_start: a clip is already open; call decode_stream_end first"
+            )
+        if self.shard is not None:
+            raise ValueError("a spatially sharded WinoVae decodes whole clips only")
+        self._stream_feat_map = [None] * self._cached_conv_counts["decoder"]
+        self._stream_layout = None
+
+    def decode_stream_step(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode the next latent frames of the clip opened by ``decode_stream_start``.
+
+        A step refused with one of the errors below leaves the clip as it was. A step that
+        fails after that closes the clip.
+
+        Args:
+            z: The clip's next consecutive latent frames ``[B, z_dim, T, H, W]``, bf16 on
+                CUDA, in the form ``decode`` takes them. The clip's first step holds exactly
+                its first latent frame. Later steps hold any ``T >= 1``, which may differ
+                from step to step, with the first step's ``B``, ``H``, ``W`` and device.
+
+        Returns:
+            The pixel frames of ``z`` as ``decode`` returns them: ``[B, C, T', H', W']`` bf16,
+            channels-last, in ``[-1, 1]``, in a tensor of their own. ``T'`` is 1 for the
+            clip's first step and ``T * scale_factor_temporal`` for every later one.
+
+        Raises:
+            RuntimeError: If no clip is open.
+            ValueError: If the clip's first step does not hold exactly one latent frame, a
+                later step holds none or differs from the first in ``B``, ``z_dim``, ``H``,
+                ``W`` or device, or the model is spatially sharded.
+            TypeError: If ``z`` or the weights are not bf16 on CUDA.
+        """
+        feat_cache = self._stream_feat_map
+        if feat_cache is None:
+            raise RuntimeError("decode_stream_step: no clip is open; call decode_stream_start")
+        self._check_dtype(z)
+        if self.shard is not None:
+            raise ValueError("a spatially sharded WinoVae decodes whole clips only")
+        layout = (z.shape[:2], z.shape[3:], z.device)
+        first_chunk = self._stream_layout is None
+        if first_chunk and z.shape[2] != 1:
+            raise ValueError(
+                f"the first decode_stream_step of a clip takes one latent frame, got {z.shape[2]}"
+            )
+        if not first_chunk and (z.shape[2] < 1 or layout != self._stream_layout):
+            raise ValueError(
+                f"decode_stream_step: latents {tuple(z.shape)} on {z.device} do not continue "
+                "the open clip; a step holds at least one latent frame with the batch, "
+                "channels, height, width and device of the clip's first step"
+            )
+        prev_benchmark = torch.backends.cudnn.benchmark
+        # The clip's length is unknown here, so every step keeps cuDNN's heuristics, as the
+        # chunks of a video decode do.
+        torch.backends.cudnn.benchmark = False
+        # A step that stops part way leaves some convs with this chunk's history and the rest
+        # with the previous chunk's, so the clip is open again only once the step completes.
+        self._stream_feat_map = None
+        try:
+            x = self._post_quant(_channels_last_3d_if_needed(z))
+            chunk = self.decoder(x, feat_cache=feat_cache, feat_idx=[0], first_chunk=first_chunk)
+        finally:
+            torch.backends.cudnn.benchmark = prev_benchmark
+        if self._use_fused_output(chunk):
+            from .kernels.frame_ops import unpatchify_clamp_into
+
+            chunk = _channels_last_3d_if_needed(chunk)
+            out = self._video_for(chunk, chunk.shape[2])
+            unpatchify_clamp_into(chunk, out, 0, self.config.patch_size)
+        else:
+            out = self._assemble_video([chunk])
+        self._stream_feat_map, self._stream_layout = feat_cache, layout
+        return out
+
+    def decode_stream_end(self) -> None:
+        """Close the open clip; no effect when no clip is open. The model keeps the GPU
+        buffers it reuses for the next clip, as it does after ``decode``."""
+        self._stream_feat_map = None

@@ -45,7 +45,9 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional, get_args
 
 import numpy as np
+import torch
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
+from diffusers.utils.torch_utils import randn_tensor
 
 from tensorrt_llm.logger import logger
 
@@ -334,6 +336,53 @@ def load_scheduler(checkpoint_dir: str, subfolder: str = "scheduler") -> Any:
     return scheduler_cls.from_pretrained(checkpoint_dir, subfolder=subfolder)
 
 
+@dataclass(frozen=True, eq=False)
+class FixedStochasticSchedule:
+    """A distilled checkpoint's fixed schedule as float32 tensors on one device.
+    Stochastic: every step but the last mixes freshly drawn noise into the sample.
+
+    Step ``i`` of ``len(schedule)`` denoises at noise level ``sigmas[i]``: the model
+    takes ``timesteps[i]`` as its raw timestep and :meth:`step` moves the sample to the
+    next level. Stepping keeps no state and reads nothing back from the device, so one
+    schedule serves any number of generations.
+    """
+
+    timesteps: "tuple[torch.Tensor, ...]"
+    """Per step, ``[1]``: the level as the scheduler's raw timestep."""
+    sigmas: "tuple[torch.Tensor, ...]"
+    """Per step, 0-dim: the level the step starts from."""
+    mixes: "tuple[Optional[tuple[torch.Tensor, torch.Tensor]], ...]"
+    """Per step, ``(1 - next level, next level)`` as 0-dim tensors; ``None`` where the
+    next level is 0 and the step returns the clean estimate."""
+
+    def __len__(self) -> int:
+        return len(self.timesteps)
+
+    def step(
+        self,
+        i: int,
+        velocity: torch.Tensor,
+        sample: torch.Tensor,
+        generator: Optional[torch.Generator],
+    ) -> torch.Tensor:
+        """``sample`` at ``sigmas[i]`` moved to the next level: the clean estimate
+        ``sample - sigmas[i] * velocity``, mixed with noise drawn from ``generator``
+        unless the next level is 0. Returns a new tensor in ``velocity``'s dtype and
+        leaves ``sample`` unchanged. The arithmetic, its order and its precision are
+        those of ``FlowMatchEulerDiscreteScheduler.step`` with stochastic sampling,
+        which also draws the noise it multiplies by a next level of 0."""
+        clean = sample.to(torch.float32, copy=True)
+        clean.sub_(self.sigmas[i] * velocity)
+        mix = self.mixes[i]
+        if mix is not None:
+            keep, next_sigma = mix
+            noise = randn_tensor(
+                sample.shape, generator=generator, device=sample.device, dtype=torch.float32
+            )
+            clean.mul_(keep).add_(noise.mul_(next_sigma))
+        return clean.to(velocity.dtype)
+
+
 @dataclass(frozen=True)
 class Cosmos3SamplingPolicy:
     """Immutable sampling facts of a loaded Cosmos3 checkpoint.
@@ -502,6 +551,31 @@ class Cosmos3SamplingPolicy:
         # UniPC looks up its first step by timestep value and, on repeats, starts at the
         # second match; every generation runs the whole schedule, so start at step 0.
         scheduler.set_begin_index(0)
+
+    def fixed_stochastic_schedule(
+        self, scheduler: Any, device: Any, schedule: SamplingSchedule
+    ) -> FixedStochasticSchedule:
+        """The fixed schedule of a distilled checkpoint on ``device``, with the levels
+        ``scheduler`` programs for ``schedule`` (see :meth:`set_timesteps`).
+
+        Raises:
+            RuntimeError: The checkpoint is not distilled, or ``schedule`` is not its
+                fixed grid.
+        """
+        if not self.is_distilled:
+            raise RuntimeError("Only a distilled Cosmos3 checkpoint has a fixed schedule.")
+        self.set_timesteps(scheduler, len(self.fixed_sigmas), device=device, schedule=schedule)
+        timesteps, sigmas = scheduler.timesteps, scheduler.sigmas
+        levels = sigmas.tolist()
+        steps = range(timesteps.shape[0])
+        return FixedStochasticSchedule(
+            timesteps=tuple(timesteps[i].reshape(1) for i in steps),
+            sigmas=tuple(sigmas[i] for i in steps),
+            mixes=tuple(
+                None if levels[i + 1] == 0.0 else (1.0 - sigmas[i + 1], sigmas[i + 1])
+                for i in steps
+            ),
+        )
 
     def scheduler_step_kwargs(self, generator: Any) -> dict:
         """Extra kwargs each ``scheduler.step()`` call requires.
