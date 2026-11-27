@@ -26,12 +26,19 @@ from unittest.mock import Mock
 
 import pytest
 
+import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
+import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
     GenTransferStatus,
 )
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    AgentResult,
+    KVRecvTask,
+    Receiver,
     RxSession,
     TaskStatus,
     TransferWorker,
@@ -208,9 +215,11 @@ def _assert_context_timeout_retains_transfer(
     assert session.aux_slot == 0
     assert req.state is None
     assert not req.py_kv_send_session_retired
-    assert warning.call_count == 2
-    for args, _kwargs in warning.call_args_list:
-        message = args[0]
+    messages = [
+        args[0] for args, _kwargs in warning.call_args_list if args[0].startswith("TxSession ")
+    ]
+    assert len(messages) == 2
+    for message in messages:
         assert "rid=16" in message
         assert "kv_transfer_timeout_ms=60000ms" in message
         assert "keeping it in progress" in message
@@ -875,7 +884,9 @@ def _make_cache_config(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
+def _construct_worker_config(
+    monkeypatch, cache_config, *, world_size=1, allgather=None
+) -> TransferWorkerConfig:
     """Build a KvCacheTransceiverV2 with all collectives/native setup mocked out.
 
     Returns the TransferWorkerConfig it wired.
@@ -913,7 +924,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     mapping = SimpleNamespace(
         rank=0,
         cp_size=1,
-        world_size=1,
+        world_size=world_size,
         pp_size=1,
         has_cp_helix=lambda: False,
         cp_config={},
@@ -924,7 +935,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
 
     KvCacheTransceiverV2(
         mapping=mapping,
-        dist=Mock(allgather=Mock(side_effect=lambda value: [value])),
+        dist=Mock(allgather=Mock(side_effect=allgather or (lambda value: [value] * world_size))),
         kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4, is_disagg=False),
         cache_transceiver_config=cache_config,
     )
@@ -932,6 +943,48 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     worker_config = worker_constructor.call_args.args[0]
     assert isinstance(worker_config, TransferWorkerConfig)
     return worker_config
+
+
+def _patch_multi_rank_recovery(monkeypatch, *, handle_retirement: bool, qualify: Mock) -> None:
+    """Make a two-rank MPI executor whose recovery qualification ``qualify`` decides."""
+    monkeypatch.setattr(
+        transfer_mod.NixlTransferAgent, "supports_handle_retirement", handle_retirement
+    )
+    monkeypatch.setattr(transceiver_mod, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(transceiver_mod, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(transceiver_mod, "_retirement_executor_comm", qualify)
+
+
+def test_old_binding_disables_recovery_before_mpi_qualification(monkeypatch) -> None:
+    qualify = Mock(side_effect=ValueError("MPI_THREAD_MULTIPLE is required"))
+    _patch_multi_rank_recovery(monkeypatch, handle_retirement=False, qualify=qualify)
+    config = _construct_worker_config(monkeypatch, _make_cache_config(), world_size=2)
+    qualify.assert_not_called()
+    assert config.recovery_fatal_callback is None
+    assert not transfer_mod.agent_recovery_supported(False, False, 0)
+
+
+@pytest.mark.parametrize("unqualified_rank", [None, 0, 1])
+def test_recovery_falls_back_when_rank_lacks_executor_mpi(monkeypatch, unqualified_rank) -> None:
+    monkeypatch.setattr(transfer_mod, "use_pure_python_transfer_agent", lambda: False)
+    communicator = Mock()
+    error = "MPI world differs from executor Mapping"
+    qualify = Mock(
+        return_value=communicator,
+        side_effect=ValueError(error) if unqualified_rank == 0 else None,
+    )
+    _patch_multi_rank_recovery(monkeypatch, handle_retirement=True, qualify=qualify)
+
+    def allgather(vote):
+        return [vote, (True, error) if len(vote) == 2 and unqualified_rank == 1 else vote]
+
+    config = _construct_worker_config(
+        monkeypatch, _make_cache_config(), world_size=2, allgather=allgather
+    )
+    if unqualified_rank is None:
+        assert config.recovery_fatal_callback.__self__._retirement_mpi_comm is communicator
+    else:
+        assert config.recovery_fatal_callback is None
 
 
 @pytest.mark.parametrize("ownership_enabled", [False, True])
@@ -1597,3 +1650,92 @@ def test_gen_idle_skip_deferred_publication_keeps_lockstep() -> None:
     assert not any(t._recv_sessions for t in ranks)
     round_()
     assert all(t._gen_idle_agreed for t in ranks)
+
+
+@pytest.mark.parametrize("writer_result", [AgentResult.SUCCESS, AgentResult.FAILED])
+def test_sync_receive_timeout_keeps_destination_until_silent_writer_reports(
+    writer_result: AgentResult, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blocking receive whose wait expires before its only writer reported stays open.
+
+    The writer was asked and may still be writing, so the timed-out receive is
+    cancelled and kept tracked rather than closed; once the writer reports, the
+    reaper retires it exactly once.
+    """
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    rid = 141
+    token = b"report-token"
+    receiver = object.__new__(Receiver)
+    receiver._enforce_physical_ownership = False
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._pre_cancelled_rids = {}
+    receiver._shutdown = False
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
+    )
+    session = RxSession(
+        request_id=rid,
+        params=DisaggregatedParams(disagg_request_id=rid),
+        receiver=receiver,
+        timeout_s=0.01,
+    )
+
+    def publish(task: KVRecvTask) -> None:
+        task.expected_transfers = 1
+        task._kv_result_report_tokens = {3: token}
+        session.mark_transferring(task.slice_id)
+
+    receiver.dispatch_task = publish
+    session.receive(
+        Chunk(
+            block_ids_per_layer_groups=[],
+            kind_per_layer_group=[],
+            token_range=TokenRange(start=0, end=0),
+            is_last=True,
+        )
+    )
+
+    request = SimpleNamespace(
+        request_id=rid,
+        py_request_id=rid,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._pending_rank_info_admissions = None
+    transceiver._page_table = None
+    transceiver._validate_bridge_req = lambda req, synchronous=False: True
+    transceiver._create_cache_extent = lambda req: SimpleNamespace(local=None)
+    transceiver._open_peer_source = lambda req: SimpleNamespace(
+        fetch=lambda extent, expected_write_bytes: None
+    )
+    transceiver._legacy_session = lambda fetches: session
+    monkeypatch.setattr(transceiver_mod, "_chunk_bytes_by_kind", lambda table, chunk: (0, 0))
+    closes: list[bool] = []
+    real_close = session.close
+
+    def counted_close() -> bool:
+        closes.append(real_close())
+        return closes[-1]
+
+    monkeypatch.setattr(session, "close", counted_close)
+
+    transceiver.request_and_receive_sync(request)
+
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert closes == []
+    assert session.status == SessionStatus.CANCELLED
+    assert transceiver._recv_sessions == {rid: session}
+    assert transceiver._recv_reqs == {rid: request}
+    assert transceiver.reap_sync_receives() is False
+    assert closes == []
+
+    session.process_kv_agent_result(3, 0, True, writer_result, token)
+    assert transceiver.reap_sync_receives() is True
+    assert closes == [True]
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+    assert transceiver.reap_sync_receives() is False
+    assert closes == [True]

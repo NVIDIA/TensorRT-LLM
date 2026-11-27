@@ -17,6 +17,7 @@ from tensorrt_llm._torch.modules.engram.engram import (
     Engram,
     EngramConfig,
     EngramHashProvider,
+    EngramPreReplayHook,
     MultiHeadEmbedding,
     ShardedFp8MultiHeadEmbedding,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "Engram",
     "EngramConfig",
     "EngramHashProvider",
+    "EngramPreReplayHook",
     "MultiHeadEmbedding",
     "ShardedFp8MultiHeadEmbedding",
     "engram_gate",
