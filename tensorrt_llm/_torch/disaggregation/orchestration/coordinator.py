@@ -769,7 +769,7 @@ class DisaggTransferCoordinator:
                 self._transceiver.request_and_receive_sync(req)
             self._align_sync_receive_failures_across_cp(admitted)
             for req in admitted:
-                if req.is_disagg_generation_transmission_complete:
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
                     self._record_transfer_outcome(req, "success")
                 elif req.state == LlmRequestState.DISAGG_TRANS_ERROR:
                     self._record_transfer_outcome(req, "error")
