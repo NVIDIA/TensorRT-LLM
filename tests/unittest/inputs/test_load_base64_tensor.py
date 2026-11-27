@@ -285,6 +285,8 @@ def test_line_wrapped_base64_near_limit_accepted() -> None:
 _BASE64_REJECTED = {
     "bytes": (b"QUJD", _LIMIT, TypeError, "base64 string"),
     "encoded-over-limit": ("A" * 5000, 1024, ValueError, "base64 characters"),
+    # Within the line-wrapping allowance, but none of it is whitespace.
+    "data-in-wrapping-allowance": ("A" * 1400, 1024, ValueError, "base64 data is over"),
     "decoded-over-limit": ("AAAA", 2, ValueError, "is 3 bytes, over the 2-byte limit"),
     "alphabet": ("not base64!", _LIMIT, ValueError, "not valid base64"),
     # The retry's error is reported, not the strict pass's refusal of line breaks.
@@ -433,8 +435,8 @@ _PICKLE_REJECTED = {
     "zero-dim-huge-product": (_pickle((10**6,) * 4 + (0,), (1,) * 5, 4), "multiply"),
     "repeats-storage": (_pickle((4, 2), (0, 1), 2), "repeats storage"),
     # Both fit in the 8-element storage, but their rows overlap.
-    "overlapping-rows": (_pickle((4, 2), (1, 1), 8), "repeats storage"),
-    "broadcast-row": (_pickle((2, 2), (0, 1), 8), "repeats storage"),
+    "overlapping-rows": (_pickle((4, 2), (1, 1), 8), "interleaves or repeats"),
+    "broadcast-row": (_pickle((2, 2), (0, 1), 8), "interleaves or repeats"),
     # Four rows of two at stride 3 cover 8 elements but end at element 10.
     "past-storage": (_pickle((4, 2), (3, 1), 8), "past its storage"),
 }

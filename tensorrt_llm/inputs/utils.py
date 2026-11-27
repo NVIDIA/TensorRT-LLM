@@ -301,12 +301,13 @@ def _check_tensor_pickle(pickled: bytes, max_bytes: int) -> _TensorSpec:
         raise ValueError("Tensor payload view reaches past its storage.")
     if logical_bytes:
         # Sorted by stride, each dim must step past every element the smaller
-        # strides reach, so no two indices share a storage element.
+        # strides reach, so no two indices share a storage element. This also
+        # refuses rare as_strided layouts that interleave without repeating.
         reach = 0
         for step, dim in sorted((s, d) for d, s in zip(size, stride) if d > 1):
             if step <= reach:
-                raise ValueError("Tensor payload view repeats storage "
-                                 "elements; save a contiguous tensor.")
+                raise ValueError("Tensor payload view interleaves or repeats "
+                                 "storage elements; save a contiguous tensor.")
             reach += (dim - 1) * step
     return _TensorSpec(pid[2], dtype, pid[4], offset, size, stride)
 
@@ -492,8 +493,9 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
 
     The payload is never unpickled: its archive and pickle are checked and the
     tensor is built from the checked fields, as the saved (possibly
-    non-contiguous) view over the saved storage, whose elements it may not
-    repeat. ``requires_grad`` is not restored. Peak allocation here is about
+    non-contiguous) view over the saved storage. Ordered by stride, each of
+    the view's dims must step past the elements the smaller strides reach, as
+    in slices, transposes and permutes, so no element repeats. ``requires_grad`` is not restored. Peak allocation here is about
     twice the decoded payload (the payload plus the tensor's storage). Only
     little-endian float16, bfloat16 and float32 tensors load, without
     conjugate or negative bits (save ``tensor.resolve_conj().resolve_neg()``),
@@ -526,6 +528,13 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
         raise ValueError(
             f"Tensor payload is {len(data)} base64 characters, over the "
             f"{max_bytes}-byte limit.")
+    # The line-wrapping allowance is for whitespace only, so the decoded
+    # slices never exceed the limit by more than base64's padding.
+    if len(data) > encoded_limit and len(data) - sum(
+            data.count(c) for c in " \t\r\n") > encoded_limit:
+        raise ValueError(
+            f"Tensor payload's base64 data is over the {max_bytes}-byte "
+            f"limit.")
     # Base64 is ASCII; checked first because translate() is slow on other text.
     if not data.isascii():
         raise ValueError("Tensor payload is not valid base64: non-ASCII text.")
