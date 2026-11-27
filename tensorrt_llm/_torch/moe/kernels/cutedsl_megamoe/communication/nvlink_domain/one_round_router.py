@@ -640,7 +640,14 @@ class _OneRoundRouter(AdaptiveRouteMixin, KernelComponent):
                             expert = self._adaptive_pick(
                                 adaptive, counted_rows, expert, token, local_rank, staged_table
                             )
-                            lane_valid = expert >= Int32(0)
+                            # A malformed table entry gives -1 or a slot outside the slots: either drops the
+                            # pick, and its combine cell, which no producer writes, is zeroed for the reduce.
+                            lane_valid = cutlass.Uint32(expert) < cutlass.Uint32(self.expert_count)
+                            if cutlass.const_expr(self.dropped_pick_cells is not None):
+                                if not lane_valid:
+                                    self._zero_dropped_pick_cells(
+                                        device_workspace, token * Int32(self.topk) + lane_idx
+                                    )
                     else:
                         raw_index = topk_indices[token, lane_idx]
                         # Int64 ids; a negative one compares as a large unsigned value.

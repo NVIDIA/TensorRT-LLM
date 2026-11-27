@@ -264,6 +264,10 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
     # long pole; the slot index and mbarrier phase stay compile-time constants
     # because the token loop is fully unrolled.
     pusher_pipeline_depth: ClassVar[int] = 2
+    # Set by a kernel built with the adaptive route and the standalone top-k reduce: the region of its self-validating
+    # combine plane. A pick the route drops for a malformed table entry gets no producer, so the exchange that counts
+    # the picks stores that pick's cell as the encoded zero the reduce reads as a finished zero term.
+    dropped_pick_cells_region: ClassVar[Optional[str]] = None
     # Named barrier ids the refine groups synchronize on. Barrier 0 belongs to the
     # block-wide `sync_threads`, so the groups start at 1.
     refine_barrier_base: ClassVar[int] = 1
@@ -1583,12 +1587,19 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
                     tma_load_1d(score_stage.iterator, topk_scores.iterator, load_mbarrier, Int32(score_plane_bytes))
         route_table = None
         counted_rows = None
+        drop_cells = None
         if cutlass.const_expr(adaptive is not None):
             # Issued behind the plane's bulk copy and ahead of the wait for it, so the two overlap.
             route_table = self._stage_route_table(adaptive, self.exchange_route_table_region, smem_base, thread_idx)
             counted_rows = self._adaptive_counted_rows(adaptive, destination_rank, thread_idx)
             if destination_rank != Int32(0):
                 counted_rows = Int32(0)
+            if cutlass.const_expr(self.dropped_pick_cells_region is not None):
+                # The CTA that counts the picks also completes the cells of the picks a malformed entry drops.
+                drop_cells = (
+                    device_workspace.ptr(self.dropped_pick_cells_region).toint(),
+                    destination_rank == Int32(0),
+                )
         if cutlass.const_expr(staged_bytes > 0):
             cute.arch.mbarrier_wait(load_mbarrier, 0)
         if cutlass.const_expr(self.exchange_stages_topk_indices and not bulk_indices):
@@ -1606,7 +1617,16 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
 
         if cutlass.const_expr(self.exchange_stages_topk_indices):
             index_stage = self._smem_workspace.tensor(self.exchange_topk_stage_region, smem_base)
-            self._canonicalize_wire_indices(index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table)
+            if cutlass.const_expr(drop_cells is None):
+                self._canonicalize_wire_indices(index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table)
+            elif drop_cells[1]:
+                # Only the counting CTA runs the copy of the loop that completes dropped picks' cells; the others run
+                # the loop without it.
+                self._canonicalize_wire_indices(
+                    index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table, (drop_cells[0], True)
+                )
+            else:
+                self._canonicalize_wire_indices(index_stage, thread_idx, local_rank, adaptive, counted_rows, route_table)
             # Every thread rewrote its own share of the staged plane; the single thread
             # that copies the plane out reads all of it.
             cute.arch.sync_threads()
@@ -1640,7 +1660,8 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
                     raw_index = raw_indices[route]
                     if cutlass.const_expr(adaptive is not None):
                         wire_indices[0] = self._routed_slot(
-                            raw_index, route // Int32(self.topk), local_rank, adaptive, route_table, counted_rows
+                            raw_index, route // Int32(self.topk), local_rank, adaptive, route_table, counted_rows,
+                            route, drop_cells,
                         )
                     else:
                         wire_indices[0] = Int32(self.invalid_expert_marker)
@@ -1787,9 +1808,13 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
         adaptive: tuple,
         route_table: cute.Tensor,
         counted_rows: Optional[Int32] = None,
+        route: Optional[Int32] = None,
+        drop_cells: Optional[tuple] = None,
     ) -> Int32:
         """The slot the adaptive route gives one caller-supplied expert id in token row ``token``, or
         ``invalid_expert_marker`` for an id outside the routed experts or a malformed table entry.
+        ``drop_cells`` (the exchange, with ``route``): the combine plane's address and whether this CTA is the one
+        that completes the cell of a pick a malformed entry drops (:meth:`_complete_dropped_pick`).
 
         The exchange and the pushers both call this with the same row and rank, so they agree on the pick's
         destination. ``counted_rows`` (the exchange only) also counts the pick into the statistics row when its
@@ -1807,7 +1832,20 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
                 slot = self._adaptive_slot(adaptive[0], Int32(raw_index), token, local_rank, route_table)
             if cutlass.Uint32(slot) >= cutlass.Uint32(self.expert_count):
                 slot = Int32(self.invalid_expert_marker)
+                if cutlass.const_expr(drop_cells is not None):
+                    if cutlass.const_expr(drop_cells[1] is True):
+                        self._complete_dropped_pick(drop_cells[0], route)
+                    elif drop_cells[1]:
+                        self._complete_dropped_pick(drop_cells[0], route)
         return slot
+
+    @cute.jit
+    def _complete_dropped_pick(self, plane: Int64, route: Int32) -> None:
+        """Store the combine cell of pick ``route`` (token row ``route // topk``, top-k slot ``route % topk``) as
+        the encoded zero: every 16-bit half reads 0xFFFF, which the polled reduce decodes as +0.0 and treats as
+        arrived. Only a dropped pick, which no FC2 epilogue writes, comes here."""
+        row_bytes = self.hidden_size * 2
+        self._fill_dropped_pick_cell(plane + Int64(route) * Int64(row_bytes), row_bytes, Int64(-1))
 
     @cute.jit
     def _canonicalize_wire_indices(
@@ -1818,6 +1856,7 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
         adaptive: Optional[tuple] = None,
         counted_rows: Optional[Int32] = None,
         route_table: Optional[cute.Tensor] = None,
+        drop_cells: Optional[tuple] = None,
     ) -> None:
         """Rewrite the staged plane into the Int32 wire form (slot ids; ``adaptive``: mapped from expert ids)."""
         wire_indices = self._wire_index_view(index_stage)
@@ -1831,7 +1870,8 @@ class GenphaseTokenComm(AdaptiveRouteMixin, KernelComponent):
                 raw_index = index_stage[route]
                 if cutlass.const_expr(adaptive is not None):
                     narrowed[narrow_round] = self._routed_slot(
-                        raw_index, route // Int32(self.topk), local_rank, adaptive, route_table, counted_rows
+                        raw_index, route // Int32(self.topk), local_rank, adaptive, route_table, counted_rows,
+                        route, drop_cells,
                     )
                 elif not self._is_unowned_expert(raw_index):
                     narrowed[narrow_round] = Int32(raw_index)

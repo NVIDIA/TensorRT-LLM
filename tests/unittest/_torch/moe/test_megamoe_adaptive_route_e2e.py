@@ -6,9 +6,10 @@ on SM107 the generation-phase kernel up to 1024) and prefill (1024 / 4096 / 8192
 
 Bit for bit: an adaptive layer whose dispatch router maps and counts its routes returns what the same layer returns
 on the staged route, and what a layer without the balancer returns; its statistics are the routing's picks of the
-live rows, nothing while the recording flag is clear. A graph captured on home tables replays an install as eager
-routes it, and the server's mixed forward captures after its warmup and replays as eager. Under ``balance`` off the
-512-slot layers return what the layers without a balancer return and launch the same kernels.
+live rows, nothing while the recording flag is clear; the picks a malformed table drops add nothing and are not
+waited for. A graph captured on home tables replays an install as eager routes it, and the server's mixed forward
+captures after its warmup and replays as eager. Under ``balance`` off the 512-slot layers return what the layers
+without a balancer return and launch the same kernels.
 """
 
 import pickle
@@ -277,6 +278,33 @@ def _run() -> None:
         replica_tables = torch.stack(
             [_replica_row(home_tables[i].tolist()) for i in range(_LAYERS)]
         ).to(device)
+        # A table with malformed entries (every 7th expert: no copy, or its slot outside the slots): the router
+        # drops those picks, which add nothing and are not waited for, as the staged route's out-of-range slots
+        # do. A well-formed forward first leaves the dropped picks' combine cells holding real rows.
+        malformed = home_tables.clone()
+        bad = torch.arange(0, _NUM_EXPERTS, 7, device=device)
+        malformed[:, bad[::2]] = 0
+        for row in malformed:
+            row[2 * _NUM_EXPERTS + row[_NUM_EXPERTS + bad[1::2]].long()] = _NUM_SLOTS
+        for rows in (64, 1024):
+            counts = [rows] * world_size
+            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            got = {}
+            for router in (False, True):
+                use_router(router)
+                tables.copy_(home_tables)
+                got["full", router] = forward(adaptive, x, counts)
+                tables.copy_(malformed)
+                got["dropped", router] = forward(adaptive, x, counts)
+            torch.cuda.synchronize()
+            problem = None
+            if _same(backends[0], rows, got["dropped", False], got["full", False]):
+                problem = f"{rows} rows: the malformed table dropped no pick"
+            elif not _same(backends[0], rows, got["dropped", True], got["dropped", False]):
+                problem = f"{rows} rows: the router's dropped picks add to the output"
+            _assert_on_all_ranks(problem)
+        tables.copy_(home_tables)
+        use_router(True)
         # Kernels per layer call (torch profiler): the router's route launches no route op or staging.
         names = {}
         for arm, router in (("adaptive_staged", False), ("adaptive_router", True)):

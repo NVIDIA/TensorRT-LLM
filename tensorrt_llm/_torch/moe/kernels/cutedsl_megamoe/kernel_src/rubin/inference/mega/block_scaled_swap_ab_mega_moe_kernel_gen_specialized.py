@@ -480,6 +480,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 outlive_producer=self.shared_expert,
             )
         )
+        if self.adaptive_route_experts and not self.reduce_topk_in_kernel:
+            # The polled reduce waits for every pick whose id is routed; one a malformed table entry drops has no
+            # producer, so the comm completes its cell (GenphaseTokenComm.dropped_pick_cells_region).
+            self.token_comm.dropped_pick_cells_region = self.pre_reduced_activation_region
 
     # ------------------------------------------------------------------
     # Construction-time validation

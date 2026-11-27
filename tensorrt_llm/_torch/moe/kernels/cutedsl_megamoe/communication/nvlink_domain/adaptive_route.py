@@ -84,6 +84,20 @@ def _red_add_u64(address: Int64, value: Int64, *, loc=None, ip=None) -> None:
     )
 
 
+@dsl_user_op
+def _st_relaxed_sys_v2_b64(address: Int64, low: Int64, high: Int64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), low.ir_value(), high.ir_value()],
+        "st.relaxed.sys.global.v2.b64 [$0], {$1, $2};",
+        "l,l,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class AdaptiveRouteMixin:
     """Device code of the adaptive route, mixed into the MegaMoE dispatch routers.
 
@@ -97,6 +111,34 @@ class AdaptiveRouteMixin:
     adaptive_expert_multiplier: ClassVar[int] = 0x632BE5AB
     adaptive_rank_multiplier: ClassVar[int] = 0x85EBCA6B
     adaptive_token_multiplier: ClassVar[int] = 0x9E3779B9
+
+    # Set by a TokenComm built with the adaptive route and a standalone top-k reduce on its router: (combine plane
+    # region, its bytes per (token, top-k) cell, scale plane region or None, its bytes per cell). The reduce reads the
+    # cell of every pick whose id is routed; one a malformed table entry drops has no producer, so the router zeroes it.
+    dropped_pick_cells: ClassVar[Optional[tuple]] = None
+
+    @cute.jit
+    def _zero_dropped_pick_cells(self, device_workspace, pick: Int32) -> None:
+        """Zero the combine cell (and scale cell) of pick ``pick`` (token row * topk + top-k slot), which a malformed
+        table entry dropped: the reduce then adds an exact zero for it instead of a cell no producer wrote. A router
+        runs before its call's producers and after the previous call's reduce."""
+        region, nbytes, sf_region, sf_nbytes = self.dropped_pick_cells
+        self._fill_dropped_pick_cell(
+            device_workspace.ptr(region).toint() + Int64(pick) * Int64(nbytes), nbytes, Int64(0)
+        )
+        if cutlass.const_expr(sf_region is not None):
+            self._fill_dropped_pick_cell(
+                device_workspace.ptr(sf_region).toint() + Int64(pick) * Int64(sf_nbytes), sf_nbytes, Int64(0)
+            )
+
+    @cute.jit
+    def _fill_dropped_pick_cell(self, cell: Int64, nbytes: int, word: Int64) -> None:
+        """Store ``word`` over the ``nbytes`` (a multiple of 16) of the combine cell at ``cell``: the cell of a pick
+        the route drops for a malformed table entry, which no producer writes. A router calls this only in the
+        branch of such a pick, so a well-formed table never runs it."""
+        # A rolled loop: the branch stays a few instructions wherever a router places it.
+        for chunk in cutlass.range(nbytes // 16, unroll=1):
+            _st_relaxed_sys_v2_b64(cell + Int64(chunk) * Int64(16), word, word)
 
     @cute.jit
     def _adaptive_counted_rows(self, adaptive: tuple, cta_idx: Int32, thread_idx: Int32) -> Int32:
@@ -247,8 +289,8 @@ def validate_adaptive_route_table(row, experts: int, slots: int) -> None:
     only (so no two runs overlap), and an expert's cumulative shares (uint32) do not decrease.
 
     The router only keeps its reads in bounds. A row outside this contract can route two picks of one token to one
-    slot, which the destination pool is not sized for, and a pick it drops for a malformed entry is still summed by
-    the top-k reduce, which sees only the expert id."""
+    slot, which the destination pool is not sized for, and a pick it drops for a malformed entry adds nothing to its
+    token's output."""
     row = [int(value) for value in row]
     if len(row) != 2 * experts + 2 * slots:
         raise ValueError(f"A route table row has 2 * {experts} + 2 * {slots} entries, got {len(row)}.")
