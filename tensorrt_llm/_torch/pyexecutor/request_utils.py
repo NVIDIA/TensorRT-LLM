@@ -399,11 +399,18 @@ def merge_requests(
 
 # A tag of its own: other point-to-point traffic (PP, autotuner) shares the world communicator.
 _OWNER_PROMPT_TAG = 21000
+# Bound combined int32 payloads and receive buffers to 4 MiB, not total in-flight memory.
+# A single longer prompt is sent alone.
 _PROMPT_BATCH_TOKEN_CAPACITY = 1 << 20
 _PROMPT_PLACEHOLDER = np.zeros(1, dtype=np.int32).tobytes()
 
 
 def _prompt_batch_slices(lengths: list[int]) -> Iterator[tuple[int, int, int]]:
+    """Yield (start, stop, total_tokens) for consecutive prompts sent as one message.
+
+    The sender and receiver must use the same lengths in the same order so
+    message boundaries and receive-buffer sizes agree.
+    """
     start = 0
     total_tokens = 0
     for index, num_tokens in enumerate(lengths):
@@ -680,15 +687,15 @@ class RequestBroadcaster:
         if not self.prompts_to_owners:
             return
         if self.dist.rank == 0:
-            prompts, sends = [], []
+            payloads, sends = [], []
             for rank, items in all_ranks_new_requests.items():
                 if rank == 0 or not items:
                     continue
                 lengths = [item.request.num_input_tokens for item in items]
                 for start, stop, _ in _prompt_batch_slices(lengths):
                     batch = [item.request.get_input_token_ids_array() for item in items[start:stop]]
-                    prompts.append(batch[0] if len(batch) == 1 else np.concatenate(batch))
-                    sends.append(self.dist.isend(prompts[-1], rank, _OWNER_PROMPT_TAG))
+                    payloads.append(batch[0] if len(batch) == 1 else np.concatenate(batch))
+                    sends.append(self.dist.isend(payloads[-1], rank, _OWNER_PROMPT_TAG))
             for send in sends:
                 send.Wait()
             return
@@ -697,9 +704,9 @@ class RequestBroadcaster:
             return
         lengths = [cast(int, item.num_input_tokens) for item in items]
         for start, stop, total_tokens in _prompt_batch_slices(lengths):
-            prompt = np.empty(total_tokens, dtype=np.int32)
-            self.dist.recv(prompt, 0, _OWNER_PROMPT_TAG)
+            payload = np.empty(total_tokens, dtype=np.int32)
+            self.dist.recv(payload, 0, _OWNER_PROMPT_TAG)
             offset = 0
             for item, num_tokens in zip(items[start:stop], lengths[start:stop]):
-                item.prompt_token_ids = prompt[offset : offset + num_tokens]
+                item.prompt_token_ids = payload[offset : offset + num_tokens]
                 offset += num_tokens
