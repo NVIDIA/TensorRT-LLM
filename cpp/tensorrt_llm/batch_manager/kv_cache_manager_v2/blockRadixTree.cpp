@@ -948,8 +948,29 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(ReuseSco
     return results;
 }
 
+namespace
+{
+// Drop `backoff` tokens off the tail of a match, dropping whole blocks while the backoff
+// outruns them. Only the tail shrinks, so pruneMatch's "leading entries are full blocks"
+// invariant still holds.
+void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff)
+{
+    while (backoff > 0 && !matched.empty())
+    {
+        auto& last = matched.back();
+        if (last.numMatchedTokens > backoff)
+        {
+            last.numMatchedTokens -= backoff;
+            return;
+        }
+        backoff -= last.numMatchedTokens;
+        matched.pop_back();
+    }
+}
+} // namespace
+
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
-    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const
+    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId, int alignment) const
 {
     // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
     TLLM_CHECK_DEBUG(matched.size() <= 1
@@ -963,6 +984,17 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     // shortens the match, so the loop terminates.
     while (!matched.empty())
     {
+        // Align before validating pages, since shortening the match can activate
+        // stale SWA pages. Snapshot and coverage trims loop back through here.
+        if (alignment > 1)
+        {
+            int const remainder = numMatchedTokens(matched, mTokensPerBlock) % alignment;
+            backOffMatch(matched, remainder);
+            if (matched.empty())
+            {
+                break;
+            }
+        }
         // Check SSM snapshot availability first: truncating to the last reusable SSM
         // snapshot changes the matched length that all the attention checks use.
         if (ssmLcId.has_value())
@@ -988,6 +1020,10 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
                 break;
             }
             matched.back().numMatchedTokens = ssmMatchLen;
+            if (alignment > 1 && numMatchedTokens(matched, mTokensPerBlock) % alignment != 0)
+            {
+                continue;
+            }
         }
 
         // Only pages that are active at this candidate endpoint constrain attention
@@ -1047,30 +1083,11 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     return matched;
 }
 
-namespace
-{
-// Drop `backoff` tokens off the tail of a match, dropping whole blocks while the backoff
-// outruns them. Only the tail shrinks, so pruneMatch's "leading entries are full blocks"
-// invariant still holds.
-void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff)
-{
-    while (backoff > 0 && !matched.empty())
-    {
-        auto& last = matched.back();
-        if (last.numMatchedTokens > backoff)
-        {
-            last.numMatchedTokens -= backoff;
-            return;
-        }
-        backoff -= last.numMatchedTokens;
-        matched.pop_back();
-    }
-}
-} // namespace
-
 BlockRadixTree::ReuseMatch BlockRadixTree::match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest,
-    bool enablePartialMatch, int backoff, bool collectOptionalMatches) const
+    bool enablePartialMatch, int backoff, bool collectOptionalMatches, int alignment) const
 {
+    TLLM_CHECK_WITH_INFO(alignment > 0 && mTokensPerBlock % alignment == 0,
+        "match: alignment %d must be positive and divide tokens_per_block %d", alignment, mTokensPerBlock);
     ReuseMatch result{};
     TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>> optionalEndpointRanges;
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch,
@@ -1090,14 +1107,22 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(ReuseScope const& reuseScope, T
     std::optional<int> numReusableTokensBeforeHybridPruning;
     if (ssmLcId.has_value())
     {
-        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+        numReusableTokensBeforeHybridPruning
+            = numMatchedTokens(pruneMatch(rawMatched, std::nullopt, alignment), mTokensPerBlock);
     }
-    auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    // Diagnostic only: the same pruning without alignment, to report the reuse it gives up.
+    std::optional<int> numReusableTokensBeforeAlignment;
+    if (alignment > 1)
+    {
+        numReusableTokensBeforeAlignment = numMatchedTokens(pruneMatch(rawMatched, ssmLcId, 1), mTokensPerBlock);
+    }
+    auto matched = pruneMatch(std::move(rawMatched), ssmLcId, alignment);
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
+    result.numReusableTokensBeforeAlignment = numReusableTokensBeforeAlignment.value_or(result.numTokens);
     result.numLookupTokens = static_cast<int>(tokens.size());
     result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
     result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
-    // REQUIRED coverage/backoff can shorten the path inside a page. Clip the
+    // REQUIRED coverage, backoff or alignment can shorten the path inside a page. Clip the
     // already validated ranges without another page-coverage search.
     result.optionalEndpointRanges.resize(optionalEndpointRanges.size());
     for (LifeCycleId lc{0}; lc < optionalEndpointRanges.size(); ++lc)

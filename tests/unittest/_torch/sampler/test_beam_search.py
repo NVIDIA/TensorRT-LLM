@@ -2001,7 +2001,7 @@ def test_vbws_cpp_formula_matches_past_array_end():
     ],
 )
 def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
-                                                  accepted: bool):
+                                                  accepted: bool) -> None:
     """Only non-decreasing beam_width_array values are supported.
 
     The documented VBWS semantics only cover widening (see getBeamWidthByIter
@@ -2023,7 +2023,6 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     executor = types.SimpleNamespace(
         _is_kv_manager_v2=True,
         max_beam_width=request.py_beam_width,
-        kv_cache_manager=None,
         kv_cache_transceiver=None,
         _configure_csa2_remote_tail=lambda _request: None,
         _validate_token_id_range=lambda _request: None,

@@ -394,6 +394,9 @@ public:
         // request's content diverges from the tree, independent of page
         // residency. Equal to numLookupTokens when there is no fork.
         int numReusableTokensBeforePruning;
+        // The prefix the same pruning supports without `alignment`. Minus numTokens,
+        // it is the local reuse alignment gives up; equal to numTokens when alignment is 1.
+        int numReusableTokensBeforeAlignment;
         // Coalesced half-open ranges of valid OPTIONAL endpoints.
         TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>> optionalEndpointRanges;
     };
@@ -402,8 +405,10 @@ public:
     // Takes a non-owning TokenSpan so a zero-copy int32 token buffer can be matched without
     // allocating/copying (the hot path). Callers holding a std::vector pass toSpan(vec).
     // backoff: tokens trimmed off the tail of the match (see KVCacheManagerConfig::reuseMatchBackoff).
+    // collectOptionalMatches: also report the valid OPTIONAL endpoints (ReuseMatch::optionalEndpointRanges).
+    // alignment: see KVCacheManagerConfig::reuseMatchAlignment.
     ReuseMatch match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest = false,
-        bool enablePartialMatch = false, int backoff = 0, bool collectOptionalMatches = false) const;
+        bool enablePartialMatch = false, int backoff = 0, bool collectOptionalMatches = false, int alignment = 1) const;
 
     // Detach all cached blocks. ~Block() releases pages when the last owner drops a block.
     void clear();
@@ -445,7 +450,8 @@ private:
     // Shorten `matched` to the prefix that is actually reusable. Passing
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
     // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
-    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const;
+    std::vector<MatchResult> pruneMatch(
+        std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId, int alignment) const;
 
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.

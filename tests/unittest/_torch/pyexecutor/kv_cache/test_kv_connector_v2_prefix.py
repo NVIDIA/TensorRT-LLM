@@ -103,6 +103,7 @@ class FakeRequest:
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
+        self.py_connector_load_failed = False
         self.py_served_prefix_end = 0
         self.py_ctx_pre_resize_cap = None
         self.py_draft_tokens = []
@@ -157,6 +158,8 @@ class FakeConnectorManager:
     def __init__(self, num_matched=0, load_async=False, add_sequence=True):
         # Read by the manager to decide whether the prefix path runs at all.
         self.capacity_only = False
+        # Read by the prefix path to align matches.
+        self.requires_block_aligned_reuse = False
         self.prefix_reservations_enabled = False
         self.reservations = {}
         self.reservation_requests = {}
@@ -271,8 +274,10 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager.kv_cache_map = {}
     manager.enable_block_reuse = True
     manager.conversation_manager = None
+    manager.reuse_match_backoff = 0
     manager._spec_recompute_tail = 0
     manager._has_cp_helix = False
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
@@ -533,6 +538,92 @@ class TestConnectorReuseStats:
         assert not serve(manager, FakeRequest(), kv_cache)
 
         assert kv_cache.connector_reuse_calls == []
+
+
+class TestRetainContextAllocation:
+    """A skipped step keeps the allocation a connector already holds pages of."""
+
+
+class TestRetainedGenerationAllocation:
+    """A retried step reuses the allocation a skipped step kept, sized for its draft width."""
+
+    @staticmethod
+    def make(retained, draft_slots, resize_ok=True):
+        manager = make_manager(FakeConnectorManager(num_matched=0))
+        kv_cache = Mock(is_active=True, capacity=100)
+        kv_cache.resize.return_value = resize_ok
+        manager.kv_cache_map = {5: kv_cache}
+        manager._retained_generation_allocations = {5: retained}
+        manager._allocated_draft_lens = {}
+        manager._inflight_draft_lens = {}
+        manager._ensure_generation_beam_width = Mock(return_value=True)
+        manager._generation_draft_slots = Mock(return_value=draft_slots)
+        manager._fill_fresh_kv_pages = Mock()
+        return manager, kv_cache
+
+    def test_a_failed_growth_keeps_the_retained_allocation_for_the_next_try(self):
+        manager, _ = self.make(retained=1, draft_slots=3, resize_ok=False)
+
+        assert not manager.try_allocate_generation(SimpleNamespace(py_request_id=5))
+
+        assert manager._retained_generation_allocations == {5: 1}
+        assert manager._allocated_draft_lens == {}
+        assert manager._inflight_draft_lens == {}
+        manager._fill_fresh_kv_pages.assert_not_called()
+
+
+class TestSkippedGenerationStepUndo:
+    """Keeping and reverting a skipped step unwind a subclass's per-step state alike."""
+
+    @pytest.mark.parametrize("keep", [True, False])
+    def test_both_paths_run_the_undo_hook(self, keep):
+        manager, _ = TestRetainedGenerationAllocation.make(retained=1, draft_slots=1)
+        manager._retained_generation_allocations = {}
+        manager._allocated_draft_lens = {5: 1}
+        manager._inflight_draft_lens = {5: [1]}
+        manager._undo_generation_step = Mock()
+        req = SimpleNamespace(py_request_id=5, is_dummy_request=False)
+
+        if keep:
+            manager.keep_generation_allocation(req)
+        else:
+            manager.revert_allocate_generation(req)
+
+        manager._undo_generation_step.assert_called_once_with(req)
+
+    def test_kda_replay_drops_the_pending_acceptance(self):
+        from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+
+        manager = object.__new__(KimiK3HybridCacheManager)
+        manager._kda_replay = SimpleNamespace(acceptance_pending={5, 6})
+
+        manager._undo_generation_step(SimpleNamespace(py_request_id=5))
+
+        assert manager._kda_replay.acceptance_pending == {6}
+
+
+class TestSparseOffloadRetainedStep:
+    """A kept decode step is reused by the sparse-offload manager, not stranded."""
+
+    @staticmethod
+    def make(retained: dict[int, int]):
+        from tensorrt_llm._torch.attention.backends.sparse.offload import SparseOffloadCacheMixin
+
+        class _OffloadManager(SparseOffloadCacheMixin, KVCacheManagerV2):
+            pass
+
+        manager = object.__new__(_OffloadManager)
+        manager._enable_kv_cache_offload = True
+        manager._sparse_batch = None
+        # The step the connector kept: one input token reserved beyond history.
+        cache = Mock(is_active=True, capacity=11, history_length=10)
+        manager.kv_cache_map = {7: cache}
+        manager._retained_generation_allocations = dict(retained)
+        manager._allocated_draft_lens = {}
+        manager._inflight_draft_lens = {}
+        manager._ensure_generation_beam_width = lambda req, kv_cache: True
+        manager._generation_draft_slots = lambda req: 0
+        return manager, cache
 
 
 class TestUnchunkedIsPureShrink:

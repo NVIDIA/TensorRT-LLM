@@ -2908,6 +2908,15 @@ class KVCacheManagerV2(BaseResourceManager):
             self._supports_partial_reuse,
             type(self).__name__,
         )
+        if (
+            self.kv_connector_manager is not None
+            and self.kv_connector_manager.requires_block_aligned_reuse
+            and self.enable_partial_reuse
+        ):
+            logger.warning(
+                "KV connector requires block-aligned reuse; disabling enable_partial_reuse"
+            )
+            self.enable_partial_reuse = False
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
             _get_generation_kv_capacity(
@@ -3602,6 +3611,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # unbounded capacity growth.
 
         self._allocated_draft_lens: dict[int, int] = {}
+        self._retained_generation_allocations: dict[int, int] = {}
+        # Local reuse forfeited to connector block alignment since the last stats
+        # report: tokens the connector served, and tokens recomputed.
+        self._alignment_forfeited_served_tokens = 0
+        self._alignment_forfeited_recomputed_tokens = 0
 
         # Draft widths of generation allocations that update_resources has not
         # reconciled yet, oldest first. Under the overlap scheduler step N+1 is
@@ -5159,6 +5173,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
         rebalance_cfg = kv_cache_config.kv_pool_rebalance_config
+        reuse_match_alignment = self._connector_reuse_match_alignment()
         return KVCacheManagerConfigPy(
             # Used by the backend only for token<->block arithmetic and
             # radix hashing; BufferConfig.size above stays the physical page.
@@ -5185,7 +5200,9 @@ class KVCacheManagerV2(BaseResourceManager):
             # Keep the lookahead evidence and its backoff in the same tree match.
             # A paired scheduler caps the claim by retaining D evidence past the
             # common usable depth, so this still trims exactly once.
+            # Alignment follows the backoff in the same match, so it also trims once.
             reuse_match_backoff=self.reuse_match_backoff,
+            reuse_match_alignment=reuse_match_alignment,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
             commit_min_snapshot=(
@@ -5619,6 +5636,26 @@ class KVCacheManagerV2(BaseResourceManager):
             f"history pools pin {pinned / (1 << 30):.2f}GiB of their "
             f"{self._host_history_budget / (1 << 30):.2f}GiB budget."
         )
+
+    def _connector_reuse_match_alignment(self) -> int:
+        """Alignment a whole-block KV connector needs of every local prefix match.
+
+        Such a connector serves only from a block boundary, and its offer starts where
+        the local match ends. Disabling partial matching is not enough: a lookahead
+        backoff, or trimming to the pages a layer holds (for example a sliding window),
+        can end a whole-block match mid-block and leave the connector nothing to offer.
+        Aligning gives up that partial block so the connector can serve it and the rest.
+
+        Returns:
+            The ledger `tokens_per_block` when the connector requires block-aligned reuse;
+            otherwise 1.
+        """
+        if (
+            self.kv_connector_manager is None
+            or not self.kv_connector_manager.requires_block_aligned_reuse
+        ):
+            return 1
+        return self._ledger_tokens_per_block
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -6882,6 +6919,20 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         request_id = req.py_request_id
+        retained = self._retained_generation_allocations.pop(request_id, None)
+        if retained is not None:
+            # The connector already holds these pages: reuse the skipped step's
+            # allocation, growing it only if this retry drafts more tokens.
+            draft_slots = max(retained, self._generation_draft_slots(req))
+            extra_slots = draft_slots - retained
+            if extra_slots > 0:
+                if not kv_cache.resize(kv_cache.capacity + extra_slots):
+                    self._retained_generation_allocations[request_id] = retained
+                    return False
+                self._fill_fresh_kv_pages(request_id)
+            self._allocated_draft_lens[request_id] = draft_slots
+            self._inflight_draft_lens.setdefault(request_id, []).append(draft_slots)
+            return True
         draft_slots = self._generation_draft_slots(req)
         self._allocated_draft_lens.pop(request_id, None)
         is_helix_req = self._has_cp_helix and not req.is_dummy_request
@@ -6901,6 +6952,33 @@ class KVCacheManagerV2(BaseResourceManager):
         self._inflight_draft_lens.setdefault(request_id, []).append(draft_slots)
         return True
 
+    def _undo_generation_step(self, req: LlmRequest) -> None:
+        """Unwind per-step state a subclass keeps for `req`'s skipped generation step.
+
+        Called first by both `revert_allocate_generation` and
+        `keep_generation_allocation`. The base manager keeps none.
+        """
+
+    def keep_generation_allocation(self, req: LlmRequest) -> None:
+        """Keep a published allocation for the next attempt of a skipped step.
+
+        The connector counterpart of `revert_allocate_generation`: pages and
+        connector save ownership stay intact. The skipped step leaves the
+        in-flight queue until it is retried, so an older overlapping forward
+        consumes only its own allocation.
+        """
+        self._undo_generation_step(req)
+        request_id = req.py_request_id
+        draft_slots = self._allocated_draft_lens.pop(request_id, None)
+        if draft_slots is None:
+            return
+        self._retained_generation_allocations[request_id] = draft_slots
+        inflight = self._inflight_draft_lens[request_id]
+        retained_slots = inflight.pop()
+        assert retained_slots == draft_slots
+        if not inflight:
+            del self._inflight_draft_lens[request_id]
+
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
 
@@ -6914,6 +6992,7 @@ class KVCacheManagerV2(BaseResourceManager):
         Keyed on ``_allocated_draft_lens``: no entry means no growth to give back.
         Recording the width keeps the paired target/draft reverts in step.
         """
+        self._undo_generation_step(req)
         request_id = req.py_request_id
         draft_slots = self._allocated_draft_lens.pop(request_id, None)
         if draft_slots is None:
@@ -6941,14 +7020,32 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._after_shrink(request_id, kv_cache)
 
+    def drop_context_allocation(self, req: LlmRequest) -> None:
+        """Release a context request's allocation and rewind it to run from the start.
+
+        Used for a request skipped past a connector prefix whose pages could not
+        be filled (`KvCacheConnectorWorker.reports_failed_loads`), and wherever
+        the manager drops a context cache (for example `revert_allocate_context`).
+
+        `free_resources` releases unstarted prefix loads, raises RuntimeError on
+        a load still pending instead of risking a use-after-free, resets the
+        request's connector state, and closes the cache uncommitted. Blocks reach
+        the radix tree only in `try_commit_blocks`, so the unfilled range is never
+        offered for reuse and the next admission queries the connector afresh.
+
+        Args:
+            req: The context request to restart.
+        """
+        self.free_resources(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
+
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
-        not shrunk; the caller drops any draft pool.
+        not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
         """
         if self._connector_reservations_enabled():
             if self.kv_connector_manager.get_prefix_reservation(req) is not None:
-                self.free_resources(req)
-                rewind_context_after_cache_drop(req, self.tokens_per_block)
+                self.drop_context_allocation(req)
                 return False
         pre_cap = getattr(req, "py_ctx_pre_resize_cap", None)
         if pre_cap is None:
@@ -6960,8 +7057,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if pre_cap >= kv_cache.capacity:
             return True
         if kv_cache.history_length > pre_cap:
-            self.free_resources(req)
-            rewind_context_after_cache_drop(req, self.tokens_per_block)
+            self.drop_context_allocation(req)
             return False
         history_length = min(kv_cache.history_length, pre_cap)
         if not kv_cache.resize(pre_cap, history_length):
@@ -7001,6 +7097,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{req.py_request_id} from {kv_cache.capacity} to {capacity}"
             )
         self._after_shrink(req.py_request_id, kv_cache)
+
+    def keep_context_allocation(self, req: LlmRequest) -> None:
+        """Keep a reported context allocation for the next attempt of a skipped step.
+
+        The connector already holds its page IDs, and shrinking could free pages a
+        retry then replaces unnoticed. `resize_context` never shrinks, so the retry
+        reuses or extends this allocation.
+        """
+        if self.is_draft:
+            req.py_draft_ctx_pre_resize_cap = None
+        else:
+            req.py_ctx_pre_resize_cap = None
 
     def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
         assert kv_cache.beam_width <= self.max_beam_width
@@ -7560,8 +7668,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"num_tokens={num_tokens})"
             )
             if reservation is not None:
-                self.free_resources(req)
-                rewind_context_after_cache_drop(req, self.tokens_per_block)
+                self.drop_context_allocation(req)
             elif req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
@@ -8065,11 +8172,16 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             return
         local_end = self.kv_cache_map[req.py_request_id].num_committed_tokens
-        reservation = self.kv_connector_manager.reserve_prefix(req, local_end)
+        reservation = self.kv_connector_manager.get_prefix_reservation(req)
         if reservation is None:
-            return
-        # Loads end at full blocks and leave the final prompt token for logits.
-        end = min(reservation.end, req.prompt_len - 1)
+            reservation = self.kv_connector_manager.reserve_prefix(req, local_end)
+            if reservation is None:
+                return
+            end = self._connector_safe_prefix_end(req, reservation.end)
+        else:
+            # A pending reservation's lookahead tail is already trimmed.
+            end = reservation.end
+        # Reservation transfers end at full blocks.
         end = end // self.tokens_per_block * self.tokens_per_block
         # A connector-served prefix starves a hidden-state drafter exactly like
         # local reuse does. Cap the reservation at the same claim limit, so
@@ -8093,8 +8205,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.request_id in accepted_request_ids:
                 continue
             # Drop unfilled history even when capacity did not grow.
-            self.free_resources(req)
-            rewind_context_after_cache_drop(req, self.tokens_per_block)
+            self.drop_context_allocation(req)
 
     def _accept_connector_prefix_reservations(self, scheduled_batch: ScheduledRequests) -> None:
         requests = scheduled_batch.context_requests
@@ -8125,7 +8236,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     req, reservation.start, reservation.end, by_group
                 )
                 self._record_connector_reuse(kv_cache, reservation.start, reservation.end)
+                self._record_alignment_forfeit(kv_cache, reservation.start, reservation.end)
                 req.py_served_prefix_end = reservation.end
+            else:
+                kv_cache = self.kv_cache_map[req.py_request_id]
+                local_end = kv_cache.num_committed_tokens
+                self._record_alignment_forfeit(kv_cache, local_end, local_end)
             self.kv_connector_manager.update_state_after_alloc(req, flat, by_group)
             req.py_connector_allocation_reported = True
 
@@ -8145,6 +8261,18 @@ class KVCacheManagerV2(BaseResourceManager):
             # server gets its prompt KV from the context worker.
             return False
         return not req.is_disagg_generation_init_state
+
+    def _connector_safe_prefix_end(self, req: LlmRequest, matched_end: int) -> int:
+        """Trim a connector match ending at `matched_end` to the prefix it may serve.
+
+        Backs off `reuse_match_backoff` tokens for the forward pass to recompute,
+        keeps the final prompt token for logits, and rounds down to a full block
+        when a backoff applies.
+        """
+        end = min(matched_end - self.reuse_match_backoff, req.prompt_len - 1)
+        if self.reuse_match_backoff:
+            end = end // self.tokens_per_block * self.tokens_per_block
+        return max(0, end)
 
     def _apply_connector_matched_prefix(self, req: LlmRequest) -> bool:
         """Ask the connector for a prefix and skip the runtime past what it takes.
@@ -8167,7 +8295,20 @@ class KVCacheManagerV2(BaseResourceManager):
         num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
             req, local_end
         )
-        offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        if req.py_connector_load_failed:
+            # After a failed load the request computes locally, even if the
+            # connector keeps offering tokens.
+            num_tokens = 0
+            if load_async:
+                logger.warning_once(
+                    "KV connector started another asynchronous load after a failed load; "
+                    "decline requests with py_connector_load_failed set to avoid delaying "
+                    "local recomputation",
+                    key="kv_connector_async_reload_after_failure",
+                )
+            # A transfer an asynchronous lookup started keeps its ownership
+            # until it completes, though no prefix is used.
+        offered_end = self._connector_safe_prefix_end(req, local_end + num_tokens)
         # A connector-served prefix starves a hidden-state drafter like local
         # reuse does: leave the spec recompute tail to the forward pass.
         # Defensive today: startup rejects a KV connector with speculative
@@ -8197,7 +8338,44 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self.kv_connector_manager.commit_new_matched_tokens(req, position - local_end, load_async)
         self._record_connector_reuse(kv_cache, local_end, position)
+        self._record_alignment_forfeit(kv_cache, local_end, position)
         return position > local_end
+
+    def _record_alignment_forfeit(self, kv_cache, local_end: int, served_end: int) -> None:
+        """Count the local reuse block alignment gave up, once a request's offer settles.
+
+        The forfeited tokens lie between the aligned match end and the unaligned
+        one (`kv_cache._get_num_reusable_tokens_before_alignment()`). Those in
+        `[local_end, served_end)` count as served; the rest as recomputed.
+
+        Args:
+            kv_cache: The request's cache.
+            local_end: Where the local match ends and the connector's offer starts.
+            served_end: Where the connector-served prefix ends; `local_end` if none.
+        """
+        alignment = self._connector_reuse_match_alignment()
+        if alignment <= 1:
+            return
+        unaligned_end = kv_cache._get_num_reusable_tokens_before_alignment()
+        aligned_end = unaligned_end // alignment * alignment
+        forfeited = unaligned_end - aligned_end
+        if forfeited <= 0:
+            return
+        served = max(0, min(served_end, unaligned_end) - max(local_end, aligned_end))
+        self._alignment_forfeited_served_tokens += served
+        self._alignment_forfeited_recomputed_tokens += forfeited - served
+
+    def _take_alignment_forfeit(self) -> tuple[int, int] | None:
+        """Return and reset the (served, recomputed) forfeit counts; None without alignment."""
+        if self._connector_reuse_match_alignment() <= 1:
+            return None
+        counts = (
+            self._alignment_forfeited_served_tokens,
+            self._alignment_forfeited_recomputed_tokens,
+        )
+        self._alignment_forfeited_served_tokens = 0
+        self._alignment_forfeited_recomputed_tokens = 0
+        return counts
 
     def _record_connector_reuse(self, kv_cache, start: int, end: int) -> None:
         """Book the prompt tokens a connector fills in ``[start, end)`` as cached.
@@ -9496,6 +9674,7 @@ class KVCacheManagerV2(BaseResourceManager):
             connector_cached_tokens=(
                 connector_cached_tokens if self._connector_reports_cached_tokens() else None
             ),
+            alignment_forfeited_tokens=self._take_alignment_forfeit(),
         )
 
     def _connector_reports_cached_tokens(self) -> bool:
@@ -10050,6 +10229,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._waiter_snapshot_points is not None:
             self._waiter_snapshot_points.pop(request.py_request_id, None)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._retained_generation_allocations.pop(request.py_request_id, None)
+
         self._inflight_draft_lens.pop(request.py_request_id, None)
         if self._keep_growth_block:
             self._kept_growth_slack.pop(request.py_request_id, None)
@@ -10477,6 +10658,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        self._retained_generation_allocations.clear()
         self._disagg_receive_ready.clear()
         self._on_allocation_stream.clear()
         self._allocation_ready.clear()

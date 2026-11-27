@@ -520,6 +520,12 @@ public:
         return mNumReusableTokensBeforePruning;
     }
 
+    // Internal diagnostic (see BlockRadixTree::ReuseMatch::numReusableTokensBeforeAlignment).
+    int numReusableTokensBeforeAlignment() const noexcept
+    {
+        return mNumReusableTokensBeforeAlignment;
+    }
+
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
@@ -926,6 +932,7 @@ private:
     bool mTextOnly = false;
     int mNumReusableTokensBeforeHybridPruning;
     int mNumReusableTokensBeforePruning;
+    int mNumReusableTokensBeforeAlignment;
     bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;

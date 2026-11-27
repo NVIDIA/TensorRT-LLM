@@ -4,6 +4,9 @@ The KV Cache Connector is a flexible interface in TensorRT-LLM that enables remo
 
 This document explains the KV Cache Connector architecture, common use cases, and provides a detailed walkthrough of the included example.
 
+Connectors see only real requests: CUDA-graph warmup and padding dummy requests never reach a
+connector callback.
+
 ## Use Cases
 
 The KV Cache Connector is designed to support a variety of advanced serving scenarios:
@@ -67,7 +70,7 @@ on the leader process; with attention DP, they run on each owning rank.
 
 * **`request_reset(self, request: LlmRequest)`**
   * **Description**: Optional, with a no-op default. The request's allocation has been released and it will run again from the start, unlike `request_finished`, which ends it. Any per-request state held in page indices now describes pages another request may own, so it must be dropped or rebuilt here.
-  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. Direct preemption calls `request_finished` instead, so a connector keying state by request id sees exactly one of the two.
+  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. A restart after a failed prefix load (see the worker's `reports_failed_loads` below) takes it too. Direct preemption calls `request_finished` instead, so a connector keying state by request id sees exactly one of the two.
 
 * **`update_state_after_alloc_by_layer_group(self, request: LlmRequest, block_ids_by_layer_group: list[list[int]])`**
 * **`request_finished_by_layer_group(self, request: LlmRequest, cache_block_ids_by_layer_group: list[list[int]]) -> bool`**
@@ -81,6 +84,9 @@ on the leader process; with attention DP, they run on each owning rank.
     | flat | non-VSWA, non-hybrid only |
 
     A set is complete when both of its methods are defined. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
+
+* **`supports_speculative_prefill: bool`** (class attribute)
+  * **Description**: Optional, `False` by default. Declares a scheduler whose offers and saves stay valid for a one-model draft's prompt lookahead. See [Speculative decoding on a disaggregated context server](#speculative-decoding-on-a-disaggregated-context-server).
 
 ##### Running under VSWA
 
@@ -198,13 +204,38 @@ following configuration limits at bring-up.
 
 | Configuration | Mechanism |
 |---|---|
-| Speculative decoding | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
+| Speculative decoding, outside the [speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server) | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
 | A capacity scheduler policy other than `GUARANTEED_NO_EVICT` with KV cache manager V1 | V1 does not reset the connector block delta when a request is destroyed and replayed. V2 resets that state and permits replay; an active connector load retains its allocation until completion. |
 | A host or disk cache tier | Tier eviction reassigns the GPU slot. See [KV cache tiers are GPU-only under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector). |
 
 The exact set the runtime refuses depends on your cache configuration; the bring-up error is
-authoritative. Speculative decoding is unsupported with a connector wherever it is not refused —
-the same page-list shrink happens there.
+authoritative. Outside the speculative-prefill-only mode below, speculative decoding is unsupported
+with a connector wherever it is not refused — the same page-list shrink happens there.
+
+##### Speculative decoding on a disaggregated context server
+
+A context-only request never rejects a draft token, so on a disaggregated context server its page
+list only grows. There, one-model speculative decoding may run next to a connector
+(speculative-prefill-only mode) when all of the following hold:
+
+* The KV cache manager is `KVCacheManagerV2`, and `cache_transceiver_config.backend` is set.
+* Speculative decoding is one-model MTP or EAGLE3, and the draft layers share the target KV cache.
+* The connector's scheduler and worker both declare `supports_speculative_prefill = True`.
+
+By declaring it, a connector promises that:
+
+* An offer covers the prompt tokens past each block that produced its draft KV. Matching block keys
+  alone do not prove this; a backend that cannot tell must decline the offer.
+* It saves only blocks the current pass has computed. One-model speculation allocates slots past
+  each context chunk before they are computed.
+* Loads and saves cover every layer group, including the draft layers. Per-layer hooks run only
+  on `DecoderLayer` modules and may run several times per layer in one forward, once per draft step.
+
+The runtime applies the native lookahead backoff to every offer and recomputes the tail. A request
+that is not context-only gets an error response at admission. A generation server should use a
+`capacity_only` role; a KV-moving one is rejected at startup when `TRTLLM_DISAGG_ROLE=generation`.
+With [attention data parallelism](#attention-data-parallelism), both classes must also declare
+`supports_attention_dp`.
 
 ##### `RequestData` fields that may not be populated
 
@@ -310,6 +341,8 @@ request in the same iteration. With chunked prefill, allocation growth can limit
 Destroying an allocation clears its connector state, so replay queries again. Specify
 `enable_block_reuse=True` alongside the connector; see
 [Block reuse alongside the connector](#block-reuse-alongside-the-connector).
+Restarting a request whose prefix load failed (`reports_failed_loads`) is available only on
+this path.
 
 **Deployment note.** Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
 
@@ -345,6 +378,37 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`get_finished_prefix_loads(self) -> list[int]`**
   * **Description**: Reports locally completed reservation identities for loads dispatched through `SchedulerOutput.prefix_loads`, including synchronous loads. Completion means this worker has finished all reads and writes and established the required CUDA stream visibility. This method must not wait for other workers. The runtime collects reports asynchronously and distributes retirement decisions before scheduling; parked async requests resume and shared resources are released only after every worker has reported.
   * **Compatibility**: Legacy request-ID load and save completions continue through `get_finished`.
+
+* **`reports_failed_loads: bool`** (class attribute)
+  * **Description**: Optional, `False` by default. Declares a worker that reports prefix loads that come up short instead of raising. The runtime drops those requests' saves, frees their allocations and recomputes them; other requests continue. Requires the three methods below, `KVCacheManagerV2` and [legacy final-batch queries](#legacy-final-batch-queries). Single-rank and attention-DP only: a tensor-parallel worker must still raise. A restarted request has `py_connector_load_failed` set, and its later offers are ignored; a second failure fails it.
+
+* **`take_failed_load_requests(self) -> set[int]`**
+  * **Description**: Polled after every `start_load_kv`. Returns and forgets the IDs of context requests in that call whose load came up short.
+
+* **`take_failed_async_load_requests(self) -> set[int]`**
+  * **Description**: Polled after every `get_finished`. Returns and forgets the IDs of parked requests that this `get_finished` reported finished loading but whose load came up short. A later report is too late and fails the executor.
+  * **Contract for both**: writes into a reported request's pages must be complete or abandoned, since the pages are freed at once. Any other ID fails the executor.
+
+* **`drop_bound_saves(self, request_ids) -> None`**
+  * **Description**: Removes these requests' saves from the current pass, so a restarted request does not publish pages it never computed. Called before `wait_for_save`; must be idempotent and accept IDs with nothing bound.
+
+* **`shutdown(self)`**
+  * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
+
+* **`capacity_only(self) -> bool`** (property)
+  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
+
+* **`supports_speculative_prefill: bool`** (class attribute)
+  * **Description**: Optional, `False` by default. Declares a worker whose loads and saves cover the one-model draft layers. See [Speculative decoding on a disaggregated context server](#speculative-decoding-on-a-disaggregated-context-server).
+
+* **`requires_block_aligned_reuse: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; may be set per instance. Declares a connector that serves whole blocks from the local prefix match. `KVCacheManagerV2` then aligns every local match down to a block boundary, which a draft's lookahead backoff or a sliding window can otherwise leave mid-block, and disables partial reuse.
+
+Only an explicit `True` counts for these declarations, and a `capacity_only` worker's are ignored.
+Under tensor parallelism, startup rejects ranks that disagree on `capacity_only`,
+`requires_block_aligned_reuse` or `reports_failed_loads`; attention-DP owners are not checked
+against each other.
+
 ## Attention data parallelism
 
 Set `enable_attention_dp=True` and
@@ -437,13 +501,19 @@ them for the backend. Non-ADP behavior has no new transfer deadline. Workers
 must keep asynchronous start/poll callbacks nonblocking; a callback that itself
 hangs remains subject to the executor's hang detector.
 
+A failed load reported through `reports_failed_loads` restarts only that request, on its owner;
+other connector errors stay fail-stop. When peers skip an iteration, an owner waits for the loads
+it started and keeps the allocations it already reported to the connector for the retry.
+
 ADP requires `KVCacheManagerV2`; an explicit V1 selection is rejected before
-connector construction, and an automatic selection that resolves to V1 is
-rejected after the manager is built. V1 connector behavior remains unchanged.
+connector construction. A feature such as `SleepConfig` that selects V1 is incompatible with ADP connectors.
 PP=1, CP=1 and beam width 1 are required. V2 layer-group layout and callbacks
 are used directly. A backend must implement both grouped callbacks for multiple
 layer groups; the existing layout validation remains in place. Internal host
-or disk tiers, speculative decoding and Mamba/hybrid state remain unsupported.
+or disk tiers and Mamba/hybrid state remain unsupported. Speculative decoding
+is supported only in the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server),
+for which both classes declare `supports_speculative_prefill` as well.
 This change adds no Mooncake backend, deployment configuration or capacity tuning.
 
 Select a connector through `connector_module`, `connector_scheduler_class`,
@@ -469,12 +539,6 @@ kv_connector_config:
 Add `examples/llm-api` to `PYTHONPATH`. The example supports one full-attention
 layer group and no chunked prefill; it demonstrates shared storage, not
 production transfer performance.
-
-* **`shutdown(self)`**
-  * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
-
-* **`capacity_only(self) -> bool`** (property)
-  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
 
 ## Example Implementation
 
@@ -616,9 +680,9 @@ settings. A `capacity` server keeps both as configured.
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
 without all of the state it was computed with — a wrong answer rather than a slow one.
 
-Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
-are rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
-this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
+Beam search and Mamba/hybrid models are rejected for every connector. Attention data parallelism
+and speculative prefill require the declarations and restrictions described above.
+This connector also rejects KV cache manager V1, context parallelism, pipeline parallelism,
 sliding-window attention, and `sparse_attention_config` with an index-V cache unless
 `sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
 multimodal content without hashes, leaving the rest of the deployment served.

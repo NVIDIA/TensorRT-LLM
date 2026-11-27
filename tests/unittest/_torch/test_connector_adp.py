@@ -6,7 +6,7 @@ import itertools
 import weakref
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from functools import partial
 from threading import Barrier, Event
 from types import SimpleNamespace
@@ -16,6 +16,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from pydantic import ValidationError
+from utils.kv_connector import ConnectorAdapterMock as ADPAdapterMock
+from utils.kv_connector import connector_mpi
+from utils.kv_connector import connector_request as _request
 
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
@@ -28,12 +31,11 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 pytestmark = pytest.mark.cpu_only
@@ -47,34 +49,6 @@ def _isolate_failed_executor_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(py_executor, "_failed_kv_connector_executors", {})
 
 
-class ADPAdapterMock(MagicMock):
-    supports_attention_dp = True
-
-
-def _request(request_id: int, *, dummy: bool = False) -> MagicMock:
-    req = MagicMock(is_dummy_request=dummy, is_generation_only_request=False)
-    req.request_id = request_id
-    req.py_request_id = request_id
-    req.is_child = False
-    req.is_finished = False
-    req.state = LlmRequestState.CONTEXT_INIT
-    req.context_current_position = 0
-    req.context_remaining_length = 8
-    req.context_chunk_size = 8
-    req.py_orig_prompt_len = 8
-    req.total_input_len_cp = 8
-    req.get_tokens.return_value = list(range(8))
-    req.py_draft_tokens = []
-    req.py_per_pos_drafted = []
-    req.py_per_pos_accepted = []
-    req.py_total_draft_tokens = 0
-    req.py_total_accepted_draft_tokens = 0
-    req.py_disaggregated_params = None
-    req.kv_cache_retention_config = None
-    req.cache_salt = None
-    return req
-
-
 def _manager(rank: int = 1) -> KvCacheConnectorManager:
     worker = ADPAdapterMock()
     worker.get_finished.return_value = ([], [])
@@ -85,9 +59,37 @@ def _manager(rank: int = 1) -> KvCacheConnectorManager:
         return KvCacheConnectorManager(worker, scheduler, enable_attention_dp=True)
 
 
+def _failed_load_manager(
+    rank: int = 1,
+    *,
+    adp: bool = True,
+    offer: tuple[int, bool] = (4, False),
+    stack: ExitStack | None = None,
+    world_size: int = 1,
+) -> KvCacheConnectorManager:
+    """A manager whose worker reports failed loads.
+
+    A non-ADP manager enters its MPI patches into `stack` for the whole test.
+    """
+    worker = ADPAdapterMock(reports_failed_loads=True)
+    worker.get_finished.return_value = ([], [])
+    worker.take_failed_load_requests.return_value = set()
+    worker.take_failed_async_load_requests.return_value = set()
+    scheduler = ADPAdapterMock()
+    scheduler.get_num_new_matched_tokens.return_value = offer
+    scheduler.request_finished.return_value = True
+    if adp:
+        with patch(f"{CONNECTOR_MODULE}.mpi_rank", return_value=rank):
+            return KvCacheConnectorManager(worker, scheduler, enable_attention_dp=True)
+    assert stack is not None, "a tensor-parallel manager needs MPI patches for the whole test"
+    stack.enter_context(connector_mpi(world_size=world_size))
+    return KvCacheConnectorManager(worker, scheduler)
+
+
 def _configure_recovery_controls(executor: "PyExecutor") -> None:
     from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
 
+    executor.execution_stream = MagicMock()
     executor._closed = False
     executor._resources_released = False
     executor.worker_started = True
@@ -267,7 +269,64 @@ def test_dummy_requests_never_reach_storage(forbid_connector_collectives: None) 
     batch.context_requests_last_chunk = [dummy]
     batch.generation_requests = [dummy]
     cache = MagicMock(spec=KVCacheManagerV2)
-    output_manager = KvCacheConnectorSchedulerOutputManager(enable_attention_dp=True)
+    output_manager = KvCacheConnectorSchedulerOutputManager()
+    output = output_manager.build_scheduler_output(batch, AsyncRequests({}, {}), cache)
+    assert not output.new_requests and not output.cached_requests
+    assert not output_manager.requests
+    cache.get_page_indices_by_layer_group.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "is_dummy_request,is_attention_dp_dummy",
+    [(True, False), (False, True)],
+    ids=["is_dummy_request", "is_attention_dp_dummy"],
+)
+def test_tp_manager_skips_dummy_requests(
+    is_dummy_request: bool, is_attention_dp_dummy: bool
+) -> None:
+    """Without attention DP, either dummy flag keeps a request from the connector.
+
+    No rank enters the leader broadcast for it.
+    """
+    worker, scheduler = MagicMock(), MagicMock()
+    dummy = _request(999)
+    dummy.is_dummy_request = is_dummy_request
+    dummy.is_attention_dp_dummy = is_attention_dp_dummy
+    real = _request(7)
+    real.is_attention_dp_dummy = False
+    with connector_mpi() as broadcast:
+        manager = KvCacheConnectorManager(worker, scheduler)
+        assert not manager.enable_attention_dp
+        assert manager.query_num_new_matched_tokens(dummy, 0) == (0, False)
+        assert manager.get_num_new_matched_tokens(dummy, 0) == 0
+        manager.commit_new_matched_tokens(dummy, 4, True)
+        manager.update_state_after_alloc(dummy, [5])
+        manager.update_state_after_alloc(dummy, [], [[3], [5]])
+        assert not manager.request_finished(dummy, [5])
+        manager.prefix_reservations_enabled = True
+        assert manager.reserve_prefix(dummy, 0) is None
+        manager.prefix_reservations_enabled = False
+        broadcast.assert_not_called()
+
+        # A request with neither flag set still reaches the leader.
+        scheduler.get_num_new_matched_tokens.return_value = (0, False)
+        assert manager.query_num_new_matched_tokens(real, 0) == (0, False)
+        scheduler.get_num_new_matched_tokens.assert_called_once_with(real, 0)
+        broadcast.assert_called_once()
+
+    scheduler.update_state_after_alloc.assert_not_called()
+    scheduler.update_state_after_alloc_by_layer_group.assert_not_called()
+    scheduler.request_finished.assert_not_called()
+    scheduler.request_finished_by_layer_group.assert_not_called()
+    scheduler.reserve_prefix.assert_not_called()
+    assert not manager.scheduler_output_manager.external_loads
+    assert not manager.has_pending_transfers(999)
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [dummy]
+    batch.generation_requests = [dummy]
+    cache = MagicMock(spec=KVCacheManagerV2)
+    output_manager = KvCacheConnectorSchedulerOutputManager()
     output = output_manager.build_scheduler_output(batch, AsyncRequests({}, {}), cache)
     assert not output.new_requests and not output.cached_requests
     assert not output_manager.requests
@@ -291,8 +350,7 @@ def test_tp_still_waits_for_all_shards() -> None:
     worker, scheduler = MagicMock(), MagicMock()
     scheduler.request_finished.return_value = True
     with (
-        patch(f"{CONNECTOR_MODULE}.mpi_rank", return_value=0),
-        patch(f"{CONNECTOR_MODULE}.mpi_broadcast", side_effect=lambda result, root: result),
+        connector_mpi(world_size=2),
         patch(f"{CONNECTOR_MODULE}.mpi_allgather") as gather,
     ):
         manager = KvCacheConnectorManager(worker, scheduler)
@@ -1671,3 +1729,286 @@ def test_phase_idle_connector_owner_joins_ready_peer(
     assert results == [(peer_has_work, peer_has_work), (peer_has_work, False)]
     for executor in executors:
         executor.dist.tp_allgather_int64.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Failed prefix loads handed back for a restart (reports_failed_loads).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("adp", [True, False], ids=["adp", "single_rank"])
+def test_failed_sync_load_restarts_the_request_and_pads_the_batch(
+    exit_stack: ExitStack, adp: bool
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager = _failed_load_manager(adp=adp, stack=exit_stack)
+    req = _request(7)
+    assert manager.get_num_new_matched_tokens(req, 0) == 4
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+    manager.set_scheduler_output(SchedulerOutput())
+    manager.worker.take_failed_load_requests.return_value = {7}
+
+    executor = object.__new__(PyExecutor)
+    _configure_recovery_controls(executor)
+    executor.kv_connector_manager = manager
+    executor.kv_cache_manager = MagicMock(spec=KVCacheManagerV2)
+    executor.resource_manager = MagicMock()
+    executor.resource_manager.get_resource_manager.return_value = None
+    padded = []
+    executor._pad_empty_attention_dp_batch = lambda scheduled: padded.append(scheduled.batch_size)
+    if not adp:
+        executor.enable_attention_dp = False
+        executor._can_queue = MagicMock(return_value=(False, False))
+
+    with patch("torch.cuda.current_stream"):
+        assert executor._kv_connector_start_batch(batch) == (False, False)
+
+    # The request leaves the batch, loses its saves and allocation, and is admitted again.
+    assert batch.context_requests == []
+    executor.kv_cache_manager.drop_context_allocation.assert_called_once_with(req)
+    manager.worker.drop_bound_saves.assert_called_with([7])
+    manager.worker.start_load_kv.assert_called_once()
+    assert manager.should_add_sequence(req)
+    assert not executor._kv_connector_failed
+    # Under attention DP the emptied batch is padded so peers keep running.
+    assert padded == ([0] if adp else [])
+
+
+def test_failed_async_load_restarts_the_parked_request(
+    forbid_connector_collectives: None,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager = _failed_load_manager(offer=(4, True))
+    req = _request(8)
+    assert manager.get_num_new_matched_tokens(req, 0) == 4
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+    manager.take_scheduled_requests_pending_load(batch)
+    assert batch.batch_size == 0
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    manager.worker.get_finished.return_value = ([], [8])
+    manager.worker.take_failed_async_load_requests.return_value = {8}
+
+    executor = object.__new__(PyExecutor)
+    _configure_recovery_controls(executor)
+    executor.kv_connector_manager = manager
+    executor.kv_cache_manager = MagicMock(spec=KVCacheManagerV2)
+    spec_manager = MagicMock()
+    executor.resource_manager = MagicMock()
+    executor.resource_manager.get_resource_manager.return_value = spec_manager
+
+    executor._kv_connector_terminate_requests(synchronize=False)
+
+    executor.kv_cache_manager.drop_context_allocation.assert_called_once_with(req)
+    spec_manager.free_resources.assert_called_once_with(req)
+    manager.worker.drop_bound_saves.assert_called_once_with([8])
+    assert req.state == LlmRequestState.CONTEXT_INIT
+    # It is queried again, not treated as loaded.
+    assert manager.should_add_sequence(req)
+    assert not manager.has_pending_transfers(8)
+
+
+def test_failed_async_load_in_adp_recovery_loop_is_not_resumed(
+    forbid_connector_collectives: None,
+) -> None:
+    """A parked request restarted mid-recovery stays out of the batch it left."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager = _failed_load_manager(offer=(4, True))
+    failed, ready = _request(10), _request(11)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [failed, ready]
+    cache = MagicMock(spec=KVCacheManagerV2)
+    cache.get_page_indices_by_layer_group.return_value = [[5, 6]]
+    for req in batch.context_requests:
+        manager.get_num_new_matched_tokens(req, 0)
+        req.context_current_position = 4
+        req.context_remaining_length = 4
+        req.context_chunk_size = 4
+        manager.update_state_after_alloc(req, [5, 6])
+
+    manager.build_scheduler_output(batch, cache)
+    manager.handle_metadata()
+    executor = object.__new__(PyExecutor)
+    _configure_recovery_controls(executor)
+    executor.kv_connector_manager = manager
+    executor.kv_cache_manager = cache
+    executor.kv_cache_transceiver = None
+    executor.active_requests = [failed, ready]
+    executor.expected_num_active_requests = 2
+    # No sequence slot is left for a padding dummy.
+    executor.max_num_active_requests = 2
+    executor._count_schedulable_active_requests = MagicMock(return_value=0)
+    executor._should_skip_dummy_for_benchmark_disagg = MagicMock(return_value=False)
+    executor._has_adp_dummy_kv_capacity = MagicMock(return_value=False)
+    executor.resource_manager = MagicMock()
+    executor.resource_manager.get_resource_manager.return_value = None
+    executor.resource_manager.prepare_resources.side_effect = AssertionError("double allocation")
+    manager.worker.get_finished.side_effect = [([], []), ([], [10]), ([], [11])]
+    manager.worker.take_failed_async_load_requests.side_effect = [set(), {10}, set()]
+
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep") as sleep,
+    ):
+        executor._kv_connector_start_batch(batch)
+
+    assert batch.context_requests == [ready]
+    assert failed.state == LlmRequestState.CONTEXT_INIT
+    assert manager.should_add_sequence(failed)
+    assert not manager.should_add_sequence(ready)
+    cache.drop_context_allocation.assert_called_once_with(failed)
+    manager.worker.drop_bound_saves.assert_called_once_with([10])
+    assert manager.worker.start_load_kv.call_count == 2
+    executor.resource_manager.prepare_resources.assert_not_called()
+    assert sleep.call_count == 2
+    assert not executor._kv_connector_failed
+    compute_plan = manager.scheduler.build_connector_meta.call_args.args[0]
+    assert [req.request_id for req in compute_plan.new_requests] == [11]
+
+
+@pytest.mark.parametrize("pad_ok", [False, True])
+def test_restart_of_the_only_parked_request_ends_the_wait(
+    forbid_connector_collectives: None, pad_ok: bool
+) -> None:
+    """Nothing is left to wait for once the only parked request restarts."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager = _failed_load_manager(offer=(4, True))
+    req = _request(10)
+    manager.get_num_new_matched_tokens(req, 0)
+    manager.update_state_after_alloc(req, [5, 6])
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+    cache = MagicMock(spec=KVCacheManagerV2)
+    cache.get_page_indices_by_layer_group.return_value = [[5, 6]]
+    manager.build_scheduler_output(batch, cache)
+
+    executor = object.__new__(PyExecutor)
+    _configure_recovery_controls(executor)
+    executor.kv_connector_manager = manager
+    executor.kv_cache_manager = cache
+    executor.resource_manager = MagicMock()
+    executor.resource_manager.get_resource_manager.return_value = None
+    dummy = _request(999, dummy=True)
+    pad_calls = 0
+
+    def pad(scheduled: ScheduledRequests) -> None:
+        # Padding fails while the parked request holds its pages.
+        nonlocal pad_calls
+        pad_calls += 1
+        assert scheduled.batch_size == 0
+        if pad_calls > 1 and pad_ok:
+            scheduled.generation_requests.append(dummy)
+
+    executor._pad_empty_attention_dp_batch = pad
+    manager.worker.get_finished.return_value = ([], [10])
+    manager.worker.take_failed_async_load_requests.side_effect = [{10}]
+
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep") as sleep,
+    ):
+        result = executor._kv_connector_start_batch(batch)
+
+    assert result == (pad_ok, pad_ok)
+    sleep.assert_not_called()
+    assert pad_calls == 2
+    assert batch.context_requests == []
+    assert batch.generation_requests == ([dummy] if pad_ok else [])
+    cache.drop_context_allocation.assert_called_once_with(req)
+    assert req.state == LlmRequestState.CONTEXT_INIT
+    assert manager.should_add_sequence(req)
+    assert not executor._kv_connector_failed
+    if pad_ok:
+        executor.resource_manager.prepare_resources.assert_called_once_with(
+            batch, publish_connector_output=False
+        )
+    else:
+        executor.resource_manager.prepare_resources.assert_not_called()
+
+
+def test_failed_load_report_under_tp_is_fatal(exit_stack: ExitStack) -> None:
+    manager = _failed_load_manager(adp=False, stack=exit_stack, world_size=2)
+    manager.worker.take_failed_load_requests.return_value = {7}
+    with pytest.raises(RuntimeError, match="tensor-parallel"):
+        manager.take_failed_load_requests()
+    manager.worker.take_failed_async_load_requests.return_value = {8}
+    with pytest.raises(RuntimeError, match="tensor-parallel"):
+        manager.pop_failed_async_loads()
+
+
+def test_failed_async_load_still_pending_is_fatal(forbid_connector_collectives: None) -> None:
+    """The pages of a load the worker has not finished may still be written."""
+    manager = _failed_load_manager(offer=(4, True))
+    req = _request(8)
+    manager.get_num_new_matched_tokens(req, 0)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+    manager.take_scheduled_requests_pending_load(batch)
+    assert manager.get_finished() == []
+    assert manager.has_pending_transfers(8)
+    manager.worker.take_failed_async_load_requests.return_value = {8}
+
+    with pytest.raises(RuntimeError, match="not reported finished"):
+        manager.pop_failed_async_loads()
+    assert manager.has_pending_transfers(8)
+
+
+def test_failed_async_load_reported_after_its_finish_is_fatal(
+    forbid_connector_collectives: None,
+) -> None:
+    """A failure reported after the finish is fatal: the request may already be scheduled."""
+    manager = _failed_load_manager(offer=(4, True))
+    req = _request(8)
+    manager.get_num_new_matched_tokens(req, 0)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+    manager.take_scheduled_requests_pending_load(batch)
+    manager.worker.get_finished.return_value = ([], [8])
+    assert manager.get_finished() == []
+    assert manager.pop_failed_async_loads() == []
+    assert not manager.should_add_sequence(req)
+
+    manager.worker.get_finished.return_value = ([], [])
+    assert manager.get_finished() == []
+    manager.worker.take_failed_async_load_requests.return_value = {8}
+    with pytest.raises(RuntimeError, match="earlier get_finished returned them as finished"):
+        manager.pop_failed_async_loads()
+    assert 8 in manager.finished_async_loading_requests
+
+
+def test_loads_of_a_skipped_forward_are_waited_on_every_layer() -> None:
+    """A skipped forward still waits for every started layer load and then the stream.
+
+    Otherwise a later skip could free pages the worker is still writing.
+    """
+    manager = _manager()
+    manager.register_load_layers([0, 1, 2])
+    stream = MagicMock()
+    # One log for both checks the stream synchronizes after every layer.
+    events: list[tuple] = []
+    manager.worker.wait_for_layer_load.side_effect = lambda layer_idx, s: events.append(
+        ("wait", layer_idx, s)
+    )
+    stream.synchronize.side_effect = lambda: events.append(("synchronize",))
+
+    manager.finish_loads_of_skipped_forward(stream)
+    assert events == []
+
+    # A forward that ran already waited in its layer hooks.
+    manager.mark_loads_started()
+    manager.mark_loads_waited()
+    manager.finish_loads_of_skipped_forward(stream)
+    assert events == []
+
+    manager.mark_loads_started()
+    manager.finish_loads_of_skipped_forward(stream)
+    expected = [("wait", 0, stream), ("wait", 1, stream), ("wait", 2, stream), ("synchronize",)]
+    assert events == expected
+
+    manager.finish_loads_of_skipped_forward(stream)
+    assert events == expected

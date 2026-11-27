@@ -29,6 +29,7 @@ def make_partial_executor(**attrs: Any) -> PyExecutor:
         kv_cache_manager=None,
         _is_kv_manager_v2=False,
         kv_cache_transceiver=None,
+        kv_connector_manager=None,
         _disagg_coordinator=None,
         _disagg_pp_termination_handler=None,
         active_requests=[],

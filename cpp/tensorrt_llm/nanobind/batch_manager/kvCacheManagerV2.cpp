@@ -2024,7 +2024,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
                 std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
-                std::optional<kv::BatchDesc> coldTypicalStep)
+                std::optional<kv::BatchDesc> coldTypicalStep, int reuseMatchAlignment)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2040,6 +2040,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->maxUtilForResume = maxUtilForResume;
                 cfg->enablePartialReuse = enablePartialReuse;
                 cfg->reuseMatchBackoff = reuseMatchBackoff;
+                cfg->reuseMatchAlignment = reuseMatchAlignment;
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
                 cfg->initialPoolRatio = std::move(initialPoolRatio);
@@ -2069,7 +2070,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
             nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
-            nb::arg("cold_typical_step").none() = std::nullopt)
+            nb::arg("cold_typical_step").none() = std::nullopt, nb::arg("reuse_match_alignment") = 1)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2079,6 +2080,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("max_util_for_resume", &kv::KVCacheManagerConfig::maxUtilForResume)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
+        .def_rw("reuse_match_alignment", &kv::KVCacheManagerConfig::reuseMatchAlignment)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
@@ -2312,6 +2314,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("reuse_status", &kv::KvCache::reuseStatus, nb::rv_policy::copy)
         .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
         .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
+        .def("_get_num_reusable_tokens_before_alignment", &kv::KvCache::numReusableTokensBeforeAlignment)
         // Both setters reach resize(), which takes the exclusive API lock: release the GIL first.
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
             [](kv::KvCache& self, int hist)

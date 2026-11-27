@@ -414,6 +414,22 @@ class TestAttentionDpIterationMetrics:
                 },
             )
 
+    def test_alignment_forfeit_counters_are_ranked(self, collector: MetricsCollector) -> None:
+        for rank, served, recomputed in [(0, 44, 0), (1, 20, 24), (1, 0, 4)]:
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "iterAlignmentForfeitedConnectorTokens": served,
+                    "iterAlignmentForfeitedRecomputedTokens": recomputed,
+                }
+            )
+        served_counter = "kv_cache_alignment_forfeited_connector_tokens_total"
+        recomputed_counter = "kv_cache_alignment_forfeited_recomputed_tokens_total"
+        assert _get_counter_value(collector, served_counter, 0) == 44
+        assert _get_counter_value(collector, recomputed_counter, 0) == 0
+        assert _get_counter_value(collector, served_counter, 1) == 20
+        assert _get_counter_value(collector, recomputed_counter, 1) == 28
+
     def test_request_and_config_labels_remain_independent(
         self, collector: MetricsCollector
     ) -> None:

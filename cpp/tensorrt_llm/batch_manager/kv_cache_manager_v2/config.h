@@ -700,6 +700,11 @@ struct KVCacheManagerConfig
     // Applied inside the match so a single tree walk yields the usable depth.
     int reuseMatchBackoff = 0;
 
+    // Each match candidate is rounded down to a multiple of this after backoff and before
+    // coverage validation. Must divide tokensPerBlock: whole-block KV connectors use
+    // tokensPerBlock, and 1 keeps token-granular reuse.
+    int reuseMatchAlignment = 1;
+
     // Constraint-based memory partitioning.
     std::vector<BatchDesc> constraints;   // batches that must always be supportable
     std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation

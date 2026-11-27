@@ -78,6 +78,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<L
     , mNumReusableTokensBeforeHybridPruning(
           reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforeHybridPruning : 0)
     , mNumReusableTokensBeforePruning(reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforePruning : 0)
+    , mNumReusableTokensBeforeAlignment(reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforeAlignment : 0)
     , mEnableRequestStats(enableRequestStats)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())

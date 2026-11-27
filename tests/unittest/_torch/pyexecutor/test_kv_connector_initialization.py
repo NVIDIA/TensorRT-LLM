@@ -37,13 +37,41 @@ pytestmark = pytest.mark.cpu_only
 RECURRENT_STATE_REJECTION = "not supported with Mamba / hybrid linear-attention"
 
 
-def _connector_executor(kv_cache_manager: Mock, *, capacity_only: bool = False) -> PyExecutor:
+def _connector(
+    *,
+    capacity_only: bool = False,
+    enable_attention_dp: bool = False,
+    speculative_prefill_only: bool = False,
+) -> Mock:
+    manager = Mock(
+        capacity_only=capacity_only,
+        enable_attention_dp=enable_attention_dp,
+        speculative_prefill_only=speculative_prefill_only,
+        reports_failed_loads=False,
+    )
+    manager.refuses.return_value = False
+    return manager
+
+
+def _connector_executor(
+    kv_cache_manager: Mock,
+    *,
+    capacity_only: bool = False,
+    connector: Mock | None = None,
+    max_draft_len: int = 0,
+    draft_kv_cache_manager: Mock | None = None,
+) -> PyExecutor:
     executor = object.__new__(PyExecutor)
-    executor.kv_connector_manager = Mock(capacity_only=capacity_only, enable_attention_dp=False)
+    executor.kv_connector_manager = (
+        _connector(capacity_only=capacity_only, enable_attention_dp=False)
+        if connector is None
+        else connector
+    )
     executor.kv_cache_transceiver = None
     executor.dist = SimpleNamespace(pp_size=1, cp_size=1)
     executor.max_beam_width = 1
-    executor.max_draft_len = 0
+    executor.max_draft_len = max_draft_len
+    executor.draft_kv_cache_manager = draft_kv_cache_manager
     executor.enable_attention_dp = False
     executor.llm_args = SimpleNamespace(kv_cache_config=None, scheduler_config=None)
     executor.kv_cache_manager = kv_cache_manager
@@ -113,6 +141,67 @@ def test_v1_connector_rejects_recurrent_managers(manager_cls: type) -> None:
     executor.kv_connector_manager.wait_for_initialization.assert_not_called()
 
 
+def _speculative_connector_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    connector: Mock,
+    *,
+    max_draft_len: int,
+    draft_kv_cache_manager: Mock | None = None,
+    kv_cache_manager: Mock | None = None,
+) -> tuple[PyExecutor, SimpleNamespace]:
+    """The executor shell of `test_v2_connector_registers_layer_groups`, with a draft."""
+    executor = _connector_executor(
+        _v2_cache(AttentionLayerConfig) if kv_cache_manager is None else kv_cache_manager,
+        connector=connector,
+        max_draft_len=max_draft_len,
+        draft_kv_cache_manager=draft_kv_cache_manager,
+    )
+    layout = SimpleNamespace(groups=[SimpleNamespace(window_size=None)])
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.build_kv_cache_layout_v2",
+        lambda manager: layout,
+    )
+    return executor, layout
+
+
+@pytest.mark.parametrize(
+    "max_draft_len,speculative_prefill_only,separate_draft_cache,error",
+    [
+        pytest.param(1, False, False, "speculative decoding", id="refused"),
+        pytest.param(1, True, False, None, id="speculative-prefill"),
+        pytest.param(1, True, True, "share the target KV cache", id="separate-draft-cache"),
+        pytest.param(0, False, False, None, id="no-speculation"),
+    ],
+)
+def test_v2_connector_speculative_decoding_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    max_draft_len: int,
+    speculative_prefill_only: bool,
+    separate_draft_cache: bool,
+    error: str | None,
+) -> None:
+    connector = _connector(
+        capacity_only=False,
+        enable_attention_dp=False,
+        speculative_prefill_only=speculative_prefill_only,
+    )
+    executor, layout = _speculative_connector_executor(
+        monkeypatch,
+        connector,
+        max_draft_len=max_draft_len,
+        draft_kv_cache_manager=Mock() if separate_draft_cache else None,
+    )
+
+    if error is not None:
+        with pytest.raises(NotImplementedError, match=error):
+            executor._maybe_init_kv_connector_manager()
+        connector.worker.register_kv_cache_layout.assert_not_called()
+    else:
+        executor._maybe_init_kv_connector_manager()
+        connector.worker.register_kv_cache_layout.assert_called_once_with(layout)
+        connector.wait_for_initialization.assert_called_once()
+
+
 @pytest.mark.parametrize(
     "use_v2,connector_mode,num_groups,with_retention,rejected",
     [
@@ -136,7 +225,7 @@ def test_connector_retention_request_validation(
     executor._is_kv_manager_v2 = use_v2
     executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
     executor.kv_connector_manager = (
-        None if connector_mode is None else Mock(capacity_only=connector_mode == "capacity")
+        None if connector_mode is None else _connector(capacity_only=connector_mode == "capacity")
     )
     executor.kv_cache_manager = SimpleNamespace(num_pools=num_groups)
     executor.kv_cache_transceiver = None
