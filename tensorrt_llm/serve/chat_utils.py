@@ -231,11 +231,48 @@ def parse_chat_message_content_part(
     raise NotImplementedError(f"Unknown part type: {part_type}")
 
 
+_MEDIA_PART_MODALITY: dict[str, str] = {
+    "image_url": "image",
+    "image_embeds": "image",
+    "video_url": "video",
+    "audio_url": "audio",
+    "input_audio": "audio",
+}
+
+
 def _no_input_reason(model_type: str, modality: str) -> str:
     """Why a model of ``model_type`` cannot be given ``modality`` input."""
     if MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_modalities(model_type):
         return f"this model does not accept {modality} input"
     return "this model accepts text only"
+
+
+def omitted_tool_media_note(part: Any, model_type: str) -> Optional[str]:
+    """Return the omission note for a tool-result media part, or ``None``.
+
+    Returns ``None`` when ``part`` is not a valid media part or when
+    ``model_type`` accepts its modality. Otherwise returns the exact note
+    :func:`_media_or_note` inserts on the chat path.
+    """
+    if not isinstance(part, dict):
+        return None
+    part_type = part.get("type")
+    if not isinstance(part_type, str):
+        return None
+    modality = _MEDIA_PART_MODALITY.get(part_type)
+    if modality is None or not isinstance(part.get(part_type), dict):
+        return None
+    content = MM_PARSER_MAP[part_type](part)
+    if content is None:
+        return None
+    if part_type == "input_audio":
+        if (not isinstance(content, dict)
+                or not isinstance(content.get("data"), str)
+                or not content["data"]):
+            return None
+    if MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality):
+        return None
+    return f"[{modality} omitted: {_no_input_reason(model_type, modality)}]"
 
 
 def _media_or_note(role: str, media: MultimodalData,
@@ -271,6 +308,13 @@ def _media_or_note(role: str, media: MultimodalData,
     return f"[{modality} omitted: {reason}]"
 
 
+def _close_media_coroutines(media_parts: Iterable[MultimodalData]) -> None:
+    """Close any unawaited loader coroutines in ``media_parts``."""
+    for media in media_parts:
+        if asyncio.iscoroutine(media.get("data")):
+            media["data"].close()
+
+
 def parse_chat_message_content_parts(
     role: str,
     parts: Iterable[ChatCompletionContentPartParam],
@@ -289,22 +333,26 @@ def parse_chat_message_content_parts(
     content_parts: list[Union[str, dict]] = []
 
     media_index = 0
-    for part in parts:
-        parse_res = parse_chat_message_content_part(part, mm_data_tracker)
-        if parse_res and not isinstance(parse_res, str):
-            parse_res = _media_or_note(role, parse_res,
-                                       mm_data_tracker._model_type)
-        if parse_res:
-            if isinstance(parse_res, str):
-                text_parts.append(parse_res)
-                content_parts.append(parse_res)
-            else:
-                media_parts.append(parse_res)
-                content_parts.append({
-                    "type": parse_res["modality"],
-                    "media_index": media_index,
-                })
-                media_index += 1
+    try:
+        for part in parts:
+            parse_res = parse_chat_message_content_part(part, mm_data_tracker)
+            if parse_res and not isinstance(parse_res, str):
+                parse_res = _media_or_note(role, parse_res,
+                                           mm_data_tracker._model_type)
+            if parse_res:
+                if isinstance(parse_res, str):
+                    text_parts.append(parse_res)
+                    content_parts.append(parse_res)
+                else:
+                    media_parts.append(parse_res)
+                    content_parts.append({
+                        "type": parse_res["modality"],
+                        "media_index": media_index,
+                    })
+                    media_index += 1
+    except BaseException:
+        _close_media_coroutines(media_parts)
+        raise
 
     text_prompt = "\n".join(text_parts)
 
@@ -352,19 +400,23 @@ def parse_chat_message_content(
         mm_data_tracker,
         keep_content_parts=keep_text_parts and is_part_list,
     )
-    if role == "assistant":
-        result.update(
-            _parse_assistant_message_content(message,
-                                             lenient_tool_call_arguments,
-                                             raw_tool_call_arguments))
-    elif role == "tool":
-        result.update(_parse_tool_message_content(message))
-    elif keep_message_tools and role == "system" and message.get("tools"):
-        # Message-level (dynamic) tool declarations: python-renderer chat
-        # templates (kimi_k3) render these as an in-conversation tool
-        # declare block at this message's position. Other models keep the
-        # pre-existing behavior of silently ignoring the key.
-        result["tools"] = message["tools"]
+    try:
+        if role == "assistant":
+            result.update(
+                _parse_assistant_message_content(message,
+                                                 lenient_tool_call_arguments,
+                                                 raw_tool_call_arguments))
+        elif role == "tool":
+            result.update(_parse_tool_message_content(message))
+        elif keep_message_tools and role == "system" and message.get("tools"):
+            # Message-level (dynamic) tool declarations: python-renderer chat
+            # templates (kimi_k3) render these as an in-conversation tool
+            # declare block at this message's position. Other models keep the
+            # pre-existing behavior of silently ignoring the key.
+            result["tools"] = message["tools"]
+    except BaseException:
+        _close_media_coroutines(result["media"])
+        raise
     return result
 
 
@@ -593,45 +645,56 @@ def parse_chat_messages_coroutines(
     else:
         content_format = ContentFormat.STRING
 
-    for msg in messages:
-        # kimi_k3's reference renderer keeps unparsable tool-call argument
-        # strings verbatim; other templates expect the strict dict contract.
-        # mistral-common (the Mistral-native renderer) encodes each text part
-        # of a content list on its own, and parses a history tool call's
-        # arguments itself.
-        native_mistral = model_type in NATIVE_MISTRAL_MODEL_TYPES
-        parsed_msg = parse_chat_message_content(
-            msg,
-            mm_data_tracker,
-            lenient_tool_call_arguments=(model_type == "kimi_k3"),
-            keep_message_tools=(model_type == "kimi_k3"),
-            keep_text_parts=native_mistral,
-            raw_tool_call_arguments=native_mistral)
-        conversation.append(parsed_msg)
+    try:
+        for msg in messages:
+            # kimi_k3's reference renderer keeps unparsable tool-call argument
+            # strings verbatim; other templates expect the strict dict contract.
+            # mistral-common (the Mistral-native renderer) encodes each text part
+            # of a content list on its own, and parses a history tool call's
+            # arguments itself.
+            native_mistral = model_type in NATIVE_MISTRAL_MODEL_TYPES
+            parsed_msg = parse_chat_message_content(
+                msg,
+                mm_data_tracker,
+                lenient_tool_call_arguments=(model_type == "kimi_k3"),
+                keep_message_tools=(model_type == "kimi_k3"),
+                keep_text_parts=native_mistral,
+                raw_tool_call_arguments=native_mistral)
+            conversation.append(parsed_msg)
 
-        # Track placeholders added for this message only.
-        msg_placeholder_counts = {}
-        # Snapshot the tracker's item_order length so we can slice off just
-        # the entries this message contributed.
-        item_order_start = len(mm_data_tracker.item_order())
-        if parsed_msg["media"]:
-            for mdata in parsed_msg["media"]:
-                placeholder = mm_data_tracker.add_data(
-                    mdata["modality"],
-                    mdata["data"],
-                    is_embedding=mdata["is_embedding"])
-                if placeholder:
-                    msg_placeholder_counts[
-                        placeholder] = msg_placeholder_counts.get(
-                            placeholder, 0) + 1
+            # Track placeholders added for this message only.
+            msg_placeholder_counts = {}
+            # Snapshot the tracker's item_order length so we can slice off just
+            # the entries this message contributed.
+            item_order_start = len(mm_data_tracker.item_order())
+            if parsed_msg["media"]:
+                for mdata in parsed_msg["media"]:
+                    placeholder = mm_data_tracker.add_data(
+                        mdata["modality"],
+                        mdata["data"],
+                        is_embedding=mdata["is_embedding"])
+                    if placeholder:
+                        msg_placeholder_counts[
+                            placeholder] = msg_placeholder_counts.get(
+                                placeholder, 0) + 1
 
-        apply_mm_placeholders(model_type,
-                              parsed_msg,
-                              msg_placeholder_counts,
-                              mm_data_tracker,
-                              item_order_start=item_order_start,
-                              content_format=content_format)
-        mm_placeholder_counts.append(msg_placeholder_counts)
+            apply_mm_placeholders(model_type,
+                                  parsed_msg,
+                                  msg_placeholder_counts,
+                                  mm_data_tracker,
+                                  item_order_start=item_order_start,
+                                  content_format=content_format)
+            mm_placeholder_counts.append(msg_placeholder_counts)
+    except BaseException:
+        for pending in (mm_data_tracker._data, mm_data_tracker._embeddings):
+            for items in pending.values():
+                for item in items:
+                    if asyncio.iscoroutine(item):
+                        item.close()
+            pending.clear()
+        for parsed_msg in conversation:
+            _close_media_coroutines(parsed_msg["media"])
+        raise
 
     # ``item_order`` is populated synchronously by ``add_data``, so it can
     # be returned directly (not through the coroutine).

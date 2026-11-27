@@ -22,6 +22,7 @@ import dataclasses
 import gc
 import warnings
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -33,6 +34,7 @@ from tensorrt_llm.serve.render import (
     HarmonyConversionError,
     RenderedRequest,
     RenderResources,
+    UnrenderableMessagesError,
     UnsupportedRenderError,
     compute_fingerprint,
     fingerprint_mismatch,
@@ -231,6 +233,169 @@ class TestRenderChat:
         )
         with pytest.raises(UnsupportedRenderError, match="Multimodal"):
             render_chat(request, resources(tokenizer))
+
+    def test_tool_result_image_renders_omission_note_for_text_only_model_only(
+        self, tokenizer
+    ) -> None:
+        image = {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}}
+        note = {"type": "text", "text": "[image omitted: this model accepts text only]"}
+        tool_with_image = chat_request(
+            messages=[
+                {"role": "user", "content": "show"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "content": [{"type": "text", "text": "a"}, image],
+                },
+            ]
+        )
+        tool_with_note = chat_request(
+            messages=[
+                {"role": "user", "content": "show"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "content": [{"type": "text", "text": "a"}, note],
+                },
+            ]
+        )
+        tool_text_only = chat_request(
+            messages=[
+                {"role": "user", "content": "show"},
+                {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "a"}]},
+            ]
+        )
+        text_res = resources(tokenizer, model_type="glm_moe_dsa")
+        expected = render_chat(tool_with_note, text_res)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exact = render_chat(tool_with_image, text_res)
+            length_render = render_chat_for_length(tool_with_image, text_res)
+            gc.collect()
+
+        assert exact.text == expected.text
+        assert exact.token_ids == expected.token_ids
+        assert length_render.text == expected.text
+        assert length_render.token_ids == expected.token_ids
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+        # A multimodal model that accepts images still refuses exact rendering and drops the image
+        # in length estimation instead of fabricating an omission note.
+        import tensorrt_llm._torch.models.modeling_vila  # noqa: F401
+
+        vlm_res = resources(tokenizer, model_type="llava_llama")
+        with pytest.raises(UnsupportedRenderError, match="Multimodal"):
+            render_chat(tool_with_image, vlm_res)
+        assert (
+            render_chat_for_length(tool_with_image, vlm_res).token_ids
+            == render_chat(tool_text_only, resources(tokenizer)).token_ids
+        )
+
+    def test_lone_tool_audio_validator_iterator_uses_media_check_on_raw_fallback(
+        self, tokenizer
+    ) -> None:
+        audio = {"type": "audio_url", "audio_url": {"url": "http://example.invalid/a.wav"}}
+        raw_messages = [
+            {"role": "user", "content": "listen"},
+            {"role": "tool", "tool_call_id": "c1", "content": [audio]},
+        ]
+        request = chat_request(messages=raw_messages)
+        expected_note = chat_request(
+            messages=[
+                {"role": "user", "content": "listen"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "content": [
+                        {"type": "text", "text": "[audio omitted: this model accepts text only]"}
+                    ],
+                },
+            ]
+        )
+        text_res = resources(tokenizer, model_type="glm_moe_dsa")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exact = render_chat(request, text_res, raw_messages=raw_messages)
+            gc.collect()
+        assert exact.text == render_chat(expected_note, text_res).text
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+        with pytest.raises(UnrenderableMessagesError):
+            render_chat(chat_request(messages=raw_messages), text_res)
+        with pytest.raises(UnrenderableMessagesError):
+            render_chat_for_length(chat_request(messages=raw_messages), text_res)
+
+        from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+
+        with (
+            patch.object(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", return_value=True),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            with pytest.raises(UnsupportedRenderError, match="Multimodal"):
+                render_chat(
+                    chat_request(messages=raw_messages),
+                    resources(tokenizer, model_type="audio_vlm"),
+                    raw_messages=raw_messages,
+                )
+            gc.collect()
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+        null_type_raw = [
+            {"role": "user", "content": "bad"},
+            {"role": "tool", "tool_call_id": "c1", "content": [{"type": None}]},
+        ]
+        with pytest.raises(ValueError, match="Invalid 'type' field"):
+            render_chat(
+                chat_request(messages=null_type_raw),
+                text_res,
+                raw_messages=null_type_raw,
+            )
+
+    def test_harmony_exact_and_length_match_on_tool_result_image(self, harmony_vocab) -> None:
+        from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
+
+        image = {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}}
+
+        def _make_request():
+            return chat_request(
+                messages=[
+                    {"role": "user", "content": "show"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "report"}],
+                        "refusal": None,
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "view_image", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "c1", "content": [image]},
+                ],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "view_image",
+                            "description": "View an image.",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+
+        res = harmony_resources()
+        exact_ids = render_chat(_make_request(), res).token_ids
+        length_ids = render_chat_for_length(_make_request(), res).token_ids
+        assert length_ids == exact_ids
+        decoded = get_harmony_adapter().encoding.decode(exact_ids)
+        assert "functions.view_image" in decoded
+        assert "report" in decoded
+        assert "omitted" not in decoded
 
     def test_the_length_of_a_refused_request_renders_the_text_and_template_without_the_media(
         self, tokenizer

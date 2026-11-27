@@ -1149,6 +1149,67 @@ def test_count_tokens_rejects_a_malformed_request():
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
+@pytest.mark.parametrize("tool_choice", [None, {"type": "any"}], ids=["exact", "length_fallback"])
+def test_count_tokens_counts_omitted_tool_result_image_note_for_text_only_model(tool_choice):
+    """A tool_result image on a text-only model is rendered as an omission note and counted."""
+    client = _count_tokens_client()
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
+    }
+    note_block = {"type": "text", "text": "[image omitted: this model accepts text only]"}
+
+    def _body(tool_result_content):
+        payload = {
+            "model": MODEL,
+            "tools": [{"name": "view_image", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "Inspect the chart."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "view_image",
+                            "input": {"path": "chart.png"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": tool_result_content,
+                        }
+                    ],
+                },
+            ],
+        }
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        return payload
+
+    with_image = client.post(
+        "/v1/messages/count_tokens",
+        json=_body([{"type": "text", "text": "chart.png"}, image_block]),
+    )
+    with_note = client.post(
+        "/v1/messages/count_tokens",
+        json=_body([{"type": "text", "text": "chart.png"}, note_block]),
+    )
+    without_image = client.post(
+        "/v1/messages/count_tokens",
+        json=_body([{"type": "text", "text": "chart.png"}]),
+    )
+
+    assert with_image.status_code == 200
+    assert with_image.json() == with_note.json()
+    assert with_image.json()["input_tokens"] > without_image.json()["input_tokens"]
+
+
 # ---------------------------------------------------------------------------
 # Disaggregated count_tokens forwarding
 # ---------------------------------------------------------------------------

@@ -755,6 +755,35 @@ class TestMediaTheModelCannotTake:
             )
         assert inspect.getcoroutinestate(user_coro) == inspect.CORO_CLOSED
 
+    def test_earlier_media_coroutines_closed_when_later_part_or_message_refused(self):
+        created: list = []
+
+        def _fake_parse(part, tracker):
+            if part.get("type") == "text":
+                return part["text"]
+            modality = "image" if part["type"] == "image_url" else "audio"
+
+            async def _load():
+                return modality
+
+            coro = _load()
+            created.append(coro)
+            return {"modality": modality, "data": coro, "is_embedding": False}
+
+        audio = {"type": "audio_url", "audio_url": {"url": "http://x/clip.wav"}}
+        same_msg = [{"role": "user", "content": [_IMAGE_PART, audio]}]
+        across_msgs = [
+            {"role": "user", "content": [_IMAGE_PART]},
+            {"role": "user", "content": [audio]},
+        ]
+        with patch.object(_chat_utils, "parse_chat_message_content_part", side_effect=_fake_parse):
+            for messages in (same_msg, across_msgs):
+                created.clear()
+                with pytest.raises(ValueError, match="carries audio input"):
+                    _parse_for(_MM_MODEL_TYPE, messages)
+                assert len(created) == 2
+                assert all(inspect.getcoroutinestate(c) == inspect.CORO_CLOSED for c in created)
+
 
 class TestParseChatMessageContentPart:
     """Unit tests for parse_chat_message_content_part."""
