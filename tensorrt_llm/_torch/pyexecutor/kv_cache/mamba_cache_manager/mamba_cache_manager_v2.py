@@ -1231,17 +1231,22 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             ):
                 return
         row_bytes = math.prod(self.ssm_state_shape) * (
-            self.local_num_mamba_layers * 4
+            torch.float32.itemsize
             if self._periodic_snapshot_requires_staging
             else self.ssm_state_dtype.itemsize
         )
         available = max(
             0, _PERIODIC_SNAPSHOT_STAGING_BYTES - self._periodic_snapshot_staging_in_use_bytes()
         )
+        max_rows = available // row_bytes
+        if self._periodic_snapshot_requires_staging:
+            # Layers reuse the buffer in stream order. Only one layer's
+            # index_select of at most rows - 1 checkpoints is live alongside it.
+            max_rows = (max_rows + 1) // 2
         rows = min(
             self.max_seq_len // interval,
             self._periodic_snapshot_max_tokens // interval,
-            available // row_bytes,
+            max_rows,
         )
         if rows < 2:
             return

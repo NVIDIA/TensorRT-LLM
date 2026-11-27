@@ -146,10 +146,10 @@ def test_gdn_staging_is_shared_across_layers_within_the_budget(monkeypatch):
 
     module.MambaHybridCacheManagerV2._setup_periodic_snapshots(manager)
 
-    assert manager.periodic_snapshot_capacity == 2
-    assert allocate.call_args.args[0] == [2, 2, 128, 128]
+    assert manager.periodic_snapshot_capacity == 4
+    assert allocate.call_args.args[0] == [4, 2, 128, 128]
     assert allocate.call_args.kwargs["device"] == "cuda"
-    first = module.MambaHybridCacheManagerV2.periodic_snapshot_stage_view(manager, 0, 2)
+    first = module.MambaHybridCacheManagerV2.periodic_snapshot_stage_view(manager, 0, 4)
     later = module.MambaHybridCacheManagerV2.periodic_snapshot_stage_view(manager, 3, 1)
     assert first.dtype == torch.float32
     assert later.shape == (1, 2, 128, 128)
