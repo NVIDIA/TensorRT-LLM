@@ -1049,6 +1049,7 @@ def test_decoder_warmup_scope_uses_device_buffer_for_host_only_batch(
     monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
     graphs = object.__new__(DecoderCudaGraphs)
     graphs._forward_warmup = forward
+    graphs._lora_cache_handoff = None
     with FakeTensorMode():
         input_buffer = torch.empty(4, device="cuda")
         output = torch.empty(4, device="cuda")
