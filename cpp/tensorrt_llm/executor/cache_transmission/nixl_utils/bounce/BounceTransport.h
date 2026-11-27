@@ -118,12 +118,19 @@ enum class BounceFailReason : std::uint8_t
 
 [[nodiscard]] char const* toString(BounceFailReason reason);
 
-/// A bounce request's single result: the terminal state plus, on kFAILURE, its cause. The future
-/// is the ONE source of truth — no side channel to keep in sync.
+struct BounceDrain
+{
+    std::promise<bool> completion;
+    std::shared_future<bool> result{completion.get_future().share()};
+};
+
+/// Transfer outcome and, on failure, any remaining destination-drain evidence.
 struct BounceResult
 {
     TransferState state{TransferState::kFAILURE};
     BounceFailReason reason{BounceFailReason::kNone};
+    bool remoteDrained{false};
+    std::shared_ptr<BounceDrain> remoteDrain{};
 };
 
 /// Shared dependencies used by both roles. Holds the injected channel/agent/arena/exec (borrowed,
@@ -224,6 +231,7 @@ private:
     {
         std::string key;
         std::uint64_t offset{}; // receiver arena region offset freed once scattered
+        bool destinationDrained{true};
     };
 
     /// The set of incoming regions currently scattering — the `busy` set passed to the scheduler's
@@ -235,11 +243,12 @@ private:
     void reclaimAndFlagDeferred(
         std::function<std::vector<Grant>(std::unordered_set<std::uint64_t> const&, std::vector<std::uint64_t>&)> const&
             reclaim);
+    void acknowledgeDrained(std::string const& key);
     void scatterWorkerLoop();
     /// Exception recovery for one scatter job (worker thread): release a still-held exec context,
     /// NACK unless an ACK or NACK was already attempted, and push the ScatterDone unless already pushed.
-    void recoverScatterJob(
-        ScatterJob const& job, ExecCtx* ctx, bool acked, bool nackSent, bool donePushed, char const* what);
+    void recoverScatterJob(ScatterJob const& job, ExecCtx* ctx, bool acked, bool nackSent, bool donePushed,
+        bool destinationDrained, char const* what);
 
     BounceContext& mCtx;
     std::vector<std::thread> mWorkers;
@@ -259,7 +268,15 @@ private:
     // from re-granting an incoming region a worker is still reading; the orphaned flag decides whether
     // drainScatterDone frees the region via freeOrphanRegion (flow already gone) or onScatterDone
     // (normal completion).
-    std::unordered_map<std::uint64_t, bool> mScattering;
+    struct ActiveScatter
+    {
+        std::string key;
+        bool orphaned{false};
+    };
+
+    std::unordered_map<std::uint64_t, ActiveScatter> mScattering;
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> mDrainAcks;
+    bool mScatterDrainUnproven{false};
 
     std::chrono::steady_clock::time_point mNextSweep{}; // checkTimeouts() throttle (IO-thread-only)
 };
@@ -283,6 +300,7 @@ public:
 
     void onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
     void onAck(std::string const& peer, BounceMsgHeader const& h);
+    void onDrainAck(std::string const& peer, BounceMsgHeader const& h);
     /// The receiver reported it cannot complete a chunk/request: fail the request now (kPeerNack)
     /// instead of waiting out requestTimeoutMs. Unknown / wrong-peer NACKs are dropped like ACKs.
     void onNack(std::string const& peer, BounceMsgHeader const& h);
@@ -465,6 +483,14 @@ private:
     // drainOrphanLocal() sends the cancel once the flow's last in-flight write reaches terminal.
     // rid -> peer. IO-thread-only.
     std::unordered_map<std::uint64_t, std::string> mPendingCancel;
+
+    struct PendingDrain
+    {
+        std::string peer;
+        std::weak_ptr<BounceDrain> drain;
+    };
+
+    std::unordered_map<std::uint64_t, PendingDrain> mAwaitingDrain;
 };
 
 /// The thin reactor: owns the shared context, the sender + receiver, and the IO thread. Routes each
