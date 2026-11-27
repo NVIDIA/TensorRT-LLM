@@ -74,7 +74,7 @@ if TYPE_CHECKING:
 _SM = (10, 7)
 
 # The kernel the SM107 MegaMoE op builds per launch bucket (cute_dsl_megamoe_custom_op._construct_megamoe_kernel); a
-# default tactic the gen-phase kernel refuses runs its next candidate on the generic kernel, with a one-time warning.
+# rejected gen-phase specialization builds the generic kernel and is logged at debug level only.
 _KERNEL = (
     f"RubinInferenceGenphaseMegaMoE up to {_megamoe_op._SM107_GENPHASE_MAX_TOKENS_PER_RANK} tokens per rank "
     f"(generic-kernel buckets {sorted(_megamoe_op._SM107_GENERIC_KERNEL_BUCKETS)}), RubinInferenceMegaMoE otherwise"
