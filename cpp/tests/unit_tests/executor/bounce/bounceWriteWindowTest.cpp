@@ -95,11 +95,14 @@ TEST(BounceReceiveWindow, RangeBoundariesAndDuplicateRegistration)
 TEST(BounceReceiveWindow, SignedMessageUsesTheIssuedWindow)
 {
     std::string const key(16, 'a');
+    std::string const otherKey(16, 'b');
+    EXPECT_EQ(b::bounceWindowId(key), "\x77\x64\xd0\x2a\xdb\xa0\x6f\x44\xf4\x25\x3e\x8c\x32\xa1\xc7\xd3");
+    EXPECT_EQ(b::bounceWindowId(otherKey), "\xcc\x87\xc9\x23\xce\xac\xcd\xe5\xfc\x39\x7b\x75\x67\x4e\xf4\xa9");
     std::string const message = "completed";
     auto const envelope = b::signBounceFrame(message, key);
     std::string id;
     ASSERT_TRUE(b::readBounceWindowId(envelope, message.size(), id));
     EXPECT_EQ(id, b::bounceWindowId(key));
     EXPECT_TRUE(b::verifyBounceFrame(envelope, key));
-    EXPECT_FALSE(b::verifyBounceFrame(envelope, std::string(16, 'b')));
+    EXPECT_FALSE(b::verifyBounceFrame(envelope, otherKey));
 }
