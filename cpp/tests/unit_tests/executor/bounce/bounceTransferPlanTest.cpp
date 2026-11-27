@@ -194,8 +194,8 @@ TEST(BounceTransferPlan, ScatterRunsCoalesceContiguousDst)
     auto const& c = plan.chunks()[0];
     EXPECT_EQ(c.srcPtrs.size(), 3u);
     ASSERT_EQ(c.scatterRuns.size(), 1u);
-    EXPECT_EQ(c.scatterRuns[0].dstAddr, 0x9000u);
-    EXPECT_EQ(c.scatterRuns[0].bounceOffset, 0u);
+    EXPECT_EQ(std::uint64_t{c.scatterRuns[0].dstAddr}, 0x9000u);
+    EXPECT_EQ(std::uint64_t{c.scatterRuns[0].bounceOffset}, 0u);
     EXPECT_EQ(c.scatterRuns[0].pieceSize, 96u);
     EXPECT_EQ(c.scatterRuns[0].count, 1u);
 }
@@ -210,8 +210,8 @@ TEST(BounceTransferPlan, ScatterRunsCoalesceUniformlyStridedDst)
     ASSERT_EQ(plan.numChunks(), 1u);
     auto const& c = plan.chunks()[0];
     ASSERT_EQ(c.scatterRuns.size(), 1u);
-    EXPECT_EQ(c.scatterRuns[0].dstAddr, 0x9000u);
-    EXPECT_EQ(c.scatterRuns[0].dstStride, 0x80u);
+    EXPECT_EQ(std::uint64_t{c.scatterRuns[0].dstAddr}, 0x9000u);
+    EXPECT_EQ(std::uint64_t{c.scatterRuns[0].dstStride}, 0x80u);
     EXPECT_EQ(c.scatterRuns[0].bounceStride, 32u);
     EXPECT_EQ(c.scatterRuns[0].pieceSize, 32u);
     EXPECT_EQ(c.scatterRuns[0].count, 3u);
@@ -233,7 +233,7 @@ TEST(BounceTransferPlan, ScatterRunsBreakOnDstHoleOrAlignGap)
     ASSERT_EQ(planGap.numChunks(), 1u);
     auto const& c = planGap.chunks()[0];
     ASSERT_EQ(c.scatterRuns.size(), 2u);
-    EXPECT_EQ(c.scatterRuns[1].bounceOffset, 128u); // alignUp(100,32)
+    EXPECT_EQ(std::uint64_t{c.scatterRuns[1].bounceOffset}, 128u); // alignUp(100,32)
 }
 
 TEST(BounceTransferPlan, ScatterRunsIrregularStrideBreaks)
@@ -247,5 +247,5 @@ TEST(BounceTransferPlan, ScatterRunsIrregularStrideBreaks)
     ASSERT_EQ(c.scatterRuns.size(), 2u);
     EXPECT_EQ(c.scatterRuns[0].count, 2u);
     EXPECT_EQ(c.scatterRuns[1].count, 1u);
-    EXPECT_EQ(c.scatterRuns[1].dstAddr, 0x90C0u);
+    EXPECT_EQ(std::uint64_t{c.scatterRuns[1].dstAddr}, 0x90C0u);
 }
