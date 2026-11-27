@@ -899,6 +899,8 @@ class LlmResult:
         self.is_final = is_final
         # Whether the request ended after its context (prefill) pass.
         self.ends_after_context = False
+        # Whether the request asked for perf metrics.
+        self.return_perf_metrics = False
         self.cached_tokens = 0
         # Cumulative (accepted, drafted) speculative-decoding draft-token
         # totals from the PyTorch executor; used to backfill
@@ -1429,7 +1431,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
             llm_result.remote_tail_start = self.py_csa2_remote_tail_start
         llm_result.cached_tokens = self.cached_tokens
-        llm_result.ends_after_context = is_final and self.py_decoding_iter <= 1
+        if is_final and not self.is_generation_only_request:
+            # A generation-only request runs no context pass here.
+            llm_result.ends_after_context = self.py_decoding_iter <= 1
+        llm_result.return_perf_metrics = self.return_perf_metrics
         return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,

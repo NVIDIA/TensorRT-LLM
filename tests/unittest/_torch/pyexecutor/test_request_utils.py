@@ -29,7 +29,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
     RequestQueueItem,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest, PythonRequestInputs
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
@@ -494,6 +494,45 @@ def test_child_factory_shares_only_sequence_group_completion(streaming) -> None:
         assert response.result.is_final is expected_final
     assert child.is_finished
     assert sibling.is_finished
+
+
+@pytest.mark.parametrize(
+    ("request_type", "decoding_iter", "finished", "expected"),
+    [
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, 1, True, True),
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY, 1, True, True),
+        # Cancelled before its last context chunk was sampled.
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY, 0, True, True),
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, 1, False, False),
+        (LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, 2, True, False),
+        # Ended by the first token it received: it ran no context pass here.
+        (LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY, 1, True, False),
+    ],
+)
+@pytest.mark.parametrize("return_perf_metrics", [False, True])
+def test_response_says_whether_its_request_ended_after_the_context_pass(
+    request_type, decoding_iter, finished, expected, return_perf_metrics
+) -> None:
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        return_perf_metrics=return_perf_metrics,
+    )
+    request.py_llm_request_type = request_type
+    request.py_decoding_iter = decoding_iter
+    if finished:
+        request.finish_by_reason(trtllm.FinishReason.CANCELLED)
+    else:
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        request.add_new_tokens([4])
+    response = request.create_response()
+    assert response is not None
+    assert response.result.is_final is finished
+    assert response.result.ends_after_context is expected
+    assert response.result.return_perf_metrics is return_perf_metrics
 
 
 @pytest.mark.parametrize("input_field", ["py_multimodal_data", "py_disaggregated_params"])

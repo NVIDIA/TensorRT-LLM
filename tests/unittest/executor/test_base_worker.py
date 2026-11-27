@@ -1139,6 +1139,7 @@ def _llm_response(client_id: int,
                   *,
                   final: bool = True,
                   prefill_only: bool = True,
+                  perf_metrics: bool = False,
                   error: str | None = None,
                   context_logits: object = None,
                   prompt_rows: list[torch.Tensor] | None = None,
@@ -1151,6 +1152,7 @@ def _llm_response(client_id: int,
             context_prompt_last_logprobs=prompt_last_row)
         result = LlmResult(b"serialized", py_result, is_final=final)
         result.ends_after_context = final and prefill_only
+        result.return_perf_metrics = perf_metrics
     return LlmResponse(request_id=100 + client_id,
                        error_msg=error,
                        result=result,
@@ -1160,28 +1162,27 @@ def _llm_response(client_id: int,
 @pytest.mark.cpu_only
 def test_other_ranks_pack_final_responses_and_the_leader_forwards_them(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    metrics = {"arrival_time": 1.5}
-    monkeypatch.setattr(
-        base_worker, "get_metrics_dict", lambda response: {}
-        if response.client_id == 3 else metrics)
+    # Packing reads no perf metrics, which would deserialize the result.
+    monkeypatch.setattr(base_worker, "get_metrics_dict",
+                        Mock(side_effect=AssertionError))
     # The leader finishes these itself: only the final response of a request
-    # that ended after its context pass is packed.
+    # that ended after its context pass and asked for no perf metrics is packed.
     kept = [(104, _llm_response(4, final=False)),
             (105, _llm_response(5, error="boom")),
             (106, _llm_response(6, context_logits="logits")),
-            (107, _llm_response(7, prefill_only=False))]
+            (107, _llm_response(7, prefill_only=False)),
+            (108, _llm_response(8, perf_metrics=True))]
 
     pairs = base_worker.pack_final_responses([(101, _llm_response(1)), *kept,
                                               (103, _llm_response(3))])
 
-    assert pairs[:4] == kept
-    (_, packed), = pairs[4:]
+    assert pairs[:5] == kept
+    (_, packed), = pairs[5:]
     assert packed.client_ids == [1, 3]
-    measured, plain = pickle.loads(packed.payload)
-    assert isinstance(measured, ResponseWrapper)
-    assert measured.request_perf_metrics == metrics and measured.logprobs is None
-    assert measured.client_id == 1 and measured.result.is_final
-    assert type(plain) is LlmResponse and plain.client_id == 3
+    first, second = pickle.loads(packed.payload)
+    assert type(first) is LlmResponse and type(second) is LlmResponse
+    assert first.client_id == 1 and first.result.is_final
+    assert second.client_id == 3
     assert base_worker.pack_final_responses(kept) == kept
 
     sent = []

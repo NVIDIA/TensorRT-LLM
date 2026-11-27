@@ -1759,22 +1759,21 @@ def pack_final_responses(
     The leader then forwards them without loading them. Only the final response
     of a request that ended after its context pass is packed. Every other
     response stays as it is, and so do those the leader has to finish itself:
-    one that carries an error or holds what prompt logprobs are computed from,
-    which is the context logits or the rows the executor reduced them to.
+    one that carries an error, one of a request that asked for perf metrics,
+    and one that holds what prompt logprobs are computed from, which is the
+    context logits or the rows the executor reduced them to.
     """
     kept, packed, client_ids = [], [], []
     for item in responses:
         response = item[1]
         result = getattr(response, "result", None)
         if (result is None or not result.is_final
-                or not result.ends_after_context
+                or not result.ends_after_context or result.return_perf_metrics
                 or result.context_logits is not None
                 or result.context_prompt_logprob_rows is not None):
             kept.append(item)
             continue
-        metrics = get_metrics_dict(response)
-        packed.append(
-            ResponseWrapper(response, None, metrics) if metrics else response)
+        packed.append(response)
         client_ids.append(response.client_id)
     if packed:
         # The key only has to differ from every request id.
