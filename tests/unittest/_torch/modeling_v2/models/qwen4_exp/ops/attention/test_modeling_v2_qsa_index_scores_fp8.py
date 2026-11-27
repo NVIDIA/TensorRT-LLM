@@ -251,3 +251,41 @@ def test_early_pf_rows_env(monkeypatch):
         monkeypatch.setenv(_module.EARLY_PF_ROWS_ENV, bad)
         with pytest.raises(ValueError):
             _module._early_pf_rows()
+
+
+@pytest.mark.parametrize(
+    "cutoff, early, want",
+    [
+        (0, True, None),  # unset: the default launch
+        (128, True, 0),
+        (159, True, 0),
+        (160, True, None),  # not more than the cutoff
+        (128, False, 0),  # not early: never a prefetch
+    ],
+    ids=["off", "past128", "past159", "at160", "not_early"],
+)
+def test_early_pf_rows_selects_the_launch(monkeypatch, cutoff, early, want):
+    """`TRTLLM_QWEN4_EXP_INDEX_EARLY_PF_ROWS`: the flat launch of a 160-row call prefetches
+    `_EARLY_PF_TILES` tiles unless the call is early and has more rows than the cutoff (the
+    bitwise test above cannot see which launch ran: the prefetch is only a hint)."""
+    want = _module._EARLY_PF_TILES if want is None else want
+    spec = _module._scores_spec(
+        requests=tuple((4800 + 4100 * r, 4) for r in range(40)), rows_per_request=4, table=8196
+    )
+    args, _, _ = build(spec, seed=37)
+    real = _module._qsa_index_scores_flat_kernel
+    seen = []
+
+    class Spy:
+        def __getitem__(self, grid):
+            def launch(*a, **kw):
+                seen.append(kw["PF_TILES"])
+                return real[grid](*a, **kw)
+
+            return launch
+
+    monkeypatch.setattr(_module, "_qsa_index_scores_flat_kernel", Spy())
+    monkeypatch.setattr(_module, "_EARLY_PF_ROWS", cutoff)
+    qsa_index_scores_fp8(**args, early=early)
+    torch.cuda.synchronize()
+    assert seen == [want]
