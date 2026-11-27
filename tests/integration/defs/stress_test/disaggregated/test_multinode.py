@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 import yaml
+from defs.conftest import skip_pre_blackwell
 from multinode_utils import check_peer, peer_connection, slurm_topology, wait_for_signal
 
 if TYPE_CHECKING:
@@ -40,7 +41,7 @@ __extra_import_path__ = [
     "~/tests/integration/defs/disaggregated",
 ]
 
-pytestmark = pytest.mark.threadleak(enabled=False)
+pytestmark = [skip_pre_blackwell, pytest.mark.threadleak(enabled=False)]
 
 CTX_PORT, GEN_PORT, FRONTEND_PORT, CONTROL_PORT = 8001, 8002, 8000, 8003
 
