@@ -911,9 +911,10 @@ def _sm107_tactic_bucket(max_tokens_per_rank: int) -> Optional[int]:
 
 
 # Generation-phase rows of single shapes, keyed by the full runner key with max_tokens_per_rank
-# normalized to its bucket; they replace the bucket entry above for that key only. GLM 5.2 at EP4
-# (64 experts per rank, top-8, hidden 6144, intermediate 2048, top-k weights at FC1): the decode
-# tactic measured fastest at 384 and 512 tokens per rank on VR200.
+# normalized to its bucket; they replace the bucket entry above for that key only. Each row is the
+# tactic measured fastest for its key and bucket on VR200: GLM 5.2 (top-8, hidden 6144,
+# intermediate 2048, top-k weights at FC1) at EP4 and EP16, and DeepSeek-V4.1-Flash and Kimi K3.1
+# at EP16.
 def _sm107_glm52_problem_key(world_size: int, num_experts_per_rank: int, bucket: int) -> Tuple:
     return (
         107,
@@ -937,20 +938,77 @@ def _sm107_glm52_problem_key(world_size: int, num_experts_per_rank: int, bucket:
     )
 
 
-_SM107_GENPHASE_SHAPE_TACTICS: dict[Tuple, Tuple] = {
-    _sm107_glm52_problem_key(4, 64, bucket): (
-        [256, 128, 256],
+def _sm107_dsv41_flash_problem_key(
+    world_size: int, bucket: int, swiglu: Optional[Tuple[float, float]]
+) -> Tuple:
+    return (
+        (107, world_size, 6, 384 // world_size, 5120, 2304, 4608, bucket, str(torch.bfloat16))
+        + (True, 10.0, None, None, False, "bf16")
+        + (swiglu if swiglu is not None else (None, None))
+        + (0,)
+    )
+
+
+def _sm107_kimi_k3_problem_key(world_size: int, bucket: int) -> Tuple:
+    return (
+        107,
+        world_size,
+        16,
+        896 // world_size,
+        3584,
+        3072,
+        6144,
+        bucket,
+        str(torch.bfloat16),
+    ) + (
+        False,
+        None,
+        4.0,
+        25.0,
+        False,
+        "bf16",
+        None,
+        None,
+        0,
+    )
+
+
+def _sm107_decode_tactic(
+    tile_n: int, lead: int, fc2_tma_stages: int, epi_flag_batch: Tuple[int, int]
+) -> Tuple:
+    return (
+        [256, tile_n, 256],
         [4, 1, 1],
         None,
-        ("decode", 27),
+        ("decode", lead),
         "atomic_counter",
         "epi_warps",
         True,
+        fc2_tma_stages,
         1,
-        1,
-        (1, 1),
+        epi_flag_batch,
     )
-    for bucket in (384, 512)
+
+
+_SM107_N128_LEAD27 = _sm107_decode_tactic(128, 27, 1, (1, 1))
+_SM107_N128_LEAD14 = _sm107_decode_tactic(128, 14, 1, (2, 4))
+_SM107_N256_LEAD14 = _sm107_decode_tactic(256, 14, 2, (1, 1))
+_SM107_GENPHASE_SHAPE_TACTICS: dict[Tuple, Tuple] = {
+    **{_sm107_glm52_problem_key(4, 64, bucket): _SM107_N128_LEAD27 for bucket in (384, 512)},
+    **{_sm107_glm52_problem_key(16, 16, bucket): _SM107_N128_LEAD14 for bucket in (384, 512)},
+    **{
+        _sm107_dsv41_flash_problem_key(16, bucket, swiglu): tactic
+        for bucket, tactic in (
+            (192, _SM107_N128_LEAD14),
+            (256, _SM107_N128_LEAD14),
+            (384, _SM107_N256_LEAD14),
+            (512, _SM107_N128_LEAD14),
+        )
+        for swiglu in (None, (1.0, 0.0))
+    },
+    _sm107_kimi_k3_problem_key(16, 256): _SM107_N128_LEAD27,
+    _sm107_kimi_k3_problem_key(16, 384): _SM107_N256_LEAD14,
+    _sm107_kimi_k3_problem_key(16, 512): _SM107_N256_LEAD14,
 }
 
 

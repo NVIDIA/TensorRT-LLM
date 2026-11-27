@@ -5018,11 +5018,11 @@ def test_sm107_glm52_genphase_rows_apply_to_their_key_only(monkeypatch: pytest.M
     # Neighbouring buckets keep their bucket entry.
     for capacity in (128, 256, 1024):
         assert default(key(4, 64, capacity)) == bucket_entry(capacity), capacity
-    # The rows are measured at EP4 (64 experts per rank) only: EP8 and EP16 (32 and 16 experts per
-    # rank) and other shape fields keep the bucket entry.
+    # The rows are measured at EP4 (64 experts per rank) only: EP8 (32 experts per rank) keeps the
+    # bucket entry, EP16 (16) has its own row, and other shape fields keep the bucket entry.
     for capacity in (384, 512):
-        for world_size, experts in ((8, 32), (16, 16)):
-            assert default(key(world_size, experts, capacity)) == bucket_entry(capacity)
+        assert default(key(8, 32, capacity)) == bucket_entry(capacity)
+        assert default(key(16, 16, capacity)) != row
         assert default(key(4, 64, capacity, apply_topk_in_fc1=False)) == bucket_entry(capacity)
         assert default(key(4, 64, capacity, gate_up_clamp=10.0)) == bucket_entry(capacity)
         assert default(key(4, 64, capacity, sm_version=103))[3][0] != "decode"
@@ -5045,6 +5045,90 @@ def test_sm107_glm52_genphase_rows_apply_to_their_key_only(monkeypatch: pytest.M
     # The default runs the row, and autotuning offers it.
     assert runner._default_tactic(384) == row
     assert row in runner.get_valid_tactics([torch.empty(384, 1)], None)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["deepseek_v4_1_flash", "kimi_k3_1", "glm_5_2"])
+def test_sm107_ep16_genphase_rows_apply_to_their_key_only(model: str) -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    shapes = {
+        "deepseek_v4_1_flash": dict(
+            num_topk=6,
+            num_experts=384,
+            hidden_size=5120,
+            intermediate_size_per_partition=2304,
+            apply_topk_in_fc1=True,
+            gate_up_clamp=10.0,
+        ),
+        "kimi_k3_1": dict(
+            num_topk=16,
+            num_experts=896,
+            hidden_size=3584,
+            intermediate_size_per_partition=3072,
+            apply_topk_in_fc1=False,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        ),
+        "glm_5_2": dict(
+            num_topk=8,
+            num_experts=256,
+            hidden_size=6144,
+            intermediate_size_per_partition=2048,
+            apply_topk_in_fc1=True,
+        ),
+    }
+    n128_lead14 = ([256, 128, 256], [4, 1, 1], None, ("decode", 14), "atomic_counter")
+    n128_lead27 = ([256, 128, 256], [4, 1, 1], None, ("decode", 27), "atomic_counter")
+    n256_lead14 = ([256, 256, 256], [4, 1, 1], None, ("decode", 14), "atomic_counter")
+    rows = {
+        "deepseek_v4_1_flash": {
+            192: n128_lead14,
+            256: n128_lead14,
+            384: n256_lead14,
+            512: n128_lead14,
+        },
+        "kimi_k3_1": {256: n128_lead27, 384: n256_lead14, 512: n256_lead14},
+        "glm_5_2": {384: n128_lead14, 512: n128_lead14},
+    }[model]
+
+    def default(world_size: int, capacity: int) -> Tuple:
+        fields = dict(shapes[model])
+        experts = fields.pop("num_experts")
+        intermediate = fields["intermediate_size_per_partition"]
+        key = megamoe_op._megamoe_problem_key(
+            **{
+                **dict(
+                    sm_version=107,
+                    world_size=world_size,
+                    num_experts_per_rank=experts // world_size,
+                    expand_intermediate_size_per_partition=2 * intermediate,
+                    max_tokens_per_rank=capacity,
+                    output_dtype=torch.bfloat16,
+                    gate_up_clamp=None,
+                    situ_beta=None,
+                    situ_linear_beta=None,
+                    in_kernel_fc2_reduce=False,
+                    combine_format="bf16",
+                ),
+                **fields,
+            }
+        )
+        return megamoe_op._default_megamoe_tactic_for_key(key, num_tokens=capacity)
+
+    def bucket_entry(capacity: int) -> Tuple:
+        bucket = megamoe_op._sm107_tactic_bucket(capacity)
+        return megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[bucket])
+
+    for bucket, row in rows.items():
+        # Any capacity that rounds up to the bucket takes the row at EP16 ...
+        for capacity in (bucket - 1, bucket):
+            assert default(16, capacity)[:5] == row, (bucket, capacity)
+        # ... and EP8 keeps the bucket entry (GLM 5.2 at EP4 has its own rows).
+        assert default(8, bucket) == bucket_entry(bucket), bucket
+    # Buckets without a row keep their bucket entry.
+    for capacity in (128, 1024):
+        assert default(16, capacity) == bucket_entry(capacity), capacity
 
 
 @pytest.mark.cpu_only
