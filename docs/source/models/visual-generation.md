@@ -179,7 +179,7 @@ Tile geometry and blending follow the loaded Diffusers VAE.
 Tensor parallelism shards the DiT attention and gated MLP weights via
 `parallel_config.tp_size`. The text encoder, AdaLN modulation, and media
 input/output projections remain replicated. TP can be combined with Ulysses;
-Ulysses supports VANILLA, FA4, TRTLLM, and FLASHINFER attention. CFG, ring, and Attention2D parallelism
+Ulysses supports VANILLA, FA4, TRTLLM, FLASHINFER, and CUTEDSL with `deco_attention`. CFG, ring, and Attention2D parallelism
 are not supported. See the
 [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
@@ -444,7 +444,7 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
     - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN, LTX-2 and MiniMax-H3 self-attention. MiniMax-H3 async is validated in BF16 only; FP8/NVFP4 combinations remain unvalidated.
 - **Parallel VAE** (`parallel_vae_size: N`): Parallelizes the final VAE decode (constraint: `parallel_vae_size ≤ world_size`). WAN/Cosmos3 shard along a spatial axis; LTX-2, LTX-2.3, and MiniMax-H3 distribute independent tiles.
-- **Context Parallel (CP)** — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (`FA4` or `CUTEDSL`). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = `cp_size · ulysses_size`. The CP degree depends on the implementation below:
+- **Context Parallel (CP)** — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (`FA4`, or `CUTEDSL` without `deco_attention`). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = `cp_size · ulysses_size`. The CP degree depends on the implementation below:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.

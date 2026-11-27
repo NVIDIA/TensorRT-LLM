@@ -41,7 +41,6 @@ _MULTI_GPU_RE = re.compile(r"\d+_GPUs")
 _STAGE_SHARD_SUFFIX_RE = re.compile(r"-\d+(_of_\d+)?(-cbts)?$")
 _ON_DEMAND_MARKER = "-OnDemand-"
 _POST_MERGE_MARKER = "Post-Merge"
-_PERF_SANITY_MARKER = "PerfSanity"
 _PACKAGE_SANITY_MARKER = "PackageSanityCheck"
 
 
@@ -99,10 +98,9 @@ def _case_counts(
     the same YAML entries once per shard would over-weight highly sharded
     platforms in both the numerator and denominator.
 
-    PerfSanity and PackageSanityCheck stages can be force-kept even when they
-    are not in affected_stages. Coverage selection can similarly request that
-    baseline multi-GPU stages be re-added; all such stages use their full
-    counts in the numerator.
+    PackageSanityCheck can be force-kept even when absent from affected_stages.
+    Coverage selection can also retain baseline multi-GPU stages. Both use
+    their full case counts in the numerator.
 
     Only meaningful when CBTS ran; returns (0, 0) otherwise or on any failure
     so the record still posts.
@@ -140,12 +138,6 @@ def _case_counts(
         if decision.get("sanity_required", True):
             force_kept_groups.update(
                 group for group in scheduled_groups if _PACKAGE_SANITY_MARKER in group
-            )
-        if decision.get("perfsanity_required", True):
-            force_kept_groups.update(
-                group
-                for group in scheduled_groups
-                if _PERF_SANITY_MARKER in group and _POST_MERGE_MARKER not in group
             )
         if decision.get("enable_multi_gpu", False) and multi_gpu_scheduled:
             force_kept_groups.update(

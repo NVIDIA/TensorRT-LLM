@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from ..conftest import get_device_count, get_gpu_device_list, llm_models_root
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
-from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
+from .pytorch_model_config import get_model_yaml_config, get_perf_config_preset
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
@@ -475,6 +475,26 @@ class PerfTestMetric(NamedTuple):
     cmd_idx: int
 
 
+# Test-name options also consumed by the launcher, with their YAML paths.
+_LAUNCH_OPTIONS = {
+    'maxbs': ('max_batch_size', 'max_batch_size'),
+    'maxnt': ('max_num_tokens', 'max_num_tokens'),
+    'tp': ('tp_size', 'tensor_parallel_size'),
+    'pp': ('pp_size', 'pipeline_parallel_size'),
+    'ep': ('ep_size', 'moe_expert_parallel_size'),
+    'kv_frac': ('kv_cache_free_gpu_mem_fraction',
+                'kv_cache_config.free_gpu_memory_fraction'),
+}
+
+
+def _launch_options_in(config: dict):
+    for option, (attribute, path) in _LAUNCH_OPTIONS.items():
+        parent, _, key = path.rpartition('.')
+        section = config.get(parent, {}) if parent else config
+        if section is not None and key in section:
+            yield option, attribute, section, key
+
+
 class PerfTestConfig:
     """
     Configurations defining the LLM perf test.
@@ -562,8 +582,9 @@ class PerfTestConfig:
         self.moe_backend = moe_backend
         # Shared random prefix length (serve only), added in front of every prompt.
         self.prefix_len = prefix_len
-        # "+"-joined names from PERF_CONFIG_PRESETS in pytorch_model_config.py.
+        # "+"-joined presets with optional per-recipe field overrides.
         self.cfg_presets = cfg_presets
+        self.explicit_options: set[str] = set()
 
     def to_string(self,
                   custom_server_name: str = None,
@@ -694,8 +715,15 @@ class PerfTestConfig:
         Populate the config properties given the test param string.
         """
 
-        # Extract configs from test param labels.
-        labels = test_param_labels.split("-")
+        # Keep hyphens in curated YAML filenames within the final cfg label.
+        case, separator, presets = test_param_labels.partition("-cfg:")
+        labels = case.split("-")
+        self.explicit_options = {
+            label.partition(':')[0]
+            for label in labels if ':' in label
+        }
+        if separator:
+            labels.append(f"cfg:{presets}")
 
         self.model_name = labels.pop(0)
 
@@ -802,8 +830,24 @@ class PerfTestConfig:
             labels
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
 
-        # Validate the parsed config.
+        supplied = self.explicit_options.copy()
+        if self.cfg_presets is not None:
+            for selection in self.cfg_presets.split("+"):
+                recipe = get_perf_config_preset(selection)
+                for option, attribute, section, key in _launch_options_in(
+                        recipe):
+                    if option not in self.explicit_options:
+                        setattr(self, attribute, section[key])
+                    supplied.add(option)
+
+        self._resolve_topology(supplied)
         self.validate()
+
+    def _resolve_topology(self, supplied: set[str]) -> None:
+        if 'gpus' not in supplied:
+            self.num_gpus = self.tp_size * self.pp_size
+        elif 'tp' not in supplied and self.pp_size > 0:
+            self.tp_size = self.num_gpus // self.pp_size
 
     def validate(self):
         """
@@ -845,15 +889,6 @@ class PerfTestConfig:
                 and self.model_name not in SERVE_IMAGE_MODELS, \
                 "prefix applies only to the random text dataset!"
 
-        if self.cfg_presets is not None:
-            unknown_presets = [
-                name for name in self.cfg_presets.split("+")
-                if name not in PERF_CONFIG_PRESETS
-            ]
-            assert not unknown_presets, (
-                f"Unknown cfg preset(s) {unknown_presets}; "
-                f"known presets: {sorted(PERF_CONFIG_PRESETS)}")
-
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
             VALID_QUANTS = [
@@ -882,12 +917,7 @@ class PerfTestConfig:
         if self.pp_size > 1:
             assert self.model_name in MODEL_PATH_DICT.keys(
             ), f"Invalid model name for pp size {self.pp_size} test"
-        if self.num_gpus > 1 and self.tp_size == 1 and self.pp_size == 1:
-            self.tp_size = self.num_gpus
-
-        if self.tp_size > 1 or self.pp_size > 1 and self.num_gpus == 1:
-            self.num_gpus = self.tp_size * self.pp_size
-
+        assert self.tp_size > 0 and self.pp_size > 0, "TP and PP must be positive!"
         assert self.num_gpus == self.tp_size * self.pp_size, f"Num of GPU shall be equal to TP*PP: {self.num_gpus}, {self.tp_size}, {self.pp_size}"
         if self.gpu_weights_percent != -1:
             assert 0 <= self.gpu_weights_percent <= 1, f"Invalid gpu_weights_percent: {self.gpu_weights_percent}!"
@@ -1043,12 +1073,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_test_name(self) -> str:
         return str(self._config)
 
-    def _get_kv_cache_free_gpu_mem_fraction(self) -> float:
+    def _get_kv_cache_free_gpu_mem_fraction(self,
+                                            fraction: float | None = None
+                                            ) -> float:
         """Return the KV cache fraction, capped on H100 for known OOM cases.
 
         The cap leaves the test name, and thus its perf history, unchanged.
         """
-        fraction = self._config.kv_cache_free_gpu_mem_fraction
+        if fraction is None:
+            fraction = self._config.kv_cache_free_gpu_mem_fraction
         lens = list(zip(self._config.input_lens, self._config.output_lens))
         cap = None
         if len(lens) == 1:
@@ -1132,6 +1165,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def _get_model_yaml_config(self) -> dict:
         config = get_model_yaml_config(self._config.to_string(),
                                        lora_dirs=self.lora_dirs)
+        for option, attribute, section, key in _launch_options_in(config):
+            if option in self._config.explicit_options:
+                section[key] = getattr(self._config, attribute)
+        if 'kv_cache_dtype' in self._config.explicit_options:
+            config.setdefault('kv_cache_config',
+                              {})['dtype'] = self._config.kv_cache_dtype
         if self._config.moe_backend is not None:
             config.setdefault('moe_config',
                               {})['backend'] = self._config.moe_backend
@@ -1372,8 +1411,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         serve_config.setdefault('max_batch_size', self._config.max_batch_size)
         serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)
         kv_cache_cfg = serve_config.setdefault('kv_cache_config', {})
-        kv_cache_cfg.setdefault('free_gpu_memory_fraction',
-                                self._get_kv_cache_free_gpu_mem_fraction())
+        fraction = self._get_kv_cache_free_gpu_mem_fraction(
+            kv_cache_cfg.get('free_gpu_memory_fraction'))
+        kv_cache_cfg['free_gpu_memory_fraction'] = fraction
         if self._config.tp_size > 1:
             serve_config.setdefault('tensor_parallel_size',
                                     self._config.tp_size)
@@ -1868,15 +1908,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             print_info(f"Metric {metric_name} is N/A; skip recording it.")
             return None
 
-        if len(metric_values) == 0:
-            if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
-                print_info("skip building process for multi-gpu test"
-                           )  #https://nvbugspro.nvidia.com/bug/5210111
-                metric_values = [0.0]
-            else:
-                raise RuntimeError(
-                    f"Cannot find perf result for {metric_name} from perf script logs!"
-                )
+        if not metric_values:
+            raise RuntimeError(
+                f"Cannot find perf result for {metric_name} from perf script logs!"
+            )
 
         if metric.metric_type in BUILDER_METRICS and metric.metric_type != PerfMetricType.ENGINE_SIZE:
             # For enc-dec models, there are 2 builder perf metrics, we add them up.
