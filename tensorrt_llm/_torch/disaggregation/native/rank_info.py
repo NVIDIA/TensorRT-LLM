@@ -178,23 +178,37 @@ class RankInfo:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
-        unpacked = msgpack.unpackb(data, strict_map_key=False)
-        # A peer that predates the versioned frames sends no version field.
-        # Check the version before building the dataclass: a peer on another
-        # version may send fields this release does not define.
-        _check_protocol_version(unpacked.get("protocol_version", _LEGACY_PROTOCOL_VERSION))
-        if unpacked.get("attention") is not None:
-            unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
-        if unpacked.get("page_table") is not None:
-            unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
-        if unpacked.get("aux_meta") is not None:
-            unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
-        # A peer built with a newer RankInfo on the same protocol version can
-        # send fields this build does not define; reject it as incompatible.
-        unknown = sorted(set(unpacked) - {f.name for f in fields(cls)})
-        if unknown:
-            raise ValueError(
-                f"RankInfo from peer has fields this build does not define: {unknown}; "
-                "run the same TensorRT-LLM build on every worker."
-            )
-        return cls(**unpacked)
+        try:
+            unpacked = msgpack.unpackb(data, strict_map_key=False)
+            if not isinstance(unpacked, dict):
+                raise ValueError("RankInfo must contain a mapping")
+            # A peer that predates the versioned frames sends no version field.
+            # Check the version before building the dataclass: a peer on another
+            # version may send fields this release does not define.
+            _check_protocol_version(unpacked.get("protocol_version", _LEGACY_PROTOCOL_VERSION))
+            if unpacked.get("attention") is not None:
+                unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
+            if unpacked.get("page_table") is not None:
+                unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
+            if unpacked.get("aux_meta") is not None:
+                unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
+            try:
+                return cls(**unpacked)
+            except TypeError as error:
+                # Report an incompatible peer build separately from missing required fields.
+                unknown = sorted(set(unpacked) - {f.name for f in fields(cls)})
+                if unknown:
+                    raise ValueError(
+                        f"RankInfo from peer has fields this build does not define: {unknown}; "
+                        "run the same TensorRT-LLM build on every worker."
+                    ) from error
+                raise
+        except (
+            KeyError,
+            IndexError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+            msgpack.exceptions.UnpackException,
+        ) as error:
+            raise ValueError("Invalid RankInfo metadata") from error

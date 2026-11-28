@@ -2303,12 +2303,16 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
                 dst=SimpleNamespace(memory=SimpleNamespace(ptrs=dst_region)),
             )
 
+    def peer_extractor(name, rank, *, expected_info):
+        assert expected_info is peer_ri
+        return _BlockExtractor(CacheKind.PAGED)
+
     registrar = SimpleNamespace(
         self_rank_info=self_ri,
         self_extractor=_BlockExtractor(CacheKind.PAGED),
         get_peer_rank_info=lambda name, rank: peer_ri,
         get_peer_overlap=lambda ri, dp_rank: SimpleNamespace(ranks=[0]),
-        peer_extractor=lambda name, rank: _BlockExtractor(CacheKind.PAGED),
+        peer_extractor=peer_extractor,
         get_pool_mapping=lambda ri: {(0, 0): (0, 0)},
         should_send_pool=lambda targets, ri, lg, pi: True,
         get_kv_map=lambda ri, src, dst: _IdentityMapper(),
@@ -2399,12 +2403,16 @@ def _helix_ring_write_meta(
             ptrs = self.base + np.asarray(block_ids, dtype=np.int64) * 1_000_000
             return SimpleNamespace(memory=SimpleNamespace(ptrs=ptrs))
 
+    def peer_extractor(name, rank, *, expected_info):
+        assert expected_info is peer_ri
+        return _PtrExtractor(dst_base)
+
     registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(cp_size=1, cp_rank=0),
         self_extractor=_PtrExtractor(src_base),
         get_peer_rank_info=lambda name, rank: peer_ri,
         get_peer_overlap=lambda ri, dp_rank: SimpleNamespace(ranks=[0]),
-        peer_extractor=lambda name, rank: _PtrExtractor(dst_base),
+        peer_extractor=peer_extractor,
         get_pool_mapping=lambda ri: {(0, 0): (0, 0)},
         should_send_pool=lambda targets, ri, lg, pi: True,
         get_kv_map=lambda ri, src, dst: mapper,

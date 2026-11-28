@@ -2455,6 +2455,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if session is None:
             # No publication exists, or the previous session already retired.
             # Do not let a later executor pass create another send for this ID.
+            self._wait_reqs.pop(rid, None)
             req.py_kv_send_session_retired = True
             return True
         if not getattr(session, "_enforce_physical_ownership", False):
@@ -2500,9 +2501,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             accepted = self.request_logical_context_cancellation(req)
             return accepted and rid not in self._send_sessions
 
-        # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
-
         # An unpublished start failure still owes the receive group a retirement vote.
         has_transferring = rid in (self._rank_info_start_failures or ())
 

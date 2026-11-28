@@ -138,11 +138,14 @@ def test_logical_context_cancel_keeps_the_qualified_profile_gate(
 def test_context_cancel_before_publication_prevents_a_new_send() -> None:
     """Cancellation without a send session creates no peer or transfer dependency."""
     request = _context_request()
+    request.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
     harness = _harness(_worker(), request, None)
     harness.transceiver._transfer_worker.create_tx_session = Mock()
+    harness.transceiver._wait_reqs[request.py_disaggregated_params.disagg_request_id] = request
 
     assert harness.coordinator.request_logical_context_cancellation(request)
     assert harness.coordinator.request_logical_context_cancellation(request)
+    assert not harness.transceiver._wait_reqs
     assert harness.transceiver.has_retired_send_session(request)
     assert harness.transceiver._get_or_create_send_session(request) is None
     harness.transceiver._transfer_worker.create_tx_session.assert_not_called()

@@ -372,6 +372,8 @@ trtllm-serve disaggregated -c disagg_config.yaml
 
 Clients still send requests to the public endpoint (`localhost:8000`); the fleet transparently delegates routing to the coordinator.
 
+Generation workers listening on a non-loopback address require `internal_request_auth_key` for requests carrying internal context metadata. Configure the same key on the issuing frontend and its generation workers. Ordinary inference requests without internal disaggregated fields do not require this header.
+
 #### Example: external coordinator
 
 To point a fleet at a coordinator already running elsewhere (for example, one shared across nodes), set `disagg_coordinator_url` and omit the coordinator from this process:

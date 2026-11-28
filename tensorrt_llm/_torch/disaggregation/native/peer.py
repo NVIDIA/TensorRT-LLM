@@ -57,6 +57,13 @@ class PeerOverlap:
         )
 
 
+@dataclass(frozen=True)
+class _RegisteredPeer:
+    info: RankInfo
+    extractor: KVRegionExtractorV1
+    pool_mapping: Dict[LGPoolKey, LGPoolKey]
+
+
 class PeerRegistrar:
     # Registry: CacheKind -> PolicyClass. Add new layer types here. The
     # policy owns every mapper kind of its life cycle and picks the mapper
@@ -69,17 +76,15 @@ class PeerRegistrar:
     def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
         self._ri = self_rank_info
         self._policies: Dict[CacheKind, Union[AttentionPolicy, MambaPolicy]] = {}
-        self._peer_ri_cache: Dict[str, RankInfo] = {}
+        self._registered: dict[tuple[str, int], _RegisteredPeer] = {}
         self._kv_map_cache: Dict[
-            tuple, RegionMapperBase
+            tuple, tuple[RankInfo, RegionMapperBase]
         ] = {}  # key: (peer_key, self_lg_pool_key, peer_lg_pool_key)
         self._self_ext_cache = self_extractor
-        self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
-        self._overlap_cache: dict[tuple[str, int, int], PeerOverlap] = {}
-        self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
-        self._lg_pool_mapping_cache: Dict[
-            str, Dict[LGPoolKey, LGPoolKey]
-        ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
+        self._overlap_cache: dict[tuple[str, int, int], tuple[RankInfo, PeerOverlap]] = {}
+        self._aux_transfer_layout_cache: dict[
+            tuple[str, int], tuple[Optional[RankInfo], AuxTransferLayout]
+        ] = {}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
         assert self._self_ext_cache is not None
@@ -88,19 +93,14 @@ class PeerRegistrar:
                 f"PeerRegistrar.register: peer {peer_name} (rank={peer_rank}) is incompatible with local rank."
             )
         key = self._unique_key(peer_name, peer_rank)
-        self._peer_ri_cache[key] = peer_ri
-        self._aux_transfer_layout_cache.pop(key, None)
-        peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
         extractor = KVRegionExtractorV1(peer_ri.page_table)
-        self._peer_ext_cache[key] = extractor
+        mapping = self.validate_view_head_geometry(peer_ri)
 
         policy = self._get_policy(CacheKind.PAGED)
         self_page_table = self._self_ext_cache.page_table
         nhd_fragments_per_token = 0
         nhd_heads: set[tuple[int, int]] = set()
-        for (layer_group_id, pool_idx), (peer_lg, peer_pi) in self.get_pool_mapping(
-            peer_ri
-        ).items():
+        for (layer_group_id, pool_idx), (peer_lg, peer_pi) in mapping.items():
             self_pv = self_page_table.layer_groups[layer_group_id].pool_views[pool_idx]
             if self_pv.mapper_kind != MapperKind.NHD:
                 continue
@@ -124,8 +124,20 @@ class PeerRegistrar:
                 key=f"native-nhd-head-mismatch-{heads_key}-{nhd_fragments_per_token}",
             )
 
-    def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
-        return self._peer_ext_cache[self._unique_key(peer_name, peer_rank)]
+        self._invalidate_derived(peer_name, peer_rank)
+        self._registered[key] = _RegisteredPeer(peer_ri, extractor, mapping)
+
+    def peer_extractor(
+        self, peer_name: str, peer_rank: int, expected_info: Optional[RankInfo] = None
+    ) -> KVRegionExtractorV1:
+        key = self._unique_key(peer_name, peer_rank)
+        if expected_info is None:
+            return self._registered[key].extractor
+        current = self._registered.get(key)
+        if current is not None and current.info is expected_info:
+            return current.extractor
+        # A writer already holds the old RankInfo. Complete its plan against that same page table.
+        return KVRegionExtractorV1(expected_info.page_table)
 
     @property
     def self_extractor(self) -> KVRegionExtractorV1:
@@ -134,37 +146,53 @@ class PeerRegistrar:
 
     def unregister(self, peer_name: str, peer_rank: int):
         key = self._unique_key(peer_name, peer_rank)
-        if key in self._peer_ri_cache:
-            del self._peer_ri_cache[key]
-        if key in self._peer_ext_cache:
-            del self._peer_ext_cache[key]
+        self._registered.pop(key, None)
+        self._invalidate_derived(peer_name, peer_rank)
+
+    def _invalidate_derived(self, peer_name: str, peer_rank: int) -> None:
+        key = self._unique_key(peer_name, peer_rank)
         self._aux_transfer_layout_cache.pop(key, None)
         # Clean up kv_map_cache entries for this peer
-        keys_to_remove = [k for k in self._kv_map_cache if k[0] == key]
+        keys_to_remove = [k for k in self._kv_map_cache.copy() if k[0] == key]
         for k in keys_to_remove:
-            del self._kv_map_cache[k]
-        if key in self._lg_pool_mapping_cache:
-            del self._lg_pool_mapping_cache[key]
+            self._kv_map_cache.pop(k, None)
+        for overlap_key in [item for item in self._overlap_cache.copy() if item[:2] == key]:
+            self._overlap_cache.pop(overlap_key, None)
 
     def get_peer_rank_info(self, peer_name: str, peer_rank: int):
-        return self._peer_ri_cache[self._unique_key(peer_name, peer_rank)]
+        return self._registered[self._unique_key(peer_name, peer_rank)].info
 
     def get_aux_transfer_layout(
-        self, peer_name: str, peer_rank: int
+        self, peer_name: str, peer_rank: int, expected_info: Optional[RankInfo] = None
     ) -> Optional[AuxTransferLayout]:
-        return self._aux_transfer_layout_cache.get(self._unique_key(peer_name, peer_rank))
+        key = self._unique_key(peer_name, peer_rank)
+        if expected_info is None and (current := self._registered.get(key)) is not None:
+            expected_info = current.info
+        cached = self._aux_transfer_layout_cache.get(key)
+        return cached[1] if cached is not None and cached[0] is expected_info else None
 
     def cache_aux_transfer_layout(
-        self, peer_name: str, peer_rank: int, layout: AuxTransferLayout
+        self,
+        peer_name: str,
+        peer_rank: int,
+        layout: AuxTransferLayout,
+        expected_info: Optional[RankInfo] = None,
     ) -> None:
-        self._aux_transfer_layout_cache[self._unique_key(peer_name, peer_rank)] = layout
+        key = self._unique_key(peer_name, peer_rank)
+        current = self._registered.get(key)
+        if expected_info is not None and (current is None or current.info is not expected_info):
+            return
+        self._aux_transfer_layout_cache[key] = (
+            current.info if current is not None else None,
+            layout,
+        )
 
     @property
     def self_rank_info(self) -> RankInfo:
         return self._ri
 
-    def _unique_key(self, name: str, rank: int) -> str:
-        return name + str(rank)
+    def _unique_key(self, name: str, rank: int) -> tuple[str, int]:
+        return name, rank
 
     def validate_bounded_replay_compatible(self, peer_ri: RankInfo) -> None:
         """Require the same generation replay mode on both peers."""
@@ -244,7 +272,6 @@ class PeerRegistrar:
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
         self.validate_draft_layers_compatible(peer_ri)
-        self.validate_view_head_geometry(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -260,12 +287,13 @@ class PeerRegistrar:
 
         return True
 
-    def validate_view_head_geometry(self, peer_ri: RankInfo) -> None:
-        """Require matching per-view head geometry before registering the peer."""
+    def validate_view_head_geometry(self, peer_ri: RankInfo) -> dict[LGPoolKey, LGPoolKey]:
+        """Return the pool mapping after validating the matched views' head geometry."""
         self_page_table = self._self_ext_cache.page_table
         peer_page_table = peer_ri.page_table
         policy = self._get_policy(CacheKind.PAGED)
-        for (self_lg, self_pi), (peer_lg, peer_pi) in self.get_pool_mapping(peer_ri).items():
+        mapping = self.get_pool_mapping(peer_ri)
+        for (self_lg, self_pi), (peer_lg, peer_pi) in mapping.items():
             layer_group = self_page_table.layer_groups[self_lg]
             self_pv = layer_group.pool_views[self_pi]
             if layer_group.kind != CacheKind.PAGED or self_pv.mapper_kind == MapperKind.REPLICATED:
@@ -293,6 +321,8 @@ class PeerRegistrar:
                     f"peer={bytes_per_head[1]})"
                 )
 
+        return mapping
+
     def get_pool_mapping(self, peer_ri: RankInfo) -> Dict[LGPoolKey, LGPoolKey]:
         """Get mapping from (self_lg_idx, self_pool_idx) -> (peer_lg_idx, peer_pool_idx).
 
@@ -314,18 +344,17 @@ class PeerRegistrar:
         per peer rank). Step 1 raises if this invariant is ever violated.
         """
         key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
-        if key in self._lg_pool_mapping_cache:
-            return self._lg_pool_mapping_cache[key]
+        cached = self._registered.get(key)
+        if cached is not None and cached.info is peer_ri:
+            return cached.pool_mapping
 
         mapping: Dict[LGPoolKey, LGPoolKey] = {}
         self_pt = self._self_ext_cache.page_table
         peer_pt = peer_ri.page_table
 
         if self_pt is None or peer_pt is None:
-            self._lg_pool_mapping_cache[key] = mapping
             return mapping
         if not self_pt.layer_groups or not peer_pt.layer_groups:
-            self._lg_pool_mapping_cache[key] = mapping
             return mapping
 
         # Build kind-specific peer layer-to-group mappings lazily. In hybrid
@@ -455,7 +484,6 @@ class PeerRegistrar:
                     )
                 mapping[(self_lg_idx, self_pi)] = (peer_lg_idx, matched_peer_pi)
 
-        self._lg_pool_mapping_cache[key] = mapping
         return mapping
 
     def _get_policy(self, kind: CacheKind) -> Union[AttentionPolicy, MambaPolicy]:
@@ -479,8 +507,9 @@ class PeerRegistrar:
         """
         peer_key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
         cache_key = (peer_key, self_pool_key, peer_pool_key)
-        if cache_key in self._kv_map_cache:
-            return self._kv_map_cache[cache_key]
+        cached = self._kv_map_cache.get(cache_key)
+        if cached is not None and cached[0] is peer_ri:
+            return cached[1]
 
         self_pt = self._self_ext_cache.page_table
         peer_pt = peer_ri.page_table
@@ -578,7 +607,7 @@ class PeerRegistrar:
             **extra_kwargs,
         )
 
-        self._kv_map_cache[cache_key] = mapper
+        self._kv_map_cache[cache_key] = (peer_ri, mapper)
         return mapper
 
     @staticmethod
@@ -600,7 +629,7 @@ class PeerRegistrar:
         entries = pool_view.buffer_entries
         if len(entries) == 0:
             return 1
-        counts = Counter(int(e["local_layer_id"]) for e in entries)
+        counts = Counter(entries["local_layer_id"].tolist())
         distinct = set(counts.values())
         if len(distinct) != 1:
             raise ValueError(
@@ -628,8 +657,9 @@ class PeerRegistrar:
         peer_ri = peer_rank_info
         # Per-view duplication factors depend on the specific peer rank's page table.
         key = (peer_ri.instance_name, peer_ri.instance_rank, peer_dp_rank)
-        if key in self._overlap_cache:
-            return self._overlap_cache[key]
+        cached = self._overlap_cache.get(key)
+        if cached is not None and cached[0] is peer_ri:
+            return cached[1]
 
         # compute pp overlap and target layers
         self_start_layer = sum(self._ri.layer_num_per_pp[: self._ri.pp_rank])
@@ -646,7 +676,7 @@ class PeerRegistrar:
 
         if tgt_pp_ranks == []:
             targets = PeerOverlap()
-            self._overlap_cache[key] = targets
+            self._overlap_cache[key] = (peer_ri, targets)
             return targets
 
         peer_start_pp = tgt_pp_ranks[0]
@@ -687,7 +717,7 @@ class PeerRegistrar:
             ranks=ranks,
             view_duplicate_head_factors=view_dup_factors,
         )
-        self._overlap_cache[key] = targets
+        self._overlap_cache[key] = (peer_ri, targets)
         return targets
 
     def _view_duplicate_head_factors(

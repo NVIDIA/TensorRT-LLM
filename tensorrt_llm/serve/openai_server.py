@@ -98,11 +98,12 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
-from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
+from tensorrt_llm.serve.cluster_storage import (create_cluster_storage_client,
+                                                is_loopback_host)
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request,
+    request_requires_internal_disagg_auth, validate_protected_disagg_request,
     validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
@@ -1133,15 +1134,39 @@ class OpenAIServer(_VideoRoutesMixin):
                 return int(vocab_size)
         return int(self.tokenizer.tokenizer.vocab_size)
 
+    @staticmethod
+    def _is_loopback_listener(host: str,
+                              sockets: Optional[list[socket.socket]]) -> bool:
+        if sockets:
+            return all(
+                isinstance(address := sock.getsockname(), tuple)
+                and is_loopback_host(address[0]) for sock in sockets)
+        return is_loopback_host(host)
+
     def _validate_internal_disagg_request(
             self, request, raw_request: Optional[Request]) -> None:
-        if (request_requires_internal_disagg_auth(request)
-                and not self._has_cache_transceiver_config()):
+        if not request_requires_internal_disagg_auth(request):
+            return
+        if not self._has_cache_transceiver_config():
             raise ValueError("Protected disaggregated request fields require "
                              "cache_transceiver_config to be configured")
+        key = getattr(self, "_internal_disagg_auth_key", None)
+        if not key:
+            local_listener = getattr(self, "_internal_listener_is_loopback",
+                                     None)
+            if local_listener is None:
+                host = getattr(self, "host", None)
+                if raw_request is not None:
+                    # ASGI supplies the actual listener address for an embedded app.
+                    bound = raw_request.scope.get("server")
+                    host = bound[0] if bound else ""
+                local_listener = host is None or is_loopback_host(host)
+            if not local_listener:
+                raise ValueError(
+                    "Protected disaggregated request fields on a network "
+                    "listener require internal_request_auth_key")
         headers = None if raw_request is None else raw_request.headers
-        validate_internal_disagg_request(
-            getattr(self, "_internal_disagg_auth_key", None), request, headers)
+        validate_protected_disagg_request(key, request, headers)
 
     def _get_scheduling_params(
             self, request: Union[ChatCompletionRequest, CompletionRequest],
@@ -4619,6 +4644,8 @@ class OpenAIServer(_VideoRoutesMixin):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
+        self._internal_listener_is_loopback = self._is_loopback_listener(
+            host, sockets)
         self.port = port
         # Without graceful_shutdown_timeout, uvicorn keeps its default and
         # waits for every request handler during graceful shutdown.

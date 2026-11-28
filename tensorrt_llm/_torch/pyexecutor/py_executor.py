@@ -13551,6 +13551,8 @@ class PyExecutor:
                 self.disagg.request_cancellation(request)
             return False
 
+        if request.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER:
+            return self.disagg.request_cancellation(request)
         if not self._is_request_in_transmission(request):
             return True
 

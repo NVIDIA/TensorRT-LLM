@@ -457,3 +457,24 @@ def test_mixed_mapper_kinds_are_rejected(self_mapper_kind, peer_mapper_kind):
         reg.get_pool_mapping(peer_ri)
     with pytest.raises(ValueError, match="incompatible mapper kinds"):
         reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+
+
+def test_rejected_peer_replacement_preserves_current_mapping():
+    def published_view(layer_ids):
+        view = _kv_pool_view(0, layer_ids)
+        view.num_kv_heads = 2
+        return view
+
+    group = _attn_lg(0, [(0, 10), (1, 11)], [published_view([0, 1])])
+    reg = _registrar(_page_table([group]))
+    current = _rank_info(name="peer", rank=1, page_table=_page_table([group]))
+    reg.register("peer", 1, current)
+    original_extractor = reg.peer_extractor("peer", 1)
+    first = _attn_lg(0, [(0, 10)], [published_view([0])])
+    second = _attn_lg(1, [(0, 11)], [published_view([0])])
+    replacement = _rank_info(name="peer", rank=1, page_table=_page_table([first, second]))
+    with pytest.raises(ValueError, match="multiple peer layer groups"):
+        reg.register("peer", 1, replacement)
+    assert reg.get_peer_rank_info("peer", 1) is current
+    assert reg.peer_extractor("peer", 1) is original_extractor
+    assert reg.get_pool_mapping(current) == {(0, 0): (0, 0)}

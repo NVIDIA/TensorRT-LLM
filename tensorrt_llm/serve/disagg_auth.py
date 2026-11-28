@@ -99,6 +99,15 @@ def validate_internal_disagg_request(
 ) -> None:
     if not request_requires_internal_disagg_auth(request):
         return
+    validate_protected_disagg_request(internal_disagg_auth_key, request, headers)
+
+
+def validate_protected_disagg_request(
+    internal_disagg_auth_key: Optional[str],
+    request: UCompletionRequest,
+    headers: Optional[Mapping[str, str]],
+) -> None:
+    """Validate a request that carries protected disaggregated fields."""
     if not internal_disagg_auth_key:
         _warn_missing_auth_key()
         return
