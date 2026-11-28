@@ -140,7 +140,7 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 
 
 # ---------------------------------------------------------------------------
-# Tactic representation (v5: 11-tuple perf knobs)
+# Tactic representation (v7: 13-tuple perf knobs)
 # ---------------------------------------------------------------------------
 #
 # A tactic is a tuple of JSON-friendly primitives (lists / ints / bools /
@@ -160,8 +160,10 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 #    flag_batch,          # int >= 1 (standalone_warps requires == 1)
 #    epi_flag_batch,      # (int, int) fc1/fc2 done-counter publish batch
 #    token_back_ready_granularity,  # "expert" | "token_tile"
-#    combine_dedup)       # bool: one reduced FC2 row per destination rank
+#    combine_dedup,       # bool: one reduced FC2 row per destination rank
 #                         # (SM107 generic kernel only; never a gen-phase bucket)
+#    epilogue_warpgroups) # 1 | 2: epilogue warpgroups sharing each accumulator tile
+#                         # (2: SM107 generic kernel, epi_warps bulk FC2, no dedup)
 #
 # Derived / out-of-tuple:
 #   use_2cta_instrs      = (mma_tiler_mnk[0] == 256), derived in _build_kernel.
@@ -170,7 +172,8 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 # Tuple wrapping makes the tactic hashable, which AutoTuner needs for the
 # tactics cache.
 
-_TACTIC_LEN = 12
+_TACTIC_LEN = 13
+_TACTIC_LEN_V6 = 12
 _TACTIC_LEN_V5 = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
@@ -275,7 +278,7 @@ def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
 
 
 def _unpack_tactic(tactic: Tuple) -> Tuple:
-    """Return the canonical 12 fields, accepting the v5 11-, v4 10- and v3 8-tuples.
+    """Return the canonical 13 fields, accepting the v6 12-, v5 11-, v4 10- and v3 8-tuples.
 
     Legacy tactics map ``static`` to grid-stride work IDs and preserve their
     grouped scheduling hint. Their single-stage bulk store is represented
@@ -283,11 +286,13 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
     Pre-v5 tactics take ``token_back_ready_granularity="expert"`` -- the only
     value this op compiled before the field entered the tuple, so a cache
     written by an older build keeps its exact meaning. Pre-v6 tactics take
-    ``combine_dedup=False`` for the same reason.
+    ``combine_dedup=False`` and pre-v7 tactics ``epilogue_warpgroups=1`` for
+    the same reason.
     Validation remains centralized in :func:`validate_megamoe_tactic`.
     """
     token_back_ready_granularity = _DEFAULT_TOKEN_BACK_READY_GRANULARITY
     combine_dedup = False
+    epilogue_warpgroups = 1
     if len(tactic) == _LEGACY_TACTIC_LEN:
         (
             mma_tiler,
@@ -338,8 +343,10 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
             epi_flag_batch,
             token_back_ready_granularity,
         ) = tactic[:_TACTIC_LEN_V5]
-        if len(tactic) == _TACTIC_LEN:
+        if len(tactic) >= _TACTIC_LEN_V6:
             combine_dedup = tactic[_TACTIC_LEN_V5]
+        if len(tactic) == _TACTIC_LEN:
+            epilogue_warpgroups = tactic[_TACTIC_LEN_V6]
 
     return (
         mma_tiler,
@@ -354,6 +361,7 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
         epi_flag_batch,
         token_back_ready_granularity,
         combine_dedup,
+        epilogue_warpgroups,
     )
 
 
@@ -420,6 +428,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             (1, 1),
             _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
             False,
+            1,
         )
     if num_tokens <= 8192:
         return (
@@ -435,6 +444,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             (1, 1),
             _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
             False,
+            1,
         )
     # Use the atomic work distributor for the upper token bucket.
     return (
@@ -450,6 +460,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
         (2, 4),
         _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
         False,
+        1,
     )
 
 
@@ -544,7 +555,8 @@ def _with_combine_dedup(tactic: Tuple) -> Tuple:
     """Return ``tactic`` with combine dedup and the token-back settings it needs.
 
     Dedup pushes the reduced rows from the dispatch warps, which need the N256
-    tile and a bulk FC2 store; the remaining fields keep the shape default.
+    tile, a bulk FC2 store and one epilogue warpgroup; the remaining fields keep
+    the shape default.
     """
     tactic = list(_unpack_tactic(tactic))
     tactic[0] = [tactic[0][0], 256, tactic[0][2]]
@@ -554,6 +566,8 @@ def _with_combine_dedup(tactic: Tuple) -> Tuple:
         tactic[7] = 1
     tactic[8] = 1
     tactic[11] = True
+    # The dedup push runs from the dispatch warps, which two epilogue warpgroups cannot share.
+    tactic[12] = 1
     return tuple(tactic)
 
 
@@ -1158,6 +1172,9 @@ def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
         auto_hint_tactic = list(tactic)
         auto_hint_tactic[3] = ("phase_interleave", None)
         candidates.append(tuple(auto_hint_tactic))
+    if tactic[12] != 1:
+        # Keep the shape's bulk FC2 path before the non-bulk fallback.
+        candidates.append((*tactic[:12], 1))
     nonbulk_tactic = _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
     if nonbulk_tactic not in candidates:
         candidates.append(nonbulk_tactic)
@@ -1411,6 +1428,20 @@ def _construct_megamoe_kernel(
         if sm_version != 107 or genphase:
             raise ValueError("combine_dedup applies to the SM107 generic MegaMoE kernel only.")
         impl_values["combine_dedup"] = True
+    if common.get("epilogue_warpgroups", 1) == 2:
+        # Same as combine_dedup: the gen-phase and Blackwell kernels would drop the option.
+        if (
+            sm_version != 107
+            or genphase
+            or (
+                ugpu_weight_layout != "none"
+                and _megamoe_ugpu_is_genphase(common["max_tokens_per_rank"])
+            )
+        ):
+            raise ValueError(
+                "epilogue_warpgroups=2 applies to the SM107 generic MegaMoE kernel only."
+            )
+        impl_values["epilogue_warpgroups"] = 2
     ugpu_kernel_cls = None
     if ugpu_weight_layout != "none":
         if _megamoe_ugpu_is_genphase(common["max_tokens_per_rank"]):
@@ -1521,13 +1552,14 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
     """
     if (not isinstance(tactic, tuple)) or len(tactic) not in {
         _TACTIC_LEN,
+        _TACTIC_LEN_V6,
         _TACTIC_LEN_V5,
         _TACTIC_LEN_V4,
         _LEGACY_TACTIC_LEN,
     }:
         raise ValueError(
-            f"MegaMoE tactic must be a {_TACTIC_LEN}-tuple (or legacy {_TACTIC_LEN_V5}- / "
-            f"{_TACTIC_LEN_V4}- / {_LEGACY_TACTIC_LEN}-tuple), got "
+            f"MegaMoE tactic must be a {_TACTIC_LEN}-tuple (or legacy {_TACTIC_LEN_V6}- / "
+            f"{_TACTIC_LEN_V5}- / {_TACTIC_LEN_V4}- / {_LEGACY_TACTIC_LEN}-tuple), got "
             f"{type(tactic).__name__} len={len(tactic) if isinstance(tactic, tuple) else 'NA'}={tactic!r}"
         )
     is_legacy_tactic = len(tactic) == _LEGACY_TACTIC_LEN
@@ -1544,6 +1576,7 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         epi_flag_batch,
         token_back_ready_granularity,
         combine_dedup,
+        epilogue_warpgroups,
     ) = _unpack_tactic(tactic)
 
     if (not isinstance(mma_tiler, (list, tuple))) or len(mma_tiler) != 3:
@@ -1773,6 +1806,24 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         if unmet:
             raise ValueError("combine_dedup=True is unmet by: " + "; ".join(unmet))
 
+    # type() rather than isinstance(): bool is an int subclass and must not pass as 1.
+    if type(epilogue_warpgroups) is not int or epilogue_warpgroups not in (1, 2):
+        raise ValueError(f"epilogue_warpgroups must be 1 or 2, got {epilogue_warpgroups!r}.")
+    if epilogue_warpgroups == 2:
+        # Tactic-local half of the kernel's guard; the gen-phase buckets, whose kernel
+        # has one epilogue warpgroup, are refused at construction.
+        unmet = []
+        if sm_version != 107:
+            unmet.append(f"SM{sm_version} (need the SM107 generic kernel)")
+        if token_back_mode != "epi_warps":  # nosec B105 -- token-back mode name, not a credential
+            unmet.append(f"token_back_mode={token_back_mode!r} (need 'epi_warps')")
+        if not use_bulk_fc2_store:
+            unmet.append("use_bulk_fc2_store=False (need True, the BF16 FC2 bulk push)")
+        if combine_dedup:
+            unmet.append("combine_dedup=True (need False)")
+        if unmet:
+            raise ValueError("epilogue_warpgroups=2 is unmet by: " + "; ".join(unmet))
+
 
 def _expand_megamoe_ready_tactics(
     candidates: list[Tuple], sm_version: int, *, load_balance: bool
@@ -1808,7 +1859,7 @@ def _expand_megamoe_ready_tactics(
     expanded = []
     for base in candidates:
         for granularity in choices:
-            tactic = (*_unpack_tactic(base)[:_TACTIC_LEN_V4], granularity, False)
+            tactic = (*_unpack_tactic(base)[:_TACTIC_LEN_V4], granularity, False, 1)
             try:
                 validate_megamoe_tactic(tactic, sm_version=sm_version)
             except ValueError:
@@ -2703,6 +2754,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 epi_flag_batch,
                 token_back_ready_granularity,
                 combine_dedup,
+                epilogue_warpgroups,
             ) = _unpack_tactic(candidate)
             mma_tiler = tuple(mma_tiler)
             (
@@ -2753,6 +2805,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 token_back_mode=str(token_back_mode),
                 token_back_ready_granularity=str(token_back_ready_granularity),
                 combine_dedup=bool(combine_dedup),
+                epilogue_warpgroups=int(epilogue_warpgroups),
                 non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
                 flag_batch=int(flag_batch),
                 epi_flag_batch=tuple(epi_flag_batch),
@@ -3194,6 +3247,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 epi_flag_batch,
                 token_back_ready_granularity,
                 combine_dedup,
+                epilogue_warpgroups,
             ) = _unpack_tactic(tactic)
             (
                 launch_cluster_count,
@@ -3243,6 +3297,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 token_back_mode=str(token_back_mode),
                 token_back_ready_granularity=str(token_back_ready_granularity),
                 combine_dedup=bool(combine_dedup),
+                epilogue_warpgroups=int(epilogue_warpgroups),
                 non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
                 flag_batch=int(flag_batch),
                 epi_flag_batch=tuple(epi_flag_batch),
@@ -3286,6 +3341,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 epi_flag_batch,
                 token_back_ready_granularity,
                 combine_dedup,
+                epilogue_warpgroups,
             ) = _unpack_tactic(tactic)
             launch_config = _launch_cluster_configuration(
                 cluster_shape,
@@ -3306,6 +3362,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tuple(epi_flag_batch),
                 str(token_back_ready_granularity),
                 bool(combine_dedup),
+                int(epilogue_warpgroups),
                 launch_config,
                 self.weight_evict_first,
                 # The SM-to-die mask is per device, so it stays out of the rank-identical

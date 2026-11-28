@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU checks of the MegaMoE ``combine_dedup`` tactic field.
+"""CPU checks of the MegaMoE ``combine_dedup`` and ``epilogue_warpgroups`` tactic fields.
 
 Execute production host definitions with CUDA imports replaced by metadata
 stubs. These checks establish the tactic format, validation, consumer
@@ -51,6 +51,7 @@ _DEDUP = (
     (1, 4),
     "expert",
     True,
+    1,
 )
 
 
@@ -160,6 +161,7 @@ def test_unpack_defaults_legacy_tactics_to_no_dedup(op: types.ModuleType) -> Non
     assert op._unpack_tactic(_DEDUP) == _DEDUP
     for length in (11, 10):
         assert op._unpack_tactic(_DEDUP[:length])[11] is False
+    assert op._unpack_tactic(_DEDUP[:12]) == _DEDUP
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     assert op._unpack_tactic(legacy)[11] is False
     for tokens in (64, 4096, 16384):
@@ -269,7 +271,7 @@ def test_shape_defaults_and_autotune_space_never_select_dedup(op: types.ModuleTy
                 in_kernel_fc2_reduce=in_kernel,
                 combine_format="bf16",
             )
-            assert len(tactic) == 12 and tactic[11] is False
+            assert len(tactic) == 13 and tactic[11] is False
     for table in (op._SM107_DSV4_PRO_DEFAULT_TACTICS.values(), op._SM107_GENPHASE_TACTICS.values()):
         assert all(op._unpack_tactic(tactic)[11] is False for tactic in table)
     # The provider is sized for the default and its non-dedup base only, so the
@@ -280,7 +282,7 @@ def test_shape_defaults_and_autotune_space_never_select_dedup(op: types.ModuleTy
                 candidates = op.enumerate_megamoe_candidate_tactics(
                     tokens, sm_version, load_balance=load_balance
                 )
-                assert candidates and all(len(t) == 12 and t[11] is False for t in candidates)
+                assert candidates and all(len(t) == 13 and t[11] is False for t in candidates)
 
 
 def _dedup_cells(op: types.ModuleType) -> list[tuple[int, int, int]]:
@@ -370,3 +372,145 @@ def test_query_sizes_the_provider_for_dedup_and_its_base(
         inputs = [SimpleNamespace(shape=(tokens, 7168))]
         tactics = runner.get_valid_tactics(inputs, None)
         assert [t for t in tactics if op._unpack_tactic(t)[11]] == [default]
+
+
+# A generic-bucket tactic that meets every tactic-local two-warpgroup condition.
+_WG2 = (
+    [256, 256, 256],
+    [4, 1, 1],
+    [2, 1, 1],
+    ("phase_interleave", 4),
+    "atomic_counter",
+    "epi_warps",
+    True,
+    2,
+    1,
+    (1, 4),
+    "expert",
+    False,
+    2,
+)
+
+
+def test_unpack_defaults_legacy_tactics_to_one_epilogue_warpgroup(op: types.ModuleType) -> None:
+    assert op._unpack_tactic(_WG2) == _WG2
+    for length in (12, 11, 10):
+        assert op._unpack_tactic(_WG2[:length])[12] == 1
+    legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
+    assert op._unpack_tactic(legacy)[12] == 1
+    for tokens in (64, 4096, 16384):
+        assert op.default_megamoe_tactic(tokens)[12] == 1
+
+
+def test_validation_rejects_tactics_two_warpgroups_cannot_run(op: types.ModuleType) -> None:
+    op.validate_megamoe_tactic(_WG2, sm_version=107)
+    op.validate_megamoe_tactic((*_WG2[:12], 1), sm_version=100)
+    for index, value, reason in (
+        (5, "reuse_dispatch_warps", "token_back_mode='reuse_dispatch_warps'"),
+        (12, 3, "epilogue_warpgroups must be 1 or 2"),
+        (12, 0, "epilogue_warpgroups must be 1 or 2"),
+        (12, True, "epilogue_warpgroups must be 1 or 2"),
+    ):
+        tactic = list(_WG2)
+        tactic[index] = value
+        with pytest.raises(ValueError, match=reason):
+            op.validate_megamoe_tactic(tuple(tactic), sm_version=107)
+    no_bulk = list(_WG2)
+    no_bulk[6], no_bulk[7] = False, None
+    with pytest.raises(ValueError, match="use_bulk_fc2_store=False"):
+        op.validate_megamoe_tactic(tuple(no_bulk), sm_version=107)
+    with_dedup = list(_DEDUP)
+    with_dedup[12] = 2
+    with pytest.raises(ValueError, match="combine_dedup=True"):
+        op.validate_megamoe_tactic(tuple(with_dedup), sm_version=107)
+    with pytest.raises(ValueError, match="SM100"):
+        op.validate_megamoe_tactic(_WG2, sm_version=100)
+    # Dedup forces one warpgroup whatever the shape default asked for.
+    assert op._with_combine_dedup(_WG2)[11:] == (True, 1)
+
+
+def test_query_and_runner_build_the_same_two_warpgroup_kernel(
+    op: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+    original = op._construct_megamoe_kernel
+
+    def construct(**kwargs: object) -> tuple:
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(op, "_construct_megamoe_kernel", construct)
+    monkeypatch.setattr(op, "_max_active_clusters", lambda size, *args: 184 // size)
+    problem = _problem()
+    query = {
+        key: value for key, value in problem.items() if key not in {"local_rank", "output_dtype"}
+    }
+    op.query_megamoe_kernel_properties(**query, tactic=_WG2)
+    runner = op.Sm100MegaMoENvfp4Runner(**problem)
+    kernel = runner._build_kernel_once(_WG2)
+    assert isinstance(kernel, _GenericMetadata)
+    assert kernel.implementation["epilogue_warpgroups"] == 2
+    for call in calls:
+        call["common"].setdefault("helper_expert_count", 0)
+        call["common"].setdefault("shared_intermediate_size", None)
+        call["common"].setdefault("shared_gate_up_clamp", None)
+    assert len(calls) == 2 and calls[0] == calls[1]
+    # One warpgroup is the kernel default: the option is left out, as before the field existed.
+    plain = _WG2[:12]
+    assert "epilogue_warpgroups" not in runner._build_kernel_once(plain).implementation
+    assert runner._tactic_cache_key(_WG2) != runner._tactic_cache_key(plain)
+    assert runner._tactic_cache_key(plain) == runner._tactic_cache_key((*plain, 1))
+
+
+@pytest.mark.parametrize("sm_version, capacity", [(107, 256), (100, 8192)])
+def test_two_warpgroups_never_reach_a_kernel_without_the_option(
+    op: types.ModuleType, sm_version: int, capacity: int
+) -> None:
+    common = dict(
+        static_expert_shape=(224, 6144, 3584),
+        world_size=4,
+        num_topk=16,
+        max_tokens_per_rank=capacity,
+        apply_topk_in_fc1=False,
+        gate_up_clamp=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        mma_tiler_mnk=(256, 256, 256),
+        cluster_shape_mnk=(4, 1, 1),
+        use_2cta_instrs=True,
+        schedule_policy=("phase_interleave", 4),
+        token_padding_block=64,
+        sf_padding_block=128,
+        work_id_mode="atomic_counter",
+        non_ubulk_fc2_store=False,
+        epi_flag_batch=(1, 4),
+        launch_cluster_count=46,
+        fallback_cluster_shape_mn=(2, 1),
+        preferred_cluster_count=44,
+        fallback_cluster_count=4,
+        flag_batch=1,
+        token_back_mode="epi_warps",
+        in_kernel_fc2_reduce=False,
+        fc2_tma_stages=2,
+        weight_evict_first=False,
+        epilogue_warpgroups=2,
+    )
+    # A gen-phase bucket and the Blackwell kernel would drop the undeclared option.
+    with pytest.raises(ValueError, match="SM107 generic MegaMoE kernel only"):
+        op._construct_megamoe_kernel(sm_version=sm_version, common=common, combine_format="bf16")
+
+
+def test_default_fallbacks_try_one_warpgroup_before_the_nonbulk_tactic(
+    op: types.ModuleType,
+) -> None:
+    candidates = op._megamoe_default_tactic_candidates(_WG2)
+    auto_hint = (*_WG2[:3], ("phase_interleave", None), *_WG2[4:])
+    assert candidates == (
+        _WG2,
+        auto_hint,
+        (*_WG2[:12], 1),
+        op._unpack_tactic(op._MEGAMOE_NONBULK_STANDALONE_TACTIC),
+    )
+    assert len(op._megamoe_default_tactic_candidates(_WG2[:12])) == 3
