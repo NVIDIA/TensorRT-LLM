@@ -196,12 +196,18 @@ def test_one_rank_context_launch_up_to_24576_rows_is_one_runner_call(
 
     def router(x, w):
         router_rows.append(x.shape[0])
-        return torch.zeros(x.shape[0], 4)
+        # Each row's id (exact in fp32) from its two bf16 digits.
+        ids = x[:, 0].float() * 256 + x[:, 1].float()
+        return ids[:, None].expand(-1, 4).contiguous()
 
     def runner(logits, xq, xsf, *args):
         assert xsf.numel() == xq.shape[0] * 2
+        ids = logits[:, 0].long()
+        # The codes and block scales handed with each chunk belong to the chunk's rows.
+        assert torch.equal(xq[:, 0].long(), ids % 256) and torch.equal(xq[:, 1].long(), ids // 256)
+        assert torch.equal(xsf.view(torch.uint8).view(-1, 2)[:, 0].long(), ids % 256)
         runner_rows.append(logits.shape[0])
-        return torch.zeros(logits.shape[0], 8)
+        return logits[:, :1].expand(-1, 8).contiguous()
 
     monkeypatch.setattr(M, "cublas_mm", router)
     monkeypatch.setattr(M, "fp4_block_scale_moe_renorm_routed", runner)
@@ -225,13 +231,22 @@ def test_one_rank_context_launch_up_to_24576_rows_is_one_runner_call(
         out1_gate_scale=None,
         out2_scale=None,
     )
+    ids = torch.arange(rows)
     x = torch.zeros(rows, 32, dtype=torch.bfloat16)
-    # NVFP4 codes (two a byte) and linear e4m3 block scales (one per 16 columns), flat.
-    fp4 = (torch.zeros(rows, 16, dtype=torch.uint8), torch.zeros(rows * 2, dtype=torch.uint8))
+    x[:, 0], x[:, 1] = (ids // 256).to(torch.bfloat16), (ids % 256).to(torch.bfloat16)
+    # NVFP4 codes (two a byte) and linear e4m3 block scales (one per 16 columns), flat; row-
+    # distinct, so a chunk handed another chunk's codes or scales fails the runner's check.
+    codes = torch.zeros(rows, 16, dtype=torch.uint8)
+    codes[:, 0], codes[:, 1] = (ids % 256).to(torch.uint8), (ids // 256).to(torch.uint8)
+    scales = torch.zeros(rows, 2, dtype=torch.uint8)
+    scales[:, 0] = (ids % 256).to(torch.uint8)
+    fp4 = (codes, scales.view(-1))
     out = M._routed_experts(
         core, x, layer, fp4, router if prefill_router else (lambda x, w: router(x, w))
     )
     assert out.shape == (rows, 8)
+    # Every row's output is its own, in row order, across the chunk boundaries.
+    assert torch.equal(out[:, 0], ids.float())
     assert runner_rows == launches
     assert router_rows == [min(8192, rows - lo) for lo in range(0, rows, 8192)]
 
