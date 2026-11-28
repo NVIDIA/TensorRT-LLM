@@ -192,6 +192,125 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// MXFP8 quantization of a few rows with swizzled scale factors
+
+namespace
+{
+
+// One CTA converts 1024 columns (eight 128-column scale-factor atoms) of one row.
+constexpr int kMxfp8SmallMThreads = 128;
+// Rows 0..31 of a swizzled 128x4 atom are the first entries of its 32 16-byte slots.
+constexpr int kMxfp8SmallMMaxRows = 32;
+
+// MXFP8 quantization (K32 UE8M0 scales, swizzled 128x4 layout) of one unpadded [numRows, numCols] matrix with
+// numRows <= 32 and numCols % 128 == 0.
+//
+// quantize_with_block_size gives each CTA one padded row, so a few rows launch 128 CTAs and most of them only write
+// zero padding scale factors one byte at a time. Here each thread converts one 8-element vector with
+// cvt_warp_fp16_to_mxfp8, the function that quantize_with_block_size uses, so the values and scale factors are bitwise
+// the same. The grid is (ceil(numCols / 1024), numRows), and the scale factors are written in 16-byte stores:
+//
+// A 128-column atom of the swizzled layout has 32 slots of 16 bytes. Slot r holds the four K32 scales of rows r,
+// r + 32, r + 64 and r + 96. For r < numRows the slot is [four scales of row r, 12 zero bytes]; the other slots are
+// zero. Every byte of the scale-factor buffer is written.
+template <typename T>
+__global__ void __launch_bounds__(kMxfp8SmallMThreads)
+    quantize_mxfp8_small_m_swizzled(int32_t numRows, int32_t numCols, T const* in, uint64_t* out, uint4* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // 16 threads convert the 128 columns of one atom.
+    constexpr int kVecsPerAtom = 4 * 32 / CVT_ELTS_PER_THREAD;
+    constexpr int kAtomsPerCta = kMxfp8SmallMThreads / kVecsPerAtom;
+    constexpr int kSlotsPerAtom = 32;
+
+    int const numVecs = numCols / CVT_ELTS_PER_THREAD;
+    int const rowIdx = blockIdx.y;
+    int const vecIdx = blockIdx.x * kMxfp8SmallMThreads + threadIdx.x;
+    // numCols % 128 == 0, so the 16 threads of an atom are all active or all inactive.
+    bool const active = vecIdx < numVecs;
+    int64_t const offset = static_cast<int64_t>(rowIdx) * numVecs + vecIdx;
+
+    cudaGridDependencySynchronize();
+
+    // Inactive threads convert zeros, so that every lane takes part in the shuffles below.
+    PackedVec<T> vec{};
+    if (active)
+    {
+        vec = reinterpret_cast<PackedVec<T> const*>(in)[offset];
+    }
+    uint8_t sf = 0;
+    uint64_t const values = cvt_warp_fp16_to_mxfp8<T, 32>(vec, &sf);
+    if (active)
+    {
+        out[offset] = values;
+    }
+
+    // The first lane of each 16-lane group stores the slot of this row: its own scale and those of lanes +4, +8, +12.
+    int const lane = threadIdx.x % 32;
+    int const groupLane = lane & ~(kVecsPerAtom - 1);
+    uint32_t const sf1 = __shfl_sync(0xffffffffU, static_cast<uint32_t>(sf), groupLane + 4);
+    uint32_t const sf2 = __shfl_sync(0xffffffffU, static_cast<uint32_t>(sf), groupLane + 8);
+    uint32_t const sf3 = __shfl_sync(0xffffffffU, static_cast<uint32_t>(sf), groupLane + 12);
+    if (active && lane == groupLane)
+    {
+        int const atomIdx = vecIdx / kVecsPerAtom;
+        SFout[atomIdx * kSlotsPerAtom + rowIdx]
+            = make_uint4(static_cast<uint32_t>(sf) | (sf1 << 8) | (sf2 << 16) | (sf3 << 24), 0U, 0U, 0U);
+    }
+
+    // The CTAs of one column chunk share the zero slots of the rows numRows..31 of its atoms.
+    int const firstAtom = blockIdx.x * kAtomsPerCta;
+    int const numAtoms = min(kAtomsPerCta, numCols / 128 - firstAtom);
+    int const numPadRows = kSlotsPerAtom - numRows;
+    for (int i = rowIdx * kMxfp8SmallMThreads + threadIdx.x; i < numAtoms * numPadRows;
+         i += numRows * kMxfp8SmallMThreads)
+    {
+        SFout[(firstAtom + i / numPadRows) * kSlotsPerAtom + numRows + i % numPadRows] = make_uint4(0U, 0U, 0U, 0U);
+    }
+
+    // The PDL contract of quantize_with_block_size: every store is visible before any thread triggers completion.
+    __threadfence();
+    __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// Runs quantize_mxfp8_small_m_swizzled when the problem fits it. Returns false when the caller must run
+// quantize_with_block_size.
+template <typename T>
+bool launchMxFP8SmallMSwizzled(int b, int m, int n, int padded_n, T const* input, int64_t* output, int32_t* SFOuput,
+    QuantizationSFLayout layout, cudaStream_t stream)
+{
+    // Up to 2048 columns both kernels run at the launch latency on B200, and quantize_with_block_size is not slower.
+    constexpr int kMinCols = 2048;
+    static int const smVersion = tensorrt_llm::common::getSMVersion();
+    bool const fits = (smVersion == 100 || smVersion == 103) && b == 1 && layout == QuantizationSFLayout::SWIZZLED
+        && m >= 1 && m <= kMxfp8SmallMMaxRows && n > kMinCols && n == padded_n && n % 128 == 0
+        && reinterpret_cast<uintptr_t>(input) % 16 == 0 && reinterpret_cast<uintptr_t>(SFOuput) % 16 == 0;
+    if (!fits)
+    {
+        return false;
+    }
+
+    int const numVecs = n / CVT_ELTS_PER_THREAD;
+    cudaLaunchConfig_t config;
+    config.gridDim = dim3((numVecs + kMxfp8SmallMThreads - 1) / kMxfp8SmallMThreads, m);
+    config.blockDim = dim3(kMxfp8SmallMThreads);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, quantize_mxfp8_small_m_swizzled<T>, m, n, input,
+        reinterpret_cast<uint64_t*>(output), reinterpret_cast<uint4*>(SFOuput)));
+    return true;
+}
+
+} // namespace
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // MXFP8 Quantization
 
 // Kill switch for the SM107 quantize_mxfp8_rows path of invokeMxFP8Quantization.
@@ -204,6 +323,14 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     static_assert(SF_VEC_SIZE == 32 || SF_VEC_SIZE == 128, "MXFP8 quantization supports SF vector sizes 32 and 128.");
     static_assert(SF_OUTPUT_VEC_SIZE == 32 || SF_OUTPUT_VEC_SIZE == SF_VEC_SIZE,
         "MXFP8 output SF vector size must be 32 or match the quantization SF vector size.");
+
+    if constexpr (SF_VEC_SIZE == 32 && SF_OUTPUT_VEC_SIZE == 32)
+    {
+        if (launchMxFP8SmallMSwizzled(b, m, n, padded_n, input, output, SFOuput, layout, stream))
+        {
+            return;
+        }
+    }
 
     if (b == 0 || m == 0 || n == 0)
     {
