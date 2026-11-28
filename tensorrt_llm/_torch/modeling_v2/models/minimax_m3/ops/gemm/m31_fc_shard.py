@@ -3,12 +3,12 @@
 """FC_SHARD: the DSpark drafter's fc as a tensor-parallel column shard plus an all-gather, bit for bit the full fc.
 
 The drafter's fc ([M, layers x H] -> [M, H], bf16, no bias) is replicated on every rank, so each rank reads the whole
-weight. Here each rank computes its H / tp output columns and the ranks all-gather them. Each column is computed by
-``mv2_minimax_m3::minimax_m31_fc_shard_gemm`` with the cuBLASLt algo the full fc uses (``PINNED_CFG``), so every output
-column is the same sum of the same K-split partials as in the full GEMM and the gathered result equals
-``torch.nn.functional.linear(x, w)``. ``FcShard.build`` checks that on the device before the first use (real-scale and
-2^+-12 block-scaled probes, every row count up to ``MAX_ROWS``) and returns None, keeping the stock fc, when the op is
-not built, the shape does not apply, or any probe differs.
+weight. Here each rank computes its H / tp output columns with
+``mv2_minimax_m3::minimax_m31_fc_shard_gemm`` and the ranks all-gather them. ``FcShard.build`` tries known pinned
+cuBLASLt configurations and checks each against ``torch.nn.functional.linear(x, w)`` on the device before the first
+use (real-scale and 2^+-12 block-scaled probes, every row count up to ``MAX_ROWS``). It keeps the first configuration
+whose probes are bitwise equal, or returns None, keeping the stock fc, when the op is not built, the shape does not
+apply, or no configuration matches.
 """
 
 from __future__ import annotations
@@ -23,10 +23,13 @@ from tensorrt_llm._torch.distributed import allgather
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm.logger import logger
 
-# cuBLASLt's algo for the full fc (K = 30720 -> N = 6144, bf16 in / out, fp32 compute) in the build's cuBLASLt:
+# cuBLASLt candidates for the full fc (K = 30720 -> N = 6144, bf16 in / out, fp32 compute):
 # ALGO_ID, TILE_ID, SPLITK_NUM, REDUCTION_SCHEME, CTA_SWIZZLING, CUSTOM_OPTION, STAGES_ID, INNER_SHAPE_ID,
-# CLUSTER_SHAPE_ID. The build self-check rejects it if this cuBLASLt picks a different one for the full fc.
+# CLUSTER_SHAPE_ID. PINNED_CFG retains the inherited 22-split compatibility choice, covered by simulation;
+# no physical 22-split setup has been verified. The nine-split alternative matched the measured full fc with
+# cuBLASLt raw version 130800. Every candidate must pass the bitwise self-check before use.
 PINNED_CFG = (66, 393, 22, 2, 0, 1, 35, 0, 3)
+_PINNED_CFGS = (PINNED_CFG, (66, 393, 9, 2, 0, 1, 35, 0, 3))
 MAX_ROWS = 8  # capacity: fixed: the verify rows of one request at draft length 7
 
 _STATE: dict = {}
@@ -77,13 +80,14 @@ class FcShard:
             return None
         logger.info(
             f"[M3 prebuild] FC_SHARD set up on rank {rank}/{tp}: fc {tuple(shard.source.shape)} -> shard "
-            f"{tuple(shard.w_shard.shape)}, bitwise to the full fc at 1..{MAX_ROWS} rows"
+            f"{tuple(shard.w_shard.shape)}, bitwise to the full fc at 1..{MAX_ROWS} rows, "
+            f"configuration {tuple(shard._cfg)}"
         )
         return shard
 
     @classmethod
     def _check(cls, fc: torch.nn.Module, tp: int, rank: int, mapping):
-        """(shard, None) when this rank's pinned shard GEMM is bitwise to the full fc on every probe, else
+        """(shard, None) when a configuration is bitwise to the full fc on every probe, else
         (None, reason)."""
         op = fc_shard_op()
         if op is None:
@@ -101,17 +105,32 @@ class FcShard:
             return None, f"fc shape / dtype / tp do not apply (tp {tp})"
         cols = w.shape[0] // tp
         shard = cls(w, w[rank * cols : (rank + 1) * cols].contiguous(), mapping, op)
+        reasons: list[str] = []
         try:
-            for rows in range(1, MAX_ROWS + 1):
-                for x in _probes(rows, w.shape[1], w.device):
-                    want = F.linear(x, w)[:, rank * cols : (rank + 1) * cols]
-                    if not torch.equal(op(x, shard.w_shard, shard._cfg), want):
-                        return (
-                            None,
-                            f"the pinned shard GEMM differs from the full fc at {rows} rows",
-                        )
-        except RuntimeError as e:
-            return None, f"the pinned cuBLASLt algo is rejected ({e})"
+            for configuration in _PINNED_CFGS:
+                shard._cfg = list(configuration)
+                why = None
+                for rows in range(1, MAX_ROWS + 1):
+                    for inputs in _probes(rows, w.shape[1], w.device):
+                        want = F.linear(inputs, w)[:, rank * cols : (rank + 1) * cols]
+                        try:
+                            got = op(inputs, shard.w_shard, shard._cfg)
+                        except NotImplementedError as error:
+                            why = f"the pinned cuBLASLt algo is rejected ({error})"
+                            break
+                        if not torch.equal(got, want):
+                            why = f"the pinned shard GEMM differs from the full fc at {rows} rows"
+                            break
+                    if why is not None:
+                        break
+                if why is None:
+                    break
+                reasons.append(f"SPLITK_NUM={configuration[2]}: {why}")
+            else:
+                return None, "; ".join(reasons)
+        except RuntimeError as error:
+            reasons.append(f"SPLITK_NUM={configuration[2]}: the fc self-check failed ({error})")
+            return None, "; ".join(reasons)
         torch.cuda.synchronize()
         return shard, None
 
