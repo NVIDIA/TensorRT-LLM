@@ -30,8 +30,10 @@ else:
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAIntermediateState,
+    KDAMtpReplayState,
     KDAReplayState,
     _is_disagg_context_server,
+    create_kda_replay_state,
     get_kda_replay_num_spec,
 )
 from tensorrt_llm._torch.modules.kimi_kda.replay_region import REPLAY_STATE_REGION, KDAReplayRegion
@@ -81,6 +83,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
 
     kda_context_only = False
     _kda_replay_region: KDAReplayRegion | None = None
+    _kda_mtp_replay = False
     # Its sparse MLA backend does not write or read mixed-precision high layers.
     _supports_mixed_precision_kv = False
 
@@ -97,6 +100,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         index_state_dim: int = 0,
         kda_replay_num_spec: int | None = None,
         kda_draft_records: bool = False,
+        kda_mtp_replay: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -113,6 +117,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 place of the k / g / v / beta caches, for a model whose verify
                 replays from them. The replay buffers then share the
                 recurrent-state slot.
+            kda_mtp_replay: Whether the model's KDA layers can verify drafts
+                with the KDA MTP replay kernels instead of the fused verify.
         """
         # Set before super().__init__: the base _build_base_config calls
         # _extra_buffers_per_layer, which reads both of these.
@@ -137,6 +143,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
+        self._kda_mtp_replay = kda_mtp_replay
         self._kda_replay: KDAReplayState | None = None
         self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
@@ -151,8 +158,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if self.kda_context_only:
             return None
         if num_spec is not None:
-            self._kda_replay = KDAReplayState(
+            self._kda_replay = create_kda_replay_state(
                 num_spec,
+                self._state_layout,
+                kda_mtp_replay=self._kda_mtp_replay,
                 stochastic_rounding=self._mamba_ssm_stochastic_rounding,
                 draft_records=self._requested_draft_records,
             )
@@ -163,6 +172,26 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
+
+    def get_replay_dummy_request_mask(self) -> torch.Tensor | None:
+        """The batch-ordered dummy-request mask of the last state-index setup.
+
+        The KDA MTP replay skips dummy rows; the buffer address stays fixed.
+        """
+        return self._dummy_request_mask
+
+    @property
+    def use_kda_mtp_replay(self) -> bool:
+        return isinstance(self._kda_replay, KDAMtpReplayState)
+
+    @property
+    @override
+    def commits_every_generation_step(self) -> bool:
+        """Whether every generation step, drafts or not, needs ``update_mamba_states``.
+
+        The KDA MTP replay verifies one-token steps too and commits them after sampling.
+        """
+        return self.use_kda_mtp_replay
 
     @override
     def _region_providers(self) -> Sequence[RegionProvider]:
@@ -392,6 +421,13 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if self._kda_replay is None or not self._kda_replay._stochastic_rounding:
             return 0
         return torch.int64.itemsize
+
+    @override
+    def _get_external_cache_bytes(self, cache) -> int:
+        external = super()._get_external_cache_bytes(cache)
+        if self._kda_replay is not None:
+            external += self._kda_replay.external_gpu_bytes(self._state_layout)
+        return external
 
     @classmethod
     @override

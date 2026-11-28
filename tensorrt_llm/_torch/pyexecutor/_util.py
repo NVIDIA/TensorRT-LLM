@@ -1548,6 +1548,14 @@ class KvCacheCreator:
                 and _uses_gdn_mtp_replay(self._model_engine.model)):
             # Cost the GDN replay region of the state the manager will select.
             extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
+        from ..modules.kimi_kda.cache_manager import uses_kda_mtp_replay
+        if (not is_draft and self._speculative_config is not None
+                and isinstance(manager_cls, type)
+                and issubclass(manager_cls, MambaHybridCacheManagerV2)
+                and self._model_engine is not None
+                and uses_kda_mtp_replay(self._model_engine.model)):
+            # Cost the KDA replay region of the state the manager will select.
+            extra_kwargs = dict(extra_kwargs, kda_mtp_replay=True)
         cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
@@ -5005,6 +5013,12 @@ def _create_kv_cache_manager(
                 and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                 and getattr(backbone, "kda_draft_records", False)):
             kda_extra_kwargs["kda_draft_records"] = True
+        from ..modules.kimi_kda.cache_manager import uses_kda_mtp_replay
+        if (spec_config is not None
+                and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+                and model_engine is not None
+                and uses_kda_mtp_replay(model_engine.model)):
+            kda_extra_kwargs["kda_mtp_replay"] = True
         if (not is_glm5_next and issubclass(kv_cache_manager_cls,
                                             MambaHybridCacheManagerV2)):
             # The V2 manager reads the MLA geometry and the per-layer KV
