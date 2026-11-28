@@ -6,6 +6,7 @@ import re
 import time
 import traceback
 import uuid
+from collections.abc import Iterable
 from typing import Any, List, Literal, Tuple
 
 from openai_harmony import (Author, Conversation, DeveloperContent,
@@ -489,10 +490,16 @@ class HarmonyAdapter:
             # Str
             if isinstance(content, str):
                 contents.append(content.strip())
-            # list[ChatCompletionContentPartTextParam]
-            if isinstance(content, list):
+            # Iterable[ChatCompletionContentPartTextParam] (list or Pydantic ValidatorIterator)
+            elif isinstance(content, Iterable) and not isinstance(
+                    content, (bytes, dict)):
+                if not isinstance(content, list):
+                    content = list(content)
+                    if isinstance(message, dict):
+                        message["content"] = content
                 for part in content:
-                    if isinstance(part, dict) and "text" in part:
+                    if isinstance(part, dict) and isinstance(
+                            part.get("text"), str):
                         contents.append(part["text"].strip())
             return "\n".join(contents)
         return None
@@ -792,8 +799,12 @@ class HarmonyAdapter:
                     if content:
                         dev_instructions.append(content.strip())
                 elif role == "assistant":
-                    # Track tool calls for later mapping
+                    # Track tool calls for later mapping; materialize single-use
+                    # Pydantic ValidatorIterators so the second pass keeps them.
                     tool_calls = msg.get("tool_calls", [])
+                    if tool_calls and not isinstance(tool_calls, list):
+                        tool_calls = list(tool_calls)
+                        msg["tool_calls"] = tool_calls
                     for tool_call in tool_calls:
                         tool_call_id = tool_call.get("id")
                         func_name = tool_call.get("function", {}).get("name")

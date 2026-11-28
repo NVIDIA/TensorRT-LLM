@@ -1487,6 +1487,84 @@ def test_count_tokens_rejects_a_malformed_request():
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
+@pytest.mark.parametrize("user_has_image", [False, True], ids=["exact", "length_fallback"])
+def test_count_tokens_counts_omitted_tool_result_image_note_for_text_only_model(
+    user_has_image, monkeypatch
+):
+    """A tool_result image on a text-only model is rendered as an omission note and counted."""
+    client = _count_tokens_client()
+    fallback_calls = 0
+    real_render_for_length = openai_server_module.render_chat_for_length
+
+    def _spy_render_for_length(*args, **kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return real_render_for_length(*args, **kwargs)
+
+    monkeypatch.setattr(openai_server_module, "render_chat_for_length", _spy_render_for_length)
+
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
+    }
+    note_block = {"type": "text", "text": "[image omitted: this model accepts text only]"}
+    user_content = (
+        [{"type": "text", "text": "Inspect the chart."}, image_block]
+        if user_has_image
+        else "Inspect the chart."
+    )
+
+    def _body(tool_result_content):
+        return {
+            "model": MODEL,
+            "tools": [{"name": "view_image", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": user_content},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "view_image",
+                            "input": {"path": "chart.png"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": tool_result_content,
+                        }
+                    ],
+                },
+            ],
+        }
+
+    with_image = client.post(
+        "/v1/messages/count_tokens",
+        json=_body([{"type": "text", "text": "chart.png"}, image_block]),
+    )
+    with_note = client.post(
+        "/v1/messages/count_tokens",
+        json=_body([{"type": "text", "text": "chart.png"}, note_block]),
+    )
+    without_image = client.post(
+        "/v1/messages/count_tokens",
+        json=_body([{"type": "text", "text": "chart.png"}]),
+    )
+
+    assert with_image.status_code == 200
+    assert with_note.status_code == 200
+    assert without_image.status_code == 200
+    assert fallback_calls == (3 if user_has_image else 0)
+    assert with_image.json() == with_note.json()
+    assert with_image.json()["input_tokens"] > without_image.json()["input_tokens"]
+
+
 # ---------------------------------------------------------------------------
 # Disaggregated count_tokens forwarding
 # ---------------------------------------------------------------------------

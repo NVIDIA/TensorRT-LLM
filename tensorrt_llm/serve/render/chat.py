@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -46,7 +47,11 @@ from tensorrt_llm.inputs.utils import (
     uses_tokenizer_native_renderer,
 )
 from tensorrt_llm.sampling_params import SamplingParams
-from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.chat_utils import (
+    omitted_tool_media_note,
+    parse_chat_messages_coroutines,
+    resolve_top_level_model_type,
+)
 from tensorrt_llm.serve.serving_extensions import ServingExtension
 
 from .prompt_types import (
@@ -362,15 +367,27 @@ def _is_passthrough_model(res: RenderResources) -> bool:
     )
 
 
-def _has_media(messages: Any) -> bool:
-    """Whether any message carries a media content part."""
+def _has_media(messages: Any, model_type: Optional[str] = None) -> bool:
+    """Whether any message carries a media content part that stays media."""
     for message in messages or []:
         content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, list):
+        if not isinstance(content, Iterable) or isinstance(content, (str, bytes, dict)):
             continue
+        if not isinstance(content, list):
+            content = list(content)
+            message["content"] = content
+        role = message.get("role")
         for part in content:
-            part_type = part.get("type", "") if isinstance(part, dict) else ""
-            if any(marker in part_type for marker in _MEDIA_PART_MARKERS):
+            part_type = part.get("type") if isinstance(part, dict) else None
+            if isinstance(part_type, str) and any(
+                marker in part_type for marker in _MEDIA_PART_MARKERS
+            ):
+                if (
+                    role == "tool"
+                    and model_type is not None
+                    and omitted_tool_media_note(part, model_type) is not None
+                ):
+                    continue
                 return True
     return False
 
@@ -379,6 +396,8 @@ def _parse_text_conversation(
     request: "ChatCompletionRequest",
     res: RenderResources,
     raw_messages: Optional[List[Any]] = None,
+    *,
+    use_raw_messages: bool = False,
 ):
     """Parse ``request.messages``; media is detected, never loaded.
 
@@ -388,6 +407,15 @@ def _parse_text_conversation(
     body passes ``raw_messages``. Without them the messages cannot be recovered, and
     guessing would silently drop content, so the request is reported as unsupported.
     """
+    if use_raw_messages:
+        return parse_chat_messages_coroutines(
+            raw_messages,
+            res.hf_config,
+            res.multimodal_server_config,
+            request_media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            model_type_override=res.model_type,
+            resolve_media=False,
+        )
     try:
         return parse_chat_messages_coroutines(
             request.messages,
@@ -413,8 +441,8 @@ def _parse_text_conversation(
         )
 
 
-def _without_media(messages: Any) -> List[Any]:
-    """The messages with every non-text content part left out."""
+def _without_media(messages: Any, model_type: Optional[str] = None) -> List[Any]:
+    """The messages with media parts omitted, keeping tool-result omission notes."""
     result = []
     for original in messages:
         message = dict(original)
@@ -426,10 +454,23 @@ def _without_media(messages: Any) -> List[Any]:
             if isinstance(original, dict):
                 original["tool_calls"] = message["tool_calls"]
         content = message.get("content")
-        if isinstance(content, list):
-            message["content"] = [
-                part for part in content if isinstance(part, dict) and part.get("type") == "text"
-            ]
+        if isinstance(content, Iterable) and not isinstance(content, (str, bytes, dict)):
+            if not isinstance(content, list):
+                content = list(content)
+                if isinstance(original, dict):
+                    original["content"] = content
+            role = message.get("role")
+            kept = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    kept.append(part)
+                elif role == "tool" and model_type is not None:
+                    note = omitted_tool_media_note(part, model_type)
+                    if note is not None:
+                        kept.append({"type": "text", "text": note})
+            message["content"] = kept
         result.append(message)
     return result
 
@@ -466,7 +507,21 @@ def render_chat(
         if token_ids is not None:
             return RenderedPrompt(token_ids=list(token_ids))
 
-    if _has_media(request.messages):
+    model_type = res.model_type or resolve_top_level_model_type(res.hf_config)
+    use_raw_messages = False
+    try:
+        has_media = _has_media(request.messages, model_type)
+    except ValidationError as error:
+        if raw_messages is None:
+            raise UnrenderableMessagesError(
+                "The messages carry fields the request model rejects; they can only be "
+                "rendered from the raw request body."
+            ) from error
+        has_media = _has_media(raw_messages, model_type)
+        use_raw_messages = True
+    if has_media or (
+        not use_raw_messages and raw_messages is not None and _has_media(raw_messages, model_type)
+    ):
         raise UnsupportedRenderError("Multimodal input is not supported by prompt rendering.")
     if _is_passthrough_model(res):
         # The model's own processor builds the prompt; the text the chat route
@@ -476,7 +531,7 @@ def render_chat(
             "rendering its prompts is not supported."
         )
     conversation, mm_coroutine, mm_placeholder_counts, _mm_item_order = _parse_text_conversation(
-        request, res, raw_messages
+        request, res, raw_messages, use_raw_messages=use_raw_messages
     )
     # Nothing here loads media; close the coroutine instead of leaving it to be reported
     # as never awaited.
@@ -544,8 +599,11 @@ def render_chat_for_length(
     The result is not an executable prompt and must never be forwarded to a worker. Messages
     the request model rejects raise :class:`UnrenderableMessagesError`.
     """
+    model_type = res.model_type or resolve_top_level_model_type(res.hf_config)
     try:
-        messages = _without_media(request.messages)
+        messages = _without_media(
+            request.messages, model_type=None if res.use_harmony else model_type
+        )
     except ValidationError as error:
         raise UnrenderableMessagesError(
             "The messages carry fields the request model rejects; they can only be "
@@ -565,6 +623,8 @@ def render_chat_for_length(
         else:
             if token_ids is not None:
                 return RenderedPrompt(token_ids=list(token_ids))
+        update["messages"] = _without_media(request.messages, model_type=model_type)
+        text_only = request.model_copy(update=update)
     plain = dataclasses.replace(
         res,
         model_type="" if _is_passthrough_model(res) else res.model_type,
