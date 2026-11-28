@@ -36,7 +36,7 @@ class UnsupportedRenderError(ValueError):
 
 
 class HarmonyConversionError(RuntimeError):
-    """The Harmony adapter could not convert the messages (a tool without a description)."""
+    """The Harmony adapter could not convert the messages (tool-call arguments not a string)."""
 
 
 class UnrenderableMessagesError(UnsupportedRenderError):

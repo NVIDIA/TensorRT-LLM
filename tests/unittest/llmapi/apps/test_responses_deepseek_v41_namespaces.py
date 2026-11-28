@@ -102,14 +102,12 @@ def _checkpoint_tools():
     )
     tools = []
     for namespace, name, description, parameters in _DECLARED:
-        # Every function the server hands over carries `strict`, unset, and the
-        # encoder renders every key it is given.
-        function = {
-            "name": name,
-            "description": description,
-            "parameters": freeform.function.parameters if parameters is None else parameters,
-            "strict": None,
-        }
+        # The encoder renders every key it is given. A function carries its name,
+        # its description when the tool declares one, and its parameters.
+        function = {"name": name}
+        if description is not None:
+            function["description"] = description
+        function["parameters"] = freeform.function.parameters if parameters is None else parameters
         tool = {"type": "function", "function": function}
         if namespace is not None:
             tool["namespace"] = {"name": namespace, "description": _NAMESPACES[namespace]}
@@ -177,6 +175,14 @@ def test_namespaced_tools_are_shown_in_the_checkpoint_form():
     assert descriptions["multi_agent_v1::wait"] == "Tools for working with sub-agents.\n"
     # An empty namespace description adds nothing.
     assert descriptions["functions::exec"] == "Runs code."
+
+
+@pytest.mark.parametrize("model_type", [MODEL_TYPE, "generic"])
+def test_a_tool_is_shown_without_fields_it_left_unset(model_type):
+    """No field a tool did not set is shown, as ``null`` or otherwise."""
+    for schema in _tool_schemas(_render(_request(), model_type=model_type)):
+        assert set(schema) <= {"name", "description", "parameters"}
+        assert None not in schema.values()
 
 
 def test_a_request_without_namespaces_renders_as_on_the_generic_path():
