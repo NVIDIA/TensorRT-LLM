@@ -132,7 +132,6 @@ full:VR200/accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-e
 full:VR200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl SKIP (https://nvbugs/7036886)
 full:VR200/accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[linear] SKIP (https://nvbugs/7045027)
 full:VR200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_parallelism[TP2_PP2] SKIP (https://nvbugs/7045027)
-full:VR200/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/7045027)
 full:VR200/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix[DeepSeek-V3-Lite-bf16-short_prompt] SKIP (https://nvbugs/7045027)
 full:VR200/test_e2e.py::test_openai_kv_cache_contamination SKIP (https://nvbugs/6949279)
 full:VR200/unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_async_lifecycle SKIP (https://nvbugs/7045027)
