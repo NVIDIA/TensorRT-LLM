@@ -399,6 +399,23 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
             f"attn_backend='{model_config.attn_backend}'.")
 
 
+def validate_confidence_scheduling_support(
+        model: torch.nn.Module,
+        spec_config: Optional[DecodingBaseConfig]) -> None:
+    """Reject DSpark confidence scheduling for a constructed target that does
+    not declare ragged verification, before its weights are allocated."""
+    if not getattr(spec_config, "enable_confidence_scheduling", False):
+        return
+    # Declaring it is optional for every model class, so absence means it is
+    # not validated.
+    declared = getattr(model, "supports_ragged_verification", None)
+    if declared is None or not declared(model.model_config):
+        raise ValueError(
+            "DSpark confidence scheduling is not validated for "
+            f"{type(model).__name__} with this speculative configuration; set "
+            "speculative_config.enable_confidence_scheduling=False")
+
+
 def release_localized_moe_weights(model: torch.nn.Module) -> None:
     """Unmap every die-local MoE weight bank (MEGAMOE_UGPU_LAYOUT) under ``model``.
 
@@ -1547,6 +1564,7 @@ class ModelLoader:
         self._model_in_load = model
 
         validate_lm_head_output_dtype(model, self.llm_args.lm_head_output_dtype)
+        validate_confidence_scheduling_support(model, self.spec_config)
 
         # raise error when the built model cannot load the checkpoint as is
         _check_post_init_model_compat(model, load_format, checkpoint_loader)

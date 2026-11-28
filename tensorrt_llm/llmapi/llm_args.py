@@ -9564,11 +9564,6 @@ class TorchLlmArgs(BaseLlmArgs):
         ragged path at all or takes it with a kernel that mis-attributes rows.
         A hard error at construction is the only signal that survives.
         """
-        if not self.speculative_config.draft_is_embedded_in_target:
-            raise ValueError(
-                "DSpark confidence scheduling supports only the embedded "
-                "DeepSeek-V4 draft. Standalone DSpark retains native "
-                "verification; disable confidence scheduling for that path.")
         speculative_config = self.speculative_config
         if (getattr(speculative_config, "acceptance_rate_window_size", None)
                 and getattr(speculative_config, "acceptance_rate_threshold",
@@ -9609,6 +9604,14 @@ class TorchLlmArgs(BaseLlmArgs):
                 "with one uniform speculative stride, which cannot represent "
                 "packed per-request verify windows. Disable LoRA or disable "
                 "confidence scheduling.")
+        if self.enable_locality_domains:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support locality domains. Fork-join attention splits the "
+                "generation rows between the domains by request, which "
+                "cannot represent packed per-request verify windows. Set "
+                "enable_locality_domains=False or disable confidence "
+                "scheduling.")
         # `fit_ragged_verify_lens` plans against the padded row count and
         # reserves tokens for the CUDA-graph padding rows, so it presumes those
         # rows exist. With padding off, `_get_padded_batch` adds none: the batch

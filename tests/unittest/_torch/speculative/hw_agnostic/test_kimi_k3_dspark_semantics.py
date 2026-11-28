@@ -15,8 +15,9 @@ resolves to the exact pre-dspark behavior (slots 1..K, no window, no
 Markov bias). CPU-only where possible; the tiny end-to-end block-decode
 parity test needs CUDA + flash_attn and is skip-guarded.
 
-Confidence-scheduled verification is MR B: here we only check that
-confidence_proj weights load without being used.
+Confidence-scheduled verification is covered elsewhere: here we check how
+the confidence head is built from the confidence_proj weights and which
+previous token each of its positions reads.
 """
 
 import math
@@ -31,7 +32,10 @@ from _torch.helpers import dspark_markov_chain_logits_reference
 
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM, dspark_layer_window_size
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
-from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
+from tensorrt_llm._torch.models.modeling_speculative import (
+    DSparkConfidenceHead,
+    dspark_markov_step_bias,
+)
 from tensorrt_llm._torch.speculative.dflash import dflash_draft_slot_ids
 
 needs_cuda = pytest.mark.skipif(
@@ -489,11 +493,14 @@ def test_dspark_drafter_loads_head_weights_and_parses_config():
     assert drafter.has_markov_head
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_w1.weight"])
     torch.testing.assert_close(drafter.markov_w2.cpu(), weights["markov_w2.weight"])
-    # Confidence weights loaded for MR B, but never consumed here.
+    head = drafter.confidence_head
+    assert head.with_markov
     torch.testing.assert_close(
-        drafter.confidence_proj_weight.cpu(), weights["confidence_proj.weight"]
+        head.proj.weight.cpu(), weights["confidence_proj.weight"].float(), rtol=0, atol=0
     )
-    assert drafter.confidence_proj_bias is not None
+    torch.testing.assert_close(
+        head.proj.bias.cpu(), weights["confidence_proj.bias"].float(), rtol=0, atol=0
+    )
 
 
 @needs_gpu
@@ -622,7 +629,11 @@ def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
     pretrained = _tiny_config(True, mask_token_id=None)
     pretrained.dspark_noise_token_id = mask_id
     spec = SimpleNamespace(
-        mask_token_id=mask_id, attention_backend="VANILLA", draft_is_embedded_in_target=False
+        mask_token_id=mask_id,
+        attention_backend="VANILLA",
+        draft_is_embedded_in_target=False,
+        max_draft_len=TINY["block_size"],
+        enable_confidence_scheduling=False,
     )
     drafter = _build_dspark_draft(
         SimpleNamespace(spec_config=spec),
@@ -660,7 +671,61 @@ def test_published_drafter_spelling_activates_the_heads():
     # the next request's anchor slot.
     assert drafter.shift_label
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
-    assert drafter.confidence_proj_bias is not None
+    torch.testing.assert_close(
+        drafter.confidence_head.proj.weight.cpu(),
+        weights["confidence_head.proj.weight"].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        drafter.confidence_head.proj.bias.cpu(),
+        weights["confidence_head.proj.bias"].float(),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("confidence_scheduling", [False, True])
+def test_confidence_head_of_an_unknown_width_fails_only_under_confidence_scheduling(
+    confidence_scheduling,
+):
+    """Drafting never reads the head, so a width the runtime does not know matters only to the
+    verification scheduler."""
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=TINY["hidden_size"]),
+        has_markov_head=True,
+        _dspark_markov_rank=RANK,
+        _dspark_confidence_scheduling=confidence_scheduling,
+    )
+    weight = torch.zeros(1, TINY["hidden_size"] + RANK + 1)
+    build = GQADSparkForCausalLM._build_confidence_head
+    if confidence_scheduling:
+        with pytest.raises(ValueError, match="Confidence scheduling cannot score drafts with it"):
+            build(drafter, weight, None)
+    else:
+        assert build(drafter, weight, None) is None
+
+
+def test_confidence_logits_pair_each_position_with_its_previous_token():
+    """A head trained with the Markov feature reads the anchor's row for the first drafted
+    position and the previous draft's row for every later one."""
+    hidden_size = TINY["hidden_size"]
+    generator = torch.Generator().manual_seed(11)
+    head = DSparkConfidenceHead(
+        hidden_size=hidden_size, markov_rank=RANK, with_markov=True, bias=True
+    )
+    markov_w1 = torch.randn(VOCAB, RANK, generator=generator)
+    drafter = SimpleNamespace(confidence_head=head, markov_w1=markov_w1)
+    block_hidden = torch.randn(2, 3, hidden_size, generator=generator)
+    anchors = torch.tensor([3, 5])
+    drafts = torch.tensor([[1, 2, 4], [6, 7, 8]])
+
+    logits = GQADSparkForCausalLM.draft_confidence_logits(drafter, block_hidden, anchors, drafts)
+
+    previous_tokens = torch.tensor([[3, 1, 2], [5, 6, 7]])
+    features = torch.cat([block_hidden, markov_w1[previous_tokens]], dim=-1)
+    expected = F.linear(features, head.proj.weight, head.proj.bias).squeeze(-1)
+    torch.testing.assert_close(logits, expected)
 
 
 @needs_gpu
@@ -747,7 +812,7 @@ def test_plain_dflash_drafter_keeps_old_gates():
     for absent in (
         "has_markov_head",
         "markov_w1",
-        "confidence_proj_weight",
+        "confidence_head",
         "apply_markov_chain_logits",
     ):
         assert not hasattr(drafter, absent), f"DFlash base still carries {absent}"
