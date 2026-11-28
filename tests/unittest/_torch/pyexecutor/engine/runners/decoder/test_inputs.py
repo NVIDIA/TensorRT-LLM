@@ -341,13 +341,20 @@ class TestCachedKvTokenLogging(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("stages_inputs", [False, True])
-@pytest.mark.parametrize("multimodal", [False, True])
+@pytest.mark.parametrize(
+    "stages_inputs,multimodal,periodic_snapshot",
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+    ],
+)
 def test_breakable_prefill_replays_multimodal_batches_only_with_staged_inputs(
-    stages_inputs: bool, multimodal: bool
+    stages_inputs: bool, multimodal: bool, periodic_snapshot: bool
 ) -> None:
-    """Multimodal batches replay a breakable prefill graph only when replay refreshes the
-    body inputs; a runner on the plain text body keeps them eager, as before."""
+    """Media replay requires staged inputs. Periodic snapshot writes run eagerly."""
     preparer = object.__new__(DecoderInputPreparer)
     preparer._config = SimpleNamespace(
         enable_attention_dp=False,
@@ -376,7 +383,10 @@ def test_breakable_prefill_replays_multimodal_batches_only_with_staged_inputs(
         remote_tail_modes=set(),
         lists=SimpleNamespace(multimodal_params_list=[object()] if multimodal else []),
     )
-    attn_metadata = SimpleNamespace(padded_num_tokens=None)
+    attn_metadata = SimpleNamespace(
+        mamba_metadata=SimpleNamespace(periodic_snapshot=object()) if periodic_snapshot else None,
+        padded_num_tokens=None,
+    )
     incoming_flag = get_per_request_prefill_cuda_graph_flag()
     try:
         preparer._pad_inputs(
@@ -387,7 +397,7 @@ def test_breakable_prefill_replays_multimodal_batches_only_with_staged_inputs(
             False,
             is_dummy=False,
         )
-        replays = stages_inputs or not multimodal
+        replays = not periodic_snapshot and (stages_inputs or not multimodal)
         assert host.virtual_num_tokens == (8 if replays else 5)
         assert attn_metadata.padded_num_tokens == (8 if replays else None)
         assert get_per_request_prefill_cuda_graph_flag() is replays
