@@ -115,12 +115,12 @@ b = 32
 warps_m = 1
 warps_n = 4
 if s == 256:
-    runs == 20000
+    runs = 20000
 if s == 384:
-    runs == 20000
+    runs = 20000
 elif s == 512:
     warps_n = 8
-    runs == 5000
+    runs = 5000
 elif s == 128:
     runs = 20000
 
