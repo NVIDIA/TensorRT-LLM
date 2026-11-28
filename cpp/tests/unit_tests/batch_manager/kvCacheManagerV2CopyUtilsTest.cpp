@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -37,6 +38,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace
@@ -126,6 +128,31 @@ private:
     int mFd = -1;
 };
 
+//! Synchronizes its streams when it goes out of scope. Declared after the buffers a test's copies use, it runs before
+//! they are destroyed, so a fatal assertion that returns early cannot leave a queued copy reading or writing them.
+class SyncOnExit
+{
+public:
+    explicit SyncOnExit(std::vector<CUstream> streams)
+        : mStreams(std::move(streams))
+    {
+    }
+
+    ~SyncOnExit()
+    {
+        for (CUstream stream : mStreams)
+        {
+            EXPECT_EQ(cuStreamSynchronize(stream), CUDA_SUCCESS);
+        }
+    }
+
+    SyncOnExit(SyncOnExit const&) = delete;
+    SyncOnExit& operator=(SyncOnExit const&) = delete;
+
+private:
+    std::vector<CUstream> mStreams;
+};
+
 class KvCacheManagerV2CopyUtilsTest : public ::testing::Test
 {
 protected:
@@ -156,6 +183,7 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, HostToHostIsBitwiseTheSameAtOneAndManyThre
     fillPattern(src, kNumPages, 1);
     std::vector<std::byte> one(src.size(), std::byte{0});
     std::vector<std::byte> many(src.size(), std::byte{0});
+    SyncOnExit const sync({mStream});
 
     ASSERT_EQ(setHostCopyThreadsForTesting(1), 1U);
     uint64_t const helpersBefore = hostCopyHelperTasksForTesting();
@@ -165,12 +193,21 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, HostToHostIsBitwiseTheSameAtOneAndManyThre
     EXPECT_EQ(hostCopyHelperTasksForTesting(), helpersBefore);
 
     ASSERT_GT(setHostCopyThreadsForTesting(16), 1U);
-    ASSERT_EQ(copyHostToHost(hostTasks(many, src), kPageBytes, mStream), CUDA_SUCCESS);
-    ASSERT_EQ(cuStreamSynchronize(mStream), CUDA_SUCCESS);
-    EXPECT_GT(hostCopyHelperTasksForTesting(), helpersBefore);
+    // A helper counts its tasks before it publishes their completion, so a count read after the stream synchronized
+    // is final. Whether a helper wakes before the callback thread has claimed every task is up to the OS scheduler,
+    // so the copy is repeated (each time checked bitwise) until one did, a bounded number of times.
+    constexpr int kMaxRounds = 20;
+    int round = 0;
+    for (; round < kMaxRounds && hostCopyHelperTasksForTesting() == helpersBefore; ++round)
+    {
+        std::fill(many.begin(), many.end(), std::byte{0});
+        ASSERT_EQ(copyHostToHost(hostTasks(many, src), kPageBytes, mStream), CUDA_SUCCESS);
+        ASSERT_EQ(cuStreamSynchronize(mStream), CUDA_SUCCESS);
+        ASSERT_EQ(std::memcmp(one.data(), many.data(), one.size()), 0) << "round " << round;
+    }
+    EXPECT_GT(hostCopyHelperTasksForTesting(), helpersBefore) << "no helper took a task in " << round << " rounds";
 
     expectPermuted(one, src);
-    EXPECT_EQ(std::memcmp(one.data(), many.data(), one.size()), 0);
 }
 
 struct CheckData
@@ -197,17 +234,18 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, CallbacksKeepStreamOrder)
     std::vector<std::byte> b(a.size(), std::byte{0});
     std::vector<std::byte> c(a.size(), std::byte{0});
     std::vector<std::byte> d(a.size(), std::byte{0});
+    std::vector<std::byte> expected(a.size());
+    std::atomic<int> result{-1};
+    SyncOnExit const sync({mStream});
     ASSERT_EQ(copyHostToHost(hostTasks(b, a), kPageBytes, mStream), CUDA_SUCCESS);
     ASSERT_EQ(copyHostToHost(hostTasks(c, b), kPageBytes, mStream), CUDA_SUCCESS);
     ASSERT_EQ(copyHostToHost(hostTasks(d, c), kPageBytes, mStream), CUDA_SUCCESS);
 
-    std::vector<std::byte> expected(a.size());
     for (size_t page = 0; page < kNumPages; ++page)
     {
         size_t const dst = permute(permute(permute(page)));
         std::memcpy(expected.data() + dst * kPageBytes, a.data() + page * kPageBytes, kPageBytes);
     }
-    std::atomic<int> result{-1};
     CheckData check{d.data(), expected.data(), d.size(), &result};
     ASSERT_EQ(cuLaunchHostFunc(mStream, checkOnStream, &check), CUDA_SUCCESS);
     ASSERT_EQ(cuStreamSynchronize(mStream), CUDA_SUCCESS);
@@ -219,12 +257,24 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, CallbacksFromManyStreamsShareThePool)
     // Several streams issue large callbacks at once; CUDA runs them one at a time, and each one gets its own job.
     ASSERT_GT(setHostCopyThreadsForTesting(16), 1U);
     constexpr int kStreams = 4;
-    std::vector<CUstream> streams(kStreams);
     std::vector<std::vector<std::byte>> srcs(kStreams);
     std::vector<std::vector<std::byte>> dsts(kStreams);
+    std::vector<CUstream> streams;
+    // Destroyed after their last copy and before the buffers, on every exit.
+    auto const destroyStreams = FuncGuard(
+        [&streams]()
+        {
+            for (CUstream stream : streams)
+            {
+                EXPECT_EQ(cuStreamSynchronize(stream), CUDA_SUCCESS);
+                EXPECT_EQ(cuStreamDestroy(stream), CUDA_SUCCESS);
+            }
+        });
     for (int s = 0; s < kStreams; ++s)
     {
-        ASSERT_EQ(cuStreamCreate(&streams[s], CU_STREAM_NON_BLOCKING), CUDA_SUCCESS);
+        CUstream stream = nullptr;
+        ASSERT_EQ(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING), CUDA_SUCCESS);
+        streams.push_back(stream);
         srcs[s].resize(kNumPages * kPageBytes);
         fillPattern(srcs[s], kNumPages, 10 + s);
         dsts[s].assign(srcs[s].size(), std::byte{0});
@@ -240,7 +290,6 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, CallbacksFromManyStreamsShareThePool)
     {
         ASSERT_EQ(cuStreamSynchronize(streams[s]), CUDA_SUCCESS);
         expectPermuted(dsts[s], srcs[s]);
-        EXPECT_EQ(cuStreamDestroy(streams[s]), CUDA_SUCCESS);
     }
 }
 
@@ -251,6 +300,7 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, SmallCallbacksStayOnTheCallbackThread)
     std::vector<std::byte> src(kNumPages * kPageBytes);
     fillPattern(src, kNumPages, 3);
     std::vector<std::byte> dst(src.size(), std::byte{0});
+    SyncOnExit const sync({mStream});
     auto tasks = hostTasks(dst, src);
     tasks.resize(kSmallPages);
     uint64_t const helpersBefore = hostCopyHelperTasksForTesting();
@@ -283,6 +333,7 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, SynchronousDiskCopiesAtOneAndManyThreads)
         std::vector<Task<DiskAddress, DiskAddress>> moves;
         std::vector<Task<MemAddress, DiskAddress>> reads;
         std::vector<std::byte> back(src.size(), std::byte{0});
+        SyncOnExit const sync({mStream});
         for (size_t page = 0; page < kNumPages; ++page)
         {
             writes.push_back({DiskAddress{first.fd(), static_cast<ssize_t>(permute(page) * kPageBytes)},
@@ -324,6 +375,7 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, FailedSynchronousWritesAreRecordedPerPage)
     std::vector<std::byte> src(kNumPages * kPageBytes);
     fillPattern(src, kNumPages, 5);
     TempFile file(kNumPages * kPageBytes);
+    SyncOnExit const sync({mStream});
     std::vector<Task<DiskAddress, MemAddress>> writes;
     for (size_t page = 0; page < kNumPages; ++page)
     {
@@ -352,10 +404,13 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, FailedSynchronousWritesAreRecordedPerPage)
 }
 
 std::atomic<bool> gReleaseStreams{false};
+// A protective deadline, far beyond the test's own run time: a hold that is never released still ends.
+constexpr auto kMaxStreamHold = std::chrono::seconds(120);
 
 CUDA_CB void holdStream(void*) noexcept
 {
-    while (!gReleaseStreams.load())
+    auto const deadline = std::chrono::steady_clock::now() + kMaxStreamHold;
+    while (!gReleaseStreams.load() && std::chrono::steady_clock::now() < deadline)
     {
         std::this_thread::yield();
     }
@@ -366,18 +421,32 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, TemporaryStreamsSkipBusyPooledStreams)
     // Make every cached pooled stream busy: each one waits behind a host function that holds the callback thread.
     auto& pool = CudaStreamPool::instance();
     gReleaseStreams.store(false);
+    std::vector<CUstream> busy;
+    // Releases the holds on every exit, a failed assertion included, and only then waits for the busy streams.
+    auto const release = FuncGuard(
+        [&busy]()
+        {
+            gReleaseStreams.store(true);
+            for (CUstream stream : busy)
+            {
+                EXPECT_EQ(cuStreamSynchronize(stream), CUDA_SUCCESS);
+            }
+        });
+    {
+        // The bounded check below needs two busy pooled streams at least: with one, the bounded acquisition would
+        // take the only busy stream and then hand out the idle one.
+        std::vector<CudaStreamPool::PoolItem> warm;
+        warm.push_back(pool.get());
+        warm.push_back(pool.get());
+    }
     std::vector<CudaStreamPool::PoolItem> taken;
     int const cached = pool.cachedCount();
-    ASSERT_GT(cached, 0);
+    ASSERT_GE(cached, 2);
     for (int i = 0; i < cached; ++i)
     {
         taken.push_back(pool.get());
         ASSERT_EQ(cuLaunchHostFunc(taken.back().get(), holdStream, nullptr), CUDA_SUCCESS);
-    }
-    std::vector<CUstream> busy;
-    for (auto const& item : taken)
-    {
-        busy.push_back(item.get());
+        busy.push_back(taken.back().get());
     }
     taken.clear(); // back to the pool, still busy
 
@@ -400,11 +469,6 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, TemporaryStreamsSkipBusyPooledStreams)
         TemporaryCudaStream bounded({});
         EXPECT_EQ(cuStreamQuery(bounded.get()), CUDA_ERROR_NOT_READY);
     }
-    gReleaseStreams.store(true);
-    for (CUstream stream : busy)
-    {
-        EXPECT_EQ(cuStreamSynchronize(stream), CUDA_SUCCESS);
-    }
 }
 
 // Last: the async disk I/O pool runs for the rest of the process once started.
@@ -418,6 +482,7 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, ZzHostCopiesComposeWithTheAsyncDiskPool)
     std::vector<std::byte> mid(src.size(), std::byte{0});
     std::vector<std::byte> back(src.size(), std::byte{0});
     TempFile file(kNumPages * kPageBytes);
+    SyncOnExit const sync({mStream});
     std::vector<Task<DiskAddress, MemAddress>> writes;
     std::vector<Task<MemAddress, DiskAddress>> reads;
     for (size_t page = 0; page < kNumPages; ++page)
@@ -442,6 +507,53 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, ZzHostCopiesComposeWithTheAsyncDiskPool)
     EXPECT_EQ(std::memcmp(back.data(), mid.data(), mid.size()), 0);
     expectPermuted(back, src);
     waitForDiskIo();
+}
+
+// Also after the pool started. Page A is staged and its flush held back, so it fills the staging; page B is then
+// written to the same offset straight to the file. B must be what a read returns, and A's flush, once released, must
+// not land over it.
+TEST_F(KvCacheManagerV2CopyUtilsTest, ZzDirectWriteRetiresAnOlderStagedCopy)
+{
+    configureAsyncDiskIo(4);
+    ASSERT_TRUE(asyncDiskIoEnabled());
+    std::vector<std::byte> a(kPageBytes);
+    std::vector<std::byte> b(kPageBytes);
+    fillPattern(a, 1, 7);
+    fillPattern(b, 1, 8);
+    std::vector<std::byte> back(kPageBytes, std::byte{0});
+    TempFile file(kPageBytes);
+    SyncOnExit const sync({mStream});
+    waitForDiskIo();
+    size_t const stagedBefore = diskWriteBehindPagesForTesting();
+    auto const restore = FuncGuard(
+        []()
+        {
+            delayDiskWriteBehindFlushesForTesting(0);
+            waitForDiskIo();
+            configureDiskWriteBehind(0);
+        });
+    configureDiskWriteBehind(kPageBytes); // room for one page: A takes all of it
+    delayDiskWriteBehindFlushesForTesting(3600);
+    auto const writePage = [&](std::vector<std::byte> const& src)
+    {
+        std::vector<Task<DiskAddress, MemAddress>> writes{
+            {DiskAddress{file.fd(), 0}, reinterpret_cast<MemAddress>(src.data())}};
+        return copyHostToDisk(std::move(writes), kPageBytes, mStream);
+    };
+    ASSERT_EQ(writePage(a), CUDA_SUCCESS);
+    ASSERT_EQ(cuStreamSynchronize(mStream), CUDA_SUCCESS);
+    ASSERT_EQ(diskWriteBehindPagesForTesting(), stagedBefore + 1) << "A was not staged";
+    ASSERT_EQ(writePage(b), CUDA_SUCCESS); // no staging left: B goes to the file
+    std::vector<Task<MemAddress, DiskAddress>> reads{
+        {reinterpret_cast<MemAddress>(back.data()), DiskAddress{file.fd(), 0}}};
+    ASSERT_EQ(copyDiskToHost(std::move(reads), kPageBytes, mStream), CUDA_SUCCESS);
+    ASSERT_EQ(cuStreamSynchronize(mStream), CUDA_SUCCESS);
+    EXPECT_EQ(std::memcmp(back.data(), b.data(), back.size()), 0) << "the read returned the older staged page";
+    EXPECT_EQ(diskWriteBehindPagesForTesting(), stagedBefore);
+    delayDiskWriteBehindFlushesForTesting(0);
+    waitForDiskIo();
+    ASSERT_EQ(::pread(file.fd(), back.data(), kPageBytes, 0), kPageBytes);
+    EXPECT_EQ(std::memcmp(back.data(), b.data(), back.size()), 0) << "the older page's flush landed over the newer one";
 }
 
 } // namespace
