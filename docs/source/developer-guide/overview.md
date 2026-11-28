@@ -81,6 +81,22 @@ if self.previous_batch is not None:
 
 This approach effectively reduces GPU idle time and improves overall hardware occupancy. While it introduces one extra decoding step into the pipeline, the resulting throughput gain is a significant trade-off. For this reason, the Overlap Scheduler is enabled by default in TensorRT LLM.
 
+### TRTLLM-Gen FMHA JIT Warmup
+
+Some TRTLLM-Gen FMHA generation kernels of the TRTLLM attention backend are compiled with NVRTC at runtime, for example the MLA generation kernels with an FP8 KV cache and the sparse-attention generation kernels. The engine warmup compiles the grid of kernel variants that the configured batch sizes and sequence lengths can select, so that no request pays for a compile. By default that grid is compiled synchronously inside the first warmup forward, which can take minutes on such models.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TRTLLM_GEN_FMHA_ASYNC_WARMUP` | unset | Set to `1` to compile the warmup grid on a background thread while the rest of the warmup proceeds. Before the CUDA graph warmup and capture passes, the engine waits for the background compilation and re-checks every kernel of the grid on the foreground, so every kernel is compiled before the engine is ready, whether or not CUDA graphs are enabled. |
+
+```bash
+export TRTLLM_GEN_FMHA_ASYNC_WARMUP=1
+```
+
+The flag is read once per process from the environment, so set it the same way on every rank. After its local wait, each rank synchronizes with the other ranks of its forward group before the graph passes, which run MoE all-to-alls, so that no rank waits inside an all-to-all for a peer that is still compiling. Under distributed weight data parallelism (DWDP) the forward group is not reachable through that synchronization, so a rank can enter the graph-shape warmup pass while a DWDP peer is still compiling and wait for it there, within the warmup communication timeout (`TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC`).
+
+With the flag set or unset, identical warmup sweeps requested by different attention layers of the same configuration are compiled once; the later requests find every kernel in the cache.
+
 ## Visual Generation
 
 For diffusion-based visual generation (image/video), TensorRT-LLM provides a separate `VisualGen` API and `DiffusionExecutor` with its own pipeline architecture. See the [Visual Generation](../models/visual-generation.md) feature documentation.
