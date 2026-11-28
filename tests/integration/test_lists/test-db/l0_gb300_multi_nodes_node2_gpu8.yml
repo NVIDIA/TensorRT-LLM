@@ -33,3 +33,9 @@ l0_gb300_multi_nodes_node2_gpu8:
   # GLM-5.2 NVFP4 modeling_v2 sm_103 tp8 target, GSM8K under modeling_v2="require".
   # Measured 34 min on 2x4 GB300 (batch 1).
   - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tp8::test_gsm8k_tp8 TIMEOUT (90)
+  # DeepSeek-V4.1-Flash tep8 (generation role, two trays): GSM8K without and with DSpark.
+  - accuracy/modeling_v2/deepseek_v41/flash_nvfp4__sm_103__tep8_moe_tp4_ep2/test_accuracy.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Tep8MoeTp4Ep2::test_gsm8k[no_spec] TIMEOUT (120)
+  - accuracy/modeling_v2/deepseek_v41/flash_nvfp4__sm_103__tep8_moe_tp4_ep2/test_accuracy.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Tep8MoeTp4Ep2::test_gsm8k[dspark] TIMEOUT (120)
+  # DeepSeek-V4.1-Flash dep at 8 ranks (generation role, attention DP + EP8 + lm_head TP in ADP, two trays): GSM8K without and with DSpark.
+  - accuracy/modeling_v2/deepseek_v41/flash_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Dep::test_gsm8k[dep8-no_spec] TIMEOUT (120)
+  - accuracy/modeling_v2/deepseek_v41/flash_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Dep::test_gsm8k[dep8-dspark] TIMEOUT (120)

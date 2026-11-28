@@ -137,6 +137,15 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm53_flash_default_text_only.py
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm53_flash_default_mtp_fused_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm53_flash_default_mtp_fused_text_only.py
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_routing.py
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_image_input.py
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_prefill_cuda_graph.py
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_engram_hash.py
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_swa_tables.py
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_launch.py
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_step_hooks.py
+  # DeepSeek-V4.1-Flash dep (8 and 32 ranks) MegaMoE build-time decisions (slots, ladder, placement, refusals): synthetic engine configs.
+  - unittest/_torch/modeling_v2/models/deepseek_v41/flash_nvfp4__sm_103__dep/test_modeling_v2_dep_megamoe_config.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/executor/test_handle_responses_fast_path.py
   - unittest/_torch/sampler/test_stop_criteria.py

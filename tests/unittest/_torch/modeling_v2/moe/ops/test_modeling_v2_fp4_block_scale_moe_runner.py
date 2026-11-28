@@ -97,6 +97,20 @@ def _dsr1_at(inter: int):
     return _DSR1_SLICE[inter]
 
 
+# DeepSeek-V4.1-Flash's routed geometry: 384 experts, H = 5120, top-6, expert intermediate 2304.
+# One slot, like `_DSR1_SLICE`: a 384-expert layer is several GB of codes.
+_DSV41_SLICE: dict = {}
+
+
+def _dsv41_at(inter: int):
+    """The V4.1 layer at an expert intermediate of `inter` (2304, or a tp4 rank's 576 padded to the
+    runner's 128-wide tile: 640, the pad being zero weights and zero scales)."""
+    if inter not in _DSV41_SLICE:
+        _DSV41_SLICE.clear()
+        _DSV41_SLICE[inter] = _build(384, 5120, inter, seed=384 + inter)
+    return _DSV41_SLICE[inter]
+
+
 # DeepSeek-R1's routed experts in 288 slots, as static EPLB places them: every expert
 # once and 32 of them again. The kernel sees a slot as an expert, so the slot stack is
 # the 256-expert stack's own rows gathered by the placement.
@@ -127,6 +141,7 @@ def _release_reference_layers() -> Iterator[None]:
     finally:
         _DSV3 = _DSR1 = _DSR1_SLOTS = None
         _DSR1_SLICE.clear()
+        _DSV41_SLICE.clear()
 
 
 # The token column certified at the R1 geometry. 8192 is trtllm's default
@@ -455,6 +470,80 @@ def test_scalars_and_optional_tensors():
             except RuntimeError as e:
                 assert "scalar" in str(e) and msg in str(e), (name, msg, str(e))
     print("  test_scalars_and_optional_tensors OK")
+
+
+@true_fp32_matmul()
+def _ref_moe_clamped(x, ids, scales, ref, g2: float, limit: float | None) -> torch.Tensor:
+    """`_ref_moe` with the checkpoint's swiglu clamp in real units: up to [-limit, limit], gate to at most limit."""
+    num_tokens, hidden = x.shape
+    up_c, up_s = ref["up"]
+    gt_c, gt_s = ref["gate"]
+    dn_c, dn_s = ref["down"]
+    out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=x.device)
+    for e in range(up_c.shape[0]):
+        tok, slot = (ids == e).nonzero(as_tuple=True)
+        if tok.numel() == 0:
+            continue
+        xe = x[tok]
+        up = xe @ _dequant(up_c[e], up_s[e]).t()
+        gate = xe @ _dequant(gt_c[e], gt_s[e]).t()
+        if limit is not None:
+            up, gate = up.clamp(-limit, limit), gate.clamp(max=limit)
+        act = _q_nvfp4(up * gate * torch.sigmoid(gate), g2) / g2
+        y = act @ _dequant(dn_c[e], dn_s[e]).t()
+        out.index_add_(0, tok, y * scales[tok, slot].float().unsqueeze(1))
+    return out
+
+
+def test_gemm1_clamp_limit_is_in_accumulator_units():
+    """`gemm1_clamp_limit[e]` clamps the FC1 accumulator, i.e. *before* `output1_scale_gate_scalar[e]` is
+    applied: a real-valued swiglu limit L (up clamped both ways, gate from above) is passed as
+    `L / output1_scale_gate_scalar[e]`. Passing L itself clamps nothing useful.
+
+    DeepSeek-V4.1 (swiglu_limit 10.0) is the caller that needs the clamp: its deepseek_v41 targets
+    pass `limit / output1_scale_gate_scalar` per local expert. Measured against a clamped torch
+    reference: `L / scalar` errs 0.24 (the reference's own tolerance of the FC1 requantization),
+    `L` itself 0.97, no clamp 0.97 -- the assertions below separate them by a factor of 5."""
+    num_experts, hidden, inter, top_k, num_tokens = 8, 256, 128, 2, 64
+    args, ref = _build(num_experts, hidden, inter, seed=909)
+    gen = ref["gen"]
+    g1 = 137.0
+    data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+    ids, wts = _routing(num_tokens, num_experts, top_k, gen)
+    g2 = _calibrate_g2(x, ids, ref)  # the FC1 output's NVFP4 global scale, from the unclamped range
+    s1, sg, s2 = _scalars(num_experts, g1, g2)
+    kw = dict(
+        topk_ids=ids,
+        topk_weights=wts,
+        output1_scale_scalar=s1,
+        output1_scale_gate_scalar=sg,
+        output2_scale_scalar=s2,
+    )
+    # a limit that binds for a good share of the gate / up values
+    up_c, up_s = ref["up"]
+    with true_fp32_matmul():
+        pre = torch.cat(
+            [(x @ _dequant(up_c[e], up_s[e]).t()).abs().flatten() for e in range(num_experts)]
+        )
+    limit = float(pre.quantile(0.7))
+    unclamped = _call(data, sf, args, num_experts, top_k, **kw)[0].float()
+    in_acc = _call(data, sf, args, num_experts, top_k, **kw, gemm1_clamp_limit=limit / sg)[
+        0
+    ].float()
+    in_real = _call(
+        data, sf, args, num_experts, top_k, **kw, gemm1_clamp_limit=torch.full_like(sg, limit)
+    )[0].float()
+    exp = _ref_moe_clamped(x, ids, wts, ref, g2, limit)
+    full = _ref_moe_clamped(x, ids, wts, ref, g2, None)
+    assert (exp - full).norm() / full.norm() > 0.05, (
+        "the limit does not bind: the test proves nothing"
+    )
+    assert exp.norm() > 0 and full.norm() > 0
+    err_acc = ((in_acc - exp).norm() / exp.norm()).item()
+    err_real = ((in_real - exp).norm() / exp.norm()).item()
+    err_none = ((unclamped - exp).norm() / exp.norm()).item()
+    assert err_acc < 0.1, err_acc
+    assert err_real > 5 * err_acc and err_none > 5 * err_acc, (err_acc, err_real, err_none)
 
 
 def test_expert_window_and_ids():
@@ -1884,6 +1973,8 @@ def _cell_layer(spec: dict, layer_factory: Callable[[], tuple[dict, dict]]) -> t
     key = (spec["num_experts"], spec["hidden"], spec["intermediate"])
     if key == (512, 2560, 640):
         return layer_factory()
+    if key[:2] == (384, 5120):
+        return _dsv41_at(key[2])
     if key == (256, 7168, 2048):
         return _dsr1()
     if key == (288, 7168, 2048):
@@ -1907,6 +1998,8 @@ _QWEN4_EXP = dict(
     local_num_experts=512,
     routing="renormalized",
 )
+
+_DSV41 = dict(hidden=5120, intermediate=2304, num_experts=384, top_k=6)
 
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
@@ -1973,6 +2066,38 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
                 local_expert_offset=108,
                 local_num_experts=36,
                 **dict(Fp4BlockScaleMoeRunner.R1, num_experts=288),
+            ),
+        ),
+    ),
+    "deepseek_v41/flash_nvfp4__sm_103__dep": (
+        Cell(
+            why="deepseek_v41 dep at 8 ranks: the last 48-wide window of 384 experts, intermediate 2304, top-6",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=336,
+                local_num_experts=48,
+                **_DSV41,
+            ),
+        ),
+        Cell(
+            why="deepseek_v41 dep at 32 ranks: the last 12-wide window of 384 experts, intermediate 2304, top-6",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=372,
+                local_num_experts=12,
+                **_DSV41,
+            ),
+        ),
+    ),
+    "deepseek_v41/flash_nvfp4__sm_103__tep8_moe_tp4_ep2": (
+        Cell(
+            why="deepseek_v41 tep8 (moe tp4 x ep2): the first 192-wide window at intermediate 576, "
+            "unpadded (stock's 32-wide alignment)",
+            spec=dict(
+                tokens=8,
+                local_expert_offset=0,
+                local_num_experts=192,
+                **dict(_DSV41, intermediate=576),
             ),
         ),
     ),

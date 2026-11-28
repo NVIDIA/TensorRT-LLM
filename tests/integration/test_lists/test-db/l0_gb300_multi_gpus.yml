@@ -27,6 +27,10 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/ops/comm
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
+  # DeepSeek-V4.1-Flash's engine collectives (ops/comm: 4 ranks, skipped below 4 GPUs).
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/comm TIMEOUT (30)
+  # Its four-rank Engram exchange (l0_b300's single-GPU ops/engram entry ignores it).
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/engram/test_modeling_v2_engram_adp_exchange.py TIMEOUT (30)
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[modeling_v2-dep4]
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[stock-dep4]
@@ -65,6 +69,20 @@ l0_gb300_multi_gpus:
   # sampling, the breakable prefill graph, every opt-in projection) on one context and one
   # generation GPU.
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_disaggregated_mtp2 TIMEOUT (90)
+  # DeepSeek-V4.1-Flash dep2 (context role: two of the four GPUs), full GSM8K
+  - accuracy/modeling_v2/deepseek_v41/flash_nvfp4__sm_103__dep2/test_accuracy.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Dep2::test_gsm8k TIMEOUT (120)
+  # DeepSeek-V4.1-Flash MegaMoE entries: the 4-rank EP4 matrix (cute_dsl_megamoe_nvfp4, megamoe_workspace and the
+  # megamoe_* entries as the composition a target runs). It launches its own mpirun, so it runs alone.
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/moe/test_modeling_v2_cute_dsl_megamoe_nvfp4.py TIMEOUT (60)
+  # The dep target's MegaMoE layer (its megamoe.py + weights.py loaders) at EP4 against a plain-torch reference;
+  # also runs alone.
+  - unittest/_torch/modeling_v2/models/deepseek_v41/flash_nvfp4__sm_103__dep/test_modeling_v2_dep_megamoe_target_layer.py TIMEOUT (60)
+  # The dep target's MegaMoE layers under the engine's warmup expert placement: one round over 4 EP ranks.
+  - unittest/_torch/modeling_v2/models/deepseek_v41/flash_nvfp4__sm_103__dep/test_modeling_v2_dep_megamoe_placement.py TIMEOUT (30)
+  # DeepSeek-V4.1-Flash dep2's expert all-to-all (moe_a2a dispatch / combine) at EP2 over NVLink; its own mpirun, runs alone.
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/moe/test_modeling_v2_moe_a2a.py TIMEOUT (30)
+  # The same all-to-all against the engine's NVLinkOneSided (its sentinel transport for small steps): bitwise; runs alone.
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/moe/test_modeling_v2_moe_a2a_vs_stock.py TIMEOUT (20)
   # Covers the GPU cases of tests/unittest/_torch/attention/ on GB300, kernels/ and
   # multi_gpu/ included; its cpu_only cases run on CPU (l0_cpu). The GPU cases of
   # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that
