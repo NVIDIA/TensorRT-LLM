@@ -790,18 +790,26 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         lut = torch.tensor(self._E2M1_VALUES, dtype=torch.float32)
         out_features, packed_in = weight.shape
         in_features = packed_in * 2
-        vals = torch.empty((out_features, in_features), dtype=torch.float32)
-        vals[:, 0::2] = lut[(weight & 0x0F).long()]
-        vals[:, 1::2] = lut[((weight >> 4) & 0x0F).long()]
         # Per-group scale = block_scale (fp8) * global_scale (fp32); the block
         # width (16, or 32 for weight-only exports) follows from the scale shape.
         num_groups = block_scale.shape[-1]
         assert in_features % num_groups == 0, (
             f"lm_head weight_scale has {num_groups} groups for {in_features} inputs"
         )
-        scale = (block_scale * global_scale).unsqueeze(-1)
-        vals = vals.view(out_features, num_groups, in_features // num_groups) * scale
-        dequantized = vals.view(out_features, in_features).to(target_dtype).contiguous()
+        scale = (block_scale * global_scale).reshape(-1, num_groups, 1).expand(out_features, -1, -1)
+        # Decode both nibbles with one lookup. Limit temporary FP32 values and
+        # integer indices to a row chunk of the vocabulary-sized output head.
+        packed_bytes = torch.arange(256)
+        pairs = torch.stack((lut[packed_bytes & 0x0F], lut[packed_bytes >> 4]), dim=-1)
+        dequantized = torch.empty((out_features, in_features), dtype=target_dtype)
+        rows_per_chunk = 1024
+        for start in range(0, out_features, rows_per_chunk):
+            rows = slice(start, start + rows_per_chunk)
+            packed_rows = weight[rows]
+            indices = packed_rows.reshape(-1).to(torch.int32)
+            values = pairs.index_select(0, indices).view(len(packed_rows), num_groups, -1)
+            values.mul_(scale[rows])
+            dequantized[rows].copy_(values.flatten(1))
 
         drop = {"lm_head.weight_scale", "lm_head.weight_scale_2", "lm_head.input_scale"}
         result = {k: v for k, v in weights.items() if k not in drop}
