@@ -17,6 +17,7 @@
 import asyncio
 import io
 import os
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +127,38 @@ class TestSamplingParamsConversion:
         assert params.temperature == 0.7
         assert params.top_k == 50
         assert params.top_p == 0.9
+
+    def test_omitted_max_tokens_defers_to_engine_default(self) -> None:
+        """An omitted max_tokens maps to None, the engine's unset sentinel.
+
+        An explicit positive max_tokens is passed through unchanged.
+        """
+        request = pb2.GenerateRequest(
+            request_id="test-no-max-tokens",
+            tokenized=pb2.TokenizedInput(input_token_ids=[1, 2, 3]),
+        )
+        assert request.max_tokens == 0  # proto3 default of the uint32 field
+
+        params = create_sampling_params_from_proto(
+            proto_config=request.sampling_config,
+            output_config=request.output_config,
+            max_tokens=request.max_tokens,
+        )
+        assert params.max_tokens is None
+
+        params = create_sampling_params_from_proto(
+            proto_config=request.sampling_config,
+            output_config=request.output_config,
+        )
+        assert params.max_tokens is None
+
+        request.max_tokens = 16
+        params = create_sampling_params_from_proto(
+            proto_config=request.sampling_config,
+            output_config=request.output_config,
+            max_tokens=request.max_tokens,
+        )
+        assert params.max_tokens == 16
 
     def test_beam_search_config(self):
         """Test beam search configuration."""
@@ -681,6 +714,32 @@ class TestGenerateValidation:
         )
         details = self._assert_invalid_argument(request)
         assert "Missing tokenized input" in details
+
+    def test_omitted_max_tokens_reaches_request_manager_as_none(self) -> None:
+        """Generate hands an omitted max_tokens to the request manager as None."""
+        captured: dict = {}
+
+        class _RecordingRequestManager:
+            def get_model_config(self) -> dict:
+                return {}
+
+            async def generate(self, **kwargs) -> AsyncIterator[None]:
+                captured.update(kwargs)
+                return
+                yield  # unreachable; makes generate() an async generator
+
+        servicer = TrtllmServiceServicer(request_manager=_RecordingRequestManager())
+        request = pb2.GenerateRequest(
+            request_id="test-no-max-tokens",
+            tokenized=pb2.TokenizedInput(input_token_ids=[1, 2, 3]),
+        )
+
+        async def run() -> None:
+            async for _ in servicer.Generate(request, _MockContext()):
+                pass
+
+        _run_async(run())
+        assert captured["sampling_params"].max_tokens is None
 
 
 # ============================================================================
