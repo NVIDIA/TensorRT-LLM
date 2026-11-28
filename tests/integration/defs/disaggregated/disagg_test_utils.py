@@ -527,6 +527,106 @@ def router(request):
     return request.param
 
 
+ETCD_START_ATTEMPTS = 3
+ETCD_READY_TIMEOUT_S = 30
+ETCD_STOP_TIMEOUT_S = 10
+
+
+def _stop_etcd(proc: subprocess.Popen, data_dir: str) -> None:
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=ETCD_STOP_TIMEOUT_S)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str, peer_url: str) -> bool:
+    deadline = time.monotonic() + ETCD_READY_TIMEOUT_S
+    with requests.Session() as session:
+        # Avoid proxies and redirects so health reflects the local etcd endpoint.
+        session.trust_env = False
+        while True:
+            if proc.poll() is not None:
+                return False
+            try:
+                response = session.get(
+                    f"{client_url}/health",
+                    timeout=min(1.0, max(0.1, deadline - time.monotonic())),
+                    allow_redirects=False,
+                )
+                if response.status_code == 200:
+                    members_response = session.post(
+                        f"{client_url}/v3/cluster/member/list",
+                        json={},
+                        timeout=min(1.0, max(0.1, deadline - time.monotonic())),
+                        allow_redirects=False,
+                    )
+                    if members_response.status_code == 200:
+                        members = members_response.json().get("members", [])
+                        if any(peer_url in member.get("peerURLs", []) for member in members):
+                            return proc.poll() is None
+            except requests.RequestException:
+                pass
+            if time.monotonic() >= deadline:
+                if proc.poll() is not None:
+                    return False
+                raise TimeoutError(
+                    f"Timed out after {ETCD_READY_TIMEOUT_S}s waiting for etcd to become healthy"
+                )
+            time.sleep(0.1)
+
+
+def _start_etcd(work_dir: str) -> tuple[subprocess.Popen, str, str]:
+    """Start healthy etcd, retrying bind-race exits with fresh ports and data.
+
+    Port selection releases each probe socket before etcd can bind it, so another
+    process can claim the selected port and make etcd exit during startup.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
+        client_port = get_free_port()
+        peer_port = get_free_port()
+        client_url = f"http://127.0.0.1:{client_port}"
+        peer_url = f"http://127.0.0.1:{peer_port}"
+        proc = subprocess.Popen(
+            [
+                "etcd",
+                "--data-dir",
+                data_dir,
+                "--listen-client-urls",
+                client_url,
+                "--advertise-client-urls",
+                client_url,
+                "--listen-peer-urls",
+                peer_url,
+                "--initial-advertise-peer-urls",
+                peer_url,
+                "--initial-cluster",
+                f"default={peer_url}",
+            ]
+        )
+        try:
+            ready = _wait_for_etcd_ready(proc, client_url, peer_url)
+        except BaseException:
+            _stop_etcd(proc, data_dir)
+            raise
+        if ready:
+            return proc, f"etcd://127.0.0.1:{client_port}", data_dir
+        exit_code = proc.returncode
+        _stop_etcd(proc, data_dir)
+        if attempt < ETCD_START_ATTEMPTS:
+            logger.warning(
+                f"etcd exited before becoming healthy on client={client_port} "
+                f"peer={peer_port} (attempt {attempt}/{ETCD_START_ATTEMPTS}); "
+                "retrying with fresh ports."
+            )
+            continue
+        raise RuntimeError(f"etcd exited during startup with code {exit_code}")
+
+
 @pytest.fixture
 def service_discovery(request, disagg_port, work_dir):
     """Setup service discovery (etcd or http).
@@ -538,15 +638,11 @@ def service_discovery(request, disagg_port, work_dir):
         tuple: (process or None, uri string)
     """
     if request.param == "etcd":
-        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
-        etcd = subprocess.Popen(["etcd", "--data-dir", data_dir])
-        yield etcd, "etcd://localhost:2379"
+        etcd, uri, data_dir = _start_etcd(work_dir)
         try:
-            etcd.kill()
-            etcd.wait(timeout=10)
-            shutil.rmtree(data_dir)
-        except Exception:
-            print(f"Failed to kill etcd: {traceback.format_exc()}")
+            yield etcd, uri
+        finally:
+            _stop_etcd(etcd, data_dir)
     else:
         yield None, f"http://localhost:{disagg_port}"
 
