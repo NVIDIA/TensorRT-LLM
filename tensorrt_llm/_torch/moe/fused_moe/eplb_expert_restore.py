@@ -53,7 +53,6 @@ _RELEASE_LAYERS_PER_CALL = 8
 
 def plan_layer_placement(
     current: np.ndarray,
-    base: np.ndarray,
     active: np.ndarray,
     active_slot_count: int,
     expert_count: int,
@@ -62,17 +61,19 @@ def plan_layer_placement(
 ) -> np.ndarray:
     """Return a deterministic ``[ranks, slots]`` placement of every expert on the ``active`` ranks.
 
-    Active ranks keep their active slots from ``base`` and their spare slots from ``current``. An
-    active slot that repeats an expert of an earlier active slot holds an extra replica, which an
-    interrupted online EPLB update can leave behind. A lost expert takes an emptied active slot
-    first. Next it takes an extra replica's slot if routing uses one replica per expert, else an
-    empty spare slot, and an extra replica's slot only when no spare slot is left. For a spare slot,
-    ranks whose node has no host copy of the expert come first, so that a later node loss still
-    leaves a copy on another node.
+    Active ranks keep the experts of their active slots, and while a rank is inactive, the experts
+    of their spare slots that no active slot holds. An active slot that repeats an expert of an
+    earlier active slot holds an extra replica, which an interrupted online EPLB update or the
+    initial placement of a rejoining rank can leave behind. A lost expert takes an empty active slot
+    first. Next it takes an extra replica's slot if routing uses one replica per expert or every
+    rank is active, else an empty spare slot, and an extra replica's slot only when no spare slot
+    is left. With every rank active, the active slots can hold every expert, so every spare slot
+    empties. For a spare slot, ranks whose node has no host copy of the expert come first, so that
+    a later node loss still leaves a copy on another node.
 
     Args:
-        current: ``[ranks, slots]`` experts, -1 for an empty slot.
-        base: ``current``, or the initial placement when a rank rejoins.
+        current: ``[ranks, slots]`` experts, -1 for an empty slot. A rejoining rank's row holds
+            the initial placement it loaded.
         active: ``[ranks]`` flags telling whether a rank is active.
         active_slot_count: The active slots per rank, the slots before the spare slots.
         expert_count: The number of experts of the layer.
@@ -84,7 +85,7 @@ def plan_layer_placement(
         ValueError: The active ranks' spare slots and extra replicas cannot hold every expert.
     """
     placement = np.full_like(current, -1)
-    placement[active, :active_slot_count] = base[active, :active_slot_count]
+    placement[active, :active_slot_count] = current[active, :active_slot_count]
     active_ranks = np.flatnonzero(active)
     # The empty active slots and the active slots of extra replicas, in rank and slot order.
     empty_slots, extra_slots = collections.deque(), collections.deque()
@@ -102,14 +103,18 @@ def plan_layer_placement(
     if single_replica:
         for rank, slot in extra_slots:
             placement[rank, slot] = -1
+    # With every rank active, the empty and extra replicas' active slots outnumber the lost
+    # experts, so every spare slot empties.
+    all_active = bool(active.all())
     replicas = np.bincount(placement[placement >= 0], minlength=expert_count)
     spare_slots = range(active_slot_count, current.shape[1])
-    for rank in active_ranks:
-        for slot in spare_slots:
-            expert_id = current[rank, slot]
-            if expert_id >= 0 and replicas[expert_id] == 0:
-                placement[rank, slot] = expert_id
-                replicas[expert_id] = 1
+    if not all_active:
+        for rank in active_ranks:
+            for slot in spare_slots:
+                expert_id = current[rank, slot]
+                if expert_id >= 0 and replicas[expert_id] == 0:
+                    placement[rank, slot] = expert_id
+                    replicas[expert_id] = 1
     rank_order = np.roll(active_ranks, -layer_idx)
     for expert_id in np.flatnonzero(replicas == 0):
         replicas[expert_id] = 1
@@ -131,7 +136,7 @@ def plan_layer_placement(
             for slot in spare_slots
             if placement[rank, slot] < 0
         ]
-        if extra_slots and (single_replica or not candidates):
+        if extra_slots and (single_replica or all_active or not candidates):
             placement[extra_slots.popleft()] = expert_id
         elif candidates:
             _, _, order, _, slot = min(candidates)
@@ -635,17 +640,17 @@ class EplbExpertRestore:
         self,
         active_ranks: Sequence[bool],
         current: Sequence[np.ndarray],
-        rejoining: Optional[Sequence[bool]] = None,
     ) -> ExpertRestorePlan:
         """Plan every layer's placement for ``active_ranks``.
+
+        With static EPLB and every rank active, the active slots take the initial placement.
 
         Args:
             active_ranks: Whether each EP rank is active.
             current: The per-layer placement that the active ranks agreed on, so that every
                 active rank plans the same placement. An active rank's row is its row of
-                ``current_placement``, so a slot that a stopped restore wrote loads again.
-            rejoining: Whether each EP rank rejoins. If one does, the active slots of all active
-                ranks take the initial placement, which the rejoining rank loaded.
+                ``current_placement``, so a slot that a stopped restore wrote loads again, and a
+                rejoining rank's row is the initial placement it loaded.
 
         Raises:
             RuntimeError: An iteration is active.
@@ -658,11 +663,6 @@ class EplbExpertRestore:
             raise ValueError(f"EP rank {balancer.ep_rank} plans for active ranks {active.tolist()}")
         if balancer.in_iter:
             raise RuntimeError("Cannot plan an expert restore while an iteration is active")
-        rejoining_ranks = (
-            np.zeros(balancer.ep_size, dtype=bool)
-            if rejoining is None
-            else np.asarray(rejoining, dtype=bool) & active
-        )
         digest = hashlib.sha256(active.tobytes())
         placements = []
         placements_before = []
@@ -673,24 +673,25 @@ class EplbExpertRestore:
         for i, (layer, layer_current) in enumerate(
             zip(balancer.single_layer_load_balancers, current, strict=True)
         ):
-            layer_current = np.asarray(layer_current, dtype=np.int32)
-            base = (
-                layer.initial_placement.reshape(layer_current.shape)
-                if rejoining_ranks.any()
-                else layer_current
-            )
+            before = np.asarray(layer_current, dtype=np.int32)
+            planned = before
+            if active.all() and not layer.updates_enabled:
+                # Static EPLB keeps the initial placement, so a full rejoin restores it, also in
+                # the extra replicas' slots that lost experts took.
+                active_slots = layer.active_slot_count_per_rank
+                planned = before.copy()
+                planned[:, :active_slots] = layer.initial_placement.reshape(before.shape)[
+                    :, :active_slots
+                ]
             has_host_weights = self._host_weight_ranks(layer)
             placement = plan_layer_placement(
-                layer_current,
-                base,
+                planned,
                 active,
                 layer.active_slot_count_per_rank,
                 layer.expert_count,
                 has_host_weights,
                 i,
             )
-            # A rejoining rank loaded its initial-placement slots from storage.
-            before = np.where(rejoining_ranks[:, None], base, layer_current)
             for target, slot in zip(*np.nonzero((placement >= 0) & (placement != before))):
                 expert = placement[target, slot]
                 if has_host_weights[target, expert]:

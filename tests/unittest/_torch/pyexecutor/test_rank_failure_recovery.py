@@ -1147,8 +1147,8 @@ def _eplb(monkeypatch, r, restored=6 * MIB, workspace=4 * MIB, device=None, rele
         device.backed -= freed
         return freed
 
-    def plan_expert_restore(active, current, rejoining):
-        calls.append(("plan", active, current, rejoining))
+    def plan_expert_restore(active, current):
+        calls.append(("plan", active, current))
         return plan
 
     balancer.expert_restore = SimpleNamespace(
@@ -1178,9 +1178,8 @@ def test_install_restores_lost_experts(monkeypatch, extra_free):
     names = [call if isinstance(call, str) else call[0] for call in calls]
     # Every active rank abandons its EPLB iterations at the resume point, before it plans.
     assert names[:2] == ["abandon", "plan"]
-    (_, active, _, rejoining) = calls[1]
+    (_, active, _) = calls[1]
     assert active == [True, True, False, True]
-    assert rejoining == [False] * WORLD
     assert ("restore", plan) in calls
     order = [names.index(name) for name in ("suspend", "resize", "remap", "restore", "resume")]
     assert order == sorted(order)
@@ -1508,9 +1507,8 @@ def test_rejoin_releases_memory_after_resume(monkeypatch):
     info = Mock()
     monkeypatch.setattr(memory_module.logger, "info", info)
     r.recovery.before_iteration()
-    (_, active, _, rejoining) = calls[1]
+    (_, active, _) = calls[1]
     assert active == [True] * WORLD
-    assert rejoining == [False, False, True, False]
     assert _replies(r) == [Reply.INSTALLED]
     assert not r.recovery.pauses_forward()
     r.moe.ep_group_health.mark_active.assert_any_call(FAILED)
@@ -1625,9 +1623,9 @@ def test_change_during_release_waits_for_it(monkeypatch):
         order.append("released")
         return freed
 
-    def plan(active, current, rejoining):
+    def plan(active, current):
         order.append(("plan", device.backed, expert_restore.backed_spare_slot_bytes))
-        return plan_expert_restore(active, current, rejoining)
+        return plan_expert_restore(active, current)
 
     def wait_then_release():
         waited.set()
@@ -1758,7 +1756,7 @@ def test_restore_plans_from_slots_after_abandon(monkeypatch):
     balancer.abandon_iterations = abandon_iterations
     r.recovery.before_iteration()
     assert _replies(r) == [Reply.INSTALLED]
-    (_, _, (current,), _) = next(call for call in calls if call[0] == "plan")
+    (_, _, (current,)) = next(call for call in calls if call[0] == "plan")
     assert current.tolist() == [[1, -1], [1, -1], [-1, -1], [2, -1]]
 
 

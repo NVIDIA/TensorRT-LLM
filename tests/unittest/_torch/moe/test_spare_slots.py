@@ -249,7 +249,13 @@ def test_failed_rank_experts_move_and_return():
     anywhere = np.zeros((4, 8), bool)
 
     def plan(current, active, layer=0):
-        return plan_layer_placement(current, initial, np.array(active, bool), 2, 8, anywhere, layer)
+        return plan_layer_placement(current, np.array(active, bool), 2, 8, anywhere, layer)
+
+    def rejoin(current, rank):
+        """Return ``current`` with ``rank``'s row of the initial placement, which it loaded."""
+        current = current.copy()
+        current[rank] = initial[rank]
+        return current
 
     # Rank 3 fails, and its experts go to the spare slots of the ranks with the fewest filled.
     without_3 = plan(initial, [1, 1, 1, 0])
@@ -267,22 +273,20 @@ def test_failed_rank_experts_move_and_return():
         without_2_3, _placement([0, 1, 6, 4], [2, 3, 7, 5], [-1] * 4, [-1] * 4)
     )
     # When rank 2 rejoins, the spare slots holding its experts are emptied.
-    np.testing.assert_array_equal(plan(without_2_3, [1, 1, 1, 0]), without_3)
+    np.testing.assert_array_equal(plan(rejoin(without_2_3, 2), [1, 1, 1, 0]), without_3)
     # With every rank back, the placement is the initial one.
-    np.testing.assert_array_equal(plan(without_3, [1, 1, 1, 1]), initial)
+    np.testing.assert_array_equal(plan(rejoin(without_3, 3), [1, 1, 1, 1]), initial)
     # Without spare slots, lost experts take the active slots of extra replicas.
     replicated = _placement([0, 1], [2, 3], [0, 1])
     np.testing.assert_array_equal(
         plan_layer_placement(
-            replicated, replicated, np.array([1, 0, 1], bool), 2, 4, np.zeros((3, 4), bool), 0
+            replicated, np.array([1, 0, 1], bool), 2, 4, np.zeros((3, 4), bool), 0
         ),
         _placement([0, 1], [-1, -1], [2, 3]),
     )
     # Without spare slots or extra replicas, a lost expert has no slot.
     with pytest.raises(ValueError, match=r"active ranks \[0\] cannot hold expert 2"):
-        plan_layer_placement(
-            initial[:2, :2], initial[:2, :2], np.array([1, 0], bool), 2, 4, anywhere[:2, :4], 0
-        )
+        plan_layer_placement(initial[:2, :2], np.array([1, 0], bool), 2, 4, anywhere[:2, :4], 0)
 
 
 def test_single_replica_layer_keeps_one_replica_per_expert():
@@ -290,7 +294,7 @@ def test_single_replica_layer_keeps_one_replica_per_expert():
     # A swap of experts 0 and 2 reached rank 0 only, so rank 1's slot of expert 2 takes expert 0.
     mixed = _placement([2, 1, -1, -1], [2, 3, -1, -1], [4, 5, -1, -1], [6, 7, -1, -1])
     placement = plan_layer_placement(
-        mixed, mixed, np.array([1, 1, 1, 0], bool), 2, 8, np.ones((4, 8), bool), 0
+        mixed, np.array([1, 1, 1, 0], bool), 2, 8, np.ones((4, 8), bool), 0
     )
     np.testing.assert_array_equal(
         placement, _placement([2, 1, 6, -1], [0, 3, 7, -1], [4, 5, -1, -1], [-1] * 4)
@@ -303,10 +307,68 @@ def test_multi_replica_layer_restores_experts_into_extra_replicas():
     # three spare slots, so expert 8 takes rank 1's slot of an extra replica of expert 4.
     mixed = _placement([0, 1, 4, -1], [3, 4, 5, -1], [0, 3, 1, -1], [6, 7, 8, -1])
     placement = plan_layer_placement(
-        mixed, mixed, np.array([1, 1, 1, 0], bool), 3, 9, np.ones((4, 9), bool), 0
+        mixed, np.array([1, 1, 1, 0], bool), 3, 9, np.ones((4, 9), bool), 0
     )
     np.testing.assert_array_equal(
         placement, _placement([0, 1, 4, 2], [3, 8, 5, 6], [0, 3, 1, 7], [-1] * 4)
+    )
+
+
+@pytest.mark.parametrize(
+    "lost, rejoining_rank, rejoined, expected, expert_count",
+    [
+        # Multi-replica layer: online EPLB left expert 0 only in rank 0's spare slot while rank 1
+        # was lost. Rank 1 rejoins with experts 2 and 3, and expert 0 takes its slot of the extra
+        # replica of expert 3.
+        (
+            _placement([1, 3, 0, -1], [-1] * 4, [3, 1, 2, -1], [2, 1, -1, -1]),
+            1,
+            [2, 3, -1, -1],
+            _placement([1, 3, -1, -1], [2, 0, -1, -1], [3, 1, -1, -1], [2, 1, -1, -1]),
+            4,
+        ),
+        # Single-replica layer: online EPLB swapped experts 4 and 6 on rank 2 while rank 3 was
+        # lost. Rank 3 rejoins with experts 6 and 7, and expert 4 takes its slot of expert 6.
+        (
+            _placement([0, 1, -1, -1], [2, 3, 7, -1], [6, 5, 4, -1], [-1] * 4),
+            3,
+            [6, 7, -1, -1],
+            _placement([0, 1, -1, -1], [2, 3, -1, -1], [6, 5, -1, -1], [4, 7, -1, -1]),
+            8,
+        ),
+    ],
+    ids=["multi_replica", "single_replica"],
+)
+def test_full_rejoin_keeps_survivors_and_empties_spare_slots(
+    lost, rejoining_rank, rejoined, expected, expert_count
+):
+    """Keep the survivors' active slots on a full rejoin, and put lost experts in active slots."""
+    current = lost.copy()
+    current[rejoining_rank] = rejoined
+    placement = plan_layer_placement(
+        current, np.ones(4, bool), 2, expert_count, np.ones((4, expert_count), bool), 0
+    )
+    np.testing.assert_array_equal(placement, expected)
+    # The survivors keep their active slots, the rejoining rank changes only the slot that takes
+    # the lost expert, every spare slot is empty and every expert has a slot.
+    survivors = [rank for rank in range(4) if rank != rejoining_rank]
+    np.testing.assert_array_equal(placement[survivors, :2], current[survivors, :2])
+    assert np.count_nonzero(placement[rejoining_rank] != current[rejoining_rank]) == 1
+    assert (placement[:, 2:] == -1).all()
+    assert set(placement.ravel().tolist()) - {-1} == set(range(expert_count))
+
+
+def test_partial_rejoin_keeps_lost_experts_in_spare_slots():
+    """Keep the experts of a rank still lost in spare slots when another lost rank rejoins."""
+    # Online EPLB moved experts on ranks 0 and 1 after ranks 2 and 3 were lost, and rank 2
+    # rejoins with its experts 4 and 5 of the initial placement.
+    current = _placement([1, 0, 6, 4], [3, 2, 7, 5], [4, 5, -1, -1], [-1] * 4)
+    placement = plan_layer_placement(
+        current, np.array([1, 1, 1, 0], bool), 2, 8, np.zeros((4, 8), bool), 0
+    )
+    # Rank 2's experts leave the spare slots, and rank 3's stay there.
+    np.testing.assert_array_equal(
+        placement, _placement([1, 0, 6, -1], [3, 2, 7, -1], [4, 5, -1, -1], [-1] * 4)
     )
 
 
@@ -355,6 +417,64 @@ def test_active_ranks_plan_the_same_restore(monkeypatch):
         [True, True, False, True], [_ONLINE]
     )
     assert other.digest != plans[0].digest
+
+
+def test_rejoin_loads_only_lost_experts_after_online_updates(monkeypatch):
+    """Load only the lost experts on a rejoin, keeping the active slots online EPLB filled."""
+    # Online EPLB moved experts while rank 1 was lost, and left expert 0 only in a spare slot.
+    online = _placement([1, 3, 0, -1], [-1] * 4, [3, 1, 2, -1], [2, 1, -1, -1])
+    load_balancer, _ = _online_balancer(monkeypatch, online)
+    # Rank 1 rejoins with its experts 2 and 3 of the initial placement.
+    current = online.copy()
+    current[1] = [2, 3, -1, -1]
+    plan = load_balancer.expert_restore.plan_expert_restore([True] * WORLD_SIZE, [current])
+    (placement,), (before,) = plan.placements, plan.placement_before
+    # Expert 0 takes rank 1's slot of the extra replica of expert 3. The survivors load nothing,
+    # and every spare slot empties.
+    np.testing.assert_array_equal(
+        placement, _placement([1, 3, -1, -1], [2, 0, -1, -1], [3, 1, -1, -1], [2, 1, -1, -1])
+    )
+    np.testing.assert_array_equal(np.argwhere((placement >= 0) & (placement != before)), [[1, 1]])
+    assert plan.staged.size == 0
+    assert plan.device_bytes == 0
+
+
+@pytest.mark.parametrize("initial", [[0, 1, 2, 3], [2, 0, 3, 1]], ids=["none", "offline"])
+def test_static_rejoin_restores_initial_placement(monkeypatch, initial):
+    """Plan the initial placement when a lost node rejoins under static EPLB."""
+    load_balancer = _load_balancer(
+        monkeypatch, largest_failure=2, eplb_slots=1, layer_updates_per_iter=0
+    )
+    (layer,) = load_balancer.single_layer_load_balancers
+    layer.set_initial_weight_assignments(layer.with_spare_slots(initial))
+    initial_placement = layer.initial_placement.reshape(WORLD_SIZE, -1)
+    restore = load_balancer.expert_restore
+    # Node 1's experts go to the spare slots of node 0, which keeps their host weights.
+    without_node_1 = restore.plan_expert_restore([True, True, False, False], [initial_placement])
+    current = without_node_1.placements[0].copy()
+    assert sorted(current[:2, 1].tolist()) == sorted(initial[2:])
+    # Ranks 2 and 3 rejoin with their experts of the initial placement.
+    current[2:] = initial_placement[2:]
+    rejoin = restore.plan_expert_restore([True] * WORLD_SIZE, [current])
+    np.testing.assert_array_equal(rejoin.placements[0], initial_placement)
+    assert rejoin.staged.size == 0
+
+
+def test_static_rejoin_restores_extra_replicas(monkeypatch):
+    """Restore the initial extra replicas when lost experts took their slots under static EPLB."""
+    load_balancer = _load_balancer(
+        monkeypatch, largest_failure=2, eplb_slots=2, layer_updates_per_iter=0
+    )
+    (layer,) = load_balancer.single_layer_load_balancers
+    layer.set_initial_weight_assignments(layer.with_spare_slots([0, 1, 0, 1, 2, 3, 2, 3]))
+    initial_placement = layer.initial_placement.reshape(WORLD_SIZE, -1)
+    # While node 1 was lost, its experts 2 and 3 took the slots of rank 1's extra replicas.
+    current = initial_placement.copy()
+    current[1, :2] = [2, 3]
+    rejoin = load_balancer.expert_restore.plan_expert_restore([True] * WORLD_SIZE, [current])
+    (placement,), (before,) = rejoin.placements, rejoin.placement_before
+    np.testing.assert_array_equal(placement, initial_placement)
+    np.testing.assert_array_equal(np.argwhere(placement != before), [[1, 0], [1, 1]])
 
 
 def test_release_keeps_filled_spare_slots_during_update(monkeypatch):
@@ -834,15 +954,16 @@ def test_replacement_nvfp4_registers_no_host_rows():
 
 def test_plan_after_stopped_restore_names_loaded_experts(monkeypatch):
     """Replan from current_placement after a stopped restore, so every slot holds what it names."""
-    load_balancer, layer = _online_balancer(monkeypatch, _ONLINE_WITHOUT_1)
+    # Online EPLB left two replicas of expert 1 on rank 0 while rank 1 was lost, and expert 0 only
+    # in rank 0's spare slot.
+    online = _placement([1, 1, 0, -1], [-1] * 4, [2, 3, -1, -1], [1, 2, -1, -1])
+    load_balancer, layer = _online_balancer(monkeypatch, online)
     restore = load_balancer.expert_restore
     impl = load_balancer.load_balancer_impl
     host = {(expert, "w"): torch.full((4,), expert, dtype=torch.int32) for expert in range(EXPERTS)}
     layer.host_tensor_sharer.node_host_weights = host
     # Rank 0's slots hold the experts of the installed placement; slot 3 is empty.
-    slots = torch.tensor(
-        [[expert] * 4 for expert in _ONLINE_WITHOUT_1[0].tolist()], dtype=torch.int32
-    )
+    slots = torch.tensor([[expert] * 4 for expert in online[0].tolist()], dtype=torch.int32)
     layer.slot_tensors = {"w": slots}
     monkeypatch.setattr(
         torch.ops.trtllm,
@@ -850,11 +971,17 @@ def test_plan_after_stopped_restore_names_loaded_experts(monkeypatch):
         lambda tensors, slot_ids, slot_counts, backed: 0,
         raising=False,
     )
-    # Rank 1 rejoins, and a newer membership change stops the restore once it loaded rank 0's
-    # active slots with the initial placement's experts 0 and 1, before it installed the placement.
-    rejoin = restore.plan_expert_restore(
-        [True] * WORLD_SIZE, [_ONLINE_WITHOUT_1], rejoining=[False, True, False, False]
-    )
+
+    # Rank 1 rejoins with its experts 2 and 3 of the initial placement, so rank 0's slot of the
+    # extra replica of expert 1 takes expert 0. A newer membership change stops the restore once
+    # it loaded that slot, before it installed the placement.
+    def rank_1_rejoins(current):
+        current = np.array(current, dtype=np.int32)
+        current[1] = [2, 3, -1, -1]
+        return current
+
+    rejoin = restore.plan_expert_restore([True] * WORLD_SIZE, [rank_1_rejoins(online)])
+    assert rejoin.placements[0][0].tolist() == [1, 0, -1, -1]
     # Every rank keeps the host weights of online EPLB, so the restore stages nothing.
     workspace = torch.empty((WORLD_SIZE, 0), dtype=torch.uint8)
 
@@ -869,19 +996,22 @@ def test_plan_after_stopped_restore_names_loaded_experts(monkeypatch):
             progress=Mock(side_effect=RuntimeError("a newer membership change")),
         )
     impl.restore_placement.assert_not_called()
-    assert slots[:, 0].tolist() == [0, 1, 3, -1]
-    # Rank 1 fails again. Rank 0's view names no expert in the slots the stopped restore wrote,
-    # so the next plan does not keep the installed placement's experts 1 and 0 there.
+    assert slots[:, 0].tolist() == [1, 0, 0, -1]
+    # Rank 0's view names no expert in the slot the stopped restore wrote, so the next plan does
+    # not keep the installed placement's expert 1 there.
     ((_, view),) = restore.current_placement()
-    assert view[0] == [-1, -1, 3, -1]
-    retry = restore.plan_expert_restore([True, False, True, True], [view])
+    assert view[0] == [1, -1, 0, -1]
+    # The stop may leave the slot written in part.
+    slots[1] = -7
+    # The rejoin runs again and loads the slot again.
+    retry = restore.plan_expert_restore([True] * WORLD_SIZE, [rank_1_rejoins(view)])
     restore.restore_lost_experts(retry, workspace, allgather)
     (dead_ranks, (installed,)), _ = impl.restore_placement.call_args
-    assert dead_ranks == [1]
+    assert dead_ranks == []
     for slot, expert in enumerate(installed[0]):
         if expert >= 0:
             assert torch.equal(slots[slot], host[(expert, "w")]), (slot, expert)
-    assert installed[0] == [-1, -1, 3, -1]
+    assert installed[0] == [1, 0, -1, -1]
 
 
 class _SpareSlotOwner(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin):

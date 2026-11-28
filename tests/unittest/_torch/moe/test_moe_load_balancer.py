@@ -831,14 +831,31 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
             # only the spare slot holds expert 2.
             route([3] * 4 + [0] * 3 + [1] * 2, update=True)
         balancer.abandon_iterations()
+
+        def rank_1_rejoins():
+            """Return the placement with rank 1's loaded initial placement."""
+            placement = layer.get_old_rank_expert_ids()
+            placement[1] = assignments[slot_count:]
+            return placement
+
         if layer_updates_per_iter:
             assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
-            # A newer membership change stops a rejoin restore once it loaded
-            # rank 0's active slots with the initial placement, before it
-            # installed that placement.
+            # Rank 1 rejoins with experts 3, 0 and 1. Rank 0 keeps its active
+            # slots and loads nothing, and expert 2 takes rank 1's slot of an
+            # extra replica of expert 3.
+            rejoined = balancer.expert_restore.plan_expert_restore(
+                [True, True], [rank_1_rejoins()])
+            assert rejoined.device_bytes == 0
+            assert balancer.expert_restore.restore_lost_experts(
+                rejoined, workspace, allgather) == 0
+            assert layer.get_old_rank_expert_ids() == [[3, 0, 1, -1, -1, -1],
+                                                       [2, 0, 1, -1, -1, -1]]
+            assert_loaded([3, 0, 1])
+            # Rank 1 fails again, and a newer membership change stops the
+            # restore once it loaded expert 2 into rank 0's spare slot 3,
+            # before it installed the placement.
             stopped = balancer.expert_restore.plan_expert_restore(
-                [True, True], [layer.get_old_rank_expert_ids()],
-                rejoining=[False, True])
+                [True, False], [layer.get_old_rank_expert_ids()])
             with pytest.raises(RuntimeError, match="newer membership change"):
                 balancer.expert_restore.restore_lost_experts(
                     stopped,
@@ -846,22 +863,23 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
                     allgather,
                     progress=MagicMock(
                         side_effect=RuntimeError("a newer membership change")))
-            assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
-            assert_loaded([0, 1, 2])
-            # Rank 1 fails again. Rank 0's view names no expert in the slots
-            # the stopped restore wrote, so the next plan loads them again.
+            assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, -1, -1, -1]
+            assert_loaded([3, 0, 1, 2])
+            # The stop may leave the slot written in part. The next plan, from
+            # rank 0's view, loads the slot again.
+            for name in slot_elements:
+                weights[name][3].zero_()
             ((_, view), ) = balancer.expert_restore.current_placement()
             retry = balancer.expert_restore.plan_expert_restore([True, False],
                                                                 [view])
             balancer.expert_restore.restore_lost_experts(
                 retry, workspace, allgather)
-            assert_loaded(layer.get_old_rank_expert_ids()[0][:4])
-            assert layer.get_old_rank_expert_ids()[0] == [0, 1, 3, 2, -1, -1]
-            assert route([0, 1, 3, 2]) == [0, 1, 2, 3]
+            assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
+            assert_loaded([3, 0, 1, 2])
+            assert route([3, 0, 1, 2]) == [0, 1, 2, 3]
             balancer.abandon_iterations()
-        rejoin = balancer.expert_restore.plan_expert_restore(
-            [True, True], [layer.get_old_rank_expert_ids()],
-            rejoining=[False, True])
+        rejoin = balancer.expert_restore.plan_expert_restore([True, True],
+                                                             [rank_1_rejoins()])
         assert rejoin.device_bytes == 0
         allgather.reset_mock()
         assert balancer.expert_restore.restore_lost_experts(
@@ -878,10 +896,14 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
         assert all(
             spare_slot_bytes_to_back(layer, [slot]) > 0
             for slot in layer.spare_slots)
-        # The initial placement again: rank 0's active slots are loaded with their experts of it.
-        expected = [[0, 1, 2, -1, -1, -1], [3, 0, 1, -1, -1, -1]]
+        # Rank 0 keeps its active slots: with static EPLB the initial placement
+        # again, and with online EPLB its experts 3, 0 and 1, while expert 2
+        # takes rank 1's slot of an extra replica of expert 3.
+        expected = ([[3, 0, 1, -1, -1, -1], [2, 0, 1, -1, -1, -1]]
+                    if layer_updates_per_iter else [[0, 1, 2, -1, -1, -1],
+                                                    [3, 0, 1, -1, -1, -1]])
         assert layer.get_old_rank_expert_ids() == expected
-        assert_loaded(range(3))
+        assert_loaded(expected[0][:3])
         # The expert in rank 1's first slot has no other replica.
         assert set(route([expected[1][0]] * 8)) == {slot_count}
 
