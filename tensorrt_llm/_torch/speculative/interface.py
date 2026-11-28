@@ -62,6 +62,8 @@ from ..pyexecutor.sampler.sampler_common import request_random_seed
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from . import logit_edits
 from .block_verification import block_verify, counter_uniforms
+from .fast_rejection_sampling import (fast_rs_draft_block, fast_rs_supported,
+                                      fast_rs_verify)
 from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
                            sample_and_strict_accept)
 from .greedy_argmax import greedy_argmax
@@ -1829,6 +1831,18 @@ class SpecMetadata:
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling or self.enable_penalty
                 or self.watermark_ready) and self.batch_slot_ids is not None:
+            if self.draft_probs is not None:
+                # The fused kernels index draft_probs by these ids without a
+                # device-side bound check (the reference's advanced indexing
+                # has one), so check the host list before it is copied.
+                num_rows = self.draft_probs.shape[0]
+                bad = [s for s in per_request_slot_ids if not 0 <= s < num_rows]
+                if bad:
+                    raise RuntimeError(
+                        f"rejection sampling: slot ids {bad[:8]} outside "
+                        f"draft_probs rows [0, {num_rows}) (num_seq_slots="
+                        f"{self.num_seq_slots}, max_num_requests="
+                        f"{self.max_num_requests})")
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
@@ -3056,6 +3070,19 @@ class SpecWorkerBase(nn.Module, ABC):
             if self._rejection_buffers_valid(draft_tokens, draft_len,
                                              stored_vocab, num_contexts,
                                              batch_size, logits, spec_metadata):
+                # The fused verify runs the token-level ("standard") rule over
+                # draft_len + 1 target rows per request, so block verification
+                # and ragged verification keep the reference path.
+                if (spec_metadata.rejection_sample_method == "standard"
+                        and not spec_metadata.is_ragged_verify
+                        and self._fast_rs_applies(spec_metadata, logits,
+                                                  stored_vocab)):
+                    # Fused kernels read the slot rows in place (no gather).
+                    accepted = self._sample_and_accept_draft_tokens_fast_rs(
+                        logits, draft_tokens, num_contexts, batch_size,
+                        spec_metadata)
+                    return self._commit_accepted_tokens(accepted, batch_size,
+                                                        spec_metadata)
                 # Gather the gen subset's slot rows, filled at the previous draft
                 # step indexed by py_seq_slot.
                 gen_slot_ids = spec_metadata.batch_slot_ids[
@@ -3495,6 +3522,103 @@ class SpecWorkerBase(nn.Module, ABC):
         if batch_slot_ids[num_contexts:batch_size].shape[0] != num_gens:
             return False
         return True
+
+    def _fast_rs_applies(self,
+                         spec_metadata: SpecMetadata,
+                         logits,
+                         stored_vocab: int,
+                         site: str = "verify") -> bool:
+        """Whether the fused rejection-sampling kernels cover this step.
+
+        The kernels run whenever the step fits them. They implement
+        temperature-only sampling, so the deploy-time ``advanced_sampling_mode``
+        must disable both filters (``no_topk_no_topp``; the reference path
+        ignores per-request top-k / top-p in that mode too). They also need a
+        shared draft/target vocabulary, full-vocab fp32 logits, no synthetic
+        acceptance override, no guided decoding (not validated with the fused
+        path) and no text watermark (the reference verify redraws the emitted
+        token under the watermark key and commits the watermark state; the
+        kernels do not). Other steps take the reference path. Host-side checks
+        only, so the decision is CUDA-graph safe. The first decision of each
+        call site (``site``) is logged once per worker, so a run's log shows
+        which path it took.
+        """
+        mode = spec_metadata.advanced_sampling_mode
+        applies = (mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP
+                   and self._d2t is None and self.guided_decoder is None
+                   and not _watermark_active(spec_metadata)
+                   and self.force_num_accepted_tokens == 0.0
+                   and not isinstance(logits, VocabShardedLogits)
+                   and fast_rs_supported(logits, spec_metadata.draft_probs,
+                                         stored_vocab))
+        reported = getattr(self, "_fast_rs_reported_sites", None)
+        if reported is None:
+            reported = self._fast_rs_reported_sites = set()
+        if site not in reported:
+            reported.add(site)
+            if applies:
+                logger.info(f"Fused rejection sampling active ({site}).")
+            else:
+                logger.info(
+                    "Fused rejection sampling does not cover this step "
+                    f"({site}; it needs advanced_sampling_mode="
+                    "no_topk_no_topp, a shared draft/target vocabulary, "
+                    "full-vocab fp32 logits, no guided decoding and no "
+                    f"watermark; mode={mode}); using the reference path.")
+        return applies
+
+    @staticmethod
+    def _fast_rs_dummy_row(spec_metadata: SpecMetadata) -> int:
+        # dummy_slot_row 0 is a live request's row, not a padding marker (see
+        # _zero_padding_rows), so it maps to "no padding slot".
+        row = getattr(spec_metadata, "dummy_slot_row", 0)
+        return row if row > 0 else -1
+
+    def _sample_and_accept_draft_tokens_fast_rs(self, logits: torch.Tensor,
+                                                draft_tokens: torch.Tensor,
+                                                num_contexts: int,
+                                                batch_size: int,
+                                                spec_metadata: SpecMetadata):
+        """Rejection-sampling acceptance through the fused kernels.
+
+        Same contract as `_sample_and_accept_draft_tokens_rejection` (context
+        rows take the target's sampled first token, generation rows run
+        rejection sampling); the generation rows read their proposals from the
+        slot-indexed ``draft_probs`` in place.
+        """
+        num_gens = batch_size - num_contexts
+        runtime_draft_len = draft_tokens.shape[1]
+        gen_end = num_contexts + num_gens * (runtime_draft_len + 1)
+        # The acceptance slot's stream, as the reference passes to
+        # rejection_sampling_one_model.
+        seed, offset = self._rng_state_per_request(
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            slot=spec_metadata.rng_accept_slot)
+        gen_accepted, gen_num_accepted = fast_rs_verify(
+            logits[num_contexts:gen_end],
+            spec_metadata.temperatures[num_contexts:gen_end],
+            draft_tokens.to(torch.int32).contiguous(),
+            spec_metadata.batch_slot_ids[num_contexts:batch_size],
+            self._fast_rs_dummy_row(spec_metadata),
+            spec_metadata.draft_probs,
+            seed,
+            offset,
+        )
+        if num_contexts == 0:
+            return gen_accepted, gen_num_accepted
+        accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+        accepted_tokens[:num_contexts, 0] = self._sample_tokens_for_batch(
+            logits[:num_contexts], spec_metadata, num_contexts, num_contexts)
+        accepted_tokens[num_contexts:] = gen_accepted
+        num_accepted_tokens[num_contexts:] = gen_num_accepted
+        return accepted_tokens, num_accepted_tokens
 
     def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata) -> bool:
         # Skip rejection sampling when the whole batch is greedy: the accepted
@@ -4010,6 +4134,29 @@ class SpecWorkerBase(nn.Module, ABC):
             return torch.empty((0, K),
                                dtype=torch.int32,
                                device=gen_logits.device)
+
+        flat_view = gen_logits.reshape(num_gens * K, vocab)
+        if (getattr(spec_metadata, "use_rejection_sampling", False)
+                and spec_metadata.draft_probs is not None
+                and spec_metadata.batch_slot_ids is not None
+                and self._fast_rs_applies(
+                    spec_metadata, flat_view, vocab, site="draft")):
+            # Fused: the proposals go straight to draft_probs[slot, 0:K]; draft
+            # position i of request b draws from subsequence b * K + i at
+            # offset + 1 (see the Philox layout in fast_rejection_sampling).
+            tokens = fast_rs_draft_block(
+                flat_view,
+                self._draft_sampling_params(spec_metadata, num_contexts,
+                                            batch_size)[0],
+                spec_metadata.batch_slot_ids[num_contexts:batch_size],
+                self._fast_rs_dummy_row(spec_metadata),
+                spec_metadata.draft_probs,
+                spec_metadata.request_seeds[num_contexts:batch_size],
+                spec_metadata.request_offsets[num_contexts:batch_size],
+                step_offset=1,
+            )
+            spec_metadata.draft_probs_last_dim = vocab
+            return tokens.reshape(num_gens, K)
 
         # Take the gen slice and repeat each request's value K times to line up
         # with the flattened [num_gens*K, vocab] logits (K rows per request).
