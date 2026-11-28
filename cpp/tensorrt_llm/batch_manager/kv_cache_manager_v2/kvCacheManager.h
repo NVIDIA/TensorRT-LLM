@@ -254,6 +254,16 @@ public:
 
     TypedVec<PoolGroupIndex, PoolGroupDesc> poolGroupDescs() const;
 
+    // ---- Cold-page codec for external storage --------------------------------
+    //
+    // The codec the cold tiers use, so a KV connector's store can hold pages in the same encoded representation as
+    // this manager's host, disk and remote levels by running it against caller-owned memory. Its per-layer-group
+    // properties are fixed at construction, and calling it takes no API lock: the codec may call into Python, and
+    // holding the lock across that would order it against the GIL. A codec is not required to be reentrant, so
+    // callers serialize their own calls, and use it only while this manager has no cold tier of its own running the
+    // codec, and not after shutdown(), which frees the pools the codec reads and writes.
+    IKvCacheColdPageCodec& coldPageCodec() noexcept;
+
     // ---- Query / info ------------------------------------------------------
 
     int tokensPerBlock() const noexcept;

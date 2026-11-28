@@ -145,7 +145,7 @@ each LLM instance.
 
 | Method | When it runs | What it changes | Primary benefit |
 | --- | --- | --- | --- |
-| Cold-page quantization (NVFP4) | When Pages move between the GPU and a Host or Disk cache tier | The stored representation of cold Attention KV | More KV Pages per cold-tier byte and fewer bytes transferred |
+| Cold-page quantization (NVFP4) | When Pages move between the GPU and a Host or Disk cache tier, or a `mooncake-store` pool | The stored representation of cold Attention KV | More KV Pages per cold-tier byte and fewer bytes transferred |
 | TriAttention | Periodically during generation | The set of KV tokens retained in the cache | Lower KV-cache memory usage and Attention work for long generation |
 
 ### Cold-Page Quantization
@@ -177,7 +177,7 @@ workload-dependent: it is largest when cold-tier capacity or Page migration is
 a bottleneck.
 
 Enable the feature with the C++ KV cache manager V2 and a nonzero Host or Disk
-cache:
+cache, or the `mooncake-store` KV connector:
 
 ```python
 from tensorrt_llm import LLM
@@ -198,6 +198,10 @@ llm = LLM(
     ),
 )
 ```
+
+With the `mooncake-store` KV connector, its pool takes the place of the Host and
+Disk tiers, and the connector stores pages in the same cold-page encoding; see
+[Compressed pages](kv-cache-connector.md#compressed-pages).
 
 Cold-page NVFP4 is different from an active NVFP4 KV cache. The former stores
 NVFP4 only in a cold cache tier and restores the runtime type before Attention;
@@ -367,7 +371,8 @@ structures. Both share the same general platform requirements.[^general-requirem
     scales, only the per-layer K scale is applied to the CSA cache; the V scale
     is not used.
 [^cold-page-requirements]: NVFP4 cold-page quantization additionally requires
-    the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
+    the native C++ KVCM V2 backend and a nonzero Host or Disk cache, or the
+    `mooncake-store` KV connector, whose pool takes their place. See the
     [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md)
     for its remaining requirements and validated modes.
 [^triattention-requirements]: TriAttention requires a model-specific offline

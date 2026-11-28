@@ -611,6 +611,44 @@ Both are settled in the `LLM` constructor, before the ranks are spawned and befo
 reads the arguments, so `trtllm-serve`, `trtllm-bench` and a direct `LLM(...)` all see the same
 settings. A `capacity` server keeps both as configured.
 
+### Compressed pages
+
+When `kv_cache_compression_config` selects a method that encodes cold pages, such as
+[`quantization_for_cold_page`](kv-cache-compression.md#cold-page-quantization), the pool holds pages
+in that encoding, as the KV cache manager's own host and disk tiers would. A role that transfers KV
+encodes each page with the manager's codec before writing it and decodes it after reading it back.
+NVFP4 makes an FP8 page about 1.8x smaller and a BF16 page about 3.5x smaller, so the same segment
+memory holds that much more prefix.
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    role: both
+    segment_size: 32GiB
+    model_key: qwen2-1.5b-instruct
+```
+
+- The codec is the manager's own instance, reached through `KvCacheLayout.page_codec`, so a
+  compression method that gives the manager a cold-page codec applies to the pool with no connector
+  change.
+- Pages pass through registered pinned staging: encoded on the GPU into it before a write, decoded
+  from it after a read. The KV pools are not registered with Mooncake, so this needs no GPUDirect
+  RDMA, and `stage_through_host` has no effect.
+- Keys carry the codec's identity (the method, its settings and what it loaded, such as calibration
+  scales), the KV element type and both page sizes, so servers whose encodings differ, or that store
+  raw pages, share nothing rather than misread each other's pages.
+- The staging takes at most 1 GiB of pinned memory per direction per rank, the ceiling of
+  `stage_through_host`'s buffers, and the node memory check counts it whenever
+  `kv_cache_compression_config` is set.
+- `mixed_precision_first_n` and `mixed_precision_last_n` stay rejected with any connector.
+
 ### Restrictions
 
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
@@ -667,4 +705,5 @@ again afterwards.
 A host without `nvidia_peermem` usually needs only `WITH_NVIDIA_PEERMEM=0`, which the connector
 selects on its own where it can. When neither path is available, set `stage_through_host: true` to
 copy pages through a pinned host buffer instead, at the cost of a copy each way. A `capacity` server
-needs neither, since it registers no pages.
+needs neither, since it registers no pages, and nor does a server whose pages go through a cold-page
+codec (see [Compressed pages](#compressed-pages)).

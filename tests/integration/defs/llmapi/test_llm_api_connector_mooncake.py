@@ -49,10 +49,21 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig, MooncakeStoreConfig
+from tensorrt_llm._torch.pyexecutor.connectors.page_codec import KvCachePageCodec
+from tensorrt_llm.llmapi.llm_args import (
+    ColdPageQuantizationCompressionConfig,
+    KvCacheConfig,
+    KvCacheConnectorConfig,
+    MooncakeStoreConfig,
+)
 
-from ..conftest import llm_models_root
+from ..conftest import is_sm_100f, llm_models_root
 from .test_llm_api_connector import E2E_MIN_TOKEN_AGREEMENT
+
+#: The NVFP4 cold-page kernels are built for the SM100 family only.
+skip_no_nvfp4_cold_pages = pytest.mark.skipif(
+    not is_sm_100f(), reason="NVFP4 cold-page kernels need an SM100-family GPU"
+)
 
 MODEL_PATH = "Qwen3/Qwen3-0.6B"
 #: What the fixture lends the pool. Small enough to pass the node budget check
@@ -296,9 +307,144 @@ def test_mooncake_e2e_cross_engine_prefix_reuse(
     assert_tokens_agree(cold_token_ids, warm_token_ids, context="Cross-engine prefix reuse")
 
 
+@pytest.fixture
+def codec_calls(monkeypatch):
+    """How many pages the engine encoded into and decoded out of the pool.
+
+    Only usable when the executor runs in this process.
+    """
+    calls = {"encode": 0, "decode": 0}
+    original_encode, original_decode = KvCachePageCodec.encode, KvCachePageCodec.decode
+
+    def encode(self, layer_group_id, base, slots, pages, stream):
+        calls["encode"] += len(pages)
+        return original_encode(self, layer_group_id, base, slots, pages, stream)
+
+    def decode(self, layer_group_id, base, pages, slots, stream):
+        calls["decode"] += len(pages)
+        return original_decode(self, layer_group_id, base, pages, slots, stream)
+
+    monkeypatch.setattr(KvCachePageCodec, "encode", encode)
+    monkeypatch.setattr(KvCachePageCodec, "decode", decode)
+    return calls
+
+
+@pytest.fixture
+def lossless_page_codec(monkeypatch):
+    """Send pages through the codec path with the cache's lossless default codec.
+
+    A cache without compression keeps raw pages in the pool; naming its default
+    codec makes the connector encode and decode through it instead, so a
+    replay exercises everything around the codec with no numerical change.
+    Only usable when the executor runs in this process.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    monkeypatch.setattr(
+        KVCacheManagerV2,
+        "cold_page_codec_identity",
+        property(lambda self: None if self.is_estimating_kv_cache else "lossless-default"),
+    )
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_mooncake_e2e_cross_engine_prefix_reuse_through_the_page_codec(
+    single_process_worker, mooncake_pool, matched_token_counts, codec_calls, lossless_page_codec
+):
+    """A prefix stored and replayed through the page codec reproduces the reference run.
+
+    The codec here is lossless, so any disagreement is the connector's: the
+    staging layout, the page indices it hands the codec, or the ordering of
+    the decode against the forward pass.
+    """
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+
+    cold = LLM(**llm_kwargs(mooncake_pool))
+    try:
+        cold_output = cold.generate([PROMPT], sampling_params)
+    finally:
+        cold.shutdown()
+    assert codec_calls["encode"] > 0, "The engine published no page through the codec."
+    assert matched_token_counts and not any(matched_token_counts), (
+        f"The first run was not a cold start (matched counts {matched_token_counts})."
+    )
+    matched_token_counts.clear()
+
+    warm = LLM(**llm_kwargs(mooncake_pool))
+    try:
+        warm_output = warm.generate([PROMPT], sampling_params)
+    finally:
+        warm.shutdown()
+    assert matched_token_counts and max(matched_token_counts) > 0, (
+        "The second engine read nothing back from the pool."
+    )
+    assert codec_calls["decode"] > 0, "The pages read back were not decoded by the codec."
+
+    assert_tokens_agree(
+        list(cold_output[0].outputs[0].token_ids),
+        list(warm_output[0].outputs[0].token_ids),
+        context="Cross-engine prefix reuse through the page codec",
+    )
+
+
+@skip_no_nvfp4_cold_pages
+@pytest.mark.threadleak(enabled=False)
+def test_mooncake_e2e_cross_engine_prefix_reuse_with_nvfp4_cold_pages(
+    single_process_worker, mooncake_pool, matched_token_counts, codec_calls
+):
+    """With NVFP4 cold-page compression, the pool holds NVFP4 pages and they replay.
+
+    The first engine must encode what it publishes and the second must decode
+    what it reads, or compression never reached the pool. NVFP4 is lossy, so a
+    replay is not held to the uncompressed run's tokens; the lossless test
+    above covers the connector's correctness. Two engines replaying the same
+    stored pages must agree with each other, since they decode the same bytes.
+    """
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+    kwargs = llm_kwargs(
+        mooncake_pool, kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
+    )
+
+    cold = LLM(**kwargs)
+    try:
+        cold.generate([PROMPT], sampling_params)
+    finally:
+        cold.shutdown()
+    assert codec_calls["encode"] > 0, "The engine published no page through the cold-page codec."
+    assert matched_token_counts and not any(matched_token_counts), (
+        f"The first run was not a cold start (matched counts {matched_token_counts})."
+    )
+
+    replays = []
+    for _ in range(2):
+        matched_token_counts.clear()
+        decoded_before = codec_calls["decode"]
+        warm = LLM(**kwargs)
+        try:
+            replays.append(list(warm.generate([PROMPT], sampling_params)[0].outputs[0].token_ids))
+        finally:
+            warm.shutdown()
+        assert matched_token_counts and max(matched_token_counts) > 0, (
+            "A replaying engine read nothing back from the pool."
+        )
+        assert codec_calls["decode"] > decoded_before, (
+            "The pages read back were not decoded by the cold-page codec."
+        )
+
+    assert replays[0] == replays[1], (
+        "Two engines decoding the same stored NVFP4 pages generated different tokens: "
+        f"{replays[0]} against {replays[1]}."
+    )
+
+
 @pytest.mark.skip_less_device(2)
 @pytest.mark.threadleak(enabled=False)
-def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
+@pytest.mark.parametrize(
+    "cold_pages",
+    [None, pytest.param("nvfp4", marks=skip_no_nvfp4_cold_pages)],
+    ids=["raw", "nvfp4_cold_pages"],
+)
+def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool, cold_pages):
     """Save and reuse at TP 2, where each rank owns a shard of every page.
 
     Three things only break above one rank. Keys are namespaced per rank, so a
@@ -309,12 +455,22 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
     the others never saved.
 
     The leader runs in a spawned process here, so its matched-token answers are
-    not observable. What is observable is that both ranks joined the pool and
-    that the replayed tokens agree, and a rank whose saves failed reports the
-    error on the next connector call rather than silently writing nothing.
+    not observable. What is observable is that both ranks joined the pool, that
+    each replay read part of its prompt back rather than computing it (the
+    iteration statistics count those tokens), and that the replayed tokens
+    agree. A rank whose saves failed reports the error on the next connector
+    call rather than silently writing nothing. With NVFP4 cold pages, each rank
+    encodes its own shard with its own codec, and a replay only reads a prefix
+    when every rank's encoded shard is found under the name it looks for.
     """
     sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
-    kwargs = llm_kwargs(mooncake_pool, tensor_parallel_size=2)
+    overrides = {"tensor_parallel_size": 2}
+    if cold_pages == "nvfp4":
+        overrides["kv_cache_compression_config"] = ColdPageQuantizationCompressionConfig()
+    kwargs = llm_kwargs(mooncake_pool, **overrides)
+    # Keep every iteration rather than the most recent 1000, so the sum below
+    # covers the whole replay.
+    warm_kwargs = dict(kwargs, enable_iter_perf_stats=True, iter_stats_max_iterations=-1)
 
     cold = LLM(**kwargs)
     try:
@@ -330,17 +486,35 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
         "a miss."
     )
 
-    warm = LLM(**kwargs)
-    try:
-        warm_output = warm.generate([PROMPT], sampling_params)
-    finally:
-        warm.shutdown()
+    replays = []
+    for _ in range(2 if cold_pages else 1):
+        warm = LLM(**warm_kwargs)
+        try:
+            replays.append(list(warm.generate([PROMPT], sampling_params)[0].outputs[0].token_ids))
+            stats = warm.get_stats(timeout=30)
+        finally:
+            warm.shutdown()
+        assert stats, "The engine returned no iteration statistics to assert on."
+        reused = sum(
+            entry.get("inflightBatchingStats", {}).get("numCtxKvTokens", 0) for entry in stats
+        )
+        assert reused > 0, (
+            "A replaying TP 2 engine computed its whole prompt, so it read nothing back "
+            "from the pool and the comparison below would hold with the connector off."
+        )
 
-    assert_tokens_agree(
-        list(cold_output[0].outputs[0].token_ids),
-        list(warm_output[0].outputs[0].token_ids),
-        context="Prefix reuse at TP 2",
-    )
+    if cold_pages:
+        # NVFP4 is lossy, so the replay is not held to the uncompressed run's
+        # tokens; two engines decoding the same stored shards must agree.
+        assert replays[0] == replays[1], (
+            f"Two TP 2 engines decoding the same NVFP4 shards disagree: {replays}"
+        )
+    else:
+        assert_tokens_agree(
+            list(cold_output[0].outputs[0].token_ids),
+            replays[0],
+            context="Prefix reuse at TP 2",
+        )
 
 
 @pytest.mark.threadleak(enabled=False)

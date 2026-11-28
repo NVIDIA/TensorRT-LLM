@@ -14,6 +14,8 @@
 # limitations under the License.
 import copy
 import enum
+import hashlib
+import json
 import math
 import os
 from abc import ABC, abstractmethod
@@ -3019,6 +3021,11 @@ class KVCacheCompressionManager(BaseResourceManager):
 
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False
+    #: Version of the page format this method's cold-page codec writes. A
+    #: method that provides a codec sets it, and raises it whenever the same
+    #: settings start producing different bytes, so a store shared across
+    #: releases never decodes one format as another.
+    cold_page_format_version: Optional[int] = None
 
     def __init__(
         self,
@@ -3098,6 +3105,43 @@ class KVCacheCompressionManager(BaseResourceManager):
     ) -> None:
         """Decode one complete KVCM migration batch from cold storage."""
         raise NotImplementedError
+
+    def cold_page_codec_settings(self) -> dict:
+        """Everything that decides the bytes this method's cold-page codec writes.
+
+        The default is every field of the method's config. A method whose
+        encoding also depends on what it derives at runtime (calibration
+        loaded from a file, flags adjusted for the model, an encoded layout
+        fixed in code) extends it, keeping the result the same on every rank.
+        """
+        return self.config.model_dump(mode="json")
+
+    def cold_page_codec_identity(self) -> str:
+        """Name the encoded representation this method's cold-page codec writes.
+
+        A store that outlives one server, or is shared by several (the
+        `mooncake-store` connector's pool), keys its pages by this name, so
+        servers whose codecs would decode a page differently never read each
+        other's pages. It is the algorithm plus a digest of
+        :attr:`cold_page_format_version` and :meth:`cold_page_codec_settings`.
+        """
+        version = self.cold_page_format_version
+        if version is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} sets no cold_page_format_version, so the "
+                "pages its codec writes cannot be named for a store outside the "
+                "cache: a later release changing the format would reuse the name."
+            )
+        payload = json.dumps(
+            {
+                "format_version": version,
+                "settings": self.cold_page_codec_settings()
+            },
+            sort_keys=True,
+            default=str)
+        digest = hashlib.blake2b(payload.encode("utf-8"),
+                                 digest_size=8).hexdigest()
+        return f"{self.config.algorithm}-{digest}"
 
     # ================================================================== #
     # KV-cache lifecycle hooks (5, in temporal order).                   #

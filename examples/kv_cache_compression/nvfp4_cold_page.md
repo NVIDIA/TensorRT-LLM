@@ -72,7 +72,9 @@ unchanged. One-model MTP-EAGLE and EAGLE3 are supported; HELIX context
 parallelism is not currently supported.
 
 Set `kv_cache_config.use_kv_cache_manager_v2: true` explicitly. A nonzero Host
-or Disk cache is also required for Pages to cross a compression boundary.
+or Disk cache is also required for Pages to cross a compression boundary, unless
+the `mooncake-store` KV connector is configured: its pool takes the place of
+those tiers and holds the Pages in the same NVFP4 representation.
 
 On Linux 6.11 through 6.13, mixed models that need both NVFP4 Attention
 lifecycles and lossless SSM/GDN fallback lifecycles are not supported. See the
@@ -422,7 +424,8 @@ kv_cache_compression_config:
    `auto`, FP16/BF16, or FP8.
 4. Provision a nonzero Host cache and, optionally, a Disk cache. A positive
    `disk_cache_size` also requires `disk_cache_path` to name an existing
-   directory.
+   directory. With the `mooncake-store` KV connector, leave both at 0: its
+   pool holds the NVFP4 Pages instead.
 5. Set `kv_cache_compression_config.algorithm` to
    `quantization_for_cold_page` and `quant` to `nvfp4`.
 6. Apply both cache configurations to every worker that owns a local cold tier.
