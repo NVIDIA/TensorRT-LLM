@@ -254,6 +254,8 @@ class GenerationResultBase:
         # every subsequent call instead of looking successful.
         self._terminal_error: Optional[BaseException] = None
         self._aborted = False
+        # Per-output string stop reasons matched during detokenization.
+        self._str_stopped_outputs: Dict[int, str] = {}
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
         self.candidate_metric_records: list[PerfMetricsRecord] = []
@@ -388,6 +390,27 @@ class GenerationResultBase:
 
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
+        str_stopped = self.__dict__.get('_str_stopped_outputs')
+        if (not self.sampling_params.use_beam_search and str_stopped
+                and id(output) in str_stopped):
+            output._last_token_ids_len = len(output.token_ids)
+            output._last_logprobs_len = len(output.logprobs)
+            output._last_text_len = len(output.text)
+            output.finish_reason = 'stop'
+            output.stop_reason = str_stopped[id(output)]
+            if request_perf_metrics is not None:
+                output.request_perf_metrics = request_perf_metrics
+                self._maybe_fill_spec_dec_perf_metrics(
+                    output.request_perf_metrics)
+            sequence_is_finished = (
+                finish_reasons and finish_reasons[src_idx]
+                != tllm.FinishReason.NOT_FINISHED and finish_reasons[src_idx]
+                != tllm.FinishReason.CANCELLED) or self._done
+            if sequence_is_finished:
+                self.record_stats(output, req_perf_metrics_dict, seq_idx)
+            if self._done:
+                self.do_tracing(output, req_perf_metrics_dict)
+            return
         output._last_token_ids_len = len(output.token_ids)
         output._last_logprobs_len = len(output.logprobs)
         output._spec_dec_counters = _SpecDecCounters()
@@ -740,6 +763,12 @@ class GenerationResultBase:
                         output_token_ids=output_token_ids,
                         request_perf_metrics=request_perf_metrics)
             else:
+                for idx, other_output in enumerate(self._outputs):
+                    if idx != response_result.sequence_index:
+                        other_output._last_token_ids_len = len(
+                            other_output.token_ids)
+                        other_output._last_logprobs_len = len(
+                            other_output.logprobs)
                 self._handle_sequence(finish_reasons,
                                       response_result,
                                       response_result.sequence_index,
@@ -1067,19 +1096,33 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         # tokenizer by this result's creator; None when unconfigured.
         self._post_processor_hook = post_processor_hook
 
+    def _abort_on_local_stop(self) -> None:
+        executor_ref = getattr(self, '_executor', None)
+        if hasattr(self, '_executor') and (executor_ref is None
+                                           or executor_ref() is None):
+            self._aborted = True
+            return
+        self.abort()
+
     def _handle_response(self, response: "GenerationExecutor.Response"):
+        raw_response = (response._response if isinstance(
+            response, ResponseWrapper) else response)
         try:
             GenerationResultBase._handle_response(self, response)
         finally:
             # An executor error ends this owner's request without a final chunk,
             # whether its background error handler returns or raises.
-            if (not isinstance(response, PostprocWorker.Output)
+            if (not isinstance(raw_response, PostprocWorker.Output)
                     and self._error_msg is not None):
                 end_post_processor_hook(self._post_processor_hook, self.id,
                                         "error")
 
         # The postprocess has been performed, return directly
-        if isinstance(response, PostprocWorker.Output):
+        if isinstance(raw_response, PostprocWorker.Output):
+            return
+        if isinstance(raw_response,
+                      ErrorResponse) or (is_llm_response(raw_response)
+                                         and raw_response.has_error()):
             return
         if self._error_msg is not None:
             return
@@ -1096,8 +1139,43 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         # ``detokenize=False``.
         if (self.sampling_params.detokenize or self._post_processor_hook
                 is not None) and self.tokenizer is not None:
-            for beam_output in self.outputs:
+            str_stopped = self.__dict__.setdefault('_str_stopped_outputs', {})
+            updated_indices = None
+            if is_llm_response(raw_response):
+                response_result = raw_response.result
+                if self.sampling_params.use_beam_search:
+                    updated_indices = set(
+                        range(len(response_result.output_token_ids)))
+                else:
+                    updated_indices = {response_result.sequence_index}
+
+            can_decode_incrementally = (
+                hasattr(self.tokenizer, 'decode_incrementally')
+                and self._streaming
+                and not self.sampling_params.use_beam_search)
+            for seq_idx, beam_output in enumerate(self._outputs):
+                output_key = id(beam_output)
+                if (not self.sampling_params.use_beam_search
+                        and output_key in str_stopped):
+                    beam_output._last_text_len = len(beam_output.text)
+                    beam_output.finish_reason = 'stop'
+                    beam_output.stop_reason = str_stopped[output_key]
+                    continue
                 beam_output._last_text_len = len(beam_output.text)
+                if (updated_indices is not None
+                        and seq_idx not in updated_indices):
+                    if (self._done and can_decode_incrementally
+                            and beam_output._incremental_states is not None):
+                        (beam_output.text, beam_output._incremental_states) = (
+                            self.tokenizer.decode_incrementally(
+                                [],
+                                prev_text=beam_output.text,
+                                states=beam_output._incremental_states,
+                                flush=True,
+                                stream_interval=self.sampling_params.
+                                _stream_interval,
+                                **kwargs))
+                    continue
                 # A stop word matched by token id is trimmed from token_ids in
                 # _handle_sequence. If some of its ids came in earlier streamed
                 # responses, the incremental decoder has already turned them
@@ -1106,16 +1184,15 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 # instead, as the non-streaming path does.
                 trimmed_streamed_ids = (len(beam_output.token_ids)
                                         < beam_output._last_token_ids_len)
-                use_incremental = (self._streaming
-                                   and not self.sampling_params.use_beam_search
-                                   and not trimmed_streamed_ids and hasattr(
-                                       self.tokenizer, 'decode_incrementally'))
+                use_incremental = (can_decode_incrementally
+                                   and not trimmed_streamed_ids)
                 if use_incremental:
                     beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
                         beam_output.token_ids_diff,
                         prev_text=beam_output.text,
                         states=beam_output._incremental_states,
-                        flush=self._done,
+                        flush=(self._done
+                               or beam_output.finish_reason is not None),
                         stream_interval=self.sampling_params._stream_interval,
                         **kwargs)
                 else:
@@ -1134,7 +1211,16 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                     beam_output.finish_reason == 'stop'
                     or beam_output.finish_reason == 'length')
 
-                if is_generating or is_finished_with_stop_or_length:
+                allow_stop_check = is_generating or is_finished_with_stop_or_length
+                if self.sampling_params.use_beam_search:
+                    # With multi-beam search, hypotheses can swap beam slots
+                    # until the engine finishes; only check visible beams and
+                    # wait for engine completion when best_of > 1.
+                    allow_stop_check = (seq_idx < self.sampling_params.n and
+                                        (self._done or len(self._outputs) == 1)
+                                        and allow_stop_check)
+
+                if allow_stop_check:
                     for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
                     ):
                         if isinstance(stop_reason,
@@ -1149,8 +1235,20 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
 
                             beam_output.finish_reason = 'stop'
                             beam_output.stop_reason = stop_reason
-                            self._done = True
+                            if self.sampling_params.use_beam_search:
+                                if len(self._outputs) == 1:
+                                    self._done = True
+                            else:
+                                str_stopped[output_key] = stop_reason
                             break
+
+            if (not self.sampling_params.use_beam_search and str_stopped
+                    and not self._done
+                    and all(output.finish_reason not in (None, 'not_finished')
+                            for output in self._outputs)):
+                self._done = True
+                if not self._aborted:
+                    self._abort_on_local_stop()
 
             self._apply_post_processor_hook()
 
