@@ -117,3 +117,22 @@ def test_graph_replay_matches_eager() -> None:
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, mid_rows_mm_op(x, mw))
+
+
+def test_an_mpad_off_the_epilogue_width_is_refused_before_compile() -> None:
+    """`mpad` must be a multiple of the plan's epilogue width `min(epi, mpad)`: 48 at `epi` 32
+    is refused by the entry, before an output is allocated or a kernel compiled (the default
+    `mma_rows(17)` = 32 is a multiple)."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm import mid_rows_mm as mod
+
+    compiled = []
+    real = mod._compiled_mm
+    mod._compiled_mm = lambda *a, **k: compiled.append(a) or real(*a, **k)
+    try:
+        x = torch.zeros(17, 512, dtype=torch.bfloat16, device=DEV)
+        w = torch.zeros(64, 512, dtype=torch.bfloat16, device=DEV)
+        with pytest.raises(AssertionError, match="not a multiple of epi 32"):
+            mod.mid_mm_raw(x, w, mod.Plan(epi=32), mpad=48)
+        assert not compiled
+    finally:
+        mod._compiled_mm = real
