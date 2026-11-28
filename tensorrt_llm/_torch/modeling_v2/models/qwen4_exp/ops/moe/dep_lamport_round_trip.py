@@ -783,10 +783,24 @@ def build(
     group = dist.group.WORLD
     handle = symm_mem.rendezvous(buffer, group=getattr(group, "group_name", group))
     peer_buffers = [handle.get_buffer(p, buffer.shape, buffer.dtype) for p in range(world)]
-    built = _assemble(hidden, max_rows, rank, world, buffer, peer_buffers, sum_order, steps, None)
+    # Every rank reaches the readiness all-reduce, its own build failed or not: a rank that
+    # raised before it would leave its peers waiting there.
+    built, failure = None, None
+    try:
+        built = _assemble(
+            hidden, max_rows, rank, world, buffer, peer_buffers, sum_order, steps, None
+        )
+    except Exception as e:  # noqa: BLE001 — reported to every rank below, raised on this one
+        failure = e
     # Every rank holds its buffers and both launches before any of them exchanges a row.
-    ok = torch.ones(1, dtype=torch.int32, device=dev)
+    ok = torch.tensor([0 if failure is not None else 1], dtype=torch.int32, device=dev)
     dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+    if failure is not None:
+        raise RuntimeError(f"dep_lamport_round_trip: rank {rank} failed to build") from failure
+    if not int(ok.item()):
+        raise RuntimeError(
+            f"dep_lamport_round_trip: another rank failed to build (rank {rank} built)"
+        )
     return built
 
 
