@@ -475,8 +475,12 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   page is pending. A newer write replaces the pending page; a superseded flush
   writes nothing, and flushes of one page never overlap. A failed flush keeps the
   page in staging and records no failure, so its disk copy stays valid. Closing
-  or shrinking a disk file drops its staged pages (`discardDiskWriteBehind`),
-  and a disk -> disk copy drops the destination's. Background writes stage into
+  or shrinking a disk file drops its staged pages (`discardDiskWriteBehind`,
+  without allocating, so none is left for a reused descriptor), and every write
+  that bypasses staging (disk -> disk, a write that finds the staging full, a
+  stage that falls back to a direct write) first drops the destination's staged
+  page, after its flush if one is writing, so neither a later read nor that flush
+  returns the older bytes. Background writes stage into
   half the bound at most and keep their share of the background cap until their
   flush.
 - Host copy threads (`host_copy_threads` -> `KVCacheManagerConfig::hostCopyThreads`,
@@ -484,8 +488,11 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   callback (host -> host, disk -> disk, and host <-> disk without the async pool)
   run on a leaked pool of workers plus the callback thread, which returns only
   once every task has finished, so stream order and ready events are unchanged.
-  The pieces of the async disk pool are never run there. A callback under 8 MiB,
-  or with 1 thread, keeps the single-thread loop exactly. The tasks of one
+  The pieces of the async disk pool are never run there. With 1 thread a callback
+  keeps the single-thread loop exactly; one under 8 MiB uses no helper thread but
+  runs the threaded form inline, which attempts every page even after one fails
+  (the single-thread loop skips the pages after a failure and records them as
+  failed). The tasks of one
   callback must be independent (distinct destinations, none another's source),
   which every caller guarantees. A forked child drops the pool and runs every task
   on the callback thread.
@@ -501,8 +508,12 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
 - Host free reserve (`host_cache_free_reserve_fraction` ->
   `HostCacheTierConfig::freeReserveFraction`, per manager): at a middle tier,
   `_prepareFreeSlots` evicts until that share of each pool group is free again,
-  one reserve ahead of need, so pages falling into the tier take slots whose
-  write-out to the tier below has finished.
+  one reserve ahead of need, so pages falling into the tier are more likely to
+  take slots whose write-out to the tier below has finished. A target, not a
+  guarantee: eviction stops at the evictable pages, and a free slot can still
+  carry a pending write-out event that an incoming copy then waits for. It is
+  also best effort: a preparation that fails only because of the reserve's extra
+  evictions is retried without it, and a shrink's defragmentation never applies it.
 - Page staging ring (`page_staging_mib` -> `KVCacheManagerConfig::pageStagingMiB`
   -> `StorageConfig::pageStagingBytes`, per manager; at least three of the largest
   cold pages): every GPU <-> disk move (and every remote move) passes through it.
@@ -511,15 +522,19 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   restores larger than the ring runs one ring-full at a time.
 - Page staging depth (`page_staging_depth` -> `pageStagingDepth`, per manager,
   default 1 = one stretch after another on the move's stream):
-  `submitStagedDiskMigration` cuts a GPU <-> disk move into stretches of at most
-  1/depth of the ring and issues them round-robin on `depth` pooled streams that
-  wait for the move's stream first; the move's stream waits for all of them
+  `submitStagedDiskMigration` runs a GPU <-> disk move on
+  `lanes = min(depth, pages of the move, cold pages the ring holds)` lanes: with
+  one lane, stretch after stretch on the move's stream; otherwise stretches of at
+  most 1/lanes of the ring, issued round-robin on `lanes` pooled streams that
+  wait for the move's stream first, so the depth is an upper bound; the move's stream waits for all of them
   before returning (also on unwinding), so the caller's finish event still covers
   the whole move. Their disk reads and writes overlap on the async disk I/O pool.
   Remote moves keep their own loop. `KvCacheConfig` refuses a depth above 1
   together with `copy_stream_busy_skip` above 0 (the pair ran a context server out
-  of GPU memory after about 30 minutes); a `KVCacheManagerConfig` built directly
-  is not checked.
+  of GPU memory after about 30 minutes). The skip is process-wide, so the manager
+  constructor (`configureCopyStreams`) also refuses the pair across managers: a
+  depth above 1 while a skip is in effect or asked for, and a skip while a manager
+  with a depth above 1 lives.
 
 ### Remote cache levels
 
