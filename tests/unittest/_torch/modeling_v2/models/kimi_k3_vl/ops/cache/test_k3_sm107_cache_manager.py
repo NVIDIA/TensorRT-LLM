@@ -77,11 +77,18 @@ def _manager_stub(local_num_mamba_layers=1, alignment=64, cls=KimiK3Sm107Midchun
     mgr.enable_block_reuse = True
     mgr.is_draft = False
     mgr.local_num_mamba_layers = local_num_mamba_layers
+    mgr.is_estimating_kv_cache = False
     mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
     mgr.conversation_manager = None
     mgr._branch_snapshot_points = {}
     mgr._context_fork_hints = {}
     mgr._waiter_snapshot_points = None
+    mgr.enable_joint_kv_cache_reuse = False
+    mgr._pending_prefix_loss = {}
+    mgr._prefix_matched_tokens_total = 0
+    mgr._iter_prefix_matched_tokens = 0
+    mgr._iter_prefix_snapshot_lost_tokens = 0
+    mgr._snapshot_loss_warned = False
     mgr._branch_snapshots_taken_total = 0
     mgr._kda_replay = None
     mgr._kda_midchunk_snapshot_alignment = alignment
@@ -484,6 +491,7 @@ def test_record_branch_snapshot_point_marks_the_pass_point():
         num_committed_tokens=0,
     )
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=999)
+    mgr._commit_prefix_loss(request.py_request_id)
     assert mgr._branch_snapshot_points == {1: 640}
     assert request.expect_snapshot_points == [640, 1000]
     assert request.py_midchunk_pass_point == 640
