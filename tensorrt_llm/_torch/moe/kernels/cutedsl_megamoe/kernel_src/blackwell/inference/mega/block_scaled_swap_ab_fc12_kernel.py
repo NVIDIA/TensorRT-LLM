@@ -55,6 +55,8 @@ class BlockScaledSwapAbFc12Kernel(KernelClass):
             "situ_linear_beta": OptionalRequirement(Optional[float]),
             # "swiglu" (default) or "quick_geglu"; validated by the epilogue.
             "gate_activation": OptionalRequirement(str),
+            # sigmoid on tanh.approx for the SwiGLU and SiTU cores; validated by the epilogue.
+            "use_tanh_sigmoid": OptionalRequirement(bool),
             # Whether __call__ receives fc1_activation_per_token_scale; reserves the epilogue's
             # SMEM scratch for it. Absent means False.
             "fc1_activation_per_token_scale": OptionalRequirement(bool),

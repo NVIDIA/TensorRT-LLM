@@ -710,51 +710,6 @@ def _megamoe_weight_evict_first(
     )
 
 
-# Static default for the SM107 Kimi K3 NVFP4 generation-phase shape at EP4. The full runner
-# key matches only a runner whose max_tokens_per_rank is exactly 512 (the 512 rung of the
-# default ladder); a per-rank cap of 385-511 keeps the generic table because it was not
-# measured. With this tactic the 128, 192, 256, 384 and 1024 buckets measured no faster
-# than the generic table; 32 and 64 were not measured. K3 applies top-k after FC2, and the
-# full key keeps this tactic from reaching other shapes, EP sizes, combine formats,
-# helper-expert counts or top-k placements.
-_SM107_KIMI_K3_GENPHASE_TACTICS: dict[Tuple, Tuple] = {
-    (
-        107,
-        4,
-        16,
-        896 // 4,
-        3584,
-        3072,
-        6144,
-        max_tokens_per_rank,
-        str(torch.bfloat16),
-        False,
-        None,
-        4.0,
-        25.0,
-        False,
-        "bf16",
-        None,
-        None,
-        0,
-    ): (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("phase_interleave", phase_hint),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        epi_flag_batch,
-    )
-    for max_tokens_per_rank, (phase_hint, epi_flag_batch) in {
-        512: (16, (2, 2)),
-    }.items()
-}
-
-
 # ---------------------------------------------------------------------------
 # Curated tuning space with staged-store and mixed-CGA candidates, filtered through
 # ``validate_megamoe_tactic``. MUST be identical on every EP rank: the MERGE
@@ -836,12 +791,17 @@ _MEGAMOE_NVFP4_COMBINE_BULK_TACTIC: Tuple = (
     (2, 1),
 )
 
+# Generation-phase kernel tactics per max_tokens_per_rank bucket. The kernel runs the decode
+# scheduler only: ("decode", L) claims FC1 tiles up to L token blocks ahead of FC2 (None: every FC1
+# tile of a stream before its FC2 tiles; 65535 keeps that order on one shared counter). Each entry
+# is the decode tactic with the best worst case over DSv4-Pro and Kimi K3 at EP4 on VR200, under
+# balanced and power-law routing.
 _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
     32: (
         [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", None),
         "atomic_counter",
         "epi_warps",
         True,
@@ -853,79 +813,79 @@ _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
         [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 22),
         "atomic_counter",
         "epi_warps",
         True,
         1,
         1,
-        (1, 4),
+        (2, 2),
     ),
     128: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 27),
         "atomic_counter",
         "epi_warps",
         True,
         1,
         1,
-        (1, 4),
+        (1, 1),
     ),
     192: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 65535),
         "atomic_counter",
         "epi_warps",
         True,
         1,
         1,
-        (1, 4),
+        (4, 4),
     ),
     256: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 65535),
         "atomic_counter",
         "epi_warps",
         True,
         1,
         1,
-        (1, 1),
+        (4, 4),
     ),
     384: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 91),
         "atomic_counter",
         "epi_warps",
         True,
-        2,
         1,
-        (1, 1),
+        1,
+        (2, 4),
     ),
     512: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", 3),
+        ("decode", 91),
         "atomic_counter",
         "epi_warps",
         True,
-        2,
         1,
-        (1, 4),
+        1,
+        (2, 4),
     ),
     1024: (
         [256, 256, 256],
         [4, 1, 1],
         None,
-        ("phase_interleave", None),
+        ("decode", 14),
         "atomic_counter",
         "epi_warps",
         True,
@@ -948,6 +908,116 @@ def _sm107_tactic_bucket(max_tokens_per_rank: int) -> Optional[int]:
             if max_tokens_per_rank <= bucket:
                 return bucket
     return None
+
+
+# Generation-phase rows of single shapes, keyed by the full runner key with max_tokens_per_rank
+# normalized to its bucket; they replace the bucket entry above for that key only. Each row is the
+# tactic measured fastest for its key and bucket on VR200: GLM 5.2 (top-8, hidden 6144,
+# intermediate 2048, top-k weights at FC1) at EP4 and EP16, and DeepSeek-V4.1-Flash and Kimi K3.1
+# at EP16.
+def _sm107_glm52_problem_key(world_size: int, num_experts_per_rank: int, bucket: int) -> Tuple:
+    return (
+        107,
+        world_size,
+        8,
+        num_experts_per_rank,
+        6144,
+        2048,
+        4096,
+        bucket,
+        str(torch.bfloat16),
+        True,
+        None,
+        None,
+        None,
+        False,
+        "bf16",
+        None,
+        None,
+        0,
+    )
+
+
+def _sm107_dsv41_flash_problem_key(
+    world_size: int, bucket: int, swiglu: Optional[Tuple[float, float]]
+) -> Tuple:
+    return (
+        (107, world_size, 6, 384 // world_size, 5120, 2304, 4608, bucket, str(torch.bfloat16))
+        + (True, 10.0, None, None, False, "bf16")
+        + (swiglu if swiglu is not None else (None, None))
+        + (0,)
+    )
+
+
+def _sm107_kimi_k3_problem_key(world_size: int, bucket: int) -> Tuple:
+    return (
+        107,
+        world_size,
+        16,
+        896 // world_size,
+        3584,
+        3072,
+        6144,
+        bucket,
+        str(torch.bfloat16),
+    ) + (
+        False,
+        None,
+        4.0,
+        25.0,
+        False,
+        "bf16",
+        None,
+        None,
+        0,
+    )
+
+
+def _sm107_decode_tactic(
+    tile_n: int, lead: int, fc2_tma_stages: int, epi_flag_batch: Tuple[int, int]
+) -> Tuple:
+    return (
+        [256, tile_n, 256],
+        [4, 1, 1],
+        None,
+        ("decode", lead),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        fc2_tma_stages,
+        1,
+        epi_flag_batch,
+    )
+
+
+_SM107_N128_LEAD27 = _sm107_decode_tactic(128, 27, 1, (1, 1))
+_SM107_N128_LEAD14 = _sm107_decode_tactic(128, 14, 1, (2, 4))
+_SM107_N256_LEAD14 = _sm107_decode_tactic(256, 14, 2, (1, 1))
+_SM107_GENPHASE_SHAPE_TACTICS: dict[Tuple, Tuple] = {
+    **{_sm107_glm52_problem_key(4, 64, bucket): _SM107_N128_LEAD27 for bucket in (384, 512)},
+    **{_sm107_glm52_problem_key(16, 16, bucket): _SM107_N128_LEAD14 for bucket in (384, 512)},
+    **{
+        _sm107_dsv41_flash_problem_key(16, bucket, swiglu): tactic
+        for bucket, tactic in (
+            (192, _SM107_N128_LEAD14),
+            (256, _SM107_N128_LEAD14),
+            (384, _SM107_N256_LEAD14),
+            (512, _SM107_N128_LEAD14),
+        )
+        for swiglu in (None, (1.0, 0.0))
+    },
+    _sm107_kimi_k3_problem_key(16, 256): _SM107_N128_LEAD27,
+    _sm107_kimi_k3_problem_key(16, 384): _SM107_N256_LEAD14,
+    _sm107_kimi_k3_problem_key(16, 512): _SM107_N256_LEAD14,
+}
+
+
+def _sm107_genphase_shape_tactic(problem_key: Tuple) -> Optional[Tuple]:
+    """Generation-phase row of ``problem_key``'s shape at its bucket, or None."""
+    bucket = _sm107_tactic_bucket(problem_key[7]) if problem_key[0] == 107 else None
+    if bucket is None:
+        return None
+    return _SM107_GENPHASE_SHAPE_TACTICS.get(problem_key[:7] + (bucket,) + problem_key[8:])
 
 
 def _sm107_use_in_kernel_fc2_reduce(
@@ -1028,7 +1098,7 @@ def _default_megamoe_tactic_for_problem(
     in_kernel_fc2_reduce: bool,
     combine_format: str,
     shape_tuned_tactic: Optional[Tuple] = None,
-    genphase_shape_tuned_tactic: Optional[Tuple] = None,
+    genphase_shape_tactic: Optional[Tuple] = None,
 ) -> Tuple:
     if combine_format != "bf16":
         if sm_version == 107:
@@ -1046,8 +1116,8 @@ def _default_megamoe_tactic_for_problem(
         )
         if in_kernel_fc2_reduce != expected_in_kernel_fc2_reduce:
             return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
-        if genphase_shape_tuned_tactic is not None:
-            return _unpack_tactic(genphase_shape_tuned_tactic)
+        if genphase_shape_tactic is not None:
+            return _unpack_tactic(genphase_shape_tactic)
         return _unpack_tactic(_SM107_GENPHASE_TACTICS[bucket])
     if in_kernel_fc2_reduce:
         return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
@@ -1068,7 +1138,7 @@ def _default_megamoe_tactic_for_key(
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
         shape_tuned_tactic=_shape_tuned_megamoe_tactic(problem_key),
-        genphase_shape_tuned_tactic=_SM107_KIMI_K3_GENPHASE_TACTICS.get(problem_key),
+        genphase_shape_tactic=_sm107_genphase_shape_tactic(problem_key),
     )
     if combine_dedup and _sm107_default_combine_dedup(problem_key):
         return _with_combine_dedup(tactic)
@@ -1080,7 +1150,11 @@ def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
     tactic = _unpack_tactic(tactic)
     candidates = [tactic]
     schedule_policy = tactic[3]
-    if schedule_policy[0] == "phase_interleave" and schedule_policy[1] is not None:
+    # Only the SM107 generation-phase kernel runs the decode scheduler, so a decode tactic it
+    # refuses retries the same tile on the generic kernel with phase_interleave.
+    if schedule_policy[0] == "decode" or (
+        schedule_policy[0] == "phase_interleave" and schedule_policy[1] is not None
+    ):
         auto_hint_tactic = list(tactic)
         auto_hint_tactic[3] = ("phase_interleave", None)
         candidates.append(tuple(auto_hint_tactic))
@@ -1095,16 +1169,26 @@ def _resolve_megamoe_kernel_tactic(
 ) -> Tuple[Any, Tuple]:
     """Build ``tactic``, retrying safe defaults only for heuristic selection."""
     candidates = _megamoe_default_tactic_candidates(tactic) if allow_fallback else (tactic,)
-    last_error = None
+    first_error = None
     for candidate in candidates:
         try:
-            return build(candidate), candidate
+            kernel = build(candidate)
         except ValueError as exc:
-            last_error = exc
+            if first_error is None:
+                first_error = exc
             logger.debug(f"[MegaMoE] rejected tactic {candidate!r}: {type(exc).__name__}: {exc}")
-    if last_error is None:
+            continue
+        if first_error is not None:
+            # A refused default runs slower; the query and every layer resolve it again.
+            msg = (
+                f"[MegaMoE] default tactic {candidates[0]!r} was refused "
+                f"({type(first_error).__name__}: {first_error}); running {candidate!r} instead."
+            )
+            logger.warning_once(msg, key=msg)
+        return kernel, candidate
+    if first_error is None:
         raise RuntimeError("MegaMoE default tactic resolution had no candidates")
-    raise last_error
+    raise first_error
 
 
 # group_hint saturates ~512; omission (-> ~74) is worst.
@@ -1242,8 +1326,8 @@ def _megamoe_ugpu_tactic() -> tuple:
 
 def _construct_megamoe_kernel(
     *, sm_version: int, common: dict, combine_format: str, ugpu_weight_layout: str = "none"
-) -> Tuple[Any, Optional[Exception]]:
-    """Construct the active architecture kernel and report a narrow gen rejection."""
+) -> Any:
+    """Construct the kernel that runs ``common["schedule_policy"]`` on the active architecture."""
     from cutlass.cute.nvgpu import OperandMajorMode
 
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
@@ -1322,8 +1406,8 @@ def _construct_megamoe_kernel(
     bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
     genphase = bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS
     if common.get("combine_dedup", False):
-        # Only the SM107 generic kernel declares the option; ImplDesc drops undeclared keys,
-        # so any other kernel would silently build without it.
+        # TensorRT-LLM enables dedup on the SM107 generic kernel only. ImplDesc drops undeclared
+        # keys, so the generation-phase kernel, which lacks the option, would build without it.
         if sm_version != 107 or genphase:
             raise ValueError("combine_dedup applies to the SM107 generic MegaMoE kernel only.")
         impl_values["combine_dedup"] = True
@@ -1376,16 +1460,29 @@ def _construct_megamoe_kernel(
     if ugpu_kernel_cls is not None:
         # Never retry with a consumer that may interpret the same bank differently.
         if ugpu_kernel_cls is RubinInferenceGenphaseMegaMoE:
-            return construct_genphase(), None
-        return construct(ugpu_kernel_cls), None
-    rejection = None
-    if genphase:
+            return construct_genphase()
+        return construct(ugpu_kernel_cls)
+    schedule_policy = tuple(common["schedule_policy"])
+    if genphase and schedule_policy[0] == "decode":
+        # The generic kernel has no decode scheduler, so a refusal here is the tactic's: the
+        # resolver catches ValueError only and moves to its next candidate.
         try:
-            return construct_genphase(), None
+            return construct_genphase()
         except (ValueError, TypeError, NotImplementedError) as exc:
-            rejection = exc
+            raise ValueError(
+                f"The generation-phase kernel refused {schedule_policy!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
     kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
-    return construct(kernel_cls), rejection
+    return construct(kernel_cls)
+
+
+def _megamoe_tmp_buffer_span(kernel: Any) -> Tuple[int, int]:
+    """Return (offset, bytes) of the kernel's tmp buffer behind its local workspace state."""
+    if not hasattr(kernel, "get_tmp_buffer_bytes"):
+        return 0, 0
+    local_bytes, _ = kernel.get_workspace_sizes()
+    return pad_up(int(local_bytes), 128), int(kernel.get_tmp_buffer_bytes())
 
 
 def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
@@ -1682,6 +1779,9 @@ def _expand_megamoe_ready_tactics(
 ) -> list[Tuple]:
     """Return canonical tactics for every legal token-back READY mode."""
     choices = _token_back_ready_granularity_choices(load_balance=load_balance)
+    if sm_version != 107:
+        # No SM100/SM103 test compares token_tile readiness with expert yet, so tune expert only.
+        choices = ("expert",)
     if sm_version == 107 and choices != ("expert",):
         # At every token bucket include a legal local-TMA/atomic-counter
         # base; the curated SM107 candidates otherwise exclude token_tile.
@@ -2090,12 +2190,20 @@ if IS_MEGAMOE_OP_AVAILABLE:
         if _MEGAMOE_TUNING_WORKSPACE_KEYS:
             _evict_latched_tuning_workspaces()
         local_bytes, _ = kernel.get_workspace_sizes()
+        # The kernel's caller-owned tmp buffer (per-launch data, never zeroed)
+        # is the 128-byte-aligned tail of the same allocation, so it shares the
+        # local workspace's lifetime, cache eviction and captured address.
+        tmp_offset, tmp_bytes = _megamoe_tmp_buffer_span(kernel)
         # Only the atomic counters need zeroing (a stray negative byte hangs
         # spin_wait at 100% SM); the multi-GiB bulk is overwritten every launch
         # (full ``torch.zeros`` = huge wasted memset). Zero the leading counter
         # prefix plus the persisted ``nvlink_barrier_counter``, deliberately
         # OUTSIDE that prefix so the device tail-reset never touches it.
-        local_workspace = torch.empty(local_bytes, dtype=torch.uint8, device=device)
+        local_workspace = torch.empty(
+            tmp_offset + tmp_bytes if tmp_bytes else local_bytes, dtype=torch.uint8, device=device
+        )
+        if local_workspace.data_ptr() % 128 != 0:
+            raise RuntimeError("MegaMoE-CuteDSL: the local workspace must be 128-byte aligned.")
         _lead = int(kernel.require_zero_workspace_leading_bytes[0])
         local_workspace[:_lead].zero_()
         _bc_off, _bc_n, _, _, _ = _megamoe_barrier_reset_slices(kernel)
@@ -2659,13 +2767,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 ),
                 **_LOCKED_KERNEL_KWARGS,
             )
-            probe, _ = _construct_megamoe_kernel(
+            return _construct_megamoe_kernel(
                 sm_version=sm_version,
                 common=common,
                 combine_format=combine_format,
                 ugpu_weight_layout=ugpu_weight_layout,
             )
-            return probe
 
         probe, resolved = _resolve_megamoe_kernel_tactic(
             tactic,
@@ -2909,7 +3016,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 candidates.append(default_tactic)
             for default_tactic in (
                 _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
-                _SM107_KIMI_K3_GENPHASE_TACTICS.get(self._tactic_lookup_key()),
+                _sm107_genphase_shape_tactic(self._tactic_lookup_key()),
             ):
                 if default_tactic is not None:
                     default_tactic = _unpack_tactic(default_tactic)
@@ -3151,18 +3258,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 helper_expert_count=self.helper_expert_count,
                 **_LOCKED_KERNEL_KWARGS,
             )
-            kernel, rejection = _construct_megamoe_kernel(
+            return _construct_megamoe_kernel(
                 sm_version=self.sm_version,
                 common=common,
                 combine_format=self.combine_format,
                 ugpu_weight_layout=self.ugpu_weight_layout,
             )
-            if rejection is not None:
-                logger.debug(
-                    f"[MegaMoE] gen specialization rejected tactic {tactic!r}: "
-                    f"{type(rejection).__name__}: {rejection}"
-                )
-            return kernel
 
         def _tactic_cache_key(self, tactic: Tuple) -> Tuple:
             """Hashable cache key over ``unique_id()`` + the full tactic.
@@ -3212,6 +3313,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 _megamoe_ugpu_die_smid_mask() if self.ugpu_weight_layout != "none" else None,
             )
 
+        def _default_tactic(self, num_tokens: int) -> Tuple:
+            """Default tactic of this runner; a subclass with its own kernels overrides it."""
+            return _default_megamoe_tactic_for_key(self._tactic_lookup_key(), num_tokens=num_tokens)
+
         def _resolve_kernel_descriptor(
             self, tactic: Tuple, *, allow_fallback: bool
         ) -> Tuple[Any, Tuple]:
@@ -3247,11 +3352,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 if not use_default_tactic and _unpack_tactic(tactic) != _unpack_tactic(tactic_t):
                     raise ValueError("Localized MegaMoE weights require the fixed uGPU tactic")
             elif use_default_tactic:
-                num_tokens = int(inputs[0].shape[0])
-                tactic_t = _default_megamoe_tactic_for_key(
-                    self._tactic_lookup_key(),
-                    num_tokens=num_tokens,
-                )
+                tactic_t = self._default_tactic(int(inputs[0].shape[0]))
             elif isinstance(tactic, list):
                 tactic_t = tuple(tactic)
             else:
@@ -3453,18 +3554,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # present K stride-1 via a transpose VIEW (DLPack carries the
             # strides); do NOT ``.contiguous()``.
             output_activation = combine_output.reshape(combine_output.shape[0], self.hidden_size)
+            # The top-k reduce stores 256-bit rows: the kernel requires the
+            # output declared 32 B aligned (from_dlpack checks the pointer).
+            output_align = 32
             if buffer_cache is None:
                 cute_activation = _to_cute(activation)
                 cute_activation_sf = _to_cute(activation_sf)
                 cute_topk_weights = _to_cute(topk_weights)
-                cute_output = _to_cute(output_activation)
+                cute_output = _to_cute(output_activation, output_align)
                 cute_topk_idx = _to_cute(topk_idx)
             else:
                 cute_activation = _to_cute_cached(buffer_cache, activation)
                 cute_activation_sf = _to_cute_cached(buffer_cache, activation_sf)
                 cute_topk_weights = _to_cute_cached(buffer_cache, topk_weights)
                 # Its live rows change per iteration, not between the layers of one.
-                cute_output = _to_cute_slot(buffer_cache, "output_activation", output_activation)
+                cute_output = _to_cute_slot(
+                    buffer_cache, "output_activation", output_activation, output_align
+                )
                 # topk_idx is the calling module's own staging buffer.
                 cute_topk_idx = _to_cute_w(topk_idx)
             runtime_kwargs = dict(
@@ -3500,6 +3606,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     shared_activation_sf=_to_cute_w(shared_activation_sf),
                     # A runtime scalar, never a compile-time constant.
                     shared_num_tokens=cutlass.Int32(int(shared_num_tokens)),
+                )
+            # The gen-phase entry has no tmp_buffer operand; the others require it.
+            if hasattr(kernel, "get_tmp_buffer_bytes"):
+                tmp_offset, tmp_bytes = _megamoe_tmp_buffer_span(kernel)
+                runtime_kwargs["tmp_buffer"] = (
+                    _to_cute_ptr_cached(local_workspace[tmp_offset:]) if tmp_bytes else None
                 )
             runtime_kwargs.update(
                 topk_indices=cute_topk_idx,

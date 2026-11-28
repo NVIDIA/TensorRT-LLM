@@ -9,7 +9,7 @@ from cutlass.cutlass_dsl import Boolean, Int32, Integer, extract_mlir_values, ne
 
 from ...api import ImplDesc, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ...helpers.device_workspace import DeviceWorkspace
-from ...helpers.dsl_helpers import spin_wait
+from ...helpers.dsl_helpers import ReadyFlag, spin_wait, wait_ready
 from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div
 from .base import SchedulerBase, SchedulerWorkTileBase, WorkIdAcquisitionMode
@@ -70,13 +70,284 @@ def minimum_phase_interleave_hint(
     return max(1, ceil_div(required_fc1_claims, launch_cluster_cnt_merge_as_preferred))
 
 
+def minimum_phase_interleave_ring_token_blocks(
+    *, blocks_fc1: int, blocks_fc2: int, launch_cluster_cnt_merge_as_preferred: int, hint: int
+) -> int:
+    """Return the smallest ring workspace, in token blocks, a kernel accepts for the phase-interleaved claim order.
+
+    With a ring workspace of R token blocks, block b takes over the slot of block b - R, so an FC1 tile of
+    block b cannot run before every FC2 tile of block b - R has: until then token_in does not write the tokens
+    of b (in the local kernel: their scale rows). A cluster runs its claims in order, so those FC2 tiles are
+    certain to run only if they were claimed before the FC1 tile, not behind it in some cluster's queue. Each
+    cluster claims ``hint`` FC1 tiles and then keeps the blocks_fc1 : blocks_fc2 cadence, in which the FC1 and
+    the FC2 count of a cluster each stay within one claim of their share. In token blocks the FC1 stream
+    therefore leads the FC2 stream by at most
+
+        clusters * hint / blocks_fc1 + clusters * (1 / blocks_fc1 + 1 / blocks_fc2)
+
+    and the bound is that many blocks, rounded up, plus two (the block an id falls into, and one block of
+    margin). It is conservative, and tests/test_ring_workspace_contract.py runs the claims of the clusters
+    against it in sampled orders; it is not a proof.
+    """
+    if blocks_fc1 <= 0 or blocks_fc2 <= 0 or launch_cluster_cnt_merge_as_preferred <= 0 or hint < 0:
+        raise ValueError("The ring bound needs positive block and cluster counts and a non-negative hint.")
+    clusters = launch_cluster_cnt_merge_as_preferred
+    # Integer ceiling of clusters * (hint + 1) / blocks_fc1 + clusters / blocks_fc2.
+    numerator = clusters * (hint + 1) * blocks_fc2 + clusters * blocks_fc1
+    return ceil_div(numerator, blocks_fc1 * blocks_fc2) + 2
+
+
 def _to_fc12_mapping_cta_coord(cta_coord_in_preferred_cluster: cute.Coord, is_swap_ab: bool) -> cute.Coord:
     if cutlass.const_expr(not is_swap_ab):
         return cta_coord_in_preferred_cluster
     return (cta_coord_in_preferred_cluster[1], cta_coord_in_preferred_cluster[0], cta_coord_in_preferred_cluster[2])
 
 
-class BlackwellFusedFc12Scheduler(SchedulerBase):
+def shared_expert_problem_requirements() -> dict:
+    return {
+        "shared_expert": OptionalRequirement(bool),
+        "shared_intermediate_gateup_size": OptionalRequirement(Optional[int]),
+        "shared_output_size": OptionalRequirement(Optional[int]),
+        "max_tokens_per_rank": OptionalRequirement(StaticOrRuntimeIntegerType),
+    }
+
+
+def shared_expert_impl_requirements() -> dict:
+    return {
+        "shared_expert_stream": OptionalRequirement(bool),
+        "shared_l2_position": OptionalRequirement(Optional[str]),
+        "shared_work_id_mode": OptionalRequirement(Optional[str]),
+        "shared_fc1_swizzle": OptionalRequirement(Optional[int]),
+        "expert_sizes_ready_region": OptionalRequirement(str),
+        "expert_sizes_ready_target": OptionalRequirement(int),
+        "expert_sizes_ready_scope": OptionalRequirement(str),
+    }
+
+
+# Shared expert stages of a cluster: claiming FC1 tiles, claiming FC2 tiles, no shared work left.
+_SHARED_FC1, _SHARED_FC2, _SHARED_DONE = 0, 1, 2
+
+
+class SharedExpertStreamMixin:
+    """Places the shared FC1/FC2 tiles around the routed work (FC2 first when ``early``, last when ``tail``)."""
+
+    def _bind_shared_expert_stream(
+        self,
+        problem_desc: ProblemDesc,
+        impl_desc: ImplDesc,
+        *,
+        cta_tile_m: int,
+        cta_tile_n: int,
+        routed_stream_count: int,
+    ) -> None:
+        self._expert_sizes_ready_region = impl_desc.get("expert_sizes_ready_region")
+        self._expert_sizes_ready_target = impl_desc.get("expert_sizes_ready_target")
+        # Peers publish the sizes in the prefill kernel (system scope); the gen-phase helper CTA is local (GPU scope).
+        self._expert_sizes_ready_scope = impl_desc.get("expert_sizes_ready_scope", "gpu")
+        if self._expert_sizes_ready_region is not None and self._expert_sizes_ready_target is None:
+            raise ValueError("expert_sizes_ready_region needs expert_sizes_ready_target.")
+        self._expert_sizes_ready_pointer = None
+        # A Python True is never loop-carried; a Boolean replaces it once the ready region is bound on device.
+        self._expert_sizes_ready = True
+        self._shared_stream_index = routed_stream_count
+        self._shared_stage = None
+        self._shared_next = None
+        self._routed_done = None
+        self.shared_fc2_position = None
+        self._shared_fc1_swizzle = 0
+        if not (impl_desc.get("shared_expert_stream", False) and problem_desc.get("shared_expert", False)):
+            return
+        if not self.is_swap_ab:
+            raise ValueError("shared_expert tiles need the swap-AB work tile layout.")
+        if self.work_id_mode == "cluster_launch_control":
+            raise ValueError("shared_expert is not supported with work_id_mode='cluster_launch_control'.")
+        if self.cluster_shape_mn[1] != 1:
+            raise ValueError("shared_expert tiles decode one token block per cluster; cluster N must be 1.")
+        sizes = []
+        for key in ("max_tokens_per_rank", "shared_intermediate_gateup_size", "shared_output_size"):
+            value = problem_desc.get(key)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"shared_expert tiles need {key} as a positive static int, got {value!r}.")
+            sizes.append(value)
+        tokens, gateup, output = sizes
+        cluster_m = self.cluster_shape_mn[0]
+        feature_tile = cta_tile_m * cluster_m
+        self._shared_tile_n = cta_tile_n
+        self._shared_cluster_m = cluster_m
+        self._shared_token_count = tokens
+        self.shared_token_blocks = ceil_div(tokens, cta_tile_n)
+        self._shared_feature_blocks = (ceil_div(gateup, feature_tile), ceil_div(output, feature_tile))
+        self._shared_phase_tiles = tuple(blocks * self.shared_token_blocks for blocks in self._shared_feature_blocks)
+        position = impl_desc.get("shared_l2_position")
+        if position is None or position == "auto":
+            # DeepGEMM's rule: FC2 goes first when one wave of clusters covers its tiles.
+            position = "early" if self._shared_phase_tiles[1] <= self.compute_cluster_count else "tail"
+        if position not in ("early", "tail"):
+            raise ValueError(f"shared_l2_position must be 'auto', 'early' or 'tail', got {position!r}.")
+        self.shared_fc2_position = position
+        swizzle = int(impl_desc.get("shared_fc1_swizzle") or 0)
+        if swizzle < 0:
+            raise ValueError(f"shared_fc1_swizzle must be a non-negative feature-block count, got {swizzle}.")
+        # A group as wide as the FC1 feature blocks is the unswizzled walk.
+        self._shared_fc1_swizzle = swizzle if 0 < swizzle < self._shared_feature_blocks[0] else 0
+        mode = impl_desc.get("shared_work_id_mode")
+        if mode not in (None, "grid_stride", "atomic_counter"):
+            raise ValueError(f"shared_work_id_mode must be 'atomic_counter' or 'grid_stride', got {mode!r}.")
+        if mode == "atomic_counter" and self.work_id_mode != "atomic_counter":
+            raise ValueError("shared_work_id_mode='atomic_counter' needs work_id_mode='atomic_counter'.")
+        self.shared_ids_atomic = self.work_id_mode == "atomic_counter" and mode != "grid_stride"
+        mixed_atomic = self.non_clc_mixed_cga_config.is_mixed and self.work_id_mode == "atomic_counter"
+        if mixed_atomic and not self.shared_ids_atomic:
+            # Fallback CTAs take their M slot from the registered group, which a block_idx-strided shared id ignores.
+            raise ValueError("shared_work_id_mode='grid_stride' is unsupported on a mixed-cluster atomic launch.")
+
+    @property
+    def shared_stream_count(self) -> int:
+        """The extra atomic counters the work-id worker carries for shared ids: one for FC1, one for FC2."""
+        return 2 if self.shared_fc2_position is not None and self.shared_ids_atomic else 0
+
+    @cute.jit
+    def _assign_shared_expert_stream(self, block_idx: Tuple, device_workspace: DeviceWorkspace) -> None:
+        if cutlass.const_expr(self._expert_sizes_ready_region is not None):
+            self._expert_sizes_ready_pointer = device_workspace.ptr(self._expert_sizes_ready_region)
+            self._expert_sizes_ready = Boolean(False)
+        if cutlass.const_expr(self.shared_fc2_position is not None):
+            self._shared_stage = Int32(_SHARED_FC1)
+            # Grid-stride only: this cluster's next shared id in the current stage.
+            self._shared_next = Int32(block_idx[2])
+            self._routed_done = Boolean(False)
+
+    @cute.jit
+    def _wait_expert_sizes_ready(self, sizes_ready: Boolean) -> Boolean:
+        """Block once per CTA until the communication kernel has published the expert sizes."""
+        if not sizes_ready:
+            wait_ready(
+                ReadyFlag(
+                    self._expert_sizes_ready_pointer, self._expert_sizes_ready_target, self._expert_sizes_ready_scope
+                )
+            )
+            sizes_ready = Boolean(True)
+        return sizes_ready
+
+    @cute.jit
+    def _decode_shared_tile(self, local_id: Int32, phase_offset: int, segment=None) -> SwapAbFc12WorkTileInfo:
+        """Map a shared FC1 (``phase_offset`` 0) or FC2 (1) cluster work id to this CTA's tile, feature block fast.
+
+        With ``segment`` = (first feature block, feature block count) the id counts that part of the feature blocks.
+        """
+        feature_blocks = Int32(self._shared_feature_blocks[phase_offset])
+        if cutlass.const_expr(segment is not None):
+            feature_blocks = segment[1]
+        token_block = local_id // feature_blocks
+        feature_block = local_id - token_block * feature_blocks
+        if cutlass.const_expr(phase_offset == 0 and self._shared_fc1_swizzle > 0):
+            # L2 swizzle: every token block of one group of feature blocks before the next group.
+            group_width = Int32(self._shared_fc1_swizzle)
+            group_tiles = group_width * Int32(self.shared_token_blocks)
+            group = local_id // group_tiles
+            in_group = local_id - group * group_tiles
+            width = cutlass.min(group_width, feature_blocks - group * group_width)
+            token_block = in_group // width
+            feature_block = group * group_width + (in_group - token_block * width)
+        if cutlass.const_expr(segment is not None):
+            feature_block = feature_block + segment[0]
+        cta_m = Int32(cute.arch.block_idx_in_cluster() % self._shared_cluster_m)
+        if cutlass.const_expr(self.non_clc_mixed_cga_config.is_mixed):
+            # A fallback cluster's CTAs take their place in the logical preferred cluster their group claims for.
+            cta_m = Int32(self._work_id_worker.cta_coord_in_preferred_cluster[0]) % Int32(self._shared_cluster_m)
+        valid_tokens = cutlass.min(
+            Int32(self._shared_token_count) - token_block * Int32(self._shared_tile_n), Int32(self._shared_tile_n)
+        )
+        return SwapAbFc12WorkTileInfo(
+            expert_idx=Int32(0),
+            tile_m_idx=feature_block * Int32(self._shared_cluster_m) + cta_m,
+            tile_n_idx=token_block,
+            cumulative_data_physical_row=Int32(0),
+            cumulative_sf_physical_row=Int32(0),
+            cumulative_token_block_count=Int32(0),
+            valid_tokens_in_cta_tile=valid_tokens,
+            phase_and_flags=Int32(int((BlockPhase.SharedLinear1, BlockPhase.SharedLinear2)[phase_offset])),
+        )
+
+    @cute.jit
+    def _claim_shared_tile(self, work_id_worker, stage: Int32, next_id: Int32, fc2: int):
+        """Claim this cluster's next shared FC1 or FC2 tile; an exhausted claim advances ``stage`` and returns DONE."""
+        if cutlass.const_expr(self.shared_ids_atomic):
+            # As in DeepGEMM, FC1 and FC2 ids come from separate counters.
+            local_id = work_id_worker.claim_next_work(self._shared_stream_index + fc2)
+        else:
+            local_id = next_id
+            next_id = next_id + Int32(self.compute_cluster_count)
+        phase_tiles = Int32(self._shared_phase_tiles[fc2])
+        work_tile = make_fc12_done_tile(True)
+        if local_id < phase_tiles:
+            work_tile = self._decode_shared_tile(local_id, fc2)
+        else:
+            stage = stage + Int32(1)
+            # A grid-stride id past FC1 carries on as this cluster's first FC2 id.
+            next_id = local_id - phase_tiles
+        return work_tile, stage, next_id, work_id_worker
+
+    @cute.jit
+    def gen_next_work(self, work_id_offset: Int32 = Int32(0)) -> SchedulerWorkTileBase:
+        """Shared FC1, early shared FC2, routed work past the expert-sizes gate, tail shared FC2, then DONE."""
+        if cutlass.const_expr(self.shared_fc2_position is None):
+            if cutlass.const_expr(self._expert_sizes_ready_pointer is not None):
+                self._expert_sizes_ready = self._wait_expert_sizes_ready(self._expert_sizes_ready)
+            return self._gen_next_routed_work(work_id_offset)
+
+        work_id_worker = self._work_id_worker
+        stage = self._shared_stage
+        next_id = self._shared_next
+        routed_done = self._routed_done
+        work_tile = make_fc12_done_tile(True)
+        if stage == Int32(_SHARED_FC1):
+            work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 0)
+        if cutlass.const_expr(self.shared_fc2_position == "early"):
+            if stage == Int32(_SHARED_FC2):
+                work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 1)
+        if not work_tile.is_valid_tile:
+            if not routed_done:
+                # Stores on ``self`` make the DSL carry the state touched by the routed call out of this branch.
+                if cutlass.const_expr(self._expert_sizes_ready_pointer is not None):
+                    self._expert_sizes_ready = self._wait_expert_sizes_ready(self._expert_sizes_ready)
+                self._work_id_worker = work_id_worker
+                work_tile = self._gen_next_routed_work(work_id_offset)
+                work_id_worker = self._work_id_worker
+                if not work_tile.is_valid_tile:
+                    routed_done = Boolean(True)
+            if cutlass.const_expr(self.shared_fc2_position == "tail"):
+                if routed_done & (stage == Int32(_SHARED_FC2)):
+                    work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
+                        work_id_worker, stage, next_id, 1
+                    )
+        self._shared_stage = stage
+        self._shared_next = next_id
+        self._routed_done = routed_done
+        self._work_id_worker = work_id_worker
+        return work_tile
+
+    def _shared_carried_names(self) -> tuple:
+        return ("_shared_stage", "_shared_next", "_routed_done") if self.shared_fc2_position is not None else ()
+
+    def _extract_shared_stream_values(self) -> list:
+        values = list(extract_mlir_values(self._expert_sizes_ready))
+        for name in self._shared_carried_names():
+            values.extend(extract_mlir_values(getattr(self, name)))
+        return values
+
+    def _rebuild_shared_stream(self, result, rebuild) -> None:
+        """Copy the static stream fields onto ``result`` and rebuild the loop-carried ones through ``rebuild``."""
+        for name, value in vars(self).items():
+            if name.startswith("_shared_") or name.startswith("shared_") or name.startswith("_expert_sizes_ready_"):
+                setattr(result, name, value)
+        result._expert_sizes_ready = rebuild(self._expert_sizes_ready)
+        result._routed_done = None
+        for name in self._shared_carried_names():
+            setattr(result, name, rebuild(getattr(self, name)))
+
+
+class BlackwellFusedFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
     """Compose work-ID claim, FC12 mapping, and SMEM tile transport."""
 
     pipeline_mbarriers_region = "blackwell.fc12.scheduler.pipeline_mbarriers"
@@ -88,6 +359,7 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
             "expert_count": StaticOrRuntimeIntegerType,
             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
             "hidden_size": StaticOrRuntimeIntegerType,
+            **shared_expert_problem_requirements(),
         }
 
     @classmethod
@@ -104,6 +376,7 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
             "is_swap_ab": bool,
             **_mixed_cga_impl_requirements(),
             "compute_cluster_count": OptionalRequirement(int),
+            **shared_expert_impl_requirements(),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -130,6 +403,9 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
             self.group_hint = self.hint
 
         self._validate_configuration()
+        self.expert_split_factor = 1
+        self.expert_split_chunk_tokens = 0
+        self.raster_group_n = 0
         mma_cta_count = 2 if self.use_2cta_instrs else 1
         launch_cta_tile_shape_mnk = (
             self.mma_tiler_mnk[0] // mma_cta_count,
@@ -147,13 +423,20 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
             self.mapping_cta_tile_shape_mnk = launch_cta_tile_shape_mnk
             self.mapping_cluster_shape_mn = self.cluster_shape_mn
 
+        self._bind_shared_expert_stream(
+            problem_desc,
+            impl_desc,
+            cta_tile_m=launch_cta_tile_shape_mnk[0],
+            cta_tile_n=launch_cta_tile_shape_mnk[1],
+            routed_stream_count=1,
+        )
         if self.work_id_mode == "cluster_launch_control":
             self._work_id_worker = ClcMixedCgaSchedulerWorker(config=self.non_clc_mixed_cga_config)
         else:
             self._work_id_worker = NonClcMixedCgaSchedulerWorker(
                 config=self.non_clc_mixed_cga_config,
                 work_id_mode=self.work_id_mode,
-                stream_count=1,
+                stream_count=1 + self.shared_stream_count,
                 work_id_stride=self.compute_cluster_count,
             )
 
@@ -324,6 +607,8 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
             device_workspace=device_workspace,
         )
 
+        if cutlass.const_expr(self.expert_split_factor > 1):
+            expert_count = expert_count * self.expert_split_factor
         task_mapping_state = create_fc12_task_mapping_state(
             expert_count=expert_count,
             intermediate_gateup_size=intermediate_gateup_size,
@@ -336,14 +621,18 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
             is_swap_ab=self.is_swap_ab,
             expert_token_sizes=expert_token_sizes,
             expert_token_prefix_sum=expert_token_prefix_sum,
+            expert_split_factor=self.expert_split_factor,
+            expert_split_chunk_tokens=self.expert_split_chunk_tokens,
+            raster_group_n=self.raster_group_n,
         )
 
         self._task_mapping_state = task_mapping_state
+        self._assign_shared_expert_stream(block_idx, device_workspace)
 
     @cute.jit
-    def gen_next_work(self) -> SchedulerWorkTileBase:
+    def _gen_next_routed_work(self, work_id_offset: Int32 = Int32(0)) -> SchedulerWorkTileBase:
         """Claim and map one work tile without first-tile prefetch."""
-        work_id = self._work_id_worker.claim_next_work()
+        work_id = self._work_id_worker.claim_next_work() + work_id_offset
         cta_id_in_mapping_cluster = _to_fc12_mapping_cta_coord(
             self._work_id_worker.cta_coord_in_preferred_cluster, self.is_swap_ab
         )
@@ -366,15 +655,15 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
 
     @cute.jit
     def produce_tail(self) -> None:
-        """Drain the work transport, then the CLC leader waits for the cluster's final release."""
+        """Drain the work transport, then the work-ID leader waits for the cluster's final release."""
         super().produce_tail()
-        if cutlass.const_expr(self.work_id_mode == "cluster_launch_control"):
-            self._work_id_worker.produce_tail()
+        self._work_id_worker.produce_tail()
 
     def __extract_mlir_values__(self) -> list:
         values = super().__extract_mlir_values__()
         values.extend(extract_mlir_values(self._work_id_worker))
         values.extend(extract_mlir_values(self._task_mapping_state))
+        values.extend(self._extract_shared_stream_values())
         return values
 
     def __new_from_mlir_values__(self, values: list) -> "BlackwellFusedFc12Scheduler":
@@ -396,6 +685,7 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
 
         result._work_id_worker = rebuild(self._work_id_worker)
         result._task_mapping_state = rebuild(self._task_mapping_state)
+        self._rebuild_shared_stream(result, rebuild)
         if value_index != len(values):
             raise ValueError(
                 f"BlackwellFusedFc12Scheduler MLIR value count mismatch: consumed {value_index}, got {len(values)}."
@@ -419,8 +709,174 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
             "non_clc_mixed_cga_config",
             "mapping_cta_tile_shape_mnk",
             "mapping_cluster_shape_mn",
+            "expert_split_factor",
+            "expert_split_chunk_tokens",
+            "raster_group_n",
         ):
             setattr(result, field_name, getattr(self, field_name))
+        return result
+
+
+class BlackwellFusedExtFc12Scheduler(BlackwellFusedFc12Scheduler):
+    """BlackwellFusedFc12Scheduler plus streaming early-exit for CTA-specialized stages.
+
+    Early-exit clusters (``blockIdx.z < early_exit_cluster_count``) stop claiming new
+    work once their mapping cursor reaches ``early_exit_expert_idx`` and leave the
+    scheduler loop with a done tile, so the CTA can stream into the next stage while
+    the remaining clusters finish the tail experts.  Only ``atomic_counter`` claims
+    keep unclaimed tiles reachable, so ``configure_early_exit`` rejects every other
+    work-id mode.
+
+    ``early_exit_cluster_start`` / ``early_exit_work_id_limit`` is the work-id cutoff
+    of ``ContiguousFc1Scheduler``: clusters with ``blockIdx.z >= early_exit_cluster_start``
+    stop claiming at work id ``early_exit_work_id_limit`` (atomic claims only).
+    """
+
+    @classmethod
+    def impl_desc_require(cls) -> dict[str, type]:
+        return {
+            **super().impl_desc_require(),
+            "early_exit_cluster_count": OptionalRequirement(int),
+            "early_exit_expert_idx": OptionalRequirement(Optional[int]),
+            "early_exit_cluster_start": OptionalRequirement(Optional[int]),
+            "early_exit_work_id_limit": OptionalRequirement(Optional[int]),
+        }
+
+    def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
+        super().__init__(problem_desc, impl_desc)
+        self.early_exit_cluster_count = int(impl_desc.get("early_exit_cluster_count", 0) or 0)
+        self.early_exit_expert_idx = impl_desc.get("early_exit_expert_idx", None)
+        self.early_exit_cluster_start = impl_desc.get("early_exit_cluster_start", None)
+        self.early_exit_work_id_limit = impl_desc.get("early_exit_work_id_limit", None)
+
+    def configure_early_exit(self, cluster_count: int, expert_idx: int) -> None:
+        """Select the early-exit clusters and the expert cutoff from host code."""
+        if self.work_id_mode != "atomic_counter":
+            raise ValueError(
+                "Routed early-exit requires scheduler work_id_mode='atomic_counter'. "
+                "grid_stride and cluster_launch_control drop the tiles an early-exit "
+                "cluster stops claiming."
+            )
+        self.early_exit_cluster_count = int(cluster_count)
+        self.early_exit_expert_idx = int(expert_idx)
+
+    @cute.jit
+    def assign_device_members(
+        self,
+        *,
+        expert_token_sizes: Optional[cute.Tensor],
+        expert_token_prefix_sum: Optional[cute.Tensor],
+        actual_expert_shape: Optional[Tuple],
+        block_idx: Tuple[Integer, Integer, Integer],
+        smem_workspace: SmemWorkspace,
+        smem_base: cute.Pointer,
+        device_workspace: DeviceWorkspace,
+        is_fallback_cluster: Optional[Boolean] = None,
+    ) -> None:
+        """Initialize base FC12 state, then the early-exit cluster predicate."""
+        if cutlass.const_expr(
+            self.early_exit_cluster_start is not None
+            and self.early_exit_work_id_limit is not None
+        ):
+            if cutlass.const_expr(self.work_id_mode != "atomic_counter"):
+                raise ValueError("The work-id early-exit cutoff requires scheduler work_id_mode='atomic_counter'.")
+            self._work_id_worker.early_exit_cluster_start = self.early_exit_cluster_start
+            self._work_id_worker.early_exit_work_id_limit = self.early_exit_work_id_limit
+        super().assign_device_members(
+            expert_token_sizes=expert_token_sizes,
+            expert_token_prefix_sum=expert_token_prefix_sum,
+            actual_expert_shape=actual_expert_shape,
+            block_idx=block_idx,
+            smem_workspace=smem_workspace,
+            smem_base=smem_base,
+            device_workspace=device_workspace,
+            is_fallback_cluster=is_fallback_cluster,
+        )
+        if cutlass.const_expr(
+            self.early_exit_cluster_count > 0
+            and self.early_exit_expert_idx is not None
+        ):
+            self._is_early_exit_cluster = Int32(block_idx[2]) < Int32(self.early_exit_cluster_count)
+
+    @cute.jit
+    def gen_next_work(self, work_id_offset: Int32 = Int32(0)) -> SchedulerWorkTileBase:
+        """Claim and map one work tile; early-exit clusters stop claiming past the cutoff."""
+        early_exit_enabled = (
+            self.early_exit_cluster_count > 0
+            and self.early_exit_expert_idx is not None
+        )
+        if cutlass.const_expr(early_exit_enabled and self.work_id_mode != "atomic_counter"):
+            raise ValueError("Routed early-exit requires scheduler work_id_mode='atomic_counter'.")
+        work_tile = make_fc12_done_tile(self.is_swap_ab)
+        if cutlass.const_expr(early_exit_enabled):
+            work_id_worker = self._work_id_worker
+            task_mapping_state = self._task_mapping_state
+            should_claim = Boolean(True)
+            if (
+                self._is_early_exit_cluster
+                and task_mapping_state.cursor_state.current_expert_idx
+                >= Int32(self.early_exit_expert_idx * self.expert_split_factor)
+            ):
+                should_claim = Boolean(False)
+            if should_claim:
+                work_id = work_id_worker.claim_next_work() + work_id_offset
+                cta_id_in_mapping_cluster = _to_fc12_mapping_cta_coord(
+                    work_id_worker.cta_coord_in_preferred_cluster, self.is_swap_ab
+                )
+                work_tile, task_mapping_state = map_fc12_linear_work_id(
+                    work_id, cta_id_in_mapping_cluster, task_mapping_state
+                )
+            self._work_id_worker = work_id_worker
+            self._task_mapping_state = task_mapping_state
+        else:
+            work_tile = super().gen_next_work(work_id_offset)
+        return work_tile
+
+    @cute.jit
+    def produce_tail(self) -> None:
+        """Drain the work transport, then the CLC leader's final release.
+
+        Spelled out without ``super().produce_tail()``: a zero-arg ``super``
+        inside a jit method inherited by a subclass re-enters the inherited
+        method in this CuTeDSL build (the MRO scan restarts at ``type(self)``),
+        which turns the inherited tail into unbounded recursion.  The two steps
+        mirror ``SchedulerBase.produce_tail`` and the CLC tail of
+        ``BlackwellFusedFc12Scheduler.produce_tail``.
+        """
+        self._pipeline.producer_tail(self._producer_state)
+        if cutlass.const_expr(self.work_id_mode == "cluster_launch_control"):
+            self._work_id_worker.produce_tail()
+
+    def __extract_mlir_values__(self) -> list:
+        values = super().__extract_mlir_values__()
+        if (
+            self.early_exit_cluster_count > 0
+            and self.early_exit_expert_idx is not None
+        ):
+            values.extend(extract_mlir_values(self._is_early_exit_cluster))
+        return values
+
+    def __new_from_mlir_values__(self, values: list) -> "BlackwellFusedExtFc12Scheduler":
+        early_exit_enabled = (
+            self.early_exit_cluster_count > 0
+            and self.early_exit_expert_idx is not None
+        )
+        base_value_count = len(super().__extract_mlir_values__())
+        expected_value_count = base_value_count + (1 if early_exit_enabled else 0)
+        if len(values) != expected_value_count:
+            raise ValueError(
+                "BlackwellFusedExtFc12Scheduler MLIR value count mismatch: "
+                f"expected {expected_value_count}, got {len(values)}."
+            )
+        result = super().__new_from_mlir_values__(values[:base_value_count])
+        result.early_exit_cluster_count = self.early_exit_cluster_count
+        result.early_exit_expert_idx = self.early_exit_expert_idx
+        result.early_exit_cluster_start = self.early_exit_cluster_start
+        result.early_exit_work_id_limit = self.early_exit_work_id_limit
+        if early_exit_enabled:
+            result._is_early_exit_cluster = new_from_mlir_values(
+                self._is_early_exit_cluster, values[base_value_count:]
+            )
         return result
 
 
@@ -473,7 +929,7 @@ class _PhaseInterleaveControlState:
         return type(self)(*rebuilt_fields)
 
 
-class PhaseInterleavedFc12Scheduler(SchedulerBase):
+class PhaseInterleavedFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
     """Schedule independent FC1 and FC2 streams with per-phase atomic counters."""
 
     pipeline_mbarriers_region = "fc12.phase_interleaved.scheduler.pipeline_mbarriers"
@@ -481,7 +937,12 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
-        return {"expert_count": int, "intermediate_gateup_size": int, "hidden_size": int}
+        return {
+            "expert_count": int,
+            "intermediate_gateup_size": int,
+            "hidden_size": int,
+            **shared_expert_problem_requirements(),
+        }
 
     @classmethod
     def impl_desc_require(cls) -> dict[str, type]:
@@ -500,6 +961,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             "fuse_ready_probe_and_linear1_claim": OptionalRequirement(bool),
             **_mixed_cga_impl_requirements(),
             "compute_cluster_count": OptionalRequirement(int),
+            **shared_expert_impl_requirements(),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -548,8 +1010,17 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         else:
             self.mapping_cta_tile_shape_mnk = launch_cta_tile_shape_mnk
             self.mapping_cluster_shape_mn = self.cluster_shape_mn
+        self._bind_shared_expert_stream(
+            problem_desc,
+            impl_desc,
+            cta_tile_m=launch_cta_tile_shape_mnk[0],
+            cta_tile_n=launch_cta_tile_shape_mnk[1],
+            routed_stream_count=2,
+        )
         self._work_id_worker = NonClcMixedCgaSchedulerWorker(
-            config=self.non_clc_mixed_cga_config, work_id_mode=self.work_id_mode, stream_count=2
+            config=self.non_clc_mixed_cga_config,
+            work_id_mode=self.work_id_mode,
+            stream_count=2 + self.shared_stream_count,
         )
 
         mapping_cluster_tile_n = self.mapping_cta_tile_shape_mnk[1] * self.mapping_cluster_shape_mn[1]
@@ -766,6 +1237,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             ),
             shared_num_tokens=Int32(0),
         )
+        self._assign_shared_expert_stream(block_idx, device_workspace)
 
     def claim_shared_fc2_tiles(
         self, *, output_blocks: int, tokens_per_tile: int, cluster_m: int
@@ -958,8 +1430,9 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         return fc1_exhausted
 
     @cute.jit
-    def gen_next_work(self) -> SchedulerWorkTileBase:
+    def _gen_next_routed_work(self, work_id_offset: Int32 = Int32(0)) -> SchedulerWorkTileBase:
         """Claim until one stream yields valid work or both streams terminate."""
+        _ = work_id_offset
         work_tile = make_fc12_done_tile(self.is_swap_ab)
         work_id_worker = self._work_id_worker
         task_mapping_state = self._task_mapping_state
@@ -1022,11 +1495,14 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
                             control_state.shared_num_tokens,
                         )
                 if stream_has_work:
-                    if (not want_fc1) and (not prologue_claims_synchronized):
-                        fc1_exhausted = self._wait_for_fc1_prologue_claims(
-                            fc1_exhausted, work_id_worker, task_mapping_state
-                        )
-                        prologue_claims_synchronized = Boolean(True)
+                    # Deferred admission starts synchronized, so the wait is not emitted for it (DSL 4.10's
+                    # remove-dead-values pass poisons the never-taken spin and LLVM then drops the claim path).
+                    if cutlass.const_expr(not self.defer_consumer_until_full_ready):
+                        if (not want_fc1) and (not prologue_claims_synchronized):
+                            fc1_exhausted = self._wait_for_fc1_prologue_claims(
+                                fc1_exhausted, work_id_worker, task_mapping_state
+                            )
+                            prologue_claims_synchronized = Boolean(True)
                     if prologue_remaining > Int32(0):
                         prologue_remaining = prologue_remaining - Int32(1)
                     else:
@@ -1048,10 +1524,17 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         self._control_state = control_state
         return work_tile
 
+    @cute.jit
+    def produce_tail(self) -> None:
+        """Drain the work transport, then the work-ID leader waits for the cluster's final release."""
+        super().produce_tail()
+        self._work_id_worker.produce_tail()
+
     def __extract_mlir_values__(self) -> list:
         values = super().__extract_mlir_values__()
         for state in (self._work_id_worker, self._task_mapping_state, self._control_state):
             values.extend(extract_mlir_values(state))
+        values.extend(self._extract_shared_stream_values())
         return values
 
     def __new_from_mlir_values__(self, values: list) -> "PhaseInterleavedFc12Scheduler":
@@ -1074,6 +1557,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         result._work_id_worker = rebuild(self._work_id_worker)
         result._task_mapping_state = rebuild(self._task_mapping_state)
         result._control_state = rebuild(self._control_state)
+        self._rebuild_shared_stream(result, rebuild)
         if value_index != len(values):
             raise ValueError(
                 f"PhaseInterleavedFc12Scheduler MLIR value count mismatch: consumed {value_index}, got {len(values)}."
@@ -1112,4 +1596,10 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         return result
 
 
-__all__ = ["BlackwellFusedFc12Scheduler", "PhaseInterleavedFc12Scheduler", "minimum_phase_interleave_hint"]
+__all__ = [
+    "BlackwellFusedFc12Scheduler",
+    "BlackwellFusedExtFc12Scheduler",
+    "PhaseInterleavedFc12Scheduler",
+    "minimum_phase_interleave_hint",
+    "minimum_phase_interleave_ring_token_blocks",
+]

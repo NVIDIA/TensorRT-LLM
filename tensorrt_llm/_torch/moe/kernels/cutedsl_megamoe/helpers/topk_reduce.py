@@ -169,6 +169,50 @@ def _zero_half_mask(word):
     return (word - Int64(0x0001000100010001)) & (word ^ Int64(-1)) & Int64(-0x7FFF7FFF7FFF8000)
 
 
+def shared_term_view(shared_term: cute.Tensor, hidden: int) -> cute.Tensor:
+    """The (token, hidden) BF16 view of a shared term, with the caller's token stride."""
+    return cute.make_tensor(shared_term.iterator, cute.make_layout((shared_term.shape[0], hidden), stride=shared_term.stride))
+
+
+REDUCE_OPERAND_ALIGN_BYTES = 32
+
+
+def check_reduce_operand_alignment(**operands) -> None:
+    """The top-k reduce's external operands must be declared 32 B aligned; ``from_dlpack`` or the TVM-FFI entry
+    then checks the pointer."""
+    for name, tensor in operands.items():
+        if tensor is not None and tensor.iterator.max_alignment < REDUCE_OPERAND_ALIGN_BYTES:
+            raise ValueError(
+                f"{name} must be declared {REDUCE_OPERAND_ALIGN_BYTES} B aligned (assumed_align="
+                f"{REDUCE_OPERAND_ALIGN_BYTES}), got {tensor.iterator.max_alignment}."
+            )
+
+
+@cute.jit
+def load_shared_term(
+    shared_term: cute.Tensor, token_idx: Int32, hidden_tile_idx: Int32, hidden_per_thread: cutlass.Constexpr[int]
+) -> cute.Tensor:
+    """One worker's BF16 shared-term slice in a single access of up to 256 bits (shared_output is 32 B aligned)."""
+    bits = min(256, hidden_per_thread * cutlass.BFloat16.width)
+    src = cute.zipped_divide(shared_term[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+    values = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+    cute.copy(
+        cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=bits),
+        mark_alignment(src, bits // 8),
+        values,
+    )
+    return values
+
+
+@cute.jit
+def add_shared_term(acc: cute.Tensor, values: cute.Tensor, hidden_per_thread: cutlass.Constexpr[int]) -> None:
+    """Add the BF16 shared-term values into the FP32 accumulators, after the routed terms."""
+    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+        acc[i], acc[i + 1] = cute.arch.add_packed_f32x2(
+            (acc[i], acc[i + 1]), (Float32(values[i]), Float32(values[i + 1]))
+        )
+
+
 def _mixed_add_bf16_asm(n: int):
     """PTX + constraint string for ``add_bf16_into_f32_ptx`` (plain Python: the
     DSL stages ``for`` loops inside ``@cute.jit`` bodies, so text is built here).
@@ -270,11 +314,15 @@ class TopkReduce:
         max_fetch: int = 8,
         fetch_rounds: int = 4,
         internode: Optional[Tuple[int, int, int]] = None,
+        shared_term: bool = False,
+        outlive_producer: bool = False,
     ) -> None:
         """``internode = (experts_per_rank, ranks_per_node, remote_node_slots)`` enables the ordered reduce
         with one BF16 node partial per remote node (design invariant I11): a token's local top-k cells
         stay separate terms; the first top-k slot that names an expert of remote node ``n`` contributes
-        that node's returned partial once and the node's other slots contribute nothing."""
+        that node's returned partial once and the node's other slots contribute nothing.
+        ``outlive_producer`` keeps the polled reduce from completing before its producer grid, for producers
+        that also write outputs the reduce does not poll."""
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.num_experts = None if num_experts is None else int(num_experts)
@@ -324,6 +372,11 @@ class TopkReduce:
         if min_blocks_per_mp is None:
             load_regs = self.hidden_per_thread * combine_format.act_dtype.width // 32
             regs_needed = self.hidden_per_thread + self.num_topk * load_regs + 16
+            if shared_term:
+                # The bf16 shared-term load and the hoisted scores must stay in flight with the top-k loads.
+                regs_needed += self.hidden_per_thread * cutlass.BFloat16.width // 32
+                if self.num_topk <= self._prefetch_limit:
+                    regs_needed += self.num_topk
             min_blocks_per_mp = max(4, min(8, 65536 // (128 * regs_needed)))
         self.min_blocks_per_mp = int(min_blocks_per_mp)
         self.internode = internode
@@ -352,6 +405,9 @@ class TopkReduce:
                     "The polled bf16 reduce is a static-grid kernel with 16 B cells on SM100+ (no persistent "
                     "scheduler, no internode partials)."
                 )
+        self.outlive_producer = bool(outlive_producer)
+        if self.outlive_producer and not self.ll_encoded:
+            raise ValueError("outlive_producer applies to the polled bf16 reduce only.")
         # hidden must tile cleanly both into worker slices and into scale blocks.
         align = max(combine_format.scale_block or self.hidden_per_thread, self.hidden_per_thread)
         if self.hidden % align != 0:
@@ -444,7 +500,7 @@ class TopkReduce:
         message_index: Optional[cute.Tensor] = None,  # (remote slot, token) -> message index
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk) global expert ids
         local_rank: Optional[Int32] = None,
-        extra_term: Optional[cute.Tensor] = None,  # (>= token, hidden) bf16, added to every reduced row
+        shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, added after the top-k terms
     ):
         """Launch the reduce.
 
@@ -489,18 +545,15 @@ class TopkReduce:
             topk_score = cute.make_tensor(
                 topk_score.iterator, cute.make_layout((topk_score.shape[0], self.num_topk), stride=topk_score.stride)
             )
-
-        if cutlass.const_expr(extra_term is not None):
-            if cutlass.const_expr(self.ll_encoded or self.internode is not None):
-                raise ValueError("extra_term needs the static or persistent reduce.")
-            extra_term = cute.make_tensor(
-                extra_term.iterator, cute.make_layout((extra_term.shape[0], self.hidden), stride=extra_term.stride)
-            )
+        if cutlass.const_expr(shared_term is not None):
+            if cutlass.const_expr(self.internode is not None):
+                raise ValueError("shared_term is not supported by the internode reduce.")
+            shared_term = shared_term_view(shared_term, self.hidden)
 
         if cutlass.const_expr(self.ll_encoded):
             if cutlass.const_expr(topk_indices is None):
                 raise ValueError("The polled bf16 reduce needs topk_indices to skip dropped slots.")
-            self._reduce_bf16_ll(combine_quant, topk_score, reduced_output, topk_indices).launch(
+            self._reduce_bf16_ll(combine_quant, topk_score, reduced_output, topk_indices, shared_term).launch(
                 grid=grid, block=block, stream=stream, use_pdl=True
             )
             return
@@ -546,10 +599,10 @@ class TopkReduce:
             launch_kwargs["preferred_smem_carveout"] = 0
         if cutlass.const_expr(self.persistent):
             self._reduce_persistent(
-                combine_quant, sf, topk_score, reduced_output, counters, num_tokens_dev, topk_indices, extra_term
+                combine_quant, sf, topk_score, reduced_output, counters, num_tokens_dev, topk_indices, shared_term
             ).launch(**launch_kwargs)
         else:
-            self._reduce_static(combine_quant, sf, topk_score, reduced_output, topk_indices, extra_term).launch(
+            self._reduce_static(combine_quant, sf, topk_score, reduced_output, topk_indices, shared_term).launch(
                 **launch_kwargs
             )
 
@@ -563,7 +616,7 @@ class TopkReduce:
         topk_score: Optional[cute.Tensor],   # (token, topk)
         reduced_output: cute.Tensor,         # (token, hidden)
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk)
-        extra_term: Optional[cute.Tensor] = None,  # (token, hidden) bf16
+        shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, or None
     ):
         """One thread per (token, hidden_tile) worker; the grid carries the
         token count. This is the default path."""
@@ -577,7 +630,7 @@ class TopkReduce:
             reduced_output.shape[0],
             self.require_predicate,
             topk_indices,
-            extra_term,
+            shared_term,
         )
 
 
@@ -663,6 +716,7 @@ class TopkReduce:
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
         topk_indices: cute.Tensor,
+        shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, or None
     ):
         """The bf16 ``_reduce_cell`` over the self-validating plane: poll, reduce, zero.
 
@@ -675,6 +729,8 @@ class TopkReduce:
         alongside the producer's tail instead of after it, and may also end before
         that tail; the next call's communication kernel waits for the tail itself. All loads of a worker
         issue before any test; only a cell that is still in flight is loaded again.
+        A shared term has no such encoding, so a worker waits for the producer grid only after its routed
+        fold, right before loading that term.
         The arithmetic is the bf16 ``_reduce_cell``'s (convert-then-FMA form), term for term.
         """
         threads = self._threads
@@ -792,6 +848,13 @@ class TopkReduce:
                             value_pair, score_pair, (Float32(0.0), Float32(0.0))
                         )
 
+            if cutlass.const_expr(shared_term is not None):
+                # The shared output carries no self-validating encoding: wait for the producer grid, then add it.
+                cute.arch.griddepcontrol_wait()
+                add_shared_term(
+                    acc, load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread), hidden_per_thread
+                )
+
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
             vector_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128)
@@ -805,6 +868,11 @@ class TopkReduce:
             for k in cutlass.range_constexpr(num_topk):
                 if (valid_slots >> Int32(k)) & Int32(1) != Int32(0):
                     cute.copy(cell_store, cleared, mark_alignment(terms[k, None], hidden_per_thread * 2))
+        if cutlass.const_expr(self.outlive_producer and shared_term is None):
+            # Only the last CTA waits, so the reduce completes after the producer grid without holding its earlier waves.
+            if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (cute.arch.thread_idx()[0] == Int32(0)):
+                cute.arch.griddepcontrol_wait()
+
     @cute.kernel
     def _reduce_persistent(
         self,
@@ -815,7 +883,7 @@ class TopkReduce:
         counters: cute.Tensor,  # int32 x1: work cursor, zeroed by the caller before every launch
         num_tokens_dev: cute.Tensor,  # int32 x1: valid token count
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk)
-        extra_term: Optional[cute.Tensor] = None,  # (token, hidden) bf16
+        shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, or None
     ):
         """Fixed-grid form of the three ``_reduce_*`` kernels above.
         """
@@ -867,7 +935,7 @@ class TopkReduce:
                 num_tokens,
                 True,
                 topk_indices,
-                extra_term,
+                shared_term=shared_term,
             )
 
             if need_fetch:
@@ -892,7 +960,7 @@ class TopkReduce:
         num_tokens: Int32,
         needs_guard: cutlass.Constexpr[bool] = True,
         topk_indices: Optional[cute.Tensor] = None,
-        extra_term: Optional[cute.Tensor] = None,
+        shared_term: Optional[cute.Tensor] = None,
     ):
         """One ``(token, hidden_tile)`` cell, format-dispatched at compile time.
 
@@ -902,6 +970,7 @@ class TopkReduce:
 
         ``needs_guard=False`` elides the bounds check entirely, which is what
         the static path wants when ``hidden_tiles`` is a whole number of CTAs.
+        ``shared_term`` adds one more unweighted BF16 term after the top-k fold.
         """
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
@@ -1059,28 +1128,10 @@ class TopkReduce:
                             # +0 seed: a -0.0 first term yields +0.0 (main's semantics).
                             acc[i], acc[i + 1] = self._fma(dequant_pair, score, (Float32(0.0), Float32(0.0)))
 
-            if cutlass.const_expr(extra_term is not None):
-                extra = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
-                extra_src = cute.zipped_divide(extra_term[token_idx, None], (hidden_per_thread,))[
-                    (None,), (hidden_tile_idx,)
-                ]
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        cutlass.BFloat16,
-                        num_bits_per_copy=min(128, hidden_per_thread * cutlass.BFloat16.width),
-                    ),
-                    mark_alignment(extra_src, hidden_per_thread * cutlass.BFloat16.width // 8),
-                    extra,
+            if cutlass.const_expr(shared_term is not None):
+                add_shared_term(
+                    acc, load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread), hidden_per_thread
                 )
-                if cutlass.const_expr(self.use_scalar_math):
-                    for i in cutlass.range_constexpr(hidden_per_thread):
-                        acc[i] = acc[i] + Float32(extra[i])
-                else:
-                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                        acc[i], acc[i + 1] = cute.arch.add_packed_f32x2(
-                            (acc[i], acc[i + 1]), (Float32(extra[i]), Float32(extra[i + 1]))
-                        )
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
@@ -1089,3 +1140,307 @@ class TopkReduce:
                 out,
                 mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
             )
+
+    @cute.jit
+    def run_device(
+        self,
+        combine_quant: cute.Tensor,
+        combine_sf: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        topk_score: Optional[cute.Tensor],
+        worker_start: Int32,
+        worker_stride: Int32,
+    ) -> None:
+        """In-kernel grid-stride TopK reduction over ``(token, hidden_tile)`` workers."""
+        hidden_per_thread = self.hidden_per_thread
+        hidden_tiles = self.hidden_tiles
+        num_topk: cutlass.Constexpr[int] = self.num_topk
+        prefetch = self.prefetch
+        out_dtype = reduced_output.element_type
+
+        combine_quant = cute.make_tensor(
+            combine_quant.iterator,
+            cute.make_layout(
+                (combine_quant.shape[0], self.num_topk, self.hidden),
+                stride=combine_quant.stride,
+            ),
+        )
+        reduced_output = cute.make_tensor(
+            reduced_output.iterator,
+            cute.make_layout(
+                (reduced_output.shape[0], self.hidden),
+                stride=reduced_output.stride,
+            ),
+        )
+        if cutlass.const_expr(topk_score is not None):
+            topk_score = cute.make_tensor(
+                topk_score.iterator,
+                cute.make_layout(
+                    (topk_score.shape[0], self.num_topk),
+                    stride=topk_score.stride,
+                ),
+            )
+
+        total_workers = Int32(reduced_output.shape[0]) * Int32(hidden_tiles)
+        score_dtype = (
+            topk_score.dtype
+            if cutlass.const_expr(topk_score is not None)
+            else cutlass.Float32
+        )
+
+        if cutlass.const_expr(not self.combine_format.is_quantized):
+            load_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.BFloat16,
+                num_bits_per_copy=128,
+            )
+            store_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                out_dtype,
+                num_bits_per_copy=128,
+            )
+            worker_idx = worker_start
+            while worker_idx < total_workers:
+                token_idx = worker_idx // Int32(hidden_tiles)
+                hidden_tile_idx = worker_idx % Int32(hidden_tiles)
+                score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
+                terms = cute.zipped_divide(
+                    combine_quant[token_idx, None, None],
+                    (num_topk, hidden_per_thread),
+                )[(None, None), (0, hidden_tile_idx)]
+                dst = cute.zipped_divide(
+                    reduced_output[token_idx, None],
+                    (hidden_per_thread,),
+                )[(None,), (hidden_tile_idx,)]
+                if cutlass.const_expr(topk_score is not None):
+                    if cutlass.const_expr(prefetch):
+                        cute.autovec_copy(topk_score[token_idx, None], score_reg)
+                else:
+                    for k in cutlass.range_constexpr(num_topk):
+                        score_reg[k] = score_dtype(1)
+                acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                for k in cutlass.range_constexpr(0, num_topk, 1):
+                    term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                    cute.copy(
+                        load_atom,
+                        mark_alignment(
+                            terms[k, None],
+                            hidden_per_thread * cutlass.BFloat16.width // 8,
+                        ),
+                        term,
+                    )
+                    if cutlass.const_expr(topk_score is not None and not prefetch):
+                        score_reg[k] = topk_score[token_idx, Int32(k)]
+                    score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                        value_pair = (Float32(term[i]), Float32(term[i + 1]))
+                        if cutlass.const_expr(k != 0):
+                            acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                                value_pair, score_pair, (acc[i], acc[i + 1])
+                            )
+                        else:
+                            acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                                value_pair,
+                                score_pair,
+                                (Float32(0.0), Float32(0.0)),
+                            )
+                out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+                out.store(acc.load().to(out_dtype))
+                cute.copy(
+                    store_atom,
+                    out,
+                    mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
+                )
+                worker_idx = worker_idx + worker_stride
+            return
+
+        sf_vec = self.combine_format.scale_block
+        if cutlass.const_expr(cute.depth(combine_sf.layout) >= 2):
+            sf_view = cute.make_tensor(
+                combine_sf.iterator,
+                cute.make_layout(
+                    (
+                        combine_sf.shape[0],
+                        self.num_topk,
+                        (sf_vec, self.hidden // sf_vec),
+                    ),
+                    stride=combine_sf.stride,
+                ),
+            )
+        else:
+            sf_view = cute.make_tensor(
+                combine_sf.iterator,
+                cute.make_layout(
+                    (
+                        combine_sf.shape[0],
+                        self.num_topk,
+                        (sf_vec, self.hidden // sf_vec),
+                    ),
+                    stride=(
+                        combine_sf.stride[0],
+                        combine_sf.stride[1],
+                        (0, combine_sf.stride[2]),
+                    ),
+                ),
+            )
+
+        if cutlass.const_expr(self.combine_format.act_dtype is cutlass.Float8E4M3FN):
+            fp8_dtype = self.combine_format.act_dtype
+            load_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), fp8_dtype, num_bits_per_copy=128
+            )
+            store_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=256
+            )
+            worker_idx = worker_start
+            while worker_idx < total_workers:
+                token_idx = worker_idx // Int32(hidden_tiles)
+                hidden_tile_idx = worker_idx % Int32(hidden_tiles)
+                score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
+                scale_reg = cute.make_rmem_tensor((num_topk,), cutlass.Float8E8M0FNU)
+                codes = cute.zipped_divide(
+                    combine_quant[token_idx, None, None],
+                    (num_topk, hidden_per_thread),
+                )[(None, None), (0, hidden_tile_idx)]
+                sf = cute.zipped_divide(
+                    sf_view[token_idx, None, None],
+                    (num_topk, hidden_per_thread),
+                )[(None, None), (0, hidden_tile_idx)]
+                dst = cute.zipped_divide(
+                    reduced_output[token_idx, None],
+                    (hidden_per_thread,),
+                )[(None,), (hidden_tile_idx,)]
+                if cutlass.const_expr(topk_score is not None):
+                    if cutlass.const_expr(prefetch):
+                        cute.autovec_copy(topk_score[token_idx, None], score_reg)
+                else:
+                    for k in cutlass.range_constexpr(num_topk):
+                        score_reg[k] = score_dtype(1)
+                if cutlass.const_expr(prefetch):
+                    cute.autovec_copy(sf[None, 0], scale_reg)
+                acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                for k in cutlass.range_constexpr(0, num_topk, 1):
+                    term = cute.make_rmem_tensor((hidden_per_thread,), fp8_dtype)
+                    cute.copy(
+                        load_atom,
+                        mark_alignment(
+                            codes[k, None],
+                            hidden_per_thread * fp8_dtype.width // 8,
+                        ),
+                        term,
+                    )
+                    value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                    value.store(term.load().to(cutlass.Float32))
+                    if cutlass.const_expr(not prefetch):
+                        scale_reg[k] = sf[k, 0]
+                        if cutlass.const_expr(topk_score is not None):
+                            score_reg[k] = topk_score[token_idx, Int32(k)]
+                    scale = Float32(scale_reg[k])
+                    scale_pair = (scale, scale)
+                    score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                        dequant_pair = cute.arch.mul_packed_f32x2(
+                            (value[i], value[i + 1]), scale_pair
+                        )
+                        if cutlass.const_expr(k != 0):
+                            acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                                dequant_pair, score_pair, (acc[i], acc[i + 1])
+                            )
+                        else:
+                            acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                                dequant_pair,
+                                score_pair,
+                                (Float32(0.0), Float32(0.0)),
+                            )
+                out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+                out.store(acc.load().to(out_dtype))
+                cute.copy(
+                    store_atom,
+                    out,
+                    mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
+                )
+                worker_idx = worker_idx + worker_stride
+        else:
+            load_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Float4E2M1FN,
+                num_bits_per_copy=64,
+            )
+            store_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=256
+            )
+            worker_idx = worker_start
+            while worker_idx < total_workers:
+                token_idx = worker_idx // Int32(hidden_tiles)
+                hidden_tile_idx = worker_idx % Int32(hidden_tiles)
+                score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
+                scale_reg = cute.make_rmem_tensor((num_topk,), cutlass.BFloat16)
+                codes = cute.zipped_divide(
+                    combine_quant[token_idx, None, None],
+                    (num_topk, hidden_per_thread),
+                )[(None, None), (0, hidden_tile_idx)]
+                sf = cute.zipped_divide(
+                    sf_view[token_idx, None, None],
+                    (num_topk, hidden_per_thread),
+                )[(None, None), (0, hidden_tile_idx)]
+                dst = cute.zipped_divide(
+                    reduced_output[token_idx, None],
+                    (hidden_per_thread,),
+                )[(None,), (hidden_tile_idx,)]
+                if cutlass.const_expr(topk_score is not None):
+                    if cutlass.const_expr(prefetch):
+                        cute.autovec_copy(topk_score[token_idx, None], score_reg)
+                else:
+                    for k in cutlass.range_constexpr(num_topk):
+                        score_reg[k] = score_dtype(1)
+                if cutlass.const_expr(prefetch):
+                    cute.autovec_copy(sf[None, 0], scale_reg)
+                acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                for k in cutlass.range_constexpr(0, num_topk, 1):
+                    term = cute.make_rmem_tensor(
+                        (hidden_per_thread,), cutlass.Float4E2M1FN
+                    )
+                    cute.copy(
+                        load_atom,
+                        mark_alignment(
+                            codes[k, None],
+                            hidden_per_thread * cutlass.Float4E2M1FN.width // 8,
+                        ),
+                        term,
+                    )
+                    value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                    if cutlass.const_expr(
+                        os.environ.get("MEGA_F4CVT_USE_MANUAL", "0") == "1"
+                    ):
+                        cvt_e2m1_to_fp32_optimal_ptx(term, value)
+                    else:
+                        cvt_e2m1_to_fp32_cvt_ptx(term, value)
+                    if cutlass.const_expr(not prefetch):
+                        scale_reg[k] = sf[k, 0]
+                        if cutlass.const_expr(topk_score is not None):
+                            score_reg[k] = topk_score[token_idx, Int32(k)]
+                    scale = Float32(scale_reg[k]) * Float32(Nvfp4E2M1RcpLimit)
+                    scale_pair = (scale, scale)
+                    score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                        dequant_pair = cute.arch.mul_packed_f32x2(
+                            (value[i], value[i + 1]), scale_pair
+                        )
+                        if cutlass.const_expr(k != 0):
+                            acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                                dequant_pair, score_pair, (acc[i], acc[i + 1])
+                            )
+                        else:
+                            acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                                dequant_pair,
+                                score_pair,
+                                (Float32(0.0), Float32(0.0)),
+                            )
+                out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+                out.store(acc.load().to(out_dtype))
+                cute.copy(
+                    store_atom,
+                    out,
+                    mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
+                )
+                worker_idx = worker_idx + worker_stride
