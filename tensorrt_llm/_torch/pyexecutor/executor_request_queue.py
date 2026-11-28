@@ -28,6 +28,9 @@ PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
 # Rank 0 asks every rank to vote on draining the current benchmark stage.
 BENCHMARK_STAGE_VOTE_REQUEST_ID = -6
+# Returns a waiting get_from_request_queue() without a request. Unlike
+# CONTROL_REQUEST_ID, it is never broadcast to the other ranks.
+WAKE_REQUEST_ID = -7
 # Shortest wait between two idle_tick calls in get_from_request_queue.
 _MIN_IDLE_TICK_WAIT_S = 0.001
 
@@ -92,7 +95,8 @@ class RequestQueueItem:
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
                     or self.is_prefix_load_completion_request
-                    or self.is_benchmark_stage_vote_request)
+                    or self.is_benchmark_stage_vote_request
+                    or self.is_wake_request)
 
     @property
     def is_prefix_load_completion_request(self):
@@ -113,6 +117,10 @@ class RequestQueueItem:
     @property
     def is_benchmark_stage_vote_request(self):
         return self.id == BENCHMARK_STAGE_VOTE_REQUEST_ID
+
+    @property
+    def is_wake_request(self):
+        return self.id == WAKE_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -136,6 +144,7 @@ class ExecutorRequestQueue:
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.max_batch_size = max_batch_size
         self.enqueue_lock = threading.Lock()
+        self._wake_pending = False
         self.next_request_id = max_batch_size
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
@@ -330,6 +339,14 @@ class ExecutorRequestQueue:
                 and item.cancel_context_client_id is None
             }
 
+    def queued_request_ids(self) -> set[int]:
+        """Inspect the ids of queued requests without consuming them."""
+        with self.request_queue.mutex:
+            return {
+                item.id
+                for item in self.request_queue.queue if item.is_normal_request
+            }
+
     def enqueue_control_request(self,
                                 drain: bool = True,
                                 control_id: Optional[str] = None):
@@ -353,6 +370,16 @@ class ExecutorRequestQueue:
         """Enqueue a profile-stop control item. Broadcasted to every rank."""
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
+
+    def wake(self):
+        """Return a waiting get_from_request_queue() without a request.
+
+        At most one wake waits in the queue.
+        """
+        with self.enqueue_lock:
+            if not self._wake_pending:
+                self._wake_pending = True
+                self.request_queue.put(RequestQueueItem(id=WAKE_REQUEST_ID))
 
     def enqueue_benchmark_stage_vote_request(self):
         """Enqueue a stage-drain vote item. Broadcasted to every rank."""
@@ -426,8 +453,15 @@ class ExecutorRequestQueue:
                     items.append(queue_item)
         except queue.Empty:
             pass
+        # wake() sets _wake_pending before it queues the wake item, so a
+        # queue without a pending wake is never scanned.
+        woken = self._wake_pending and any(item.is_wake_request
+                                           for item in items)
+        if woken:
+            self._wake_pending = False
+            items = [item for item in items if not item.is_wake_request]
 
-        if not wait_for_batch or self.batch_wait_timeout_ms == 0:
+        if not wait_for_batch or self.batch_wait_timeout_ms == 0 or woken:
             return items
 
         if len(items) >= self.max_batch_size:
@@ -442,9 +476,12 @@ class ExecutorRequestQueue:
 
             try:
                 item = self.request_queue.get(timeout=remaining_timeout)
-                items.append(item)
             except queue.Empty:
                 break
+            if self._wake_pending and item.is_wake_request:
+                self._wake_pending = False
+                break
+            items.append(item)
 
         return items
 

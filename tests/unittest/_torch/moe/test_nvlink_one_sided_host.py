@@ -128,6 +128,141 @@ def test_sentinel_workspace_layout(payload_format: str) -> None:
         )
 
 
+# The workspace regions after the round flag value, in the order calculateWorkspaceLayout places them.
+_REGIONS_AFTER_FLAG_VAL = (
+    "LOCAL_TOKEN_COUNTER",
+    "SEND_COUNTERS",
+    "RECV_COUNTERS",
+    "DISPATCH_COMPLETION_FLAGS",
+    "TOPK_TARGET_RANKS",
+    "TOPK_TARGET_INDICES",
+    "EPLB_GATHERED_STATS",
+    "DISPATCH_PAYLOAD",
+    "COMBINE_COMPLETION_FLAGS",
+    "COMBINE_INPUT",
+)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        # ep_size, max_num_tokens_per_rank, top_k, dispatch_payload_bytes, combine_input_bytes, EPLB experts
+        (8, 128, 8, 1000, 3000, 288),
+        (36, 77, 6, 4096, 70000, None),
+    ],
+)
+def test_workspace_layout_without_rank_mask_has_no_incomplete_round_word(args: tuple) -> None:
+    """Only a rank-mask layout reserves the incomplete-round word, right after the round flag value."""
+    from tensorrt_llm.bindings import internal as _tllm_internal
+
+    thop = _tllm_internal.thop
+
+    def offset(layout: torch.Tensor, region: str) -> int:
+        return int(layout[getattr(thop, f"MOE_A2A_{region}_OFFSET_INDEX")])
+
+    default = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args)
+    without_mask = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=False)
+    with_mask = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=True)
+    assert torch.equal(without_mask, default)
+    assert offset(without_mask, "INCOMPLETE_ROUND") == 0
+
+    # The word follows the round flag value, and only the regions after it move.
+    assert offset(with_mask, "FLAG_VAL") == offset(without_mask, "FLAG_VAL")
+    assert offset(with_mask, "FLAG_VAL") < offset(with_mask, "INCOMPLETE_ROUND")
+    assert offset(with_mask, "INCOMPLETE_ROUND") < offset(with_mask, _REGIONS_AFTER_FLAG_VAL[0])
+    for region in _REGIONS_AFTER_FLAG_VAL:
+        assert offset(with_mask, region) >= offset(without_mask, region)
+    unchanged = [
+        int(getattr(thop, f"MOE_A2A_{name}_INDEX"))
+        for name in (
+            "DISPATCH_PAYLOAD_SIZE",
+            "COMBINE_INPUT_SIZE",
+            "MAX_NUM_TOKENS",
+            "TOP_K",
+            "EP_SIZE",
+            "EPLB_STATS_NUM_EXPERTS",
+        )
+    ]
+    assert torch.equal(with_mask[unchanged], without_mask[unchanged])
+
+
+def test_replacement_rank_replays_the_sentinel_vote(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A replacement rank takes the sentinel vote that the original ranks recorded at startup.
+
+    It builds its layers without the other ranks, so the vote must issue no collective there. A
+    replacement whose own vote differs from its predecessor's cannot start. The layers are Wide-EP
+    fault tolerant, so every rank votes the sentinel transport off: its kernels take no active-rank
+    mask or abort state.
+    """
+    from tensorrt_llm._torch.distributed import communicator
+    from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
+    from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
+
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_sentinel_available", lambda: True)
+    monkeypatch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+    monkeypatch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
+
+    def layer(ep_rank: int) -> NVLinkOneSided:
+        comm = NVLinkOneSided.__new__(NVLinkOneSided)
+        comm.mapping = None
+        comm.ep_rank, comm.ep_size, comm.top_k, comm.num_experts = ep_rank, 2, 2, 8
+        comm.max_num_tokens_per_rank = 16
+        comm.use_low_precision_combine = False
+        return comm
+
+    layout = NVLinkOneSided._make_workspace_layout(
+        2, 2, 16, 64, torch.bfloat16, None, 0, rank_mask=True
+    )
+
+    def vote(comm: NVLinkOneSided) -> tuple:
+        return comm._vote_sentinel(layout.clone(), 64, torch.bfloat16, "BF16", fault_tolerant=True)
+
+    gathered = []
+
+    def allgather(own_vote):
+        gathered.append(own_vote)
+        # The other rank's layer is fault tolerant as well, so it votes the sentinel transport off.
+        return [own_vote, (False, None, own_vote[2])]
+
+    def no_collective(own_vote):
+        raise AssertionError("a replacement rank must not run the sentinel vote collective")
+
+    def get_comm(allgather, rank):
+        # Like MnnvlMemory.get_comm, whose first call splits the startup group.
+        communicator.Distributed.agree_per_process("startup_group_split", lambda: [(0, 0)] * 2)
+        return SimpleNamespace(allgather=allgather, Get_rank=lambda: rank)
+
+    original = StartupRecord()
+    original.record()
+    monkeypatch.setattr(communicator.Distributed, "startup_record", original)
+    monkeypatch.setattr(
+        nvlink_one_sided.MnnvlMemory, "get_comm", lambda mapping: get_comm(allgather, 0)
+    )
+    expected = vote(layer(0))
+    original.close()
+    assert expected == (0, None, tuple(layout.tolist()))
+    assert len(gathered) == 1 and gathered[0][:2] == (False, None)
+
+    def replacement_record() -> StartupRecord:
+        replacement = StartupRecord()
+        replacement.replay(original.published())
+        monkeypatch.setattr(communicator.Distributed, "startup_record", replacement)
+        return replacement
+
+    monkeypatch.setattr(
+        nvlink_one_sided.MnnvlMemory, "get_comm", lambda mapping: get_comm(no_collective, 1)
+    )
+    replacement = replacement_record()
+    assert vote(layer(1)) == expected
+    # The replacement takes each startup value as often as the original ranks recorded it.
+    replacement.close()
+
+    replacement_record()
+    monkeypatch.setenv(SENTINEL_MAX_TOKENS_ENV, "64")
+    with pytest.raises(ReplacementCannotStart, match="nvlink_one_sided_sentinel_vote"):
+        vote(layer(1))
+
+
 def test_sentinel_row_geometry() -> None:
     hidden_size, top_k = 7168, 8
     # (hidden-state bytes, scale bytes, dispatch blocks per token) per row.
@@ -326,3 +461,24 @@ def test_sentinel_formats_share_a_live_workspace(monkeypatch: pytest.MonkeyPatch
     bf16, bf16_layout = layer("BF16")
     assert bf16.sentinel_max_tokens == 160 and bf16._sentinel_format == "BF16"
     assert not torch.equal(bf16_layout, nvfp4_layout)
+
+
+@pytest.mark.parametrize("phase", ["dispatch", "combine"])
+@pytest.mark.parametrize(
+    "rank_mask, message",
+    [
+        (False, "active_rank_mask requires committed EP group health"),
+        (True, "active_rank_mask is not an argument"),
+    ],
+    ids=["fault_tolerance_off", "fault_tolerance_on"],
+)
+def test_active_rank_mask_argument_refused(phase: str, rank_mask: bool, message: str) -> None:
+    """Refuse an active_rank_mask argument rather than run the all-to-all without it."""
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm._rank_mask_enabled = rank_mask
+    mask = torch.zeros(1, dtype=torch.uint64)
+    with pytest.raises(ValueError, match=message):
+        if phase == "dispatch":
+            comm.dispatch(None, None, None, None, [1], active_rank_mask=mask)
+        else:
+            comm.combine(None, active_rank_mask=mask)

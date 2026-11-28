@@ -16,7 +16,7 @@
 
 ``_handle_control_request`` runs on the executor-loop thread at a point every
 rank reaches in the same iteration. Before it yields to the action it retires
-the overlap loop's in-flight ``previous_batch`` (``_retire_inflight_batch_for_control``)
+the overlap loop's in-flight ``previous_batch`` (``retire_inflight_batch``)
 with the same attention-DP gathers on every rank, whether or not the rank has
 a batch, so nothing consumes that batch later from a per-rank code path (that
 deadlocked attention-DP context engines at an in-flight weight update). With
@@ -45,7 +45,8 @@ def _batch():
 class _Rank:
     """Records what the retirement helper does on one rank."""
 
-    _retire_inflight_batch_for_control = PyExecutor._retire_inflight_batch_for_control
+    retire_inflight_batch = PyExecutor.retire_inflight_batch
+    _accept_or_discard_previous_batch = PyExecutor._accept_or_discard_previous_batch
 
     def __init__(
         self,
@@ -60,6 +61,7 @@ class _Rank:
         self.dist = MagicMock(pp_size=pp_size, world_size=8)
         self.disable_overlap_scheduler = not overlap
         self.previous_batch = previous_batch
+        self.rank_failure_recovery = None
         self.speculation_gate = None
         self.enable_early_first_token_response = early_first_token
         self.drafter = drafter
@@ -104,7 +106,7 @@ class TestRetireInflightBatch:
     def test_rank_with_batch_follows_the_loop_tail_order(self):
         rank = _Rank(previous_batch=_batch())
 
-        rank._retire_inflight_batch_for_control()
+        rank.retire_inflight_batch()
 
         assert rank.calls == [
             "update_requests",
@@ -173,7 +175,7 @@ class _ControlExecutor:
     def _pop_sleep_wakeup_abort(self, control_id):
         return None
 
-    def _retire_inflight_batch_for_control(self):
+    def retire_inflight_batch(self):
         self.order.append("retire")
 
 
@@ -203,6 +205,23 @@ class TestHandleControlRequest:
         assert ex.order == [] and cuda_sync == []
         assert len(ex.control_requests) == 1
         assert ex._control_drain_transfer_deadline is None
+
+    def test_drain_vote_counts_only_active_ranks(self, cuda_sync):
+        """Fire once every active TP rank drained, without a vote from a rank that left.
+
+        A host collective gives a rank outside the membership the value None unless it gathers the
+        active ranks only.
+        """
+        ex = _ControlExecutor(drain=True)
+
+        def tp_allgather(value, active_only=False):
+            return [value, value] if active_only else [value, None, value]
+
+        ex.dist = SimpleNamespace(world_size=3, pp_size=1, tp_size=3, tp_allgather=tp_allgather)
+
+        ex._handle_control_request()
+
+        assert ex.control_requests == []
 
     def test_drain_transfer_deadline_arms_once_then_fires(self):
         ex = _ControlExecutor(drain=True, transfers=1)

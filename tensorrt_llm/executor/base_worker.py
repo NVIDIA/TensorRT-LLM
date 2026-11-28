@@ -54,6 +54,7 @@ from .executor import GenerationExecutor
 from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
+from .rank_failure_requests import RankFailureError
 from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict,
@@ -222,6 +223,9 @@ class BaseWorker(GenerationExecutor):
         # Model construction may update the maximum sequence length.
         if self.engine.max_seq_len is not None:
             self.max_seq_len = self.engine.max_seq_len
+        if self.engine.rank_failure_recovery is not None:
+            self.engine.rank_failure_recovery.set_outstanding_requests(
+                self.outstanding_requests)
 
         self._lora_manager: Optional[LoraManager] = None
 
@@ -347,6 +351,19 @@ class BaseWorker(GenerationExecutor):
                 )
                 return
             self.engine.cancel_request(request_id)
+
+    def outstanding_requests(self) -> Dict[int, int]:
+        """Map request id to client id for every request without a final response.
+
+        A request has a result until its final response. The submit may store
+        the request id after that response, so the result decides.
+        """
+        return {
+            request_id: client_id
+            for client_id, request_id in dict(
+                self._client_id_to_request_id).items()
+            if client_id in self._results
+        }
 
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()
@@ -1621,7 +1638,9 @@ class AwaitResponseHelper:
         for response in responses:
             assert response is not None
             is_error = isinstance(response, ErrorResponse)
-            if not is_error and _drop_refused_response(self.worker, response):
+            if not is_error and (_drop_refused_response(self.worker, response)
+                                 or _drop_rank_failure_after_final(
+                                     self.worker, response)):
                 continue
             queue = self.worker.return_queue(response.client_id)
 
@@ -1664,6 +1683,8 @@ class AwaitResponseHelper:
             if isinstance(response, ErrorResponse):
                 pass  # send ErrorResponse directly
             elif _drop_refused_response(self.worker, response):
+                continue
+            elif _drop_rank_failure_after_final(self.worker, response):
                 continue
             elif self.worker._has_background_error():
                 release_undelivered_response(response)
@@ -1894,6 +1915,19 @@ def _drop_refused_response(worker, response: LlmResponse) -> bool:
         worker._refused_client_ids.discard(response.client_id)
     release_undelivered_response(response)
     return True
+
+
+def _drop_rank_failure_after_final(worker, response: LlmResponse) -> bool:
+    """Whether ``response`` is a rank failure error of a request already answered.
+
+    After a rank failure, rank 0 fails the requests that no active rank holds,
+    including a request whose final response has not reached this worker yet.
+    That final response comes first and ends the request, so the error is
+    dropped.
+    """
+    return (response.has_error()
+            and isinstance(response.error_msg, RankFailureError)
+            and response.client_id not in worker._results)
 
 
 def _maybe_wrap_response(

@@ -502,6 +502,8 @@ class CpuContractTests(unittest.TestCase):
             profile.get_opt_shapes()[0][0]
         )
         self.tuner._primed_cached_tactics = set()
+        self.tuner.prime_all_runners = False
+        self.tuner._report_progress = lambda: None
         self.tuner.is_tuning_mode = True
         r.tuning_config.inputs_pre_hook = None
         with patch.dict(os.environ, {"TLLM_AUTOTUNER_PRIME_CACHED_TACTICS": "1"}):

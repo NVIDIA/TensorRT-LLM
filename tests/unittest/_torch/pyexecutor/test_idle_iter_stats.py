@@ -738,7 +738,7 @@ def _fetch_stub(**overrides):
             last_finalize_settled=False, last_idle_rank_states=None, next_payload=lambda: None
         ),
         _idle_heartbeat_tick=Mock(return_value=1.0),
-        _flush_staged_responses=lambda: None,
+        flush_staged_responses=lambda: None,
         _waiting_queue_needs_clock=False,
         request_accumulated=[],
         hang_detector=SimpleNamespace(pause=nullcontext),

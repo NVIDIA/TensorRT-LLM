@@ -113,6 +113,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     engine.kv_cache_transceiver = Mock()
     engine._disagg_coordinator = Mock(
         spec=[
+            "logical_context_cancellation_enabled",
             "supports_logical_context_cancellation",
             "request_logical_context_cancellation",
             "has_retiring_gen_receives",
@@ -123,6 +124,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
             "requires_gen_cancellation_consensus",
         ]
     )
+    engine.disagg.logical_context_cancellation_enabled = True
     engine.disagg.supports_logical_context_cancellation.return_value = True
     engine.disagg.request_logical_context_cancellation.return_value = True
     engine.disagg.has_retiring_gen_receives = False
@@ -294,8 +296,8 @@ def test_staged_context_cancellation_survives_retirement(executor: PyExecutor) -
     assert not executor._response_channel.result_wait_queues
     executor._free_request_resources.assert_called_once_with(request)
 
-    executor._flush_staged_responses()
-    executor._flush_staged_responses()
+    executor.flush_staged_responses()
+    executor.flush_staged_responses()
     assert executor._response_channel.responses == {request.py_request_id: [response]}
     result_queue.put_response.remote.assert_called_once_with(response.client_id, response)
     assert not executor._staged_responses
@@ -613,7 +615,7 @@ def test_draining_control_waits_for_retained_transfer(
     executor.control_action_done = Mock()
     executor.hang_detector = SimpleNamespace(pause=nullcontext)
     executor.dwdp_manager = None
-    executor._retire_inflight_batch_for_control = Mock()
+    executor.retire_inflight_batch = Mock()
     executor._pop_sleep_wakeup_abort = Mock(return_value=None)
     synchronize = Mock()
     monkeypatch.setattr("torch.cuda.synchronize", synchronize)
@@ -639,7 +641,7 @@ def test_draining_control_waits_for_retained_transfer(
     assert not executor.control_requests
     executor.control_request_barrier.set.assert_called_once()
     executor.control_action_done.wait.assert_called_once()
-    executor._retire_inflight_batch_for_control.assert_called_once()
+    executor.retire_inflight_batch.assert_called_once()
     synchronize.assert_called_once()
 
 
@@ -738,7 +740,7 @@ def test_control_drain_delivers_accumulated_and_live_aborts_on_every_rank(
     for engine in engines:
         engine.control_request_barrier = Mock()
         engine.control_action_done = Mock()
-        engine._retire_inflight_batch_for_control = Mock()
+        engine.retire_inflight_batch = Mock()
         engine._pop_sleep_wakeup_abort = Mock(return_value=None)
         engine.dwdp_manager = None
     # Exercise the group control gate with asymmetric local readiness. This is
@@ -783,7 +785,7 @@ def test_adp_drain_delivers_parking_abort_to_the_owning_rank(
         engine.control_requests = [RequestQueueItem(CONTROL_REQUEST_ID, control_id="drain")]
         engine.control_request_barrier = Mock()
         engine.control_action_done = Mock()
-        engine._retire_inflight_batch_for_control = Mock()
+        engine.retire_inflight_batch = Mock()
         engine._pop_sleep_wakeup_abort = Mock(return_value=None)
         engine.dwdp_manager = None
     monkeypatch.setattr("torch.cuda.synchronize", Mock())
