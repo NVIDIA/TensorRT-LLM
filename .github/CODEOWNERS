@@ -139,6 +139,7 @@
 /tensorrt_llm/serve @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/tokenizer @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/usage @NVIDIA/trt-llm-runtime-devs
+/tests/test_common/serve @NVIDIA/trt-llm-runtime-devs
 /tests/torch @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/compilation @NVIDIA/trt-llm-runtime-devs
 # Matches nothing today -- PR #17968 moved these tests out -- but kept so a recreated custom_ops/ lands here instead of on the global fallback.
@@ -159,6 +160,7 @@
 /tests/unittest/llmapi @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/llmapi/apps/*multimodal* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
 /tests/unittest/pyexecutor @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/serve @NVIDIA/trt-llm-runtime-devs
 
 # ===== KERNELS - MISC =====
 /cpp/include/tensorrt_llm/deep_gemm @NVIDIA/trt-llm-kernels-devs
@@ -393,6 +395,7 @@
 /tests/integration/defs/**/visual_gen/ @NVIDIA/trt-llm-visualgen-devs
 /tests/scripts/perf-sanity/visual_gen @NVIDIA/trt-llm-visualgen-devs
 /tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/tests/unittest/serve/api/visual_gen @NVIDIA/trt-llm-visualgen-devs
 /tests/*/visual_gen/ @NVIDIA/trt-llm-visualgen-devs
 /jenkins/scripts/cbts/cbts/rules/visual_gen.py @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-visualgen-devs
 

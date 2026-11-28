@@ -27,9 +27,12 @@ from unittest import mock
 import pytest
 from fastapi import FastAPI
 from starlette.routing import Match
+from test_common.serve.routes import effective_routes
 
 from tensorrt_llm._torch.memory.monitor import configure
 from tensorrt_llm.llmapi.llm_args import MemoryMonitorConfig
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.multi_frontend import FORWARDED_ROUTES
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -85,6 +88,9 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     server._enable_runtime_control_endpoints = True
     server._runtime_control_api_key = "route-gate-key"
     server.resource_governor = None
+    # Attach the system router before the role's own routes, as in OpenAIServer.__init__.
+    server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
+    attach_routers(server.app, ServerCapabilities.for_role(None))
     # The configuration decides, whatever TLLM_MEM_MONITOR the caller has.
     with mock.patch.dict(os.environ):
         os.environ.pop("TLLM_MEM_MONITOR", None)
@@ -92,9 +98,10 @@ def _llm_server_routes() -> list[tuple[str, str]]:
             server.register_routes()
         finally:
             configure(None)
+    # Included routers don't expose .path or .methods directly in FastAPI 0.139.
     return sorted(
-        (method, route.path)
-        for route in server.app.routes
+        (method, path)
+        for path, route in effective_routes(server.app)
         if getattr(route, "methods", None)
         for method in route.methods
         if method != "HEAD"
