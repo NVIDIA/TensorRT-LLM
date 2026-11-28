@@ -1197,34 +1197,38 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::KVCacheEvent* self, int64_t eventId, nb::handle data, int windowSize,
                 std::optional<std::string> hashAlgo, std::optional<int> attentionDpRank,
-                kv::EventLayerGroupId layerGroupId)
+                kv::EventLayerGroupId layerGroupId, std::optional<std::string> region)
             {
-                new (self) kv::KVCacheEvent{
-                    eventId, castEventData(data), windowSize, std::move(hashAlgo), attentionDpRank, layerGroupId};
+                new (self) kv::KVCacheEvent{eventId, castEventData(data), windowSize, std::move(hashAlgo),
+                    attentionDpRank, layerGroupId, std::move(region)};
             },
             nb::arg("event_id"), nb::arg("data"), nb::arg("window_size"), nb::arg("hash_algo") = std::nullopt,
-            nb::arg("attention_dp_rank") = std::nullopt, nb::arg("layer_group_id") = std::nullopt)
+            nb::arg("attention_dp_rank") = std::nullopt, nb::arg("layer_group_id") = std::nullopt,
+            nb::arg("region") = std::nullopt)
         .def_ro("event_id", &kv::KVCacheEvent::eventId)
         .def_prop_ro("data", [](kv::KVCacheEvent const& self) { return castEventData(self.data); })
         .def_ro("window_size", &kv::KVCacheEvent::windowSize)
         .def_ro("hash_algo", &kv::KVCacheEvent::hashAlgo)
         .def_ro("attention_dp_rank", &kv::KVCacheEvent::attentionDpRank)
         .def_ro("layer_group_id", &kv::KVCacheEvent::layerGroupId)
+        .def_ro("region", &kv::KVCacheEvent::region,
+            "Name of the region whose life cycle the layer group is; None for a layer config's group.")
         .def("__eq__", &kv::KVCacheEvent::operator==, nb::arg("other"))
         .def("__repr__",
             [](kv::KVCacheEvent const& self)
             {
-                return "KVCacheEvent(event_id=" + pythonRepr(self.eventId) + ", data="
-                    + pythonHandleRepr(castEventData(self.data)) + ", window_size=" + pythonRepr(self.windowSize)
-                    + ", hash_algo=" + pythonRepr(self.hashAlgo) + ", attention_dp_rank="
-                    + pythonRepr(self.attentionDpRank) + ", layer_group_id=" + pythonRepr(self.layerGroupId) + ")";
+                return "KVCacheEvent(event_id=" + pythonRepr(self.eventId)
+                    + ", data=" + pythonHandleRepr(castEventData(self.data))
+                    + ", window_size=" + pythonRepr(self.windowSize) + ", hash_algo=" + pythonRepr(self.hashAlgo)
+                    + ", attention_dp_rank=" + pythonRepr(self.attentionDpRank)
+                    + ", layer_group_id=" + pythonRepr(self.layerGroupId) + ", region=" + pythonRepr(self.region) + ")";
             })
         .def("__reduce__",
             [](kv::KVCacheEvent const& self)
             {
                 return nb::make_tuple(nb::type<kv::KVCacheEvent>(),
                     nb::make_tuple(self.eventId, castEventData(self.data), self.windowSize, self.hashAlgo,
-                        self.attentionDpRank, self.layerGroupId));
+                        self.attentionDpRank, self.layerGroupId, self.region));
             });
 
     nb::class_<kv::EventSink>(m, "KVCacheEventSink");
@@ -1284,6 +1288,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_group_ids") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("set_layer_group_window_sizes", &kv::EventManager::setLayerGroupWindowSizes, nb::arg("window_sizes"),
             nb::call_guard<nb::gil_scoped_release>())
+        .def("set_layer_group_regions", &kv::EventManager::setLayerGroupRegions, nb::arg("regions"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Region name of each layer group that is a region's life cycle; events of the other groups carry no "
+            "region.")
         .def(
             "add_stored_event",
             [](kv::EventManager& self, nb::object parentHash, nb::object blocks, kv::EventLayerGroupId layerGroupId)
@@ -1555,8 +1563,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("SINK_REQUIRED_ONLY", kv::ReusePolicy::SINK_REQUIRED_ONLY);
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int, kv::ReusePolicy>(), nb::arg("window_size").none(),
-            nb::arg("num_sink_blocks"), nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
+        .def(nb::init<std::optional<int>, int, kv::ReusePolicy, std::optional<int>>(), nb::arg("window_size").none(),
+            nb::arg("num_sink_blocks"), nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED,
+            nb::arg("region_index").none() = std::nullopt)
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
@@ -1564,6 +1573,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
         .def_ro("reuse_policy", &kv::AttnLifeCycle::reusePolicy)
+        .def_prop_ro(
+            "region_index", [](kv::AttnLifeCycle const& self) { return self.regionIndex; },
+            "Index into KVCacheManagerConfig.regions of the token-block region this life cycle belongs to; None for "
+            "attention layer buffers.")
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1888,13 +1901,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("buffer", &kv::RegionBuffer::buffer) DEF_COPY(kv::RegionBuffer);
 
     nb::class_<kv::RegionConfig>(m, "RegionConfig",
-        "Buffers that share a life cycle of the region's own, never merged with another life cycle. Only "
-        "REQUEST regions with the PRIVATE reuse policy are supported, on layers that have an SsmLayerConfig.")
+        "A REQUEST region places per-request state on SSM layers. Layer buffers and regions together have at "
+        "most one REQUIRED SSM lifecycle. A TOKEN_BLOCK region places REQUIRED attention pages on attention "
+        "layers and may set a sliding window.")
         .def(
             "__init__",
             [](kv::RegionConfig* cfg, std::string name, std::vector<kv::RegionBuffer> buffers,
                 kv::RegionAllocationUnit allocationUnit, kv::ReusePolicy reusePolicy,
-                std::optional<std::int64_t> fixedSlotCount)
+                std::optional<std::int64_t> fixedSlotCount, std::optional<int> windowSize)
             {
                 new (cfg) kv::RegionConfig();
                 cfg->name = std::move(name);
@@ -1902,13 +1916,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->allocationUnit = allocationUnit;
                 cfg->reusePolicy = reusePolicy;
                 cfg->fixedSlotCount = fixedSlotCount;
+                cfg->windowSize = windowSize;
             },
             nb::arg("name"), nb::arg("buffers"), nb::arg("allocation_unit") = kv::RegionAllocationUnit::kRequest,
-            nb::arg("reuse_policy") = kv::ReusePolicy::PRIVATE, nb::arg("fixed_slot_count").none() = std::nullopt)
+            nb::arg("reuse_policy") = kv::ReusePolicy::PRIVATE, nb::arg("fixed_slot_count").none() = std::nullopt,
+            nb::arg("window_size").none() = std::nullopt)
         .def_rw("name", &kv::RegionConfig::name)
         .def_rw("buffers", &kv::RegionConfig::buffers)
         .def_rw("allocation_unit", &kv::RegionConfig::allocationUnit)
         .def_rw("reuse_policy", &kv::RegionConfig::reusePolicy)
+        .def_rw("window_size", &kv::RegionConfig::windowSize, nb::for_setter(nb::arg("value").none()),
+            "Sliding window of a TOKEN_BLOCK region, in tokens; None keeps every block. None on a REQUEST region.")
         .def_rw("fixed_slot_count", &kv::RegionConfig::fixedSlotCount, nb::for_setter(nb::arg("value").none()),
             "GPU slot count of the region's pool group. When set, the region gets a pool group of its own with "
             "exactly this many hot-tier slots, which ratio-based sizing (construction, resize(), adjust() and the "
@@ -3964,6 +3982,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_region_group_id",
             [](kv::KvCacheManager const& self, std::string const& name) { return self.getRegionGroupId(name).value(); },
             nb::arg("name"), "CacheGroupId of the region named `name`; raises IndexError for an unknown name.")
+        .def(
+            "get_group_life_cycle",
+            [](kv::KvCacheManager const& self, int groupId)
+            { return castLifeCycle(self.lifeCycles().getLifeCycle(kv::LifeCycleId{groupId})); },
+            nb::arg("group_id"),
+            "Life cycle of the group: an AttnLifeCycle (window, sink blocks, reuse policy, region index) or an "
+            "SsmLifeCycle (reuse policy, region index). Raises IndexError for an unknown group.")
         .def(
             "get_sparse_cache_max_units",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)

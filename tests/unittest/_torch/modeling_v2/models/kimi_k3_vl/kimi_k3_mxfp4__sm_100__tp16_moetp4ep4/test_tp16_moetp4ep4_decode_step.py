@@ -49,8 +49,8 @@ def _kda_verify_module(monkeypatch, seen):
     module.k3_buffers = object()
     core = torch.arange(8 * 2 * 128, dtype=torch.float32).to(torch.bfloat16).reshape(8, 2, 128)
 
-    def k3_verify(x, num_steps, layer_cache, ssm_pool, slots):
-        seen.append("_k3_verify")
+    def k3_verify(x, num_steps, layer_cache, ssm_pool, slots, replay_slots):
+        seen.append(("_k3_verify", slots.item(), replay_slots.item()))
         return core.reshape(8, -1)
 
     def path(name):
@@ -79,25 +79,26 @@ def _verify_cache(kind):
 
 @pytest.mark.parametrize("use_output_buffer", [False, True])
 @pytest.mark.parametrize(
-    "kind,path",
+    "kind,replay_slot,expected_call",
     [
-        ("records", "_k3_verify"),  # the per-draft records: k3_kda_attn / k3_kda_verify
-        ("replay", "_verify_replay"),  # the replay caches alone: kda_mtp_decode
-        ("sequential", "_verify_sequential"),  # the sequential-verify buffers: FLA token by token
+        ("records", None, ("_k3_verify", 0, 0)),
+        ("records", 3, ("_k3_verify", 0, 3)),
+        ("replay", None, "_verify_replay"),  # the replay caches alone: kda_mtp_decode
+        ("sequential", None, "_verify_sequential"),  # FLA token by token
     ],
 )
 def test_kda_verify_takes_the_path_of_the_managers_state(
-    monkeypatch, kind, path, use_output_buffer
+    monkeypatch, kind, replay_slot, expected_call, use_output_buffer
 ):
     """The KDA verify path follows the manager's speculative state, and every path returns the dense core
     [N T, H, 128], in the breakable CUDA graph's buffer when one is given."""
     seen = []
     module, core = _kda_verify_module(monkeypatch, seen)
     output = torch.empty_like(core) if use_output_buffer else None
-    result = module._verify(
-        torch.empty(8, 16), 8, _verify_cache(kind), torch.tensor([0], dtype=torch.int32), output
-    )
-    assert seen == [path]
+    slots = torch.tensor([0], dtype=torch.int32)
+    replay_slots = None if replay_slot is None else torch.tensor([replay_slot], dtype=torch.int32)
+    result = module._verify(torch.empty(8, 16), 8, _verify_cache(kind), slots, output, replay_slots)
+    assert seen == [expected_call]
     torch.testing.assert_close(result, core, rtol=0, atol=0)
     if output is not None:
         assert result is output

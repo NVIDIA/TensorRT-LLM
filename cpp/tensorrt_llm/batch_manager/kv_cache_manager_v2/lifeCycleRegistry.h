@@ -34,14 +34,18 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // ---------------------------------------------------------------------------
-// AttnLifeCycle — lifecycle for attention layers (SWA + sink blocks).
-// Mirrors _life_cycle_registry.py::AttnLifeCycle.
+// AttnLifeCycle — lifecycle for attention layer buffers (SWA + sink blocks) and token-block
+// regions. Attention layer buffers with equal window, sinks and effective reuse policy share
+// a lifecycle. A token-block region's lifecycle carries the region's index, so it is never
+// shared.
 // ---------------------------------------------------------------------------
 struct AttnLifeCycle
 {
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
     ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
+    //! Index into KVCacheManagerConfig::regions; nullopt for a lifecycle of attention layer buffers.
+    std::optional<int> regionIndex;
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
@@ -58,7 +62,8 @@ struct AttnLifeCycle
 
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
-        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && reusePolicy == o.reusePolicy;
+        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && reusePolicy == o.reusePolicy
+            && regionIndex == o.regionIndex;
     }
 
     bool operator<(AttnLifeCycle const& o) const noexcept
@@ -71,7 +76,11 @@ struct AttnLifeCycle
         {
             return numSinkBlocks < o.numSinkBlocks;
         }
-        return reusePolicy < o.reusePolicy;
+        if (reusePolicy != o.reusePolicy)
+        {
+            return reusePolicy < o.reusePolicy;
+        }
+        return regionIndex < o.regionIndex;
     }
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock,
@@ -200,7 +209,8 @@ using LayerGroupId = LifeCycleId;
 //
 // Ids follow registration order: the layers' buffers first, in layer and buffer order,
 // then one lifecycle per region in declaration order. Declaring a region therefore
-// never renumbers the lifecycles of the layers.
+// never renumbers the lifecycles of the layers. A config may declare no layer buffers at
+// all, in which case every lifecycle is a region's.
 // ---------------------------------------------------------------------------
 class LifeCycleRegistry
 {

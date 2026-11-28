@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <algorithm>
 #include <stdexcept>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -48,10 +49,12 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, in
 
 LifeCycle makeLifeCycle(RegionConfig const& region, int regionIndex)
 {
-    // RegionConfig::validate() admits request regions only; a token-block region would map
-    // to an AttnLifeCycle with the region's own window.
-    TLLM_CHECK_WITH_INFO(region.allocationUnit == RegionAllocationUnit::kRequest,
-        "Region '%s': only request regions are supported", region.name.c_str());
+    // A token-block region holds token blocks the way an attention layer's buffers do, with
+    // the region's own window and no sink blocks.
+    if (region.allocationUnit == RegionAllocationUnit::kTokenBlock)
+    {
+        return AttnLifeCycle{region.windowSize, 0, region.reusePolicy, regionIndex};
+    }
     return SsmLifeCycle{region.reusePolicy, regionIndex};
 }
 
@@ -94,6 +97,14 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
         TLLM_CHECK_WITH_INFO(mRegionLifeCycleIdByName.emplace(region.name, id).second,
             "Region name '%s' is declared twice", region.name.c_str());
     }
+    // Matching prunes to an endpoint where the first REQUIRED SSM life cycle has a checkpoint, and
+    // restoration expects every REQUIRED SSM life cycle to have one there. A second one's checkpoint
+    // can be missing at that endpoint, so layer buffers and regions together may have one at most.
+    auto const numRequiredSsm = std::count_if(mSsmLifeCycleIds.begin(), mSsmLifeCycleIds.end(),
+        [this](LifeCycleId id) { return requiresPrefixCoverage(mLifeCycleList[id]); });
+    TLLM_CHECK_WITH_INFO(numRequiredSsm <= 1,
+        "At most one REQUIRED SSM life cycle is supported, from SSM layer buffers or a region; got %ld",
+        static_cast<long>(numRequiredSsm));
     check();
 }
 

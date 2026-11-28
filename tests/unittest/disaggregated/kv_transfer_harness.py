@@ -324,8 +324,13 @@ def run_kv_transfer_test(
     manager_factory: ManagerFactory[_CacheManagerT],
     init_fn: CacheInitializer[_CacheManagerT],
     verify_fn: CacheVerifier[_CacheManagerT],
+    prepare_resources: bool = False,
 ) -> None:
-    """Run one ctx->gen KV transfer with injectable model-specific cache hooks."""
+    """Run one ctx->gen KV transfer with injectable model-specific cache hooks.
+
+    ``prepare_resources`` also runs each manager's ``prepare_resources`` on its
+    allocation batch, which a hybrid manager needs to bind recurrent-state slots.
+    """
     ctx_world = ctx_tp * ctx_pp
     gen_world = gen_tp * gen_pp
 
@@ -415,7 +420,9 @@ def run_kv_transfer_test(
                     gen_handle_map[rank].append((req_idx, gen_request))
 
         # ===== 5. Allocate KV cache for all ranks =====
-        # prepare_resources is a no-op for non-draft KVCacheManagerV2.
+        # prepare_resources is a no-op for non-draft KVCacheManagerV2; a hybrid
+        # manager binds each request's recurrent-state slot there, so the
+        # caller asks for it with prepare_resources=True.
         # All ranks must allocate BEFORE mutating shared request objects
         # (add_new_token changes is_first_context_chunk).
         #
@@ -434,6 +441,8 @@ def run_kv_transfer_test(
                 batch.context_requests_last_chunk = reqs
                 for req in reqs:
                     gen_managers[rank].prepare_disagg_gen_init(req)
+                if prepare_resources:
+                    gen_managers[rank].prepare_resources(batch)
                 gen_batches[rank] = batch
 
         ctx_batches: Dict[int, ScheduledRequests] = {}
@@ -445,6 +454,8 @@ def run_kv_transfer_test(
                 for req in reqs:
                     ctx_managers[rank].prepare_context(req)
                     ctx_managers[rank].resize_context(req, req.context_chunk_size)
+                if prepare_resources:
+                    ctx_managers[rank].prepare_resources(batch)
                 ctx_batches[rank] = batch
 
         # ===== 5.5. context_current_position + add_new_token =====

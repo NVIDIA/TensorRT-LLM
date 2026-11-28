@@ -166,7 +166,15 @@ def layer_configs(manager: KVCacheManagerV2) -> dict[int, object]:
 
 def layer_group_layer_ids(manager: KVCacheManagerV2) -> list[list[int]]:
     """Internal layer ids per runtime layer group, in layer-group order."""
-    return [[int(layer_id) for layer_id in group] for group in manager.impl.layer_grouping]
+    from ..page_table import layer_groups
+
+    return layer_groups(manager)
+
+
+def attention_group_window(manager: KVCacheManagerV2, group: int) -> tuple[int | None, int]:
+    """Window in tokens and sink blocks of an attention group."""
+    life_cycle = manager.impl.get_group_life_cycle(group)
+    return life_cycle.window_size, life_cycle.num_sink_blocks
 
 
 def pool_group_descriptors(manager: KVCacheManagerV2) -> Sequence[PoolGroupDesc]:
@@ -174,19 +182,26 @@ def pool_group_descriptors(manager: KVCacheManagerV2) -> Sequence[PoolGroupDesc]
     return manager.impl.pool_group_descs
 
 
-def declared_global_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | None:
+def declared_global_layer_ids(
+    manager: KVCacheManagerV2, group: tuple[int, Sequence[int]] | None = None
+) -> dict[int, int] | None:
     """Internal-to-global layer ids, or ``None`` without the manager's declaration."""
     getter = getattr(manager, "get_disagg_global_layer_ids", None)
     if getter is None:
         return None
     table: dict[int, int] = {}
-    for layer_group, layer_ids in enumerate(manager.impl.layer_grouping):
+    groups = (group,) if group is not None else enumerate(layer_group_layer_ids(manager))
+    for layer_group, layer_ids in groups:
         ids = [int(value) for value in getter(layer_group)]
         if len(ids) != len(layer_ids):
             raise ValueError(
                 f"layer group {layer_group}: {len(ids)} declared global ids for {len(layer_ids)} layers"
             )
-        table.update(zip((int(layer_id) for layer_id in layer_ids), ids))
+        for lid, transfer_id in zip(layer_ids, ids):
+            if table.setdefault(int(lid), transfer_id) != transfer_id:
+                raise ValueError(
+                    f"layer {lid} has different transfer ids across groups; select its group"
+                )
     return table
 
 

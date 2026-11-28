@@ -175,6 +175,10 @@ public:
     static TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(KvCacheManager& manager, BatchDesc const& batch,
         int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse);
 
+    // White-box hook: the hot level's minimum slot count of each pool group, from the life-cycle floors,
+    // the constraints and the fixed slot counts.
+    static TypedVec<PoolGroupIndex, SlotCount> hotMinSlots(KvCacheManager& manager);
+
     // White-box test hooks: mutate auto-tuner state so accuracy tests can force a
     // pool rebalance. Reach KvCacheManager's private members via friendship.
     static void setNumSampledKvCaches(KvCacheManager& manager, int value);

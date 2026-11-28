@@ -16,6 +16,9 @@ is a `PageTableSpec` (`pyexecutor/kv_cache/page_table.py`):
 - `request_rebuilt_roles`: roles the receiver rebuilds for some requests.
 - `layer_ids`: the global layer id and model layer of each layer where they differ from the
   default naming (`page_table.layer_ids_of`).
+- `buffer_layer_ids`: transfer and model layer ids for a particular (internal layer, role).
+  On Kimi K3 an FP4 layer's HP ring uses transfer id `2L + 1` and its latent uses `2L`.
+  Pass the role to `layer_ids_of` to resolve the buffer's name.
 - `quant_mode` (one of `QUANT_MODES`): how the KV data is quantized, as configured.
 - `mixed_precision`: reserved for the low and high element types of mixed-precision KV. No
   manager fills it today, and neither the page table nor a peer's check reads it.

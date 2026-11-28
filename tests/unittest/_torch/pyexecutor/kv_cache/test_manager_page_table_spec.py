@@ -470,6 +470,21 @@ def test_fp4_mla_lays_latents_token_major_and_its_tail_as_a_ring():
     assert dict(spec.layer_ids) == {0: (0, 0), 1: (2, 1), 2: (1, 0), 3: (3, 1)}
 
 
+def test_fp4_mla_spec_names_a_tail_on_the_same_layer_as_its_latent():
+    manager = _fp4_mla_manager()
+    manager.fp4_mla_layout._hp_manager_layer_ids = [LayerId(0), LayerId(1)]
+    manager.impl.buffer_grouping[1] = [
+        SimpleNamespace(layer_id=LayerId(layer), role=Role.MLA_HP_TAIL) for layer in (0, 1)
+    ]
+    spec = _spec_for(manager, (Role.KEY, Role.MLA_HP_TAIL))
+    for group, role in enumerate((Role.KEY, Role.MLA_HP_TAIL)):
+        names = layer_ids_of(manager, spec, role=str(role))
+        assert [names[layer] for layer in (0, 1)] == [
+            (gid, layer) for layer, gid in enumerate(manager.get_disagg_global_layer_ids(group))
+        ]
+    assert layer_ids_of(manager, spec, role=str(Role.MLA_HP_TAIL)) == {0: (1, 0), 1: (3, 1)}
+
+
 def test_fp4_mla_refuses_a_layer_it_does_not_name():
     manager = _fp4_mla_manager()
     manager.impl.buffer_grouping.append([SimpleNamespace(layer_id=LayerId(7), role=Role.KEY)])

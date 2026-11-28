@@ -18,6 +18,7 @@ Kimi K3's manager is the hybrid manager that appends a drafter's layers; the
 shared hybrid base describes only the model's own.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -53,6 +54,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GpuCacheTierConfig,
     KVCacheManagerConfig,
     LayerId,
+    RegionAllocationUnit,
+    RegionBuffer,
+    RegionConfig,
+    ReusePolicy,
     SsmLayerConfig,
 )
 
@@ -468,7 +473,8 @@ _K3_TARGET_POOL_RATIO = [0.14, 0.635, 0.205, 0.02]
 
 def _k3_draft_pool_ratio_config(pool_ratio):
     manager = object.__new__(KimiK3HybridCacheManager)
-    manager._appended_draft_layer_specs = {3: None}
+    manager._draft_layer_specs = (_draft_spec(7),)
+    manager.layer_offsets = {7: 3}
     manager.max_seq_len = _K3_MAX_SEQ_LEN
     config = KVCacheManagerConfig(
         tokens_per_block=128,
@@ -521,6 +527,48 @@ def test_k3_target_pool_ratio_gets_the_draft_share_inserted():
 def test_k3_pool_ratio_with_one_share_per_layer_group_is_used_as_given():
     manager, config = _k3_draft_pool_ratio_config([0.1, 0.5, 0.2, 0.18, 0.02])
     assert manager._with_draft_pool_ratio(config) is config
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        pytest.param(_K3_TARGET_POOL_RATIO, id="fp4-limits-draft"),
+        pytest.param([0.14, 0.80, 0.04, 0.02], id="fp8-limits-draft"),
+        pytest.param([0.1, 0.5, 0.2, 0.18, 0.02], id="explicit-draft"),
+    ],
+)
+def test_k3_mla_regions_preserve_each_configured_pool_weight(configured):
+    manager, config = _k3_draft_pool_ratio_config(configured)
+    legacy = manager._with_draft_pool_ratio(config).initial_pool_ratio
+    ssm, fp4, fp8, draft, hp = config.layers
+
+    def region(name, layer_id, buffer, window=None):
+        return RegionConfig(
+            name=name,
+            allocation_unit=RegionAllocationUnit.TOKEN_BLOCK,
+            reuse_policy=ReusePolicy.REQUIRED,
+            buffers=[RegionBuffer(layer_id, buffer)],
+            window_size=window,
+        )
+
+    config = replace(
+        config,
+        layers=[
+            ssm,
+            AttentionLayerConfig(layer_id=fp4.layer_id, buffers=[]),
+            AttentionLayerConfig(layer_id=fp8.layer_id, buffers=[]),
+            draft,
+        ],
+        regions=[
+            region("fp4_mla_latent", fp4.layer_id, fp4.buffers[0]),
+            region("fp8_mla_latent", fp8.layer_id, fp8.buffers[0]),
+            region("mla_hp_ring", fp4.layer_id, hp.buffers[0], hp.sliding_window_size),
+        ],
+    )
+    # Native id order puts the layer-backed drafter before the three regions.
+    assert manager._with_draft_pool_ratio(config).initial_pool_ratio == pytest.approx(
+        [legacy[0], legacy[3], legacy[1], legacy[2], legacy[4]]
+    )
 
 
 def test_k3_pool_ratio_of_another_length_is_rejected():

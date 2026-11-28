@@ -405,6 +405,13 @@ class Manager:
             )
         self.impl = SimpleNamespace(
             layer_grouping=[list(lids) for _, lids, _ in groups],
+            buffer_grouping=[
+                [SimpleNamespace(layer_id=lid, role=role) for lid in lids for role, _, _ in roles]
+                for _, lids, roles in groups
+            ],
+            get_group_life_cycle=lambda lg: SimpleNamespace(
+                window_size=windows[lg], num_sink_blocks=-(-int(sinks[lg] or 0) // TPB)
+            ),
             pool_group_descs=list(descs.values()),
             get_life_cycle_pool_group_indices=lambda: list(pool_group_of),
             init_config=SimpleNamespace(layers=layers),
@@ -680,6 +687,27 @@ def test_virtual_layers_are_numbered_by_model_layer_and_attention_type():
     }
     assert global_layer_ids(manager, [0, 1, 2]) == [12, 13, 15]
     assert derive_layout(manager).layers == ((12, 13, 15),)
+
+
+@pytest.mark.cpu_only
+def test_split_mla_layer_keeps_its_transfer_ids_and_windows():
+    manager = Manager(
+        [kv_group(lids=(0,)), (AttentionLayerConfig, [0], [("mla_hp_tail", 64, None)])],
+        pp_layers=[2],
+        windows=[None, 19],
+        mappers={"mla_hp_tail": MapperKind.REPLICATED},
+    )
+    manager.get_disagg_global_layer_ids = lambda group: [4 + group]
+    layout = derive_layout(manager).layout
+    assert [(group.layers, group.window) for group in layout.layer_groups] == [
+        ((4,), None),
+        ((5,), 19),
+    ]
+    assert {(buffer.layer, buffer.role) for buffer in layout.buffers} == {
+        (4, "key"),
+        (4, "value"),
+        (5, "mla_hp_tail"),
+    }
 
 
 @pytest.mark.cpu_only

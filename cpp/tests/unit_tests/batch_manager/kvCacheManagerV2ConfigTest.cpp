@@ -18,6 +18,7 @@
 #include "kvCacheManagerV2TestUtils.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "tensorrt_llm/common/tllmException.h"
 
 #include <gtest/gtest.h>
 
@@ -516,6 +517,150 @@ TEST(KvCacheManagerV2ConfigTest, FixedRegionGetsAPoolGroupOfItsOwn)
     }
 }
 
+TEST(KvCacheManagerV2ConfigTest, TokenBlockRegionLaysOutLikeItsLayerLifecycle)
+{
+    // The same buffers, declared on attention layers and as a token-block region on empty attention layers,
+    // get the same slot layout; only the region index tells the two life cycles apart.
+    for (auto const windowSize : {std::optional<int>{}, std::optional<int>{6}})
+    {
+        SCOPED_TRACE(windowSize.value_or(0));
+        auto layers = makeTieredConfig();
+        layers.layers.clear();
+        auto region = layers;
+        region.regions.push_back(RegionConfig{.name = "latent",
+            .allocationUnit = RegionAllocationUnit::kTokenBlock,
+            .reusePolicy = ReusePolicy::REQUIRED,
+            .windowSize = windowSize});
+        for (LayerId const layerId : {0, 1})
+        {
+            std::vector<BufferConfig> const buffers{
+                BufferConfig{.role = "key", .size = 4096}, BufferConfig{.role = "scale", .size = 512}};
+            layers.layers.emplace_back(
+                AttentionLayerConfig{.layerId = layerId, .buffers = buffers, .slidingWindowSize = windowSize});
+            region.layers.emplace_back(AttentionLayerConfig{.layerId = layerId});
+            for (auto const& buffer : buffers)
+            {
+                region.regions[0].buffers.push_back(RegionBuffer{.layerId = layerId, .buffer = buffer});
+            }
+        }
+        ASSERT_NO_THROW(layers.validate());
+        ASSERT_NO_THROW(region.validate());
+
+        LifeCycleRegistry const registry(region);
+        ASSERT_EQ(registry.size(), LifeCycleId{1});
+        EXPECT_EQ(registry.regionLifeCycleId(std::string{"latent"}), LifeCycleId{0});
+        EXPECT_EQ(registry[LifeCycleId{0}], (LifeCycle{AttnLifeCycle{windowSize, 0, ReusePolicy::REQUIRED, 0}}));
+        EXPECT_NE(registry[LifeCycleId{0}], LifeCycleRegistry(layers)[LifeCycleId{0}]);
+        EXPECT_FALSE(registry.hasSSM());
+
+        auto const layerStorage = createStorageConfig(layers);
+        auto const regionStorage = createStorageConfig(region);
+        auto const regionAttributes = regionStorage.bufferAttributes();
+        ASSERT_EQ(regionAttributes.size(), layerStorage.bufferAttributes().size());
+        for (auto const& [buffer, attr] : layerStorage.bufferAttributes())
+        {
+            SCOPED_TRACE(std::to_string(buffer.layerId) + "/" + buffer.role);
+            auto const& other = regionAttributes.at(buffer);
+            EXPECT_EQ(other.lifeCycleId, attr.lifeCycleId);
+            EXPECT_EQ(other.poolIndex, attr.poolIndex);
+            EXPECT_EQ(other.offset, attr.offset);
+            EXPECT_EQ(other.size, attr.size);
+            EXPECT_EQ(other.expansion, attr.expansion);
+            EXPECT_EQ(other.scratchPagesPerBlock, attr.scratchPagesPerBlock);
+        }
+        ASSERT_EQ(regionStorage.slotDescList.size(), layerStorage.slotDescList.size());
+        EXPECT_EQ(regionStorage.slotDescList[PoolGroupIndex{0}].slotSizeList(),
+            layerStorage.slotDescList[PoolGroupIndex{0}].slotSizeList());
+        EXPECT_EQ(regionStorage.layerToLifeCycleIds(), layerStorage.layerToLifeCycleIds());
+    }
+}
+
+TEST(KvCacheManagerV2ConfigTest, TokenBlockRegionsWithEqualParametersStaySeparate)
+{
+    // Two windowless REQUIRED token-block regions and a windowless REQUIRED attention layer have equal
+    // parameters; each keeps a life cycle of its own, and the regions follow the layer life cycle.
+    auto config = makeTieredConfig();
+    config.layers.emplace_back(AttentionLayerConfig{.layerId = 1});
+    for (char const* name : {"first", "second"})
+    {
+        config.regions.push_back(RegionConfig{.name = name,
+            .allocationUnit = RegionAllocationUnit::kTokenBlock,
+            .reusePolicy = ReusePolicy::REQUIRED,
+            .buffers = {RegionBuffer{.layerId = 1, .buffer = BufferConfig{.role = name, .size = 2 << 20}}}});
+    }
+    ASSERT_NO_THROW(config.validate());
+
+    LifeCycleRegistry const registry(config);
+    std::vector<LifeCycle> const expected{AttnLifeCycle{}, AttnLifeCycle{std::nullopt, 0, ReusePolicy::REQUIRED, 0},
+        AttnLifeCycle{std::nullopt, 0, ReusePolicy::REQUIRED, 1}};
+    ASSERT_EQ(registry.size(), LifeCycleId{3});
+    for (LifeCycleId id{0}; id < registry.size(); ++id)
+    {
+        SCOPED_TRACE(id.value());
+        EXPECT_EQ(registry[id], expected.at(id.value()));
+    }
+    EXPECT_EQ(registry.regionLifeCycleId(std::string{"first"}), LifeCycleId{1});
+    EXPECT_EQ(registry.regionLifeCycleId(std::string{"second"}), LifeCycleId{2});
+
+    // Equal policy and slot sizes still share a pool group, as layer life cycles of different windows do.
+    auto const storage = createStorageConfig(config);
+    auto const attributes = storage.bufferAttributes();
+    EXPECT_EQ(attributes.at(BufferId{0, "key"}).lifeCycleId, LifeCycleId{0});
+    EXPECT_EQ(attributes.at(BufferId{1, "first"}).lifeCycleId, LifeCycleId{1});
+    EXPECT_EQ(attributes.at(BufferId{1, "second"}).lifeCycleId, LifeCycleId{2});
+    EXPECT_EQ(storage.layerToLifeCycleIds().at(1), (std::vector<LifeCycleId>{LifeCycleId{1}, LifeCycleId{2}}));
+    EXPECT_EQ(storage.slotDescList.size(), PoolGroupIndex{1});
+}
+
+TEST(KvCacheManagerV2ConfigTest, RegionOnlyConfigBuildsItsStorage)
+{
+    // Empty attention layers host the three MLA regions and declare no buffer, so every life cycle comes
+    // from a region. Adding the KDA layer puts its SSM life cycle first and the replay region last.
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::kMlaHpWindow;
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeMlaRegionConfig;
+    for (bool const withKda : {false, true})
+    {
+        SCOPED_TRACE(withKda);
+        auto const config = makeMlaRegionConfig(32 << 20, withKda);
+        ASSERT_NO_THROW(config.validate());
+        LifeCycleRegistry const registry(config);
+        int const first = withKda ? 1 : 0;
+        ASSERT_EQ(registry.size(), LifeCycleId{first + static_cast<int>(config.regions.size())});
+        LifeCycleId const fp4{first};
+        LifeCycleId const fp8{first + 1};
+        LifeCycleId const hp{first + 2};
+        EXPECT_EQ(registry[fp4], (LifeCycle{AttnLifeCycle{std::nullopt, 0, ReusePolicy::REQUIRED, 0}}));
+        EXPECT_EQ(registry[fp8], (LifeCycle{AttnLifeCycle{std::nullopt, 0, ReusePolicy::REQUIRED, 1}}));
+        EXPECT_EQ(registry[hp], (LifeCycle{AttnLifeCycle{kMlaHpWindow, 0, ReusePolicy::REQUIRED, 2}}));
+        EXPECT_EQ(registry.attentionLifeCycles().size(), 3U);
+        if (withKda)
+        {
+            EXPECT_EQ(registry.requiredSsmLifeCycleId(), LifeCycleId{0});
+            EXPECT_EQ(registry.regionLifeCycleId(std::string{"replay"}), LifeCycleId{4});
+        }
+        else
+        {
+            EXPECT_FALSE(registry.hasSSM());
+        }
+
+        auto const storage = createStorageConfig(config);
+        auto const layerLifeCycles = storage.layerToLifeCycleIds();
+        EXPECT_EQ(layerLifeCycles.at(0), (std::vector<LifeCycleId>{fp4, hp}));
+        EXPECT_EQ(layerLifeCycles.at(2), (std::vector<LifeCycleId>{fp4, hp}));
+        EXPECT_EQ(layerLifeCycles.at(3), (std::vector<LifeCycleId>{fp8}));
+        auto const attributes = storage.bufferAttributes();
+        // Each FP4 layer's key and scale coalesce into the latent slot; the HP buffers fill a slot of their own.
+        EXPECT_EQ(attributes.at(BufferId{0, "key"}).lifeCycleId, fp4);
+        EXPECT_EQ(attributes.at(BufferId{2, "key_block_scale"}).lifeCycleId, fp4);
+        EXPECT_EQ(attributes.at(BufferId{2, "mla_hp_tail"}).lifeCycleId, hp);
+        EXPECT_EQ(attributes.at(BufferId{3, "key"}).lifeCycleId, fp8);
+        auto const grouping = storage.lifeCycleGrouping();
+        EXPECT_NE(grouping[fp4], grouping[fp8]);
+        EXPECT_NE(grouping[fp4], grouping[hp]);
+        EXPECT_NE(grouping[fp8], grouping[hp]);
+    }
+}
+
 TEST(KvCacheManagerV2ConfigTest, InvalidRegionsAreRejected)
 {
     auto const base = makeReplayRegionConfig(32 << 20, 4);
@@ -528,12 +673,11 @@ TEST(KvCacheManagerV2ConfigTest, InvalidRegionsAreRejected)
         EXPECT_THROW(config.validate(), std::invalid_argument);
     };
     expectRejected("empty name", [](KVCacheManagerConfig& c) { c.regions[0].name.clear(); });
-    expectRejected("token-block region",
+    expectRejected("token-block PRIVATE region",
         [](KVCacheManagerConfig& c) { c.regions[0].allocationUnit = RegionAllocationUnit::kTokenBlock; });
-    for (auto const policy : {ReusePolicy::REQUIRED, ReusePolicy::OPTIONAL, ReusePolicy::SINK_REQUIRED_ONLY})
-    {
-        expectRejected("non-PRIVATE policy", [policy](KVCacheManagerConfig& c) { c.regions[0].reusePolicy = policy; });
-    }
+    expectRejected("attention-only policy",
+        [](KVCacheManagerConfig& c) { c.regions[0].reusePolicy = ReusePolicy::SINK_REQUIRED_ONLY; });
+    expectRejected("request region with a window", [](KVCacheManagerConfig& c) { c.regions[0].windowSize = 8; });
     expectRejected("no buffers", [](KVCacheManagerConfig& c) { c.regions[0].buffers.clear(); });
     for (std::int64_t const count : {0, -1})
     {
@@ -548,7 +692,7 @@ TEST(KvCacheManagerV2ConfigTest, InvalidRegionsAreRejected)
     expectRejected("buffer declared twice",
         [](KVCacheManagerConfig& c) { c.regions[0].buffers.push_back(c.regions[0].buffers[0]); });
     expectRejected(
-        "buffer on an attention layer", [](KVCacheManagerConfig& c) { c.regions[0].buffers[0].layerId = 0; });
+        "request region on an attention layer", [](KVCacheManagerConfig& c) { c.regions[0].buffers[0].layerId = 0; });
     expectRejected("buffer on a missing layer", [](KVCacheManagerConfig& c) { c.regions[0].buffers[0].layerId = 9; });
     expectRejected(
         "buffer a layer config owns", [](KVCacheManagerConfig& c) { c.regions[0].buffers[0].buffer.role = "state"; });
@@ -566,6 +710,100 @@ TEST(KvCacheManagerV2ConfigTest, InvalidRegionsAreRejected)
             other.buffers = {RegionBuffer{.layerId = 1, .buffer = BufferConfig{.role = "count", .size = 64}}};
             c.regions.push_back(std::move(other));
         });
+}
+
+TEST(KvCacheManagerV2ConfigTest, RequiredRegionIsTheOnlyRequiredSsmLifecycle)
+{
+    // The replay-region layout with the SSM layers' state and conv buffers moved into a REQUIRED region declared
+    // first: the SSM layers keep no buffers of their own.
+    auto config = makeReplayRegionConfig(32 << 20, 4);
+    RegionConfig recurrent{.name = "recurrent", .reusePolicy = ReusePolicy::REQUIRED};
+    for (auto& layer : config.layers)
+    {
+        if (auto* ssm = std::get_if<SsmLayerConfig>(&layer))
+        {
+            for (auto const& buffer : ssm->buffers)
+            {
+                recurrent.buffers.push_back(RegionBuffer{.layerId = ssm->layerId, .buffer = buffer});
+            }
+            ssm->buffers.clear();
+        }
+    }
+    config.regions.insert(config.regions.begin(), std::move(recurrent));
+    ASSERT_NO_THROW(config.validate());
+
+    // Layer lifecycles 0 (full attention) and 1 (PRIVATE windowed attention), then the regions in declaration
+    // order. Prefix matching gates on the REQUIRED region.
+    LifeCycleRegistry const registry(config);
+    LifeCycleId const recurrentLc{2};
+    LifeCycleId const replayLc{3};
+    ASSERT_EQ(registry.size(), LifeCycleId{4});
+    EXPECT_EQ(registry.regionLifeCycleId(std::string{"recurrent"}), recurrentLc);
+    EXPECT_EQ(registry[recurrentLc], (LifeCycle{SsmLifeCycle{ReusePolicy::REQUIRED, 0}}));
+    EXPECT_EQ(registry.ssmLifeCycleIds(), (std::vector<LifeCycleId>{recurrentLc, replayLc}));
+    EXPECT_EQ(registry.requiredSsmLifeCycleId(), recurrentLc);
+    auto const storage = createStorageConfig(config);
+    auto const attributes = storage.bufferAttributes();
+    for (LayerId const layerId : {1, 2})
+    {
+        SCOPED_TRACE(layerId);
+        EXPECT_EQ(storage.layerToLifeCycleIds().at(layerId), (std::vector<LifeCycleId>{recurrentLc, replayLc}));
+        EXPECT_EQ(attributes.at(BufferId{layerId, "state"}).lifeCycleId, recurrentLc);
+        EXPECT_EQ(attributes.at(BufferId{layerId, "conv"}).lifeCycleId, recurrentLc);
+        EXPECT_EQ(attributes.at(BufferId{layerId, "old_x"}).lifeCycleId, replayLc);
+    }
+
+    // Beside it, an SSM layer buffer or a second region may take any policy but REQUIRED.
+    for (auto const policy : {ReusePolicy::PRIVATE, ReusePolicy::OPTIONAL, ReusePolicy::REQUIRED})
+    {
+        SCOPED_TRACE(static_cast<int>(policy));
+        bool const admitted = policy != ReusePolicy::REQUIRED;
+        auto withLayerBuffer = config;
+        std::get<SsmLayerConfig>(withLayerBuffer.layers[1])
+            .buffers.push_back(BufferConfig{.role = "extra", .size = 64, .reusePolicy = policy});
+        ASSERT_NO_THROW(withLayerBuffer.validate());
+        auto withRegion = config;
+        withRegion.regions[1].reusePolicy = policy;
+        ASSERT_NO_THROW(withRegion.validate());
+        for (auto const* candidate : {&withLayerBuffer, &withRegion})
+        {
+            if (admitted)
+            {
+                EXPECT_NO_THROW(LifeCycleRegistry{*candidate});
+            }
+            else
+            {
+                EXPECT_THROW(LifeCycleRegistry{*candidate}, tensorrt_llm::common::TllmException);
+            }
+        }
+    }
+}
+
+TEST(KvCacheManagerV2ConfigTest, InvalidTokenBlockRegionsAreRejected)
+{
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeMlaRegionConfig;
+    auto const base = makeMlaRegionConfig(32 << 20, /*withKda=*/true);
+    ASSERT_NO_THROW(base.validate());
+    auto const expectRejected = [&](std::string const& what, auto&& mutate)
+    {
+        SCOPED_TRACE(what);
+        auto config = base;
+        mutate(config);
+        EXPECT_THROW(config.validate(), std::invalid_argument);
+    };
+    for (auto const policy : {ReusePolicy::PRIVATE, ReusePolicy::OPTIONAL, ReusePolicy::SINK_REQUIRED_ONLY})
+    {
+        expectRejected("non-REQUIRED policy", [policy](KVCacheManagerConfig& c) { c.regions[2].reusePolicy = policy; });
+    }
+    for (int const window : {0, -1})
+    {
+        expectRejected("non-positive window", [window](KVCacheManagerConfig& c) { c.regions[2].windowSize = window; });
+    }
+    expectRejected("fixed slot count", [](KVCacheManagerConfig& c) { c.regions[0].fixedSlotCount = 4; });
+    expectRejected(
+        "token-block region on an SSM layer", [](KVCacheManagerConfig& c) { c.regions[0].buffers[0].layerId = 1; });
+    expectRejected("buffer two regions own",
+        [](KVCacheManagerConfig& c) { c.regions[2].buffers[0].buffer.role = c.regions[0].buffers[0].buffer.role; });
 }
 
 } // namespace

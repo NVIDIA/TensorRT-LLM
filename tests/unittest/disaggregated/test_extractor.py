@@ -53,7 +53,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     Mapping,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
-from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttnLifeCycle, CacheTier
 
 
 class DummyRankInfo:
@@ -263,6 +263,22 @@ def test_layer_group_meta_serialization():
     assert KVCachePageTable.from_dict(d).layer_groups[0].pool_views[0].num_kv_heads is None
 
 
+def _fake_group_life_cycle(impl):
+    """Return a fake impl's ``get_group_life_cycle``.
+
+    Each group's attention life cycle has the window of its first layer's config, as the
+    native registry derives it, and none when the stub configures no such layer.
+    """
+
+    def get_group_life_cycle(group_id: int) -> AttnLifeCycle:
+        layers = impl.init_config.layers
+        first_layer = int(impl.buffer_grouping[group_id][0].layer_id)
+        window = layers[first_layer].window_size if first_layer < len(layers) else None
+        return AttnLifeCycle(window, 0)
+
+    return get_group_life_cycle
+
+
 def _make_fake_v2_manager(
     attrs,
     role_mapper_kinds,
@@ -333,6 +349,7 @@ def _make_fake_v2_manager(
         ),
         pool_group_descs=[pg_desc],
     )
+    impl.get_group_life_cycle = _fake_group_life_cycle(impl)
     return Mock(
         spec=KVCacheManagerV2,
         get_disagg_pool_view_partition=None,
@@ -1018,6 +1035,7 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
         ),
         pool_group_descs=[recurrent_pg, attention_pg],
     )
+    manager.impl.get_group_life_cycle = _fake_group_life_cycle(manager.impl)
     manager.pp_layers = [0, 1, 2]
     manager._mamba_layer_mask = [True, True, False]
     manager.local_num_mamba_layers = 2

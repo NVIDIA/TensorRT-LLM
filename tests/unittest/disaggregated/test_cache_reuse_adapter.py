@@ -28,12 +28,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    AttentionLayerConfig,
-    BufferConfig,
-    ReusePolicy,
-    SsmLayerConfig,
-)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttnLifeCycle, ReusePolicy, SsmLifeCycle
 
 pytestmark = pytest.mark.cpu_only
 
@@ -241,34 +236,31 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
 
 
-def _sink_only_manager(cache, num_sink_tokens: int, *, hybrid: bool):
-    """Manager stand-in whose per-group life cycles come from KVCacheManagerV2 itself.
-
-    Groups: the low-precision history, the high-precision group (sinks and a
-    66-token window), a PRIVATE group and, for a hybrid model, a Mamba layer,
-    whose config has no sink count.
-    """
-    kv = [BufferConfig(role=role, size=128) for role in ("key", "value")]
-    layers = [
-        AttentionLayerConfig(layer_id=0, buffers=kv),
-        AttentionLayerConfig(
-            layer_id=1,
-            buffers=kv,
-            sliding_window_size=66,
+def _sink_only_manager(
+    cache: SimpleNamespace, num_sink_tokens: int, *, hybrid: bool
+) -> SimpleNamespace:
+    """Model full-history, sink-only and private groups, plus recurrent state for a hybrid."""
+    tokens_per_block = 128
+    life_cycles: list[AttnLifeCycle | SsmLifeCycle] = [
+        AttnLifeCycle(window_size=None, num_sink_blocks=0),
+        AttnLifeCycle.make(
+            window_size=66,
             num_sink_tokens=num_sink_tokens,
+            tokens_per_block=tokens_per_block,
             reuse_policy=ReusePolicy.SINK_REQUIRED_ONLY,
         ),
-        AttentionLayerConfig(layer_id=2, buffers=kv, reuse_policy=ReusePolicy.PRIVATE),
+        AttnLifeCycle(window_size=None, num_sink_blocks=0, reuse_policy=ReusePolicy.PRIVATE),
     ]
     if hybrid:
-        states = [BufferConfig(role=role, size=128) for role in ("ssm_state", "conv_state")]
-        layers.append(SsmLayerConfig(layer_id=3, buffers=states))
+        life_cycles.append(SsmLifeCycle())
     manager = SimpleNamespace(
         enable_block_reuse=True,
-        tokens_per_block=128,
+        tokens_per_block=tokens_per_block,
         kv_cache_map={0: cache},
-        kv_cache_manager_py_config=SimpleNamespace(layers=layers),
-        _layer_ids_by_group=[[layer_id] for layer_id in range(len(layers))],
+        impl=SimpleNamespace(
+            buffer_grouping=[[] for _ in life_cycles],
+            get_group_life_cycle=life_cycles.__getitem__,
+        ),
         _layer_group_life_cycles=None,
     )
     manager._life_cycle_by_layer_group = MethodType(

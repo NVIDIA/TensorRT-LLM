@@ -46,7 +46,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttnLifeCycle, CacheTier, DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -410,21 +410,11 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         if not isinstance(layout, RoleLayout):
             raise ValueError(f"Invalid disaggregation role layout {layout!r} for role {role!s}")
 
-    def _window_size_for_layer(internal_layer_id: int):
-        if internal_layer_id < len(config.layers):
-            return getattr(config.layers[internal_layer_id], "window_size", None)
-
-        if hasattr(manager, "_layer_attn_to_layer_id"):
-            for (model_layer, _attn_type), layer_id in manager._layer_attn_to_layer_id.items():
-                if layer_id != internal_layer_id:
-                    continue
-                local_layer = manager.layer_offsets.get(model_layer)
-                if local_layer is not None and local_layer < len(config.layers):
-                    return getattr(config.layers[local_layer], "window_size", None)
-                if model_layer < len(config.layers):
-                    return getattr(config.layers[model_layer], "window_size", None)
-
-        raise ValueError(f"Cannot resolve layer config for internal layer {internal_layer_id}")
+    def _window_size_for_group(layer_group_id: int) -> Optional[int]:
+        # The window is part of the group's life cycle, whether a layer config
+        # or a region declares it.
+        life_cycle = manager.impl.get_group_life_cycle(layer_group_id)
+        return life_cycle.window_size if isinstance(life_cycle, AttnLifeCycle) else None
 
     virtual_layer_mapping = getattr(manager, "_layer_attn_to_layer_id", None)
     model_layer_by_internal_id: dict[int, int] = {}
@@ -572,11 +562,10 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
 
             # The group field describes its first head-sharded view; each
             # view carries the actual geometry used for transfer.
-            first_local_layer = all_internal_layer_ids[0]
             num_kv_heads = next(
                 (view.num_kv_heads for view in pool_views if view.num_kv_heads is not None), 0
             )
-            sliding_window_size = _window_size_for_layer(first_local_layer)
+            sliding_window_size = _window_size_for_group(layer_group_id)
 
             layer_groups_by_id[layer_group_id] = AttentionLayerGroup(
                 pool_group_idx=storage_pg_to_list_idx[storage_pg_idx],

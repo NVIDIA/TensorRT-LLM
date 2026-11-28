@@ -120,6 +120,11 @@ TypedVec<PoolGroupIndex, SlotCount> KvCacheIntrospection::computeSlotsForBatch(K
     return manager.storage().computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
 }
 
+TypedVec<PoolGroupIndex, SlotCount> KvCacheIntrospection::hotMinSlots(KvCacheManager& manager)
+{
+    return manager.storage().mHotMinSlots;
+}
+
 std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};

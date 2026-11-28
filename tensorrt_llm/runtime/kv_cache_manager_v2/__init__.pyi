@@ -103,13 +103,18 @@ CacheGroupId: TypeAlias = LifeCycleId
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
-    """The attention life cycle, keyed by window, sink tokens, and reuse policy."""
+    """The attention life cycle, keyed by window, sink tokens, reuse policy and region.
+
+    ``region_index`` is the index into ``KVCacheManagerConfig.regions`` of the token-block
+    region the life cycle belongs to, or None for attention layer buffers.
+    """
 
     def __init__(
         self,
         window_size: int | None,
         num_sink_blocks: int,
         reuse_policy: ReusePolicy = ...,
+        region_index: int | None = None,
     ) -> None: ...
     @staticmethod
     def make(
@@ -124,6 +129,22 @@ class AttnLifeCycle:
     def num_sink_blocks(self) -> int: ...
     @property
     def reuse_policy(self) -> ReusePolicy: ...
+    @property
+    def region_index(self) -> int | None: ...
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
+
+class SsmLifeCycle:
+    """The life cycle of SSM layer buffers, keyed by reuse policy, or of a request region.
+
+    ``region_index`` is the index into ``KVCacheManagerConfig.regions`` of the request region
+    the life cycle belongs to, or None for SSM layer buffers.
+    """
+
+    def __init__(self, reuse_policy: ReusePolicy = ...) -> None: ...
+    @property
+    def reuse_policy(self) -> ReusePolicy: ...
+    @property
+    def region_index(self) -> int | None: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -501,7 +522,7 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class RegionAllocationUnit(enum.IntEnum):
     # One slot per KV cache and beam, held for the cache's lifetime.
     REQUEST = 0
-    # One page per token block. Not supported yet.
+    # One page per token block, as an attention layer's buffers have.
     TOKEN_BLOCK = 1
 
 @dataclass(slots=True)
@@ -515,13 +536,24 @@ class RegionBuffer:
 class RegionConfig:
     """Buffers that share a life cycle of the region's own, never merged with another one.
 
-    Only REQUEST regions with the PRIVATE reuse policy are supported: one slot per living
-    KV cache and beam, never published for reuse, returned when the cache closes. Each
-    buffer sits on a layer that has an SsmLayerConfig and sets no reuse policy of its own.
+    A REQUEST region holds one slot per living KV cache and beam, returned when
+    the cache closes. The region's life cycle is an SSM life cycle with its reuse policy: a
+    PRIVATE region is never published for reuse, and a REQUIRED one is snapshotted at commit
+    and restored at a matched prefix. Layer buffers and regions together have at most one
+    REQUIRED SSM life cycle. Each buffer sits on a layer that has an SsmLayerConfig, which may
+    have no buffers of its own, and sets no reuse policy of its own.
 
-    ``fixed_slot_count`` set gives the region a pool group of its own with exactly that many
-    GPU slots, which ratio-based sizing (construction, resize(), adjust() and the tuner)
-    leaves alone; a GPU quota too small to hold it is raised. None sizes it by ratio.
+    A TOKEN_BLOCK region uses the REQUIRED reuse policy: one page per token block, committed
+    at block boundaries and required by every prefix match, as the buffers of an attention
+    layer without sink tokens are. ``window_size`` marks the blocks before the window stale;
+    None keeps every block. Each buffer sits on a layer that has an AttentionLayerConfig.
+
+    Region buffers set no reuse policy of their own.
+
+    ``fixed_slot_count`` set gives a REQUEST region a pool group of its own with exactly that
+    many GPU slots, which ratio-based sizing (construction, resize(), adjust() and the tuner)
+    leaves alone; a GPU quota too small to hold it is raised. None sizes it by ratio. A
+    TOKEN_BLOCK region is always sized by ratio.
     """
 
     name: str
@@ -529,6 +561,7 @@ class RegionConfig:
     allocation_unit: RegionAllocationUnit = RegionAllocationUnit.REQUEST
     reuse_policy: ReusePolicy = ReusePolicy.PRIVATE
     fixed_slot_count: int | None = None
+    window_size: int | None = None
     def validate(self) -> None: ...
 
 @dataclass(slots=True)
@@ -663,6 +696,8 @@ class KVCacheEvent:
     hash_algo: str | None = None
     attention_dp_rank: int | None = None
     layer_group_id: int | None = None
+    # Name of the region whose life cycle the layer group is; None for a layer config's group.
+    region: str | None = None
 
 class StreamingBlockStoredData:
     @property
@@ -729,6 +764,9 @@ class KVCacheEventManager:
         layer_group_ids: Sequence[int] | None = None,
     ) -> None: ...
     def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None: ...
+    # Region name of each layer group that is a region's life cycle; events of the other
+    # groups carry no region.
+    def set_layer_group_regions(self, regions: dict[int, str]) -> None: ...
     def add_stored_event(
         self,
         parent_hash: EventBlockHash | None,
@@ -2022,6 +2060,9 @@ class KVCacheManager:
     def get_buffer_group_id(self, layer_id: LayerId, role: DataRole) -> CacheGroupId: ...
     # Raises IndexError for a name no region declares.
     def get_region_group_id(self, name: str) -> CacheGroupId: ...
+    # Life cycle of the group: window, sink blocks, reuse policy and region for an attention
+    # group; reuse policy and region for an SSM group. Raises IndexError for an unknown group.
+    def get_group_life_cycle(self, group_id: CacheGroupId) -> AttnLifeCycle | SsmLifeCycle: ...
     # Deprecated: use buffer_grouping. Raises RuntimeError if any layer is split.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...

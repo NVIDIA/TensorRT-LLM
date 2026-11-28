@@ -469,7 +469,7 @@ inline std::vector<BufferConfig> const& layerBuffers(LayerConfig const& layer)
 enum class RegionAllocationUnit : std::uint8_t
 {
     kRequest,    //!< One slot per KV cache and beam, held for the cache's lifetime.
-    kTokenBlock, //!< One page per token block. Not supported yet.
+    kTokenBlock, //!< One page per token block, as an attention layer's buffers have.
 };
 
 //! One buffer of a region. The layer id places the buffer in the per-layer address
@@ -483,9 +483,17 @@ struct RegionBuffer
 //! Buffers that share a life cycle of the region's own. The life cycle is never merged
 //! with another one, even one whose parameters are equal.
 //!
-//! Only request regions with the PRIVATE reuse policy are supported: one slot per living
-//! KV cache and beam, never published for reuse, returned when the cache closes. Each
-//! buffer sits on a layer that has an SsmLayerConfig.
+//! A request region holds one slot per living KV cache and beam, returned when
+//! the cache closes. The region's life cycle is an SSM life cycle with the region's reuse
+//! policy: a PRIVATE region is never published for reuse, and a REQUIRED one is snapshotted at
+//! commit and restored at a matched prefix like an SSM layer's state. A manager has at most one
+//! REQUIRED SSM life cycle, from SSM layer buffers or a region. Each buffer sits on a layer that
+//! has an SsmLayerConfig, which may have no buffers of its own.
+//! A token-block region uses the REQUIRED reuse policy: one page per token block,
+//!   committed at block boundaries and required by every prefix match, as the buffers of an
+//!   attention layer without sink tokens are. An optional window marks the blocks before it
+//!   stale. Each buffer sits on a layer that has an AttentionLayerConfig. Its life cycle is
+//!   an AttnLifeCycle.
 struct RegionConfig
 {
     std::string name;
@@ -493,11 +501,16 @@ struct RegionConfig
     ReusePolicy reusePolicy = ReusePolicy::PRIVATE;
     std::vector<RegionBuffer> buffers;
 
+    //! Sliding window of a token-block region, in tokens; nullopt keeps every block. Unset on a
+    //! request region.
+    std::optional<int> windowSize;
+
     //! GPU slot count of the region's pool group. When set, the region's life cycle gets a
     //! pool group of its own with exactly this many hot-tier slots; ratio-based sizing at
     //! construction, in resize() and adjust(), and in tuner targets leaves that group at
     //! this size. A GPU quota too small to hold it is raised, as for the constraint floors.
-    //! When unset, the region is sized by ratio like any other life cycle.
+    //! When unset, the region is sized by ratio like any other life cycle. Unset on a
+    //! token-block region.
     std::optional<std::int64_t> fixedSlotCount;
 
     //! Checks of the region alone; KVCacheManagerConfig::validate() checks it against the layers.

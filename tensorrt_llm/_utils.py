@@ -1146,6 +1146,9 @@ class KVCacheEventSerializer:
         layer_group_id = getattr(event, "layer_group_id", None)
         if layer_group_id is not None:
             json_str["layer_group_id"] = layer_group_id
+        region = getattr(event, "region", None)
+        if region is not None:
+            json_str["region"] = region
         if event.attention_dp_rank is not None:
             json_str["attention_dp_rank"] = event.attention_dp_rank
 
