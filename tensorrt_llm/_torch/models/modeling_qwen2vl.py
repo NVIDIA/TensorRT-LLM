@@ -79,7 +79,8 @@ from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
     fuse_input_embeds, get_attached_multimodal_embeddings,
-    get_multimodal_embeddings)
+    get_multimodal_embeddings, get_vision_context_params,
+    validate_encoderless_vision_request)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
@@ -2613,12 +2614,12 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         # `multimodal_params` holds one entry per request that carried any
         # multimodal data, context entries first, followed by the generation
         # entries that only seed the MRoPE delta cache. The slice bounds the
-        # scan to the context prefix; `_get_requests_with_mm_data` is what
+        # scan to the context prefix; `get_vision_context_params` is what
         # actually selects the entries with encoder input, so this does not
         # rely on the entries lining up with the context requests.
         if num_context_requests > 0:
-            mm_multimodal_params = self._get_requests_with_mm_data(
-                multimodal_params[:num_context_requests])
+            mm_multimodal_params = get_vision_context_params(
+                multimodal_params, num_context_requests)
         else:
             mm_multimodal_params = []
         if len(mm_multimodal_params) > 0:
@@ -2667,20 +2668,10 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         logger.debug(f'output shape: {output_prob.shape}')
         return output_prob
 
-    def _get_requests_with_mm_data(self, multimodal_params):
-        mm_multimodal_params = []
-        for multimodal_param in multimodal_params:
-            data = multimodal_param.multimodal_data
-            if (
-                    # The first 2 conditions check whether there is input on which inference should be run.
-                    data.get("image", {}).get("pixel_values") is not None or
-                    data.get("video", {}).get("pixel_values_videos") is not None
-                    # This condition corresponds to when the embeddings are already populated, as is e.g.
-                    # the case in EPD disagg in the prefill worker.
-                    or data.get("multimodal_embedding") is not None):
-                mm_multimodal_params.append(multimodal_param)
-
-        return mm_multimodal_params
+    def validate_request(self, request) -> None:
+        if self.mm_encoder is None:
+            validate_encoderless_vision_request(
+                request, getattr(self, "support_mm_disagg", False))
 
 
 @register_vision_encoder(Qwen2VisionModelBase,

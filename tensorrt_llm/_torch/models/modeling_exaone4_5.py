@@ -28,6 +28,7 @@ from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
+    get_vision_context_params,
 )
 from .modeling_qwen2vl import (
     Qwen2_5_VisionModel,
@@ -257,7 +258,9 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
 
-        mm_multimodal_params = self._get_requests_with_mm_data(multimodal_params)
+        mm_multimodal_params = get_vision_context_params(
+            multimodal_params, attn_metadata.num_contexts
+        )
 
         if len(mm_multimodal_params) > 0:
             if not _is_mm_disagg():

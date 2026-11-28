@@ -230,3 +230,50 @@ def test_language_model_inherits_top_level_tie_word_embeddings(
     modeling_qwen2vl.Qwen2VLModelBase(ModelConfig(pretrained_config=config), disable_fuse_rope=True)
 
     assert getattr(built["config"], "tie_word_embeddings", None) is tie_word_embeddings
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("family", ["qwen", "kimi", "hyperclovax", "exaone"])
+def test_vision_forward_preserves_metadata_only_text(family, monkeypatch):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.models import (
+        modeling_exaone4_5,
+        modeling_hyperclovax,
+        modeling_kimi_k25,
+    )
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+
+    model_cls = {
+        "qwen": modeling_qwen2vl.Qwen2_5_VLModel,
+        "kimi": modeling_kimi_k25.KimiK25ForConditionalGeneration,
+        "hyperclovax": modeling_hyperclovax.HCXVisionForCausalLM,
+        "exaone": modeling_exaone4_5.Exaone4_5_ForConditionalGeneration,
+    }[family]
+    monkeypatch.setattr(modeling_kimi_k25, "DISAGG", True)
+    monkeypatch.setattr(modeling_hyperclovax, "DISAGG", True)
+    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+
+    class TextModel:
+        model = SimpleNamespace(embed_tokens=torch.nn.Embedding(8, 4))
+
+        def forward(self, attn_metadata, input_ids, *args, **kwargs):
+            assert torch.is_inference_mode_enabled()
+            return input_ids
+
+    model = SimpleNamespace(
+        mm_encoder=None,
+        llm=TextModel(),
+        model_config=SimpleNamespace(pretrained_config=SimpleNamespace(disable_fuse_rope=True)),
+        mm_token_ids=torch.tensor([7]),
+    )
+    context = MultimodalParams(multimodal_data={"image": {"image_grid_thw": torch.ones(1, 3)}})
+    decode = MultimodalParams(multimodal_data={"mrope_config": {"mrope_position_deltas": 1}})
+    input_ids = torch.tensor([1, 2, 3])
+    out = model_cls.forward(
+        model,
+        SimpleNamespace(num_contexts=1, num_generations=1),
+        input_ids=input_ids,
+        multimodal_params=[context, decode],
+    )
+    torch.testing.assert_close(out, input_ids)

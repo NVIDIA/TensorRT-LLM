@@ -30,7 +30,9 @@ from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
-                                        get_multimodal_embeddings)
+                                        get_multimodal_embeddings,
+                                        get_vision_context_params,
+                                        validate_encoderless_vision_request)
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import register_auto_model
 
@@ -1085,6 +1087,10 @@ class HCXVisionForCausalLM(PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
+    def validate_request(self, request) -> None:
+        if DISAGG:
+            validate_encoderless_vision_request(request)
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1105,18 +1111,18 @@ class HCXVisionForCausalLM(PreTrainedModel):
 
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
-        if len(multimodal_params) > 0:
+        if multimodal_params and (mm_ctx_params := get_vision_context_params(
+                multimodal_params, num_context_requests)):
             if not DISAGG:
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
-                    multimodal_params=multimodal_params[:num_context_requests])
+                    multimodal_params=mm_ctx_params)
             else:
                 raise NotImplementedError(
                     "HCXVisionForCausalLM does not support disaggregated inference yet. Please unset "
                     f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
-            mm_embeds = find_input_mm_embeds(
-                mm_embeds, multimodal_params[:num_context_requests])
+            mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,

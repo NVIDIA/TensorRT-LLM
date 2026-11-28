@@ -178,6 +178,45 @@ def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
         multimodal_data.get(m) is not None for m in ("image", "video", "audio"))
 
 
+def _has_vision_input(data: dict, video_pixel_alias: str | None) -> bool:
+    if (data.get("multimodal_embedding") is not None
+            or (data.get("image") or {}).get("pixel_values") is not None):
+        return True
+    video = data.get("video")
+    return video is not None and (video.get("pixel_values_videos") is not None
+                                  or (video_pixel_alias is not None and
+                                      video.get(video_pixel_alias) is not None))
+
+
+def get_vision_context_params(
+        params: List[MultimodalParams],
+        num_contexts: int,
+        *,
+        video_pixel_alias: str | None = None) -> List[MultimodalParams]:
+    """Select context entries with pixels or attached embeddings, skipping positional metadata."""
+    return [
+        param for param in params[:num_contexts] if param.multimodal_data
+        and _has_vision_input(param.multimodal_data, video_pixel_alias)
+    ]
+
+
+def validate_encoderless_vision_request(
+        request,
+        supports_precomputed: bool = False,
+        *,
+        video_pixel_alias: str | None = None) -> None:
+    if request.is_generation_only_request:
+        return
+    data = request.py_multimodal_data
+    if data and _has_vision_input(data, video_pixel_alias):
+        if supports_precomputed and data.get(
+                "multimodal_embedding") is not None:
+            return
+        raise ValueError(
+            "This worker requires a local vision encoder or supported precomputed embeddings"
+        )
+
+
 # Processor *output* keys that transformers 5.x's
 # ``ProcessorMixin._merge_kwargs`` strictly rejects when they leak into
 # ``output_kwargs[<modality>]`` and reach ``validate_typed_dict``. They
