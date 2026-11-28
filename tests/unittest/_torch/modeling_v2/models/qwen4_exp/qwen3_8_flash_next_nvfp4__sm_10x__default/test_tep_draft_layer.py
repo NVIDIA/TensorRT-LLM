@@ -399,15 +399,21 @@ def test_draft_sparse_gate(monkeypatch, cute):
     calls = []
     monkeypatch.setattr(M, "_decode_index_scores", lambda *a: calls.append("scores") or "s")
     monkeypatch.setattr(M, "_selection", lambda *a, **k: calls.append("select"))
-    monkeypatch.setattr(
-        M,
-        "_sparse_gqa_decode",
-        lambda *a: calls.append("cute") or (torch.ones(2, 3, 4) if cute else None),
-    )
+
+    def decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p):
+        assert gate == "g", gate  # the step's output gate, applied in the launch
+        calls.append("cute")
+        return torch.ones(2, 3, 4) if cute else None
+
+    def apart(out, gate):
+        assert gate == "g", gate  # the same gate, applied after the plain kernel
+        calls.append("gate")
+
+    monkeypatch.setattr(M, "_sparse_gqa_decode", decode)
     monkeypatch.setattr(
         M, "_sparse_gqa", lambda *a: calls.append("fallback") or torch.ones(2, 3, 4)
     )
-    monkeypatch.setattr(M, "fused_sigmoid_mul_inplace", lambda out, gate: calls.append("gate"))
+    monkeypatch.setattr(M, "fused_sigmoid_mul_inplace", apart)
     target = M.DecodeTarget.__new__(M.DecodeTarget)
     target.core = core
     md = SimpleNamespace(

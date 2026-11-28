@@ -3,7 +3,7 @@
 """GPU test for the qsa_paged_sparse_gqa_e4m3_decode entry (SM103): cells against the
 composition entry's fp32 reference in the bf16 decode entry's band (4 ulp of each head row's
 magnitude, 2 ulp relative RMS), over an e4m3 pool at the tep4 shard (6 query heads on one KV
-head); the selection's read-after-wait under graph replay with PDL; and the envelope."""
+head); the composed top-k + op step under graph replay with PDL; and the envelope."""
 
 import zlib
 
@@ -108,7 +108,10 @@ def test_plan_at_the_selection_width(rows, splits, tps) -> None:
 def test_reads_the_selection_after_the_wait_under_graph_replay() -> None:
     """The target's top-k runs inside the graph right before the op: a PDL producer that
     releases the op right after its own wait, before it writes the selection. A read of the
-    selection before the op's wait would see the previous replay's."""
+    selection before the op's wait would see the previous replay's -- where the two launches
+    overlap. CUDA may also run them one after the other, and then this replay comparison passes
+    whatever the op's read order: it is a graph-replay regression of the composed step, and the
+    read-after-wait itself is not shown here."""
     args = _build(dict(pos=(8700,), gated=True), seed=23)
     pos = torch.tensor([8700], dtype=torch.int64, device=DEV)
     ends = ((pos + 1) // CR).to(torch.int32)
@@ -146,3 +149,10 @@ def test_envelope() -> None:
     assert not entry.supports(q, k.to(torch.bfloat16), v.to(torch.bfloat16), bt, sel, req, tpb)
     assert not entry.supports(q, k, v, bt, sel[:, :192].contiguous(), req, tpb)
     assert not entry.supports(q, k, v, bt, sel, req, tpb, max_rows=0)
+    # The hard row ceiling (`MAX_ROWS`, 32) holds whatever the caller's cap: 32 otherwise valid
+    # rows are taken and 33 are not, both under `max_rows=33`.
+    for rows, taken in ((entry.MAX_ROWS, True), (entry.MAX_ROWS + 1, False)):
+        q_n = q[:1].expand(rows, -1, -1).contiguous()
+        sel_n = sel[:1].expand(rows, -1).contiguous()
+        req_n = req[:1].expand(rows).contiguous()
+        assert entry.supports(q_n, k, v, bt, sel_n, req_n, tpb, max_rows=33) is taken, rows

@@ -137,6 +137,27 @@ def test_plan_wide_2_runs_the_shared_gate_up_on_the_default_tactic() -> None:
         assert picked.tactic == fi_splitk.default_tactic(m, 1296, 2560), m
 
 
+def test_plan_wide_2_falls_back_to_cublas_when_split_k_refuses(monkeypatch) -> None:
+    """`wide` 2 at an unlisted shape of up to `WIDE_MAX_ROWS` rows tries split-K's default
+    tactic; when split-K refuses the shape, `plan` keeps it on cuBLAS."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm import low_m_bf16_mm as mod
+
+    shape = (2560, 640)  # the shared expert's down projection: in no table
+    assert shape not in mod._TABLE and shape not in mod._WIDE
+    assert shape not in mod._WIDE_DEFAULT_FIRST
+
+    def refuse(*args, **kwargs):
+        raise ValueError("split-K refused the shape")
+
+    plan.cache_clear()
+    try:
+        monkeypatch.setattr(mod._fi_splitk, "validate_tactic", refuse)
+        for m in (1, 12, mod.WIDE_MAX_ROWS):
+            assert plan(m, *shape, 2).kind == "cublas", m
+    finally:
+        plan.cache_clear()
+
+
 def test_plan_pins_the_wide_rows() -> None:
     picked = [(m, n, k, w, want, plan(m, n, k, w).kind) for m, n, k, w, want in _WIDE_PINS]
     wrong = [p for p in picked if p[4] != p[5]]
