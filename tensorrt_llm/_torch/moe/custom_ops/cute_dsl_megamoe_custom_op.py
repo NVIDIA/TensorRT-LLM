@@ -17,7 +17,7 @@ standard TRT-LLM CuteDSL op pattern used by
 * ``trtllm::cute_dsl_megamoe_nvfp4_blackwell`` is the historically named
   architecture-dispatching torch
   custom op that the ``MegaMoECuteDsl`` backend calls from
-  ``run_moe``. ``tactic_autotune=True`` (bench-only, enabled via the
+  ``run_moe``. ``tactic_autotune=True`` (opt-in, enabled via the
   ``MEGAMOE_TACTIC_AUTOTUNE=1`` env var read by the backend) runs
   ``AutoTuner.choose_one`` per call over the key's default and its region
   shortlist (BF16 combine); the default bypasses the AutoTuner and uses the
@@ -52,10 +52,6 @@ from tensorrt_llm._torch.autotuner import (
     TuningConfig,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.utils import (
-    get_last_power_of_2_num_tokens_buckets,
-    last_positive_power_of_2,
-)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div, pad_up
@@ -362,6 +358,14 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
         token_back_ready_granularity,
         combine_dedup,
         epilogue_warpgroups,
+    )
+
+
+def _comparable_megamoe_tactic(tactic: Tuple) -> Tuple:
+    """The canonical fields of ``tactic`` with lists as tuples, so that tactics
+    written either way (tables, enumeration, a loaded cache) compare equal."""
+    return tuple(
+        tuple(field) if isinstance(field, list) else field for field in _unpack_tactic(tactic)
     )
 
 
@@ -745,7 +749,7 @@ def _megamoe_weight_evict_first(
 
 # ---------------------------------------------------------------------------
 # Curated tuning space with staged-store and mixed-CGA candidates, filtered through
-# ``validate_megamoe_tactic``. MUST be identical on every EP rank: the MERGE
+# ``validate_megamoe_tactic``. MUST be identical on every EP rank: the COLLECTIVE
 # tuning sweep runs the candidate list in lockstep across ranks, so there is
 # deliberately NO runtime knob selecting a different space.
 # ---------------------------------------------------------------------------
@@ -2686,6 +2690,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
     # when REAL profiling launches, so a tuning-mode cache HIT never pays the
     # multi-GiB allocation.
     _ACTIVE_MEGAMOE_PROFILING_SCRATCH_FACTORY = None
+    # The EP process group of the current launch, set by the backend around an
+    # opt-in launch: its tuning collectives run over the group the kernel spans.
+    _ACTIVE_MEGAMOE_TUNING_GROUP = None
+    # Set by the backend around an opt-in launch given direct (non-symmetric)
+    # inputs: a zero-arg callable that stages them into the launch buffers and
+    # returns (activation, activation_sf, topk_idx, topk_weights).
+    _ACTIVE_MEGAMOE_DIRECT_INPUT_RESTAGE = None
 
     def get_megamoe_profiling_scratch(
         *,
@@ -2767,6 +2778,34 @@ if IS_MEGAMOE_OP_AVAILABLE:
         not allocated. See ``_ACTIVE_MEGAMOE_PROFILING_SCRATCH_FACTORY``."""
         global _ACTIVE_MEGAMOE_PROFILING_SCRATCH_FACTORY
         _ACTIVE_MEGAMOE_PROFILING_SCRATCH_FACTORY = factory
+
+    def set_active_megamoe_direct_input_restage(restage) -> None:
+        """Set (``None`` clears) the staging callback of an opt-in launch with direct inputs."""
+        global _ACTIVE_MEGAMOE_DIRECT_INPUT_RESTAGE
+        _ACTIVE_MEGAMOE_DIRECT_INPUT_RESTAGE = restage
+
+    def set_active_megamoe_tuning_group(group) -> None:
+        """Set (``None`` clears) the EP process group of the current launch."""
+        global _ACTIVE_MEGAMOE_TUNING_GROUP
+        _ACTIVE_MEGAMOE_TUNING_GROUP = group
+
+    def _megamoe_tuning_group(world_size: int):
+        """The EP process group a multi-rank opt-in launch tunes across.
+
+        The kernel is one collective over the EP ranks, so its tuning
+        collectives must span exactly those ranks, not the autotuner's TP group.
+        """
+        import torch.distributed as dist
+
+        group = _ACTIVE_MEGAMOE_TUNING_GROUP
+        group_size = None if group is None else dist.get_world_size(group)
+        if group_size != int(world_size):
+            raise RuntimeError(
+                "MegaMoE-CuteDSL autotune must tune across the EP process group of "
+                f"the launch (EP={world_size}); the active tuning group has "
+                f"{group_size} ranks (set it with set_active_megamoe_tuning_group)."
+            )
+        return group
 
     def release_megamoe_profiling_scratch() -> None:
         """Free all profiling-scratch symmetric buffers (call after warmup);
@@ -3125,8 +3164,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
-            # SAME tactic and MERGE merges timings by cache key across ranks,
-            # so the key MUST be rank-identical. world_size stays so
+            # SAME tactic and COLLECTIVE tuning compares timings by cache key
+            # across ranks, so the key MUST be rank-identical. world_size stays so
             # single-rank and multi-rank never share entries. The key depends
             # only on constructor inputs, so each runner builds it once.
             key = self.__dict__.get("_unique_id")
@@ -3236,7 +3275,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Runs ONLY on a real profiling MISS (a tuning-mode cache HIT
             # early-returns in choose_one), so materializing the DEFERRED
             # scratch here keeps cache-hitting forwards allocation-free. The
-            # factory's collective rendezvous is safe: MERGE lockstep tuning
+            # factory's collective rendezvous is safe: COLLECTIVE lockstep tuning
             # gets every EP rank to this pre-hook before any coupled launch.
             if self._profiling_scratch is None and self._profiling_scratch_factory is not None:
                 self._profiling_scratch = self._profiling_scratch_factory()
@@ -3327,11 +3366,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             if config is not None:
                 return config
             config = self._tuning_config = TuningConfig(
-                dynamic_tensor_specs=(
-                    DynamicTensorSpec(
-                        0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
-                    ),
-                ),
+                # One profile per capacity bucket: every launch of this runner
+                # stages ``max_tokens_per_rank`` activation rows, so that is the
+                # only shape a lookup maps to.
+                dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (self.max_tokens_per_rank,)),),
                 constraint_specs=(
                     ConstraintSpec(1, 0, _megamoe_autotune_num_tokens),  # activation_sf
                     ConstraintSpec(2, 0, _megamoe_autotune_num_tokens),  # topk_idx
@@ -3346,9 +3384,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # peer mapping (clone ptr + scratch peer_offsets) resolves
                 # outside any symmetric region -> cross-rank IMA while tuning.
                 use_cold_l2_cache=False,
-                # Pin the bucket ladder to the per-rank token ceiling instead
-                # of whatever (KV-clamped, possibly non-pow2) num_tokens the
-                # warmup forward fed. Mirrors trtllm-gen's tune_max_num_tokens.
                 tune_max_num_tokens=self.max_tokens_per_rank,
                 # CUDA Graph capture cannot reproduce MegaMoE's runtime
                 # peer-pointer table / dispatch-counter view and would
@@ -3358,12 +3393,74 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 use_cuda_graph=False,
                 # Ranks couple inside the fused kernel, so every EP rank must
                 # profile the SAME tactic in lockstep with identical launch
-                # counts; MERGE does that and all-gathers timings so all ranks
-                # converge on one global-best tactic. PARALLEL would split
-                # tactics across ranks -> contaminated timing + barrier desync.
-                distributed_tuning_strategy=DistributedTuningStrategy.MERGE,
+                # counts, and a launch takes as long as its slowest rank:
+                # COLLECTIVE keeps, on every rank, the tactic whose slowest
+                # rank is fastest. Its process group (the EP group) is set per
+                # tuning call, see ``_megamoe_tuning_group``.
+                distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
             )
             return config
+
+        def fallback_tactic(
+            self, inputs: List[torch.Tensor], profile: OptimizationProfile, **kwargs
+        ) -> Any:
+            """The candidate ``tactic=-1`` runs: this runner's default tactic as the launch resolves
+            it (a default the op refuses runs its first accepted fallback), or -1."""
+            if self.ugpu_weight_layout != "none" and _megamoe_ugpu_is_genphase(
+                self.max_tokens_per_rank
+            ):
+                default = _megamoe_ugpu_tactic()
+            else:
+                try:
+                    _, default = self._resolve_kernel_descriptor(
+                        self._default_tactic(int(inputs[0].shape[0])),
+                        allow_fallback=self.ugpu_weight_layout == "none",
+                    )
+                except (ValueError, NotImplementedError):
+                    # Nothing builds: tactic=-1 fails like every candidate.
+                    return -1
+            default = _comparable_megamoe_tactic(default)
+            return next(
+                (
+                    tactic
+                    for tactic in self.get_valid_tactics(inputs, profile, **kwargs)
+                    if _comparable_megamoe_tactic(tactic) == default
+                ),
+                -1,
+            )
+
+        def prepare_tactic(self, inputs: List[torch.Tensor], tactic: Any, **kwargs) -> None:
+            """Validate and construct the kernel ``tactic`` runs, without a launch or a barrier:
+            a refusal raises here, before any rank enters the tactic's collective launch."""
+            del kwargs
+            use_default_tactic = tactic == -1 or tactic is None
+            if self.ugpu_weight_layout != "none" and _megamoe_ugpu_is_genphase(
+                self.max_tokens_per_rank
+            ):
+                fixed = _megamoe_ugpu_tactic()
+                if not use_default_tactic and _unpack_tactic(tactic) != _unpack_tactic(fixed):
+                    raise ValueError("Localized MegaMoE weights require the fixed uGPU tactic")
+                tactic, use_default_tactic = fixed, False
+            elif use_default_tactic:
+                tactic = self._default_tactic(int(inputs[0].shape[0]))
+            elif isinstance(tactic, list):
+                tactic = tuple(tactic)
+            self._resolve_kernel_descriptor(
+                tactic, allow_fallback=use_default_tactic and self.ugpu_weight_layout == "none"
+            )
+
+        def reads_inputs_locally(self, tactic: Any) -> bool:
+            """Whether the kernel ``tactic`` runs reads its activation and routing inputs only
+            locally (the generation-phase kernel), so they may be non-symmetric tensors."""
+            use_default_tactic = tactic == -1 or tactic is None
+            if use_default_tactic:
+                tactic = self._default_tactic(self.max_tokens_per_rank)
+            elif isinstance(tactic, list):
+                tactic = tuple(tactic)
+            kernel, _ = self._resolve_kernel_descriptor(
+                tactic, allow_fallback=use_default_tactic and self.ugpu_weight_layout == "none"
+            )
+            return isinstance(kernel, RubinInferenceGenphaseMegaMoE)
 
         def _build_kernel_once(self, tactic: Tuple):
             validate_megamoe_tactic(tactic, sm_version=self.sm_version)
@@ -4027,7 +4124,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         Inputs are pre-staged by the caller (the ``MegaMoECuteDsl``
         backend in ``mega_moe_cute_dsl.py``). ``tactic_autotune=True``
-        (``MEGAMOE_TACTIC_AUTOTUNE=1`` bench opt-in) picks the tactic via
+        (``MEGAMOE_TACTIC_AUTOTUNE=1`` opt-in) picks the tactic via
         AutoTuner per call; the default selects an architecture- and
         problem-specific tactic without profiling.
 
@@ -4129,10 +4226,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 raise ValueError("The fused shared expert needs all six shared tensors.")
             inputs.extend(shared_inputs)
         if not tactic_autotune:
-            # Opt-OUT (default; serving never opts in): skip the AutoTuner.
+            # Opt-OUT (default): skip the AutoTuner.
             # ``choose_one`` is NOT a safe no-op -- in tuning mode a cache miss
-            # materializes the multi-GiB scratch and MERGE-sweeps every
-            # candidates. tactic=-1 guarantees deterministic default selection
+            # materializes the multi-GiB scratch and sweeps every candidate
+            # in lockstep. tactic=-1 guarantees deterministic default selection
             # with no tuning collectives, even inside a global autotune().
             try:
                 runner(
@@ -4148,7 +4245,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 runner._helper_ready_flags = None
             return
         tuner = AutoTuner.get()
-        # Opt-IN: in tuning mode the MERGE lockstep sweep runs (made safe by
+        # Opt-IN: in tuning mode the COLLECTIVE lockstep sweep runs (made safe by
         # the tactic-change fence in forward); outside it choose_one is a pure
         # cache lookup (tuned tactic, or -1 -> deterministic default selection).
         # Profiling must use SYMMETRIC cross-rank buffers (the transient
@@ -4182,11 +4279,22 @@ if IS_MEGAMOE_OP_AVAILABLE:
             runner._profiling_scratch_factory = prof_factory
             prof_peer_offsets = peer_offsets
             prof_shared_workspace = shared_workspace
+        tuning_config = runner.get_tuning_config()
+        if world_size > 1:
+            # Tuning runs over the EP group; serving replays only the entries
+            # every EP rank agreed on while tuning (or the default on all).
+            group = _megamoe_tuning_group(world_size)
+            ep_config = runner.__dict__.get("_ep_tuning_config")
+            if ep_config is None or ep_config.process_group is not group:
+                ep_config = runner._ep_tuning_config = dataclasses.replace(
+                    tuning_config, process_group=group
+                )
+            tuning_config = ep_config
         try:
             _, best_tactic = tuner.choose_one(
                 _megamoe_tuning_op_name(runner.helper_expert_count),
                 [runner],
-                runner.get_tuning_config(),
+                tuning_config,
                 inputs,
                 peer_offsets=prof_peer_offsets,
                 shared_workspace=prof_shared_workspace,
@@ -4195,6 +4303,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
         finally:
             runner._profiling_scratch = None
             runner._profiling_scratch_factory = None
+        restage = _ACTIVE_MEGAMOE_DIRECT_INPUT_RESTAGE
+        if restage is not None and not runner.reads_inputs_locally(best_tactic):
+            # The backend took the caller's inputs directly, which only a kernel reading
+            # them locally may consume; this tactic's kernel reads peers' inputs.
+            inputs[:4] = restage()
         # Real run always uses the caller's staging buffer + peer_offsets.
         try:
             runner(

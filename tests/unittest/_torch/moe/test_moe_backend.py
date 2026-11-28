@@ -4848,10 +4848,11 @@ def test_nvfp4_streaming_refuses_pre_quant_scale_without_gating() -> None:
         )
 
 
-def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
+def test_megamoe_cutedsl_tuning_mode_keeps_the_chunk_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Profiling scratch is sized for the largest adaptive bucket.
+    # The opt-in tunes every bucket on scratch sized for it (bucket priming),
+    # so tuning launches the bucket serving would.
     monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
     moe = _make_megamoe_cutedsl_for_ctor_test()
     buckets = moe._maxt_buckets
@@ -4859,7 +4860,7 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
     small_hint = buckets[0]
     assert moe._select_launch_max_tokens(small_hint) == buckets[0]
     monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
-    assert moe._select_launch_max_tokens(small_hint) == buckets[-1]
+    assert moe._select_launch_max_tokens(small_hint) == buckets[0]
 
 
 @pytest.mark.cpu_only

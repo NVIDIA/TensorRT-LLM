@@ -89,8 +89,8 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 "or initialize torch.distributed before model build."
             )
         top_k = self.routing_method.experts_per_token
-        full_T = self._maxt_buckets[-1]
         self._profiling_scratch_provider_ref = None
+        self._profiling_scratch_kwargs = {}
         self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
             (
@@ -135,13 +135,13 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 shared_workspace_bytes=shared_workspace_bytes,
             )
             self._symm_providers[max_T] = provider
-            # AutoTuner profiling scratch: record only the request kwargs
-            # (full bucket only, matching tuning mode's forced top bucket);
-            # the multi-GiB allocation itself is deferred to the op's
-            # profiling pre-hook via the factory in ``_launch_megamoe_kernel``,
-            # so a process that never tunes never pays it.
-            if max_T == full_T and self.tactic_autotune:
-                self._profiling_scratch_kwargs = dict(
+            # AutoTuner profiling scratch: record only the request kwargs of
+            # each bucket (each bucket tunes on scratch sized for it); the
+            # multi-GiB allocation itself is deferred to the op's profiling
+            # pre-hook via the factory in ``_launch_megamoe_kernel``, so a
+            # process that never tunes never pays it.
+            if self.tactic_autotune:
+                self._profiling_scratch_kwargs[max_T] = dict(
                     process_group=self._ep_pg,
                     world_size=self.ep_size,
                     rank=self.ep_rank,
@@ -306,12 +306,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 raise RuntimeError(
                     "GLM MegaMoE direct stage does not match the lockstep launch bucket"
                 )
-            if (
-                self.ep_size > 1
-                and not self.tactic_autotune
-                and _MEGAMOE_PRIME_LADDER
-                and AutoTuner.get().is_tuning_mode
-            ):
+            if self.ep_size > 1 and _MEGAMOE_PRIME_LADDER and AutoTuner.get().is_tuning_mode:
                 self._prime_ladder(
                     live_T=launch_max_T,
                     weight_view=kwargs["weight_view"],

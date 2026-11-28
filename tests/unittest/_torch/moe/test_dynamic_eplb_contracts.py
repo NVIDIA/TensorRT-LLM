@@ -1962,9 +1962,7 @@ def test_megamoe_tuning_config_is_built_once_per_runner():
             "TuningConfig": tuning_config,
             "DynamicTensorSpec": lambda *args: args,
             "ConstraintSpec": lambda *args: args,
-            "DistributedTuningStrategy": SimpleNamespace(MERGE="merge"),
-            "get_last_power_of_2_num_tokens_buckets": None,
-            "last_positive_power_of_2": None,
+            "DistributedTuningStrategy": SimpleNamespace(COLLECTIVE="collective"),
             "_megamoe_autotune_num_tokens": None,
         },
     )
@@ -1974,6 +1972,9 @@ def test_megamoe_tuning_config_is_built_once_per_runner():
 
     config = first.get_tuning_config()
     assert first.get_tuning_config() is config
+    # One profile per capacity bucket, tuned collectively across the EP ranks.
+    assert config.dynamic_tensor_specs == ((0, 0, (8192,)),)
+    assert config.distributed_tuning_strategy == "collective"
     # The profiling pre-hook stays bound to the runner that built the config.
     assert config.inputs_pre_hook.__self__ is first
     assert second.get_tuning_config().inputs_pre_hook.__self__ is second

@@ -3948,3 +3948,552 @@ def test_tensor_spec_remakes_the_storage_a_view_reads(monkeypatch):
     assert torch.equal(remade, view)
     assert remade.untyped_storage().nbytes(
     ) == view.numel() * view.element_size()
+
+
+@pytest.mark.parametrize("strategy,builds_in_pool", [
+    (DistributedTuningStrategy.INDEPENDENT, True),
+    (DistributedTuningStrategy.MERGE, False),
+    (DistributedTuningStrategy.COLLECTIVE, False),
+])
+def test_collective_runners_never_build_in_worker_processes(
+        monkeypatch, strategy, builds_in_pool):
+    """MERGE and COLLECTIVE runners launch kernels that span the ranks, so their builds never go
+    to the rank's worker processes, even for an op that sets ``use_build_pool_in_warmup`` while
+    the workers take builds."""
+    from tensorrt_llm._torch import build_pool
+
+    monkeypatch.setattr(build_pool.BuildPool, "accepting", lambda self: True)
+    config = TuningConfig(distributed_tuning_strategy=strategy,
+                          use_build_pool_in_warmup=True)
+    assert bool(AutoTuner()._builds_in_pool(config)) == builds_in_pool
+
+
+@pytest.mark.parametrize("strategy, expect_pool", [
+    pytest.param(DistributedTuningStrategy.INDEPENDENT,
+                 True,
+                 marks=pytest.mark.skipif(
+                     not torch.cuda.is_available(),
+                     reason="the thread pool runs on CUDA")),
+    (DistributedTuningStrategy.COLLECTIVE, False),
+])
+def test_collective_ops_never_run_the_parallel_jit_warmup(
+        monkeypatch, strategy, expect_pool):
+    """A COLLECTIVE op launches one kernel across its group's ranks, so the thread-pool JIT
+    warmup, which would launch it outside the ranks' lockstep, never runs it, even with
+    TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP set."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", "4")
+    ThreadRecordingRunner.calls.clear()
+    device = "cuda" if expect_pool else "cpu"
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (4, 8, 16, 32)), ),
+                          distributed_tuning_strategy=strategy)
+    inputs = [
+        torch.randn(32, 8, device=device),
+        torch.randn(8, 16, device=device)
+    ]
+    tuner = AutoTuner()
+    tuner._parallel_jit_warmup("autotuner_test::collective_jit_warmup",
+                               [ThreadRecordingRunner()],
+                               tuner._optimization_profiles(config, inputs),
+                               inputs, config)
+    assert bool(ThreadRecordingRunner.calls) == expect_pool
+
+
+class _ThreadGroup:
+    """All-gathers across the threads of a test, one thread per simulated rank.
+
+    A rank left waiting by a peer that raised gets BrokenBarrierError after the
+    timeout.
+    """
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self._barrier = threading.Barrier(size, timeout=30)
+        self._slots: List[Any] = [None] * size
+
+    def allgather(self, rank: int, obj: Any) -> List[Any]:
+        self._slots[rank] = obj
+        self._barrier.wait()
+        gathered = list(self._slots)
+        self._barrier.wait()
+        return gathered
+
+
+class _ThreadGroupDist:
+    """The Distributed calls the autotuner makes, for one rank of a _ThreadGroup."""
+
+    def __init__(self, group: _ThreadGroup, rank: int) -> None:
+        self.group, self.rank = group, rank
+
+    def tp_cp_allgather(self, obj, **kwargs):
+        return self.group.allgather(self.rank, obj)
+
+    def tp_barrier(self):
+        self.group.allgather(self.rank, None)
+
+
+_SIMULATED_RANK = threading.local()
+
+
+def _run_ranks(group: _ThreadGroup, fn) -> tuple:
+    """fn(rank) on one thread per rank of ``group``: (per-rank results, per-rank errors)."""
+    results, errors = [None] * group.size, [None] * group.size
+
+    def target(rank: int) -> None:
+        _SIMULATED_RANK.rank = rank
+        try:
+            results[rank] = fn(rank)
+        except Exception as e:  # noqa: BLE001 - reported to the test
+            errors[rank] = e
+
+    threads = [
+        threading.Thread(target=target, args=(rank, ))
+        for rank in range(group.size)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    assert not any(thread.is_alive() for thread in threads), "a rank hung"
+    return results, errors
+
+
+class _CollectiveRunner(TunableRunner):
+    """Fixed candidate tactics; forward does no work."""
+
+    def __init__(self, tactics, fallback: Any = -1) -> None:
+        self.tactics, self.fallback = list(tactics), fallback
+
+    def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+        return list(self.tactics)
+
+    def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+        return inputs[0]
+
+    def fallback_tactic(self, inputs, profile, **kwargs):
+        return self.fallback
+
+    def unique_id(self):
+        return ("collective_test", )
+
+
+def _time_by_rank(monkeypatch: pytest.MonkeyPatch, times: dict) -> list:
+    """Make profiling return times[rank][tactic] (an Exception there is raised).
+
+    Returns the (rank, tactic) pairs profiled, in order.
+    """
+    profiled = []
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        rank = _SIMULATED_RANK.rank
+        profiled.append((rank, tactic))
+        value = times[rank][tactic]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    return profiled
+
+
+def _collective_tuner(group: _ThreadGroup, rank: int) -> AutoTuner:
+    tuner = autotuner.AutoTuner()
+    tuner.setup_distributed_state(Mapping(world_size=group.size,
+                                          rank=rank,
+                                          tp_size=group.size),
+                                  dist=_ThreadGroupDist(group, rank))
+    tuner.is_tuning_mode = True
+    return tuner
+
+
+_COLLECTIVE_INPUTS = [torch.zeros(8, 64)]
+
+
+def _tune_on_ranks(monkeypatch, times, *, strategy, runners=None, op=None):
+    """choose_one on every rank of a 2-rank group; (results, errors, tuners, profiled)."""
+    group = _ThreadGroup(len(times))
+    profiled = _time_by_rank(monkeypatch, times)
+    tuners = [_collective_tuner(group, rank) for rank in range(group.size)]
+    runners = runners or [
+        _CollectiveRunner(sorted(times[0])) for _ in range(group.size)
+    ]
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+    op = op or f"autotuner_test::collective_{strategy.value}"
+
+    def tune(rank):
+        return tuners[rank].choose_one(op, [runners[rank]], config,
+                                       _COLLECTIVE_INPUTS)[1]
+
+    results, errors = _run_ranks(group, tune)
+    return results, errors, tuners, profiled
+
+
+@pytest.mark.parametrize("strategy,expected", [
+    (DistributedTuningStrategy.MERGE, 1),
+    (DistributedTuningStrategy.COLLECTIVE, 2),
+])
+def test_collective_keeps_the_tactic_whose_slowest_rank_is_fastest(
+        monkeypatch, strategy, expected):
+    """A kernel spanning the ranks takes as long as its slowest rank. MERGE
+    keeps the fastest rank-local winner (tactic 1, 0.5 ms on rank 0 but 2 ms
+    on rank 1); COLLECTIVE keeps tactic 2, whose slowest rank takes 0.95 ms."""
+    times = {0: {0: 1.0, 1: 0.5, 2: 0.9}, 1: {0: 1.0, 1: 2.0, 2: 0.95}}
+    results, errors, tuners, profiled = _tune_on_ranks(monkeypatch,
+                                                       times,
+                                                       strategy=strategy)
+    assert errors == [None, None]
+    assert results == [expected, expected]
+    # Every rank timed the same tactics in the same order.
+    assert [t for r, t in profiled if r == 0] == [0, 1, 2]
+    assert [t for r, t in profiled if r == 1] == [0, 1, 2]
+    if strategy == DistributedTuningStrategy.COLLECTIVE:
+        # One persisted winner on every rank, scored by its slowest rank.
+        entries = [list(t.profiling_cache.cache.values()) for t in tuners]
+        assert entries == [[(0, 2, 0.95)], [(0, 2, 0.95)]]
+
+
+@pytest.mark.parametrize(
+    "fallback,fallback_ms,expected",
+    [
+        (0, 1.004, 0),  # within COLLECTIVE_TIE_RTOL of the best: kept
+        (0, 1.006, 1),  # slower by more: the best, the earliest of a tie
+        (-1, 1.004, 1),  # no fallback among the candidates
+    ])
+def test_collective_ties_break_toward_the_fallback_then_list_order(
+        monkeypatch, fallback, fallback_ms, expected):
+    rank_times = {0: fallback_ms, 1: 1.0, 2: 1.0}
+    runners = [_CollectiveRunner([0, 1, 2], fallback) for _ in range(2)]
+    results, errors, _, _ = _tune_on_ranks(
+        monkeypatch, {
+            0: dict(rank_times),
+            1: dict(rank_times)
+        },
+        strategy=DistributedTuningStrategy.COLLECTIVE,
+        runners=runners)
+    assert errors == [None, None]
+    assert results == [expected, expected]
+
+
+def test_collective_excludes_a_tactic_failing_on_any_rank(monkeypatch):
+    """Tactic 1 is fastest on rank 0 but fails on rank 1: no rank keeps it."""
+    times = {
+        0: {
+            0: 1.0,
+            1: 0.2,
+            2: 0.9
+        },
+        1: {
+            0: 1.0,
+            1: RuntimeError("launch failed"),
+            2: 0.95
+        }
+    }
+    results, errors, tuners, profiled = _tune_on_ranks(
+        monkeypatch, times, strategy=DistributedTuningStrategy.COLLECTIVE)
+    assert errors == [None, None]
+    assert results == [2, 2]
+    assert sorted(profiled) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+
+
+def test_collective_ranks_must_time_the_same_candidates(monkeypatch):
+    """Lists that differ would leave the ranks in different collective
+    launches: every rank raises before timing any."""
+    runners = [_CollectiveRunner([0, 1, 2]), _CollectiveRunner([1, 0, 2])]
+    times = {rank: {0: 1.0, 1: 1.0, 2: 1.0} for rank in range(2)}
+    results, errors, _, profiled = _tune_on_ranks(
+        monkeypatch,
+        times,
+        strategy=DistributedTuningStrategy.COLLECTIVE,
+        runners=runners)
+    assert all(
+        isinstance(e, RuntimeError) and "same candidates" in str(e)
+        for e in errors), errors
+    assert profiled == []
+
+
+def _seed_entries(tuners, runners, op, tactics):
+    """Cache tactics[rank] (None: no entry) on each rank for the test inputs."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+    shapes = tuple(tuners[0]._get_input_sizes(_COLLECTIVE_INPUTS))
+    for tuner, runner, tactic in zip(tuners, runners, tactics):
+        if tactic is not None:
+            key = tuner.profiling_cache.get_cache_key(op, runner, shapes,
+                                                      config)
+            tuner.profiling_cache[key] = (0, tactic, 1.0)
+
+
+@pytest.mark.parametrize("seeded,expected_profiled", [
+    ((1, 1), False),
+    ((0, None), True),
+])
+def test_collective_cache_hit_needs_the_same_entry_on_every_rank(
+        monkeypatch, seeded, expected_profiled):
+    """A hit on every rank with one tactic is used as is; a miss on any rank
+    tunes again on every rank."""
+    group = _ThreadGroup(2)
+    times = {rank: {0: 1.0, 1: 0.5, 2: 0.9} for rank in range(2)}
+    profiled = _time_by_rank(monkeypatch, times)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1, 2]) for _ in range(2)]
+    op = "autotuner_test::collective_cache_hit"
+    _seed_entries(tuners, runners, op, seeded)
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(op, [runners[rank]], config,
+                                                    _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [1, 1]
+    assert bool(profiled) == expected_profiled
+
+
+def test_collective_cache_hit_with_different_tactics_tunes_again(monkeypatch):
+    """Ranks that loaded different caches would launch mismatched kernels: the
+    entry counts as a miss on every rank, all tune it again and keep one tactic."""
+    group = _ThreadGroup(2)
+    profiled = _time_by_rank(monkeypatch,
+                             {rank: {
+                                 0: 1.0,
+                                 1: 0.5
+                             }
+                              for rank in range(2)})
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1]) for _ in range(2)]
+    op = "autotuner_test::collective_cache_mismatch"
+    _seed_entries(tuners, runners, op, (0, 1))
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(op, [runners[rank]], config,
+                                                    _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [1, 1]
+    assert sorted(profiled) == [(0, 0), (0, 1), (1, 0), (1, 1)]
+    entries = [list(t.profiling_cache.cache.values()) for t in tuners]
+    assert entries[0] == entries[1] == [(0, 1, 0.5)]
+
+
+def test_collective_agreement_check_drops_entries_the_ranks_disagree_on():
+    """Disagreeing entries of other shapes are dropped on every rank, so each
+    misses everywhere and is tuned again before it is served."""
+    group = _ThreadGroup(2)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1]) for _ in range(2)]
+    op = "autotuner_test::collective_cache_drop"
+    _seed_entries(tuners, runners, op, (0, 1))
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+    _, errors = _run_ranks(
+        group,
+        lambda rank: tuners[rank]._check_collective_agreement(op, config))
+    assert errors == [None, None]
+    assert [len(t.profiling_cache.cache) for t in tuners] == [0, 0]
+
+
+class _NoCollectives:
+    """A Distributed whose every call fails the test: serving must not communicate."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"inference called dist.{name}")
+
+
+def _serve(tuners, runners, op, inputs_by_rank, config=None):
+    """Serving lookups (tuning off, communication forbidden) on every rank."""
+    config = config or TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+    tactics = []
+    for rank, tuner in enumerate(tuners):
+        tuner.is_tuning_mode = False
+        tuner._dist = _NoCollectives()
+        tactics.append(
+            tuner.choose_one(op, [runners[rank]], config,
+                             inputs_by_rank[rank])[1])
+    return tactics
+
+
+def test_collective_inference_lookup_is_local(monkeypatch):
+    """Serving lookups never communicate and replay the entry the ranks agreed
+    on while tuning."""
+    group = _ThreadGroup(2)
+    _time_by_rank(monkeypatch, {rank: {0: 1.0, 1: 0.5} for rank in range(2)})
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1]) for _ in range(2)]
+    op = "autotuner_test::collective_inference"
+    _seed_entries(tuners, runners, op, (1, 1))
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+    # The tuning pass finds the entry on every rank and agrees on it.
+    _, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(op, [runners[rank]], config,
+                                                    _COLLECTIVE_INPUTS))
+    assert errors == [None, None]
+    assert _serve(tuners, runners, op, [_COLLECTIVE_INPUTS] * 2) == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "seeded",
+    [
+        (1, None),  # one rank loaded the entry, the other did not
+        (0, 1),  # the ranks loaded different (stale) entries
+        (1, 1),  # the same entry, but never agreed on while tuning
+    ])
+def test_collective_inference_without_an_agreed_entry_falls_back_on_every_rank(
+        seeded):
+    """Without a tuning pass that agreed on the entry, every rank serves the
+    fallback (the same kernel), whatever each rank's cache holds."""
+    tuners = [_collective_tuner(_ThreadGroup(2), rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1]) for _ in range(2)]
+    op = "autotuner_test::collective_unagreed"
+    _seed_entries(tuners, runners, op, seeded)
+    assert _serve(tuners, runners, op, [_COLLECTIVE_INPUTS] * 2) == [-1, -1]
+
+
+def test_collective_inference_with_unequal_and_zero_live_rows(monkeypatch):
+    """Rows that map to the one tuned bucket (here 8, 3 and 0 on three ranks) are
+    served the tactic the ranks agreed on for it, without communicating."""
+    group = _ThreadGroup(3)
+    _time_by_rank(monkeypatch, {rank: {0: 1.0, 1: 0.5} for rank in range(3)})
+    tuners = [_collective_tuner(group, rank) for rank in range(3)]
+    runners = [_CollectiveRunner([0, 1]) for _ in range(3)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, (8, ), map_to_tuning_buckets=lambda x: 8), ),
+        tune_max_num_tokens=8)
+    op = "autotuner_test::collective_live_rows"
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(op, [runners[rank]], config,
+                                                    _COLLECTIVE_INPUTS)[1])
+    assert errors == [None] * 3
+    assert results == [1, 1, 1]
+    rows = [torch.zeros(8, 64), torch.zeros(3, 64), torch.zeros(0, 64)]
+    assert _serve(tuners, runners, op, [[r] for r in rows], config) == [1, 1, 1]
+
+
+class _FakeProcessGroup:
+    """Stands for a torch.distributed process group of a _ThreadGroup."""
+
+    def __init__(self, group: _ThreadGroup) -> None:
+        self.group = group
+        self.barriers = [0] * group.size
+
+
+def _route_torch_distributed(monkeypatch, process_group: _FakeProcessGroup):
+    """torch.distributed calls on ``process_group`` go to its _ThreadGroup."""
+
+    def all_gather_object(out, obj, group=None):
+        assert group is process_group
+        out[:] = group.group.allgather(_SIMULATED_RANK.rank, obj)
+
+    def barrier(group=None):
+        assert group is process_group
+        group.barriers[_SIMULATED_RANK.rank] += 1
+        group.group.allgather(_SIMULATED_RANK.rank, None)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object",
+                        all_gather_object)
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    monkeypatch.setattr(torch.distributed,
+                        "get_world_size",
+                        lambda group=None: group.group.size)
+    monkeypatch.setattr(torch.distributed,
+                        "get_rank",
+                        lambda group=None: _SIMULATED_RANK.rank)
+
+
+def test_collective_tunes_across_its_process_group(monkeypatch):
+    """With a process group the op tunes across it, whatever the tuning
+    group: here the TP group is a single rank and no Distributed is set."""
+    group = _ThreadGroup(2)
+    process_group = _FakeProcessGroup(group)
+    _route_torch_distributed(monkeypatch, process_group)
+    times = {0: {0: 1.0, 1: 0.5, 2: 0.9}, 1: {0: 1.0, 1: 2.0, 2: 0.95}}
+    _time_by_rank(monkeypatch, times)
+    tuners = []
+    for _ in range(2):
+        tuner = autotuner.AutoTuner()
+        tuner.setup_distributed_state(Mapping(), dist=None)
+        tuner.is_tuning_mode = True
+        tuners.append(tuner)
+    runners = [_CollectiveRunner([0, 1, 2]) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        process_group=process_group)
+    op = "autotuner_test::collective_process_group"
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(op, [runners[rank]], config,
+                                                    _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [2, 2]
+    # The barrier before each timed loop runs over the process group too.
+    _, errors = _run_ranks(
+        group, lambda rank: tuners[rank]._collective_barrier(config))
+    assert errors == [None, None]
+    assert process_group.barriers == [1, 1]
+
+
+def _raise_on(monkeypatch, failing: set) -> list:
+    """Profiling raises for the (rank, tactic) pairs in ``failing``, else returns 1 ms (0.5 ms
+    for tactic 1); returns the (rank, tactic) pairs profiled."""
+    profiled = []
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        rank = _SIMULATED_RANK.rank
+        profiled.append((rank, tactic))
+        if (rank, tactic) in failing:
+            raise RuntimeError(f"rank {rank} failed tactic {tactic}")
+        return 0.5 if tactic == 1 else 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    return profiled
+
+
+class _RefusingRunner(_CollectiveRunner):
+    """Refuses to build ``tactic`` on ``rank`` (prepare_tactic raises there)."""
+
+    def __init__(self, tactics, rank, tactic) -> None:
+        super().__init__(tactics, fallback=0)
+        self.refused = (rank, tactic)
+
+    def prepare_tactic(self, inputs, tactic, **kwargs):
+        if (_SIMULATED_RANK.rank, tactic) == self.refused:
+            raise ValueError("tactic refused on this rank")
+
+
+def test_collective_build_failure_on_one_rank_skips_the_tactic_everywhere(
+        monkeypatch):
+    """A rank that cannot build a tactic says so before any rank launches it:
+    no rank times it, and all keep the same tactic."""
+    profiled = _raise_on(monkeypatch, set())
+    group = _ThreadGroup(2)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_RefusingRunner([0, 1, 2], rank=1, tactic=1) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(
+            "autotuner_test::collective_build_failure", [runners[rank]], config,
+            _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [0, 0]
+    assert sorted(profiled) == [(0, 0), (0, 2), (1, 0), (1, 2)]
+
+
+def test_collective_failure_of_every_candidate_serves_the_fallback(monkeypatch):
+    """When no candidate runs on every rank, no entry is agreed and every rank
+    serves the fallback."""
+    _raise_on(monkeypatch, {(0, 0), (1, 1)})
+    group = _ThreadGroup(2)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1], fallback=0) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+    op = "autotuner_test::collective_all_fail"
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(op, [runners[rank]], config,
+                                                    _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [-1, -1]
+    assert _serve(tuners, runners, op, [_COLLECTIVE_INPUTS] * 2,
+                  config) == [-1, -1]

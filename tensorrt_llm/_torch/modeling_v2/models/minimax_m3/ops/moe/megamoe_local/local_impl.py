@@ -393,8 +393,9 @@ class TrtllmCutedslMegaMoeLocalNvfp4Impl(SharedExpertPlanMixin, TrtllmCutedslMeg
             for t in (x, router_logits, bias, scale)
         ):
             return "a tensor is not on the activation's CUDA device"
-        # The first AutoTuner.get() builds the tuner, which needs a CUDA device.
-        if self.tactic_autotune or AutoTuner.get().is_tuning_mode:
+        # The first AutoTuner.get() builds the tuner, which needs a CUDA device. Tuning-mode
+        # launches stage every input, with the tactic autotune opt-in or without.
+        if AutoTuner.get().is_tuning_mode:
             return "autotuning"
         if scale.dtype != torch.float32 or scale.numel() < 1:
             return "the input scale is not a float32 tensor"

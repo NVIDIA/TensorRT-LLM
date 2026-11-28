@@ -73,7 +73,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -707,9 +707,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self.combine_format = combine_format
 
         # AutoTuner tactic-sweep opt-in via MEGAMOE_TACTIC_AUTOTUNE=1
-        # (bench-only knob; default OFF so serving warmup never pays the
-        # MERGE lockstep sweep). Must be set identically on ALL ranks (it
-        # gates collective tuning behavior).
+        # (default OFF so warmup never pays the lockstep sweep). Must be set
+        # identically on ALL ranks (it gates collective tuning behavior).
         self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
 
         # The FP8 shared expert runs inside the fused kernel once fuse_shared_expert succeeds.
@@ -805,7 +804,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # goes dead (no per-module teardown). Materialized lazily by the
         # deferred factory in ``_launch_megamoe_kernel``.
         self._profiling_scratch_provider_ref = None
-        self._profiling_scratch_kwargs = None
+        # Profiling scratch request kwargs per ladder bucket (opt-in only).
+        self._profiling_scratch_kwargs: Dict[int, dict] = {}
         # Cute views of this module's weights, reused across launches.
         self._cute_weight_cache: Dict[tuple, Any] = {}
         self._weights_loaded = False
@@ -857,8 +857,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         Every EP rank derives the same architecture-specific ladder (divergence
         breaks the cross-rank NVLink barrier). Rubin adds generation-phase
-        rungs through 1024; Blackwell keeps the existing 256/1024/4096 ladder.
-        Kept small -- each rung multiplies the compile/capture/memory surface.
+        buckets through 1024; Blackwell keeps the existing 256/1024/4096 ladder.
+        Kept small -- each bucket multiplies the compile/capture/memory surface.
         """
         full = int(max_num_tokens)
         if full <= 0:
@@ -879,14 +879,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         the chunk (rank-identical) or ``None`` (-> full bucket); input and
         ladder rank-identical => bucket rank-identical, so all ranks launch
         the same compiled kernel against same-sized symmetric buffers.
-
-        Tuning mode with the ``tactic_autotune`` opt-in ALWAYS takes the top
-        bucket (profiling scratch and tuned-cache keys are sized/keyed for
-        it); both gates are rank-identical so the bucket stays lockstep.
         """
         buckets = self._maxt_buckets
-        if self.tactic_autotune and AutoTuner.get().is_tuning_mode:
-            return buckets[-1]
         if chunk_max_tokens is None or chunk_max_tokens <= 0:
             return buckets[-1]
         for b in buckets:
@@ -901,6 +895,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             f"min(moe_max_num_tokens, max_num_tokens)). Raise moe_max_num_tokens or "
             f"reduce the per-rank chunk."
         )
+
+    def _autotune_profiling(self) -> bool:
+        """Whether launches now run under the opt-in's tuning mode: they then stage every input,
+        skipping the fused route+quant and direct-input paths."""
+        return self.tactic_autotune and AutoTuner.get().is_tuning_mode
 
     def set_adaptive_launch_tokens(self, chunk_max_tokens: Optional[int]) -> None:
         """Scheduler hook: record the lockstep per-chunk cross-rank max token
@@ -1276,8 +1275,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 "or initialize torch.distributed before model build."
             )
         top_k = self.routing_method.experts_per_token
-        full_T = self._maxt_buckets[-1]
         self._profiling_scratch_provider_ref = None
+        self._profiling_scratch_kwargs = {}
         self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
             (
@@ -1325,13 +1324,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 ugpu_weight_layout=self._ugpu_weight_layout,
             )
             self._symm_providers[max_T] = provider
-            # AutoTuner profiling scratch: record only the request kwargs
-            # (full bucket only, matching tuning mode's forced top bucket);
-            # the multi-GiB allocation itself is deferred to the op's
-            # profiling pre-hook via the factory in ``_launch_megamoe_kernel``,
-            # so a process that never tunes never pays it.
-            if max_T == full_T and self.tactic_autotune:
-                self._profiling_scratch_kwargs = dict(
+            # AutoTuner profiling scratch: record only the request kwargs of
+            # each bucket (each bucket tunes on scratch sized for it); the
+            # multi-GiB allocation itself is deferred to the op's profiling
+            # pre-hook via the factory in ``_launch_megamoe_kernel``, so a
+            # process that never tunes never pays it.
+            if self.tactic_autotune:
+                self._profiling_scratch_kwargs[max_T] = dict(
                     process_group=self._ep_pg,
                     world_size=self.ep_size,
                     rank=self.ep_rank,
@@ -1521,7 +1520,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     def _route_quant_bucket(self, num_tokens: int, top_k: int, device, output_dtype):
         """The chosen launch bucket's (ids, weights, activation, scales) when the fused launch can
         write them directly, else None."""
-        if self._active_launch_max_tokens is None or self.tactic_autotune or num_tokens == 0:
+        if self._active_launch_max_tokens is None or self._autotune_profiling() or num_tokens == 0:
             return None
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
         if num_tokens > launch_max_T or launch_max_T in self._genphase_direct_input_buckets:
@@ -1992,6 +1991,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         launch_max_T: int,
         replica_plan=None,
         staged_inputs: bool = False,
+        restage: Optional[Callable[[], Tuple[torch.Tensor, ...]]] = None,
     ) -> torch.Tensor:
         """Launch the fused MegaMoE CuteDSL kernel and return its reduced output.
 
@@ -2002,7 +2002,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         :func:`_as_fp8_sf` helpers (the kernel rejects raw uint8 byte
         tensors). ``staged_inputs`` states that activation, activation_sf,
         topk_idx and topk_weights are this bucket's launch buffers, whose cute
-        views the op may then reuse.
+        views the op may then reuse. ``restage`` (opt-in launches with direct
+        inputs) stages them into those buffers and returns them, for a tactic
+        whose kernel cannot take direct inputs.
         """
         # Hand the symmetric profiling scratch (or a deferred factory) to the
         # op for tuning-mode profiling launches; cleared in the ``finally`` so
@@ -2012,21 +2014,23 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             run_cute_dsl_megamoe_nvfp4_blackwell,
             set_active_megamoe_cute_buffer_cache,
             set_active_megamoe_cute_weight_cache,
+            set_active_megamoe_direct_input_restage,
             set_active_megamoe_profiling_scratch,
             set_active_megamoe_profiling_scratch_factory,
+            set_active_megamoe_tuning_group,
         )
 
+        scratch_kwargs = self._profiling_scratch_kwargs.get(launch_max_T)
         scratch_provider = (
             self._profiling_scratch_provider_ref()
             if self._profiling_scratch_provider_ref is not None
             else None
         )
+        if scratch_provider is not None and scratch_provider.max_tokens_per_rank != launch_max_T:
+            # The live scratch is another bucket's; this bucket tunes on its own.
+            scratch_provider = None
         scratch_factory = None
-        if (
-            scratch_provider is None
-            and self._profiling_scratch_kwargs is not None
-            and world_size > 1
-        ):
+        if scratch_provider is None and scratch_kwargs is not None and world_size > 1:
             if AutoTuner.get().is_tuning_mode:
                 # Tuning but no live provider (lazy-only, or an earlier
                 # engine's release freed it): hand a DEFERRED factory -- a
@@ -2038,8 +2042,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     get_megamoe_profiling_scratch,
                 )
 
-                def _deferred_scratch_factory(_self=self, _get=get_megamoe_profiling_scratch):
-                    provider = _get(**_self._profiling_scratch_kwargs)
+                def _deferred_scratch_factory(
+                    _self=self, _get=get_megamoe_profiling_scratch, _kwargs=scratch_kwargs
+                ):
+                    provider = _get(**_kwargs)
                     _self._profiling_scratch_provider_ref = weakref.ref(provider)
                     return provider.get_regions()
 
@@ -2079,6 +2085,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             else None
         )
         set_active_megamoe_profiling_scratch_factory(scratch_factory)
+        # An opt-in launch tunes across the EP group its kernel spans.
+        set_active_megamoe_tuning_group(self._ep_pg if self.tactic_autotune else None)
+        set_active_megamoe_direct_input_restage(restage)
         # READY generation comes only from the caller-owned replica plan.
         # Helper-free launches (OFF and internal bucket priming) keep the
         # M-shaped allocation but compile out the READY gate with S=0.
@@ -2163,6 +2172,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             # global alive (its closure strongly references this module).
             set_active_megamoe_profiling_scratch(None)
             set_active_megamoe_profiling_scratch_factory(None)
+            set_active_megamoe_tuning_group(None)
+            set_active_megamoe_direct_input_restage(None)
             set_active_megamoe_cute_weight_cache(None)
             set_active_megamoe_cute_buffer_cache(None)
         if num_tokens == 0:
@@ -2184,11 +2195,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """Warm-up: launch every other adaptive bucket once with zero live tokens.
 
         Each bucket owns a compiled kernel, a local workspace and a one-time
-        barrier fence; serving never autotunes this op, so without this the
-        first chunk landing in a new bucket pays ``cute.compile`` inside a
-        serving iteration on every EP rank at once. Zero live tokens is the
-        existing scheduler-invariant path (``topk_idx == -1`` everywhere); the
-        ladder, the tuning-mode gate and the done-set are rank-identical.
+        barrier fence; serving never tunes, so without this the first chunk
+        landing in a new bucket pays ``cute.compile`` inside a serving
+        iteration on every EP rank at once. With the ``tactic_autotune``
+        opt-in each of these launches is also where its bucket is tuned, in
+        ladder order on every rank. Zero live tokens is the existing
+        scheduler-invariant path (``topk_idx == -1`` everywhere); the ladder,
+        the tuning-mode gate and the done-set are rank-identical.
         """
         key = (
             tuple(self._maxt_buckets),
@@ -2275,6 +2288,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 output_dtype=output_dtype,
                 launch_max_T=max_T,
             )
+            if self.tactic_autotune:
+                # Free this bucket's profiling scratch before the next bucket
+                # tunes, so the peak is one bucket's. Every rank primes the
+                # same buckets in the same order.
+                from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+                    release_megamoe_profiling_scratch,
+                )
+
+                torch.cuda.current_stream().synchronize()
+                release_megamoe_profiling_scratch()
             primed.append(max_T)
 
     def _run_moe(
@@ -2337,12 +2360,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if num_tokens == 0 and self.ep_size == 1:
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
-        if (
-            self.ep_size > 1
-            and not self.tactic_autotune
-            and _MEGAMOE_PRIME_LADDER
-            and AutoTuner.get().is_tuning_mode
-        ):
+        if self.ep_size > 1 and _MEGAMOE_PRIME_LADDER and AutoTuner.get().is_tuning_mode:
             self._prime_ladder(
                 live_T=launch_max_T,
                 weight_view=weight_view,
@@ -2374,7 +2392,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         use_direct_inputs = (
             not inputs_staged
             and self.ep_size > 1
-            and not self.tactic_autotune
+            and not self._autotune_profiling()
+            and (not self.tactic_autotune or replica_plan is None)
             and num_tokens == launch_max_T
             and launch_max_T in self._genphase_direct_input_buckets
             and x.shape == bufs.activation.shape
@@ -2419,6 +2438,28 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 act_buffer=bufs.activation,
                 sf_buffer=bufs.activation_sf,
             )
+        restage = None
+        if use_direct_inputs and self.tactic_autotune:
+            # A tuned tactic can run a kernel that reads peers' inputs from symmetric memory; the
+            # op then stages the direct inputs into this bucket's buffers first.
+            def restage():
+                stage_megamoe_inputs(
+                    topk_idx,
+                    topk_weights,
+                    bufs.topk_idx_local,
+                    bufs.topk_weights,
+                    x=x,
+                    x_sf=x_sf,
+                    act_buffer=bufs.activation,
+                    sf_buffer=bufs.activation_sf,
+                )
+                return (
+                    bufs.activation,
+                    bufs.activation_sf,
+                    bufs.topk_idx_local,
+                    bufs.topk_weights[:, :top_k],
+                )
+
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,
             activation_sf=x_sf if use_direct_inputs else bufs.activation_sf,
@@ -2440,6 +2481,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             replica_plan=replica_plan,
             # Direct routing inputs imply direct activation inputs.
             staged_inputs=not use_direct_inputs,
+            restage=restage,
         )
 
 
