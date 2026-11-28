@@ -260,7 +260,8 @@ def test_supports_steady_decode_step_follows_the_policy(monkeypatch):
         (None, True),
         ("per_layer", False),
         ("expansion", False),
-        ("width", False),
+        ("width", False),  # host and destination tables of different widths (4 and 8)
+        ("alignment", False),  # both 6 wide: not a multiple of the 4-entry copy
         ("override", False),
     ],
 )
@@ -272,11 +273,12 @@ def test_plain_copy_detection(monkeypatch, change, plain):
             pass
 
     manager = Manager()
-    width = 6 if change == "width" else 8
+    width = 6 if change == "alignment" else 8
+    host_width = 4 if change == "width" else width
     manager._use_per_layer_page_tables = change == "per_layer"
     manager._page_table_materializer = SimpleNamespace(uses_device_expansion=change == "expansion")
     manager.kv_cache_type = None
-    manager.host_kv_cache_block_offsets = torch.zeros((2, 4, 2, width), dtype=torch.int32)
+    manager.host_kv_cache_block_offsets = torch.zeros((2, 4, 2, host_width), dtype=torch.int32)
     manager._stream = SimpleNamespace(cuda_stream=0)
     if change == "override":
         Manager.copy_batch_block_offsets = lambda self, *a, **k: None
