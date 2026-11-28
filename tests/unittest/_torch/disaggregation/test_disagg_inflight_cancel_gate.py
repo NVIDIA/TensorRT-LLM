@@ -57,6 +57,7 @@ def _reset_inflight_cancel_env_cache(monkeypatch):
 def _make_timeout_request(request_id=7, in_progress=False):
     return SimpleNamespace(
         is_attention_dp_dummy=False,
+        is_generation_only_request=True,
         py_kv_transfer_timed_out=True,
         py_request_id=request_id,
         is_disagg_generation_transmission_in_progress=in_progress,

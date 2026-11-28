@@ -43,6 +43,7 @@ def _make_stub_executor(rank=0, queued_items=None):
     stub.request_accumulated = []
     stub.active_requests = []
     stub.canceled_req_ids = []
+    stub._timed_out_receive_ids = frozenset()
     stub._disable_mpi = False
     stub.is_shutdown = False
     # Iteration stats off: the idle wait publishes no heartbeats.

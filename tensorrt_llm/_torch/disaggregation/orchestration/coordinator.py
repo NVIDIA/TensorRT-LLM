@@ -270,8 +270,11 @@ class DisaggTransferCoordinator:
         self._transceiver.prepare_context_requests(gen_first_ctx_requests)
 
     @nvtx_range("poll_gen_transfers")
-    def poll_gen_transfers(self) -> None:
-        """Poll receive-side transfers and their timeouts; rank-synchronized."""
+    def poll_gen_transfers(self) -> List[int]:
+        """Poll receive-side transfers and their timeouts; rank-synchronized.
+
+        Returns the receives rank 0 timed out in a batch that cancels by consensus, for the executor to broadcast.
+        """
         if getattr(self._transceiver, "can_admit_ctx_requests", True) is False:
             # Continue the existing send outcome exchange after the last failed
             # request retires, so recovery can reopen context admission while idle.
@@ -279,7 +282,7 @@ class DisaggTransferCoordinator:
         if not uses_async_gen_transfer():
             if self._transceiver.reap_sync_receives():
                 self._check_transfer_errors("generation requests")
-            return
+            return []
         if self._defer_unready_gen_receives:
             self._publish_ready_gen_receives()
         # Gen-transfer status performs cross-rank consensus internally. Enter
@@ -289,27 +292,46 @@ class DisaggTransferCoordinator:
         if self.inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
-        else:
-            self._retire_legacy_timed_out_gen_transfers()
+            return []
+        return self._retire_legacy_timed_out_gen_transfers()
 
-    def _retire_legacy_timed_out_gen_transfers(self) -> None:
+    def _retire_legacy_timed_out_gen_transfers(self) -> List[int]:
         """Progress expired receives without requiring a runnable model batch.
 
         A successful legacy cancel authorizes memory release; a refused or
         failed cancel must be retried with the request and its KV still held.
         Multi-rank ADP publishes failures at the existing loop-head error vote.
+        A replicated batch that cancels by consensus returns rank 0's timed-out
+        receives instead (see ``poll_gen_transfers``).
         """
         timeout_ms = self._transceiver.kv_transfer_timeout_ms
         if timeout_ms is None:
-            return
+            return []
         canceled_ids = set(self._registry.canceled_request_ids())
+        # Read on the first receive that needs it: a batch of decodes alone pays nothing.
+        consensus = None
+        timed_out = []
         retired = False
         poll_index = self._legacy_retire_poll_index
         self._legacy_retire_poll_index = poll_index + 1
         for request in list(self._registry.active_requests()):
-            if not request.is_generation_only_request or self._vote_id(request) in canceled_ids:
+            vote_id = self._vote_id(request)
+            if not request.is_generation_only_request or vote_id in canceled_ids:
                 continue
-            if request.is_disagg_generation_transmission_in_progress:
+            in_transfer = request.is_disagg_generation_transmission_in_progress
+            if not in_transfer and not request.py_kv_transfer_timed_out:
+                continue
+            if consensus is None:
+                consensus = self.requires_gen_cancellation_consensus
+            if consensus:
+                # Retiring on its own clock would leave this rank's batch apart from its peers'. A broadcast
+                # retirement is in the cancelled IDs by the next poll.
+                if self._dist.rank == 0 and in_transfer and vote_id not in timed_out:
+                    self._flag_transfer_timeout(request, "generation", timeout_ms)
+                    if request.py_kv_transfer_timed_out:
+                        timed_out.append(vote_id)
+                continue
+            if in_transfer:
                 self._flag_transfer_timeout(request, "generation", timeout_ms)
             if (
                 not request.py_kv_transfer_timed_out
@@ -332,6 +354,7 @@ class DisaggTransferCoordinator:
                 self._legacy_retire_retry[request_id] = poll_index + _LEGACY_RETIRE_RETRY_INTERVAL
         if retired:
             self._check_transfer_errors("generation requests")
+        return timed_out
 
     def _describe_transfer_timeout(self, request: LlmRequest) -> str:
         """Get optional native progress only when an existing deadline expires.
@@ -1648,8 +1671,8 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         return None
 
-    def poll_gen_transfers(self) -> None:
-        return None
+    def poll_gen_transfers(self) -> List[int]:
+        return []
 
     def poll_progress_when_idle(self, batch_is_empty: bool = False) -> None:
         return None
