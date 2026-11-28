@@ -113,7 +113,10 @@ one shuts down.
 
 With `report_dir` set, the directory is created readable by its owner only
 (mode 0700) and each report file likewise (0600). Each report goes to its own
-file, named by rank, process, UTC time and tag. Each process keeps the
+file, named by rank, process, UTC time and tag. Startup and periodic reports
+are single JSON records, logged on one line and saved as JSON Lines
+(`.jsonl`, one record per file). OOM reports, including a startup failure
+classified as OOM, are logged and saved as readable text (`.log`). Each process keeps the
 newest 100 periodic reports it wrote and deletes older ones; files from
 earlier processes are left alone. Logs from
 several ranks interleave and are often cut short when a job dies; the files
@@ -141,7 +144,7 @@ cannot detach an observer, so it stays attached and is made inert.
 
 ## Asking for a report
 
-`LLM.get_memory_report()` (also on `AsyncLLM`) returns one entry per rank,
+`LLM.get_memory_report()` (also on `AsyncLLM`) returns one JSON-compatible dictionary per rank,
 rank 0 first, in every mode. Under the default MPI executor the other ranks
 send their reports only in full mode; otherwise their entries say that they
 were not gathered.
@@ -152,7 +155,52 @@ from tensorrt_llm import LLM
 with LLM(model="Qwen/Qwen2-0.5B-Instruct") as llm:
     llm.generate(["Hello"])
     for report in llm.get_memory_report():
-        print(report)
+        if report["status"] == "ok":
+            print(report["rank"], report["groups"].get("kv_cache"))
+        else:
+            print(report["rank"], report["reason"])
+```
+
+The HTTP response contains the same records in its `reports` array. A successful
+record includes the rank, PID, CUDA device, sampling start time (`timestamp_ns`, integer
+nanoseconds since the Unix epoch), byte counts by group, allocator readings,
+component entries and checks. To preserve the exact timestamp, use a JSON
+parser that supports 64-bit integers.
+Group identifiers such as `kv_cache` and `weights` are independent of the display
+labels. All numeric memory measurements are in bytes, including pool sizes,
+startup plan and step readings, and signed changes. On a startup failure,
+`failed_stage` contains the recorded step and its readings, with `free_after`
+set to null. When no failed step was recorded, `failed_stage` is null.
+Missing measurements are null or absent; zero is a measured value.
+When NVML cannot measure this process, `process_used_bytes` is null and
+`accounted_bytes_is_upper_bound` identifies the device-wide fallback.
+An unavailable rank has `status: "unavailable"` and a `reason`. Consumers that
+previously parsed a text report should read these fields directly.
+
+For example, a TP=2 server in full mode could return the following records.
+This excerpt shows two groups per rank with illustrative byte counts.
+
+```json
+{
+  "reports": [
+    {
+      "rank": 0,
+      "status": "ok",
+      "groups": {
+        "weights": 17179869184,
+        "kv_cache": 32212254720
+      }
+    },
+    {
+      "rank": 1,
+      "status": "ok",
+      "groups": {
+        "weights": 17179869184,
+        "kv_cache": 32212254720
+      }
+    }
+  ]
+}
 ```
 
 Outside full mode, the report has no startup-step

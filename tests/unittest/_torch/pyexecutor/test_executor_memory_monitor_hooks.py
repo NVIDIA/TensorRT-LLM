@@ -422,8 +422,8 @@ def test_a_late_report_request_says_the_ranks_are_shutting_down(teardown):
     executor._release_memory_monitor()
 
     assert executor.gather_memory_reports() == [
-        "rank 1: not gathered; shutting down",
-        "rank 2: not gathered; shutting down",
+        triggers.unavailable_report(1, "not gathered; shutting down"),
+        triggers.unavailable_report(2, "not gathered; shutting down"),
     ]
 
 
@@ -444,12 +444,13 @@ def test_a_full_mode_executor_without_rank_reports_says_why(mode):
     (line,) = executor.gather_memory_reports()
 
     if mode == "full":
-        assert line == (
-            "rank 1: not gathered; MPI does not provide MPI_THREAD_MULTIPLE, "
+        assert line["rank"] == 1 and line["status"] == "unavailable"
+        assert line["reason"] == (
+            "not gathered; MPI does not provide MPI_THREAD_MULTIPLE, "
             "which the ranks' report listeners need"
         )
     else:
-        assert "mode='full'" in line
+        assert "mode='full'" in line["reason"]
 
 
 def test_an_unmonitored_executor_says_why_it_has_no_reports(monkeypatch):
@@ -464,12 +465,20 @@ def test_an_unmonitored_executor_says_why_it_has_no_reports(monkeypatch):
     executor._memory_monitor_released = False
     executor._disable_mpi = False
     executor.dist = SimpleNamespace(rank=0, world_size=2)
-    expected = f"rank 1: {providers.NOT_MONITORED}"
-    assert executor.gather_memory_reports() == [expected]
+    rank_one = {
+        "tag": "on_demand",
+        "rank": 1,
+        "status": "unavailable",
+        "reason": providers.NOT_MONITORED,
+    }
+    assert executor.gather_memory_reports() == [rank_one]
 
     monkeypatch.setattr(triggers, "report_now", mock.Mock(side_effect=AssertionError("built")))
     worker = SimpleNamespace(engine=executor)
-    assert BaseWorker.get_memory_report(worker) == [f"rank 0: {providers.NOT_MONITORED}", expected]
+    assert BaseWorker.get_memory_report(worker) == [
+        {"tag": "on_demand", "rank": 0, "status": "unavailable", "reason": providers.NOT_MONITORED},
+        rank_one,
+    ]
 
 
 class _Comm:

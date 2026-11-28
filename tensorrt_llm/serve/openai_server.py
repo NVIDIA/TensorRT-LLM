@@ -4118,7 +4118,7 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=status.model_dump(mode="json"))
 
     async def memory_report(self) -> JSONResponse:
-        """Where each GPU worker's memory is going, as readable reports.
+        """Where each GPU worker's memory is going, as JSON records.
 
         See ``LLM.get_memory_report``. Concurrent requests share one
         in-flight gather rather than each asking every rank again.

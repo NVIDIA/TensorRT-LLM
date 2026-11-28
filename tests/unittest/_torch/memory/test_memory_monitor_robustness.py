@@ -317,7 +317,7 @@ def test_reports_are_written_to_files_when_asked(monkeypatch, tmp_path):
     text = triggers.report_now(tag="unit", rank=3)
     (path,) = list((tmp_path / "reports").iterdir())
     assert path.name.startswith(f"memory_rank3_pid{os.getpid()}_") and path.name.endswith(
-        "_unit.txt"
+        "_unit.log"
     )
     assert path.read_text().strip() == text.strip()
 

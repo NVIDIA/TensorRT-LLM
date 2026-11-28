@@ -47,7 +47,7 @@ class AsyncLLM(LLM):
             self._async_initialized = True
         return self
 
-    async def get_memory_report(self) -> list[str]:
+    async def get_memory_report(self) -> list[dict]:
         """Explain where each GPU worker's memory is going; see ``LLM.get_memory_report``."""
         replies = await self.collective_rpc("get_memory_report")
         return [report for reply in replies if reply for report in reply if report]

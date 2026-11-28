@@ -125,7 +125,7 @@ class RankReporter:
                 return False
         return True
 
-    def gather(self, timeout: float = _DEFAULT_TIMEOUT_S) -> list[str]:
+    def gather(self, timeout: float = _DEFAULT_TIMEOUT_S) -> list[dict]:
         """Reports from ranks 1..N-1, in rank order. Rank 0 only.
 
         Stops waiting as soon as :meth:`stop` is called; ranks not heard
@@ -135,15 +135,18 @@ class RankReporter:
             return []
         with self._gather_lock:
             if self._stop.is_set():
-                return [f"rank {r}: {_SHUTTING_DOWN}" for r in range(1, self._world_size)]
+                return [
+                    triggers.unavailable_report(r, _SHUTTING_DOWN)
+                    for r in range(1, self._world_size)
+                ]
             sequence = next(self._sequence)
             for dest in range(1, self._world_size):
                 self._comm.send(sequence, dest=dest, tag=_REQUEST_TAG)
-            replies: dict[int, str] = {}
+            replies: dict[int, dict] = {}
             deadline = time.monotonic() + timeout
             pending = set(range(1, self._world_size))
 
-            def current(reply: tuple[int, str | None]) -> bool:
+            def current(reply: tuple[int, dict | None]) -> bool:
                 # A reply to an earlier request that timed out is dropped.
                 return reply[0] == sequence
 
@@ -152,16 +155,16 @@ class RankReporter:
                     received, reply = try_recv(self._comm, source, _REPLY_TAG, current)
                     if not received:
                         continue
-                    replies[source] = reply[1] or f"rank {source}: the report could not be built"
+                    replies[source] = reply[1] or triggers.unavailable_report(
+                        source, "the report could not be built"
+                    )
                     pending.discard(source)
                 if pending:
                     self._stop.wait(_GATHER_POLL_S)
             stopped = self._stop.is_set()
             for source in pending:
-                replies[source] = (
-                    f"rank {source}: {_SHUTTING_DOWN}"
-                    if stopped
-                    else f"rank {source}: no report within {timeout:g} s"
+                replies[source] = triggers.unavailable_report(
+                    source, _SHUTTING_DOWN if stopped else f"no report within {timeout:g} s"
                 )
             if stopped:
                 # stop() could neither drain nor free while this gather held

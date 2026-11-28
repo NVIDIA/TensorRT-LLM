@@ -563,7 +563,7 @@ def startup_window(rank: int | None = None) -> Iterator[bool]:
                 "the startup breakdown is skipped so the error is delivered first"
             )
         elif not interrupted:
-            _log_window_result(snapshot, rank, failed=failed, out_of_memory=out_of_memory)
+            _log_window_result(rank, failed=failed, out_of_memory=out_of_memory)
 
 
 def _crash_kill_pending() -> bool:
@@ -587,38 +587,14 @@ def _is_out_of_memory(exc: BaseException) -> bool:
 
 
 def _log_window_result(
-    snapshot: TagSnapshot,
     rank: int | None = None,
     failed: bool = False,
     out_of_memory: bool = False,
 ) -> None:
-    """State what startup attributed, then emit the full startup breakdown.
-
-    The closing line names the totals -- or says that nothing was
-    attributed -- rather than leaving the first sign of trouble to be a
-    missing row in a report read much later.
-    """
-    try:
-        totals = live_bytes_by_tag(snapshot)
-        tagged = {k: v for k, v in totals.items() if k != UNTAGGED and v}
-        if tagged:
-            summary = ", ".join(
-                f"{name}={size / (1 << 20):.1f} MiB" for name, size in sorted(tagged.items())
-            )
-            logger.info(f"memory monitor: startup attribution -- {summary}")
-        elif not snapshot.supported:
-            logger.info("memory monitor: tagging unsupported here; torch-side rows will be absent")
-        else:
-            logger.warning(
-                "memory monitor: startup attributed no bytes; torch-side rows "
-                "will be absent rather than zero"
-            )
-    except Exception as exc:  # diagnostic boundary: never fail startup over a log line
-        logger.debug(f"memory monitor: startup summary failed ({type(exc).__name__}: {exc})")
-
+    """Emit the startup report once the allocation tags have been frozen."""
     # Imported here: ``triggers`` builds reports through ``capture``, which
     # reads this module's tags.
-    from .triggers import report_now
+    from .triggers import report_log_message, report_now
 
     tag_name = "startup_failed" if failed else "startup_complete"
     headline, suggestion = "", ""
@@ -644,7 +620,8 @@ def _log_window_result(
         suggestion=suggestion,
         advise=out_of_memory or not failed,
         startup_steps=True,
+        startup_oom=failed and out_of_memory,
     )
     if report is not None:
         log = logger.warning if failed else logger.info
-        log(f"memory monitor: {tag_name.replace('_', ' ')} breakdown\n{report}")
+        log(report_log_message(report))

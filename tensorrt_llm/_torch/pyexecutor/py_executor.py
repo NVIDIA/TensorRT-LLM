@@ -2533,7 +2533,7 @@ class PyExecutor:
         self._rank_reporter = RankReporter(mpi_comm().Dup(), self.dist.rank,
                                            self.dist.world_size, self.device_id)
 
-    def gather_memory_reports(self) -> list[str]:
+    def gather_memory_reports(self) -> list[dict]:
         """GPU memory reports of ranks 1..N-1, gathered by rank 0.
 
         Only rank 0 answers report requests under MPI. Without the monitor's
@@ -2549,26 +2549,30 @@ class PyExecutor:
             return []
         if self._memory_monitor_released:
             return [
-                f"rank {rank}: {RankReporter.SHUTTING_DOWN}"
+                monitor_triggers.unavailable_report(rank,
+                                                    RankReporter.SHUTTING_DOWN)
                 for rank in range(1, dist.world_size)
             ]
         token = self._memory_monitor_token
         if token is not None and not token.monitored:
             return [
-                f"rank {rank}: {monitor_providers.NOT_MONITORED}"
+                monitor_triggers.unavailable_report(
+                    rank, monitor_providers.NOT_MONITORED)
                 for rank in range(1, dist.world_size)
             ]
         if monitor_settings.full_mode_in(self.llm_args.memory_monitor_config):
             # Full mode with no reporter: _rank_reports_wanted declined it.
             return [
-                f"rank {rank}: not gathered; MPI does not provide "
-                "MPI_THREAD_MULTIPLE, which the ranks' report listeners need"
-                for rank in range(1, dist.world_size)
+                monitor_triggers.unavailable_report(
+                    rank,
+                    "not gathered; MPI does not provide MPI_THREAD_MULTIPLE, which the ranks' report listeners need"
+                ) for rank in range(1, dist.world_size)
             ]
         return [
-            f"rank {rank}: not gathered; run with memory_monitor_config.mode='full' "
-            "(or TLLM_MEM_MONITOR=1) to get every rank's report"
-            for rank in range(1, dist.world_size)
+            monitor_triggers.unavailable_report(
+                rank,
+                "not gathered; run with memory_monitor_config.mode='full' (or TLLM_MEM_MONITOR=1) to get every rank's report"
+            ) for rank in range(1, dist.world_size)
         ]
 
     def _release_memory_monitor(self) -> None:

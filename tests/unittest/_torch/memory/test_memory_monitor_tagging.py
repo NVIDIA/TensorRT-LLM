@@ -374,8 +374,7 @@ def test_startup_window(monkeypatch):
         m.setattr(tagging, "start_tagging_window", lambda: True)
         m.setattr(tagging, "freeze_tag_map", lambda: TagSnapshot(supported=True))
         m.setattr(tagging, "stop_tagging_window", lambda: order.append("stop"))
-        m.setattr(tagging, "live_bytes_by_tag", lambda s: order.append("read") or {})
         m.setattr(triggers, "report_now", lambda **kw: order.append("report"))
         with tagging.startup_window():
             pass
-        assert order.index("stop") < order.index("read") < order.index("report")
+        assert order.index("stop") < order.index("report")

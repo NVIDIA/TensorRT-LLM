@@ -30,7 +30,7 @@ from .capability import Capability
 from .checks import CheckResult
 from .frame import Frame, derived_entries
 from .schema import GIB, Category, Entry, Group, Placement
-from .summary import group_totals, render_summary
+from .summary import GroupTotals, group_totals, render_summary
 
 __all__ = ["render"]
 
@@ -75,6 +75,7 @@ def render(
     advice: dict[Group, str] | None = None,
     suggestion: str = "",
     startup_steps: bool = False,
+    totals: GroupTotals | None = None,
     unattributed_sites: dict[str, int] | None = None,
 ) -> str:
     """Render a human-readable report: a summary first, allocator detail after."""
@@ -100,7 +101,7 @@ def render(
     out.extend(
         render_summary(
             frame,
-            group_totals(frame),
+            totals if totals is not None else group_totals(frame),
             baseline=baseline,
             headline=headline,
             advice=advice,

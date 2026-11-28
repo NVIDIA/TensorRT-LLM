@@ -291,6 +291,7 @@ def test_plan_compares_against_the_kv_pools_only():
 
 def test_a_failure_not_about_memory_gets_no_advice():
     from tensorrt_llm._torch.memory.monitor.capture import MonitorCapture, render_capture
+    from tensorrt_llm._torch.memory.monitor.summary import group_totals
 
     pool = Entry(
         Category.KV_CACHE_POOL,
@@ -314,6 +315,9 @@ def test_a_failure_not_about_memory_gets_no_advice():
                     frame=frame,
                     capability=capability(),
                     tag="startup_failed",
+                    timestamp_ns=1,
+                    totals=group_totals(frame),
+                    startup_tagging_supported=False,
                     pid=1,
                     rank=0,
                     device_index=0,

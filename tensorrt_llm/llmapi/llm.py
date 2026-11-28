@@ -2048,8 +2048,8 @@ class _TorchLLM(BaseLLM):
         return normalized
 
     @set_api_status("prototype")
-    def get_memory_report(self) -> list[str]:
-        """Explain where the GPU workers' memory is going, as readable reports.
+    def get_memory_report(self) -> list[dict]:
+        """Explain where the GPU workers' memory is going, as JSON-compatible records.
 
         Each report splits one worker process's GPU memory by purpose (KV
         cache, weights, runtime buffers, CUDA graphs, communication buffers,
@@ -2063,19 +2063,20 @@ class _TorchLLM(BaseLLM):
         and every other rank is listed as not gathered.
 
         Returns:
-            list[str]: One entry per rank, rank 0 first: its report, or one
-            line saying why there is none (not gathered, not answered in
+            list[dict]: One record per rank, rank 0 first, with status and
+            byte counts, or a reason when unavailable (not gathered, not answered in
             time, or the report could not be built). With
             ``encode_only=True`` the encoder runs in this process, and the one
             entry is this process's report.
         """
         if self._encode_only:
-            from tensorrt_llm._torch.memory.monitor.triggers import report_now
+            from tensorrt_llm._torch.memory.monitor.triggers import (
+                report_now, unavailable_report)
 
-            report = report_now(tag="on_demand", force=True, save=False)
+            report = report_now(tag="on_demand", rank=0, force=True, save=False)
             return [
-                report or
-                "rank 0: the report could not be built; see this process's log"
+                report or unavailable_report(
+                    0, "the report could not be built; see this process's log")
             ]
         replies = self._collective_rpc("get_memory_report")
         return [
