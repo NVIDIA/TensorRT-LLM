@@ -251,6 +251,15 @@ def check_tables(views, ids: torch.Tensor, local_offset: int, num_local: int, ti
         return "a permuted index sits in another expert's CTA"
     if bool((perm >= cta_limit[perm // tile].to(torch.int64)).any()):
         return "a permuted index sits past its CTA's row limit"
+    # The rows the runner serves -- CTA c's rows from c * tile up to its limit -- are exactly
+    # the live permuted indices (in any order within a tile): a stale row below a limit would
+    # be served too.
+    served = [
+        torch.arange(c * tile, int(cta_limit[c]), dtype=torch.int64) for c in range(int(n_ctas[0]))
+    ]
+    served = torch.cat(served) if served else torch.empty(0, dtype=torch.int64)
+    if not torch.equal(served.sort().values, perm.sort().values):
+        return "the rows below the CTA limits are not exactly the live permuted indices"
     return ""
 
 
