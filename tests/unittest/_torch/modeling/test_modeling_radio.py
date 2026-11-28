@@ -1,4 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+import weakref
 from unittest import mock
 
 import pytest
@@ -9,8 +10,9 @@ from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel, VisionTransformer
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
-from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
+from tensorrt_llm._torch.utils import is_torch_compiling, model_extra_attrs, torch_compiling
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -337,6 +339,51 @@ def test_radio_blocks_cuda_graph_matches_eager_multi_context(tiny_vit_config):
     maybe_run.assert_called_once()
 
     torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("vision_attn_backend", ["FLASHINFER", "TRTLLM"])
+def test_radio_forward_under_breakable_cuda_graph_uses_tower_metadata(
+    tiny_vit_config, vision_attn_backend
+):
+    """An inline RADIO tower under the breakable graph flag keeps its own metadata.
+
+    The decoder's forward installs its metadata for registered attention layers;
+    RADIO attention must not pick it up.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    torch.manual_seed(0)
+    pixel_values = torch.randn(1, 3, 32, 32, device=device, dtype=dtype)
+
+    def build():
+        model = RADIOVisionModel(
+            _make_bf16_model_config(),
+            disable_quantization=True,
+            vision_attn_backend=vision_attn_backend,
+        )
+        return model.to(device).to(dtype).eval()
+
+    model = build()
+    # Its attention layers left the attention layer map.
+    assert not model.model_config.extra_attrs.get("attn_layers")
+    _init_finite_weights(model)
+    # Stand-in for the decoder's metadata: same backend, different length.
+    other_tower = build().radio_model.model
+    decoder_metadata = other_tower.prepare_attn_metadata(1, [4], other_tower.attn_metadata)
+    attrs = {
+        **model.model_config.extra_attrs,
+        "attention_metadata": weakref.ref(decoder_metadata),
+    }
+
+    with torch.inference_mode():
+        expected = model.forward(pixel_values).clone()
+        with model_extra_attrs(attrs), enable_breakable_cuda_graph():
+            actual = model.forward(pixel_values)
+    assert not expected.isnan().any(), "eager fixture produced NaN; tighten init"
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _make_temporal_model_config() -> model_config_lib.ModelConfig:

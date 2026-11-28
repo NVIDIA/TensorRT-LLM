@@ -125,6 +125,9 @@ class _CuBLASGemmRunner(TunableRunner):
     ) -> List[Any]:
         return [self._TACTIC]
 
+    def build(self, inputs: List[torch.Tensor], *, tactic: Any = -1, **kwargs: Any) -> None:
+        """Nothing to build: cuBLAS ships its kernels."""
+
     def forward(
         self,
         inputs: List[torch.Tensor],

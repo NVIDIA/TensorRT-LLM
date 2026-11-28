@@ -538,7 +538,7 @@ def test_index_k_cache_follows_the_config_sparse_layers(
     manager = MiniMaxM3KVCacheManagerV2(
         num_layers=5,
         spec_config=SimpleNamespace(spec_dec_mode=mode, _num_draft_hidden_layers=None),
-        sparse_attention_config=SimpleNamespace(
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
             implementation=implementation, indexer_kv_dtype="bf16"
         ),
         pretrained_config=_text_config([1, 0, 1, 1, 0]),

@@ -98,6 +98,8 @@ struct SparseCacheShape
     //! Sub-slots one page divides into. One when the life cycle has no fetch path, so the
     //! page and the unit coincide.
     int unitsPerPage = 1;
+    //! Whether a partially written unit is resident and written back each step.
+    bool includePartialUnits = false;
     //! Sparse buffers this life cycle has.
     int buffers = 0;
     //! Units a step selects per buffer.
@@ -470,6 +472,20 @@ public:
     [[nodiscard]] int sparseCacheUnitsPerPage(LifeCycleId lifeCycle) const noexcept
     {
         return _sparseCacheShape(lifeCycle).unitsPerPage;
+    }
+
+    //! Tokens in one selection unit of this life cycle's sparse cache: tokens_per_block
+    //! divided by sparseCacheUnitsPerPage.
+    [[nodiscard]] int sparseCacheUnitTokens(LifeCycleId lifeCycle) const noexcept
+    {
+        return config().tokensPerBlock / sparseCacheUnitsPerPage(lifeCycle);
+    }
+
+    //! Whether this life cycle's sparse cache holds a growing unit before it is complete,
+    //! restoring its prefix on reservation and writing back appended tokens on flush.
+    [[nodiscard]] bool sparseCacheIncludesPartialUnits(LifeCycleId lifeCycle) const noexcept
+    {
+        return _sparseCacheShape(lifeCycle).includePartialUnits;
     }
 
     //! Sparse buffers this life cycle has, one per (layer, role). Cells and cold-page

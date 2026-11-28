@@ -292,6 +292,15 @@ def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
 
 
+def sparse_cache_valid_chunks(kv_cache: Any, lc_id: int) -> list[int]:
+    """Chunk validity bitmask per sparse cache entry, in sparse_cache_resident_ordinals order.
+
+    Bit c is set when the entry's cell holds chunk c (for a head-major page, KV head c) of
+    its resident unit. Empty when the life cycle reserves no cache.
+    """
+    return list(_cpp().sparse_cache_valid_chunks(kv_cache, lc_id))
+
+
 def locality_domain_free_slots(manager: Any) -> list[int]:
     """Return the free GPU slot count per locality domain, summed over pool groups."""
     return list(_cpp().locality_domain_free_slots(manager))
@@ -435,6 +444,7 @@ def sparse_unit_copy(
     buffer_layer: list[int],
     write_back: bool = False,
     grid_ctas: int = 1,
+    miss_mask: list[int] | None = None,
 ) -> list[int]:
     """Move units between a caller-supplied cold pool and cache entries.
 
@@ -449,7 +459,10 @@ def sparse_unit_copy(
     layer share a list; its length is the number of buffers copied.
 
     ``grid_ctas`` is how many CTAs walk the compacted list. Only throughput depends on it,
-    so a result must not. Synchronises.
+    so a result must not.
+
+    ``miss_mask`` is parallel to ``miss_ordinal``: the chunks of each listed unit to move, one
+    bit per chunk. Omitted, every chunk moves. Synchronises.
     """
     return list(
         _cpp().sparse_unit_copy(
@@ -473,6 +486,7 @@ def sparse_unit_copy(
             buffer_layer,
             write_back,
             grid_ctas,
+            list(miss_mask or []),
         )
     )
 
@@ -582,6 +596,89 @@ def sparse_resolve(
         list(miss_total),
         list(miss_count),
         list(in_flight),
+    )
+
+
+class SparseChunkResolveResult(NamedTuple):
+    """What ``sparse_resolve_chunks`` leaves behind, laid out as ``sparse_resolve``'s results."""
+
+    resident_ordinal: list[int]
+    valid_chunks: list[int]
+    out_slot: list[int]
+    miss_row: list[int]
+    miss_ordinal: list[int]
+    miss_slot: list[int]
+    miss_mask: list[int]
+    miss_total: list[int]
+    copied_slices: int
+
+
+def sparse_resolve_chunks(
+    resident_ordinal: list[int],
+    entry_age: list[int],
+    num_layers: int,
+    entries_per_layer: int,
+    selected: list[int],
+    selection_width: int,
+    history_units: int | list[int],
+    capacity_units: int | list[int] = 0,
+    max_in_flight_units: int = 0,
+    inactive_rows: list[int] | None = None,
+    *,
+    unit_chunks: int = 1,
+    resident_valid: list[int] | None = None,
+    unit_mask: list[int] | None = None,
+) -> SparseChunkResolveResult:
+    """``sparse_resolve`` with per-chunk residency.
+
+    ``unit_chunks`` is the chunks per unit (KV heads for a head-major page).
+    ``resident_valid`` gives each starting entry's chunk bitmask, laid out like
+    ``resident_ordinal``; empty means every chunk. ``unit_mask`` gives the chunks each selected
+    unit is read through, laid out like ``selected``; empty means every chunk. A resident unit
+    lacking a named chunk is listed for that chunk alone; a missing unit is listed for the named
+    chunks. ``miss_mask`` carries each listed entry's chunks, parallel to ``miss_ordinal``.
+    Synchronises.
+    """
+    history = [history_units] if isinstance(history_units, int) else list(history_units)
+    if isinstance(capacity_units, int):
+        capacity = [max(capacity_units, h) for h in history]
+    else:
+        capacity = list(capacity_units)
+    (
+        resident,
+        valid,
+        out,
+        miss_row,
+        miss_ord,
+        miss_slot,
+        miss_mask,
+        miss_total,
+        copied,
+    ) = _cpp().sparse_resolve_chunks(
+        resident_ordinal,
+        entry_age,
+        num_layers,
+        entries_per_layer,
+        selected,
+        selection_width,
+        history,
+        capacity,
+        max_in_flight_units,
+        list(inactive_rows or []),
+        unit_chunks,
+        list(resident_valid or []),
+        list(unit_mask or []),
+    )
+    return SparseChunkResolveResult(
+        list(resident),
+        list(valid),
+        list(out),
+        list(miss_row),
+        list(miss_ord),
+        list(miss_slot),
+        list(miss_mask),
+        list(miss_total),
+        int(copied),
     )
 
 

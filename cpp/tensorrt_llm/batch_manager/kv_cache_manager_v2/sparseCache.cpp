@@ -43,12 +43,19 @@ size_t alignedBytes(size_t bytes) noexcept
 namespace
 {
 
-//! Bytes one lease's entry words take. Arrays shared by every lease of a life cycle live
-//! on the arena instead.
-size_t leaseBytes(SparseCacheInit const& shape)
+//! Bytes of one lease's entry words, which its validity bytes follow. Arrays shared by every
+//! lease of a life cycle live on the arena instead.
+size_t validOffsetBytes(SparseCacheInit const& shape)
 {
     auto const entries = static_cast<size_t>(shape.numSelections) * shape.entriesPerSelection;
     return alignedBytes(sizeof(uint32_t) * entries);
+}
+
+//! Bytes one lease's metadata takes: the entry words, then one validity byte per entry.
+size_t leaseBytes(SparseCacheInit const& shape)
+{
+    auto const entries = static_cast<size_t>(shape.numSelections) * shape.entriesPerSelection;
+    return validOffsetBytes(shape) + alignedBytes(entries);
 }
 
 } // namespace
@@ -74,6 +81,9 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
         "SparseCellArena requires one pool slot per buffer");
     TLLM_CHECK_WITH_INFO(shape.layerSelection.size() == static_cast<size_t>(shape.numLayers),
         "SparseCellArena requires one selection index per layer");
+    TLLM_CHECK_WITH_INFO(shape.unitChunks >= 1 && shape.unitChunks <= kMaxSparseUnitChunks,
+        "SparseCellArena: a unit has between 1 and %d chunks, since a validity byte holds one bit per chunk",
+        kMaxSparseUnitChunks);
     TLLM_CHECK_WITH_INFO(shape.entriesPerSelection % shape.cellsPerBuffer == 0,
         "SparseCellArena: cells must contain a whole number of selection units");
     auto const unitsPerCell = static_cast<uint64_t>(shape.entriesPerSelection / shape.cellsPerBuffer);
@@ -176,8 +186,11 @@ void SparseCellArena::initialiseLease(SparseLeaseIndex slot, CUstream stream)
     int const index = slot.value();
 
     auto const entries = static_cast<size_t>(mShape.numSelections) * static_cast<size_t>(mShape.entriesPerSelection);
-    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mMetadataBase + static_cast<size_t>(index) * mMetadataBytes),
-        SparseEntry::kFreeWord, entries, stream));
+    auto const lease = reinterpret_cast<CUdeviceptr>(mMetadataBase + static_cast<size_t>(index) * mMetadataBytes);
+    cuCheck(cuMemsetD32Async(lease, SparseEntry::kFreeWord, entries, stream));
+    // A free entry holds no chunk. Every admission also resets its entry's byte, so this
+    // is not what keeps a reassigned cell clean; it keeps the introspection reads honest.
+    cuCheck(cuMemsetD8Async(lease + validOffsetBytes(mShape), 0, entries, stream));
 }
 
 SparseArenaView SparseCellArena::view() const noexcept
@@ -185,6 +198,8 @@ SparseArenaView SparseCellArena::view() const noexcept
     SparseArenaView out;
     out.metadataBase = mMetadataBase;
     out.leaseStride = mMetadataBytes;
+    out.validOffset = validOffsetBytes(mShape);
+    out.unitChunks = mShape.unitChunks;
     out.bufferSlotInPool = mSharedSlotInPool;
     out.bufferLayer = mSharedLayer;
     out.layerSelection = mSharedLayerSelection;
@@ -192,6 +207,25 @@ SparseArenaView SparseCellArena::view() const noexcept
     out.numSelections = mShape.numSelections;
     out.entriesPerSelection = mShape.entriesPerSelection;
     return out;
+}
+
+std::vector<int32_t> SparseCellArena::peekValidChunks(SparseLeaseIndex slot) const
+{
+    CUstream const stream = nullptr;
+    if (empty() || slot == kNoSparseLease)
+    {
+        return {};
+    }
+    // Ordered the same way, and for the same reason, as peekResidentOrdinals().
+    cuCheck(cuCtxSynchronize());
+    auto const arena = view();
+    std::vector<uint8_t> bytes(static_cast<size_t>(arena.numEntries()));
+    cuCheck(cuMemcpyDtoHAsync(bytes.data(),
+        reinterpret_cast<CUdeviceptr>(
+            arena.metadataBase + static_cast<uint64_t>(slot.value()) * arena.leaseStride + arena.validOffset),
+        bytes.size(), stream));
+    cuCheck(cuStreamSynchronize(stream));
+    return std::vector<int32_t>(bytes.begin(), bytes.end());
 }
 
 std::vector<int32_t> SparseCellArena::peekResidentOrdinals(SparseLeaseIndex slot) const

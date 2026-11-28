@@ -564,9 +564,15 @@ class Router(ABC):
 
     async def renew_request(self,
                             request: OpenAIRequest,
-                            req_id: Optional[int] = None) -> None:
-        """Extend a request reservation when retrying a backend request."""
-        del request, req_id
+                            req_id: Optional[int] = None,
+                            timeout_s: Optional[float] = None) -> None:
+        """Extend a request reservation while the backend request is active."""
+        del request, req_id, timeout_s
+
+    @property
+    def reservation_renewal_interval_s(self) -> Optional[float]:
+        """Interval in seconds for renewing active stream reservations, or None."""
+        return None
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -2542,6 +2548,10 @@ class _CoordinatorFinishError(RuntimeError):
         self.status = status
 
 
+class ReservationNotFoundError(ValueError):
+    """Raised when renewing a coordinator reservation that is no longer active."""
+
+
 class CoordinatorDelegatingRouter(Router):
     """Worker-side Router that delegates placement to the disagg coordinator.
 
@@ -2591,14 +2601,16 @@ class CoordinatorDelegatingRouter(Router):
             maxsize=0 if self.pooled else COORDINATOR_FINISH_QUEUE_SIZE)
         self._finish_workers: set[asyncio.Task] = set()
         self._dropped_finishes = 0
-        self._pooled_finish_window_s = None
-        if self.pooled:
-            from tensorrt_llm.serve.disagg_coordinator import (
-                pooled_reservation_timeout, reservation_timeout)
-
-            # The coordinator's own expiry of the seat (it gets the same request timeout).
-            self._pooled_finish_window_s = pooled_reservation_timeout(
-                reservation_timeout(request_timeout_s=request_timeout_s))
+        from tensorrt_llm.serve.disagg_coordinator import (
+            pooled_reservation_timeout, reservation_timeout)
+        base_reservation_timeout = reservation_timeout(
+            request_timeout_s=request_timeout_s)
+        self._reservation_timeout_s: Optional[float] = (
+            pooled_reservation_timeout(base_reservation_timeout)
+            if self.pooled else base_reservation_timeout)
+        # The coordinator's own expiry of the seat (it gets the same request timeout).
+        self._pooled_finish_window_s = (self._reservation_timeout_s
+                                        if self.pooled else None)
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
@@ -2762,6 +2774,10 @@ class CoordinatorDelegatingRouter(Router):
         if body["server"] is None:
             raise ValueError(f"coordinator /select placed no {self._role} "
                              f"server: {info}")
+        lease_s = body.get("reservation_timeout_s")
+        if (isinstance(lease_s, (int, float)) and not isinstance(lease_s, bool)
+                and lease_s > 0):
+            self._reservation_timeout_s = float(lease_s)
         # Only ConversationRouter asks for content, and it never asks for a prediction.
         prediction = info.get(OUTPUT_LENGTH_KEY)
         if isinstance(prediction, dict):
@@ -2829,17 +2845,41 @@ class CoordinatorDelegatingRouter(Router):
                     f"coordinator expiration will release dropped requests "
                     f"(dropped={self._dropped_finishes})")
 
+    @property
+    def reservation_renewal_interval_s(self) -> Optional[float]:
+        """Renew active stream reservations well before coordinator expiry."""
+        if (self._reservation_timeout_s is None
+                or self._reservation_timeout_s <= 0):
+            return None
+        return self._reservation_timeout_s / 3.0
+
     async def renew_request(self,
                             request: OpenAIRequest,
-                            req_id: Optional[int] = None) -> None:
+                            req_id: Optional[int] = None,
+                            timeout_s: Optional[float] = None) -> None:
         req_id = self._request_id(request, req_id)
         payload = {"role": self._role, "req_id": req_id}
-        async with self.session.post(f"{self._coordinator_url}/renew",
-                                     data=msgpack.packb(payload,
-                                                        use_bin_type=True),
-                                     headers=_MSGPACK_HEADERS,
-                                     timeout=self._request_timeout_s) as resp:
+        renew_timeout = (
+            min(self._request_timeout_s, COORDINATOR_FINISH_TIMEOUT_S)
+            if self._request_timeout_s > 0 else COORDINATOR_FINISH_TIMEOUT_S)
+        if (self._reservation_timeout_s is not None
+                and self._reservation_timeout_s > 0):
+            # Cap each /renew attempt at one renewal interval (lease / 3) so a
+            # timed-out attempt still leaves room to back off and retry before expiry.
+            renew_timeout = min(renew_timeout,
+                                self._reservation_timeout_s / 3.0)
+        if timeout_s is not None and timeout_s > 0:
+            renew_timeout = min(renew_timeout, timeout_s)
+        async with self.session.post(
+                f"{self._coordinator_url}/renew",
+                data=msgpack.packb(payload, use_bin_type=True),
+                headers=_MSGPACK_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=renew_timeout)) as resp:
             body = msgpack.unpackb(await resp.read(), raw=False)
+            if resp.status == 404:
+                raise ReservationNotFoundError(
+                    f"coordinator /renew returned {resp.status}: "
+                    f"{body.get('error', body)}")
             if resp.status != 200:
                 raise ValueError(f"coordinator /renew returned {resp.status}: "
                                  f"{body.get('error', body)}")
@@ -2978,7 +3018,7 @@ def create_router(
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
-    extra_args = router_config.args if router_config else {}
+    extra_args = router_config.args.copy() if router_config else {}
     if extra_args.get("max_requests_per_server") is not None:
         if router_class is not LoadBalancingRouter:
             raise ValueError("max_requests_per_server needs the load_balancing "

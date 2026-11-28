@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from setuptools import find_namespace_packages, find_packages, setup
+from setuptools.command.build_py import build_py
 from setuptools.dist import Distribution
 
 
@@ -168,13 +169,14 @@ if constraints_file.exists():
 if on_windows:
     package_data = [
         'libs/th_common.dll', 'libs/tensorrt_llm.dll', 'bindings.*.pyd',
-        "include/**/*"
+        "include/**/*", 'libs/libth_visual_gen_*.dll'
     ]
 else:
     package_data = [
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
         'libs/libth_modeling_v2_*.so',
+        'libs/libth_visual_gen_*.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
@@ -203,6 +205,7 @@ else:
     ]
 
 package_data += [
+    'libs/visual_gen_native.json',
     'bindings/*.pyi',
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',
@@ -247,8 +250,72 @@ def download_precompiled(workspace: str, version: str) -> str:
         return wheel_path
 
 
+def is_visual_gen_native_artifact(name: str) -> bool:
+    return name == "visual_gen_native.json" or (
+        name.startswith("libth_visual_gen_") and name.endswith((".so", ".dll")))
+
+
+def stage_visual_gen_native_libs(src, dst: Path, *, link: bool = False) -> None:
+    """Stage the native manifest and its libraries from a directory or a zipfile.Path."""
+    import json
+    import shutil
+    import tempfile
+
+    manifest = src / "visual_gen_native.json"
+    names = []
+    if manifest.is_file():
+        libraries = {
+            entry["library"]
+            for entry in json.loads(manifest.read_text()).values()
+        }
+        for name in sorted(libraries):
+            if not re.fullmatch(r"libth_visual_gen_[A-Za-z0-9_]+\.(?:so|dll)",
+                                name):
+                raise ValueError(
+                    f"Invalid VisualGen library name {name!r} in {manifest}")
+            if not (src / name).is_file():
+                raise FileNotFoundError(
+                    f"Missing VisualGen library {src / name} listed in {manifest}"
+                )
+            names.append(name)
+        names.append(manifest.name)
+
+    if names:
+        dst.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=dst) as tmp:
+            for name in names:
+                target = Path(tmp) / name
+                if link:
+                    target.symlink_to((src / name).absolute())
+                elif isinstance(src, Path):
+                    shutil.copy2(src / name, target)
+                else:
+                    with (src /
+                          name).open("rb") as inp, target.open("wb") as out:
+                        shutil.copyfileobj(inp, out)
+            for name in names:
+                os.replace(Path(tmp) / name, dst / name)
+    if dst.is_dir():
+        for old in dst.iterdir():
+            if is_visual_gen_native_artifact(
+                    old.name) and old.name not in names:
+                old.unlink()
+
+
+class BuildPy(build_py):
+
+    def run(self):
+        super().run()
+        if not self.dry_run and not self.editable_mode:
+            # Incremental setuptools builds retain package data from earlier native configurations.
+            source = Path(self.get_package_dir("tensorrt_llm")) / "libs"
+            stage_visual_gen_native_libs(
+                source,
+                Path(self.build_lib) / "tensorrt_llm/libs")
+
+
 def should_skip_precompiled_package_data(filename: str) -> bool:
-    """Return True for source-owned package data kept from local checkout.
+    """Return True for package data handled separately from precompiled file globs.
 
     Precompiled wheels own native bits. Source owns configuration/telemetry schemas, the
     OpenEngine contract and the kernel sources compiled at run time. Skip those wheel files so
@@ -256,6 +323,10 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
     remain authoritative.
     """
     filename = filename.replace("\\", "/")
+    prefix = "tensorrt_llm/libs/"
+    if filename.startswith(prefix) and is_visual_gen_native_artifact(
+            filename[len(prefix):]):
+        return True
     if filename.startswith(
         ("tensorrt_llm/schemas/", "tensorrt_llm/usage/schemas/")):
         return filename.endswith(".json")
@@ -282,8 +353,9 @@ def warn_on_build_skew(precompiled_location: str) -> None:
         "setup.py",
         "scripts/build_wheel.py",
         "requirements.txt",
-        # modeling_v2 families keep their native code with their Python code.
-        ":(glob)tensorrt_llm/_torch/modeling_v2/models/**/csrc/**"
+        ":(glob)tensorrt_llm/_torch/modeling_v2/models/**/csrc/**",
+        ":(glob)tensorrt_llm/_torch/visual_gen/modeling_v2/catalog/**/csrc/**",
+        ":(glob)tensorrt_llm/_torch/visual_gen/modeling_v2/models/**/csrc/**",
     ]
 
     def head_of(checkout: str) -> str | None:
@@ -527,6 +599,9 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         else:
             print("Precompiled directory does not contain embedded NCCL-EP "
                   "packages; continuing without NCCL-EP.")
+        stage_visual_gen_native_libs(Path(source_tensorrt_llm) / "libs",
+                                     Path("tensorrt_llm/libs"),
+                                     link=link_artifacts)
         return
 
     # Handle local file or remote URL
@@ -636,6 +711,8 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                 f"Extracting and including {file.filename} from precompiled wheel."
             )
             wheel.extract(file)
+        stage_visual_gen_native_libs(zipfile.Path(wheel, "tensorrt_llm/libs/"),
+                                     Path("tensorrt_llm/libs"))
 
 
 precompiled: str | None = os.getenv("TRTLLM_USE_PRECOMPILED")
@@ -743,6 +820,7 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
+    cmdclass={"build_py": BuildPy},
     options=get_build_state_options(),
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",

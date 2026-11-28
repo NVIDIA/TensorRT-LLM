@@ -68,6 +68,8 @@ public:
     // one life cycle. Synchronises and copies back, so it is test-only. Empty when the
     // life cycle has no cache reserved.
     static std::vector<int32_t> sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId);
+    //! The chunks each entry holds, in the order of sparseCacheResidentOrdinals().
+    static std::vector<int32_t> sparseCacheValidChunks(KvCache const& kvCache, int lcId);
 
     // The first cell of this request's lease on the life cycle's arena;
     // nullopt when it holds none. A lease is one contiguous run, so its first cell
@@ -134,6 +136,12 @@ public:
         std::vector<int32_t> missTotal;    //!< [layer] entries the list holds
         std::vector<int32_t> missCount;    //!< [layer][row] entries that row contributed
         std::vector<int32_t> inFlightSlot; //!< [layer][maxInFlightUnits]
+        //! [layer][entry] the chunks each entry holds after the resolve, and the chunks the
+        //! compacted list asks the copy to move, parallel to missOrdinal.
+        std::vector<int32_t> validChunks;
+        std::vector<int32_t> missMask;
+        //! Chunk copies the resolve asked for, summed over the layers.
+        uint64_t copiedSlices = 0;
     };
 
     //! @param entryAge [layer][entry] steps since each entry's last use, as the state the
@@ -142,7 +150,8 @@ public:
     static SparseResolveProbe sparseResolve(std::vector<int32_t> const& residentOrdinal,
         std::vector<int32_t> const& entryAge, int numLayers, int entriesPerLayer, std::vector<int32_t> const& selected,
         int selectionWidth, std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits,
-        int maxInFlightUnits, std::vector<int32_t> const& inactiveRows);
+        int maxInFlightUnits, std::vector<int32_t> const& inactiveRows, int unitChunks = 1,
+        std::vector<int32_t> const& residentValid = {}, std::vector<int32_t> const& unitMask = {});
 
     // Run the sparse unit copy over caller-supplied pools, so the address
     // arithmetic can be checked against a known byte pattern. Returns the destination pool
@@ -152,7 +161,8 @@ public:
         int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
         uint32_t unitStride, int unitsPerPage, std::vector<int32_t> const& missOrdinal,
         std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
-        std::vector<int32_t> const& bufferLayer, bool writeBack, int gridCtas);
+        std::vector<int32_t> const& bufferLayer, bool writeBack, int gridCtas,
+        std::vector<int32_t> const& missMask = {});
 
     // The entries holding units a watermark move has just passed.
     // Synchronises.

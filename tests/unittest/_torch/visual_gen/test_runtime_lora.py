@@ -241,6 +241,23 @@ def test_runtime_lora_fuses_qkv_segments(tmp_path: Path) -> None:
     )
 
 
+def test_runtime_lora_applies_transformer_name_map(tmp_path: Path) -> None:
+    class NamedAdapterTransformer(TinyTransformer):
+        @staticmethod
+        def map_runtime_lora_names(names):
+            return {source: "proj" for source, alias in names.items() if alias == "source_proj"}
+
+    model = NamedAdapterTransformer()
+    tensors = {}
+    _add_rank_one_lora_pair(tensors, "model.diffusion_model.source_proj")
+    path = tmp_path / "adapter.safetensors"
+    save_file(tensors, str(path))
+    before = model.proj.weight.detach().clone()
+    report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(path)))
+    assert report.applied_modules == ("proj",)
+    torch.testing.assert_close(model.proj.weight, before + torch.tensor([[1.0, 0.0]]))
+
+
 def test_runtime_lora_maps_minimax_h3_turbo_names(tmp_path: Path) -> None:
     model = TinyMiniMaxH3Transformer()
     with torch.no_grad():

@@ -77,6 +77,7 @@ from tensorrt_llm.serve.router import (
     ROUTING_CONTENT_REQUIRED,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
+    ReservationNotFoundError,
     Router,
     build_disagg_routers,
 )
@@ -392,6 +393,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
             return pooled_reservation_timeout(self._reservation_timeout_secs)
         return self._reservation_timeout_secs
 
+    def reservation_timeout_for_role(self, role: str) -> float:
+        """Return the reservation lease timeout in seconds for ``role``."""
+        return self._reservation_timeout_for(self._router_for_role(role))
+
     async def _select_pooled(
         self,
         router: Router,
@@ -479,7 +484,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         async with self._reservation_lock(reservation_key):
             reservation = self._reservation_tasks.get(reservation_key)
             if reservation is None:
-                raise ValueError(
+                raise ReservationNotFoundError(
                     f"No active coordinator reservation for role={normalized_role}, req_id={req_id}"
                 )
             reservation.cancel()

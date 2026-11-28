@@ -288,7 +288,7 @@ def test_cache_manager_honors_executor_sparse_attention_config(
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", fake_get_index_k_buffer)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
-    sparse_config = SimpleNamespace(
+    sparse_config = MiniMaxM3SparseAttentionConfig.model_construct(
         sparse_index_dim=configured_sparse_index_dim,
         indexer_kv_dtype=indexer_kv_dtype,
     )
@@ -398,7 +398,9 @@ def test_index_k_views_are_fullgraph_safe(
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", resolve_index_view)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
-    config = SimpleNamespace(implementation=implementation, indexer_kv_dtype=indexer_kv_dtype)
+    config = MiniMaxM3SparseAttentionConfig.model_construct(
+        implementation=implementation, indexer_kv_dtype=indexer_kv_dtype
+    )
     managers = [
         MiniMaxM3KVCacheManagerV2(
             num_layers=61,
@@ -453,7 +455,11 @@ def test_index_k_views_are_fullgraph_safe(
 def test_cache_manager_rejects_non_positive_sparse_index_dim(sparse_index_dim: int) -> None:
     for kwargs in (
         {"sparse_index_dim": sparse_index_dim},
-        {"sparse_attention_config": SimpleNamespace(sparse_index_dim=sparse_index_dim)},
+        {
+            "sparse_attention_config": MiniMaxM3SparseAttentionConfig.model_construct(
+                sparse_index_dim=sparse_index_dim
+            )
+        },
     ):
         with pytest.raises(ValueError, match=r"sparse_index_dim must be greater than 0"):
             MiniMaxM3KVCacheManagerV2(num_layers=4, **kwargs)
@@ -576,6 +582,45 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch, nv
     index.fill_(3)
     torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
     torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
+
+
+@pytest.mark.cpu_only
+def test_msa_buffers_stage_no_views_for_offloaded_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offloaded layers' arenas belong to the cache manager, so no view of them is staged.
+
+    The compiled producer, the only reader of the staged views, never runs with offload.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    metadata = _buffer_metadata(
+        sparse_layer_ids=[3, 4],
+        layer_offsets={3: 0, 4: 1},
+        _enable_kv_cache_offload=True,
+        offloads_layer=lambda layer_idx: True,
+        is_nvfp4_layer=lambda layer_idx: True,
+    )
+    manager = metadata.kv_cache_manager
+    getters = (
+        "get_buffers",
+        "get_block_scale_buffers",
+        "get_sparse_arena_buffers",
+        "get_index_k_buffer",
+    )
+    for name in getters:
+        setattr(manager, name, Mock())
+    monkeypatch.setattr(
+        metadata,
+        "get_empty",
+        lambda buffers, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]),
+    )
+    # No native pool in this CPU test; only zero-copy cache-view staging is under test.
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+
+    metadata._create_msa_buffers()
+
+    assert metadata.msa_layer_cache_tensors == {}
+    for name in getters:
+        getattr(manager, name).assert_not_called()
 
 
 @pytest.mark.cpu_only
