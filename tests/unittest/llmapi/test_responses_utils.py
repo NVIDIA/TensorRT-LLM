@@ -85,5 +85,6 @@ async def test_store_response_trims_previous_response_conversation(monkeypatch):
 
     assert len(conversation) <= store.conversation_capacity
     assert (
-        store.response_to_conversation["resp_next"] == store.response_to_conversation["resp_prev"]
+        store.response_to_conversation["resp_next"] != store.response_to_conversation["resp_prev"]
     )
+    assert await store.get_conversation_history("resp_prev") == _turns(2)
