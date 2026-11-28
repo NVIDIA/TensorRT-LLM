@@ -193,6 +193,7 @@ class ScriptedStep:
 
     text: str = ""
     token_ids: tuple = ()
+    logprobs: tuple = ()  # one entry per token in token_ids, as the engine returns them
     finish_reason: Optional[str] = None  # set on the last step: "stop", "length", ...
     stop_reason: Optional[Union[int, str]] = None
     index: Optional[int] = None  # output index; None applies the step to every output
@@ -207,6 +208,7 @@ class ScriptedOutput:
     raise_after_steps: Optional[BaseException] = None  # raised once the steps are replayed
     hold_after_steps: bool = False  # wait until release(), abort() or cancellation
     prompt_token_ids: Optional[tuple] = None  # default: derived from the inputs
+    prompt_logprobs: Optional[tuple] = None  # what the engine returns for prompt_logprobs
 
 
 @dataclass
@@ -276,6 +278,9 @@ class ScriptedRequestOutput(GenerationResultBase):
                 self.prompt = None
         else:
             self.prompt_token_ids, self.prompt = _derive_prompt_fields(inputs, tokenizer)
+        if script.prompt_logprobs is not None:
+            for output in self._outputs:
+                output.prompt_logprobs = list(script.prompt_logprobs)
         self._pending = collections.deque(script.steps)
         self._release_event = asyncio.Event()
         self._after_steps_raised = False
@@ -310,6 +315,7 @@ class ScriptedRequestOutput(GenerationResultBase):
             output._last_logprobs_len = len(output.logprobs)
             output.text += step.text
             output.token_ids = list(output.token_ids) + list(step.token_ids)
+            output.logprobs = list(output.logprobs) + list(step.logprobs)
             if step.finish_reason is not None:
                 output.finish_reason = step.finish_reason
                 output.stop_reason = step.stop_reason
