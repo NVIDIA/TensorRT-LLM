@@ -445,9 +445,10 @@ public:
     //! stretches page moves between GPU and disk have issued on extra streams (pageStagingDepth > 1).
     struct PageStagingInfo
     {
-        size_t bytes{0};        //!< Ring size; 0 when no level needs one.
-        size_t depth{1};        //!< Stretches one move keeps in flight.
-        uint64_t laneChunks{0}; //!< Stretches issued on a move's extra streams so far.
+        size_t bytes{0};            //!< Ring size; 0 when no level needs one.
+        size_t depth{1};            //!< Stretches one move keeps in flight.
+        uint64_t laneChunks{0};     //!< Stretches issued on a move's extra streams so far.
+        uint64_t laneReadChunks{0}; //!< Those of them that moved pages from disk to GPU.
     };
 
     [[nodiscard]] PageStagingInfo pageStagingInfo() const noexcept;
@@ -727,6 +728,7 @@ private:
     // Ring stretches one page move between GPU and disk keeps in flight (StorageConfig::pageStagingDepth).
     size_t mPageStagingDepth = 1;
     uint64_t mPageStagingLaneChunks = 0;
+    uint64_t mPageStagingLaneReadChunks = 0;
     static constexpr size_t kMaxIndexBatchBytes = 64u << 10u;
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.
@@ -764,6 +766,11 @@ private:
     TypedVec<CacheLevel, bool> mKeepCopyAfterRestoreAt;   // per level: keepCopyAfterRestore of that disk tier
     TypedVec<CacheLevel, float> mProtectedCopyFractionAt; // per level: protectedCopyFraction of that disk tier
     TypedVec<CacheLevel, float> mFreeReserveFractionAt;   // per level: freeReserveFraction of that host tier
+    // Nonzero while _prepareFreeSlots must take only the slots asked for: a shrink's defragmentation (its overflow
+    // pages must stay at their level), or the retry of a preparation that the reserve's extra evictions failed.
+    int mFreeReserveSuppressed = 0;
+    // The current _prepareFreeSlots call evicted ahead of need for a reserve.
+    bool mFreeReserveApplied = false;
     //! Retained copies the pool group may hold ahead of pages whose only copy is at \p level.
     [[nodiscard]] SlotCount protectedCopyShare(CacheLevel level, PoolGroupIndex pgIdx) const;
     // Oldest first.

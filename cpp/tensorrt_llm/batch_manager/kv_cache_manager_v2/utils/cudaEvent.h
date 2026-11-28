@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -308,6 +309,53 @@ void configureBusyStreamSkip(size_t maxBusy) noexcept;
 
 //! Testing only: set the bound whatever was configured.
 void setBusyStreamSkipForTesting(size_t maxBusy) noexcept;
+
+//! Keeps a manager that runs GPU <-> disk page moves on several staging streams (pageStagingDepth > 1) registered
+//! for configureCopyStreams while it lives.
+class DeepPageStagingHold
+{
+public:
+    DeepPageStagingHold() noexcept = default;
+
+    DeepPageStagingHold(DeepPageStagingHold&& other) noexcept
+        : mActive(std::exchange(other.mActive, false))
+    {
+    }
+
+    DeepPageStagingHold& operator=(DeepPageStagingHold&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            mActive = std::exchange(other.mActive, false);
+        }
+        return *this;
+    }
+
+    DeepPageStagingHold(DeepPageStagingHold const&) = delete;
+    DeepPageStagingHold& operator=(DeepPageStagingHold const&) = delete;
+
+    ~DeepPageStagingHold()
+    {
+        release();
+    }
+
+    void release() noexcept;
+
+private:
+    friend DeepPageStagingHold configureCopyStreams(size_t busySkip, size_t pageStagingDepth);
+    bool mActive = false;
+};
+
+//! Applies a new manager's copyStreamBusySkip (configureBusyStreamSkip) and registers its pageStagingDepth. The skip
+//! is process-wide, and together with a depth above 1 it ran a context server out of GPU memory, so the two never
+//! meet in one process, whichever manager comes first: a depth above 1 is refused while a busy skip is in effect or
+//! asked for, and a nonzero skip while a manager with a depth above 1 lives. A refusal throws std::invalid_argument
+//! and changes nothing.
+[[nodiscard]] DeepPageStagingHold configureCopyStreams(size_t busySkip, size_t pageStagingDepth);
+
+//! Testing only: live managers with pageStagingDepth > 1.
+[[nodiscard]] size_t deepPageStagingManagersForTesting() noexcept;
 
 //! Testing only: busy pooled streams TemporaryCudaStream has skipped so far.
 [[nodiscard]] uint64_t busyStreamsSkippedForTesting() noexcept;
