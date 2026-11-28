@@ -194,6 +194,19 @@ def get_padding_support(attention_config: AttentionConfig) -> PaddingSupport:
     return PaddingSupport(supports_mask, supports_length, requires_trailing)
 
 
+def is_quant_excluded(recipe: QuantAttentionConfig, module_name: Optional[str]) -> bool:
+    """Match attention quantization exclusions against qualified and relative layer paths."""
+    if not recipe.ignore:
+        return False
+    if module_name is None:
+        raise ValueError("Attention ignore requires a module_name for matching layer paths.")
+    matcher = QuantConfig(exclude_modules=recipe.ignore)
+    relative_name = module_name.split(".", 1)[1] if "." in module_name else module_name
+    return matcher.is_module_excluded_from_quantization(
+        module_name
+    ) or matcher.is_module_excluded_from_quantization(relative_name)
+
+
 def create_attention(
     backend: str,
     layer_idx: int,
@@ -243,13 +256,10 @@ def create_attention(
     is_vsa = sparse_algorithm == "vsa"
     is_sol = sparse_algorithm == "sol_attn"
 
-    quant_attention_config = (
-        attention_config.quant_attention_config if attention_config is not None else None
-    )
-
+    recipe = getattr(attention_config, "quant_attention_config", None)
     backend_name = backend.upper()
     attn_cls = get_visual_gen_attention_backend(
-        backend_name, sparse_algorithm, get_quant_algorithm(quant_attention_config)
+        backend_name, sparse_algorithm, get_quant_algorithm(recipe)
     )
 
     if is_vsa:
@@ -263,8 +273,8 @@ def create_attention(
 
     # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, or the dense CuTe DSL
     # FMHA or DeCo-Attention backend.
-    if quant_attention_config is not None:
-        kwargs["quant_attention_config"] = quant_attention_config
+    if recipe is not None:
+        kwargs["quant_attention_config"] = recipe
     if backend_name == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(

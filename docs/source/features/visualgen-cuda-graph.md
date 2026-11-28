@@ -68,6 +68,10 @@ Subclasses can override `register_cuda_graph_extra_key_fns()` to add model-speci
 
 ## Capture and Replay
 
+Linear `ignore_steps` uses a separate graph runner for each Transformer instance.
+Attention `ignore_steps` adds the attention quantization state to the graph key.
+Warmup covers the configured combinations.
+
 Capture is lazy:
 
 1. On the first call with a new graph key, VisualGen runs a short warmup, captures a CUDA graph, and stores static input buffers for that key.

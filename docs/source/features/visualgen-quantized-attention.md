@@ -14,6 +14,7 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
 - [FP8 and MXFP8 in the cuDNN Backend](#fp8-and-mxfp8-in-the-cudnn-backend)
 - [MXFP8 and NVFP4 in the `CUTEDSL` and `FlashInfer` backends](#mxfp8-and-nvfp4-in-the-cutedsl-and-flashinfer-backends)
 - [DeCo-Attention in the `CUTEDSL` backend](#deco-attention-in-the-cutedsl-backend)
+- [Layer and step exclusions](#layer-and-step-exclusions)
 - [Interaction With Other Features](#interaction-with-other-features)
 
 ## Overview
@@ -79,6 +80,8 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | `vc_attention` | bool | `false` | Run the recipe as VC-Attention on the `TRTLLM` backend. See [VC-Attention in the `TRTLLM` backend](#vc-attention-in-the-trtllm-backend). |
 | `vc_repair_budget` | float in `[0, 1)` | `0.0` | Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means. `0` restores the means. `vc_attention` only. |
 | `deco_attention` | bool | `false` | Run the recipe as DeCo-Attention on the `CUTEDSL` backend. See [DeCo-Attention in the `CUTEDSL` backend](#deco-attention-in-the-cutedsl-backend). |
+| `ignore` | list of strings | `[]` | Attention module paths that keep their native BF16/FP16 dtype at every step. Uses the same patterns as Linear exclusions. |
+| `ignore_steps` | list of integers ≥ 0 | `[]` | Steps that use the selected backend's native BF16/FP16 attention for every layer. Step 0 is the first denoising step. |
 
 Routing (`tensorrt_llm/_torch/visual_gen/attention/backends/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and for `CUTEDSL` the dense `CuTeDSLAttention` FMHA backend, or `DeCoAttention` when `deco_attention` is set.
 
@@ -386,6 +389,50 @@ attention_config:
 ```
 
 For NVFP4 PV, set `v_dtype` to `nvfp4`.
+
+## Layer and step exclusions
+
+Use `ignore` for layer exclusions or `ignore_steps` for step exclusions under
+`attention_config.quant_attention_config` to exclude attention kernels from quantization.
+Excluded attention uses the selected backend's native BF16/FP16 path.
+Nonempty layer and step exclusion lists are mutually exclusive across Linear and
+attention configurations. For Linear settings, see
+[Linear exclusions](../models/visual-generation.md#layer-and-step-exclusions).
+
+**By layer.** `ignore` accepts module paths, `*` wildcard patterns, or
+`re:`-prefixed regular expressions.
+
+```yaml
+attention_config:
+  backend: CUTEDSL
+  quant_attention_config:
+    qk_dtype: nvfp4
+    v_dtype: fp8
+    ignore:
+      - "transformer_blocks.1.attn"
+      - "transformer_blocks.3.attn"
+      - "transformer_blocks.4.attn"
+```
+
+**By step.** In this example, attention uses the backend's native BF16/FP16 path
+at steps 0 and 2 and remains quantized at the other steps. Step 0 is the first
+denoising step.
+In two-stage generation, numbering continues across stages: with 8 steps in
+Stage 1, `ignore_steps: [9]` selects Stage 2's second step. Each new generation
+starts at 0; indices outside the actual total step count raise an error.
+
+```yaml
+attention_config:
+  backend: CUTEDSL
+  quant_attention_config:
+    qk_dtype: nvfp4
+    v_dtype: fp8
+    ignore_steps: [0, 2]
+```
+
+- Step exclusions cannot be combined with diffusion caching.
+- Attention exclusions preserve sparse-attention settings: an excluded step
+  may still use BF16 sparse attention rather than dense attention.
 
 ## Interaction With Other Features
 

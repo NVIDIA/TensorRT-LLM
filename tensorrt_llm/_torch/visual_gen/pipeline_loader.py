@@ -392,8 +392,10 @@ class PipelineLoader:
         #   - Copied into model's quantized buffers
         # =====================================================================
         weights = pipeline.load_transformer_weights(checkpoint_dir)
-        pipeline.load_weights(weights)
+        pipeline.load_transformer_quant_weights(weights)
         del weights
+        if getattr(pipeline, "_transformer_quant_dispatchers", None):
+            pipeline._setup_runtime_lora()
 
         # =====================================================================
         # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)
@@ -449,9 +451,9 @@ class PipelineLoader:
 
             marker = LayerwiseNvtxMarker()
             module_prefix = pipeline.__class__.__name__
-            for transformer_component in pipeline.transformer_components:
+            for transformer_component, transformer in pipeline.transformer_quant_models():
                 logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
-                marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
+                marker.register_hooks(transformer, module_prefix)
 
         logger.info(
             f"Pipeline loaded: {pipeline.__class__.__name__} "
@@ -467,7 +469,7 @@ class PipelineLoader:
         helper mirrors the pipeline's configured stages so offloaded towers never
         need to materialize on GPU first.
         """
-        available_components = pipeline.offload_pipeline_components()
+        available_components = pipeline.all_offload_pipeline_components()
         modules: list[torch.nn.Module] = []
         seen: set[int] = set()
 

@@ -546,7 +546,8 @@ class LTX23RetakePipeline(LTX23Pipeline):
             audio_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
             audio_latent = torch.zeros(audio_shape.to_torch_shape(), device=device, dtype=dtype)
         audio_shape = AudioLatentShape.from_torch_shape(audio_latent.shape)
-        self.transformer.configure_audio_ulysses(audio_shape.frames)
+        for _, model in self.transformer_quant_models("transformer"):
+            model.configure_audio_ulysses(audio_shape.frames)
         audio_clean_latents = self.audio_patchifier.patchify(audio_latent.float())
         audio_positions = self.audio_patchifier.get_patch_grid_bounds(audio_shape, device=device)
         audio_denoise_mask = (
@@ -557,7 +558,8 @@ class LTX23RetakePipeline(LTX23Pipeline):
         if not regenerate_audio:
             audio_denoise_mask = torch.zeros_like(audio_denoise_mask)
 
-        text_cache = self.transformer.prepare_text_cache(
+        text_cache = self.prepare_transformer_inputs(
+            "prepare_text_cache",
             video_context=video_embeds,
             video_context_mask=connector_mask,
             video_positions=video_positions,
@@ -603,7 +605,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 denoise_mask=denoise_mask,
                 clean_latent=clean_latent,
                 num_steps=num_steps,
-                text_cache=text_cache,
+                text_cache=self.resolve_transformer_inputs(text_cache),
                 audio_denoise_mask=audio_denoise_mask,
                 clean_audio_latent=clean_audio,
                 regenerate_video=regenerate_video,

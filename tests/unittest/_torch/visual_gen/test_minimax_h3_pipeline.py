@@ -45,6 +45,10 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
+from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
+    TransformerQuantDispatcher,
+    TransformerQuantSchedule,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
@@ -188,29 +192,27 @@ def _ulysses_mapping(world_size: int) -> SimpleNamespace:
     )
 
 
-class _FakeMiniMaxH3Transformer:
+class _FakeMiniMaxH3Transformer(torch.nn.Module):
     def __init__(self) -> None:
+        super().__init__()
         self.device = torch.device("cpu")
         self.config = SimpleNamespace(patch_size=(1, 2, 2))
-        self.training = True
+        self.static_context: tuple[torch.Tensor, torch.Tensor] | None = None
         self.static_context_calls = 0
         self.forward_calls = 0
         self.inference_modes: list[bool] = []
         self.attention_timesteps: list[torch.Tensor] = []
 
-    def eval(self) -> "_FakeMiniMaxH3Transformer":
-        self.training = False
-        return self
-
     def prepare_static_context(
         self,
-        prompt_embeds: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self.static_context_calls += 1
-        return prompt_embeds, position_ids
+        self.static_context = (encoder_hidden_states, position_ids)
+        return self.static_context
 
-    def __call__(
+    def forward(
         self,
         *,
         hidden_states: torch.Tensor,
@@ -219,7 +221,7 @@ class _FakeMiniMaxH3Transformer:
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self.attention_timesteps.append(kwargs["timestep"].clone())
-        assert static_context is not None
+        assert static_context is self.static_context
         self.forward_calls += 1
         self.inference_modes.append(torch.is_inference_mode_enabled())
         # Non-zero: an all-zero velocity is what _check_denoise_step treats
@@ -288,8 +290,18 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         return torch.zeros(1, 2, num_audio_latents * 800)
 
 
-def test_pipeline_reuses_static_context_across_joint_denoise_steps() -> None:
+@pytest.mark.parametrize("ignore_linear", [False, True])
+def test_pipeline_reuses_static_context_across_joint_denoise_steps(ignore_linear: bool) -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
+    quantized = pipeline.transformer
+    bf16 = _FakeMiniMaxH3Transformer() if ignore_linear else None
+    if bf16 is not None:
+        schedule = TransformerQuantSchedule(linear=frozenset({1}))
+        dispatcher = TransformerQuantDispatcher(schedule)
+        dispatcher.add(False, quantized)
+        dispatcher.add(True, bf16)
+        pipeline._transformer_quant_dispatchers = torch.nn.ModuleDict({"transformer": dispatcher})
+        pipeline._transformer_quant_schedules = {"transformer": schedule}
 
     output = pipeline.forward(
         prompt="a synthetic prompt",
@@ -301,17 +313,21 @@ def test_pipeline_reuses_static_context_across_joint_denoise_steps() -> None:
         num_inference_steps=4,
     )
 
-    assert pipeline.transformer.static_context_calls == 1
-    assert pipeline.transformer.forward_calls == 3
+    assert quantized.static_context_calls == 1
+    assert quantized.forward_calls == (2 if ignore_linear else 3)
     assert output.video.shape == (1, 124, 32, 32, 3)
     assert output.video.dtype == torch.uint8
     assert output.audio.shape[0:2] == (1, 2)
     assert output.audio_sample_rate == 32000
     assert output.frame_rate == 24.0
-    actual_times = torch.cat(pipeline.transformer.attention_timesteps)
+    actual_times = torch.cat(quantized.attention_timesteps)
     expected_times = 1.0 - torch.minimum(
         pipeline.scheduler.timesteps, pipeline.audio_scheduler.timesteps
     )
+    if bf16 is not None:
+        assert bf16.static_context_calls == 1
+        torch.testing.assert_close(torch.cat(bf16.attention_timesteps), expected_times[1:2])
+        expected_times = expected_times[[0, 2]]
     torch.testing.assert_close(actual_times, expected_times)
     assert bool(((actual_times >= 0) & (actual_times <= 1)).all())
     assert bool((actual_times[1:] <= actual_times[:-1]).all())
@@ -1505,7 +1521,7 @@ def test_denoise_validates_only_generated_rows(
     monkeypatch.setattr(pipeline, "_encode_keyframes", lambda *args: torch.zeros(condition_rows, 8))
 
     class ConditionedTransformer(_FakeMiniMaxH3Transformer):
-        def __call__(
+        def forward(
             self,
             *,
             hidden_states: torch.Tensor,
@@ -1831,7 +1847,7 @@ def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPat
         return torch.ones(1, 1, 4), layout, torch.full((1, 8), 7.0), torch.full((1, 3), 9.0)
 
     monkeypatch.setattr(h3_pipeline, "prepare_references", prepare)
-    original = _FakeMiniMaxH3Transformer.__call__
+    original = _FakeMiniMaxH3Transformer.forward
 
     def observe(
         self: _FakeMiniMaxH3Transformer, **kwargs: object
@@ -1841,7 +1857,7 @@ def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPat
         )
         return original(self, **kwargs)
 
-    monkeypatch.setattr(_FakeMiniMaxH3Transformer, "__call__", observe)
+    monkeypatch.setattr(_FakeMiniMaxH3Transformer, "forward", observe)
     pipeline.forward(
         prompt="subject",
         seed=42,

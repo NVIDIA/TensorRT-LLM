@@ -2321,7 +2321,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             "text_ids": (cond_ids, uncond_ids),
             "text_mask": (cond_mask, uncond_mask),
         }
-        self.transformer.reset_cache()
+        for _, model in self.transformer_quant_models("transformer"):
+            model.reset_cache()
 
         timer.mark_denoise_start()
         extra_streams = None
@@ -2750,7 +2751,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 raise ValueError("Cosmos3 transfer diffusion expects video predictions.")
             return result.video
 
-        self.transformer.reset_cache()
+        for _, model in self.transformer_quant_models("transformer"):
+            model.reset_cache()
         try:
             transfer_steps = tqdm(
                 timesteps,
@@ -2814,7 +2816,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 )[0]
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
         finally:
-            self.transformer.reset_cache()
+            for _, model in self.transformer_quant_models("transformer"):
+                model.reset_cache()
 
         return latents
 

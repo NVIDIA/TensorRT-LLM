@@ -160,7 +160,10 @@ class DynamicLinearWeightLoader:
         name: str,
         module: Linear | None = None,
     ) -> None:
-        """Refuse static quant recipes against checkpoints without scales.
+        """Validate the checkpoint scales used by static quantization.
+
+        Static NVFP4 activation quantization requires a calibrated input scale
+        even when weights are quantized at load time.
 
         With ``dynamic_weight_quant=False`` the loader expects the checkpoint
         to provide pre-quantized weights plus their scale tensors. If a module
@@ -175,12 +178,29 @@ class DynamicLinearWeightLoader:
         closed: a high-precision weight under any static recipe is refused
         even when the expected scale names are unknown.
         """
+        if (
+            quant_algo == QuantAlgo.NVFP4
+            and module is not None
+            and getattr(getattr(module, "quant_method", None), "quantizes_nvfp4_activations", False)
+            and not module.force_dynamic_quantization
+        ):
+            input_scale = weight_dict.get("input_scale")
+            if (
+                input_scale is None
+                or input_scale.numel() != 1
+                or not torch.isfinite(input_scale).all()
+                or not (input_scale > 0).all()
+            ):
+                raise ValueError(
+                    f"Static NVFP4 activation quantization for module '{name}' requires a "
+                    "calibrated 'input_scale' tensor containing one finite, positive value "
+                    "in every checkpoint weight entry. Load-time weight quantization does "
+                    "not calibrate activations. Provide the calibrated scale or explicitly set "
+                    "quant_config.config_groups.<group>.input_activations.dynamic: true."
+                )
+
         if quant_algo is None or self.dynamic_weight_quant:
             return
-
-        if self.quant_config is not None:
-            if self.quant_config.is_module_excluded_from_quantization(name):
-                return
 
         # Ask the destination buffer, not the module's name. ``quant_algo``
         # above falls back to the *global* recipe for any module that carries
@@ -224,16 +244,11 @@ class DynamicLinearWeightLoader:
         )
 
     def _should_dynamic_quantize(
-        self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
+        self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo]
     ) -> bool:
-        """Decide if weight should be dynamically quantized at load time."""
+        """Decide whether a checkpoint weight needs load-time quantization."""
         if not self.dynamic_weight_quant or quant_algo is None:
             return False
-
-        # Check if module is excluded
-        if self.quant_config is not None:
-            if self.quant_config.is_module_excluded_from_quantization(name):
-                return False
 
         weight = weight_dict.get("weight")
         if weight is None:
@@ -257,11 +272,34 @@ class DynamicLinearWeightLoader:
 
         return False
 
+    def _validate_linear_step_ignore_weight_loading(
+        self, weight_dict: Dict[str, torch.Tensor], quant_algo: QuantAlgo, name: str
+    ) -> None:
+        """Validate source weights and load-time quantization support for Linear step ignore."""
+        weight = weight_dict.get("weight")
+        if (
+            not self.dynamic_weight_quant
+            or weight is None
+            or weight.dtype not in _HIGH_PRECISION_DTYPES
+        ):
+            raise ValueError(
+                f"quant_config.ignore_steps requires original BF16/FP16 weights and "
+                f"load-time weight quantization (dynamic: true) for module '{name}'; "
+                "a pre-quantized checkpoint cannot restore the original BF16 precision."
+            )
+        if not self._should_dynamic_quantize(weight_dict, quant_algo):
+            raise ValueError(
+                "`ignore_steps` requires load-time weight quantization (`dynamic: true`). "
+                f"Load-time weight quantization ({quant_algo.name}) is not supported for "
+                f"module '{name}'. The checkpoint provides a {weight.dtype} weight, "
+                "but the VisualGen loader has no load-time quantizer for this algorithm."
+            )
+
     def _maybe_dynamic_quantize(
-        self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
+        self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo]
     ) -> Dict[str, torch.Tensor]:
         """Conditionally quantize weight at load time on GPU."""
-        if not self._should_dynamic_quantize(weight_dict, quant_algo, name):
+        if not self._should_dynamic_quantize(weight_dict, quant_algo):
             return weight_dict
 
         weight = weight_dict["weight"]
@@ -295,13 +333,12 @@ class DynamicLinearWeightLoader:
         self,
         weight_dicts: List[Dict[str, torch.Tensor]],
         quant_algo: Optional[QuantAlgo],
-        name: str,
     ) -> bool:
         if len(weight_dicts) <= 1:
             return False
         if quant_algo != QuantAlgo.NVFP4:
             return False
-        return any(self._should_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts)
+        return any(self._should_dynamic_quantize(wd, quant_algo) for wd in weight_dicts)
 
     def _quantize_fused_nvfp4(
         self, weight_dicts: List[Dict[str, torch.Tensor]]
@@ -365,20 +402,29 @@ class DynamicLinearWeightLoader:
             quant_algo = module_quant_config.quant_algo
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
+            # The name may be a checkpoint alias. Resolve exclusions by name only
+            # if the destination does not already have a quantization configuration.
+            if (
+                self.quant_config is not None
+                and self.quant_config.is_module_excluded_from_quantization(name)
+            ):
+                quant_algo = None
 
-        # Static (pre-quantized) recipes must not be loaded from checkpoints
-        # that do not carry the expected scale tensors.
         for weight_dict in weight_dicts:
             self._check_static_quant_scales(weight_dict, quant_algo, name, module)
+
+        if quant_algo is not None and getattr(self.quant_config, "ignore_steps", []):
+            for weight_dict in weight_dicts:
+                self._validate_linear_step_ignore_weight_loading(weight_dict, quant_algo, name)
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
         # to ensure consistent global scale
-        if self._is_fused_nvfp4_dynamic(weight_dicts, quant_algo, name):
+        if self._is_fused_nvfp4_dynamic(weight_dicts, quant_algo):
             quantized_weight_dicts = self._quantize_fused_nvfp4(weight_dicts)
         else:
             quantized_weight_dicts = [
-                self._maybe_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts
+                self._maybe_dynamic_quantize(wd, quant_algo) for wd in weight_dicts
             ]
 
         module.load_weights(quantized_weight_dicts)

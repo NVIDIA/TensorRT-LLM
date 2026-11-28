@@ -232,6 +232,48 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 
 Omit `quant_config` for BF16/FP16 baseline.
 
+#### Layer and step exclusions
+
+Use `ignore` to keep selected Linear layers, including attention projections,
+in BF16/FP16 at every step:
+
+```yaml
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+  ignore: ["transformer_blocks.0.*", "transformer_blocks.2.*", "transformer_blocks.4.*"]
+```
+
+Or use `ignore_steps` to run all Linear layers without quantization at selected steps:
+
+```yaml
+quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+  ignore_steps: [0, 1]
+```
+
+Nonempty layer and step exclusion lists cannot be combined. Step 0 is the first
+denoising step. In two-stage generation, numbering continues across stages:
+with 8 steps in Stage 1, `ignore_steps: [9]` selects Stage 2's second step.
+Each new generation starts at 0; indices outside the actual total step count
+raise an error.
+
+Step exclusions require a BF16/FP16 checkpoint and load-time quantization (`dynamic: true`).
+Pre-quantized checkpoints are not supported. Step exclusions cannot be combined
+with diffusion caching or runtime LoRA fusion.
+With Python `LinearQuantConfig`, a nonempty `ignore_steps` list enables load-time
+quantization automatically; without it, typed configurations retain static loading.
+They retain both BF16 and quantized Linear weights: roughly 1.5 times the BF16
+weight storage for FP8, or 1.3 times for NVFP4 including scales, before auxiliary
+buffers and loading peaks. These ratios describe weights, not total pipeline memory.
+LoRA-modified stages also retain their own changed weights.
+LTX-2 refinement follows its native LoRA precision policy: NVFP4 LoRA targets
+can use merged BF16 weights.
+
+Attention kernels use the same numbering with their own `ignore_steps` list;
+see [attention layer and step exclusions](../features/visualgen-quantized-attention.md#layer-and-step-exclusions).
+
 #### Wan VAE NVFP4
 
 The VAE can represent a substantial fraction of end-to-end latency in distilled

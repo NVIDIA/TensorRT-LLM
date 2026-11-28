@@ -1645,7 +1645,8 @@ class LTX2Pipeline(BasePipeline):
             hop_length=getattr(self, "audio_hop_length", 160),
         )
 
-        self.transformer.configure_audio_ulysses(audio_shape.frames)
+        for _, model in self.transformer_quant_models("transformer"):
+            model.configure_audio_ulysses(audio_shape.frames)
 
         # ---- 4. Generate initial noise / image conditioning ---------------
         latents = randn_tensor(
@@ -1775,7 +1776,8 @@ class LTX2Pipeline(BasePipeline):
             a_ctx = audio_embeds if has_audio else None
             a_mask = connector_mask if has_audio else None
 
-        _text_cache = self.transformer.prepare_text_cache(
+        _text_cache = self.prepare_transformer_inputs(
+            "prepare_text_cache",
             video_context=v_ctx,
             video_context_mask=v_mask,
             video_positions=video_positions,
@@ -1787,7 +1789,8 @@ class LTX2Pipeline(BasePipeline):
 
         # Uncond cache — only when multi-modal guidance runs separate uncond passes.
         _text_cache_uncond = (
-            self.transformer.prepare_text_cache(
+            self.prepare_transformer_inputs(
+                "prepare_text_cache",
                 video_context=neg_video_embeds,
                 video_context_mask=neg_connector_mask,
                 video_positions=video_positions,
@@ -1864,7 +1867,7 @@ class LTX2Pipeline(BasePipeline):
                 video=video_mod,
                 audio=audio_mod,
                 perturbations=perturbations,
-                text_cache=text_cache,
+                text_cache=self.resolve_transformer_inputs(text_cache),
                 # The scheduler sigma is already normalized to [0, 1] with the
                 # contract's sense (larger = noisier). The previous
                 # step_index / num_steps was ascending, which inverted the

@@ -317,7 +317,8 @@ def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output() -> None:
     attention.to_q = torch.nn.Linear(12, 8, bias=False)
     attention.to_k = torch.nn.Linear(12, 8, bias=False)
     attention.to_v = torch.nn.Linear(12, 8, bias=False)
-    attention.attn = _CaptureAsyncAttention()
+    attention._attn = _CaptureAsyncAttention()
+    attention._bf16_attn = None
     output_projection = _CaptureOutputProjection()
     attention.to_out = torch.nn.ModuleList([output_projection])
     gate_compress = torch.randn(1, 3, 8)

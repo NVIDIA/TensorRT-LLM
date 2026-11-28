@@ -1226,11 +1226,14 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 f"Distilled LoRA ready: {len(self._distilled_lora_deltas)} parameter deltas"
             )
             try:
-                self._distilled_lora_weight_cache = _PersistentLoRAWeightCache.build(
-                    self.transformer,
-                    self._distilled_lora_deltas,
-                )
+                entries = []
+                for _, model in self.transformer_quant_models("transformer"):
+                    cache = _PersistentLoRAWeightCache.build(model, self._distilled_lora_deltas)
+                    entries.extend(cache._entries)
+                self._distilled_lora_weight_cache = _PersistentLoRAWeightCache(entries)
             except torch.cuda.OutOfMemoryError as exc:
+                if self._transformer_quant_dispatchers:
+                    raise
                 logger.warning(
                     "Persistent LTX-2 LoRA weights disabled after CUDA OOM "
                     f"during cache build: {exc}"
@@ -1249,6 +1252,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     # ------------------------------------------------------------------
     # Inference entry point
     # ------------------------------------------------------------------
+
+    def _validate_quant_ignore_steps(self, num_steps: int) -> None:
+        if not getattr(self, "_quant_ignore_step_offset", 0):
+            num_steps += len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1
+        super()._validate_quant_ignore_steps(num_steps)
 
     def infer(self, req):
         extra = req.params.extra_params or {}
@@ -1399,6 +1407,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
         # state, so no per-request clone, merge, or unmerge math is needed.
         self._assert_cuda_graph_safe_lora_bindings()
+        transformers = [model for _, model in self.transformer_quant_models("transformer")]
         lora_cache = self._distilled_lora_weight_cache
         using_persistent_lora = lora_cache is not None
         saved_lora_state: Dict[str, Any] = {}
@@ -1433,7 +1442,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 # attention stacks (the key reads active_topology). It precedes
                 # prepare_text_cache (topology-dependent) inside
                 # _refinement_denoise and is restored in the finally below.
-                self.transformer.set_ulysses_topology(is_stage2=True)
+                for model in transformers:
+                    model.set_ulysses_topology(is_stage2=True)
                 if self.rank == 0:
                     vgm = self.pipeline_config.visual_gen_mapping
                     logger.info(
@@ -1441,23 +1451,25 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                         f"uly{vgm.ulysses_size} to uly {self.transformer._sharder_s2.size} "
                         "(there is no cfg in stage 2)"
                     )
-            video_latents, audio_latents = self._refinement_denoise(
-                video_latents=video_latents,
-                audio_latents=audio_latents,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                seed=seed,
-                max_sequence_length=max_sequence_length,
-                image=image,
-                image_cond_strength=image_cond_strength,
-                timer=timer,
-            )
+            with self.transformer_quant_stage(ignore_steps_offset=len(self.scheduler.timesteps)):
+                video_latents, audio_latents = self._refinement_denoise(
+                    video_latents=video_latents,
+                    audio_latents=audio_latents,
+                    prompt=prompt,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    seed=seed,
+                    max_sequence_length=max_sequence_length,
+                    image=image,
+                    image_cond_strength=image_cond_strength,
+                    timer=timer,
+                )
         finally:
             if self.transformer._has_stage2:
-                self.transformer.set_ulysses_topology(is_stage2=False)
+                for model in transformers:
+                    model.set_ulysses_topology(is_stage2=False)
             if using_persistent_lora:
                 lora_cache.bind_original()
                 self._lora_cuda_graph_state = "original"
@@ -1655,7 +1667,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             sample_rate=getattr(self, "audio_sampling_rate", 16000),
             hop_length=getattr(self, "audio_hop_length", 160),
         )
-        self.transformer.configure_audio_ulysses(audio_shape.frames)
+        for _, model in self.transformer_quant_models("transformer"):
+            model.configure_audio_ulysses(audio_shape.frames)
 
         # --- Video: patchify, positions ---
         v_latents = self.video_patchifier.patchify(video_latents)
@@ -1744,7 +1757,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             a_working = a_noise * sigma_0 + a_working * (1.0 - sigma_0)
 
         # --- Pre-compute static preproc (context, PE, KV) for Stage 2 ---
-        _s2_static = self.transformer.prepare_text_cache(
+        _s2_static = self.prepare_transformer_inputs(
+            "prepare_text_cache",
             video_context=video_embeds,
             video_context_mask=connector_mask,
             video_positions=video_positions,
@@ -1797,7 +1811,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 vel_v, vel_a = self.transformer(
                     video=video_mod,
                     audio=audio_mod,
-                    text_cache=_s2_static,
+                    text_cache=self.resolve_transformer_inputs(_s2_static),
                     step_index=i,
                     timestep=timestep,
                 )
