@@ -186,6 +186,8 @@ from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen.output import VisualGenOutput
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 
 def _preprocess_in_conversation(
@@ -929,6 +931,8 @@ class OpenAIServer(_VideoRoutesMixin):
             await self._deregister_server()
             if self.resource_governor is not None:
                 self.resource_governor.close()
+            if self._is_visual_gen:
+                await self._shutdown_image_edit_tasks()
             self.generator.shutdown()
             # A stats read still in flight fails fast now that the executor is
             # down; the /metrics handler already treats that as no stats.
@@ -1008,6 +1012,59 @@ class OpenAIServer(_VideoRoutesMixin):
         self.media_storage_path = _resolve_media_dir()
         logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
+        self._image_edit_tasks: set[asyncio.Task["VisualGenOutput"]] = set()
+        self._image_edit_submissions: set[
+            asyncio.Task["VisualGenResult"]] = set()
+
+    def _on_image_edit_task_done(
+            self,
+            task: "asyncio.Task[VisualGenOutput]",
+            *,
+            submission: Optional["asyncio.Task[VisualGenResult]"] = None
+    ) -> None:
+        """Retire an edit's generation task and observe any late failure."""
+        self._image_edit_tasks.discard(task)
+        if task.cancelled():
+            if submission is not None:
+                submission.add_done_callback(
+                    self._on_image_edit_submission_done)
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(f"Background image edit generation failed: {error!r}")
+
+    def _on_image_edit_submission_done(
+            self, submission: "asyncio.Task[VisualGenResult]") -> None:
+        """Observe a submission failure after its generation owner was cancelled."""
+        if submission.cancelled():
+            return
+        error = submission.exception()
+        if error is not None:
+            logger.error(f"Background image edit generation failed: {error!r}")
+
+    async def _shutdown_image_edit_tasks(self) -> None:
+        """Settle submissions, then boundedly observe cancelled result waits."""
+        observed = set()
+        while True:
+            # A cancelled await cannot stop a submitting worker. Keep its
+            # executor live until the callable returns or raises, including
+            # submissions registered by continuations while we were waiting.
+            while self._image_edit_submissions:
+                await asyncio.gather(
+                    *(asyncio.shield(task)
+                      for task in tuple(self._image_edit_submissions)),
+                    return_exceptions=True)
+            tasks = tuple(self._image_edit_tasks - observed)
+            if not tasks:
+                return
+            observed.update(tasks)
+            for task in tasks:
+                task.cancel()
+            _, pending = await asyncio.wait(tasks, timeout=1.0)
+            if pending:
+                logger.warning(
+                    f"{len(pending)} image edit generation task(s) still pending at shutdown"
+                )
 
     def _supports_image_edit(self) -> bool:
         if not self._is_visual_gen:
@@ -4536,8 +4593,32 @@ class OpenAIServer(_VideoRoutesMixin):
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_edit_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
+
+                submission_ready = asyncio.Event()
+
+                async def _submit() -> "VisualGenResult":
+                    await submission_ready.wait()
+                    return await asyncio.to_thread(
+                        self.generator.generate_async, request.prompt, params)
+
+                submission = asyncio.create_task(_submit())
+                self._image_edit_submissions.add(submission)
+                submission.add_done_callback(
+                    self._image_edit_submissions.discard)
+                submission_ready.set()
+
+                async def _submit_and_wait() -> "VisualGenOutput":
+                    handle = await asyncio.shield(submission)
+                    return await handle.aresult()
+
+                # Keep ownership across both awaits even if the request goes
+                # away: generation cannot be cancelled, so consume its result.
+                task = asyncio.create_task(_submit_and_wait())
+                self._image_edit_tasks.add(task)
+                task.add_done_callback(
+                    functools.partial(self._on_image_edit_task_done,
+                                      submission=submission))
+                output = await asyncio.shield(task)
             except ValidationError as exc:
                 return render_visual_gen_validation_error(
                     exc, self.create_error_response)
