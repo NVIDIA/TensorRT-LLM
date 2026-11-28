@@ -391,11 +391,13 @@ def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
     load_balance = helper_expert_count > 0
     alpha = _autotune_pl_alpha(helper_expert_count)
     granularities = _token_back_ready_granularity_choices(load_balance=load_balance)
+    # profile_v4: entries scored before each profiling workload was timed with its own inputs, and
+    # before the ranks were lined up ahead of each timed loop, are never replayed.
     if not load_balance and alpha == 0 and granularities == ("expert",):
         # Helper-free runners score tactics on several workloads, relative to the default.
-        return f"{base}:profile_v3:workloads={','.join(MEGAMOE_PROFILING_WORKLOADS)}"
+        return f"{base}:profile_v4:workloads={','.join(MEGAMOE_PROFILING_WORKLOADS)}"
     return (
-        f"{base}:profile_v2:load_balance={int(load_balance)}:alpha={alpha!r}"
+        f"{base}:profile_v4:load_balance={int(load_balance)}:alpha={alpha!r}"
         f":ready={','.join(granularities)}"
     )
 
@@ -3528,6 +3530,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # tuning call, see ``_megamoe_tuning_group``.
                 distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
                 profiling_workloads=self._profiling_workloads(),
+                # One untimed launch after each barrier lines the EP ranks up before the timed
+                # loop, so decode-sized kernels are not timed with the ranks' barrier skew.
+                collective_warmup_launches=1,
+                # A launch's host side (tactic resolution, workspace, argument marshalling) takes
+                # longer than a decode-sized kernel: queue the whole timed loop before it runs.
+                cover_host_launches=True,
             )
             return config
 

@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import weakref
 from types import SimpleNamespace
 from typing import Any, List
@@ -4707,6 +4708,220 @@ def test_collective_workload_build_failure_on_one_rank_stops_before_its_launch(
         ] == [(0, w)
               for w in _WORKLOADS] + [(1, "bal_full")] + [(2, w)
                                                           for w in _WORKLOADS]
+
+
+class _SkewedLaunchClock:
+    """Per-rank simulated GPU time: a launch takes its tactic's time, and the first launch after
+    a barrier also waits for the ranks' skew, which shrinks as tuning goes on (the first barriers
+    follow the longest host-side gaps)."""
+
+    def __init__(self, times: dict, skew_ms: float) -> None:
+        self.times, self.skew_ms = times, skew_ms
+        self.now, self.barriers, self.after_barrier = 0.0, 0, False
+
+    def barrier(self) -> None:
+        self.barriers += 1
+        self.after_barrier = True
+
+    def launch(self, tactic: int) -> None:
+        self.now += self.times[tactic]
+        if self.after_barrier:
+            self.now += self.skew_ms / self.barriers
+            self.after_barrier = False
+
+
+def _simulate_skewed_launches(monkeypatch, clocks: dict) -> None:
+    """Run the real profiling loop on simulated GPU time: events and launches advance the
+    calling rank's clock; streams, delays and graphs do nothing."""
+
+    class Event:
+
+        def __init__(self, **kwargs) -> None:
+            self.at = None
+
+        def record(self, stream=None) -> None:
+            self.at = clocks[_SIMULATED_RANK.rank].now
+
+        def elapsed_time(self, end) -> float:
+            return end.at - self.at
+
+    class Stream:
+
+        def synchronize(self) -> None:
+            pass
+
+    class Graph:
+
+        def reset(self) -> None:
+            pass
+
+    barrier = AutoTuner._collective_barrier
+
+    def collective_barrier(self, tuning_config):
+        barrier(self, tuning_config)
+        clocks[_SIMULATED_RANK.rank].barrier()
+
+    def run(runner, inputs, tactic, **kwargs):
+        clocks[_SIMULATED_RANK.rank].launch(tactic)
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: Stream())
+    monkeypatch.setattr(torch.cuda, "stream",
+                        lambda stream: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(autotuner, "delay_kernel", lambda *args: None)
+    monkeypatch.setattr(AutoTuner, "_collective_barrier", collective_barrier)
+    monkeypatch.setattr(AutoTuner, "_run_profile_runner", staticmethod(run))
+
+
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_collective_warmup_launches_keep_the_winner_independent_of_order(
+        monkeypatch, order):
+    """Tactic 0 (the fallback) is 2% faster than tactic 1, but the first launch after a barrier
+    also absorbs the ranks' skew, which is largest for the candidate timed first. Timed from the
+    first launch, that skew decides the winner by candidate order; one untimed launch after the
+    barrier keeps it out of the timed loop, so tactic 0 wins in either order."""
+    group = _ThreadGroup(2)
+    clocks = {
+        rank: _SkewedLaunchClock({
+            0: 0.100,
+            1: 0.102
+        }, skew_ms=1.0)
+        for rank in range(2)
+    }
+    _simulate_skewed_launches(monkeypatch, clocks)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    for tuner in tuners:
+        tuner._use_global_timer = False
+    runners = [_CollectiveRunner(order, fallback=0) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        use_cuda_graph=False,
+        collective_warmup_launches=1)
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(
+            f"autotuner_test::collective_warmup_{order[0]}{order[1]}",
+            [runners[rank]], config, _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [0, 0]
+
+
+class _HostBoundStream:
+    """One rank's simulated host and GPU timelines (ms): a launch costs host time to queue, then
+    runs on the GPU once both the host has queued it and the GPU is free; the delay kernel holds
+    the GPU; events take the GPU time at which the stream reaches them."""
+
+    def __init__(self, kernel_ms: dict, host_ms: dict) -> None:
+        self.kernel_ms, self.host_ms = kernel_ms, host_ms
+        self.host = self.gpu_free = 0.0
+
+    def delay(self, us: float) -> None:
+        self.gpu_free = max(self.gpu_free, self.host) + us / 1000.0
+
+    def launch(self, tactic: int) -> None:
+        self.host += self.host_ms[tactic]
+        self.gpu_free = max(self.gpu_free, self.host) + self.kernel_ms[tactic]
+
+    def record(self) -> float:
+        self.gpu_free = max(self.gpu_free, self.host)
+        return self.gpu_free
+
+    def synchronize(self) -> None:
+        self.host = max(self.host, self.gpu_free)
+
+
+def _simulate_host_bound_launches(monkeypatch, streams: dict) -> None:
+
+    def current():
+        return streams[_SIMULATED_RANK.rank]
+
+    class Event:
+
+        def __init__(self, **kwargs) -> None:
+            self.at = None
+
+        def record(self, stream=None) -> None:
+            self.at = current().record()
+
+        def elapsed_time(self, end) -> float:
+            return end.at - self.at
+
+    class Stream:
+
+        def synchronize(self) -> None:
+            current().synchronize()
+
+    class Graph:
+
+        def reset(self) -> None:
+            pass
+
+    class Clock:
+        """``time`` for the autotuner module: perf_counter reads the rank's host timeline."""
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        @staticmethod
+        def perf_counter() -> float:
+            return current().host / 1000.0
+
+    def run(runner, inputs, tactic, **kwargs):
+        current().launch(tactic)
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: Stream())
+    monkeypatch.setattr(torch.cuda, "stream",
+                        lambda stream: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(autotuner, "delay_kernel",
+                        lambda us, stream: current().delay(us))
+    monkeypatch.setattr(autotuner, "time", Clock())
+    monkeypatch.setattr(AutoTuner, "_run_profile_runner", staticmethod(run))
+
+
+@pytest.mark.parametrize("cover", [True, False])
+def test_cover_host_launches_times_kernels_not_the_host(monkeypatch, cover):
+    """Tactic 0 has the faster kernel (0.10 vs 0.12 ms) but the slower host side of a launch (0.40
+    vs 0.20 ms). Behind a fixed 1 ms delay the timed loop runs at the host's pace and ranks tactic
+    1 first; sized to the measured host time of its launches, the delay lets the GPU run them back
+    to back, the loop times the kernels and tactic 0 wins."""
+    group = _ThreadGroup(2)
+    streams = {
+        rank: _HostBoundStream({
+            0: 0.10,
+            1: 0.12
+        }, {
+            0: 0.40,
+            1: 0.20
+        })
+        for rank in range(2)
+    }
+    _simulate_host_bound_launches(monkeypatch, streams)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    for tuner in tuners:
+        tuner._use_global_timer = False
+    runners = [_CollectiveRunner([0, 1], fallback=0) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        use_cuda_graph=False,
+        collective_warmup_launches=1,
+        cover_host_launches=cover)
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(
+            f"autotuner_test::cover_host_launches_{cover}", [runners[rank]],
+            config, _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == ([0, 0] if cover else [1, 1])
+
+
+def test_collective_warmup_launches_need_the_collective_strategy() -> None:
+    with pytest.raises(ValueError, match="collective_warmup_launches"):
+        TuningConfig(collective_warmup_launches=1)
+    with pytest.raises(ValueError, match="collective_warmup_launches"):
+        TuningConfig(
+            distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+            collective_warmup_launches=-1)
 
 
 @pytest.mark.parametrize("strategy", [

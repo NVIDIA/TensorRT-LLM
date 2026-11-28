@@ -202,6 +202,17 @@ class TuningConfig:
             Every candidate is timed on each, and scores the mean over workloads of its
             slowest-rank time relative to the fallback tactic's; that score, not a time, is what
             the cache keeps. Empty times the profiling inputs as they are.
+        collective_warmup_launches (int): COLLECTIVE only. Untimed launches of the candidate on
+            the timed inputs between the barrier before each timed loop and its start. A kernel
+            that spans the ranks takes as long as its last rank to arrive, so without them the
+            first timed launch also times how far apart the ranks left the barrier; for short
+            kernels that skew can exceed the gaps between candidates, and it varies with what
+            ran before, so the winner can depend on the order candidates are timed in.
+        cover_host_launches (bool): Eager profiling only (``use_cuda_graph=False``). Size the
+            delay kernel before each timed loop to the host time its launches took in the
+            previous, shorter loop, so the GPU runs them back to back. For runners whose host
+            side of a launch takes longer than their kernel, the timed loop otherwise measures
+            how fast the host launches, which neither ranks the kernels nor repeats.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -217,6 +228,8 @@ class TuningConfig:
     use_build_pool_in_warmup: bool = False
     process_group: Any = None
     profiling_workloads: Tuple[Callable, ...] = ()
+    collective_warmup_launches: int = 0
+    cover_host_launches: bool = False
 
     def __post_init__(self):
         if (self.profiling_workloads and self.distributed_tuning_strategy
@@ -224,6 +237,13 @@ class TuningConfig:
             raise ValueError(
                 "TuningConfig.profiling_workloads requires the COLLECTIVE strategy"
             )
+        if self.collective_warmup_launches < 0 or (
+                self.collective_warmup_launches
+                and self.distributed_tuning_strategy
+                != DistributedTuningStrategy.COLLECTIVE):
+            raise ValueError(
+                "TuningConfig.collective_warmup_launches must be >= 0 and "
+                "needs the COLLECTIVE strategy")
 
 
 @dataclass(frozen=True)
@@ -2598,8 +2618,14 @@ class AutoTuner:
         short_profile_threshold_ms = 1
 
         avg_time = float('inf')
+        warmup_launches = (tuning_config.collective_warmup_launches
+                           if tuning_config.distributed_tuning_strategy
+                           == DistributedTuningStrategy.COLLECTIVE else 0)
+        # Host seconds per launch of the last timed loop (cover_host_launches).
+        host_launch_s = None
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
+            nonlocal host_launch_s
             graph = torch.cuda.CUDAGraph()
 
             @contextlib.contextmanager
@@ -2676,7 +2702,26 @@ class AutoTuner:
                 if use_cuda_graph:
                     delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
                 else:
-                    delay_kernel(self.stream_delay_micro_secs, stream)
+                    delay_us = self.stream_delay_micro_secs
+                    if tuning_config.cover_host_launches and host_launch_s is not None:
+                        # Long enough for the host to queue every launch below before the GPU
+                        # reaches them, with margin for host jitter.
+                        delay_us = max(
+                            delay_us,
+                            math.ceil(1.5e6 * host_launch_s *
+                                      (warmup_launches + repeat)))
+                    delay_kernel(delay_us, stream)
+                host_start = time.perf_counter()
+
+                # Queued behind the delay, these untimed launches of a kernel that spans the ranks
+                # end together on every rank, so the timed loop starts with the ranks lined up.
+                for r in range(warmup_launches):
+                    self._run_profile_runner(
+                        runner,
+                        input_tensor_batches[r % len(input_tensor_batches)],
+                        tactic,
+                        **kwargs,
+                    )
 
                 record_start()
 
@@ -2692,6 +2737,9 @@ class AutoTuner:
                         )
 
                 record_end()
+                if not use_cuda_graph:
+                    host_launch_s = (time.perf_counter() -
+                                     host_start) / (warmup_launches + repeat)
                 stream.synchronize()
 
                 return elapsed_time() / repeat

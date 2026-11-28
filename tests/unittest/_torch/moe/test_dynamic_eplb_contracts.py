@@ -2166,9 +2166,9 @@ def test_on_autotune_uses_distinct_tactics():
     on_key = helpers["_megamoe_tuning_op_name"](4)
     assert off_key == (
         "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
-        ":profile_v3:workloads=bal_full,bal_partial,recv_hotspot"
+        ":profile_v4:workloads=bal_full,bal_partial,recv_hotspot"
     )
-    assert on_key != off_key and "alpha=0.8" in on_key
+    assert on_key != off_key and "alpha=0.8" in on_key and ":profile_v4:" in on_key
 
     off = helpers["enumerate_megamoe_candidate_tactics"](32, 107)
     on = helpers["enumerate_megamoe_candidate_tactics"](32, 107, load_balance=True)
