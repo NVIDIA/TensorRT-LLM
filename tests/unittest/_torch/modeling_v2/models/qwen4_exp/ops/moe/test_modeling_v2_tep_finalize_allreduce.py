@@ -25,13 +25,16 @@ row has no local slot), with -0.0 lanes and values over 2^-12..2^8. For each cel
 Both release points (`early` False / True) run. The `shared` cells add each rank's fp32
 shared-expert quarter with its gate logit (0, 60 or -200 by row: a sigmoid of 0.5, 1 or 0, exact
 in both the launch's form and torch's), the gate a column view of a wider bf16 row.
-`QWEN4_EXP_FINAR_REPLAYS` raises the replays (default 300 a cell and release point) for a longer
-stress run.
+`QWEN4_EXP_FINAR_REPLAYS` raises the replays (default 300 a cell and release point; at least 1)
+for a longer stress run. The ranks run under a parent-side deadline (`QWEN4_EXP_FINAR_TIMEOUT`,
+default 1800 s): a rank left polling for a peer's publication fails the test instead of hanging
+it.
 """
 
 import os
 import random
 import socket
+import time
 
 import pytest
 import torch
@@ -40,6 +43,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import tep_finaliz
 
 WORLD = op.WORLD
 REPLAYS = int(os.environ.get("QWEN4_EXP_FINAR_REPLAYS", "300"))
+TIMEOUT = float(os.environ.get("QWEN4_EXP_FINAR_TIMEOUT", "1800"))
 #: Slot cycles a back-to-back graph holds.
 CYCLES = 4
 CASES = sorted(
@@ -230,7 +234,24 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def test_fused_finalize_allreduce_matches_its_reference():
+def _spawn_bounded(fn, args, nprocs: int, timeout: float) -> None:
+    """`mp.spawn` with a parent-side deadline: past `timeout` seconds the ranks are killed and
+    reaped, then the test fails."""
     import torch.multiprocessing as mp
 
-    mp.spawn(_rank_main, args=(_free_port(),), nprocs=WORLD, join=True)
+    context = mp.spawn(fn, args=args, nprocs=nprocs, join=False)
+    deadline = time.monotonic() + timeout
+    while not context.join(timeout=5):
+        if time.monotonic() > deadline:
+            for p in context.processes:
+                if p.is_alive():
+                    p.kill()
+            for p in context.processes:
+                p.join(timeout=60)
+            pytest.fail(f"the ranks did not finish within {timeout:.0f} s (a rank is polling)")
+
+
+def test_fused_finalize_allreduce_matches_its_reference():
+    # Zero replays would skip both replay checks and pass on the eager launches alone.
+    assert REPLAYS >= 1, f"QWEN4_EXP_FINAR_REPLAYS={REPLAYS}: the replay checks need at least 1"
+    _spawn_bounded(_rank_main, (_free_port(),), WORLD, TIMEOUT)
