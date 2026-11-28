@@ -171,7 +171,7 @@ def test_encode_only_server_rejects_multi_gpu_config(monkeypatch, parallelism_ke
     monkeypatch.setattr(
         serve,
         "_apply_effective_telemetry_config",
-        lambda *args, **kwargs: None,
+        lambda llm_args, **kwargs: llm_args,
     )
 
     with pytest.raises(click.BadParameter, match="single-GPU only"):
@@ -219,7 +219,7 @@ def test_rerank_server_rejects_extra_model_inputs(monkeypatch, cuda_graph_config
     monkeypatch.setattr(
         serve,
         "_apply_effective_telemetry_config",
-        lambda *args, **kwargs: None,
+        lambda llm_args, **kwargs: llm_args,
     )
 
     with pytest.raises(click.BadParameter, match="trtllm-serve rerank"):

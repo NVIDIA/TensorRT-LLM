@@ -15,6 +15,8 @@ import platform
 import random
 import sys
 import traceback
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -116,7 +118,12 @@ def _run(tp_size: int, fabric: bool) -> bool:
             assert markov_chain_supported(shard, w2_shard, w1, workspace)
             return markov_chain_fused(shard, w2_shard, w1, bonus, offset, VOCAB, workspace)
 
-        for batch in (1, 2, 4, 8):
+        sm107 = torch.cuda.get_device_capability() == (10, 7)
+        batches = (1, 2) if sm107 else (1, 2, 4, 8)
+        if sm107:
+            unsupported = torch.empty(3, BLOCK, local, dtype=torch.bfloat16, device="cuda")
+            assert not markov_chain_supported(unsupported, w2_shard, w1, workspace)
+        for batch in batches:
             for trial in range(3):
                 base, bonus = _make_inputs(batch, 100 * batch + trial, VOCAB)
                 got = fused(base, bonus).long()
@@ -125,7 +132,7 @@ def _run(tp_size: int, fabric: bool) -> bool:
                 )
 
         graphs = {}
-        for batch in (1, 2, 4, 8):
+        for batch in batches:
             shard = torch.zeros(batch, BLOCK, local, dtype=torch.bfloat16, device="cuda")
             bonus = torch.zeros(batch, dtype=torch.int64, device="cuda")
             x1 = torch.zeros(6 * batch, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -188,14 +195,73 @@ def _fabric_supported() -> bool:
     return platform.machine().lower() in ("aarch64", "arm64") and MnnvlMemory.supports_mnnvl()
 
 
+def _run_packed_ipc(tp_size: int, fabric: bool) -> bool:
+    from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
+
+    compile_kernel = markov._compiled
+
+    def compile_packed(*args, packed: bool):
+        return compile_kernel(*args, packed=True)
+
+    with patch.object(markov, "_compiled", compile_packed):
+        return _run(tp_size, fabric)
+
+
+_SM107 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
+_TP_SIZE = 8 if _SM107 else 4
+
+
+def test_markov_exchange_uses_only_nonempty_vocabulary_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=(128, 148)[device]),
+    )
+    num_ctas = markov._num_ctas.__wrapped__
+    assert num_ctas(17, 0) == 17
+    assert num_ctas(128 * 256, 0) == 128
+    assert num_ctas(128 * 256 + 1, 0) == 0
+    assert num_ctas(16160, 1) == 147
+
+
+def test_sm107_markov_requires_tp8(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch import cute_dsl_utils
+    from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 7))
+    device_supported = markov._device_supported.__wrapped__
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", True)
+    assert device_supported(8)
+    assert not device_supported(4)
+    assert not device_supported(2)
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
+    assert not device_supported(8)
+
+    monkeypatch.setattr(markov, "_num_ctas", lambda vocab, device: 128)
+    base = torch.empty((2, 5, 16160), device="meta", dtype=torch.bfloat16)
+    w2 = torch.empty((16160, RANK_DIM), device="meta")
+    w1 = torch.empty((VOCAB, RANK_DIM), device="meta")
+    assert markov.markov_chain_supported(
+        base, w2, w1, SimpleNamespace(nranks=8, slot_bytes=1 << 24)
+    )
+    assert not markov.markov_chain_supported(
+        base, w2, w1, SimpleNamespace(nranks=4, slot_bytes=1 << 24)
+    )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.device_count() < 4
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="needs 4 SM100/SM103 GPUs",
+    or torch.cuda.device_count() < _TP_SIZE
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="requires TP4 on SM100/SM103 or TP8 on SM107",
 )
 @pytest.mark.parametrize("fabric", [False, True], ids=["ipc", "fabric"])
-@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+@pytest.mark.parametrize("mpi_pool_executor", [_TP_SIZE], indirect=True)
 def test_dspark_markov_chain_matches_reference(mpi_pool_executor, fabric):
     if fabric and not _fabric_supported():
         pytest.skip("needs fabric-mapped (MNNVL) memory")
@@ -203,3 +269,15 @@ def test_dspark_markov_chain_matches_reference(mpi_pool_executor, fabric):
     results = mpi_pool_executor.map(_run, *zip(*[(tp_size, fabric)] * tp_size))
     for r in results:
         assert r is True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 4
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="requires TP4 on SM100/SM103 to exercise the packed exchange in multi-GPU CI",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_packed_markov_exchange_matches_reference_over_ipc(mpi_pool_executor) -> None:
+    results = mpi_pool_executor.map(_run_packed_ipc, [4] * 4, [False] * 4)
+    assert all(results)

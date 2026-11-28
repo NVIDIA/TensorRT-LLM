@@ -28,7 +28,7 @@ import torch
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
-from tensorrt_llm._utils import is_blackwell_datacenter
+from tensorrt_llm._utils import get_sm_version
 
 from .decode_front import max_num_tiles
 from .kernel_inputs import get_data_or_none, to_trtllm_gen_act_type
@@ -71,6 +71,15 @@ _CUTE_FC2_OPTIONS = {
 }
 
 
+# The K128 cubin is bitwise qualified for the DeepSeek-V4.1 NVFP4 FC2 shape on SM107.
+_SM107_FC2_CUBIN = (
+    "bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x256_s9_et128x8_m128x8x128"
+    "_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+)
+_SM107_FC2_WEIGHT_SHAPE = (192, 5120, 288)
+_SM107_FC2_MAX_TOKENS = 16
+
+
 def cute_fc2_reproduces(gemm2_kernel_options: Mapping[str, str]) -> bool:
     """Whether ``moe_lowm_fc2`` reproduces the FC2 cubin of these options (the runner's
     ``get_gemm2_kernel_options(tile, config)``) bit for bit."""
@@ -83,19 +92,25 @@ class DecodeKernel(enum.Enum):
     ENGINE = 2
 
 
-#: (act type, tile, config) -> the tile K of that tactic's FC2 cubin where ``moe_lowm_fc2`` reproduces it, else None.
+#: (SM, act type, tile, config) -> tile K if ``moe_lowm_fc2`` reproduces the tactic's FC2 cubin.
 #: The C++ runners are shared per act type (``FP4BlockScaleMoERunner.get_runner``), so the key names the cubin.
-_FC2_REPRODUCED: Dict[Tuple[int, int, int], Optional[int]] = {}
+_FC2_REPRODUCED: Dict[Tuple[int, int, int, int], Optional[int]] = {}
 
 
 def fc2_cubin_tile_k(
     kernel_runner: torch.ScriptObject, act_type: int, tactic: List[int]
 ) -> Optional[int]:
     """The tile K of the tactic's FC2 cubin where ``moe_lowm_fc2`` reproduces it, else None."""
-    key = (int(act_type), int(tactic[0]), int(tactic[1]))
+    sm = get_sm_version()
+    tile, config = tactic
+    key = (sm, int(act_type), tile, config)
     if key not in _FC2_REPRODUCED:
-        options = kernel_runner.get_gemm2_kernel_options(key[1], key[2])
-        _FC2_REPRODUCED[key] = int(options["tileK"]) if cute_fc2_reproduces(options) else None
+        options = kernel_runner.get_gemm2_kernel_options(tile, config)
+        if sm == 107:
+            reproduced = kernel_runner.get_gemm2_kernel_name(tile, config) == _SM107_FC2_CUBIN
+        else:
+            reproduced = cute_fc2_reproduces(options)
+        _FC2_REPRODUCED[key] = int(options["tileK"]) if reproduced else None
     return _FC2_REPRODUCED[key]
 
 
@@ -116,6 +131,12 @@ def cute_fc2_tile_k(
     if x.shape[0] > max_tokens or w2.dim() != 3 or w2_sf.dim() != 3:
         return None
     if w2.shape[2] * 2 != intermediate_size:
+        return None
+    if get_sm_version() == 107 and (
+        not 0 < x.shape[0] <= _SM107_FC2_MAX_TOKENS
+        or w2.shape != _SM107_FC2_WEIGHT_SHAPE
+        or args.output2_scale_scalar is None
+    ):
         return None
     tile_k = fc2_cubin_tile_k(kernel_runner, act_type, tactic)
     if tile_k is None:
@@ -289,12 +310,15 @@ def cute_fc2_opt_in(
     do_finalize: bool,
     output: Optional[torch.Tensor],
 ) -> Optional[int]:
-    """:func:`cute_fc2_tile_k` for a model's ``MoEDecodeOptions.cute_fc2_rows`` (``rows``): un-finalized attention-TP
-    calls of up to that many tokens on SM 10.0 / 10.3, without FC2 bias or output tensor."""
+    """:func:`cute_fc2_tile_k` for un-finalized attention-TP calls on SM100/SM103 or the qualified SM107 geometry.
+
+    The model opts in through ``MoEDecodeOptions.cute_fc2_rows`` (``rows``). The call must have
+    no FC2 bias or output tensor.
+    """
     _LAST_FC2.ptr, _LAST_FC2.node = 0, None
     if rows <= 0 or use_dp or do_finalize or output is not None or args.gemm2_bias is not None:
         return None
-    if not is_blackwell_datacenter():
+    if get_sm_version() not in (100, 103, 107):
         return None
     return cute_fc2_tile_k(
         kernel_runner,

@@ -101,6 +101,7 @@
 /tests/unittest/docs @NVIDIA/trt-llm-doc-owners
 
 # ===== QA =====
+/tests/qa_selection/ @NVIDIA/trt-llm-qa-function
 /tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function
 /tests/integration/defs/perf @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
@@ -124,6 +125,7 @@
 /tensorrt_llm/commands/__init__.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/commands/serve.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/commands/utils.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/commands/serve_cli @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/grpc @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs

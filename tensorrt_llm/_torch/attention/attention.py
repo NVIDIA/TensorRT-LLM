@@ -575,6 +575,7 @@ class Attention(nn.Module):
         cache_context_plan: bool = False,
         context_fmha_head_dim_per_stage_kv: int = 0,
         context_last_rows_only: bool = False,
+        register_to_config: bool = True,
     ):
         """
         Initialize the Attention module.
@@ -601,6 +602,9 @@ class Attention(nn.Module):
             cache_context_plan (bool): Let the TRTLLM backend plan a context-only forward once for all layers.
             context_fmha_head_dim_per_stage_kv (int): See TrtllmAttention; 0 keeps the default context kernel.
             context_last_rows_only (bool): See TrtllmAttention; the layer reads only each context request's last row.
+            register_to_config (bool): Register the layer in ``config.extra_attrs["attn_layers"]``, which the custom-op
+                path (torch.compile, breakable CUDA graph) uses to find it with the decoder's metadata. Encoder towers
+                that run with their own metadata pass False.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -608,7 +612,7 @@ class Attention(nn.Module):
 
         self.register_to_config = False
         # We only register TRTLLM attention layers to config.
-        if config is not None:
+        if config is not None and register_to_config:
             if "attn_layers" not in config.extra_attrs:
                 config.extra_attrs["attn_layers"] = {}
             suffix = 0
@@ -1064,6 +1068,15 @@ class Attention(nn.Module):
         """Run the attention backend; with output_gate, the returned output has the gate applied (by the backend or
         here), and kv_append is the KV-append plan of a GQA decode layer (see preprocess_qkv)."""
         num_tokens = attn_metadata.num_tokens
+
+        num_rows = q.shape[0]
+        if (mrope_rotary_cos_sin is not None and num_rows > num_tokens
+                and mrope_rotary_cos_sin.numel() % num_rows == 0):
+            # A padded prefill graph packs a cos/sin row for every row of q. Keep the live rows,
+            # as for q, k and v: locality-domain attention reads the row width from them.
+            row_width = mrope_rotary_cos_sin.numel() // num_rows
+            mrope_rotary_cos_sin = mrope_rotary_cos_sin.reshape(
+                -1)[:num_tokens * row_width].view(1, -1)
 
         q = q[:num_tokens, :]
         if k is not None:
