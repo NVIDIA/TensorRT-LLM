@@ -358,23 +358,38 @@ else:
 calibrator.maybe_wrap_model(runner.model)
 
 # Autotune
-run_pack = runner.create_run_pack(
-    args.run_type,
-    batch_size=max(args.batch_size_list),
-    request_id_begin=0,
-    seq_len_q=max(args.seq_len_q_list),
-    seq_len_kv_cache=args.seq_len_kv_cache_list[0],
-    kv_cache_manager=kv_cache_manager,
-    attn_workspace=attn_workspace,
-)
 if args.enable_autotuner:
     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
     AutoTuner.get().nvmmh_config = NvMMHConfig() if args.enable_autotuner_nvmmh else None
     logger.info(f"Layer-wise benchmarks: Autotuner nvmmh_config={AutoTuner.get().nvmmh_config}")
     AutoTuner.get().setup_distributed_state(mapping)
-    with autotune(cache_path=cache_path):
-        run_pack()
+    # Profile only the buckets the benchmarked shapes map to, not every token-count bucket up
+    # to them as a serving warmup does: those are the buckets the runs below look up, and the
+    # rest of the sweep would only cover shapes this run never executes.
+    with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+        for batch_size, seq_len_q, seq_len_kv_cache in itertools.product(
+            args.batch_size_list, args.seq_len_q_list, args.seq_len_kv_cache_list
+        ):
+            run_pack = runner.create_run_pack(
+                args.run_type,
+                batch_size=batch_size,
+                request_id_begin=0,
+                seq_len_q=seq_len_q,
+                seq_len_kv_cache=seq_len_kv_cache,
+                kv_cache_manager=kv_cache_manager,
+                attn_workspace=attn_workspace,
+            )
+            run_pack()
 else:
+    run_pack = runner.create_run_pack(
+        args.run_type,
+        batch_size=max(args.batch_size_list),
+        request_id_begin=0,
+        seq_len_q=max(args.seq_len_q_list),
+        seq_len_kv_cache=args.seq_len_kv_cache_list[0],
+        kv_cache_manager=kv_cache_manager,
+        attn_workspace=attn_workspace,
+    )
     run_pack()
 
 # Prefill KV cache

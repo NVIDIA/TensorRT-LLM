@@ -96,6 +96,9 @@ def require_msa_module() -> types.ModuleType:
             "MiniMax-M3 MSA attention requires the fmha_sm100 kernels packaged "
             "with TensorRT-LLM. Reinstall TensorRT-LLM from a complete build."
         ) from exc
+    from .msa_kernel_builds import install
+
+    install(fmha_sm100)
     return fmha_sm100
 
 

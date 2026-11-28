@@ -49,6 +49,7 @@ from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.output_length_predictor import MAX_TOKENS, RECORD_BATCH_MAX, is_token_count
+from tensorrt_llm.serve.router import ReservationNotFoundError
 from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -182,7 +183,14 @@ class CoordinatorServer:
         except Exception as e:  # noqa: BLE001
             logger.error(f"CoordinatorServer.select failed: {e}")
             return self._response({"error": str(e)}, status_code=500)
-        return self._response({"server": server, "info": info, "req_id": req_id})
+        return self._response(
+            {
+                "server": server,
+                "info": info,
+                "req_id": req_id,
+                "reservation_timeout_s": self._coordinator.reservation_timeout_for_role(role),
+            }
+        )
 
     def _pooled(self, role: str) -> bool:
         """Whether a select for ``role`` may wait for a seat (a pooled router)."""
@@ -290,6 +298,8 @@ class CoordinatorServer:
             return self._response({"error": "req_id must be an integer"}, status_code=400)
         try:
             await self._coordinator.renew(role, req_id)
+        except ReservationNotFoundError as e:
+            return self._response({"error": str(e)}, status_code=404)
         except ValueError as e:
             return self._response({"error": str(e)}, status_code=503)
         except Exception as e:  # noqa: BLE001

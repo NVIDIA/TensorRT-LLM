@@ -51,6 +51,7 @@ class Qwen3MoeVLModel(Qwen3VLModelBase):
     supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
 
     supports_encoder_cache = True
+    supports_multimodal_breakable_cuda_graph = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.
