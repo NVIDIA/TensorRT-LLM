@@ -36,6 +36,7 @@ try:
     from cutlass._mlir.dialects import llvm
     from cutlass.cute.runtime import make_ptr
     from cutlass.cutlass_dsl import T, dsl_user_op
+    from cutlass.experimental import primitives as prims
 except ImportError:
     _HAS_CUTE_DSL = False
 else:
@@ -57,6 +58,23 @@ if _HAS_CUTE_DSL:
             ip=ip,
         )
         return Int32(bits)
+
+    @cute.jit
+    def _mbar_wait_cluster_acquire(mbar_ptr: cute.Pointer, phase: Int32):
+        """Wait for ``phase`` of this CTA's mbarrier at ``mbar_ptr``, acquiring at cluster scope.
+
+        ``cute.arch.mbarrier_wait`` acquires at CTA scope. The peers' ``st.async ...
+        mbarrier::complete_tx`` (``store_async_dsmem``) that completes this barrier releases at
+        cluster scope, and only a cluster-scope acquire orders their payload before the reads that
+        follow the wait: a relaxed cluster-scope try_wait loop and an acquire fence restricted to
+        shared::cluster (the ISA's acquire pattern for it; unlike ``.acquire.cluster`` on the wait
+        it adds no L1 invalidate).
+        """
+        while not prims.mbarrier_try_wait_parity(
+            mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+        ):
+            pass
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
     class _ClusterBoundaryKernel:
         def __init__(
@@ -123,7 +141,8 @@ if _HAS_CUTE_DSL:
                         bars.iterator + phase,
                         lane,
                     )
-                cute.arch.mbarrier_wait(bars.iterator + phase, 0)
+                # The peers' st.async complete-tx releases at cluster scope.
+                _mbar_wait_cluster_acquire(bars.iterator + phase, 0)
             else:
                 if lane == 0:
                     partials[(phase * self.slots + warp) * 4] = value

@@ -20,6 +20,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 from ...cute_dsl_utils import smem_optin_bytes
 from .moe_decode_front import (
@@ -106,6 +107,24 @@ def _ld_shared_v4_b32(addr: Int32, *, loc=None, ip=None):
 @dsl_user_op
 def _tcgen05_after_sync(*, loc=None, ip=None) -> None:
     _asm(None, [], "tcgen05.fence::after_thread_sync;", "~{memory}", loc=loc, ip=ip)
+
+
+@cute.jit
+def _mbar_wait_cluster_acquire(mbar_ptr: cute.Pointer, phase: Int32):
+    """Wait for ``phase`` of this CTA's mbarrier at ``mbar_ptr``, acquiring at cluster scope.
+
+    ``cute.arch.mbarrier_wait`` acquires at CTA scope. The peers' ``cp.async.bulk ...
+    mbarrier::complete_tx`` (``_bulk_push``) that completes this barrier releases at cluster
+    scope, and only a cluster-scope acquire orders their payload before the reads that follow
+    the wait: a relaxed cluster-scope try_wait loop and an acquire fence restricted to
+    shared::cluster (the ISA's acquire pattern for it; unlike ``.acquire.cluster`` on the wait
+    it adds no L1 invalidate).
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 class MoeRouterGemmKernel:
@@ -538,7 +557,8 @@ class MoeRouterGemmKernel:
                 self._quant_phase(
                     sB, full_mbar, gs_ptr, xq_ptr, xsf_ptr, s, e_tile, t_tile, tidx, phase
                 )
-        cute.arch.mbarrier_wait(recv_mbar, 0)
+        # The split CTAs' bulk copies complete `recv_mbar` with a cluster-scope release.
+        _mbar_wait_cluster_acquire(recv_mbar, 0)
         _cluster_arrive_relaxed()  # this CTA's slices have arrived (waited at the end)
 
         # Reduce this CTA's slice (tokens [s tps, (s + 1) tps) of the tile, all 128 experts) in split order.
