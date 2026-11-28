@@ -22,9 +22,10 @@ from pathlib import Path
 import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import (
-    MODEL_TYPE_TO_REASONING_PARSER, DeepSeekV41ReasoningParser,
-    MuseSparkReasoningParser, NemotronV3ReasoningParser, ReasoningParserFactory,
-    resolve_auto_reasoning_parser)
+    MODEL_TYPE_TO_REASONING_PARSER, AutoReasoningParserResult,
+    DeepSeekV41ReasoningParser, MuseSparkReasoningParser,
+    NemotronV3ReasoningParser, ReasoningParserFactory,
+    detect_auto_reasoning_parser, resolve_auto_reasoning_parser)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -916,6 +917,395 @@ def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "qwen3"
+
+
+def _write_qwen3_checkpoint(model_dir: str,
+                            model_type: str = "qwen3",
+                            *,
+                            jinja: str | None = None,
+                            tokenizer_config: dict | None = None,
+                            chat_template_json: dict | None = None):
+    """Write a Qwen3 checkpoint with its chat template in the given files."""
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+    if jinja is not None:
+        with open(os.path.join(model_dir, "chat_template.jinja"), "w") as f:
+            f.write(jinja)
+    if tokenizer_config is not None:
+        with open(os.path.join(model_dir, "tokenizer_config.json"), "w") as f:
+            json.dump(tokenizer_config, f)
+    if chat_template_json is not None:
+        with open(os.path.join(model_dir, "chat_template.json"), "w") as f:
+            json.dump(chat_template_json, f)
+
+
+# A tokenizer_config.json as written by transformers 5.x, which stores the
+# chat template in chat_template.jinja instead.
+_TOKENIZER_CONFIG_WITHOUT_TEMPLATE = {"tokenizer_class": "Qwen2Tokenizer"}
+
+
+@pytest.mark.parametrize("model_type", ["qwen3", "qwen3_5"])
+@pytest.mark.parametrize(("template", "expected"), [
+    pytest.param(_HYBRID_TEMPLATE, "qwen3", id="hybrid"),
+    pytest.param(_FORCED_THINKING_TEMPLATE, "deepseek-r1",
+                 id="forced_thinking"),
+])
+def test_auto_detect_qwen3_template_in_jinja_file(tmp_path, model_type,
+                                                  template, expected):
+    """A chat template stored only in chat_template.jinja is read."""
+    model_dir = str(tmp_path / "Qwen3-jinja")
+    _write_qwen3_checkpoint(model_dir,
+                            model_type,
+                            jinja=template,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
+def test_auto_detect_qwen3_jinja_file_takes_priority(tmp_path):
+    """chat_template.jinja wins over tokenizer_config.json, as in transformers."""
+    model_dir = str(tmp_path / "Qwen3-both")
+    _write_qwen3_checkpoint(
+        model_dir,
+        jinja=_HYBRID_TEMPLATE,
+        tokenizer_config={"chat_template": _FORCED_NON_THINKING_TEMPLATE})
+
+    assert resolve_auto_reasoning_parser(model_dir) == "qwen3"
+
+
+def test_auto_detect_qwen3_named_templates(tmp_path):
+    """The "default" entry of a list of named templates is the one read."""
+    model_dir = str(tmp_path / "Qwen3-named")
+    _write_qwen3_checkpoint(model_dir,
+                            tokenizer_config={
+                                "chat_template": [
+                                    {
+                                        "name": "tool_use",
+                                        "template": _HYBRID_TEMPLATE
+                                    },
+                                    {
+                                        "name": "default",
+                                        "template": _FORCED_THINKING_TEMPLATE
+                                    },
+                                ]
+                            })
+
+    assert resolve_auto_reasoning_parser(model_dir) == "deepseek-r1"
+
+
+def test_auto_detect_qwen3_template_in_chat_template_json(tmp_path):
+    """chat_template.json is read when no other file holds a template."""
+    model_dir = str(tmp_path / "Qwen3-processor")
+    _write_qwen3_checkpoint(
+        model_dir,
+        tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE,
+        chat_template_json={"chat_template": _FORCED_THINKING_TEMPLATE})
+
+    assert resolve_auto_reasoning_parser(model_dir) == "deepseek-r1"
+
+
+def test_detect_qwen3_tokenizer_config_precedes_chat_template_json(tmp_path):
+    """tokenizer_config.json wins over chat_template.json."""
+    model_dir = str(tmp_path / "Qwen3-precedence")
+    _write_qwen3_checkpoint(
+        model_dir,
+        "qwen3_moe",
+        tokenizer_config={"chat_template": _FORCED_NON_THINKING_TEMPLATE},
+        chat_template_json={"chat_template": _FORCED_THINKING_TEMPLATE})
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        None, no_parser_needed=True)
+    assert resolve_auto_reasoning_parser(model_dir) is None
+
+
+def test_auto_detect_qwen3_no_chat_template_anywhere(tmp_path):
+    """No template in any file → 'qwen3' fallback, not forced-non-thinking."""
+    model_dir = str(tmp_path / "Qwen3-no-template")
+    _write_qwen3_checkpoint(model_dir,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert resolve_auto_reasoning_parser(model_dir) == "qwen3"
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        "qwen3")
+
+
+@pytest.mark.parametrize(("files", "expected"), [
+    pytest.param(
+        {"chat_template.jinja": b" \n\t\n"}, "qwen3", id="whitespace_jinja"),
+    pytest.param({"chat_template.jinja": b"\xff\xfe{{ not utf-8 }}"},
+                 "qwen3",
+                 id="non_utf8_jinja"),
+    pytest.param({"tokenizer_config.json": b'{"chat_template": '},
+                 "qwen3",
+                 id="malformed_tokenizer_config"),
+    pytest.param({"chat_template.json": b"not json"},
+                 "qwen3",
+                 id="malformed_chat_template_json"),
+    pytest.param(
+        {
+            "chat_template.jinja":
+            b"\xff\xfe{{ not utf-8 }}",
+            "chat_template.json":
+            json.dumps({
+                "chat_template": _FORCED_THINKING_TEMPLATE
+            }).encode(),
+        },
+        "deepseek-r1",
+        id="non_utf8_jinja_falls_through"),
+])
+def test_auto_detect_qwen3_unusable_template_files_are_skipped(
+        tmp_path, files, expected):
+    """Unreadable, malformed or blank template files do not abort detection."""
+    model_dir = str(tmp_path / "Qwen3-unusable")
+    _write_qwen3_checkpoint(model_dir)
+    if "tokenizer_config.json" not in files:
+        files = {
+            "tokenizer_config.json":
+            json.dumps(_TOKENIZER_CONFIG_WITHOUT_TEMPLATE).encode(),
+            **files
+        }
+    for file_name, content in files.items():
+        with open(os.path.join(model_dir, file_name), "wb") as f:
+            f.write(content)
+
+    assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
+@pytest.mark.parametrize("files", ["jinja", "tokenizer_config"])
+def test_detect_qwen3_forced_non_thinking_needs_no_parser(tmp_path, files):
+    """A template that never opens a reasoning block is a positive answer."""
+    model_dir = str(tmp_path / "Qwen3-Instruct")
+    if files == "jinja":
+        _write_qwen3_checkpoint(
+            model_dir,
+            "qwen3_moe",
+            jinja=_FORCED_NON_THINKING_TEMPLATE,
+            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+    else:
+        _write_qwen3_checkpoint(
+            model_dir,
+            "qwen3_moe",
+            tokenizer_config={"chat_template": _FORCED_NON_THINKING_TEMPLATE})
+
+    detected = detect_auto_reasoning_parser(model_dir)
+    assert detected == AutoReasoningParserResult(None, no_parser_needed=True)
+    assert resolve_auto_reasoning_parser(model_dir) is None
+
+
+# Qwen3-Reranker layout: chat_template.jinja prefills an empty, closed
+# reasoning block, and tokenizer_config.json keeps the hybrid template.
+_EMPTY_THINK_PREFILL_TEMPLATE = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+
+@pytest.mark.parametrize(("jinja", "expected"), [
+    pytest.param(_EMPTY_THINK_PREFILL_TEMPLATE, None, id="newlines"),
+    pytest.param("{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}",
+                 None,
+                 id="escaped_newlines"),
+    pytest.param(_EMPTY_THINK_PREFILL_TEMPLATE + _FORCED_THINKING_TEMPLATE,
+                 "deepseek-r1",
+                 id="with_open_block"),
+    pytest.param(_FORCED_THINKING_TEMPLATE + _EMPTY_THINK_PREFILL_TEMPLATE,
+                 "deepseek-r1",
+                 id="open_block_first"),
+])
+def test_detect_qwen3_empty_think_prefill(tmp_path, jinja, expected):
+    """An empty, closed <think></think> block does not open reasoning."""
+    model_dir = str(tmp_path / "Qwen3-Reranker")
+    _write_qwen3_checkpoint(
+        model_dir,
+        jinja=jinja,
+        tokenizer_config={"chat_template": _HYBRID_TEMPLATE})
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        expected, no_parser_needed=expected is None)
+    assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
+# Message loops without a generation prompt. The first re-renders the reasoning
+# of past assistant turns in a <think> block, as the chat_template.jinja of
+# nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4 does.
+_REASONING_HISTORY_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{%- if message.role == 'assistant' and message.reasoning_content %}"
+    "{{- '<|im_start|>assistant\\n<think>\\n' + message.reasoning_content"
+    " + '\\n</think>\\n\\n' + message.content + '<|im_end|>\\n' }}"
+    "{%- else %}"
+    "{{- '<|im_start|>' + message.role + '\\n' + message.content"
+    " + '<|im_end|>\\n' }}"
+    "{%- endif %}{%- endfor %}")
+_PLAIN_HISTORY_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{{- '<|im_start|>' + message.role + '\\n' + message.content"
+    " + '<|im_end|>\\n' }}"
+    "{%- endfor %}")
+# As in PrimeIntellect/Qwen3-1.7B: past turns without reasoning get an empty
+# block, which is not a prefill of the generation prompt.
+_REASONING_OR_EMPTY_HISTORY_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{{- '<|im_start|>' + message.role + '\\n' }}"
+    "{%- if message.reasoning_content %}"
+    "{{- '<think>' + message.reasoning_content + '</think>' }}"
+    "{%- else %}{{- '<think></think>' }}{%- endif %}"
+    "{{- message.content + '<|im_end|>\\n' }}{%- endfor %}")
+
+
+@pytest.mark.parametrize(("jinja", "expected"), [
+    pytest.param(_REASONING_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE,
+                 None,
+                 id="history_only"),
+    pytest.param(_REASONING_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE +
+                 "{# add_generation_prompt: <think> #}",
+                 None,
+                 id="comment_after_prompt"),
+    pytest.param("{%- if add_generation_prompt is not defined %}"
+                 "{%- set add_generation_prompt = false %}{%- endif %}" +
+                 _REASONING_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE,
+                 None,
+                 id="default_set_before_history"),
+    pytest.param(
+        _REASONING_OR_EMPTY_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE,
+        None,
+        id="reasoning_or_empty_block_in_history"),
+    pytest.param(_REASONING_HISTORY_TEMPLATE + _FORCED_THINKING_TEMPLATE,
+                 "deepseek-r1",
+                 id="history_and_prompt"),
+    pytest.param(_PLAIN_HISTORY_TEMPLATE + _FORCED_THINKING_TEMPLATE,
+                 "deepseek-r1",
+                 id="prompt_only"),
+    pytest.param("<|im_start|>assistant\n<think>\n",
+                 "deepseek-r1",
+                 id="no_generation_prompt"),
+])
+def test_detect_qwen3_think_in_generation_prompt(tmp_path, jinja, expected):
+    """Only a <think> in the generation prompt marks a forced-thinking model.
+
+    A non-empty <think> written only outside the generation prompt cannot be
+    detected: thinking and instruct checkpoints ship such templates alike.
+    """
+    model_dir = str(tmp_path / "Qwen3-235B-A22B-Instruct-2507")
+    _write_qwen3_checkpoint(model_dir,
+                            "qwen3_moe",
+                            jinja=jinja,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        expected)
+    assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
+@pytest.mark.parametrize("jinja", [
+    pytest.param("{%- for message in messages %}"
+                 "{{- '<|im_start|>' + message.role + '\\n<think>\\n\\n"
+                 "</think>\\n\\n' + message.content + '<|im_end|>\\n' }}"
+                 "{%- endfor %}" + _FORCED_NON_THINKING_TEMPLATE,
+                 id="empty_block_in_history"),
+    pytest.param(_REASONING_HISTORY_TEMPLATE + "{%- if add_generation_prompt %}"
+                 "{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}"
+                 "{%- endif %}",
+                 id="empty_prefill_after_history"),
+    pytest.param("{#- <think> is never written -#}" + _PLAIN_HISTORY_TEMPLATE +
+                 _FORCED_NON_THINKING_TEMPLATE,
+                 id="think_in_comment"),
+])
+def test_detect_qwen3_no_reasoning_outside_generation_prompt(tmp_path, jinja):
+    """Empty blocks and comments outside the prompt still need no parser.
+
+    So does reasoning in past turns when the generation prompt itself closes
+    an empty <think></think> block, as in t-tech/T-pro-it-2.1.
+    """
+    model_dir = str(tmp_path / "Qwen3-235B-A22B-Instruct-2507")
+    _write_qwen3_checkpoint(model_dir,
+                            "qwen3_moe",
+                            jinja=jinja,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        None, no_parser_needed=True)
+
+
+# DeepSeek-R1-0528-Qwen3-8B layout: a Qwen3 base with a DeepSeek chat template
+# whose generation prompt never opens <think>.
+_DEEPSEEK_TOKEN_TEMPLATE = (
+    "{% if not add_generation_prompt is defined %}"
+    "{% set add_generation_prompt = false %}{% endif %}"
+    "{%- for message in messages %}{%- if message['role'] == 'user' %}"
+    "{{'<｜User｜>' + message['content'] + '<｜Assistant｜>'}}{%- endif %}"
+    "{%- if message['role'] == 'assistant' %}"
+    "{% set content = message['content'] %}"
+    "{% if '</think>' in content %}"
+    "{% set content = content.split('</think>')[-1] %}{% endif %}"
+    "{{content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endfor %}"
+    "{% if add_generation_prompt %}{{'<｜Assistant｜>'}}{% endif %}")
+
+
+@pytest.mark.parametrize("files", ["jinja", "tokenizer_config"])
+def test_detect_qwen3_non_chatml_template_is_a_failure(tmp_path, files):
+    """A non-ChatML template that never opens <think> cannot be detected."""
+    model_dir = str(tmp_path / "DeepSeek-R1-0528-Qwen3-8B")
+    if files == "jinja":
+        _write_qwen3_checkpoint(
+            model_dir,
+            jinja=_DEEPSEEK_TOKEN_TEMPLATE,
+            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+    else:
+        _write_qwen3_checkpoint(
+            model_dir,
+            tokenizer_config={"chat_template": _DEEPSEEK_TOKEN_TEMPLATE})
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        None)
+    assert resolve_auto_reasoning_parser(model_dir) is None
+
+
+def test_detect_qwen3_non_chatml_forced_thinking(tmp_path):
+    """Any chat format that opens <think> in the prompt is forced thinking."""
+    model_dir = str(tmp_path / "DeepSeek-R1-Qwen3-forced-thinking")
+    jinja = _DEEPSEEK_TOKEN_TEMPLATE.replace(
+        "{{'<｜Assistant｜>'}}{% endif %}",
+        "{{'<｜Assistant｜><think>\\n'}}{% endif %}")
+    _write_qwen3_checkpoint(model_dir,
+                            jinja=jinja,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        "deepseek-r1")
+
+
+def test_detect_qwen3_non_chatml_prompt_after_chatml_history(tmp_path):
+    """Only the generation prompt has to be in the Qwen ChatML format."""
+    model_dir = str(tmp_path / "Qwen3-chatml-history-deepseek-prompt")
+    jinja = _DEEPSEEK_TOKEN_TEMPLATE.replace(
+        "{{'<｜User｜>' + message['content'] + '<｜Assistant｜>'}}",
+        "{{'<|im_start|>user\\n' + message['content'] + '<|im_end|>\\n'}}")
+    _write_qwen3_checkpoint(model_dir,
+                            jinja=jinja,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        None)
+
+
+@pytest.mark.parametrize(("name", "model_type"), [
+    ("DeepSeek-V3.1", "deepseek_v3"),
+    ("SomeUnknownModel", "some_unknown_type"),
+])
+def test_detect_none_without_template_evidence_is_a_failure(
+        tmp_path, name, model_type):
+    """A None that is not backed by a chat template is not "no parser needed"."""
+    model_dir = str(tmp_path / name)
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+    _write_tokenizer_config(model_dir, _FORCED_NON_THINKING_TEMPLATE)
+
+    detected = detect_auto_reasoning_parser(model_dir)
+    assert detected == AutoReasoningParserResult(None)
+
+
+def test_detect_without_config_is_a_failure(tmp_path):
+    """A directory without config.json cannot be detected."""
+    assert detect_auto_reasoning_parser(
+        str(tmp_path)) == AutoReasoningParserResult(None)
 
 
 @pytest.mark.parametrize(
