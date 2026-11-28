@@ -13207,7 +13207,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _LSE_DTYPE_BYTES = 4  # float32
 
         _MMA_TILE_M = 128
-        _MAX_SPLIT_KV = 32
+        _MAX_SPLIT_KV = 64
+        # Default-grid cap for batches with more than one query-tile row: the
+        # per-request split plan rarely exceeds it there, and the empty slots
+        # of a larger grid cost ~3-4% (measured on SM100, see #20510).
+        _MULTI_ROW_MAX_SPLIT_KV = 32
         # CTA waves the split targets: with one wave, the longest request of a
         # skewed decode batch sets the kernel time.
         _SPLIT_KV_WAVES = 8
@@ -13283,7 +13287,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """~_SPLIT_KV_WAVES waves of (2, B * S, split_kv) CTAs, as a power of
             two; ``S`` is the number of packed query tiles per request."""
             target = cls._SPLIT_KV_WAVES * max_active_blocks / (2 * B * S)
-            return min(cls._MAX_SPLIT_KV, 1 << max(0, round(math.log2(target))))
+            # A single query-tile row (B * S == 1) is the only grid whose
+            # per-request plan can use more than _MULTI_ROW_MAX_SPLIT_KV
+            # slots without over-provisioning the grid for the rest of the
+            # batch: splitting a lone long request across a full wave of
+            # clusters cuts its decode latency by 23-31% on SM100 (#20510).
+            cap = (cls._MAX_SPLIT_KV if B *
+                   S == 1 else cls._MULTI_ROW_MAX_SPLIT_KV)
+            return min(cap, 1 << max(0, round(math.log2(target))))
+
+        def _max_uniform_split_kv(self) -> int:
+            """Uniform-split cap of this runner's kernel. The fp8 kernel's
+            measured win region extends to ``_MAX_SPLIT_KV``; the fp16/bf16
+            kernel keeps its pre-existing 32 cap (its ``can_implement``
+            still rejects larger uniform splits)."""
+            if self.in_dtype == cutlass.Float8E4M3FN:
+                return self._MAX_SPLIT_KV
+            return self._MULTI_ROW_MAX_SPLIT_KV
 
         @staticmethod
         def get_split_kv_candidates(B: int, S: int,
@@ -13426,9 +13446,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ((128, 128), (128, 256)),
             ]
             max_active_blocks = self._get_max_active_blocks()
-            split_candidates = self.get_split_kv_candidates(
-                batch_size, self.get_num_q_tiles(h, seq_len_q),
-                max_active_blocks)
+            split_candidates = [
+                min(split, self._max_uniform_split_kv())
+                for split in self.get_split_kv_candidates(
+                    batch_size, self.get_num_q_tiles(h, seq_len_q),
+                    max_active_blocks)
+            ]
             persistent_candidates = self.get_is_persistent_candidates()
 
             valid = []
@@ -13613,10 +13636,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
             bucketed_batch_size = last_positive_power_of_2(batch_size)
-            split_kv = self.get_default_split_kv(
-                bucketed_batch_size,
-                self.get_num_q_tiles(self.num_heads, self.seq_len_q),
-                max_active_blocks)
+            split_kv = min(
+                self.get_default_split_kv(
+                    bucketed_batch_size,
+                    self.get_num_q_tiles(self.num_heads, self.seq_len_q),
+                    max_active_blocks), self._max_uniform_split_kv())
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, False)
 
         # The kernel depends on the inputs' shapes alone: meta inputs compile it, from CUDA
@@ -13851,6 +13875,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._CLUSTER_SHAPE_MNK[0] * self._CLUSTER_SHAPE_MNK[1] *
                     self._CLUSTER_SHAPE_MNK[2])
 
+                # Parallelize the fp8 reduction across D bands when the
+                # packed query rows alone cannot fill the SMs (one output
+                # row per CTA otherwise; measured on SM100, see #20510).
+                reducer_rows = self.num_heads * seq_len_q
+                reducer_d_tiles = 1
+                if has_fp8_input:
+                    reducer_d_tiles = (4 if reducer_rows < 48 else
+                                       (2 if reducer_rows <= 128 else 1))
                 mla = self.kernel_class(
                     cutlass.Float32,  # acc_dtype
                     cutlass.Float32,  # lse_dtype
@@ -13864,9 +13896,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     is_var_split_kv,
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
+                    reducer_d_tiles=reducer_d_tiles,
                     # The variable split-KV reducer needs the generic capacity.
-                    reducer_max_splits=(MLA_DECODE_MAX_SPLITS
-                                        if is_var_split_kv else 32),
+                    reducer_max_splits=(MLA_DECODE_MAX_SPLITS if is_var_split_kv
+                                        else self._max_uniform_split_kv()),
                     emit_softmax_stats=self.emit_softmax_stats,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
