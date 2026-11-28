@@ -260,6 +260,9 @@ class _ContextClaim:
     state: int = _CLAIM_PENDING
     kv_cache: object = None
     passes: int = 0
+    # The helper item that runs it, withdrawn from the helper's queue when the claim is dropped
+    # before it starts.
+    item: object = None
 
 
 @dataclass(eq=False)
@@ -270,6 +273,10 @@ class _ContextPrefetch:
     request_id: int
     num_blocks: int
     cancelled: bool = False
+    # Set by the helper when the prefetch raised or brought nothing up; the executor then gives
+    # its blocks back to the bound (offer_context_prefetch).
+    failed: bool = False
+    item: object = None
 
 
 # Storage dtypes accepted as the history half of a mixed-precision KV cache.
@@ -10201,16 +10208,39 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._host_helper
 
     def stop_host_helper(self) -> None:
-        """Run the deferred closes, close the parked claims and stop the helper thread."""
+        """Run the deferred closes, stop the helper thread and close the parked claims.
+
+        Every step runs even when an earlier one raises (a close that fails, say); the first
+        error is raised once all of them have run. A call after a failed one finishes what that
+        one left: the remaining deferred closes and parked claims."""
         helper = self._host_helper
-        if helper is None:
+        if helper is None and not self._claims and not self._deferred_closes:
             return
-        self.flush_deferred_closes()
-        self._helper_releases = False
-        helper.stop()
-        self._host_helper = None
-        for request_id in list(self._claims):
-            self._drop_claim(request_id)
+        errors: list[BaseException] = []
+        if helper is not None:
+            try:
+                self.flush_deferred_closes()
+            except Exception as error:  # noqa: BLE001 - raised below, after the cleanup
+                errors.append(error)
+            self._helper_releases = False
+            try:
+                helper.stop()
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+            self._host_helper = None
+        # Each close takes its item off the queue before it runs, so one that raises does not
+        # stop the rest.
+        while self._deferred_closes:
+            try:
+                self._close_deferred(*self._deferred_closes.popleft())
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+        # _pop_claim forgets a claim before its cache is closed, so the loop always ends.
+        while self._claims:
+            try:
+                self._drop_claim(next(iter(self._claims)))
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
         self._claim_ahead_limit = 0
         self._claims_expired = set()
         self._claims_paused = 0
@@ -10219,6 +10249,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._prefetches = {}
         self._prefetch_blocks = 0
         self._prefetch_block_limit = 0
+        if errors:
+            raise errors[0]
 
     # ---- context claims ahead (host helper) --------------------------------------------------
 
@@ -10256,10 +10288,18 @@ class KVCacheManagerV2(BaseResourceManager):
             return 0
         for claim in list(self._claims.values()):
             claim.passes += 1
+            if claim.passes <= 4:
+                continue
             # A running claim is left to finish: dropping it here would make this forward wait.
-            if claim.passes > 4 and claim.state != _CLAIM_RUNNING:
-                self._drop_claim(claim.request_id)
-                self._claims_expired.add(claim.request_id)
+            # The check and the cancel of a pending one are one step under the condition, so the
+            # helper cannot start it in between.
+            with self._claims_cond:
+                if claim.state == _CLAIM_RUNNING:
+                    continue
+                if claim.state == _CLAIM_PENDING:
+                    claim.state = _CLAIM_FAILED
+            self._drop_claim(claim.request_id)
+            self._claims_expired.add(claim.request_id)
         if self._claims_paused:
             self._claims_paused -= 1
             return 0
@@ -10283,13 +10323,11 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens = self._context_reuse_tokens(req, self.context_reuse_claim_limit(req))
             scope, kwargs = self._context_create_args(req)
             claim = _ContextClaim(request_id, len(tokens))
-            self._claims[request_id] = claim
-            self._host_helper.submit(
-                CLAIM,
-                functools.partial(
-                    self._run_claim, claim, scope, tokens, kwargs, self._claim_stream
-                ),
+            claim.item = functools.partial(
+                self._run_claim, claim, scope, tokens, kwargs, self._claim_stream
             )
+            self._claims[request_id] = claim
+            self._host_helper.submit(CLAIM, claim.item)
             queued += 1
         return queued
 
@@ -10300,21 +10338,27 @@ class KVCacheManagerV2(BaseResourceManager):
                 return
             claim.state = _CLAIM_RUNNING
         kv_cache = None
+        resumed = False
         try:
-            kv_cache = self.impl.create_kv_cache(scope, tokens, id=claim.request_id, **kwargs)
-            kv_cache.cuda_stream = stream.cuda_stream
-            if not kv_cache.resume(stream.cuda_stream):
-                kv_cache.close()
-                kv_cache = None
-        except Exception as error:  # noqa: BLE001 - the scheduler claims inline instead
-            logger.warning(f"context claim ahead of request {claim.request_id} failed: {error!r}")
-            if kv_cache is not None:
-                kv_cache.close()
-            kv_cache = None
+            try:
+                kv_cache = self.impl.create_kv_cache(scope, tokens, id=claim.request_id, **kwargs)
+                kv_cache.cuda_stream = stream.cuda_stream
+                resumed = bool(kv_cache.resume(stream.cuda_stream))
+            except Exception as error:  # noqa: BLE001 - the scheduler claims inline instead
+                logger.warning(
+                    f"context claim ahead of request {claim.request_id} failed: {error!r}"
+                )
+            if not resumed and kv_cache is not None:
+                # Forgotten before the close, which may raise: the claim then still fails.
+                failed, kv_cache = kv_cache, None
+                failed.close()
         finally:
+            # Only a cache whose resume succeeded is handed over; every other path fails the
+            # claim, so the scheduling pass creates the cache itself.
+            adopt = kv_cache if resumed else None
             with self._claims_cond:
-                claim.kv_cache = kv_cache
-                claim.state = _CLAIM_DONE if kv_cache is not None else _CLAIM_FAILED
+                claim.kv_cache = adopt
+                claim.state = _CLAIM_DONE if adopt is not None else _CLAIM_FAILED
                 self._claims_cond.notify_all()
 
     def _pop_claim(self, request_id: int):
@@ -10323,12 +10367,18 @@ class KVCacheManagerV2(BaseResourceManager):
         claim = self._claims.pop(request_id, None)
         if claim is None:
             return None, None
+        withdraw = False
         with self._claims_cond:
             while claim.state == _CLAIM_RUNNING:
                 self._claims_cond.wait()
             if claim.state == _CLAIM_PENDING:
                 claim.state = _CLAIM_FAILED
+                withdraw = True
             kv_cache, claim.kv_cache = claim.kv_cache, None
+        if withdraw and self._host_helper is not None and claim.item is not None:
+            # Not left in the queue: it would run as a no-op only in a later forward window.
+            self._host_helper.withdraw(CLAIM, claim.item)
+        claim.item = None
         return claim, kv_cache
 
     def _close_claimed(self, request_id: int, kv_cache: _KVCache) -> None:
@@ -10406,6 +10456,11 @@ class KVCacheManagerV2(BaseResourceManager):
         number queued."""
         if not self._prefetch_block_limit or not self.can_evict:
             return 0  # nothing below the GPU tier to bring up
+        # A prefetch that raised or brought nothing up gives its blocks back to the bound now,
+        # not when its request is admitted or freed. Its request is not offered again.
+        for prefetch in [p for p in self._prefetches.values() if p.failed]:
+            self._prefetch_blocks -= prefetch.num_blocks
+            prefetch.num_blocks = 0
         queued = 0
         for req in requests:
             request_id = req.py_request_id
@@ -10427,19 +10482,21 @@ class KVCacheManagerV2(BaseResourceManager):
             scope = ReuseScope(
                 lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)
             )
-            self._host_helper.submit(
-                PREFETCH, functools.partial(self._run_prefetch, prefetch, scope, tokens)
-            )
+            prefetch.item = functools.partial(self._run_prefetch, prefetch, scope, tokens)
+            self._host_helper.submit(PREFETCH, prefetch.item)
             queued += 1
         return queued
 
     def _run_prefetch(self, prefetch: _ContextPrefetch, scope, tokens) -> None:
-        """The host helper's prefetch item."""
+        """The host helper's prefetch item. A failure is only flagged on the prefetch: the
+        executor thread owns the prefetch bound."""
         if prefetch.cancelled:
             return
         try:
-            self.impl.prefetch_reuse(scope, tokens, GPU_LEVEL)
+            if self.impl.prefetch_reuse(scope, tokens, GPU_LEVEL) is False:
+                prefetch.failed = True
         except Exception as error:  # noqa: BLE001 - the request restores its prefix inline
+            prefetch.failed = True
             logger.warning(f"context prefetch of request {prefetch.request_id} failed: {error!r}")
 
     def _end_prefetch(self, request_id: int) -> None:
@@ -10447,6 +10504,10 @@ class KVCacheManagerV2(BaseResourceManager):
         if prefetch is not None:
             prefetch.cancelled = True
             self._prefetch_blocks -= prefetch.num_blocks
+            prefetch.num_blocks = 0
+            if self._host_helper is not None and prefetch.item is not None:
+                self._host_helper.withdraw(PREFETCH, prefetch.item)
+            prefetch.item = None
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while

@@ -75,9 +75,21 @@ class KvHostHelper:
         self.num_run = [0, 0, 0]
         self.num_forward_waits = 0
         self._thread: Optional[threading.Thread] = None
+        self._startup_error: Optional[BaseException] = None
         if start_thread:
-            self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+            started = threading.Event()
+            self._thread = threading.Thread(
+                target=self._run, args=(started,), name=name, daemon=True
+            )
             self._thread.start()
+            # The thread reports its setup before the helper is handed out: a helper whose thread
+            # exited would accept work that never runs.
+            started.wait()
+            if self._startup_error is not None:
+                self._thread.join()
+                raise RuntimeError(
+                    f"{name} could not start: {self._startup_error!r}"
+                ) from self._startup_error
 
     # ---- executor thread --------------------------------------------------------------------
 
@@ -88,6 +100,17 @@ class KvHostHelper:
                 raise RuntimeError(f"{self._name} is stopped")
             self._queues[kind].append(item)
             self._cond.notify()
+
+    def withdraw(self, kind: int, item: Callable[[], None]) -> bool:
+        """Take a queued ``item`` of ``kind`` off its queue; False if it is not queued (it has
+        started, or was dropped). A cancelled item is withdrawn so that the queue holds live work
+        only: what it holds stays within the caller's own bound."""
+        with self._cond:
+            try:
+                self._queues[kind].remove(item)
+            except ValueError:
+                return False
+            return True
 
     def num_pending(self, kind: int) -> int:
         return len(self._queues[kind])
@@ -188,11 +211,20 @@ class KvHostHelper:
             self.num_run[kind] += 1
         return True
 
-    def _run(self) -> None:
-        if self._device is not None:
-            import torch
+    def _run(self, started: Optional[threading.Event] = None) -> None:
+        try:
+            if self._device is not None:
+                import torch
 
-            torch.cuda.set_device(self._device)
+                torch.cuda.set_device(self._device)
+        except BaseException as error:  # noqa: BLE001 - reported to the constructor
+            self._startup_error = error
+            with self._cond:
+                self._stopped = True
+            return
+        finally:
+            if started is not None:
+                started.set()
         while True:
             with self._cond:
                 while not self._stopped and not any(

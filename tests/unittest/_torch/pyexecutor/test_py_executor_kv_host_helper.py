@@ -26,13 +26,21 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 pytestmark = pytest.mark.cpu_only
 
 
-def _request(request_id, state=LlmRequestState.CONTEXT_INIT, first_chunk=True, dummy=False):
+def _request(
+    request_id,
+    state=LlmRequestState.CONTEXT_INIT,
+    first_chunk=True,
+    dummy=False,
+    generation_only=None,
+):
+    if generation_only is None:
+        generation_only = state == LlmRequestState.GENERATION_IN_PROGRESS
     return SimpleNamespace(
         py_request_id=request_id,
         state=state,
         is_first_context_chunk=first_chunk,
         is_dummy_request=dummy,
-        is_generation_only_request=state == LlmRequestState.GENERATION_IN_PROGRESS,
+        is_generation_only_request=generation_only,
     )
 
 
@@ -193,7 +201,9 @@ def test_the_helper_stays_off_on_ranks_that_schedule_in_lock_step(mapping, start
     assert ex._kv_host_helper is helper
 
 
-def test_a_finished_generation_request_is_noted_for_the_scheduler() -> None:
+def test_a_finished_generation_only_request_is_noted_for_the_scheduler() -> None:
+    """A generation-only request that completed normally (GENERATION_COMPLETE before it is
+    terminated) is noted; a context request and a dummy are not."""
     ex = object.__new__(PyExecutor)
     ex._free_request_resources = Mock()
     ex._release_multimodal_resources = Mock()
@@ -201,8 +211,12 @@ def test_a_finished_generation_request_is_noted_for_the_scheduler() -> None:
     ex.dist = SimpleNamespace(rank=1)
     note = ex._note_generation_release = Mock()
 
-    ex._do_terminate_request(_request(1, state=LlmRequestState.GENERATION_IN_PROGRESS))
     ex._do_terminate_request(_request(2))  # a context request
-    ex._do_terminate_request(_request(3, state=LlmRequestState.GENERATION_IN_PROGRESS, dummy=True))
-
+    ex._do_terminate_request(
+        _request(3, state=LlmRequestState.GENERATION_COMPLETE, generation_only=True, dummy=True)
+    )
+    note.assert_not_called()
+    ex._do_terminate_request(
+        _request(1, state=LlmRequestState.GENERATION_COMPLETE, generation_only=True)
+    )
     note.assert_called_once_with()
