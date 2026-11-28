@@ -598,8 +598,8 @@ class TRTLLMWorker(Worker):
     async def streaming_generate_helper(self, generate_result, step_at_least,
                                         streaming_output_list):
         step = 0
-        while not generate_result._done:
-            async_task = asyncio.create_task(generate_result._aresult_step())
+        while not generate_result.finished:
+            async_task = asyncio.create_task(anext(generate_result))
             if step_at_least and step >= step_at_least and not async_task.done(
             ):
                 async_task.cancel()
@@ -607,7 +607,7 @@ class TRTLLMWorker(Worker):
             await async_task
             step += 1
             # do not put the last token to the streaming_output_list
-            if streaming_output_list is not None and not generate_result._done:
+            if streaming_output_list is not None and not generate_result.finished:
                 streaming_output_list.append(
                     ScaffoldingOutput(
                         generate_result.outputs[0].text,
@@ -656,7 +656,7 @@ class TRTLLMWorker(Worker):
 
         self.fill_task_with_result(task, task.request_handle)
 
-        if task.request_handle._done:
+        if task.request_handle.finished:
             task.end_flag = True
         return TaskStatus.SUCCESS
 

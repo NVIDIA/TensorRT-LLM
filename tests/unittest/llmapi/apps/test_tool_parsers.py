@@ -6304,7 +6304,7 @@ class TestForcedToolCallStreamingFinishReason:
 
         rsp = Mock()
         rsp.outputs = [output]
-        rsp._done = finish_reason is not None
+        rsp.finished = finish_reason is not None
         rsp.cached_tokens = 0
         rsp.prompt_token_ids = [1, 2, 3]
         # Read via getattr() and fed straight into a pydantic model, so it must
@@ -6893,7 +6893,7 @@ class TestForcedToolChoicePostprocessing:
             rsp = SimpleNamespace(outputs=[output],
                                   cached_tokens=0,
                                   id="test-request",
-                                  _done=last)
+                                  finished=last)
             for line in chat_stream_post_processor(rsp, args):
                 payloads.append(json.loads(line[len("data: "):]))
         return payloads
@@ -7210,7 +7210,7 @@ class TestChatStreamFinishChunk:
             rsp = SimpleNamespace(outputs=outputs,
                                   cached_tokens=0,
                                   id="test-request",
-                                  _done=last)
+                                  finished=last)
             for line in chat_stream_post_processor(rsp, args):
                 payloads.append(json.loads(line[len("data: "):]))
         return payloads

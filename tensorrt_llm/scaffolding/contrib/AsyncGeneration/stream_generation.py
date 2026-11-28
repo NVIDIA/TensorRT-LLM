@@ -43,12 +43,11 @@ async def stream_generation_handler(worker,
             return TaskStatus.SUCCESS
 
         for _ in range(task.streaming_step):
-            await task.request_handle._aresult_step()
-            if task.request_handle._done:
+            await anext(task.request_handle)
+            if task.request_handle.finished:
                 break
-        while not task.request_handle._done:
-            async_task = asyncio.create_task(
-                task.request_handle._aresult_step())
+        while not task.request_handle.finished:
+            async_task = asyncio.create_task(anext(task.request_handle))
             if not async_task.done():
                 async_task.cancel()
                 break
@@ -58,7 +57,7 @@ async def stream_generation_handler(worker,
         task.cumulative_logprob = task.request_handle.outputs[
             0].cumulative_logprob
         task.logprobs = task.request_handle.outputs[0].logprobs
-        if task.request_handle._done:
+        if task.request_handle.finished:
             task.end_flag = True
 
     sampling_params = worker.convert_task_params(task)
