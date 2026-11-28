@@ -17,9 +17,11 @@ import array
 import os
 import sys
 import time
+import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -63,6 +65,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -7042,7 +7045,7 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
         patch.object(KVCacheManagerV2, "_reserve_guard_page"),
     ):
-        KVCacheManagerV2(
+        manager = KVCacheManagerV2(
             KvCacheConfig(max_gpu_total_bytes=64 << 20, enable_block_reuse=False),
             CacheType.SELFKONLY,
             num_layers=1,
@@ -7063,8 +7066,9 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
     gpu_tier, host_tier = config.cache_tiers
     # The manager splits both from its typical step, host-backed pools included.
     assert config.initial_pool_ratio is None
-    # Only the offload allocations come off the 64 MiB budget.
-    assert gpu_tier.quota > (63 << 20)
+    # The single small arena maps one 2 MiB GPU chunk; host history is charged separately.
+    assert manager._sparse_batch_buffer_bytes > 0
+    assert gpu_tier.quota + manager._sparse_batch_buffer_bytes + (2 << 20) == (64 << 20)
     # The 200 MiB of host history less the sparse Batch's one-page staging copy, handed
     # over whole: the manager counts host bytes in their own grain.
     assert config.host_sparse_pool_quota == (200 << 20) - 4096
@@ -7367,6 +7371,505 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
     assert torch.equal(buffer[22], torch.full((2,), 5.0))
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "host_tiers,mode,warning",
+    [
+        ([], RestoreMode.NONE, None),
+        ([], RestoreMode.MEMSET, None),
+        ([16 << 20], RestoreMode.CPU, "shortfall: 16777216 bytes"),
+        ([16 << 20], RestoreMode.PINNED, "shortfall: 16777216 bytes"),
+        ([32 << 20], RestoreMode.CPU, None),
+        ([32 << 20], RestoreMode.PINNED, None),
+    ],
+)
+def test_sleep_warns_when_host_capacity_below_gpu(
+    host_tiers: list[int], mode: RestoreMode, warning: str | None
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    # Hot and cold GPU levels both count toward the backup capacity.
+    tiers = [GpuCacheTierConfig(quota=16 << 20), GpuCacheTierConfig(quota=16 << 20)]
+    tiers.extend(HostCacheTierConfig(quota=quota) for quota in host_tiers)
+    manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
+    with (
+        patch.object(kv_cache_v2_module.logger, "_appeared_keys", set()),
+        patch.object(kv_cache_v2_module.logger, "log") as mock_log,
+    ):
+        manager.validate_sleep_config(mode)
+    if warning is None:
+        mock_log.assert_not_called()
+    else:
+        mock_log.assert_called_once()
+        assert mock_log.call_args.args[0] == kv_cache_v2_module.logger.WARNING
+        assert warning in mock_log.call_args.args[1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", [RestoreMode.CPU, RestoreMode.PINNED])
+@pytest.mark.parametrize("layout", ["gpu_only", "empty_host", "host_before_last_gpu"])
+def test_sleep_rejects_missing_backup_tier_before_native_mutation(
+    mode: RestoreMode, layout: str
+) -> None:
+    """Reject an unusable preservation layout without changing native state."""
+    tiers = [GpuCacheTierConfig(quota=32 << 20)]
+    if layout == "empty_host":
+        tiers.append(HostCacheTierConfig(quota=0))
+    elif layout == "host_before_last_gpu":
+        tiers.extend([HostCacheTierConfig(quota=32 << 20), GpuCacheTierConfig(quota=16 << 20)])
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = None
+    manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
+
+    for validate in (
+        manager.validate_sleep_config,
+        manager.validate_memory_release,
+        manager.release_memory,
+    ):
+        with pytest.raises(
+            ValueError, match="nonzero HOST or DISK cache tier below all GPU levels"
+        ):
+            validate(mode)
+
+    assert manager._sleep_restore_mode is None
+    manager.impl.validate_memory_release.assert_not_called()
+    manager.impl.release_gpu_memory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", [RestoreMode.CPU, RestoreMode.PINNED])
+def test_sleep_accepts_disk_backup_without_host_tier(mode: RestoreMode, tmp_path: Path) -> None:
+    """Leave disk-backed preservation capacity to the native preflight."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock(
+        init_config=SimpleNamespace(
+            cache_tiers=[
+                GpuCacheTierConfig(quota=32 << 20),
+                DiskCacheTierConfig(quota=32 << 20, path=str(tmp_path)),
+            ]
+        )
+    )
+    manager.validate_memory_release(mode)
+    manager.impl.validate_memory_release.assert_called_once_with(discard=False, retiring=[])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", [RestoreMode.CPU, RestoreMode.MEMSET])
+def test_sleep_preflight_retires_only_owned_padding_and_guard(mode: RestoreMode) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock(
+        init_config=SimpleNamespace(
+            cache_tiers=[GpuCacheTierConfig(quota=32 << 20), HostCacheTierConfig(quota=32 << 20)]
+        )
+    )
+    guard, padding, other = Mock(), Mock(), Mock()
+    manager.kv_cache_map = {kv_cache_v2_module._GUARD_PAGE_REQUEST_ID: guard, 1: padding, 2: other}
+    manager.validate_memory_release(mode, retiring_padding_ids={1, 3})
+    kwargs = manager.impl.validate_memory_release.call_args.kwargs
+    assert kwargs["discard"] == (mode == RestoreMode.MEMSET)
+    assert set(kwargs["retiring"]) == ({guard, padding} if mode == RestoreMode.CPU else set())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", [RestoreMode.CPU, RestoreMode.PINNED])
+def test_sleep_host_warning_is_deduplicated_across_release_checks(mode: RestoreMode) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = None
+    manager.event_manager = None
+    manager._restore_memory_bindings = Mock()
+    manager.impl = Mock(
+        init_config=SimpleNamespace(
+            cache_tiers=[GpuCacheTierConfig(quota=32 << 20), HostCacheTierConfig(quota=16 << 20)]
+        )
+    )
+    with (
+        patch.object(kv_cache_v2_module.logger, "_appeared_keys", set()),
+        patch.object(kv_cache_v2_module.logger, "log") as mock_log,
+    ):
+        for _ in range(3):
+            manager.validate_sleep_config(mode)
+            manager.validate_sleep_config(mode)
+            manager.validate_memory_release(mode)
+            manager.release_memory(mode)
+            manager.materialize_memory()
+        mock_log.assert_called_once()
+
+    assert (
+        manager.impl.validate_memory_release.call_args_list
+        == [call(discard=False, retiring=[])] * 3
+    )
+    assert manager.impl.release_gpu_memory.call_args_list == [call(discard=False)] * 3
+
+
+@pytest.mark.cpu_only
+def test_sleep_host_warning_is_per_manager_without_retaining_managers() -> None:
+    managers = [object.__new__(KVCacheManagerV2) for _ in range(2)]
+    references = [weakref.ref(manager) for manager in managers]
+    with (
+        patch.object(kv_cache_v2_module.logger, "_appeared_keys", set()),
+        patch.object(kv_cache_v2_module.logger, "log") as mock_log,
+    ):
+        for manager in managers:
+            manager.impl = Mock(
+                init_config=SimpleNamespace(
+                    cache_tiers=[
+                        GpuCacheTierConfig(quota=32 << 20),
+                        HostCacheTierConfig(quota=16 << 20),
+                    ]
+                )
+            )
+            manager.validate_sleep_config(RestoreMode.CPU)
+            manager.validate_sleep_config(RestoreMode.PINNED)
+        assert mock_log.call_count == 2
+        del manager, managers
+        assert all(reference() is None for reference in references)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("gpu_quota,host_quota", [(48 << 20, 32 << 20), (32 << 20, 8 << 20)])
+def test_sleep_host_warning_changes_with_capacity(gpu_quota: int, host_quota: int) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock(
+        init_config=SimpleNamespace(
+            cache_tiers=[GpuCacheTierConfig(quota=32 << 20), HostCacheTierConfig(quota=16 << 20)]
+        )
+    )
+    with (
+        patch.object(kv_cache_v2_module.logger, "_appeared_keys", set()),
+        patch.object(kv_cache_v2_module.logger, "log") as mock_log,
+    ):
+        manager.validate_sleep_config(RestoreMode.CPU)
+        manager.impl.init_config.cache_tiers = [
+            GpuCacheTierConfig(quota=gpu_quota),
+            HostCacheTierConfig(quota=host_quota),
+        ]
+        manager.validate_sleep_config(RestoreMode.CPU)
+        manager.validate_sleep_config(RestoreMode.CPU)
+        assert mock_log.call_count == 2
+        assert f"Combined GPU quota: {gpu_quota} bytes" in mock_log.call_args.args[1]
+        assert f"largest eligible host tier: {host_quota} bytes" in mock_log.call_args.args[1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+def test_sleep_rechecks_lender_after_successful_validation(mode: RestoreMode) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = None
+    manager.impl = Mock(
+        init_config=SimpleNamespace(
+            cache_tiers=[GpuCacheTierConfig(quota=32 << 20), HostCacheTierConfig(quota=32 << 20)]
+        )
+    )
+    manager.validate_sleep_config(mode)
+    manager._sharing = Mock()
+    with pytest.raises(ValueError, match="attached KV cache lender"):
+        manager.validate_memory_release(mode)
+    with pytest.raises(ValueError, match="attached KV cache lender"):
+        manager.release_memory(mode)
+    manager.impl.validate_memory_release.assert_not_called()
+    manager.impl.release_gpu_memory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_sleep_rechecks_native_capacity_after_host_warning() -> None:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock(
+        init_config=SimpleNamespace(
+            cache_tiers=[GpuCacheTierConfig(quota=32 << 20), HostCacheTierConfig(quota=16 << 20)]
+        )
+    )
+    with (
+        patch.object(kv_cache_v2_module.logger, "_appeared_keys", set()),
+        patch.object(kv_cache_v2_module.logger, "log") as mock_log,
+    ):
+        manager.validate_memory_release(RestoreMode.CPU)
+        manager.impl.validate_memory_release.side_effect = OutOfPagesError(
+            "held pages exceed capacity"
+        )
+        with pytest.raises(ValueError, match="held pages exceed capacity"):
+            manager.validate_memory_release(RestoreMode.CPU)
+        mock_log.assert_called_once()
+    assert (
+        manager.impl.validate_memory_release.call_args_list
+        == [call(discard=False, retiring=[])] * 2
+    )
+    manager.impl.release_gpu_memory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+def test_sleep_rejects_locality_domains_before_mutation(mode: RestoreMode) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = None
+    manager.impl = Mock(num_locality_domains=2)
+    for operation in (
+        manager.validate_sleep_config,
+        manager.validate_memory_release,
+        manager.release_memory,
+    ):
+        with pytest.raises(ValueError, match="multiple locality domains"):
+            operation(mode)
+    assert manager._sleep_restore_mode is None
+    manager.impl.validate_memory_release.assert_not_called()
+    manager.impl.release_gpu_memory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+def test_sleep_rejects_attached_lender_before_mutation(mode: RestoreMode) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sharing = Mock()
+    manager._sleep_restore_mode = None
+    manager.impl = Mock()
+
+    with pytest.raises(ValueError, match="attached KV cache lender"):
+        manager.validate_sleep_config(mode)
+    with pytest.raises(ValueError, match="attached KV cache lender"):
+        manager.release_memory(mode)
+
+    assert manager._sleep_restore_mode is None
+    manager.impl.release_gpu_memory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+def test_wakeup_zeroes_fresh_pools_in_every_mode(mode: RestoreMode) -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+
+    # FP4 MLA reads whole V-scale pages, so remapped pools must start zeroed.
+    for manager_type in (KVCacheManagerV2, Fp4MlaKVCacheManagerV2, KimiK3HybridCacheManager):
+        manager = object.__new__(manager_type)
+        manager._sleep_restore_mode = mode
+        manager.impl = Mock()
+        manager._restore_memory_bindings = Mock()
+        manager.materialize_memory()
+        manager.impl.materialize_gpu_memory.assert_called_once_with(zero=True)
+        manager._restore_memory_bindings.assert_called_once_with()
+        assert manager._sleep_restore_mode is None
+
+
+@pytest.mark.cpu_only
+def test_wakeup_keeps_native_batch_bindings() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = RestoreMode.CPU
+    cache = Mock(batch_row=1, is_active=True)
+    manager.kv_cache_map = {1: cache}
+    manager._stream = Mock()
+    manager.impl = Mock()
+    manager._restore_page_index_bufs = Mock()
+
+    manager.materialize_memory()
+
+    cache.resume.assert_not_called()
+    manager._restore_page_index_bufs.assert_not_called()
+    manager.impl.materialize_gpu_memory.assert_called_once_with(zero=True)
+    manager._stream.synchronize.assert_called_once_with()
+    assert manager._sleep_restore_mode is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("native_ready", [False, True])
+@pytest.mark.parametrize("error_name", ["OutOfPagesError", "HostOOMError", "ResourceBusyError"])
+def test_release_failure_does_not_publish_sleep_state(native_ready: bool, error_name: str) -> None:
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+    from tensorrt_llm.runtime import kv_cache_manager_v2 as native
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.event_manager = None
+    manager._sleep_restore_mode = None
+    manager.validate_sleep_config = Mock()
+    manager._restore_memory_bindings = Mock()
+    manager.impl = Mock()
+    native_error = getattr(native, error_name)
+    manager.impl.release_gpu_memory.side_effect = native_error("offload failed")
+    manager.impl.is_memory_ready.return_value = native_ready
+
+    with pytest.raises(MemoryReleaseAbortedError if native_ready else native_error) as caught:
+        manager.release_memory(RestoreMode.CPU)
+
+    assert isinstance(caught.value, MemoryReleaseAbortedError) == native_ready
+    assert manager._sleep_restore_mode is None
+    assert manager._restore_memory_bindings.call_count == int(native_ready)
+
+
+@pytest.mark.cpu_only
+def test_release_preflight_normalizes_native_capacity_error() -> None:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.validate_sleep_config = Mock()
+    manager.impl = Mock()
+    manager.impl.validate_memory_release.side_effect = OutOfPagesError("held pages exceed capacity")
+    with pytest.raises(ValueError, match="held pages exceed capacity"):
+        manager.validate_memory_release(RestoreMode.CPU)
+    manager.impl.release_gpu_memory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+@pytest.mark.parametrize("cleared", [False, True])
+def test_release_abort_clears_metadata_only_after_reuse_change(
+    mode: RestoreMode, cleared: bool
+) -> None:
+    """Propagate reuse changes from both discard and preserve-mode rollback."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.event_manager = None
+    manager._sleep_restore_mode = None
+    manager.validate_sleep_config = Mock()
+    manager._restore_memory_bindings = Mock()
+    manager.kv_cache_map = {}
+    manager._fresh_pages_filled = {1: {}}
+    manager._sharing = None
+    manager.conversation_manager = ConversationManager(max_num_turns=1)
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[1] * 32,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    request.py_conversation_params = ConversationParams(conversation_id="conversation")
+    prior_drop = Mock()
+    # Only the native cache boundary is mocked; conversation ownership and
+    # rollback run through the production manager and request classes.
+    kv_cache = Mock(
+        spec=[
+            "plan_committed_block_drop",
+            "num_committed_tokens",
+            "tokens_per_block",
+            "_get_committed_prefix_key",
+        ],
+        num_committed_tokens=32,
+        tokens_per_block=32,
+    )
+    kv_cache.plan_committed_block_drop.side_effect = [prior_drop, Mock()]
+    kv_cache._get_committed_prefix_key.return_value = b"prefix"
+    manager.conversation_manager.prepare_request(request)
+    manager.conversation_manager.save_drop_plan(request, kv_cache)
+    manager.impl = Mock()
+    manager.impl.is_memory_ready.return_value = True
+    manager.impl.get_reuse_state_version.side_effect = [4, 5 if cleared else 4]
+    manager.impl.release_gpu_memory.side_effect = MemoryError("release aborted")
+    on_cleared = Mock()
+
+    with pytest.raises(MemoryReleaseAbortedError) as caught:
+        manager.release_memory(mode, on_cleared=on_cleared)
+
+    assert caught.value.reuse_state_changed == cleared
+    assert on_cleared.call_count == int(cleared)
+    assert manager._fresh_pages_filled == ({} if cleared else {1: {}})
+    manager._restore_memory_bindings.assert_called_once_with()
+    assert manager._sleep_restore_mode is None
+    request.py_request_id = 2
+    manager.conversation_manager.prepare_request(request)
+    manager.conversation_manager.save_drop_plan(request, kv_cache)
+    assert prior_drop.drop.call_count == int(not cleared)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+def test_sleep_reset_notifies_dependent_caches_only_for_discard(mode: RestoreMode) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.event_manager = None
+    manager._sleep_restore_mode = None
+    manager.validate_sleep_config = Mock()
+    manager.kv_cache_map = {}
+    manager._fresh_pages_filled = {1: {}}
+    manager.conversation_manager = Mock()
+    manager._sharing = None
+    manager.impl = Mock()
+    on_cleared = Mock()
+
+    manager.release_memory(mode, on_cleared=on_cleared)
+    manager.release_memory(mode, on_cleared=on_cleared)
+
+    discard = mode in (RestoreMode.NONE, RestoreMode.MEMSET)
+    assert on_cleared.call_count == int(discard)
+    assert manager.conversation_manager.clear.call_count == int(discard)
+    assert manager._fresh_pages_filled == ({} if discard else {1: {}})
+    manager.impl.release_gpu_memory.assert_called_once_with(discard=discard)
+
+
+@pytest.mark.cpu_only
+def test_release_recovery_requires_restored_python_bindings() -> None:
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.event_manager = None
+    manager._sleep_restore_mode = None
+    manager.validate_sleep_config = Mock()
+    manager.impl = Mock()
+    manager.impl.release_gpu_memory.side_effect = MemoryError("backup allocation failed")
+    manager.impl.is_memory_ready.return_value = True
+    manager._restore_memory_bindings = Mock(side_effect=RuntimeError("binding restore failed"))
+    with pytest.raises(RuntimeError, match="binding restore failed") as caught:
+        manager.release_memory(RestoreMode.CPU)
+    assert not isinstance(caught.value, MemoryReleaseAbortedError)
+    assert manager._sleep_restore_mode is None
+
+
+@pytest.mark.cpu_only
+def test_native_owns_unbatched_resume_intent() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = RestoreMode.CPU
+    active = Mock(is_active=True, batch_row=None)
+    inactive = Mock(is_active=False, batch_row=None)
+    manager.kv_cache_map = {1: active, 2: inactive}
+    manager.impl = Mock()
+    manager._restore_page_index_bufs = Mock()
+    manager._stream = Mock()
+
+    manager.materialize_memory()
+    manager.materialize_memory()
+
+    manager.impl.materialize_gpu_memory.assert_called_once_with(zero=True)
+    manager._restore_page_index_bufs.assert_called_once_with(1, active)
+    active.resume.assert_not_called()
+    inactive.resume.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_release_repeats_require_matching_restore_mode() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = RestoreMode.CPU
+    manager.impl = Mock()
+    manager.release_memory(RestoreMode.CPU)
+    with pytest.raises(ValueError, match="different restore mode"):
+        manager.release_memory(RestoreMode.NONE)
+    manager.impl.release_gpu_memory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("native_failure", [False, True])
+def test_event_publication_failure_preserves_release_outcome(native_failure: bool) -> None:
+    """A failed event sink cannot hide an abort or a completed native release."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache_events import StreamingKVCacheEventManager
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = None
+    manager.validate_sleep_config = Mock()
+    manager._restore_memory_bindings = Mock()
+    manager.impl = Mock()
+    manager.event_manager = Mock(spec=StreamingKVCacheEventManager, dropped_batches=0)
+    manager.flush_iteration_events = Mock(side_effect=RuntimeError("event sink failed"))
+    if native_failure:
+        manager.impl.release_gpu_memory.side_effect = MemoryError("backup failed")
+        manager.impl.is_memory_ready.return_value = True
+        with pytest.raises(MemoryReleaseAbortedError, match="execution state restored"):
+            manager.release_memory(RestoreMode.CPU)
+        assert manager._sleep_restore_mode is None
+    else:
+        manager.release_memory(RestoreMode.CPU)
+        assert manager._sleep_restore_mode == RestoreMode.CPU
+    manager.flush_iteration_events.assert_called_once_with()
+
+
 class _GuardKVCache:
     """Scriptable stand-in for the guard sequence's KV cache."""
 
@@ -7375,9 +7878,13 @@ class _GuardKVCache:
         self.resize_ok = resize_ok
         self.closed = False
         self.committing_stopped = False
+        self.is_active = True
+        self.num_committed_tokens = 0
+        self.batch_row = None
 
     def resume(self, stream: object) -> bool:
         del stream
+        self.is_active = self.resume_ok
         return self.resume_ok
 
     def stop_committing(self) -> None:
@@ -7390,6 +7897,12 @@ class _GuardKVCache:
     def close(self) -> None:
         self.closed = True
 
+    def discard_pending_stats(self) -> None:
+        """Model the native teardown operation without a statistics backend."""
+
+    def suspend(self) -> None:
+        self.is_active = False
+
 
 def _make_guard_manager(
     monkeypatch: pytest.MonkeyPatch,
@@ -7399,15 +7912,26 @@ def _make_guard_manager(
 ) -> KVCacheManagerV2:
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     manager = object.__new__(KVCacheManagerV2)
+    manager.event_manager = None
     manager._guard_page_fill = "nan"
     manager._guard_page_value = float("nan")
     manager._guard_page_by_layer = {}
+    manager._sleep_restore_mode = None
+    manager._fresh_pages_filled = {}
+    manager._early_freed_index_requests = set()
+    manager.conversation_manager = None
+    manager._sharing = None
+    manager.validate_sleep_config = Mock()
+    manager._restore_page_index_bufs = Mock()
     manager.num_extra_kv_tokens = 0
     manager.pp_layers = [0]
-    manager._stream = SimpleNamespace(cuda_stream=None)
+    manager._stream = SimpleNamespace(cuda_stream=None, synchronize=lambda: None)
     manager.kv_cache_map = {}
     manager.index_mapper = Mock()
     manager.impl = Mock()
+    if kv_cache is not None:
+        manager.impl.release_gpu_memory.side_effect = lambda **kwargs: kv_cache.suspend()
+        manager.impl.materialize_gpu_memory.side_effect = lambda **kwargs: kv_cache.resume(None)
 
     def create_kv_cache(request_id: int, *args: object, **kwargs: object) -> object | None:
         del args, kwargs
@@ -7419,6 +7943,39 @@ def _make_guard_manager(
     manager.get_buffers = lambda layer_idx: buffer
     manager.get_batch_cache_indices = lambda request_ids, layer_idx: [[page]]
     return manager
+
+
+@pytest.mark.cpu_only
+def test_guard_page_sleep_reconstruction_uses_new_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Executor guard cleanup does not retain the old diagnostic cache."""
+    buffer = torch.zeros(8, 2)
+    old_cache = _GuardKVCache()
+    manager = _make_guard_manager(monkeypatch, old_cache, buffer, page=3)
+    manager._reserve_guard_page()
+    assert manager.release_guard_page_for_sleep()
+    assert old_cache.closed
+    assert not manager.kv_cache_map
+    assert not manager.guard_page_indices()
+    assert not manager.release_guard_page_for_sleep()
+    new_cache = _GuardKVCache()
+
+    def create(request_id: int, *args: object, **kwargs: object) -> _GuardKVCache:
+        manager.kv_cache_map[request_id] = new_cache
+        return new_cache
+
+    manager._create_kv_cache = create
+    manager.get_batch_cache_indices = lambda request_ids, layer_idx: [[5]]
+    manager.restore_guard_page_after_sleep()
+    assert manager.guard_page_indices() == frozenset({5})
+    assert torch.isnan(buffer[5]).all()
+    assert new_cache.committing_stopped
+
+
+@pytest.mark.cpu_only
+def test_guard_page_reconstruction_failure_is_not_silent(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _make_guard_manager(monkeypatch, None, torch.zeros(8, 2), page=3)
+    with pytest.raises(RuntimeError, match="Could not recreate"):
+        manager.restore_guard_page_after_sleep()
 
 
 def test_reserve_guard_page_fills_and_publishes_the_page(
@@ -7436,6 +7993,19 @@ def test_reserve_guard_page_fills_and_publishes_the_page(
     assert torch.equal(buffer[2], torch.zeros(2))
     # Never committed: the reuse tree must never hand this page to a request.
     assert kv_cache.committing_stopped
+    assert not kv_cache.closed
+
+    manager.release_memory(RestoreMode.NONE)
+    manager.impl.release_gpu_memory.assert_called_once_with(discard=True)
+    caches_before = dict(manager.kv_cache_map)
+    buffer.fill_(1)
+    with patch.object(manager, "_create_kv_cache", wraps=manager._create_kv_cache) as create_cache:
+        manager.materialize_memory()
+    create_cache.assert_not_called()
+    assert manager.kv_cache_map == caches_before
+    assert torch.isnan(buffer[3]).all()
+    assert torch.equal(buffer[2], torch.ones(2))
+    assert manager.guard_page_indices() == frozenset({3})
     assert not kv_cache.closed
 
 

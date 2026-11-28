@@ -26,14 +26,20 @@ pytestmark = pytest.mark.cpu_only
 
 def _make_llm() -> LLM:
     llm = object.__new__(LLM)
+    llm.shutdown = MagicMock()
     llm.args = SimpleNamespace(sleep_config=SleepConfig())
+    llm._orchestrator_type = None
+    llm._encode_only = False
+    llm._executor = SimpleNamespace(sleep=MagicMock())
     llm._collective_rpc = MagicMock()
     return llm
 
 
 def _make_async_llm() -> AsyncLLM:
     llm = object.__new__(AsyncLLM)
+    llm.shutdown = MagicMock()
     llm.args = SimpleNamespace(sleep_config=SleepConfig())
+    llm._executor = SimpleNamespace(sleep_async=AsyncMock())
     llm.collective_rpc = AsyncMock()
     return llm
 
@@ -54,7 +60,16 @@ async def test_async_release_defaults_to_all_usable_tags():
         )
     ]
     assert result is None
-    llm.collective_rpc.assert_awaited_once_with("sleep", args=(expected,))
+    llm._executor.sleep_async.assert_awaited_once_with(expected)
+    llm.collective_rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_async_release_uses_explicit_sleep_with_normalized_tags():
+    llm = _make_async_llm()
+    await llm.release(["model", ExecutorMemoryType.KV_CACHE, "model"])
+    llm._executor.sleep_async.assert_awaited_once_with(["model", "kv_cache"])
+    llm.collective_rpc.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -194,6 +209,24 @@ def test_release_normalizes_enum_strings_and_duplicates():
     )
 
     llm._collective_rpc.assert_called_once_with("sleep", (["model", "kv_cache"],))
+
+
+def test_ray_release_uses_explicit_sleep_with_normalized_tags():
+    llm = _make_llm()
+    llm._orchestrator_type = "ray"
+    assert llm.release(["model", ExecutorMemoryType.KV_CACHE, "model"]) is None
+    llm._executor.sleep.assert_called_once_with(["model", "kv_cache"])
+    llm._collective_rpc.assert_not_called()
+
+
+def test_ray_release_rejects_encode_only():
+    llm = _make_llm()
+    llm._orchestrator_type = "ray"
+    llm._encode_only = True
+    with pytest.raises(RuntimeError, match="encode_only=True"):
+        llm.release(["kv_cache"])
+    llm._executor.sleep.assert_not_called()
+    llm._collective_rpc.assert_not_called()
 
 
 @pytest.mark.parametrize(

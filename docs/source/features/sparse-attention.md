@@ -282,11 +282,10 @@ Vanilla implementation requires a BF16 KT cache.
 
 RocketKV follows `kv_cache_config.use_kv_cache_manager_v2`. With the V2 KV
 cache manager (the default), each KV cache block also stores the KT rows of its
-request, so the KV cache memory budget covers the KT cache. The V2 manager has
-these additional restrictions:
+request, so the KV cache memory budget covers the KT cache. Setting
+`sleep_config` does not switch RocketKV to V1. The [V2 sleep/wake restrictions](sleep-wakeup.md)
+apply. RocketKV also has these restrictions with V2:
 
-- Sleep mode (`sleep_config`) is not supported; it requires the V1 manager
-  (`kv_cache_config.use_kv_cache_manager_v2: false`).
 - `kv_cache_config.enable_swa_scratch_reuse` must be disabled.
 - Every attention layer must have the same number of KV heads and the same head
   size on each rank, and all layers must share one attention window.

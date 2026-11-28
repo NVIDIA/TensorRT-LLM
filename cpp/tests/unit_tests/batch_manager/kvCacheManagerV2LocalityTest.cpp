@@ -260,6 +260,33 @@ TEST_F(KvCacheManagerV2MockLocalityTest, MockReportsTwoDomainsOnlyWhenEnabled)
     EXPECT_EQ(resolveNumLocalityDomains(false), 1);
 }
 
+TEST_F(KvCacheManagerV2MockLocalityTest, SleepRejectsBeforeChangingEitherDomain)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
+    auto first = createOn(*manager, 0);
+    auto second = createOn(*manager, 1);
+    ASSERT_TRUE(first->resume(reinterpret_cast<CUstream>(mStream)));
+    ASSERT_TRUE(second->resume(reinterpret_cast<CUstream>(mStream)));
+    ASSERT_TRUE(first->resize(64));
+    ASSERT_TRUE(second->resize(64));
+    auto const before = freeSlotsPerDomain(manager->storage());
+    auto const version = manager->getReuseStateVersion();
+    for (bool discard : {false, true})
+    {
+        EXPECT_THROW(manager->validateMemoryRelease(discard), tensorrt_llm::common::TllmException);
+        EXPECT_THROW(manager->releaseGpuMemory(discard), tensorrt_llm::common::TllmException);
+        EXPECT_TRUE(manager->isMemoryReady());
+        EXPECT_TRUE(first->isActive());
+        EXPECT_TRUE(second->isActive());
+        EXPECT_EQ(freeSlotsPerDomain(manager->storage()), before);
+        EXPECT_EQ(manager->getReuseStateVersion(), version);
+    }
+    EXPECT_TRUE(first->resize(96));
+    EXPECT_TRUE(second->resize(96));
+    first->close();
+    second->close();
+}
+
 TEST_F(KvCacheManagerV2MockLocalityTest, FreeSlotsAreTrackedPerDomain)
 {
     auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());

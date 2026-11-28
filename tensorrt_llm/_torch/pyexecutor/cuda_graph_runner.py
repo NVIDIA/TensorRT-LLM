@@ -1964,6 +1964,20 @@ class CUDAGraphRunner:
                 managers.append(manager)
         return managers
 
+    def retiring_padding_ids(self, resource_manager: ResourceManager,
+                             manager: BaseResourceManager) -> set[int]:
+        """Request IDs release_padding_dummies will free from this manager."""
+        ids = {
+            req.py_request_id
+            for cache in self._padding_dummy_caches()
+            for req in cache.values()
+        }
+        if ids and any(
+                owner is manager
+                for owner in self._padding_dummy_managers(resource_manager)):
+            return ids
+        return set()
+
     def release_padding_dummy(self, resource_manager: ResourceManager,
                               runtime_draft_len: int) -> bool:
         """Releases the padding dummy for ``runtime_draft_len`` from every
@@ -2007,6 +2021,46 @@ class CUDAGraphRunner:
             if batch_size < padded <= self.config.batch_size:
                 return True
         return False
+
+    def release_padding_dummies(
+            self,
+            resource_manager: ResourceManager) -> tuple[tuple[int, int], ...]:
+        """Release internal requests without destroying captured graphs.
+
+        Args:
+            resource_manager: Owners of the drained requests. The caller must
+                retire GPU readers before releasing their resources.
+
+        Returns:
+            Draft-length and variant pairs to recreate before execution resumes.
+        """
+        variants = tuple(
+            (draft_len, variant)
+            for variant, cache in enumerate(self._padding_dummy_caches())
+            for draft_len in sorted(cache))
+        for draft_len in sorted({draft_len for draft_len, _ in variants}):
+            self.release_padding_dummy(resource_manager, draft_len)
+        return variants
+
+    def restore_padding_dummies(self, resource_manager: ResourceManager,
+                                variants: tuple[tuple[int, int], ...]) -> None:
+        """Recreate prior padding requests through normal model initialization.
+
+        Args:
+            resource_manager: Owners with usable native and tagged backing.
+            variants: Draft-length and variant pairs returned by release.
+
+        Raises:
+            RuntimeError: A prior padding request could not be reallocated.
+                The caller must keep inference admission closed.
+        """
+        for draft_len, variant in variants:
+            if self._get_or_create_padding_dummy(resource_manager,
+                                                 draft_len,
+                                                 variant=variant) is None:
+                raise RuntimeError(
+                    "Could not restore CUDA graph padding request "
+                    f"(draft_len={draft_len}, variant={variant})")
 
     def preallocate_padding_dummies(self,
                                     resource_manager: ResourceManager) -> None:

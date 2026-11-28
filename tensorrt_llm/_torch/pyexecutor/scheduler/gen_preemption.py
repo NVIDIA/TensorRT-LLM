@@ -67,7 +67,6 @@ def unsupported_headroom_reason(config, llm_args) -> Optional[str]:
         if not resolved_kv_cache_manager_is_v2(
             kv_cache_config,
             getattr(llm_args, "max_beam_width", None),
-            enable_sleep=getattr(llm_args, "sleep_config", None) is not None,
         ):
             return "needs the KV cache manager V2 scheduler"
     return None
