@@ -23,9 +23,9 @@ bashUtilsPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | s
 source "$bashUtilsPath"
 
 # The read helper (jenkins/scripts/fetch_build_artifact.sh) sits beside this script, under the same
-# per-job prefix. LLM_ARTIFACTS_PRIMARY, ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID reach it
-# from the job script. fetchHelperPath is used after slurm_install_setup changes into
-# $resourcePathNode, so run or source this script by an absolute path.
+# per-job prefix. ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID reach it from the job script.
+# fetchHelperPath is used after slurm_install_setup changes into $resourcePathNode, so run or
+# source this script by an absolute path.
 fetchHelperPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_install\.sh/fetch_build_artifact.sh/')"
 # The read helper's exit status for a transfer that still failed after its own retries, the one
 # failure of the helper that the download tries again. Its other failures, such as an absent package
@@ -39,7 +39,7 @@ FETCH_TRANSFER_FAILED=4
 # share the one file in the job workspace: each marks its download finished beside it and goes on to
 # install the package, and the node that finds every node of this run of the step finished deletes
 # it. No later step of the job downloads the package again. A run that Slurm requeues after the
-# deletion has no netrc, so its download fails whenever it needs artifactory.nvidia.com.
+# deletion has no netrc, so its download fails.
 remove_artifactory_netrc() {
     local netrc="${ARTIFACTORY_NETRC:-}"
     if [ -z "$netrc" ]; then

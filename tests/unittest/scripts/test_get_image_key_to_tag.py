@@ -37,7 +37,7 @@ SCRIPT_PATH = REPO_ROOT / "jenkins" / "scripts" / "get_image_key_to_tag.py"
 # The pipeline whose builds branch mode walks, for the branch "main".
 POST_MERGE = "LLM/main/L0_PostMerge"
 CREDENTIAL_ID = "aws-artifactory-credentials"
-HELPER_ENVIRONMENT = ("LLM_ARTIFACTS_PRIMARY", "ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
+HELPER_ENVIRONMENT = ("ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
 
 # Stands in for fetch_build_artifact.sh. It records its arguments and the environment it sees,
 # writes to stdout and stderr, and exits with the status set for the artifact path: by default 0
@@ -172,7 +172,6 @@ class _Lookup:
 def lookup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> _Lookup:
-    monkeypatch.setenv("LLM_ARTIFACTS_PRIMARY", "urm")
     monkeypatch.setenv("ARTIFACTORY_NETRC", str(tmp_path / "artifactory-netrc"))
     monkeypatch.setenv("ARTIFACTORY_CREDENTIAL_ID", CREDENTIAL_ID)
     directory = tmp_path / "script-copy"
@@ -322,33 +321,22 @@ def test_a_helper_that_cannot_start_exits_1(
     )
 
 
-@pytest.mark.parametrize("primary", ("aws", "urm", None), ids=("aws", "urm", "unset"))
 @pytest.mark.parametrize("args", (("main",), (POST_MERGE, "90")), ids=("branch", "pipeline"))
 def test_the_helper_sees_the_callers_environment(
-    lookup: _Lookup,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    args: tuple[str, ...],
-    primary: str | None,
+    lookup: _Lookup, tmp_path: Path, args: tuple[str, ...]
 ) -> None:
-    if primary is None:
-        monkeypatch.delenv("LLM_ARTIFACTS_PRIMARY")
-    else:
-        monkeypatch.setenv("LLM_ARTIFACTS_PRIMARY", primary)
     lookup.latest_build = 90
     lookup.holds(POST_MERGE, 90)
 
     assert lookup.run(*args).exit_code == 0
 
     [call] = lookup.calls
-    # The script chooses no primary: an unset one is left for the helper's default.
     assert call["env"] == {
-        "LLM_ARTIFACTS_PRIMARY": primary,
         "ARTIFACTORY_NETRC": str(tmp_path / "artifactory-netrc"),
         "ARTIFACTORY_CREDENTIAL_ID": CREDENTIAL_ID,
     }
 
 
 def test_the_script_holds_no_urm_address() -> None:
-    # The helper knows where each location is; the script asks it by legacy path alone.
+    # The helper knows where the artifacts are; the script asks it by legacy path alone.
     assert "urm.nvidia.com" not in SCRIPT_PATH.read_text(encoding="utf-8")

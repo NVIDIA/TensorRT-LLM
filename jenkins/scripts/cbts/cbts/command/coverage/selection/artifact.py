@@ -80,9 +80,8 @@ _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 
 # `build_info.txt`, the coverage archives, and the pins are read with the read helper,
-# jenkins/scripts/fetch_build_artifact.sh, which looks for each file in the primary artifact
-# location (LLM_ARTIFACTS_PRIMARY) first and in the other one only when it is absent there,
-# authenticating to artifactory.nvidia.com with the ARTIFACTORY_NETRC file.
+# jenkins/scripts/fetch_build_artifact.sh, which reads each file from artifactory.nvidia.com,
+# authenticating with the ARTIFACTORY_NETRC file.
 _FETCH_BUILD_ARTIFACT = Path(__file__).resolve().parents[5] / "fetch_build_artifact.sh"
 # Exit codes of the read helper that this module acts on, by the names the helper gives them;
 # tests/unittest/scripts/test_fetch_build_artifact.py checks that they match.
@@ -108,7 +107,7 @@ class ArtifactError(Exception):
 
 
 class ArtifactAuthError(ArtifactError):
-    """The read helper exited with FETCH_REJECTED: the primary location rejected the request."""
+    """The read helper exited with FETCH_REJECTED: the location rejected the request."""
 
 
 class ArtifactTransferError(ArtifactError):
@@ -157,10 +156,10 @@ def _helper_failure(artifact_path: str, status: int) -> ArtifactError:
 
 
 def _fetch_build_artifact(artifact_path: str) -> Optional[bytes]:
-    """Content of a build artifact read with the read helper, or None when neither location has it.
+    """Content of a build artifact read with the read helper, or None when the artifact is absent.
 
     The helper's stdout is discarded, since this command's stdout carries JSON; its stderr, which
-    names the location that served the file or says why it could not, goes to the job log.
+    says that the file was served or why it could not be, goes to the job log.
 
     Raises:
         ArtifactAuthError: The helper exited with FETCH_REJECTED.
@@ -189,22 +188,18 @@ def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str
     """Revision a build ran, from its `build_info.txt`, or None when unavailable.
 
     A read that fails in transfer counts as unavailable, so `select_tarball` skips that build as it
-    skips one without the file. A rejection by the primary location still raises: every other
-    build's read would be rejected too. The helper reports a rejection by the secondary location as
-    a transfer failure, so that build is skipped.
+    skips one without the file. A rejection still raises: every other build's read would be
+    rejected too.
 
-    While artifactory.nvidia.com is down or unreachable, each read that has to go there, of the
-    pin, of this file, or of a coverage archive, fails in transfer after the helper's three
-    attempts: about 6 s when it refuses connections or answers 5xx at once, about 96 s when
-    connections time out, and about 15 min when no data arrives (curl ends an attempt after 300 s
-    below 1 byte/s). While it is the primary location (the default), every read goes there. A
-    pre-merge L0_MergeRequest run calls this command with `--resolve-pin` in its Setup Environment
-    stage, before it starts any build. `resolve_pin` reads the pin first, so the run waits for
-    that one read, and the coverage tier declines without probing a build. The probe pays for a
-    failed read once for each of the last `_MAX_PROBE` builds, whose first coverage archive
-    cannot be read, only when no pin's read comes before it or the outage starts after that read.
-    After a rollback to urm, only files that urm does not hold are read there, and the probe
-    stops at the newest complete build that urm holds.
+    While artifactory.nvidia.com is down or unreachable, each read, of the pin, of this file, or
+    of a coverage archive, fails in transfer after the helper's three attempts: about 6 s when it
+    refuses connections or answers 5xx at once, about 96 s when connections time out, and about
+    15 min when no data arrives (curl ends an attempt after 300 s below 1 byte/s). A pre-merge
+    L0_MergeRequest run calls this command with `--resolve-pin` in its Setup Environment stage,
+    before it starts any build. `resolve_pin` reads the pin first, so the run waits for that one
+    read, and the coverage tier declines without probing a build. The probe pays for a failed
+    read once for each of the last `_MAX_PROBE` builds, whose first coverage archive cannot be
+    read, only when no pin's read comes before it or the outage starts after that read.
 
     Raises:
         ArtifactError: As `_fetch_build_artifact` raises it, except `ArtifactTransferError`;
@@ -233,10 +228,10 @@ def _coverage_archive_path(build: int, name: str, artifact_base: str = ARTIFACT_
 def _coverage_archive_location(
     build: int, name: str, artifact_base: str = ARTIFACT_BASE
 ) -> Optional[str]:
-    """URL of one of a build's coverage archives, or None when neither location has it.
+    """URL of one of a build's coverage archives, or None when the archive is absent.
 
-    The read helper's --exists prints "<url> <sha1>" for the location that holds the archive; its
-    stderr, which names that location or says why it could not tell, goes to the job log.
+    The read helper's --exists prints "<url> <sha1>" for the archive; its stderr, which says that
+    the archive was found or why it could not tell, goes to the job log.
 
     Raises:
         ArtifactAuthError: The helper exited with FETCH_REJECTED.
@@ -291,7 +286,7 @@ def _download_coverage_archive(
 ) -> Optional[Path]:
     """Download one of a build's coverage archives into `dest_dir` with the read helper.
 
-    Returns the archive, `dest_dir/<name>`, or None when neither location has it. The helper's
+    Returns the archive, `dest_dir/<name>`, or None when the archive is absent. The helper's
     stdout is discarded and its stderr goes to the job log, as `_fetch_build_artifact` does.
 
     Raises:
@@ -353,7 +348,7 @@ def resolve_pin(
 ) -> dict:
     """Reuse a PR-head coverage pin or create the local file Jenkins must upload.
 
-    The pin is read with the read helper, and one is created only when neither location has it.
+    The pin is read with the read helper, and one is created only when the pin is absent.
     A read that fails in transfer leaves that unknown and declines; so does a pin that does not
     match this PR head or the schema.
 

@@ -296,7 +296,7 @@ run Tier 1                                      → Tier-2 residual paths
 GitHub compare main...<PR head>                 → PR base commit
 read helper, pin at <PR number>/<PR head>:
    read                                          → reuse its coverage build
-   absent from both locations                    → resolve the newest build below
+   absent                                        → resolve the newest build below
    refused / failed in transfer / malformed      → decline Tier 2
 when no pin:
    Jenkins REST lastBuild                        → newest build number N

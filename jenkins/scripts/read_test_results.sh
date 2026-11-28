@@ -19,8 +19,8 @@
 # test-results/ folder, reads every final archive, and reads a stage attempt's checkpoint only
 # when the attempt's final archive could not be read, so that a checkpoint left beside its final
 # archive never adds to or replaces the final archive's results. An archive that was read and is
-# not a valid archive is removed and counts as not read. While aws is the primary, a failure of
-# urm is logged and changes nothing else. Run it with --help for the interface and the exit codes.
+# not a valid archive is removed and counts as not read. Run it with --help for the interface and
+# the exit codes.
 #
 # The script handles no credential: the helper takes it from the netrc file that the environment
 # names.
@@ -33,17 +33,16 @@ set -uo pipefail
 FETCH_ABSENT=2
 FETCH_REJECTED=3
 FETCH_TRANSFER_FAILED=4
-FETCH_SECONDARY_FAILED=5
 # This script's exit codes other than success.
 READ_INCOMPLETE=1
 READ_USAGE=64
 # What read_archive returns for a file that the helper read and that is not a valid archive. The
 # helper exits with no such status.
 READ_INVALID=65
-# The reading stops after this many reads in a row that the primary rejected or failed, since the
-# rest would only wait out the helper's retries.
+# The reading stops after this many reads in a row that artifactory.nvidia.com rejected or failed,
+# since the rest would only wait out the helper's retries.
 READ_FAILURES_BEFORE_STOP=3
-readonly FETCH_ABSENT FETCH_REJECTED FETCH_TRANSFER_FAILED FETCH_SECONDARY_FAILED
+readonly FETCH_ABSENT FETCH_REJECTED FETCH_TRANSFER_FAILED
 readonly READ_INCOMPLETE READ_USAGE READ_INVALID READ_FAILURES_BEFORE_STOP
 
 # A checkpoint is named after its stage attempt's final archive, results-<x>.tar.gz, as
@@ -56,11 +55,12 @@ usage() {
     cat <<EOF
 Usage: read_test_results.sh <helper> <test-results dir> <dest dir> [<name ERE> [<exclude ERE>]]
 
-Reads the test-result archives of one CI run into <dest dir> with the read helper. A stage
-attempt's checkpoint is results-<x>-progress.tar.gz, and its final archive is
-results-<x>.tar.gz.
+Reads the test-result archives of one CI run into <dest dir> with the read helper, which
+reads artifactory.nvidia.com. A stage attempt's checkpoint is results-<x>-progress.tar.gz,
+and its final archive is results-<x>.tar.gz.
 
-  - Lists <test-results dir> on the locations that the helper asks.
+  - Lists <test-results dir> with the helper's --list. A folder that does not exist holds
+    nothing to read.
   - Reads every listed name that is not a checkpoint.
   - For each listed checkpoint whose final archive was not read, reads the final archive by
     name, which may have landed after the listing, and the checkpoint only when that fails.
@@ -70,10 +70,6 @@ results-<x>.tar.gz.
   - Checks each file it read whose name ends in .tar.gz. One that is not a gzip-compressed
     tar archive with at least one member is removed and counts as a read that failed, so a
     checkpoint stands in for a final archive that is not valid.
-
-While aws is the primary, the helper gets --secondary-optional, and a listing or a read that
-fails on urm is logged and counted, and leaves the exit code alone. While urm is the primary,
-the helper asks urm alone.
 
 Arguments:
   <helper>            Path of fetch_build_artifact.sh, which is run with bash.
@@ -87,36 +83,34 @@ Arguments:
                       Without it, or when it is empty, no name is dropped.
 
 Environment, as the helper reads it:
-  LLM_ARTIFACTS_PRIMARY      aws (the default) or urm.
   ARTIFACTORY_NETRC, ARTIFACTORY_CREDENTIAL_ID
-                             The netrc file for aws, and the name of the CI credential behind
-                             it.
+                             The netrc file for artifactory.nvidia.com, and the name of the CI
+                             credential behind it.
 
 Output:
   The helper's messages and one line on stderr for each name that was skipped, replaced,
   absent, or not read, and then, as the last line on stderr:
-    [test-results] listed <n> (aws <a>, urm <u>), read <r>, checkpoints skipped <s>,
-    replaced <g>, absent <x>, urm unreachable <m>, failed <f>
-  on one line, with "aws not asked" in place of "aws <a>" while urm is the primary.
-    listed           Names kept by the patterns, and how many of them each location listed.
-    read             Files read into <dest dir>.
-    skipped          Checkpoints not read because their final archive was read.
-    replaced         Checkpoints whose final archive, read after the listing, took their place.
-    absent           Listed final archives that neither location has, without a listed
-                     checkpoint to stand in for them.
-    urm unreachable  Listings and reads that failed on urm while aws is the primary.
-    failed           Reads that failed in any other way, which the helper's message tells,
-                     files that were read and are not valid archives, and checkpoints that are
-                     gone while neither location has their final archive.
+    [test-results] listed <n>, read <r>, checkpoints skipped <s>, replaced <g>,
+    absent <x>, failed <f>
+  on one line.
+    listed    Names kept by the patterns.
+    read      Files read into <dest dir>.
+    skipped   Checkpoints not read because their final archive was read.
+    replaced  Checkpoints whose final archive, read after the listing, took their place.
+    absent    Listed final archives that are gone, without a listed checkpoint to stand in
+              for them.
+    failed    Reads that failed in any other way, which the helper's message tells, files
+              that were read and are not valid archives, and checkpoints that are gone while
+              their final archive is absent.
 
 Exit codes:
-  0   Complete: the listing succeeded on the primary, or neither location has the folder, and
-      absent and failed are both 0.
-  $READ_INCOMPLETE   Incomplete: the listing failed on the primary, or absent or failed is not 0.
-      The reading stops early, with this code, after $READ_FAILURES_BEFORE_STOP reads in a row
-      that the primary rejected or failed.
-  $READ_USAGE  Usage error: wrong arguments, a missing <helper> or <dest dir>, an invalid pattern,
-      or a bad LLM_ARTIFACTS_PRIMARY.
+  0   Complete: the listing succeeded, or the folder does not exist, and absent and failed
+      are both 0.
+  $READ_INCOMPLETE   Incomplete: the listing failed, or absent or failed is not 0. The reading
+      stops early, with this code, after $READ_FAILURES_BEFORE_STOP reads in a row that
+      artifactory.nvidia.com rejected or failed.
+  $READ_USAGE  Usage error: wrong arguments, a missing <helper> or <dest dir>, or an invalid
+      pattern.
 EOF
 }
 
@@ -168,49 +162,24 @@ keeps() {
     [[ -z "$EXCLUDE_ERE" || ! "$1" =~ $EXCLUDE_ERE ]]
 }
 
-# run_helper <argument>...: runs the read helper and returns its exit status. While aws is the
-# primary, the helper reports a failure of urm with a status of its own.
-run_helper() {
-    if [[ "$PRIMARY" == aws ]]; then
-        bash "$HELPER" --secondary-optional "$@"
-    else
-        bash "$HELPER" "$@"
-    fi
-}
-
-# Lists the folder and sorts the names that the patterns keep into FINALS and CHECKPOINTS, each
-# name once and in the listing's order. The helper prints "<location> <name>" for each file, the
-# primary's files first. A listing that failed on the primary makes the read incomplete, and the
-# names that the helper still printed are read.
+# Lists the folder and sorts the names that the patterns keep into FINALS and CHECKPOINTS, in the
+# listing's order. The helper prints the name of each file, one per line. A folder that does not
+# exist holds nothing to read. A listing that failed in any other way makes the read incomplete,
+# and the names that the helper still printed are read.
 list_results() {
-    local listing status line location name
-    listing="$(run_helper --list "$RESULTS_DIR")"
+    local listing status name
+    listing="$(bash "$HELPER" --list "$RESULTS_DIR")"
     status=$?
-    if (( status == FETCH_SECONDARY_FAILED )); then
-        URM_UNREACHABLE=$(( URM_UNREACHABLE + 1 ))
-        log "urm could not be listed (fetch_build_artifact.sh exited $status);" \
-            "going on with the names that aws listed"
-    elif (( status != 0 && status != FETCH_ABSENT )); then
+    if (( status != 0 && status != FETCH_ABSENT )); then
         INCOMPLETE=true
         log "the listing failed (fetch_build_artifact.sh exited $status);" \
             "some names may be missing"
     fi
-    while IFS= read -r line; do
-        location="${line%% *}"
-        name="${line#* }"
-        if [[ "$line" != *" "* || -z "$name" ]] || ! keeps "$name"; then
+    while IFS= read -r name; do
+        if [[ -z "$name" ]] || ! keeps "$name"; then
             continue
         fi
-        case "$location" in
-            aws) ON_AWS=$(( ON_AWS + 1 )) ;;
-            urm) ON_URM=$(( ON_URM + 1 )) ;;
-            *) continue ;;
-        esac
-        if [[ -n "${LISTED[$name]:-}" ]]; then
-            continue
-        fi
-        # The first location that listed the name: the primary, when it lists the name at all.
-        LISTED[$name]="$location"
+        LISTED[$name]=1
         if [[ "$name" == *"$CHECKPOINT_SUFFIX" ]]; then
             CHECKPOINTS+=("$name")
         else
@@ -235,26 +204,17 @@ valid_archive() {
 # the helper's exit status, or READ_INVALID for a file named as an archive that the helper read
 # and that is not a valid archive. Such a file is removed and counted as failed: the helper
 # checks a download against the checksum of the stored file, so the stored file itself is not
-# valid, and unpacking it would give none of its results or only some of them. After a download,
-# valid or not, SERVED_BY is the location that the helper names as the one that served the file. A
-# read that the primary rejected or failed counts toward the stop, and any other result starts
+# valid, and unpacking it would give none of its results or only some of them. A read that
+# artifactory.nvidia.com rejected or failed counts toward the stop, and any other result starts
 # that count again; STOPPED is set once READ_FAILURES_BEFORE_STOP such reads came in a row. A
-# name that both locations lack is left to the caller, which knows what its absence means.
+# name that is absent is left to the caller, which knows what its absence means.
 read_archive() {
-    local name="$1" status messages
-    SERVED_BY=""
-    # A download prints nothing on stdout, and the helper's messages go on to stderr.
-    messages="$(run_helper "$RESULTS_DIR/$name" "$DEST_DIR/$name" 2>&1)"
+    local name="$1" status
+    bash "$HELPER" "$RESULTS_DIR/$name" "$DEST_DIR/$name"
     status=$?
-    if [[ -n "$messages" ]]; then
-        printf '%s\n' "$messages" >&2
-    fi
     case "$status" in
         0)
             FAILURES_IN_A_ROW=0
-            if [[ "$messages" =~ served-by=(aws|urm)[[:space:]] ]]; then
-                SERVED_BY="${BASH_REMATCH[1]}"
-            fi
             if [[ "$name" == *"$ARCHIVE_SUFFIX" ]] && ! valid_archive "$DEST_DIR/$name"; then
                 rm -f -- "$DEST_DIR/$name"
                 FAILED=$(( FAILED + 1 ))
@@ -266,12 +226,6 @@ read_archive() {
             fi
             ;;
         "$FETCH_ABSENT") FAILURES_IN_A_ROW=0 ;;
-        "$FETCH_SECONDARY_FAILED")
-            URM_UNREACHABLE=$(( URM_UNREACHABLE + 1 ))
-            FAILURES_IN_A_ROW=0
-            log "urm unreachable: aws does not have $name, and urm could not answer" \
-                "(fetch_build_artifact.sh exited $status); not read"
-            ;;
         *)
             FAILED=$(( FAILED + 1 ))
             if (( status == FETCH_REJECTED || status == FETCH_TRANSFER_FAILED )); then
@@ -289,8 +243,8 @@ read_archive() {
     return "$status"
 }
 
-# Reads every listed name that is not a checkpoint. A final archive that both locations lack is
-# absent unless its checkpoint is listed, which read_checkpoints then reads in its place.
+# Reads every listed name that is not a checkpoint. A final archive that is gone counts as absent
+# unless its checkpoint is listed, which read_checkpoints then reads in its place.
 read_finals() {
     local name
     (( ${#FINALS[@]} > 0 )) || return 0
@@ -302,8 +256,7 @@ read_finals() {
         if (( $? == FETCH_ABSENT )) \
             && [[ -z "${LISTED[${name%"$ARCHIVE_SUFFIX"}$CHECKPOINT_SUFFIX]:-}" ]]; then
             ABSENT=$(( ABSENT + 1 ))
-            log "absent: neither location has $name, which was listed," \
-                "and no checkpoint stands in for it"
+            log "absent: $name was listed and is gone, and no checkpoint stands in for it"
         fi
     done
 }
@@ -319,13 +272,9 @@ replaced() {
 # archive, which may have landed after the listing, and the checkpoint only when that fails. A
 # stage deletes its checkpoint only after its final archive's upload, so a checkpoint that is gone
 # sends the read to its final archive once more, and the attempt's results are lost only when
-# that fails too. A checkpoint is gone when both locations lack it, and also when aws listed it
-# and lacks it now, whether urm could not answer or served a copy of its own, valid or not: a
-# stage deletes its checkpoint on aws first, so urm's copy is one that the stage has not deleted
-# yet or could not delete. That copy is kept only when it is valid and the final archive cannot
-# be read.
+# that fails too.
 read_checkpoints() {
-    local checkpoint final status gone_from_aws
+    local checkpoint final status
     (( ${#CHECKPOINTS[@]} > 0 )) || return 0
     for checkpoint in "${CHECKPOINTS[@]}"; do
         final="${checkpoint%"$CHECKPOINT_SUFFIX"}$ARCHIVE_SUFFIX"
@@ -345,50 +294,23 @@ read_checkpoints() {
             continue
         fi
         read_archive "$checkpoint"
-        status=$?
-        gone_from_aws=false
-        if [[ "${LISTED[$checkpoint]}" == aws ]]; then
-            if (( status == FETCH_SECONDARY_FAILED )) ||
-                { (( status == 0 || status == READ_INVALID )) && [[ "$SERVED_BY" == urm ]]; }; then
-                gone_from_aws=true
-            fi
-        fi
-        if (( status != FETCH_ABSENT )) && [[ "$gone_from_aws" == false ]]; then
+        if (( $? != FETCH_ABSENT )); then
             continue
         fi
         read_archive "$final"
         status=$?
         if (( status == 0 )); then
-            if [[ -n "${READ[$checkpoint]:-}" ]]; then
-                rm -f -- "$DEST_DIR/$checkpoint"
-                unset 'READ[$checkpoint]'
-                READ_COUNT=$(( READ_COUNT - 1 ))
-            fi
             replaced "$checkpoint" "$final"
-        elif [[ -n "${READ[$checkpoint]:-}" ]]; then
-            log "kept urm's copy of checkpoint $checkpoint: aws no longer has it, and its final" \
-                "archive $final could not be read"
         elif (( status == FETCH_ABSENT )); then
             FAILED=$(( FAILED + 1 ))
-            log "failed: checkpoint $checkpoint is gone, and neither location has its final" \
-                "archive $final"
-        elif (( status == FETCH_SECONDARY_FAILED )) && [[ "${LISTED[$checkpoint]}" == aws ]]; then
-            # aws listed the checkpoint, so the stage wrote there, and aws has neither file now.
-            FAILED=$(( FAILED + 1 ))
-            log "failed: checkpoint $checkpoint is gone from aws, which does not have its final" \
-                "archive $final either, and urm could not answer"
+            log "failed: checkpoint $checkpoint is gone, and its final archive $final is absent"
         fi
     done
 }
 
 print_summary() {
-    local on_aws="aws $ON_AWS"
-    if [[ "$PRIMARY" == urm ]]; then
-        on_aws="aws not asked"
-    fi
-    log "listed ${#LISTED[@]} ($on_aws, urm $ON_URM), read $READ_COUNT," \
-        "checkpoints skipped $SKIPPED, replaced $REPLACED, absent $ABSENT," \
-        "urm unreachable $URM_UNREACHABLE, failed $FAILED"
+    log "listed ${#LISTED[@]}, read $READ_COUNT, checkpoints skipped $SKIPPED," \
+        "replaced $REPLACED, absent $ABSENT, failed $FAILED"
 }
 
 case "${1:-}" in
@@ -422,25 +344,15 @@ if [[ -n "$EXCLUDE_ERE" ]] && ! valid_ere "$EXCLUDE_ERE"; then
     usage_error "<exclude ERE> is not an extended regular expression: '$EXCLUDE_ERE'"
 fi
 
-PRIMARY="${LLM_ARTIFACTS_PRIMARY:-aws}"
-if [[ "$PRIMARY" != aws && "$PRIMARY" != urm ]]; then
-    usage_error "LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '$PRIMARY'"
-fi
-
 # The names to read, in the order of the listing, and the sets of names listed and read.
 FINALS=()
 CHECKPOINTS=()
 declare -A LISTED=()
 declare -A READ=()
-ON_AWS=0
-ON_URM=0
 READ_COUNT=0
-# The location that served the last file read, as the helper names it.
-SERVED_BY=""
 SKIPPED=0
 REPLACED=0
 ABSENT=0
-URM_UNREACHABLE=0
 FAILED=0
 FAILURES_IN_A_ROW=0
 INCOMPLETE=false
