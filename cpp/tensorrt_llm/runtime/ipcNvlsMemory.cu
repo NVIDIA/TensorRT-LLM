@@ -26,6 +26,7 @@
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #endif
+#include <cstdlib>
 #include <mutex>
 #include <unistd.h>
 #include <unordered_map>
@@ -631,6 +632,33 @@ bool ipcNvlsFabricUsable()
 #else
     return false;
 #endif
+}
+
+void setNcclEnvDefaults()
+{
+#if ENABLE_MULTI_DEVICE
+#if defined(_WIN32)
+    // Need static connection initialization for accurate KV cache size estimation
+    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
+        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+    // Disable graph register to avoid startup hangs
+    if (getenv("NCCL_GRAPH_REGISTER") == nullptr)
+        _putenv_s("NCCL_GRAPH_REGISTER", "0");
+#else
+    // Need static connection initialization for accurate KV cache size estimation
+    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+    // Disable graph register to avoid startup hangs
+    setenv("NCCL_GRAPH_REGISTER", "0", 0);
+    // NCCL aborts during init if it tries NVLS multicast but the fabric/IMEX
+    // plane can't bind it. Disable NVLS when the fabric is not usable so NCCL
+    // falls back to NVLink P2P. No-overwrite preserves an explicit user setting,
+    // and an explicit setting also skips the (heavy) fabric probe.
+    if (getenv("NCCL_NVLS_ENABLE") == nullptr && !ipcNvlsFabricUsable())
+    {
+        setenv("NCCL_NVLS_ENABLE", "0", 0);
+    }
+#endif // _WIN32
+#endif // ENABLE_MULTI_DEVICE
 }
 
 #if ENABLE_MULTI_DEVICE
