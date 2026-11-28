@@ -743,6 +743,18 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     is_last_stage=is_last_call,
                     allreduce=self.allreduce)
 
+    def _load_balancer_wait_for_statistic_allreduce(self) -> None:
+        """Order the current stream after the statistic allreduce.
+
+        Issued right before a fused-communication MoE kernel launch: by the
+        backend's ``run_moe`` through ``MoERunContext.before_launch`` when it
+        declares ``takes_before_launch``, otherwise by the scheduler before
+        ``run_moe``. See
+        SingleLayerMoeLoadBalancer.wait_for_statistic_allreduce.
+        """
+        if self._using_dynamic_load_balancer():
+            self.layer_load_balancer.wait_for_statistic_allreduce()
+
     @contextlib.contextmanager
     def load_balancer_overlap(self,
                               overlap_fn: Callable[[], None]) -> Iterator[None]:

@@ -891,6 +891,12 @@ class MoERunContext:
     lamport_fc2_out: Optional[torch.Tensor] = None
     # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
     replica_plan: Optional[MoEReplicaPlan] = None
+    # produced by a fused-communication scheduler: the stream wait the impl must
+    # issue on its launch stream after its own input preparation and before
+    # its first kernel that waits for peer ranks (the load balancer's statistic
+    # allreduce on its auxiliary stream). Passed only to an impl that declares
+    # ``takes_before_launch``; None when there is nothing to wait for.
+    before_launch: Optional[Callable[[], None]] = None
     # produced by routing when the impl's ``try_route_with_sort`` routed this
     # forward: the ``moe_sort`` tables of ``token_selected_experts``.
     sort_tables: Optional[MoESortTables] = None

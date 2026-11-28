@@ -18,6 +18,8 @@
 #include "tensorrt_llm/kernels/moe/routing/customMoeRoutingKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
+#include <c10/cuda/CUDAException.h>
+
 namespace th = torch;
 namespace tl = tensorrt_llm;
 
@@ -73,6 +75,7 @@ void gate_forward(th::Tensor scores_in, // [batch_size, nExperts] - pre-computed
         out_weights.data_ptr<float>(), out_indices.data_ptr<int>(), batch_size, static_cast<int>(n_experts),
         static_cast<float>(route_scale), is_hash, image_mask.has_value() ? image_mask->data_ptr<bool>() : nullptr,
         vision_bias.has_value() ? vision_bias->data_ptr<float>() : nullptr, stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 } // namespace torch_ext

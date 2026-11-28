@@ -31,6 +31,7 @@ from cutlass.cutlass_dsl import Float32, Int32, Int64, T
 from cutlass._mlir.dialects import llvm
 
 from ..quant_def import CombineFormat
+from .live_rows import live_rows_at
 from .constants import Nvfp4E2M1RcpLimit
 from .dsl_helpers import mark_alignment
 from .ptx_helpers import nanosleep
@@ -501,6 +502,10 @@ class TopkReduce:
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk) global expert ids
         local_rank: Optional[Int32] = None,
         shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, added after the top-k terms
+        # With shared_term: the address of the forward's live-row word and the launch's rows; the shared term is added
+        # to the live rows of those only (helpers/live_rows.py), as the shared expert computed them. None: every row.
+        shared_live_word: Optional[Int64] = None,
+        shared_rows: Optional[Int32] = None,
     ):
         """Launch the reduce.
 
@@ -549,11 +554,17 @@ class TopkReduce:
             if cutlass.const_expr(self.internode is not None):
                 raise ValueError("shared_term is not supported by the internode reduce.")
             shared_term = shared_term_view(shared_term, self.hidden)
+        if cutlass.const_expr((shared_live_word is None) != (shared_rows is None)):
+            raise ValueError("shared_live_word and shared_rows come together.")
+        if cutlass.const_expr(shared_live_word is not None and shared_term is None):
+            raise ValueError("shared_live_word bounds the shared term: it needs shared_term.")
 
         if cutlass.const_expr(self.ll_encoded):
             if cutlass.const_expr(topk_indices is None):
                 raise ValueError("The polled bf16 reduce needs topk_indices to skip dropped slots.")
-            self._reduce_bf16_ll(combine_quant, topk_score, reduced_output, topk_indices, shared_term).launch(
+            self._reduce_bf16_ll(
+                combine_quant, topk_score, reduced_output, topk_indices, shared_term, shared_live_word, shared_rows
+            ).launch(
                 grid=grid, block=block, stream=stream, use_pdl=True
             )
             return
@@ -599,12 +610,13 @@ class TopkReduce:
             launch_kwargs["preferred_smem_carveout"] = 0
         if cutlass.const_expr(self.persistent):
             self._reduce_persistent(
-                combine_quant, sf, topk_score, reduced_output, counters, num_tokens_dev, topk_indices, shared_term
+                combine_quant, sf, topk_score, reduced_output, counters, num_tokens_dev, topk_indices, shared_term,
+                shared_live_word, shared_rows,
             ).launch(**launch_kwargs)
         else:
-            self._reduce_static(combine_quant, sf, topk_score, reduced_output, topk_indices, shared_term).launch(
-                **launch_kwargs
-            )
+            self._reduce_static(
+                combine_quant, sf, topk_score, reduced_output, topk_indices, shared_term, shared_live_word, shared_rows
+            ).launch(**launch_kwargs)
 
     # -- kernels --------------------------------------------------------------
 
@@ -617,10 +629,15 @@ class TopkReduce:
         reduced_output: cute.Tensor,         # (token, hidden)
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk)
         shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, or None
+        shared_live_word: Optional[Int64] = None,
+        shared_rows: Optional[Int32] = None,
     ):
         """One thread per (token, hidden_tile) worker; the grid carries the
         token count. This is the default path."""
         worker_idx = cute.arch.block_idx()[0] * Int32(self._threads) + cute.arch.thread_idx()[0]
+        shared_bound = None
+        if cutlass.const_expr(shared_live_word is not None):
+            shared_bound = live_rows_at(shared_live_word, shared_rows)
         self._reduce_cell(
             worker_idx,
             combine_quant,
@@ -631,6 +648,7 @@ class TopkReduce:
             self.require_predicate,
             topk_indices,
             shared_term,
+            shared_bound,
         )
 
 
@@ -717,6 +735,8 @@ class TopkReduce:
         reduced_output: cute.Tensor,
         topk_indices: cute.Tensor,
         shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, or None
+        shared_live_word: Optional[Int64] = None,
+        shared_rows: Optional[Int32] = None,
     ):
         """The bf16 ``_reduce_cell`` over the self-validating plane: poll, reduce, zero.
 
@@ -851,9 +871,17 @@ class TopkReduce:
             if cutlass.const_expr(shared_term is not None):
                 # The shared output carries no self-validating encoding: wait for the producer grid, then add it.
                 cute.arch.griddepcontrol_wait()
-                add_shared_term(
-                    acc, load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread), hidden_per_thread
-                )
+                if cutlass.const_expr(shared_live_word is None):
+                    add_shared_term(
+                        acc, load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread),
+                        hidden_per_thread,
+                    )
+                elif token_idx < live_rows_at(shared_live_word, shared_rows):
+                    # Rows past the bound hold no shared output of this launch.
+                    add_shared_term(
+                        acc, load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread),
+                        hidden_per_thread,
+                    )
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
@@ -884,6 +912,8 @@ class TopkReduce:
         num_tokens_dev: cute.Tensor,  # int32 x1: valid token count
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk)
         shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, or None
+        shared_live_word: Optional[Int64] = None,
+        shared_rows: Optional[Int32] = None,
     ):
         """Fixed-grid form of the three ``_reduce_*`` kernels above.
         """
@@ -896,6 +926,9 @@ class TopkReduce:
         bid = cute.arch.block_idx()[0]
 
         num_tokens = max(Int32(0), min(Int32(reduced_output.shape[0]), num_tokens_dev[0]))
+        shared_bound = None
+        if cutlass.const_expr(shared_live_word is not None):
+            shared_bound = live_rows_at(shared_live_word, shared_rows)
 
         num_units = (num_tokens * Int32(hidden_tiles) + Int32(lanes - 1)) // Int32(lanes)
 
@@ -936,6 +969,7 @@ class TopkReduce:
                 True,
                 topk_indices,
                 shared_term=shared_term,
+                shared_bound=shared_bound,
             )
 
             if need_fetch:
@@ -961,6 +995,7 @@ class TopkReduce:
         needs_guard: cutlass.Constexpr[bool] = True,
         topk_indices: Optional[cute.Tensor] = None,
         shared_term: Optional[cute.Tensor] = None,
+        shared_bound: Optional[Int32] = None,
     ):
         """One ``(token, hidden_tile)`` cell, format-dispatched at compile time.
 
@@ -970,7 +1005,8 @@ class TopkReduce:
 
         ``needs_guard=False`` elides the bounds check entirely, which is what
         the static path wants when ``hidden_tiles`` is a whole number of CTAs.
-        ``shared_term`` adds one more unweighted BF16 term after the top-k fold.
+        ``shared_term`` adds one more unweighted BF16 term after the top-k fold, to the rows below
+        ``shared_bound`` only when that is given.
         """
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
@@ -1129,9 +1165,16 @@ class TopkReduce:
                             acc[i], acc[i + 1] = self._fma(dequant_pair, score, (Float32(0.0), Float32(0.0)))
 
             if cutlass.const_expr(shared_term is not None):
-                add_shared_term(
-                    acc, load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread), hidden_per_thread
-                )
+                if cutlass.const_expr(shared_bound is None):
+                    add_shared_term(
+                        acc, load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread),
+                        hidden_per_thread,
+                    )
+                elif token_idx < shared_bound:
+                    add_shared_term(
+                        acc, load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread),
+                        hidden_per_thread,
+                    )
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

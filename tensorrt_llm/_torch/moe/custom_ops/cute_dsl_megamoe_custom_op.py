@@ -174,6 +174,9 @@ _TACTIC_LEN = 12
 _TACTIC_LEN_V5 = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
+# SM versions whose load-balanced (helper-bearing) tactic candidates also come with atomic-counter
+# work ids; measured on SM103, and SM100 runs the same kernel.
+_ATOMIC_COUNTER_TWIN_SM_VERSIONS = (100, 103)
 _DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
 _TOKEN_BACK_READY_GRANULARITIES = ("expert", "token_tile")
 
@@ -1390,6 +1393,10 @@ def _construct_megamoe_kernel(
         "token_back_ready_granularity": str(common.get("token_back_ready_granularity", "expert")),
         "reduce_topk_in_kernel": bool(common["in_kernel_fc2_reduce"]),
     }
+    if common.get("shared_intermediate_size") is not None:
+        # The fused shared expert covers the live rows of the forward's live-row word only (the op's
+        # shared_live_row_word; every row when the caller passes none), as the staged routes do.
+        impl_values["shared_live_rows"] = True
     if sm_version == 107:
         impl_values.update(
             mma_instruction_mnk=(
@@ -1477,6 +1484,21 @@ def _construct_megamoe_kernel(
     return construct(kernel_cls)
 
 
+def _shared_live_row_word_tensor(
+    word: Optional[torch.Tensor], device: torch.device
+) -> torch.Tensor:
+    """The live-row word the fused shared expert reads: the caller's, else a word that keeps every row."""
+    if word is None:
+        from tensorrt_llm._torch.moe import live_rows
+
+        return live_rows.all_rows_word(device)
+    if word.dtype != torch.int32 or word.numel() != 1 or word.device != device:
+        raise ValueError(
+            f"shared_live_row_word must be one int32 on {device}, got {word.numel()} {word.dtype} on {word.device}."
+        )
+    return word
+
+
 def _megamoe_tmp_buffer_span(kernel: Any) -> Tuple[int, int]:
     """Return (offset, bytes) of the kernel's tmp buffer behind its local workspace state."""
     if not hasattr(kernel, "get_tmp_buffer_bytes"):
@@ -1488,6 +1510,38 @@ def _megamoe_tmp_buffer_span(kernel: Any) -> Tuple[int, int]:
 def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
     local_bytes, shared_bytes = kernel.require_zero_workspace_leading_bytes
     return 0, int(local_bytes), 0, int(shared_bytes), f"export-{type(kernel).__name__}"
+
+
+def _require_megamoe_shared_workspace(
+    kernel, shared_workspace: torch.Tensor, num_experts_per_rank: int
+) -> None:
+    """Refuse a caller's shared workspace smaller than ``kernel`` addresses.
+
+    Its layout grows with the expert count and the token bucket, so a workspace sized for
+    another problem lets the kernel write and read past the end of the allocation.
+    """
+    _, needed = kernel.get_workspace_sizes()
+    have = shared_workspace.numel() * shared_workspace.element_size()
+    if have < int(needed):
+        raise ValueError(
+            f"MegaMoE-CuteDSL: the shared workspace has {have} bytes, but the kernel for "
+            f"{num_experts_per_rank} experts per rank needs {int(needed)}; size it with "
+            f"query_megamoe_kernel_properties for this runner's problem."
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class MegaMoeKernelProperties:
+    """What a bucket's default kernel tells the backend before its first launch
+    (``query_megamoe_kernel_properties``). Read the fields by name: a new field then breaks no
+    caller."""
+
+    shared_workspace_bytes: int
+    # The kernel reads the caller's inputs in place (an exact-size generation-phase bucket).
+    supports_direct_inputs: bool
+    # The kernel's top-k reduce masks routes with an invalid expert, so routes staged as -1
+    # drop their rows.
+    masks_invalid_routes: bool
 
 
 def megamoe_activation_sf_bytes_per_row(hidden_size: int) -> int:
@@ -1774,14 +1828,36 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             raise ValueError("combine_dedup=True is unmet by: " + "; ".join(unmet))
 
 
+def _load_balanced_work_ids(
+    sm_version: int, load_balance: bool, work_id_mode: str
+) -> Tuple[str, ...]:
+    """The work-id modes of a hand-written candidate whose own mode is ``work_id_mode``: on
+    _ATOMIC_COUNTER_TWIN_SM_VERSIONS a load-balanced (helper-bearing) launch also gets
+    atomic-counter work ids, and the autotuner chooses per shape.
+
+    Per-layer dynamic EPLB launches MegaMoE on the full grid while the HALO-Q + TMA copy kernel can
+    still hold its auxiliary SMs, so with grid-stride work ids the CTAs that start late keep a
+    static share of the tiles.
+    """
+    if load_balance and sm_version in _ATOMIC_COUNTER_TWIN_SM_VERSIONS:
+        return tuple(dict.fromkeys((work_id_mode, "atomic_counter")))
+    return (work_id_mode,)
+
+
+def _atomic_counter_twin(tactic: Tuple, sm_version: int) -> Tuple:
+    """``tactic`` with atomic-counter work ids, validated (the fifth canonical field is the
+    work-id mode)."""
+    fields = tuple(_unpack_tactic(tactic))
+    twin = fields[:4] + ("atomic_counter",) + fields[5:]
+    validate_megamoe_tactic(twin, sm_version=sm_version)
+    return twin
+
+
 def _expand_megamoe_ready_tactics(
     candidates: list[Tuple], sm_version: int, *, load_balance: bool
 ) -> list[Tuple]:
     """Return canonical tactics for every legal token-back READY mode."""
     choices = _token_back_ready_granularity_choices(load_balance=load_balance)
-    if sm_version != 107:
-        # No SM100/SM103 test compares token_tile readiness with expert yet, so tune expert only.
-        choices = ("expert",)
     if sm_version == 107 and choices != ("expert",):
         # At every token bucket include a legal local-TMA/atomic-counter
         # base; the curated SM107 candidates otherwise exclude token_tile.
@@ -1947,35 +2023,39 @@ def enumerate_megamoe_candidate_tactics(
     # than crossing every independent tactic axis.
     if num_tokens >= 2048:
         for fc2_tma_stages in (2, 4):
+            for work_id_mode in _load_balanced_work_ids(sm_version, load_balance, "grid_stride"):
+                tactic = (
+                    [256, 256, 256],
+                    [2, 1, 1],
+                    None,
+                    ("grouped", 512),
+                    work_id_mode,
+                    "epi_warps",
+                    True,
+                    fc2_tma_stages,
+                    4,
+                    tuple(epi_flag_batch),
+                )
+                validate_megamoe_tactic(tactic, sm_version=sm_version)
+                candidates.append(tactic)
+        # Include the resource-balanced local TMA configuration.
+        local_work_id = "atomic_counter" if num_tokens >= 16384 else "grid_stride"
+        for work_id_mode in _load_balanced_work_ids(sm_version, load_balance, local_work_id):
             tactic = (
                 [256, 256, 256],
                 [2, 1, 1],
                 None,
                 ("grouped", 512),
-                "grid_stride",
-                "epi_warps",
+                work_id_mode,
+                "reuse_dispatch_warps",
                 True,
-                fc2_tma_stages,
+                2,
                 4,
                 tuple(epi_flag_batch),
             )
             validate_megamoe_tactic(tactic, sm_version=sm_version)
-            candidates.append(tactic)
-        # Include the resource-balanced local TMA configuration.
-        tactic = (
-            [256, 256, 256],
-            [2, 1, 1],
-            None,
-            ("grouped", 512),
-            ("atomic_counter" if num_tokens >= 16384 else "grid_stride"),
-            "reuse_dispatch_warps",
-            True,
-            2,
-            4,
-            tuple(epi_flag_batch),
-        )
-        validate_megamoe_tactic(tactic, sm_version=sm_version)
-        candidates.append(tactic)
+            if tactic not in candidates:
+                candidates.append(tactic)
     if num_tokens >= 8192:
         tactic = (
             [256, 256, 256],
@@ -2651,8 +2731,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
         ugpu_weight_layout: str = "none",
-    ) -> Tuple[int, bool]:
-        """Probe workspace size and direct-input support of the default kernel."""
+    ) -> MegaMoeKernelProperties:
+        """Probe the default kernel: its shared workspace bytes, whether it reads its inputs in
+        place (direct inputs), and whether its top-k reduce masks routes with an invalid expert
+        (``masks_invalid_combine_slots``), so that routes staged as -1 drop their rows."""
 
         sm_version = get_sm_version()
         if ugpu_weight_layout != "none" and _megamoe_ugpu_is_genphase(max_tokens_per_rank):
@@ -2794,7 +2876,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 build=build,
             )
             shared_bytes = max(shared_bytes, plain.get_workspace_sizes()[1])
-        return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
+        return MegaMoeKernelProperties(
+            shared_workspace_bytes=int(shared_bytes),
+            supports_direct_inputs=isinstance(probe, RubinInferenceGenphaseMegaMoE),
+            masks_invalid_routes=bool(getattr(probe, "masks_invalid_combine_slots", False)),
+        )
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
         """Shape-derivation rule: the activation token count (input[0] dim0)
@@ -2926,6 +3012,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Set by the op right after construction; never a codegen input.
             self._helper_ready_flags = None
             self._helper_ready_generation = 0
+            # Per-launch live-row word of the fused shared expert (int32[1] on the device), set by the op like the
+            # READY bundle; never a codegen input.
+            self._shared_live_row_word = None
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
@@ -3012,8 +3101,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
             )
-            if default_tactic not in candidates:
-                candidates.append(default_tactic)
+            defaults = [default_tactic]
+            if self.helper_expert_count > 0 and self.sm_version in _ATOMIC_COUNTER_TWIN_SM_VERSIONS:
+                defaults.append(_atomic_counter_twin(default_tactic, self.sm_version))
+            candidates.extend(tactic for tactic in defaults if tactic not in candidates)
             for default_tactic in (
                 _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
                 _sm107_genphase_shape_tactic(self._tactic_lookup_key()),
@@ -3391,6 +3482,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tactic_t,
                 allow_fallback=use_default_tactic and self.ugpu_weight_layout == "none",
             )
+            if shared_workspace is not None:
+                _require_megamoe_shared_workspace(
+                    kernel, shared_workspace, self.num_experts_per_rank
+                )
 
             # form-B accumulates the top-k reduction into ``combine_output``,
             # so its live rows MUST start at 0; the CALLER zeros [:num_tokens]
@@ -3606,6 +3701,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     shared_activation_sf=_to_cute_w(shared_activation_sf),
                     # A runtime scalar, never a compile-time constant.
                     shared_num_tokens=cutlass.Int32(int(shared_num_tokens)),
+                    # A fixed device address: a captured graph reads the word each replay writes.
+                    shared_live_word=cutlass.Int64(
+                        _shared_live_row_word_tensor(
+                            self._shared_live_row_word, local_workspace.device
+                        ).data_ptr()
+                    ),
                 )
             # The gen-phase entry has no tmp_buffer operand; the others require it.
             if hasattr(kernel, "get_tmp_buffer_bytes"):
@@ -3829,6 +3930,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
         ugpu_weight_layout: str = "none",
+        # The forward's live-row word (int32[1], moe/live_rows.py) bounding the fused shared expert's rows; None keeps
+        # every row of shared_num_tokens.
+        shared_live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3909,6 +4013,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # values across calls, even when the runner itself is cached.
         runner._helper_ready_flags = hot_expert_weight_ready_flags
         runner._helper_ready_generation = int(hot_expert_weight_ready_generation)
+        runner._shared_live_row_word = shared_live_row_word
         inputs = [
             activation,
             activation_sf,
@@ -3953,6 +4058,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # Release the cached runner reference to this generation's terminal tensor.
                 # The next call supplies fresh READY inputs.
                 runner._helper_ready_flags = None
+                runner._shared_live_row_word = None
             return
         tuner = AutoTuner.get()
         # Opt-IN: in tuning mode the MERGE lockstep sweep runs (made safe by
@@ -4013,6 +4119,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
         finally:
             runner._helper_ready_flags = None
+            runner._shared_live_row_word = None
 
     # Eager callers may call ``run_cute_dsl_megamoe_nvfp4_blackwell`` directly
     # and skip the custom-op dispatch; traced code must use the registered op.
@@ -4074,5 +4181,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
         ugpu_weight_layout: str = "none",
+        shared_live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         return None

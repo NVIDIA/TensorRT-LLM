@@ -184,7 +184,8 @@ def test_bf16_localized_query_and_runner_share_consumer(
     query = {
         key: value for key, value in problem.items() if key not in {"local_rank", "output_dtype"}
     }
-    assert op.query_megamoe_kernel_properties(**query) == (
+    properties = op.query_megamoe_kernel_properties(**query)
+    assert (properties.shared_workspace_bytes, properties.supports_direct_inputs) == (
         (512, True) if capacity <= 1024 else (1024, False)
     )
     runner = op.Sm100MegaMoENvfp4Runner(**problem)

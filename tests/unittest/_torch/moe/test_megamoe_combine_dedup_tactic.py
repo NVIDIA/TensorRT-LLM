@@ -201,7 +201,9 @@ def test_query_and_runner_build_the_same_dedup_kernel(
         key: value for key, value in problem.items() if key not in {"local_rank", "output_dtype"}
     }
     # The probe sizes the shared workspace from the dedup kernel itself.
-    assert op.query_megamoe_kernel_properties(**query, tactic=_DEDUP) == (1024, False)
+    properties = op.query_megamoe_kernel_properties(**query, tactic=_DEDUP)
+    assert properties.shared_workspace_bytes == 1024
+    assert not properties.supports_direct_inputs
     runner = op.Sm100MegaMoENvfp4Runner(**problem)
     kernel = runner._build_kernel_once(_DEDUP)
     assert isinstance(kernel, _GenericMetadata)
@@ -361,7 +363,9 @@ def test_query_sizes_the_provider_for_dedup_and_its_base(
             max_tokens_per_rank=tokens,
             gate_up_clamp=10.0,
         )
-        assert op.query_megamoe_kernel_properties(**query) == (max(world, 6) * 128, False)
+        properties = op.query_megamoe_kernel_properties(**query)
+        assert properties.shared_workspace_bytes == max(world, 6) * 128
+        assert not properties.supports_direct_inputs
         key = op._sm107_dsv4_pro_problem_key(world, experts, tokens)
         runner = op.Sm100MegaMoENvfp4Runner(**_problem(**query, output_dtype="torch.bfloat16"))
         assert runner.unique_id() == key
