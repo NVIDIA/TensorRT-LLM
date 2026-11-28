@@ -1458,6 +1458,28 @@ _ROUTE_FRONT_TACTICS_BASE = ((256, (8, 53)), (512, (16, 32)), (1025, (32, 20)))
 #: listed tactic's (`_route_front_check` against `_route_front_w64_tactic`'s listed reference);
 #: a row count whose check fails keeps the runner's routing.
 _ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (1025, (64, 5)))
+#: Opt-in (bitwise), default off: at a dep8 rank (the route front's 64-expert window) a trunk MoE
+#: block entered without the runner's finalize (the fused finalize reduce-scatter,
+#: `DP_MOE_FIN_RS_ENV`) at the lean gathered row counts runs the runner's FC1 alone
+#: (`run_moe_prerouted_fc1`) and FC2 on the in-house `moe_lowm_fc2` (tile N 8, two CTAs an SM,
+#: weights streamed before its PDL wait) in place of the FC2 cubin. Those row counts are pinned to
+#: `_DP_MOE_LOWM_FC2_TACTIC` (a tile-8 tactic whose FC2 cubin `moe_lowm_fc2` reproduces bit for
+#: bit), held at build to a listed tactic's window output where the runner does not list it (as
+#: every dep8 pin), and the in-house FC2 is held at build to the cubin FC2 of the same tactic over
+#: every layer (`_dp_lowm_fc2_check`); a row count that differs keeps the cubin. The FC2 waits
+#: before it reads FC1's rows and releases its dependent (the fused finalize, whose own wait is its
+#: first statement) after that wait, so the route front's early / lean release is unchanged. `1`
+#: takes `_DP_MOE_LOWM_FC2_ROWS`; an integer N takes the gathered row counts from the lower bound up
+#: to N (an A/B value, at most `_ROUTE_FRONT_LEAN_MAX_ROWS`). Read once, when the target is built.
+DP_MOE_LOWM_FC2_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_LOWM_FC2"
+#: The tile-8 tactic of `DP_MOE_LOWM_FC2_ENV` (the route front's pin below 96 gathered rows).
+_DP_MOE_LOWM_FC2_TACTIC = (8, 53)  # capacity: fixed: a measured tactic
+#: Gathered rows `DP_MOE_LOWM_FC2_ENV=1` serves: dep8 8 x 2..8 requests of four rows. GB300, one
+#: rank's window, 48-layer graph under recorded routing (forced acceptance 1.32), FC1 + FC2 against
+#: the pinned tactic's cubins, ms a step at 2 / 3 / 4 / 5 / 6 / 7 / 8 requests a rank: -0.054 /
+#: -0.122..-0.127 / -0.124 / -0.116 / -0.340 / -0.324 / -0.323 (of which the tile-8 re-pin on the
+#: cubins +0.002 / -0.059..-0.067 / -0.041 / -0.015 / -0.209 / -0.165 / -0.139).
+_DP_MOE_LOWM_FC2_ROWS = (64, 256)  # capacity: fixed: dispatch thresholds
 #: The high-cap row tables: at a dep4 / dep8 rank the decode forms that would stop at 1024 gathered
 #: rows (32 requests a rank at dep8 MTP-3) or at 128 / 152 rows a rank serve the CUDA-graph batch
 #: sizes past them, up to 56 requests a rank. Unset, a dep8 rank takes `_DP_HICAP_DEFAULT` (`route`
@@ -4679,6 +4701,7 @@ def _decode_forms(core) -> str:
             if route
             else [],
             "route front early rows": rows(getattr(route, "early", None) if route else None),
+            "lowm fc2 rows": rows(getattr(route, "lowm", None) if route else None),
             "draft moe tile": getattr(core, "_draft_moe_tactics", None) is not None,
             "launch order": getattr(core, "dp_launch_order", False),
             "index key fp8": getattr(core, "index_key_fp8", False),
@@ -7401,6 +7424,90 @@ class _RouteFront:
         self.fast2: dict = {}
         # `DP_ROUTE_FRONT_EARLY_ENV`: the row counts compiled with the release after the wait.
         self.early: set = set()
+        # `DP_MOE_LOWM_FC2_ENV`: per row count whose un-finalized calls run FC2 on
+        # `moe_lowm_fc2`, the tile K of the FC2 cubin it reproduces.
+        self.lowm: dict = {}
+
+
+def _dp_lowm_fc2_rows(core) -> tuple[int, int] | None:
+    """`DP_MOE_LOWM_FC2_ENV` at `core`'s rank: the gathered row range it serves, None where it is
+    off or the rank is not a dep8 one (one warning where it is set there). ValueError on another
+    spelling or a bound outside the lean rows."""
+    raw = os.environ.get(DP_MOE_LOWM_FC2_ENV, "")
+    value = raw.strip().lower()
+    if not value or value in _SWITCH_OFF:
+        return None
+    lo, hi = _DP_MOE_LOWM_FC2_ROWS
+    if value not in _SWITCH_ON:
+        try:
+            hi = int(value)
+        except ValueError:
+            hi = 0
+        if not lo <= hi <= _ROUTE_FRONT_LEAN_MAX_ROWS:
+            raise ValueError(
+                f"{DP_MOE_LOWM_FC2_ENV}={raw!r}: expected 0, 1 or a gathered row bound in "
+                f"[{lo}, {_ROUTE_FRONT_LEAN_MAX_ROWS}]"
+            )
+    if not (core.dp_size > 1 and core.local_experts == _ROUTE_FRONT_WINDOWS[8]):
+        logger.warning(
+            f"{DP_MOE_LOWM_FC2_ENV}={raw} is set but ignored: it serves a dep8 rank's route front"
+        )
+        return None
+    return lo, hi
+
+
+def _dp_lowm_fc2_pin(runner, core, rows: int) -> tuple | None:
+    """`DP_MOE_LOWM_FC2_ENV`'s `(tactic, listed reference or None, FC2 cubin tile K)` for `rows`
+    gathered rows: `_DP_MOE_LOWM_FC2_TACTIC` where `moe_lowm_fc2` reproduces its FC2 cubin on this
+    window's FC2 weights and the runner lists a reference tactic, else None (the row count keeps
+    `_route_front_w64_tactic`'s pin)."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return None
+    from tensorrt_llm._torch.kernels.blackwell.moe_lowm_fc2 import supports
+
+    tactic = tuple(int(v) for v in _DP_MOE_LOWM_FC2_TACTIC)
+    options = runner.get_gemm2_kernel_options(*tactic)
+    if not decode_moe.cute_fc2_reproduces(options):
+        return None
+    tile_k = int(options["tileK"])
+    if not supports((core.local_experts, core.hidden, core.expert_inter // 2), tile_k):
+        return None
+    valid = {
+        tuple(int(v) for v in t)
+        for t in runner.get_valid_configs(
+            core.topk, core.hidden, core.expert_inter, core.local_experts, rows
+        )
+    }
+    if tactic in valid:
+        return tactic, None, tile_k
+    pinned, ref = _route_front_w64_tactic(runner, core, rows)
+    ref = ref if ref is not None else pinned
+    return (tactic, ref, tile_k) if ref is not None else None
+
+
+def _dp_lowm_fc2_check(core, st: _RouteFront, L: _LayerWeights, layer: int, rows: int, gen) -> str:
+    """One layer at one row count of `DP_MOE_LOWM_FC2_ENV`, eagerly: the un-finalized call with FC2
+    on `moe_lowm_fc2` against the same call on the FC2 cubin (the same tactic and routing): "" where
+    the FC2 row of every (row, pick) the tables map (`st.views[rows][layer][0]`, read after each
+    call: the front may order the rows inside an expert's tile differently) is bitwise equal, else
+    what differs."""
+    x = torch.randn([rows, core.hidden], generator=gen, device=L.router.device).to(torch.bfloat16)
+    logits = cublas_mm(x, L.router)
+    ref = _route_front_run(core, st, x, L, layer, logits, finalize=False, lowm=False)[0].clone()
+    e2p_ref = st.views[rows][layer][0].clone()
+    got = _route_front_run(core, st, x, L, layer, logits, finalize=False)[0]
+    e2p = st.views[rows][layer][0]
+    if not torch.equal(e2p >= 0, e2p_ref >= 0):
+        return "the tables map other (row, pick) pairs"
+    a = got[e2p[e2p >= 0].long()].contiguous()
+    b = ref[e2p_ref[e2p_ref >= 0].long()].contiguous()
+    if not torch.equal(a.view(torch.int16), b.view(torch.int16)):
+        n = int((a.view(torch.int16) != b.view(torch.int16)).sum())
+        return f"{n} of {a.numel()} FC2 elements"
+    return ""
 
 
 def _route_front_tactic(runner, core, rows: int) -> tuple | None:
@@ -7466,6 +7573,7 @@ def _route_front_run(
     fp4=None,
     finalize=True,
     routed=None,
+    lowm=True,
 ):
     """The route front and the pre-routed runner over rows `x` (a built row count) and their
     router logits: `(out, xq, xsf, ids, wts)`. The runner runs this rank's window numbered from
@@ -7474,7 +7582,10 @@ def _route_front_run(
     permuted order (the slot -> row table is `st.views[rows][layer][0]`, the weights `wts`).
     `logits` None (`_tep_front_logits`): the decode front forms them in its own launch. `routed`
     (`DP_MOE_PACK_GATHER_ENV`, `x` None): the gathered rows' `(xq, xsf, ids, wts)` the packed
-    gather and the routing-only front formed; the runner alone runs."""
+    gather and the routing-only front formed; the runner alone runs. Un-finalized at a row count of
+    `st.lowm` (`DP_MOE_LOWM_FC2_ENV`) and with `lowm`, the runner runs FC1 alone and `moe_lowm_fc2`
+    the FC2 into the runner's FC2 rows (the same bits; `lowm` False: the cubin, the build check's
+    reference)."""
     rows = x.shape[0] if routed is None else routed[2].shape[0]
     tactic = st.tactics[rows]
     tile = int(tactic[0])
@@ -7504,7 +7615,7 @@ def _route_front_run(
             rows in st.early,
         )
     xq_in, xsf_in = (xq, xsf) if fp4 is None else fp4
-    out = st.runner.run_moe_prerouted(
+    head = (
         None,
         None,
         xq_in,
@@ -7518,7 +7629,8 @@ def _route_front_run(
         None,
         L.fc2_w,
         L.fc2_s,
-        None,
+    )
+    mid = (
         L.out1_scale,
         L.out1_gate_scale,
         L.out2_scale,
@@ -7531,13 +7643,32 @@ def _route_front_run(
         core.local_experts,
         None,
         ROUTING_RENORMALIZE,
-        finalize,
-        list(tactic),
-        wts,
-        ids,
-        None,
-        *st.views[rows][layer],
-        tile,
+    )
+    tables = (*st.views[rows][layer], tile)
+    tile_k = st.lowm.get(rows) if lowm and not finalize else None
+    if tile_k is not None:
+        # `DP_MOE_LOWM_FC2_ENV`: the FC1-only entry takes the arguments without FC2 bias,
+        # finalize and output (`decode_moe.fc1_only_args`).
+        from tensorrt_llm._torch.kernels.blackwell.moe_lowm_fc2 import moe_lowm_fc2
+
+        g1, g1s, g2, _, _, cta_batch, cta_limit, num_ctas = st.runner.run_moe_prerouted_fc1(
+            *head, *mid, list(tactic), wts, ids, *tables
+        )
+        moe_lowm_fc2(
+            g1.view(torch.uint8),
+            g1s.view(torch.uint8),
+            L.fc2_w.view(torch.uint8),
+            L.fc2_s.view(torch.uint8),
+            L.out2_scale,
+            cta_batch,
+            cta_limit,
+            num_ctas.view(-1),
+            g2,
+            cubin_k_tile=tile_k,
+        )
+        return g2, xq, xsf, ids, wts
+    out = st.runner.run_moe_prerouted(
+        *head, None, *mid, finalize, list(tactic), wts, ids, None, *tables
     )[0]
     return out, xq, xsf, ids, wts
 
@@ -7678,16 +7809,33 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
     if not rows_list:
         return None
 
+    # `DP_MOE_LOWM_FC2_ENV`: the gathered row range whose FC2 may run on `moe_lowm_fc2`.
+    lowm_rows = _dp_lowm_fc2_rows(core) if dp else None
+    if lowm_rows is not None and not all(
+        L.fc2_w.dim() == 3 and 2 * L.fc2_w.shape[-1] == core.expert_inter for L in layers
+    ):
+        logger.warning(f"{DP_MOE_LOWM_FC2_ENV} is set but ignored: the FC2 weights are not 3-D")
+        lowm_rows = None
+
     def pin(runner, rows: int) -> tuple:
-        """`(tactic, listed reference or None)` of `rows`."""
+        """`(tactic, listed reference or None, DP_MOE_LOWM_FC2_ENV's FC2 tile K or None)` of
+        `rows`."""
         if dp and core.local_experts == _ROUTE_FRONT_WINDOWS[8]:
-            return _route_front_w64_tactic(runner, core, rows)
-        return (_route_front_tactic if dp else _tep_route_front_tactic)(runner, core, rows), None
+            if lowm_rows is not None and lowm_rows[0] <= rows <= lowm_rows[1]:
+                lowm = _dp_lowm_fc2_pin(runner, core, rows)
+                if lowm is not None:
+                    return lowm
+            return (*_route_front_w64_tactic(runner, core, rows), None)
+        return (
+            (_route_front_tactic if dp else _tep_route_front_tactic)(runner, core, rows),
+            None,
+            None,
+        )
 
     st = _RouteFront(_moe_runner())
     with torch.cuda.device(device):
         for rows in rows_list:
-            tactic, ref = pin(st.runner, rows)
+            tactic, ref, lowm_k = pin(st.runner, rows)
             # Past `MAX_ROWS` (`DP_HICAP_ENV`) the launch exists on the fast path only.
             wide = rows > _ROUTE_FRONT_MAX_ROWS
             form = _route_front_fast2(core, rows)
@@ -7723,6 +7871,8 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
             st.tactics[rows] = tactic
             if ref is not None:
                 st.refs[rows] = ref
+            if lowm_k is not None:
+                st.lowm[rows] = lowm_k
             st.flats[rows] = [fill.clone() for _ in range(core.num_layers)]
             st.views[rows] = [
                 table_views(flat, rows, core.topk, core.local_experts, int(tactic[0]))
@@ -7743,7 +7893,7 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
                     f"{DP_HICAP_ENV}: layer {i} at {rows} gathered rows differs from the runner's "
                     f"own routing ({bad}); that row count keeps the runner's routing"
                 )
-                for table in (st.tactics, st.refs, st.flats, st.views):
+                for table in (st.tactics, st.refs, st.flats, st.views, st.lowm):
                     table.pop(rows, None)
                 st.fast2.pop(rows, None)
                 st.early.discard(rows)
@@ -7765,7 +7915,7 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
                     f"listed {list(st.refs[rows])} ({bad}); that row count keeps the runner's "
                     "routing"
                 )
-                for table in (st.tactics, st.refs, st.flats, st.views):
+                for table in (st.tactics, st.refs, st.flats, st.views, st.lowm):
                     table.pop(rows, None)
             elif bad:
                 logger.warning(
@@ -7773,6 +7923,23 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
                     f"rows differs from the runner's own routing ({bad}); every MoE block keeps it"
                 )
                 return None
+        # `DP_MOE_LOWM_FC2_ENV`: every layer, at every row count it serves (also compiles the FC2
+        # before any capture).
+        for rows in sorted(st.lowm):
+            for i, L in enumerate(layers):
+                if rows not in st.lowm:
+                    break
+                try:
+                    bad = _dp_lowm_fc2_check(core, st, L, i, rows, gen)
+                except Exception as e:  # noqa: BLE001 -- that row count keeps the cubin
+                    bad = f"{type(e).__name__}: {e}"
+                if bad:
+                    logger.warning(
+                        f"{DP_MOE_LOWM_FC2_ENV}: layer {i} at {rows} gathered rows differs from "
+                        f"the FC2 cubin of {list(st.tactics[rows])} ({bad}); that row count keeps "
+                        "the cubin"
+                    )
+                    st.lowm.pop(rows)
         built = sorted(st.tactics)
         torch.cuda.synchronize(device)
     if not built:
@@ -7787,6 +7954,7 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
             else ""
         )
         + (f", FC1 released after the wait at {sorted(st.early)}" if st.early else "")
+        + (f", FC2 on moe_lowm_fc2 ({DP_MOE_LOWM_FC2_ENV}) at {sorted(st.lowm)}" if st.lowm else "")
     )
     return st
 
