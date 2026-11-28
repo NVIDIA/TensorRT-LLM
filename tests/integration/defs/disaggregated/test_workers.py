@@ -693,6 +693,12 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts))
 
 
+# NOTE: this test does not test what its name claims, so it was removed from the test
+# lists. It never sets conditional_disagg_config, and ConditionalWorkerTester picks the
+# ctx or gen server itself, so the server's conditional disaggregation never runs.
+# Before restoring it, rename it or set conditional_disagg_config in its config.
+# Server-side conditional disagg is tested by
+# test_disaggregated_deepseek_v3_lite_bf16_conditional_v2.
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)

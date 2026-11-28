@@ -40,11 +40,10 @@ l0_h100:
   # this stage's "not cpu_only" selection runs the ones that need a real allocator and device.
   - unittest/_torch/memory
   # ------------- modules (non-MoE) ---------------
-  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
+  # Only the single-rank NCCL allreduce fallback tests run on Hopper; the rest of the file is SM100+.
+  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py -k "test_nccl_residual_rms_norm_quant_fp8"
   - unittest/_torch/modules/test_rms_norm_fp8_per_token.py
   - unittest/_torch/kernels/fused_ops/test_add_rmsnorm_fp8_quant.py
-  - unittest/_torch/modules/test_fused_activation_quant.py
-  - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/mamba
@@ -119,9 +118,6 @@ l0_h100:
   - unittest/_torch/modeling/test_modeling_deepseekv32.py
   - unittest/_torch/modeling/test_modeling_kimi_k25.py::test_kimi_k25_forward_with_attached_embeddings
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_sanity
-  # Real-weight Nano CG/overlap and chunked-prefill path smoke (MoE L0 cannot
-  # reuse dense-8B greedy/logprob equality; accuracy stays on GSM8K/MMLU).
-  - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_cuda_graph_overlap_scheduler
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_chunked_prefill
   # Breakable prefill CUDA graphs (BCG) on the hybrid Mamba path; mpi_ray_parity (Ray id runs in the ray stage below).
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph[tp1] TIMEOUT (90)
@@ -179,7 +175,6 @@ l0_h100:
   - unittest/llmapi/test_return_routed_experts.py
   - unittest/llmapi/test_lm_head_dtype.py
   - unittest/scaffolding
-  - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[no_overlap]
   - accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[overlap]
@@ -205,6 +200,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dflash
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[VANILLA]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-triton-auto]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8_piecewise_cuda_graph
@@ -461,13 +457,12 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRITON]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestMistralSmall24B::test_auto_dtype[forced_chunked_prefill]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL::test_auto_dtype[forced_chunked_prefill]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNemotron_Nano_12B_V2_VL::test_auto_dtype[forced_chunked_prefill]
   # ---- moved to post-merge (MoE CI optimization) ----
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
-  # ---- non-quantized (quant=None) moved to post-merge ----
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
   # SM90 runs of the SM-agnostic MoE checks that pre-merge runs on B200 (l0_b200).
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py

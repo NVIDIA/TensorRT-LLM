@@ -21,7 +21,25 @@ from tensorrt_llm.inputs import media_io
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-COSMOS3_NANO_PATH = os.path.join(llm_models_root(), "nvidia", "Cosmos3-Nano")
+
+def cosmos3_nano_checkpoint(root=None) -> str:
+    """Resolve the Nano checkpoint under LLM_MODELS_ROOT.
+
+    The CI cache stores it as ``Cosmos3-Nano``. A ``nvidia/Cosmos3-Nano`` layout
+    (see ``tests/test_common/llm_data.py``) is also accepted.
+    """
+    if root is None:
+        root = llm_models_root()
+    if root is None:
+        return ""
+    for relative in ("Cosmos3-Nano", os.path.join("nvidia", "Cosmos3-Nano")):
+        candidate = os.path.join(root, relative)
+        if os.path.isdir(os.path.join(candidate, "transformer")):
+            return candidate
+    return os.path.join(root, "Cosmos3-Nano")
+
+
+COSMOS3_NANO_PATH = cosmos3_nano_checkpoint()
 
 COSMOS3_TEST_CONFIG = copy.deepcopy(QWEN3_VL_8B_CONFIG)
 COSMOS3_TEST_CONFIG.update(
@@ -111,6 +129,25 @@ def test_cosmos3_preserves_prepared_video_frame_count(
 
     assert decoded_video.frames.shape[0] == prepared_frame_count
     assert decoded_video.metadata["frames_indices"] == list(range(prepared_frame_count))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "layouts, expected",
+    [
+        pytest.param(["Cosmos3-Nano"], "Cosmos3-Nano", id="top-level-only"),
+        pytest.param(["nvidia/Cosmos3-Nano"], "nvidia/Cosmos3-Nano", id="nested-only"),
+        pytest.param(
+            ["Cosmos3-Nano", "nvidia/Cosmos3-Nano"], "Cosmos3-Nano", id="prefers-top-level"
+        ),
+        pytest.param([], "Cosmos3-Nano", id="missing-defaults-to-top-level"),
+    ],
+)
+def test_cosmos3_nano_checkpoint_resolves_each_layout(tmp_path, layouts, expected) -> None:
+    for layout in layouts:
+        (tmp_path / layout / "transformer").mkdir(parents=True)
+
+    assert cosmos3_nano_checkpoint(tmp_path) == os.path.join(tmp_path, expected)
 
 
 # TestQwen3VL is a unittest.TestCase subclass, which pytest collects

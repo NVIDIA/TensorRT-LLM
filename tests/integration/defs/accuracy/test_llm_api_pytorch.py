@@ -1412,6 +1412,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    # NOTE: the quant_dtype=nvfp4 + fp8kv=True ids never run. nvfp4 needs SM >= 100
+    # (skip_pre_blackwell) and fp8kv=True needs SM == 90 (skip_no_hopper), so no GPU
+    # passes both. Do not add them back to a test list.
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
         [(False, False, False, False),
