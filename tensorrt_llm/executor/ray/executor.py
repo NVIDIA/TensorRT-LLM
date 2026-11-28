@@ -127,9 +127,14 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                                     thread_name="ray_executor_main_loop")
 
         except Exception as e:
-            self.shutdown()
+            try:
+                self.shutdown()
+            except Exception as cleanup_error:
+                logger.warning(
+                    f"RayExecutor initialization cleanup failed: {cleanup_error}"
+                )
             logger.error(f"Failed to initialize RayExecutor: {e}")
-            raise e
+            raise
 
     def create_workers(self, worker_cls, worker_kwargs):
         llm_args = worker_kwargs.get("llm_args")
@@ -362,6 +367,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
     def shutdown(self):
         if hasattr(self, '_shutdown_event') and self._shutdown_event.is_set():
+            if getattr(self, "_rpc_client_close_pending", False):
+                self._close_rpc_client()
             return
         if hasattr(self, '_shutdown_event'):
             self._shutdown_event.set()
@@ -411,11 +418,12 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 except Exception as e:
                     logger.warning(f"Error killing worker: {e}")
 
+        close_error = None
         if hasattr(self, 'rpc_client') and self.rpc_client is not None:
             try:
-                self.rpc_client.close()
-            except Exception as e:
-                logger_debug(f"Suppressed error during RPC client close: {e}")
+                self._close_rpc_client()
+            except Exception as error:
+                close_error = error
 
         self.workers = None
         if hasattr(self,
@@ -435,6 +443,9 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         if self.has_start_local_cluser and ray.is_initialized():
             logger.debug("Shutting down Ray cluster")
             ray.shutdown()
+
+        if close_error is not None:
+            raise close_error
 
     def _shutdown_workers_collectively(self):
         """Shut down workers that must release EP resources collectively.

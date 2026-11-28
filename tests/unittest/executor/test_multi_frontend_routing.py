@@ -20,8 +20,9 @@ attached-frontend proxy lifecycle over real ipc:// sockets.
 """
 
 import os
-import tempfile
-import time
+import pickle
+import threading
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
@@ -193,41 +194,25 @@ class TestClassicFrontendProxyEndToEnd:
         )
         return proxy, worker_ingress, hmac_key, result_addrs
 
-    @staticmethod
-    def _stop_dispatch_thread(proxy, result_addrs, hmac_key):
-        """End the dispatch thread the way the worker does at engine teardown.
-
-        The worker fans a per-lane None sentinel to every frontend (see
-        notify_proxy_threads_to_quit). Frontend shutdown deliberately leaves
-        the thread to process teardown, which the threadleak checker would
-        report as a leak.
-        """
-        import zmq
-
-        from tensorrt_llm.executor.ipc import FusedIpcQueue
-
-        worker_lane = FusedIpcQueue(
-            (result_addrs[proxy._frontend_id], hmac_key),
-            is_server=False,
-            fuse_message=False,
-            socket_type=zmq.PUSH,
-            name="fake_worker_shutdown_lane",
-        )
-        worker_lane.put(None)
-        proxy.dispatch_result_thread.join(timeout=10)
-        assert not proxy.dispatch_result_thread.is_alive()
-
-    def test_submit_namespaces_and_shutdown_never_sends_sentinel(self):
+    def test_submit_namespaces_and_shutdown_never_sends_sentinel(
+        self, tmp_path, monkeypatch
+    ) -> None:
         from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
+        from tensorrt_llm.executor.utils import RequestError
         from tensorrt_llm.sampling_params import SamplingParams
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+        proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmp_path)
+        receiving = threading.Event()
+        real_recv = proxy.result_queue.queue._recv_data
 
-            # Attributes read by OpenAIServer at init must exist (a missing
-            # _resource_governor_queue crashed all siblings in the first e2e).
+        def recv() -> object:
+            receiving.set()
+            return real_recv()
+
+        monkeypatch.setattr(proxy.result_queue.queue, "_recv_data", recv)
+        try:
+            # OpenAIServer reads this property when it initializes a frontend.
             assert proxy.resource_governor_queue is None
-
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
             assert get_frontend_id(result.request_id) == 1
             assert worker_ingress.poll(5)
@@ -235,66 +220,122 @@ class TestClassicFrontendProxyEndToEnd:
             assert isinstance(received, GenerationRequest)
             assert received.id == result.request_id
 
-            # Frontend shutdown aborts its in-flight requests (cancel) but
-            # must NOT emit the None engine-shutdown sentinel.
+            # No worker result or sentinel is sent to this lane on detach.
+            assert receiving.wait(5)
             proxy.shutdown()
+            assert not proxy.dispatch_result_thread.is_alive()
+            assert proxy.result_queue.queue.socket is None
+            assert proxy.request_queue.socket is None
+            assert not proxy._results
+            with pytest.raises(RequestError, match="shut down"):
+                result.result(timeout=1)
+            assert not proxy._engine_dead
             assert worker_ingress.poll(5)
             cancel = worker_ingress.get()
             assert isinstance(cancel, CancellingRequest)
             assert cancel.id == result.request_id
-            assert not worker_ingress.poll(1), (
+            proxy.shutdown()  # Idempotent; no duplicate cancel or global quit.
+            assert not worker_ingress.poll(0.1), (
                 "an attached frontend must never send the engine-shutdown sentinel"
             )
-            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+            with pytest.raises(RuntimeError, match="shutting down|shut down"):
+                proxy.submit(GenerationRequest([4], SamplingParams()))
+        finally:
+            with ExitStack() as cleanup:
+                cleanup.callback(worker_ingress.close)
+                proxy.shutdown()
 
-    def test_check_health_and_submit_reflect_fatal_error(self):
-        from tensorrt_llm.executor.request import GenerationRequest
+    @pytest.mark.parametrize("batching", [False, True])
+    def test_check_health_and_submit_reflect_fatal_error(
+        self, tmp_path, monkeypatch, batching
+    ) -> None:
+        from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
         from tensorrt_llm.executor.utils import EngineDeadError
         from tensorrt_llm.sampling_params import SamplingParams
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, _, _, _ = self._make_proxy_and_fake_worker(tmpdir)
-
-            # Regression: this state lives in GenerationExecutorProxy.__init__,
-            # which an attached frontend deliberately skips, so it must be
-            # initialized explicitly (a missing _engine_dead broke the first
-            # submit(); a missing _worker_process_monitor broke /health).
+        monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", "1" if batching else "0")
+        proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmp_path)
+        try:
             assert proxy.check_health()
             assert proxy.model_world_size == 1
+            assert proxy.dispatch_result_thread is None
+            results = [proxy.submit(GenerationRequest([i], SamplingParams())) for i in (1, 2)]
+            received = []
+            while len(received) < len(results):
+                assert worker_ingress.poll(5)
+                message = worker_ingress.get()
+                received.extend([pickle.loads(p) for p in message] if batching else [message])
+            assert [r.id for r in received] == [r.request_id for r in results]
+            assert all(isinstance(r, GenerationRequest) for r in received)
 
-            proxy._set_fatal_error(RuntimeError("rank0 worker died"))
+            # A local fatal error must not leave work running on the shared engine.
+            proxy._set_fatal_error(RuntimeError("frontend dispatcher failed"))
             assert not proxy.check_health()
             with pytest.raises(EngineDeadError):
-                proxy.submit(GenerationRequest([1], SamplingParams()))
+                proxy.submit(GenerationRequest([3], SamplingParams()))
+            proxy.shutdown()
+            assert not proxy.dispatch_result_thread.is_alive()
+            assert not proxy._results
+            cancels = []
+            while len(cancels) < len(results):
+                assert worker_ingress.poll(5)
+                message = worker_ingress.get()
+                cancels.extend([pickle.loads(p) for p in message] if batching else [message])
+            assert all(isinstance(r, CancellingRequest) for r in cancels)
+            assert [r.id for r in cancels] == [r.request_id for r in results]
+            for result in results:
+                with pytest.raises(EngineDeadError):
+                    result.result(timeout=1)
+            proxy.shutdown()
+            assert not worker_ingress.poll(0.1), "no duplicate cancel or global engine quit"
+        finally:
+            with ExitStack() as cleanup:
+                cleanup.callback(worker_ingress.close)
+                proxy.shutdown()
 
-    def test_dispatch_routes_own_lane_responses(self):
+    def test_dispatch_routes_own_lane_responses(self, tmp_path) -> None:
         import zmq
 
         from tensorrt_llm.executor.ipc import FusedIpcQueue
         from tensorrt_llm.executor.request import GenerationRequest
-        from tensorrt_llm.executor.utils import ErrorResponse
+        from tensorrt_llm.executor.utils import ErrorResponse, RequestError
         from tensorrt_llm.sampling_params import SamplingParams
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, _, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+        proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmp_path)
+        completed = threading.Event()
+
+        class _ResultRegistry(dict):
+            def pop(self, key: object, default: object = None) -> object:
+                value = super().pop(key, default)
+                completed.set()
+                return value
+
+        proxy._results = _ResultRegistry(proxy._results)
+        worker_lane = FusedIpcQueue(
+            (result_addrs[1], hmac_key),
+            is_server=False,
+            fuse_message=False,
+            socket_type=zmq.PUSH,
+            name="fake_worker_result_lane",
+        )
+        try:
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
             client_id = result.request_id
             assert client_id in proxy._results
-
-            # The fake worker pushes an ErrorResponse down this frontend's
-            # result lane; the dispatcher must deliver it and retire the
-            # request.
-            worker_lane = FusedIpcQueue(
-                (result_addrs[1], hmac_key),
-                is_server=False,
-                fuse_message=False,
-                socket_type=zmq.PUSH,
-                name="fake_worker_result_lane",
-            )
+            assert worker_ingress.poll(5)
+            worker_ingress.get()
             worker_lane.put(ErrorResponse(client_id, "boom", 1))
-            deadline = time.time() + 5
-            while client_id in proxy._results and time.time() < deadline:
-                time.sleep(0.01)
+            with pytest.raises(RequestError, match="boom"):
+                result.result(timeout=5)
+            # Queue delivery precedes the dispatcher's final registry bookkeeping.
+            assert completed.wait(5)
             assert client_id not in proxy._results
-
-            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+            proxy.shutdown()
+            assert not proxy.dispatch_result_thread.is_alive()
+            assert not proxy._results
+            assert not worker_ingress.poll(0.1)
+        finally:
+            with ExitStack() as cleanup:
+                cleanup.callback(worker_ingress.close)
+                cleanup.callback(worker_lane.close)
+                proxy.shutdown()

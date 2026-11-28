@@ -18,11 +18,14 @@ import time
 import weakref
 from collections import UserDict
 from collections.abc import Iterator
+from queue import Empty
 from threading import Thread
 from typing import Literal
+from unittest.mock import Mock, patch
 
 import pytest
 import zmq
+from utils.spawn_process import SpawnProcessContext, spawn_process
 
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
@@ -54,6 +57,20 @@ def async_queue_pair(request: pytest.FixtureRequest) -> Iterator[tuple[ZeroMqQue
         for queue in (sender, receiver):
             queue.socket.setsockopt(zmq.LINGER, 0)
             queue.close()
+
+
+def _run_interruptible_send_timeout(context: SpawnProcessContext) -> None:
+    """Exercise a real no-peer send in a process the parent can kill."""
+    sender = ZeroMqQueue(socket_type=zmq.PUSH, is_server=True)
+    try:
+        with patch.object(sender, "_send_data", wraps=sender._send_data) as attempt:
+            context.send("ready")
+            with pytest.raises(RuntimeError, match="send cancelled during shutdown"):
+                sender.put_interruptible({"message": "no peer"}, lambda: attempt.called)
+            attempt.assert_called_once()
+    finally:
+        sender.close()
+    context.send("completed")
 
 
 class TestIpcBasics:
@@ -355,6 +372,63 @@ class TestIpcBasics:
             assert time.monotonic() - start_time < 1.0
         finally:
             server.close()
+
+    @pytest.mark.parametrize("closed", [False, True])
+    def test_put_interruptible_cancelled_before_setup(self, closed: bool) -> None:
+        """Cancellation must precede lazy setup, socket access and pickling."""
+        sender = ZeroMqQueue(address=("tcp://127.0.0.1:1", b"test-key"), is_server=False)
+        should_stop = Mock(return_value=True)
+        try:
+            if closed:
+                sender.close()
+            with pytest.raises(RuntimeError, match="send cancelled during shutdown"):
+                sender.put_interruptible(lambda: None, should_stop)
+            should_stop.assert_called_once_with()
+            assert not sender._setup_done
+            if not closed:
+                assert sender.socket.getsockopt(zmq.SNDTIMEO) == -1
+        finally:
+            sender.close()
+
+    def test_put_interruptible_cancelled_during_serialization(self, monkeypatch) -> None:
+        sender = ZeroMqQueue(is_server=True)
+        prepare = Mock(wraps=sender._prepare_data)
+        send = Mock(side_effect=AssertionError("cancelled message sent"))
+        monkeypatch.setattr(sender, "_prepare_data", prepare)
+        monkeypatch.setattr(sender, "_send_data", send)
+        try:
+            with pytest.raises(RuntimeError, match="send cancelled during shutdown"):
+                sender.put_interruptible("message", lambda: prepare.called)
+            prepare.assert_called_once_with("message")
+            send.assert_not_called()
+        finally:
+            sender.close()
+
+    def test_put_interruptible_rechecks_after_send_timeout(self) -> None:
+        """A real send timeout observes cancellation before retrying without a peer."""
+        with spawn_process(_run_interruptible_send_timeout) as child:
+            child.receive("ready", timeout=60)
+            child.receive("completed", timeout=10)
+            assert child.wait(timeout=10) == 0
+
+    @pytest.mark.parametrize(
+        ("recv_timeout", "timeout_ms"), [(None, -1), (0, 0), (0.0001, 1), (0.0011, 2)]
+    )
+    def test_recv_timeout_socket_option(self, recv_timeout: float | None, timeout_ms: int) -> None:
+        """Keep blocking/zero semantics and round positive fractional milliseconds up."""
+        receiver = ZeroMqQueue(is_server=True, recv_timeout=recv_timeout)
+        try:
+            assert receiver.socket.getsockopt(zmq.RCVTIMEO) == timeout_ms
+            if recv_timeout is not None:
+                with pytest.raises(Empty):
+                    receiver.get()
+        finally:
+            receiver.close()
+
+    def test_recv_timeout_rejects_negative_values(self) -> None:
+        """A negative timeout must not select ZeroMQ's infinite-wait convention."""
+        with pytest.raises(ValueError, match="recv_timeout must be non-negative"):
+            ZeroMqQueue(is_server=True, recv_timeout=-0.0001)
 
     @staticmethod
     def _orphaned_sender(linger_ms: int | None = None) -> ZeroMqQueue:

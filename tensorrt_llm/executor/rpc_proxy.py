@@ -345,9 +345,16 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
     def shutdown(self):
         if self._shutdown_event.is_set():
+            if getattr(self, "_rpc_client_close_pending", False):
+                self._close_rpc_client()
             return
         if not self._uses_collective_shutdown():
-            self._shutdown_rank_local()
+            try:
+                self._shutdown_rank_local()
+            except BaseException:
+                # Publish client-only retry only after worker teardown unwinds.
+                self._rpc_client_close_pending = True
+                raise
             return
         self._shutdown_event.set()
         logger_debug("Shutting down GenerationExecutorRpcProxy", color="yellow")
@@ -398,7 +405,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             self.mpi_session = None
 
         try:
-            self.rpc_client.close()
+            self._close_rpc_client()
         except BaseException as error:
             shutdown_errors.append(error)
 
@@ -455,7 +462,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             logger_debug("Mpi session shutdown", color="yellow")
             self.mpi_session = None
 
-        self.rpc_client.close()
+        self._close_rpc_client()
 
     def __enter__(self):
         return self

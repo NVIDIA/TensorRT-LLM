@@ -10,6 +10,7 @@ import types
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -50,6 +51,14 @@ def _extract_class(source, class_name, methods, namespace, bases=()):
     module = ast.fix_missing_locations(ast.Module(body=[derived], type_ignores=[]))
     exec(compile(module, str(source), "exec"), namespace)
     return namespace[class_name]
+
+
+_RpcExecutorMixin = _extract_class(
+    _ROOT / "tensorrt_llm/executor/rpc_proxy_mixin.py",
+    "RpcExecutorMixin",
+    {"_close_rpc_client"},
+    {},
+)
 
 
 _uses_collective_shutdown = _extract_function(
@@ -112,6 +121,8 @@ class _FakeRay:
 
     @staticmethod
     def get(ref, timeout=None):
+        if isinstance(ref, list):
+            return [value.get() for value in ref]
         return ref.get()
 
     def kill(self, worker, no_restart=True):
@@ -132,6 +143,7 @@ def _ray_executor(ray, per_layer_dynamic=True):
         "RayExecutor",
         {"shutdown", "_shutdown_workers_collectively"},
         {
+            "RpcExecutorMixin": _RpcExecutorMixin,
             "ray": ray,
             "uses_collective_shutdown": _uses_collective_shutdown,
             "time": __import__("time"),
@@ -140,6 +152,7 @@ def _ray_executor(ray, per_layer_dynamic=True):
             ),
             "logger_debug": lambda *args, **kwargs: None,
         },
+        bases=("RpcExecutorMixin",),
     )
     executor = cls()
     executor.worker_kwargs = {"llm_args": _llm_args(per_layer_dynamic)}
@@ -213,6 +226,72 @@ def test_ray_shutdown_without_per_layer_eplb_tears_down_best_effort():
 
     assert ray.killed == [worker]
     assert executor.workers is None
+
+
+@pytest.mark.parametrize("per_layer_dynamic", [False, True])
+def test_ray_client_close_failure_retries_only_client(per_layer_dynamic: bool) -> None:
+    ray = _FakeRay()
+    ray.is_initialized = lambda: True
+    ray.util.remove_placement_group = Mock()
+    ray.shutdown = Mock()
+    worker = _RayWorker([_Ref([None])])
+    executor = _ray_executor(ray, per_layer_dynamic)
+    executor.workers = [worker]
+    executor.placement_group = object()
+    executor.has_start_local_cluser = True
+    executor._wait_for_cluster_resource_release = Mock()
+    close_error = TimeoutError("client still closing")
+    executor.rpc_client.close = Mock(side_effect=[close_error, None])
+
+    with pytest.raises(TimeoutError) as raised:
+        executor.shutdown()
+    assert raised.value is close_error
+    assert executor._shutdown_event.is_set()
+    assert executor.workers is None
+    assert worker.shutdown.calls == 1
+    assert ray.killed == [worker]
+    ray.util.remove_placement_group.assert_called_once()
+    executor._wait_for_cluster_resource_release.assert_called_once_with(timeout=30.0)
+    ray.shutdown.assert_called_once()
+
+    executor.shutdown()
+    executor.shutdown()
+    assert executor.rpc_client.close.call_count == 2
+    assert worker.shutdown.calls == 1
+    assert ray.killed == [worker]
+    ray.util.remove_placement_group.assert_called_once()
+    executor._wait_for_cluster_resource_release.assert_called_once()
+    ray.shutdown.assert_called_once()
+
+
+def test_ray_initialization_preserves_error_when_client_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_error = ConnectionError("Ray initialization failed")
+    ray = SimpleNamespace(init=Mock(side_effect=initial_error))
+    cls = _extract_class(
+        _ROOT / "tensorrt_llm/executor/ray/executor.py",
+        "RayExecutor",
+        {"__init__"},
+        {
+            "Base": type("Base", (), {"__init__": lambda self, *args: None}),
+            "Dict": dict,
+            "PostprocWorkerConfig": object,
+            "os": __import__("os"),
+            "ray": ray,
+            "logger": SimpleNamespace(warning=Mock(), error=Mock()),
+        },
+        bases=("Base",),
+    )
+    cls.shutdown = Mock(side_effect=TimeoutError("client still closing"))
+    monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
+    monkeypatch.setenv("RAY_DEDUP_LOGS", "0")
+    monkeypatch.setenv("TLLM_RAY_FORCE_LOCAL_CLUSTER", "1")
+
+    with pytest.raises(ConnectionError) as raised:
+        cls({}, 1, object(), True)
+    assert raised.value is initial_error
+    cls.shutdown.assert_called_once()
 
 
 class _BaseWorker:
@@ -323,17 +402,31 @@ def _rpc_proxy(per_layer_dynamic=True):
     cls = _extract_class(
         _ROOT / "tensorrt_llm/executor/rpc_proxy.py",
         "GenerationExecutorRpcProxy",
-        {"_uses_collective_shutdown", "shutdown_remote", "shutdown", "_shutdown_rank_local"},
         {
+            "_uses_collective_shutdown",
+            "shutdown_remote",
+            "shutdown",
+            "_shutdown_rank_local",
+        },
+        {
+            "RpcExecutorMixin": _RpcExecutorMixin,
             "uses_collective_shutdown": _uses_collective_shutdown,
             "logger_debug": lambda *args, **kwargs: None,
             "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
             "threading": threading,
         },
+        bases=("RpcExecutorMixin",),
     )
     cls._COLLECTIVE_SHUTDOWN_TIMEOUT_S = 300.0
     proxy = cls()
     proxy.worker_kwargs = {"llm_args": _llm_args(per_layer_dynamic)}
+    proxy._shutdown_event = threading.Event()
+    proxy._rpc_client_close_pending = False
+    proxy.main_loop = None
+    proxy.main_loop_task_obj = None
+    proxy.main_loop_thread = None
+    proxy.mpi_session = None
+    proxy._owns_mpi_session = True
     return proxy
 
 
@@ -373,6 +466,122 @@ def test_rpc_proxy_cleanup_failure_keeps_retry_gate_and_resources_live():
     assert not proxy._shutdown_event.is_set()
     assert proxy.mpi_session is not None
     assert calls == [("cleanup", True, 300.0)]
+
+
+@pytest.mark.parametrize(
+    ("per_layer_dynamic", "prior_failure"),
+    [(False, None), (True, None), (True, "mpi"), (True, "worker_future")],
+)
+def test_rpc_proxy_client_close_failure_retries_only_client(
+    per_layer_dynamic: bool, prior_failure: str | None
+) -> None:
+    calls = []
+    proxy = _rpc_proxy(per_layer_dynamic)
+    proxy.rpc_client = _RpcClient(calls)
+    close_error = TimeoutError("client still closing")
+    prior_error = RuntimeError("worker teardown failed")
+    proxy.rpc_client.close = Mock(side_effect=[close_error, None])
+    session = SimpleNamespace(
+        shutdown=Mock(side_effect=prior_error if prior_failure == "mpi" else None)
+    )
+    proxy.mpi_session = session
+    worker_future = SimpleNamespace(
+        result=Mock(side_effect=prior_error if prior_failure == "worker_future" else None)
+    )
+    proxy.worker_futures = [worker_future]
+    proxy.main_loop = SimpleNamespace(call_soon_threadsafe=Mock())
+    proxy.main_loop_task_obj = SimpleNamespace(cancel=Mock())
+    proxy.main_loop_thread = SimpleNamespace(join=Mock(), is_alive=lambda: False)
+
+    expected_error = prior_error if prior_failure else close_error
+    with pytest.raises(type(expected_error)) as raised:
+        proxy.shutdown()
+    assert raised.value is expected_error
+    assert proxy._shutdown_event.is_set()
+    assert proxy.mpi_session is None
+    assert calls == (
+        [("cleanup", True, 300.0), ("commit", True, 300.0)]
+        if per_layer_dynamic
+        else [("cleanup", False, None)]
+    )
+    session.shutdown.assert_called_once()
+    assert worker_future.result.call_count == int(per_layer_dynamic)
+
+    proxy.shutdown()
+    proxy.shutdown()
+    assert proxy.rpc_client.close.call_count == 2
+    session.shutdown.assert_called_once()
+    proxy.main_loop.call_soon_threadsafe.assert_called_once()
+    proxy.main_loop_thread.join.assert_called_once()
+    assert len(calls) == (2 if per_layer_dynamic else 1)
+
+
+@pytest.mark.parametrize("failure_site", ["remote", "mpi"])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_rpc_rank_local_prior_failure_defers_client_close_for_retry(
+    failure_site: str, close_fails: bool
+) -> None:
+    error = RuntimeError("worker teardown failed")
+    close_error = TimeoutError("client still closing")
+    proxy = _rpc_proxy(per_layer_dynamic=False)
+    proxy.rpc_client = _RpcClient([])
+    proxy.rpc_client.close = Mock(side_effect=[close_error, None] if close_fails else None)
+    session = SimpleNamespace(shutdown=Mock(side_effect=error))
+    proxy.mpi_session = session
+    teardown_entered = threading.Event()
+    release_teardown = threading.Event()
+    errors = []
+
+    def shutdown_remote() -> None:
+        teardown_entered.set()
+        assert release_teardown.wait(timeout=5)
+        if failure_site == "remote":
+            raise error
+
+    proxy.shutdown_remote = Mock(side_effect=shutdown_remote)
+
+    def shutdown() -> None:
+        try:
+            proxy.shutdown()
+        except BaseException as caught:
+            errors.append(caught)
+
+    thread = threading.Thread(target=shutdown)
+    thread.start()
+    try:
+        assert teardown_entered.wait(timeout=5)
+        assert proxy._shutdown_event.is_set()
+        # A concurrent caller must not close the client during worker teardown.
+        shutdown()
+        assert errors == []
+        proxy.rpc_client.close.assert_not_called()
+        assert not getattr(proxy, "_rpc_client_close_pending", False)
+    finally:
+        release_teardown.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and errors[0] is error
+    assert proxy.mpi_session is session
+    assert session.shutdown.call_count == int(failure_site == "mpi")
+    proxy.rpc_client.close.assert_not_called()
+    assert proxy._rpc_client_close_pending
+    assert proxy._shutdown_event.is_set()
+
+    if close_fails:
+        with pytest.raises(TimeoutError) as raised:
+            proxy.shutdown()
+        assert raised.value is close_error
+        assert proxy._rpc_client_close_pending
+        assert proxy._shutdown_event.is_set()
+
+    proxy.shutdown()
+    proxy.shutdown()
+    assert proxy.rpc_client.close.call_count == (2 if close_fails else 1)
+    assert not proxy._rpc_client_close_pending
+    assert proxy._shutdown_event.is_set()
+    assert proxy.mpi_session is session
+    proxy.shutdown_remote.assert_called_once()
+    assert session.shutdown.call_count == int(failure_site == "mpi")
 
 
 def test_rpc_server_completes_commit_only_after_response_send():
