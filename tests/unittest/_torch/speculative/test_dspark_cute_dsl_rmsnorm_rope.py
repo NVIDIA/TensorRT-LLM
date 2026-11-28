@@ -36,6 +36,14 @@ def _make_inputs(
     return x, weight, freqs
 
 
+def _with_row_padding(x: torch.Tensor, padding: int) -> torch.Tensor:
+    """Copy x into the last columns of wider rows, like the K/V part of a fused GEMM output."""
+    storage = torch.empty((*x.shape[:-1], padding + x.shape[-1]), device=x.device, dtype=x.dtype)
+    padded = storage[..., padding:]
+    padded.copy_(x)
+    return padded
+
+
 def _reference(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -199,20 +207,37 @@ def test_fused_dspark_rmsnorm_rope_cuda_graph_replay():
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_fused_dspark_rmsnorm_rope_compiles_once_across_batches():
+def test_fused_dspark_rmsnorm_rope_compiles_once_per_row_layout_across_batches():
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         _compile_fused_dspark_rmsnorm_rope,
         cute_dsl_dspark_rmsnorm_rope,
     )
 
     _compile_fused_dspark_rmsnorm_rope.cache_clear()
-    for batch in (1, 3):
-        inputs = _make_inputs(batch, 5, 512, 64, 1, seed=batch)
-        cute_dsl_dspark_rmsnorm_rope(*inputs, 1, 64, 1e-6, True, True, False)
+    args = (1, 64, 1e-6, True, True, False)
+    # Every batch runs compact rows. The two padded batches also run the same rows
+    # as row-strided views, with different row strides.
+    for batch, padding in ((1, 0), (3, 0), (2, 64), (4, 128)):
+        x, weight, freqs = _make_inputs(batch, 5, 512, 64, 1, seed=batch)
+        compact_output = cute_dsl_dspark_rmsnorm_rope(x, weight, freqs, *args)
+        torch.testing.assert_close(
+            compact_output, _reference(x, weight, freqs, *args), rtol=2e-2, atol=2e-2
+        )
+        if padding:
+            strided_x = _with_row_padding(x, padding)
+            # Row-strided rows give the same bits as compact rows.
+            torch.testing.assert_close(
+                cute_dsl_dspark_rmsnorm_rope(strided_x, weight, freqs, *args),
+                compact_output,
+                rtol=0,
+                atol=0,
+            )
 
+    # Compact rows and row-strided views compile separately; neither recompiles
+    # when the batch or the row stride changes.
     cache_info = _compile_fused_dspark_rmsnorm_rope.cache_info()
-    assert cache_info.misses == 1
-    assert cache_info.hits == 1
+    assert cache_info.misses == 2
+    assert cache_info.hits == 4
 
 
 @pytest.mark.parametrize("split_norm", [False, True])
@@ -257,6 +282,45 @@ def test_fused_dspark_rmsnorm_rope_norm_dim(split_norm):
     ref = torch.cat([ref[..., :nope], rot.to(ref.dtype)], dim=-1)
 
     torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+# One row flattens to a compact [1, 576] view, so it takes the compact-row kernel.
+@pytest.mark.parametrize("rows", [1, 16])
+def test_fused_dspark_rmsnorm_rope_reads_mla_layer_slice_in_place(rows):
+    """The MLA drafter passes each layer's slice of one fused GEMM output.
+
+    ``latent[:, layer]`` has row stride ``layers * 576``. The fused path must
+    read it with the row-strided kernel and match a compact copy bitwise.
+    """
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        _compile_fused_dspark_rmsnorm_rope,
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+    from tensorrt_llm._torch.models.modeling_dspark import _rmsnorm_rope_batched
+
+    torch.manual_seed(rows)
+    layers, hidden, rope_dim = 3, 576, 64
+    norm_dim = hidden - rope_dim
+    eps = 1e-5
+    latent = torch.randn(rows, layers, hidden, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(norm_dim, dtype=torch.bfloat16, device="cuda").abs() + 0.5
+    ang = torch.rand(1, rows, rope_dim // 2, device="cuda", dtype=torch.float32) * 6.28
+    freqs = torch.complex(ang.cos(), ang.sin())
+    x = latent[:, 1].unsqueeze(0)
+    compact = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    compact.copy_(x)
+
+    assert x.stride(1) == layers * hidden
+    freqs_real = torch.view_as_real(freqs).reshape(-1, freqs.shape[-1], 2)
+    assert is_fused_dspark_rmsnorm_rope_supported(x, w, freqs_real, 1, rope_dim, norm_dim)
+    _compile_fused_dspark_rmsnorm_rope.cache_clear()
+    got = _rmsnorm_rope_batched(x, w, eps, rope_dim, freqs, norm_dim=norm_dim)
+    expected = _rmsnorm_rope_batched(compact, w, eps, rope_dim, freqs, norm_dim=norm_dim)
+
+    # With several rows, the slice and the compact copy each compile their own row
+    # layout. With one row, both use the compact-row kernel.
+    assert _compile_fused_dspark_rmsnorm_rope.cache_info().misses == (1 if rows == 1 else 2)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
 def test_fused_dspark_rmsnorm_rope_accepts_no_weight() -> None:

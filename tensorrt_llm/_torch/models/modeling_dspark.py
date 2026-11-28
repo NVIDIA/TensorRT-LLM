@@ -4837,14 +4837,16 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # One fused RMSNorm+RoPE per layer, not one eager chain for all of them:
         # the kernel takes a single norm weight per call and the layers do not
         # share one. Same op the block path uses, so the two halves of an
-        # attention stay numerically consistent -- which is the point here, not
-        # speed (this runs per request, not per decode step).
+        # attention stay numerically consistent. This runs for each prefill
+        # chunk and in every decode step.
         freqs = self._mla_freqs_cis(latent.device)[positions.view(-1).long()]
         out = torch.empty_like(latent)
         for layer_idx in range(num_layers):
             # 3D throughout: the eager fallback's rotary indexes [G, s, rd].
+            # latent[:, layer_idx] has row stride num_layers * head_dim; the
+            # fused kernel reads it in place.
             out[:, layer_idx] = _rmsnorm_rope_batched(
-                latent[:, layer_idx].unsqueeze(0).contiguous(),
+                latent[:, layer_idx].unsqueeze(0),
                 self._kv_a_norm_stacked[layer_idx],
                 self._kv_a_norm_eps,
                 self.qk_rope_head_dim,
