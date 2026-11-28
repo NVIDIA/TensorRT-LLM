@@ -18,7 +18,8 @@
 
 One CTA per work unit (128 query rows of one (batch, head)) runs the whole key sequence, a tile of 128 keys at a time:
     * QK: S = Q' K'^T over the 192 channels of Q' and K' on the block-scaled NVFP4 MMA (kind::mxf4nvf4, m16n8k64).
-    * Softmax (softmax.py): log2 units, lazy rescale at T = 4, I-ExpCast, NVFP4 P coded against its decoded scales.
+    * Softmax (softmax.py): log2 units, lazy rescale at the threshold T of the build, I-ExpCast, NVFP4 P coded
+      against its decoded scales.
     * PV: O += P V' on the same MMA, with V' = V minus its 16-key means in V's own 128 channels (key-contiguous E2M1
       codes, UE4M3 scales per channel and 16 keys).
     * Means: the 16-key block sums of the unquantized P times v_mean on BF16 MMAs (m16n8k16, one k per block of a
@@ -410,12 +411,15 @@ def attn_kernel(
     RSPLIT: Int32,
     KMID: Int32,
     lens_ptr,
+    *,
+    rescale_threshold: cutlass.Constexpr,
 ):
     """One work unit per CTA, NTHREADS threads: thread (warp, g, t) holds the query rows 16 warp + g and + 8 of the
     unit's tile, as the warp-level MMAs lay out their fragments. NFULL, RSPLIT, KMID: split_plan of the grid; ws_ptr:
     the split units' partials and arrival counters. lens_ptr: None, or the valid prefix lengths: the keys of the
     unit's batch element then end at its length (the tiles after the one that holds it are not run), and the query
-    rows from there on are zero in o."""
+    rows from there on are zero in o. rescale_threshold: the rescale threshold of the softmax, from 0 to log2(448)
+    (ValueError while the kernel is traced otherwise)."""
     nT = key_tiles(S)
 
     tidx, _, _ = cute.arch.thread_idx()
@@ -577,6 +581,7 @@ def attn_kernel(
         Mlo=Mlo,
         thr=thr,
         safe=safe,
+        rescale_threshold=rescale_threshold,
     )
 
     # A CTA with keys runs them; with lengths only a unit with a valid query row, any other unit stores zeros.

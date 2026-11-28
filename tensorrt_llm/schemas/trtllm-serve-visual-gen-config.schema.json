@@ -23,15 +23,26 @@
         "quant_attention_config": {
           "anyOf": [
             {
-              "$ref": "#/$defs/QuantAttentionConfig"
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/QuantAttentionConfig"
+                },
+                {
+                  "$ref": "#/$defs/DeCoAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
+                }
+              ]
             },
             {
               "type": "null"
             }
           ],
           "default": null,
-          "description": "Quantized-attention recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends). Set to a QuantAttentionConfig instance to enable quantized attention; leave as None to disable.",
-          "status": "prototype"
+          "description": "Quantized-attention recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends). Set to a QuantAttentionConfig instance, or to a DeCoAttentionConfig instance (algorithm: deco_attention, CUTEDSL backend), to enable quantized attention; leave as None to disable.",
+          "status": "prototype",
+          "title": "Quant Attention Config"
         },
         "sparse_attention_config": {
           "anyOf": [
@@ -363,6 +374,152 @@
       "title": "CudaGraphConfig",
       "type": "object"
     },
+    "DeCoAttentionConfig": {
+      "additionalProperties": false,
+      "description": "DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.\n\nQ/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the\nfirst-order quantization error of the scores; V is smoothed over blocks of keys and\nquantized to FP8 or NVFP4. Self-attention with head dimension 128.\n\n* Compensation channels: ``q_channels`` of the Q-residual term, which compensates the\n  rounding residual of Q, and ``k_channels`` of the K-residual term, which compensates\n  that of K.\n* Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated\n  on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,\n  ``min_sample_rows``).\n* Quantizer of Q/K: the rule for the scale of an NVFP4 block of the head channels\n  (``scale_rule``).\n* Transformations of Q and K before quantization (``equalize``, ``center_k``).\n* The recipe sets its scaling granularity and smooths V itself: it has no block size,\n  smoothing or VC-Attention options.",
+      "properties": {
+        "algorithm": {
+          "const": "deco_attention",
+          "default": "deco_attention",
+          "description": "Selects DeCo-Attention. A mapping must set it: a quant_attention_config without an algorithm is a QuantAttentionConfig.",
+          "status": "prototype",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "basis": {
+          "default": "shared",
+          "description": "Bases of the two compensation terms. shared takes both from the leading eigenvectors of one weighted sum of the Gram matrices of Q and K; separate takes the basis of the Q-residual term from the leading eigenvectors of the Gram matrix of K and that of the K-residual term from those of Q.",
+          "enum": [
+            "shared",
+            "separate"
+          ],
+          "status": "prototype",
+          "title": "Basis",
+          "type": "string"
+        },
+        "center_k": {
+          "default": false,
+          "description": "K centering: per head, K minus its mean over the sampled video tokens. The scores of a query move by one constant, and its attention is unchanged. Needs compensation channels.",
+          "status": "prototype",
+          "title": "Center K",
+          "type": "boolean"
+        },
+        "equalize": {
+          "default": false,
+          "description": "Channel equalization: per head, channel c of Q is multiplied and channel c of K divided by one factor, taken from the largest magnitudes of the channel over the sampled tokens. With exact factors every score is unchanged. Needs compensation channels.",
+          "status": "prototype",
+          "title": "Equalize",
+          "type": "boolean"
+        },
+        "gram_weight": {
+          "default": 0.5,
+          "description": "Weight of the Gram matrix of Q against that of K in the shared basis: 0.5 weighs them equally, 1 takes Q alone and 0 takes K alone. basis: shared only.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Gram Weight",
+          "type": "number"
+        },
+        "k_channels": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "multipleOf": 16,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Compensation channels of the K-residual term, a multiple of 16; 0 drops the term. None is half of the compensation channels the kernels of the GPU offer: 32 of 64, or 64 of 128.",
+          "status": "prototype",
+          "title": "K Channels"
+        },
+        "k_sample_rate": {
+          "default": 0.00390625,
+          "description": "Fraction of the tokens of the sequence, padding included, whose K rows estimate the Gram matrix of K.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "status": "prototype",
+          "title": "K Sample Rate",
+          "type": "number"
+        },
+        "min_sample_rows": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fewest sampled tokens per Gram matrix, whatever the sample rate gives. None is twice the channels of the larger compensation term, at least 64.",
+          "status": "prototype",
+          "title": "Min Sample Rows"
+        },
+        "q_channels": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "multipleOf": 16,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Compensation channels of the Q-residual term, a multiple of 16; 0 drops the term. None is half of the compensation channels the kernels of the GPU offer: 32 of 64, or 64 of 128.",
+          "status": "prototype",
+          "title": "Q Channels"
+        },
+        "q_sample_rate": {
+          "default": 0.00390625,
+          "description": "Fraction of the tokens of the sequence, padding included, whose Q rows estimate the Gram matrix of Q.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "status": "prototype",
+          "title": "Q Sample Rate",
+          "type": "number"
+        },
+        "qk_dtype": {
+          "const": "nvfp4",
+          "default": "nvfp4",
+          "description": "Q/K quantization format: block-scaled nvfp4.",
+          "status": "prototype",
+          "title": "Qk Dtype",
+          "type": "string"
+        },
+        "scale_rule": {
+          "default": "band",
+          "description": "Rule for the scale of an NVFP4 block of 16 values of the head channels, the 128 rotated channels of Q and of K. With m the largest magnitude of the block: max takes m / 6, which puts the largest magnitude on the largest code; band takes m / 4 where a value of the block has 0.76 m <= |x| < 0.85 m, else m / 6; search quantizes the block with m / 6 and with m / 4 and keeps the scale with the smaller squared rounding error. A block of the compensation channels takes m / 6 under every rule.",
+          "enum": [
+            "max",
+            "band",
+            "search"
+          ],
+          "status": "prototype",
+          "title": "Scale Rule",
+          "type": "string"
+        },
+        "v_dtype": {
+          "default": "fp8",
+          "description": "V quantization format, which is also the format of BMM2: fp8, or nvfp4 on a GPU whose kernels offer it.",
+          "enum": [
+            "fp8",
+            "nvfp4"
+          ],
+          "status": "prototype",
+          "title": "V Dtype",
+          "type": "string"
+        }
+      },
+      "title": "DeCoAttentionConfig",
+      "type": "object"
+    },
     "ParallelConfig": {
       "additionalProperties": false,
       "description": "Configuration for distributed parallelism across DiT-shaped models.\n\nThe sequence axis can be sharded via Attention2D (a 2D mesh) or Ring\nAttention (a 1D mesh); these two are mutually exclusive. Either can be\ncombined with Ulysses head-sharding to form an outer \u00d7 inner sequence\nparallel mesh. See ``mapping.py`` for the underlying DeviceMesh layout.",
@@ -514,15 +671,8 @@
     },
     "QuantAttentionConfig": {
       "additionalProperties": false,
-      "description": "Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).\n\nSpecifies Q/K and V quantization formats and their optional block sizes.\n\nBare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is\nbackend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V\non SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. CUTEDSL runs NVFP4 Q/K with FP8 V,\nor with NVFP4 V on SM120, as DeCo-Attention when deco_attention is set. Unsupported\nrecipes are rejected by AttentionConfig's validator with a ValueError.",
+      "description": "Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).\n\nSpecifies Q/K and V quantization formats and their optional block sizes.\n\nBare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is\nbackend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V\non SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. DeCo-Attention has its own config,\nDeCoAttentionConfig. Unsupported recipes are rejected by AttentionConfig's validator\nwith a ValueError.",
       "properties": {
-        "deco_attention": {
-          "default": false,
-          "description": "Run the recipe as DeCo-Attention on the CUTEDSL backend. nvfp4 Q/K are Hadamard-rotated and carry compensation channels for the first-order quantization error of the scores; V is smoothed over blocks of keys and quantized to fp8, or to nvfp4 on SM120. Self-attention with head dimension 128.",
-          "status": "prototype",
-          "title": "Deco Attention",
-          "type": "boolean"
-        },
         "k_block_size": {
           "default": 0,
           "description": "Number of K tokens per SageAttention quantization block; 0 otherwise.",

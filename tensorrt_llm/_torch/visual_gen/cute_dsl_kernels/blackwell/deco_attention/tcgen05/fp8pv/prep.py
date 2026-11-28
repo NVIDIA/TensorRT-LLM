@@ -14,11 +14,14 @@
 # limitations under the License.
 """Host entry of the preparation of the tcgen05 FP8-PV kernel: run turns raw BF16 q, k, v into its operands.
 
-One TVM-FFI host function per device launches the kernel chain on the current stream (_make_host); its scratch is
-part of the buffers of the call (scratch). Nothing reads a device value back, so the chain captures into a CUDA graph.
+One TVM-FFI host function per device and configuration launches the kernel chain on the current stream (_make_host,
+which lists what a configuration is); its scratch is part of the buffers of the call (scratch). Nothing reads a
+device value back, so the chain captures into a CUDA graph; the first call of a configuration compiles its host
+function (the rule of a capture: api.py).
 
     clear launch        zeroes the per-call words of gmax                                    basis.clear_kernel
-    eigensolver launch  one CTA per (batch, head): the compensation basis U of Q' and K'     basis.eig_kernel
+    eigensolver launch  one CTA per basis of a (batch, head): the directions of the          basis.eig_kernel
+                        compensation terms; not launched with a caller's basis or rank (0, 0)
     V scan              128-key means of V (v_mean) and their largest deviation, beside the   v_pass.v_scan_kernel
                         eigensolver
     V encode            E4M3 V minus its means (v8) and the scaled means (v_mean)            v_pass.v_encode_kernel
@@ -27,8 +30,10 @@ part of the buffers of the call (scratch). Nothing reads a device value back, so
 
 The first three are chained by programmatic dependent launch: the eigensolver waits for the clear launch, and the V
 scan starts beside the eigensolver CTAs and ends with a wait for them, so the plain launches after it see the basis.
+Without an eigensolver launch the V scan is a plain launch after the clear launch.
 """
 
+import functools
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -39,12 +44,20 @@ from cutlass import BFloat16, Float32, Int32, Int64
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-from ...constants import HEAD_DIM, key_tiles, qk_scale_atoms
-from ...inputs import hadamard
-from ...runtime import Layout, num_sms, pdl_enabled, token_pitches
-from ..prep.basis import EIG_THREADS, GMAX_WORDS, clear_kernel, eig_kernel
+from ...constants import HEAD_DIM, KEY_TILE, key_tiles, qk_channels, qk_scale_atoms
+from ...inputs import Compensation, Transforms, hadamard
+from ...runtime import Basis, Layout, compiled, num_sms, pdl_enabled, token_pitches
+from ..prep.basis import (
+    EIG_THREADS,
+    GMAX_WORDS,
+    TRANSFORM_BYTES,
+    clear_kernel,
+    eig_directions,
+    eig_kernel,
+    eig_transform_kernel,
+)
 from ..prep.encode import encode_kernel, encode_threads
-from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel
+from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel, qk_rule_kernel, qk_transform_kernel
 from .softmax import MIN_SCORE_LOG2
 from .v_pass import V_BLOCK, V_CTAS_PER_SM, V_THREADS, v_encode_kernel, v_scan_kernel
 
@@ -60,34 +73,55 @@ def _launch_chain(
     inputs: tuple,
     operands: tuple,
     scratch: tuple,
-    sizes: tuple,
+    pitches: tuple,
     grids: tuple,
+    gram_weight: Float32,
     lens: Int64,
+    records: Int64,
+    video: Int64,
+    rotation_t: Int64,
     stream: cuda.CUstream,
-    rank: int,
-    rows_mode: tuple | None,
-    pdl: bool,
+    config: tuple,
 ) -> None:
-    """Issue the launches of the chain; rows_mode: None, or (rows per sample, mapped rows) of a call with valid prefix
-    lengths [B] at the address lens; pdl: the V scan and the eigensolver launch are programmatic dependents."""
-    q, k, v, rows, hadamard = inputs
+    """Issue the launches of the chain of a configuration (_make_host), on the tensors and sizes of a call."""
+    q, k, v, rows_q, rows_k, NK, hadamard = inputs
     q4, k4, q_sf, k_sf, score_scale, v8, v_mean, v8_scale = operands
-    gmax, uT, q_sfv, k_sfv = scratch
-    S, H, QP, KP, VP, NQK, NCQ, BH, NB = sizes
-    v_units, v_grid, qgrid, egrid = grids
+    gmax, ut_q, ut_k, q_sfv, k_sfv = scratch
+    QP, KP, VP = pitches
+    v_grid, qgrid, egrid, v_counted = grids
+    rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule, transforms = config
+    equalize, center_k, counted = transforms
+    transformed = equalize or center_k
+    # the shape of the call, and the sizes of its launches that follow from it
+    B, S, H = (Int32(n) for n in q.shape[:3])
+    BH = B * H
+    NB = (S + (KEY_TILE - 1)) // KEY_TILE
+    v_units = B * ((S + (V_BLOCK - 1)) // V_BLOCK)
     ntiles = BH * NB * 2
     min_prod = HEAD_DIM * 2.0**MIN_SCORE_LOG2
-    clear_kernel(gmax).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
     with_lens = rows_mode is not None
-    eig = eig_kernel(q, k, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, lens, rank, rows_mode)
-    vs = v_scan_kernel(v, v_mean, gmax, S, H, VP, NB, v_units, lens, with_lens)
+    clear_kernel(gmax).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+    if eig:
+        NQ = Int32(rows_q.shape[-1])
+        eig_args = (q, k, rows_q, rows_k, hadamard, ut_q, S, H, QP, KP, NQ, NK, gram_weight, lens)
+        eig_build = (eig_directions(rank), rows_mode, two_row_sets, separate)
+        if transformed:
+            eigs = eig_transform_kernel(*eig_args, records, video, *eig_build, *transforms)
+        else:
+            eigs = eig_kernel(*eig_args, *eig_build)
+        eigs.launch(
+            grid=(BH * (2 if separate else 1), 1, 1),
+            block=(EIG_THREADS, 1, 1),
+            use_pdl=pdl,
+            stream=stream,
+        )
+    vs = v_scan_kernel(v, v_mean, gmax, S, H, VP, NB, v_units, v_counted, lens, with_lens)
     ve = v_encode_kernel(v, v8, v_mean, gmax, S, H, VP, NB, v_units, lens, with_lens)
-    eig.launch(grid=(BH, 1, 1), block=(EIG_THREADS, 1, 1), use_pdl=pdl, stream=stream)
     vs.launch(
         grid=(v_grid, 1, 1),
         block=(V_THREADS, 1, 1),
         min_blocks_per_mp=V_CTAS_PER_SM,
-        use_pdl=pdl,
+        use_pdl=pdl and eig,
         stream=stream,
     )
     ve.launch(
@@ -111,37 +145,58 @@ def _launch_chain(
     tma_k = cute.nvgpu.make_tiled_tma_atom_A(
         op, _gemm_view(k), a_layout, (128, 128, 128), tiled_mma
     )
-    qk_args = (tiled_mma, tma_q, tma_k, hadamard, uT, q4, k4, q_sfv, k_sfv, gmax)
-    qkp = qk_kernel(*qk_args, S, H, NB, ntiles, lens, rank, with_lens)
+    qk_args = (tiled_mma, tma_q, tma_k, hadamard, ut_q, ut_k, q4, k4, q_sfv, k_sfv, gmax)
+    qk_args += (S, H, NB, ntiles, lens)
+    qk_build = (rank, with_lens, separate)
+    if transformed:
+        qkp = qk_transform_kernel(
+            *qk_args, records, rotation_t, *qk_build, scale_rule, equalize, center_k
+        )
+    elif scale_rule == "max":
+        qkp = qk_kernel(*qk_args, *qk_build)
+    else:
+        qkp = qk_rule_kernel(*qk_args, *qk_build, scale_rule)
     qkp.launch(grid=(qgrid, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
     encode_kernel(
         q_sfv, k_sfv, q_sf, k_sf, gmax, score_scale, BH * NB, v8_scale, min_prod, rank
-    ).launch(grid=(egrid, 1, 1), block=(encode_threads(rank), 1, 1), stream=stream)
+    ).launch(grid=(egrid, 1, 1), block=(encode_threads(qk_channels(rank)), 1, 1), stream=stream)
 
 
-def _make_host(
-    rank: int, rows_per_sample: bool | None = None, map_rows: bool = False, pdl: bool = True
-) -> Callable:
-    """Return the host function that launches the chain of compensation rank `rank` on its `stream` argument.
+def _make_host(config: tuple) -> Callable:
+    """Return the host function that launches the chain of a configuration on its `stream` argument.
 
+    * config: (rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule, transforms).
+        - rank: (r_q, r_k), the channels of the compensation terms. separate: each term has a basis of its own, ut_q
+          (the Q-residual term's) and the one at the address ut_k (else both read ut_q); the eigensolver then writes
+          both from the address of ut_q.
+        - eig: the eigensolver launch is part of the chain; without it ut_q and ut_k hold the caller's basis or
+          are not read (rank (0, 0)), and the rows and the Gram weight are not read.
+        - two_row_sets: the Gram matrix of K takes the NK rows at the address rows_k (else both take rows_q).
+        - rows_mode: None for a call whose batch elements are all full (the host function's lens is not read);
+          otherwise lens is the address of the valid prefix lengths [B], and rows_mode is (rows per sample, mapped
+          rows): the row arguments are [B, rows] or [rows], and the eigensolver maps them into each valid prefix
+          (the default draw) or takes them as given.
+        - pdl: the launches of the chain follow each other as programmatic dependents.
+        - scale_rule: the rule for the scale of a head block in the Q/K pass (constants.SCALE_RULES).
+        - transforms: (equalize, center_k, counted): the transformations of Q and K; either one takes the
+          transformed eigensolver and Q/K pass, which write and read the records at the address records
+          (basis.py). counted: the video row counts of center_k are at the address video. With equalize
+          the transformed Q/K pass reads the transposed rotation at the address rotation_t.
     * The score prescale log2(e) / sqrt(128) is folded into Q' (QPRE), so the multiplier of the raw scores in log2
       units is the score scale (group scale product / 128) itself, a power of two; the encode launch raises it to at
       least 2^MIN_SCORE_LOG2, the floor of the attention's landing (softmax.py), by shrinking the Q' / K' block scales.
-    * rows_per_sample: None for a call whose batch elements are all full (the host function's lens is not read);
-      otherwise lens is the address of the valid prefix lengths [B], with rows [B, NQK] (True) or [NQK] (False).
-      map_rows: the eigensolver maps the rows into each valid prefix (the default draw).
-    * pdl: the launches of the chain follow each other as programmatic dependents.
-    * QP, KP, VP: the bytes between consecutive tokens of q, k and v, which the eigensolver and the V scan and encode
-      read in place (the Q/K pass reads them through TMA descriptors built on the tensors' layouts).
+    * gram_weight: the Gram weight of the shared basis. QP, KP, VP: the bytes between consecutive tokens of q, k
+      and v, which the eigensolver and the V scan and encode read in place (the Q/K pass reads them through TMA
+      descriptors built on the tensors' layouts). v_grid, qgrid, egrid: the CTAs of the V passes, the Q/K pass and
+      the encode launch. v_counted: nonzero when the V scan shares its SMs with the eigensolver CTAs.
     """
-    rows_mode = None if rows_per_sample is None else (rows_per_sample, map_rows)
 
     @cute.jit
     def deco_host(
         q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
-        rows: cute.Tensor,
+        rows_q: cute.Tensor,
         hadamard: cute.Tensor,
         q4: cute.Tensor,
         k4: cute.Tensor,
@@ -152,36 +207,39 @@ def _make_host(
         v_mean: cute.Tensor,
         v8_scale: cute.Tensor,
         gmax: cute.Tensor,
-        uT: cute.Tensor,
+        ut_q: cute.Tensor,
         q_sfv: cute.Tensor,
         k_sfv: cute.Tensor,
-        S: Int32,
-        H: Int32,
         QP: Int32,
         KP: Int32,
         VP: Int32,
-        NQK: Int32,
-        NCQ: Int32,
-        BH: Int32,
-        NB: Int32,
-        v_units: Int32,
         v_grid: Int32,
         qgrid: Int32,
         egrid: Int32,
+        v_counted: Int32,
+        NK: Int32,
+        gram_weight: Float32,
+        rows_k: Int64,
+        ut_k: Int64,
         lens: Int64,
+        records: Int64,
+        video: Int64,
+        rotation_t: Int64,
         stream: cuda.CUstream,
     ):
         _launch_chain(
-            (q, k, v, rows, hadamard),
+            (q, k, v, rows_q, rows_k, NK, hadamard),
             (q4, k4, q_sf, k_sf, score_scale, v8, v_mean, v8_scale),
-            (gmax, uT, q_sfv, k_sfv),
-            (S, H, QP, KP, VP, NQK, NCQ, BH, NB),
-            (v_units, v_grid, qgrid, egrid),
+            (gmax, ut_q, ut_k, q_sfv, k_sfv),
+            (QP, KP, VP),
+            (v_grid, qgrid, egrid, v_counted),
+            gram_weight,
             lens,
+            records,
+            video,
+            rotation_t,
             stream,
-            rank,
-            rows_mode,
-            pdl,
+            config,
         )
 
     return deco_host
@@ -201,84 +259,132 @@ def _ffi_tensor(t: torch.Tensor) -> cute.Tensor:
     )
 
 
-# the buffers of a call that the host function takes after q, k, v, the rows and the rotation, in its order
-_HOST_BUFFERS = (
-    "q4",
-    "k4",
-    "q_sf",
-    "k_sf",
-    "score_scale",
-    "v8",
-    "v_mean",
-    "v8_scale",
-    "gmax",
-    "uT",
-    "q_sfv",
-    "k_sfv",
-)
+# the operands of a call that the host function takes after q, k, v, the rows and the rotation, in its order
+_HOST_OPERANDS = ("q4", "k4", "q_sf", "k_sf", "score_scale", "v8", "v_mean", "v8_scale")
 
 
-def scratch(B: int, S: int, H: int, rank: int) -> Layout:
-    """Return the scratch of the chain at this shape and rank, name -> (dtype, shape); every call rewrites it first."""
+def scratch(B: int, S: int, H: int, rank: tuple[int, int], bases: str) -> Layout:
+    """Return the scratch of the chain at this shape, rank and bases, name -> (dtype, shape); every call rewrites it
+    first, except uT under a caller's basis."""
     NB = key_tiles(S)
-    atoms = qk_scale_atoms(rank)
+    atoms = qk_scale_atoms(qk_channels(rank))
+    directions = eig_directions(rank)
     return {
-        # the per-call words (maxima and the V pass's CTA count), U^T and the provisional Q' / K' block scales
+        # the per-call words (maxima and the V scan's unit count), U^T of the basis (one per term with bases
+        # "separate"; none without compensation channels) and the provisional Q' / K' block scales
         "gmax": (torch.float32, (GMAX_WORDS,)),
-        "uT": (torch.float32, (B, H, rank, HEAD_DIM)),
+        **(
+            {
+                "uT": (
+                    torch.float32,
+                    (*((2,) if bases == "separate" else ()), B, H, directions, HEAD_DIM),
+                )
+            }
+            if directions
+            else {}
+        ),
         "q_sfv": (torch.bfloat16, (B, H, NB, atoms, 512)),
         "k_sfv": (torch.bfloat16, (B, H, NB, atoms, 512)),
     }
+
+
+@functools.cache
+def _transposed_rotation(device: torch.device) -> torch.Tensor:
+    """Return the transposed rotation of Q and K (inputs.hadamard), contiguous, built once per device: row n holds
+    column n of the rotation, which the transformed Q/K pass stages from."""
+    return hadamard(device).t().contiguous()
+
+
+def transform_scratch(B: int, H: int) -> Layout:
+    """Return the records of the transformations of Q and K, name -> (dtype, shape): TRANSFORM_BYTES per
+    (batch, head), which a call with equalize or center_k writes (basis.py) and no other call reads."""
+    return {"transform": (torch.uint8, (B, H, TRANSFORM_BYTES))}
+
+
+def basis(buffers: dict[str, torch.Tensor], bases: str) -> Basis:
+    """Return the basis that the eigensolver left in the buffers of a call: U^T [B, H, directions, 128], the leading
+    direction last; with bases "separate" the two (basis of the Q-residual term, of the K-residual term)."""
+    u = buffers["uT"]
+    return (u[0], u[1]) if bases == "separate" else (u,)
 
 
 def run(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    rows: torch.Tensor,
     buffers: dict[str, torch.Tensor],
-    rank: int,
-    lens: torch.Tensor | None = None,
-    map_rows: bool = False,
+    lens: torch.Tensor | None,
+    comp: Compensation,
+    scale_rule: str,
+    transforms: Transforms,
 ) -> None:
     """Fill the operands of a call (buffers: the buffers of the call, the layout of this package) from raw BF16 q, k, v.
 
     * Operands: see layout. score_scale is the multiplier of the raw scores in log2 units, a power of two of at
       least 2^MIN_SCORE_LOG2 (_make_host); v8 and v_mean (row j: the mean of block j) are over v8_scale (v_pass.py).
-    * rows: int32 indices of the tokens whose q and k rows estimate the compensation basis (inputs.sample_rows).
-    * lens: None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place. rows is
-      then [NQK] for every batch element or [B, NQK] per batch element: positions in the padded sequence that the
-      eigensolver maps into each valid prefix with map_rows, tokens otherwise.
+    * lens: None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place.
+    * comp: the compensation of the call (inputs.Compensation). With a caller's basis the eigensolver is not
+      launched and the rows are None, as they are with rank (0, 0).
+    * scale_rule: the rule for the scale of a head block of Q' and K' (constants.SCALE_RULES).
+    * transforms: the transformations of Q and K (inputs.Transforms); they need the eigensolver launch.
     """
     B, S, H, _ = q.shape
     NB = key_tiles(S)
-    NQK = rows.shape[-1]
-    rows_per_sample = None if lens is None else rows.dim() == 2
     dev = q.device
     nsm = num_sms(dev)
     BH = B * H
+    rank, bases, gram_weight, rows_q, rows_k, map_rows, caller_basis = comp
+    separate = bases == "separate"
+    compensated = rank != (0, 0)
+    eig = compensated and caller_basis is None
+    gmax = buffers["gmax"]
+    # the basis of the Q-residual term and the rows of Gq (gmax where a configuration reads neither); the basis of the
+    # K-residual term and the rows of Gk go by address
+    ut_q, ut_k_addr = gmax, 0
+    if compensated:
+        u = basis(buffers, bases) if eig else caller_basis
+        ut_q, ut_k_addr = u[0], u[-1].data_ptr()
+    if not eig:
+        rows_q = rows_k = gmax
+    two_row_sets = rows_k is not rows_q
+    nk, rows_k_addr = (rows_k.shape[-1], rows_k.data_ptr()) if two_row_sets else (0, 0)
+    rows_mode = None if lens is None else (eig and rows_q.dim() == 2, eig and map_rows)
     # The V scan runs beside the eigensolver CTAs, V_CTAS_PER_SM per SM. A pass of at most V_SMALL_PASS_BYTES per
     # free SM is launched on the SMs that the eigensolver launch leaves free (at least V_SMALL_PASS_MIN_SMS, at most
     # the device's); a larger one on every SM.
-    free = min(nsm, max(nsm - BH, V_SMALL_PASS_MIN_SMS))
-    v_sms = free if BH < nsm and B * S * H * 16 * 40 <= V_SMALL_PASS_BYTES * free else nsm
-    v_units = B * ((S + V_BLOCK - 1) // V_BLOCK)
-    v_grid = min(V_CTAS_PER_SM * v_sms, v_units)
-    ntiles = BH * NB * 2
-    qgrid = min(nsm, ntiles)
+    eig_ctas = BH * (2 if separate else 1) if eig else 0
+    free = min(nsm, max(nsm - eig_ctas, V_SMALL_PASS_MIN_SMS))
+    v_sms = free if eig_ctas < nsm and B * S * H * 16 * 40 <= V_SMALL_PASS_BYTES * free else nsm
+    v_grid = min(V_CTAS_PER_SM * v_sms, B * ((S + V_BLOCK - 1) // V_BLOCK))
+    # a V scan on SMs that also hold eigensolver CTAs takes its work from the counter of the call (v_pass.py)
+    v_counted = int(eig_ctas > 0 and v_sms + min(eig_ctas, nsm) > nsm)
+    qgrid = min(nsm, BH * NB * 2)
     egrid = min(ENCODE_CTAS_PER_SM * nsm, BH * NB)
-    tensors = (q, k, v, rows, hadamard(dev), *(buffers[n] for n in _HOST_BUFFERS))
-    sizes = (S, H, *token_pitches(q, k, v), NQK, (NQK + 255) // 256, BH, NB)
-    sizes += (v_units, v_grid, qgrid, egrid)
+    tensors = (q, k, v, rows_q, hadamard(dev), *(buffers[n] for n in _HOST_OPERANDS))
+    tensors += (gmax, ut_q, buffers["q_sfv"], buffers["k_sfv"])
+    sizes = (*token_pitches(q, k, v), v_grid, qgrid, egrid, v_counted, nk)
     lens_addr = 0 if lens is None else lens.data_ptr()
-    map_rows = lens is not None and map_rows
     pdl = pdl_enabled()
-    key = (dev.index, rank, rows_per_sample, map_rows, pdl)
-    fn = _hosts.get(key)
-    if fn is None:
-        cargs = [_ffi_tensor(t) for t in tensors] + [Int32(x) for x in sizes] + [Int64(lens_addr)]
+    equalize, center_k, video = transforms
+    video_addr = 0 if video is None else video.data_ptr()
+    config = (rank, separate, eig, two_row_sets, rows_mode, pdl, scale_rule)
+    config += ((equalize, center_k, video is not None),)
+    values = (
+        gram_weight,
+        rows_k_addr,
+        ut_k_addr,
+        lens_addr,
+        buffers["transform"].data_ptr(),
+        video_addr,
+    )
+    values += (_transposed_rotation(dev).data_ptr() if equalize else 0,)
+
+    # the chain compiles per device and configuration (_make_host)
+    def make():
+        cargs = [_ffi_tensor(t) for t in tensors] + [Int32(x) for x in sizes]
+        cargs += [Float32(values[0]), *(Int64(x) for x in values[1:])]
         cargs.append(cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True))
-        fn = _hosts[key] = cute.compile(
-            _make_host(rank, rows_per_sample, map_rows, pdl), *cargs, options="--enable-tvm-ffi"
-        )
-    fn(*tensors, *sizes, lens_addr)
+        return _make_host(config), *cargs
+
+    fn = compiled(_hosts, (dev.index, *config), make, options="--enable-tvm-ffi")
+    fn(*tensors, *sizes, *values)

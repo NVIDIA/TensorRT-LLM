@@ -15,8 +15,9 @@
 """Preparation passes that the kernels of the sm_120 family share.
 
 The chain of a kernel launches them (<kernel package>/prep.py), with the V pass of its PV format (v_pass.py there):
-    basis.py    the basis launch: the eigensolver of the rank-32 compensation basis, with a kernel's V scan and V pass
+    basis.py    the basis launch: the eigensolver of the compensation basis, with a kernel's V scan and V pass
     qk_pass.py  rotation, NVFP4 quantization and compensation channels of Q and K
     encode.py   the encode launch: UE4M3 scale factors of Q' and K', score scale
-    chain.py    the host side that the chains share: compile cache, launch sizes, scratch, the call
+    chain.py    the host side that the chains share: the compensation of a call, compile cache, launch sizes,
+                scratch, the call
 """

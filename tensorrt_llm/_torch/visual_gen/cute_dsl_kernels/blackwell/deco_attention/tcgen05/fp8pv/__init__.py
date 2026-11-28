@@ -23,22 +23,28 @@ Files:
     sched.py     work distribution inside a launch
     tuning.py    schedule constants per target
 Attention:
-    * The scores are exponentiated straight into E4M3 P (I-ExpCast), with a lazy rescale threshold of T = 4 binades.
+    * The scores are exponentiated straight into E4M3 P (I-ExpCast), with a lazy rescale threshold of T binades, one
+      of constants.RESCALE_THRESHOLDS["fp8"].
     * The row sum of P comes from the PV MMA; a BF16 MMA over the block sums of P adds the V means back, once per
       eight key tiles.
 """
 
+import functools
+
 import torch
 
-from ...constants import HEAD_DIM, QK_ROW_BYTES, key_tiles, qk_scale_atoms
+from ...constants import HEAD_DIM, QK_ROW_BYTES, key_tiles, qk_channels, qk_scale_atoms
+from ...inputs import Compensation, Transforms
 from ...runtime import Layout
 from . import launch, prep
 
 
-def layout(b: int, s: int, h: int, rank: int, nsm: int) -> Layout:
-    """Return the buffers of one call in workspace order, name -> (dtype, shape): the operands, then the scratch."""
+@functools.cache
+def layout(b: int, s: int, h: int, rank: tuple[int, int], bases: str, nsm: int) -> Layout:
+    """Return the buffers of one call in workspace order, name -> (dtype, shape): the operands, then the scratch.
+    Built once per shape, rank, bases and SM count; read only."""
     tiles = key_tiles(s)
-    atoms = qk_scale_atoms(rank)
+    atoms = qk_scale_atoms(qk_channels(rank))
     return {
         # operands, which the preparation writes and the attention reads. q4, k4: rows of packed E2M1, the QK channels
         # in the first bytes of a token row (the bytes after them are not written and no MMA reads them)
@@ -53,8 +59,10 @@ def layout(b: int, s: int, h: int, rank: int, nsm: int) -> Layout:
         "score_scale": (torch.float32, (1,)),
         "v8_scale": (torch.float32, (1,)),
         # scratch of the preparation and of the split launch
-        **prep.scratch(b, s, h, rank),
+        **prep.scratch(b, s, h, rank, bases),
         **launch.scratch(b, s, h, nsm),
+        # the records of the transformations of Q and K, behind every other buffer
+        **prep.transform_scratch(b, h),
     }
 
 
@@ -62,23 +70,30 @@ def prepare(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    rows: torch.Tensor,
     buffers: dict[str, torch.Tensor],
-    rank: int,
-    lens: torch.Tensor | None = None,
-    map_rows: bool = False,
+    lens: torch.Tensor | None,
+    comp: Compensation,
+    scale_rule: str,
+    transforms: Transforms,
 ) -> None:
-    """Run the preparation of this kernel on the buffers of a call (layout); rows, lens and map_rows as in prep.run."""
+    """Run the preparation of this kernel on the buffers of a call (layout); the arguments as in prep.run."""
     # every buffer may hold anything on entry; only the arrival counters of a split launch must be zero when the
     # attention starts: they are zeroed here
     flags = buffers.get("split_flags")
     if flags is not None:
         flags.zero_()
-    prep.run(q, k, v, rows, buffers, rank, lens, map_rows)
+    prep.run(q, k, v, buffers, lens, comp, scale_rule, transforms)
 
 
 def attention(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, rank: int, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    rank: tuple[int, int],
+    lens: torch.Tensor | None,
+    rescale_threshold: float,
 ) -> None:
     """Run the attention of this kernel into BF16 o on the buffers that prepare filled; lens: those prepare took."""
-    launch.run(buffers, o, rank, lens)
+    launch.run(buffers, o, qk_channels(rank), lens, rescale_threshold)
+
+
+basis = prep.basis

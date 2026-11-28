@@ -27,7 +27,7 @@ from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
 from ...common.ptx import asm, f32, i32, i64, tied, u32
-from ...constants import E4M3_MAX, RESCALE_THRESHOLD
+from ...constants import E4M3_MAX
 from .shared import f32_literal
 
 
@@ -61,13 +61,25 @@ def e4m3_to_f32(byte, *, loc=None, ip=None):
     )
 
 
+def _in_range(rescale_threshold):
+    """Return the rescale threshold T of a kernel build. ValueError, while the kernel is traced, unless
+    0 <= T <= log2(448): the scale of a P block whose maximum is at the anchor of its row, 448 * 2^-T, is then from
+    1 to the largest UE4M3 value."""
+    if not 0.0 <= rescale_threshold <= math.log2(E4M3_MAX):
+        raise ValueError(
+            f"the NVFP4-PV attention kernel takes a rescale threshold from 0 to log2({E4M3_MAX:g}), "
+            f"got {rescale_threshold!r}"
+        )
+    return rescale_threshold
+
+
 # the blocks of the softmax (nvfp4pv/softmax.py), down to land32_sum
 @dsl_user_op
 def need_vote(bm, thr0, thr1, *, loc=None, ip=None):
     """Eight f32 bm (the block maxima), f32 thr0, thr1 -> i32 warp-uniform 1 if on any lane a bm[2 i] exceeds thr0 or a
     bm[2 i + 1] exceeds thr1 (setp.gt.f32 with .or, vote.sync.any.pred), else 0: whether an anchor may have to move.
-    Each raw threshold is div.rm(RN(anchor + T), c), T = RESCALE_THRESHOLD, so a block max at or below it cannot meet
-    the move condition of anchor_update, RN(c max) > RN(anchor + T)."""
+    Each raw threshold is div.rm(RN(anchor + T), c), T the rescale threshold, so a block max at or below it cannot
+    meet the move condition of anchor_update, RN(c max) > RN(anchor + T)."""
     bmi, thr0i, thr1i = 1, 9, 10
     body = ["{", ".reg .pred p;", f"setp.gt.f32 p, ${bmi}, ${thr0i};"]
     body += [f"setp.gt.or.f32 p, ${bmi + 2 * i}, ${thr0i}, p;" for i in range(1, 4)]
@@ -84,18 +96,20 @@ def need_vote(bm, thr0, thr1, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def anchor_update(need, bm, a0, a1, th0, th1, ls0, ls1, safe, c, *, loc=None, ip=None):
+def anchor_update(
+    need, bm, a0, a1, th0, th1, ls0, ls1, safe, c, rescale_threshold: float, *, loc=None, ip=None
+):
     """i32 need, eight f32 bm (the block maxima), f32 a0, a1 (the anchors), th0, th1 (their thresholds), ls0, ls1 (the
     row sums), i32 safe (the last seven tied to their results), f32 c -> eight f32 (the anchors, the two correction
     factors of O, the thresholds, the sums) and the i32 fold-safety flag. When need != 0 (rare): the full row maxima,
-    the skip-correction update of the anchors (a move when RN(c max) > RN(anchor + T), T = RESCALE_THRESHOLD) with
+    the skip-correction update of the anchors (a move when RN(c max) > RN(anchor + T), T = rescale_threshold) with
     their thresholds, the sums times the correction factors, and the flag; when need is 0: the tied values and factors
     of 1.0. The update runs behind a warp-uniform branch, written as a loop that runs at most once."""
     # $0 .. $8: the results: the anchors (ai), the factors (fi), the thresholds (thresh_i), the sums (lsi) and the flag;
     # then, behind the seven tied operands, need, bm and c
     ai, fi, thresh_i, lsi, safei, needi, bmi, ci = 0, 2, 4, 6, 8, 16, 17, 25
     # the skip threshold T, as a PTX literal
-    t_lit = f32_literal(RESCALE_THRESHOLD)
+    t_lit = f32_literal(_in_range(rescale_threshold))
     body = [
         "{",
         ".reg .pred p, cpow2;",
@@ -209,17 +223,17 @@ def rescale64_loop(o, f0, f1, need, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def block_scales2(bm0, bm1, c, anchor0, anchor1, *, loc=None, ip=None):
+def block_scales2(bm0, bm1, c, anchor0, anchor1, rescale_threshold: float, *, loc=None, ip=None):
     """f32 bm0, bm1 (the maxima of two 16-key blocks, of rows g and g + 8), f32 c, anchor0, anchor1 -> i32 word of two
     f16, i32 of two UE4M3 bytes, and two f32; no side effects. The P scales of the two blocks, 448 * 2^(c bm - anchor -
-    T) (fma.rn.f32x2, ex2.approx.ftz.f32; T = RESCALE_THRESHOLD), rounded to UE4M3 and read back
+    T) (fma.rn.f32x2, ex2.approx.ftz.f32; T = rescale_threshold), rounded to UE4M3 and read back
     (cvt.rn.satfinite.e4m3x2.f16x2, cvt.rn.f16x2.e4m3x2): the decoded scales as f16x2, floored at 2^-10 so that a block
     whose scale rounds to zero keeps finite elements (the sum factor); the UE4M3 bytes; and per block the log2 of the
     unrounded scale over the decoded one (lg2.approx.ftz.f32), the shift of its element offset."""
     # the results: the decoded scales, the UE4M3 bytes and the two shifts; then the operands: the maxima, c, the anchors
     schi, sfi, shifti, bmi, ci, anchori = 0, 1, 2, 4, 6, 7
     # the headroom of the P block scales, UE4M3(448 * 2^(bm - anchor - T)), as a PTX literal
-    k = f32_literal(math.log2(E4M3_MAX) - RESCALE_THRESHOLD)
+    k = f32_literal(math.log2(E4M3_MAX) - _in_range(rescale_threshold))
     body = [
         "{",
         ".reg .b64 bb, cc, ll, tt;",

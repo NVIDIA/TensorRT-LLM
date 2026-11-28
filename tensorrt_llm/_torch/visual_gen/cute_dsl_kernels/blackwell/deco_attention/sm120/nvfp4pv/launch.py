@@ -17,7 +17,8 @@
 * A call is one launch on the current stream: the attention kernel (kernel.py), one CTA per (query tile, head,
   batch) unit, on the per-tile images of K', V' and their scales that the preparation wrote (layout.py).
 * The last units % nsm units of the grid (nsm: the SM count of the device) run as two key halves each (split_plan).
-* The kernels take the shape and the plan at run time: one compile per device, and one more for calls with lengths.
+* The kernels take the shape and the plan at run time: one compile per device and rescale threshold, and one more
+  for calls with lengths.
 """
 
 import cuda.bindings.driver as cuda
@@ -26,7 +27,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.typing import Int32
 
-from ...runtime import compiled, current_stream, gmem_ptr, num_sms
+from ...runtime import Layout, compiled, current_stream, gmem_ptr, num_sms
 from .kernel import NTHREADS, RECORD_BYTES, SMEM_BYTES, attn_kernel
 from .layout import key_tiles
 
@@ -47,8 +48,10 @@ def attn_launch(
     rsplit: Int32,
     kmid: Int32,
     stream: cuda.CUstream,
+    rescale_threshold: cutlass.Constexpr,
 ):
-    # lens_ptr: None, or the valid prefix lengths, which the kernel reads in place; nfull, rsplit, kmid: split_plan
+    # lens_ptr: None, or the valid prefix lengths, which the kernel reads in place; nfull, rsplit, kmid: split_plan;
+    # rescale_threshold: the rescale threshold of the softmax
     attn_kernel(
         q_ptr,
         qsf_ptr,
@@ -63,6 +66,7 @@ def attn_launch(
         rsplit,
         kmid,
         lens_ptr,
+        rescale_threshold=rescale_threshold,
     ).launch(
         grid=[nfull + 2 * rsplit, 1, 1], block=[NTHREADS, 1, 1], smem=SMEM_BYTES, stream=stream
     )
@@ -80,7 +84,7 @@ def split_plan(B: int, S: int, H: int, nsm: int) -> tuple[int, int, int]:
     return n - r, r, 4 * ((nT + 4) // 8)
 
 
-def scratch(B: int, S: int, H: int, nsm: int) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
+def scratch(B: int, S: int, H: int, nsm: int) -> Layout:
     """Return the scratch of the attention at this shape on a device of nsm SMs, name -> (dtype, shape).
 
     * split: the split units' records, then their arrival counters.
@@ -99,11 +103,15 @@ _compiled = {}
 
 
 def run(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    lens: torch.Tensor | None,
+    rescale_threshold: float,
 ) -> None:
     """Run the attention on the current stream: BF16 o [B, S, H, 128] from the operands in the buffers of the call.
     Nothing here reads a device value or allocates. lens: None, or the int32 valid prefix lengths [B], read in place
-    by the kernel variant with lengths; the plan follows the padded S."""
+    by the kernel variant with lengths; the plan follows the padded S. rescale_threshold: one of
+    constants.RESCALE_THRESHOLDS["nvfp4"]."""
     q4 = buffers["q4"]
     B, S, H, _ = q4.shape
     dev = q4.device
@@ -123,4 +131,5 @@ def run(
     lens_ptr = gmem_ptr(cutlass.Int32, lens, 4) if lens is not None else None
     plan = split_plan(B, S, H, num_sms(dev))
     args = (*ptrs, lens_ptr, *(Int32(x) for x in (S, H, *plan)), stream)
-    compiled(_compiled, (dev.index, lens is not None), lambda: attn_launch, *args)(*args)
+    key = (dev.index, lens is not None, rescale_threshold)
+    compiled(_compiled, key, lambda: (attn_launch, *args, rescale_threshold))(*args)

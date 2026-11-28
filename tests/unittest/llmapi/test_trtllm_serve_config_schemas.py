@@ -320,6 +320,102 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 2}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"attention_config": {"backend": "not-a-backend"}}, False),
+        # quant_attention_config: `algorithm` selects DeCoAttentionConfig; a mapping without it
+        # is a QuantAttentionConfig and takes none of the DeCo-Attention fields.
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "backend": "CUTEDSL",
+                    "quant_attention_config": {"qk_dtype": "nvfp4", "v_dtype": "fp8"},
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "backend": "CUTEDSL",
+                    "quant_attention_config": {
+                        "algorithm": "deco_attention",
+                        "v_dtype": "fp8",
+                        "q_channels": 48,
+                        "k_channels": 16,
+                        "basis": "separate",
+                        "q_sample_rate": 0.01,
+                        "min_sample_rows": 128,
+                    },
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "backend": "CUTEDSL",
+                    "quant_attention_config": {"algorithm": "deco_attention"},
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "quant_attention_config": {"algorithm": "deco_attention", "q_channels": 40}
+                }
+            },
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "backend": "CUTEDSL",
+                    "quant_attention_config": {
+                        "algorithm": "deco_attention",
+                        "equalize": True,
+                        "center_k": True,
+                    },
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "quant_attention_config": {"algorithm": "deco_attention", "equalize": "both"}
+                }
+            },
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "quant_attention_config": {"algorithm": "deco_attention", "qk_dtype": "fp8"}
+                }
+            },
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"attention_config": {"quant_attention_config": {"q_channels": 32}}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"attention_config": {"quant_attention_config": {"algorithm": "vc_attention"}}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"attention_config": {"quant_attention_config": {"deco_attention": True}}},
+            False,
+        ),
         (
             generator.VISUAL_GEN_SCHEMA,
             {

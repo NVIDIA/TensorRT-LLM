@@ -14,7 +14,9 @@
 # limitations under the License.
 """Encode launch of the sm_120 preparation: the Q/K group scales from the group maxima of the Q'/K' pass, the
 score-scale floor (2^msl, by growing the Q group scales), score_scale, and the UE4M3 Q'/K' block scales from the
-provisional BF16 scales."""
+provisional BF16 scales. The groups: the head channels, the Q-residual term and the K-residual term, whose blocks
+follow each other in the last scale atom (rank: the channels of the two terms; the blocks behind them hold zero
+scales)."""
 
 import cutlass
 import cutlass.cute as cute
@@ -45,6 +47,7 @@ def encode_kernel(
     ncta: Int32,
     *,
     tile_pitch: cutlass.Constexpr = None,
+    rank: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
@@ -101,10 +104,11 @@ def encode_kernel(
             f[2 * e] = bf16_f32(w[e], 0)
             f[2 * e + 1] = bf16_f32(w[e], 1)
         d = [Float32(cutlass.select_(side != 0, ik[j], iq[j])) for j in range(3)]
-        db = Float32(cutlass.select_(atom == 2, d[1], d[0]))
-        dc = Float32(cutlass.select_(atom == 2, d[2], d[0]))
-        lo = e4m3x4(f[0] * db, f[1] * db, f[2] * dc, f[3] * dc)
-        hi = e4m3x4(f[4] * db, f[5] * db, f[6] * dc, f[7] * dc)
+        # the factor of each of the four blocks of a row: the head group, or in the last atom the term of the block
+        term = [Float32(cutlass.select_(atom == 2, d[j], d[0])) for j in (1, 2)]
+        db = [term[int(16 * blk >= rank[0])] for blk in range(4)]
+        lo = e4m3x4(f[0] * db[0], f[1] * db[1], f[2] * db[2], f[3] * db[3])
+        hi = e4m3x4(f[4] * db[0], f[5] * db[1], f[6] * db[2], f[7] * db[3])
         if side == 0:
             store_vector(gptr(Uint32, qsf_p + Int64(li) * 8, 8), (lo, hi))
         elif cutlass.const_expr(tile_pitch is None):

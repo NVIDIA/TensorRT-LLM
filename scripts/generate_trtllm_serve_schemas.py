@@ -604,7 +604,16 @@ def generate_visual_gen_schema() -> dict:
     """Describe the separate VisualGen engine-args YAML file."""
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-    return _schema_for(VisualGenArgs)
+    schema = _schema_for(VisualGenArgs)
+    # Validation reads `algorithm` before choosing a branch of quant_attention_config: a mapping
+    # that names it is the config of that algorithm, one without it a QuantAttentionConfig.
+    # Require it on the branches that define it; the definitions keep their Python defaults.
+    quant_attention = schema["$defs"]["AttentionConfig"]["properties"]["quant_attention_config"]
+    for branch in quant_attention["anyOf"][0]["oneOf"]:
+        name = branch["$ref"].rsplit("/", 1)[-1]
+        if "algorithm" in schema["$defs"][name]["properties"]:
+            branch["required"] = ["algorithm"]
+    return schema
 
 
 def _source_version() -> str:

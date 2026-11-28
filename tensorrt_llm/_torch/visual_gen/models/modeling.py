@@ -22,6 +22,7 @@ import torch.nn as nn
 from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.token_order import require_native_token_order
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 from tensorrt_llm.visual_gen.sparse_attention import BaseSparseAttentionConfig
 
 if TYPE_CHECKING:
@@ -102,7 +103,7 @@ class BaseDiffusionModel(nn.Module):
         """
         quant_config = self.model_config.attention.quant_attention_config
         if (
-            quant_config is not None
+            isinstance(quant_config, QuantAttentionConfig)
             and quant_config.vc_attention
             and not quant_config.vc_repair_budget
         ):

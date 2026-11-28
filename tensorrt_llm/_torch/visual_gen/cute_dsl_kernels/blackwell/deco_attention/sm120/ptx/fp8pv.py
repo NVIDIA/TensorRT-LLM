@@ -27,7 +27,7 @@ from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
 from ...common.ptx import asm, early, f32, i32, i64, operand, tied, u32
-from ...constants import RESCALE_THRESHOLD, SUBNORMAL_ULPS
+from ...constants import SUBNORMAL_ULPS, p_prescale_log2
 from .shared import f32_literal, ldsm
 
 
@@ -176,14 +176,23 @@ def _landed_bits(t):
 # the blocks of the softmax (softmax.py), down to packed_pv_needed; n ULP has the f32 bits n, TO_GRID 2^-139
 ULP = 2.0**-149
 TO_GRID = f32_literal(SUBNORMAL_ULPS * ULP)
+# Anchors of this magnitude (log2 units) and above take the two-FMA landing of land_pack. The one-FMA landing adds
+# the scores to the offset bias - anchor 2^-139 of their row, which must be an f32 on the grid of the landing
+# (1024 units per binade of P):
+#   * below the limit the offset is within half a unit for an anchor below 2^13 and, from 2^13 on, exact for a
+#     positive anchor and within 4 units for a negative one
+#   * from 2^24 on f32 rounds it by whole binades
+ONE_FMA_ANCHOR_LIMIT = 2.0**16
 
 
 @dsl_user_op
 def expcast_guard(sc, anchor0, anchor1, *, loc=None, ip=None):
     """Return the warp-uniform landing path of land_pack, valid until either anchor changes.
 
-    * 1, the exact two-FMA path: on some lane sc * 2^-139 is not exact on the subnormal grid or an anchor is not finite.
-    * 0, one FMA per pair: it needs the multiplier exact (sc a multiple of 2^-10, as the scales of the preparation are).
+    * 1, the exact two-FMA path: on some lane sc * 2^-139 is not exact on the subnormal grid, or an anchor is
+      ONE_FMA_ANCHOR_LIMIT or more in magnitude or not a number.
+    * 0, one FMA per pair: it needs the multiplier exact (sc a multiple of 2^-10, as the scales of the preparation
+      are) and the offset of each row on the grid (an anchor below the limit).
     """
     sci, m0i, m1i = 1, 2, 3
     return asm(
@@ -193,8 +202,8 @@ def expcast_guard(sc, anchor0, anchor1, *, loc=None, ip=None):
         f"mul.rn.f32 r, r, {f32_literal(2.0**69)};\n"
         f"setp.neu.f32 bad, r, ${sci};\n"
         f"abs.f32 a0, ${m0i};\nabs.f32 a1, ${m1i};\n"
-        "setp.eq.f32 b0, a0, 0f7F800000;\n"
-        "setp.eq.f32 b1, a1, 0f7F800000;\n"
+        f"setp.ge.f32 b0, a0, {f32_literal(ONE_FMA_ANCHOR_LIMIT)};\n"
+        f"setp.ge.f32 b1, a1, {f32_literal(ONE_FMA_ANCHOR_LIMIT)};\n"
         "or.pred bad, bad, b0;\nor.pred bad, bad, b1;\n"
         "setp.nan.f32 b0, a0, a1;\n"
         "or.pred bad, bad, b0;\n"
@@ -209,19 +218,20 @@ def expcast_guard(sc, anchor0, anchor1, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def land_pack(acc, sc, anchor0, anchor1, path, *, loc=None, ip=None):
+def land_pack(acc, sc, anchor0, anchor1, path, rescale_threshold: float, *, loc=None, ip=None):
     """Return the scores of the tile of the warp landed on the f32 subnormal grid and packed by pairs; no side effects.
 
-    * Landing: the f16 pattern of 2^t, t = s - anchor + T, T = RESCALE_THRESHOLD. The warp-uniform path picks one FMA
-      per score (0, exact multiplier) or d = x sc - anchor and a second FMA (1).
+    * Landing: the f16 pattern of 2^t, t = s - anchor + pre, pre = p_prescale_log2(rescale_threshold). The
+      warp-uniform path (expcast_guard) picks one FMA per score (0: exact multiplier, anchors below
+      ONE_FMA_ANCHOR_LIMIT) or d = x sc - anchor and a second FMA (1).
     * Pack: x[8 i + 2 e + j] = f16x2 of (n-tile 4 i + 2 j, 4 i + 2 j + 1) at element e, saturating (t < -15 and -inf
       -> +0; overflow and NaN -> 0xFFFF).
     """
     inputs = [acc[n][e] for n in range(16) for e in range(4)] + [sc, anchor0, anchor1]
     # $0 .. $31: the packed words; then the operands: the scores, sc, the anchors and path
     acci, sci, m0i, m1i, pathi = 32, 96, 97, 98, 99
-    # the offset of the landing: a score at its anchor lands on 2^T
-    bias = f32_literal(_landed_bits(RESCALE_THRESHOLD) * ULP)
+    # the offset of the landing: a score at its anchor lands on 2^pre
+    bias = f32_literal(_landed_bits(p_prescale_log2(rescale_threshold)) * ULP)
     body = [
         "{",
         ".reg .f32 z<64>, a, nm0, nm1, b0, b1;",
@@ -287,11 +297,12 @@ def land_pack(acc, sc, anchor0, anchor1, path, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def landed_flags(xs, *, loc=None, ip=None):
+def landed_flags(xs, rescale_threshold: float, *, loc=None, ip=None):
     """Return the warp-uniform flags of a landed tile (land_pack), from the maximum of its values.
 
-    * Bit 0: on some lane a landed score exceeds the f16 pattern of 2^(2 T) (t > 2 T, that is s > anchor + T,
-      T = RESCALE_THRESHOLD), is saturated or is NaN. The anchor may have to move, so the exact tile max decides.
+    * Bit 0: on some lane a landed score exceeds the f16 pattern of 2^(pre + T) (that is s > anchor + T, T =
+      rescale_threshold, pre = p_prescale_log2(T)), is saturated or is NaN. The anchor may have to move, so the exact
+      tile max decides.
     * Bit 1, exclusive with bit 0: every landed value is at most 2^-10 (f16 0x1400), which E4M3 rounds to zero: the P
       of the tile, its block sums and its row-sum terms are all zero.
     """
@@ -310,7 +321,7 @@ def landed_flags(xs, *, loc=None, ip=None):
         f"shr.u32 t, {vals[0]}, 16;",
         f"and.b32 u, {vals[0]}, 65535;",
         "max.u32 t, t, u;",
-        f"setp.gt.u32 p, t, {_landed_bits(2 * RESCALE_THRESHOLD)};",
+        f"setp.gt.u32 p, t, {_landed_bits(p_prescale_log2(rescale_threshold) + rescale_threshold)};",
         "vote.sync.any.pred wp, p, 0xffffffff;",
         f"setp.le.u32 z, t, {_landed_bits(-10)};",
         "vote.sync.all.pred wz, z, 0xffffffff;",

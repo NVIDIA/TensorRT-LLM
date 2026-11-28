@@ -15,6 +15,7 @@ from tensorrt_llm.visual_gen.args import (
     CacheDiTConfig,
     CompilationConfig,
     CudaGraphConfig,
+    DeCoAttentionConfig,
     ParallelConfig,
     QuantAttentionConfig,
     RuntimeLoRAConfig,
@@ -308,48 +309,143 @@ class TestAttentionConfigQuantValidation:
                     sparse_attention_config=sparse,
                 )
 
-    @pytest.mark.parametrize("v_dtype", ["fp8", "nvfp4"])
-    def test_supported_quant_config_deco_attention(self, v_dtype):
-        """DeCo-Attention validates on CUTEDSL with nvfp4 Q/K and fp8 or nvfp4 V."""
+    @pytest.mark.parametrize(
+        "quant",
+        [
+            dict(),
+            dict(v_dtype="nvfp4"),
+            dict(q_channels=0, k_channels=48),
+            dict(q_channels=96, k_channels=32),
+            dict(k_channels=16),
+            dict(gram_weight=1.0),
+            dict(basis="separate"),
+            dict(q_sample_rate=1 / 64, k_sample_rate=1.0, min_sample_rows=256),
+            dict(scale_rule="search"),
+            dict(equalize=True, center_k=True),
+        ],
+        ids=[
+            "defaults",
+            "nvfp4_v",
+            "zero_width_term",
+            "128_channels",
+            "one_term_open",
+            "gram_weight",
+            "separate_bases",
+            "sampling",
+            "scale_rule",
+            "transformations",
+        ],
+    )
+    def test_supported_deco_attention_config(self, quant):
+        """DeCo-Attention validates on CUTEDSL with nvfp4 Q/K, fp8 or nvfp4 V and its
+        compensation, sampling, scale rule and transformation fields. ``algorithm`` selects its config class
+        from a mapping, as a YAML file gives it, and the config survives a dump, also one that
+        leaves out the defaults or the fields that were not set."""
         attention = AttentionConfig(
-            backend="CUTEDSL",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype="nvfp4", v_dtype=v_dtype, deco_attention=True
-            ),
+            backend="CUTEDSL", quant_attention_config=DeCoAttentionConfig(**quant)
         )
 
-        assert attention.quant_attention_config.deco_attention
+        assert type(attention.quant_attention_config) is DeCoAttentionConfig
+        from_mapping = AttentionConfig(
+            backend="CUTEDSL", quant_attention_config={"algorithm": "deco_attention", **quant}
+        )
+        assert from_mapping == attention
+        for partial in (dict(), dict(exclude_defaults=True), dict(exclude_unset=True)):
+            assert AttentionConfig(**attention.model_dump(**partial)) == attention
+
+    def test_quant_attention_config_selection(self):
+        """A config without an algorithm is a QuantAttentionConfig, also with the dtypes of
+        DeCo-Attention. The DeCo-Attention fields default to the shared basis of equal weights
+        on 1/256 of the tokens, with the channels and the fewest sampled tokens left to the
+        GPU and both transformations off."""
+        plain = AttentionConfig(
+            backend="CUTEDSL", quant_attention_config={"qk_dtype": "nvfp4", "v_dtype": "fp8"}
+        )
+        assert type(plain.quant_attention_config) is QuantAttentionConfig
+
+        deco = DeCoAttentionConfig()
+        assert (deco.q_channels, deco.k_channels, deco.min_sample_rows) == (None, None, None)
+        assert (deco.basis, deco.gram_weight) == ("shared", 0.5)
+        assert (deco.q_sample_rate, deco.k_sample_rate) == (1 / 256, 1 / 256)
+        assert (deco.equalize, deco.center_k) == (False, False)
 
     @pytest.mark.parametrize(
         "backend, quant, sparse, match",
         [
-            ("TRTLLM", dict(qk_dtype="nvfp4"), None, "deco_attention is a CUTEDSL backend option"),
-            ("CUTEDSL", dict(qk_dtype="mxfp8"), None, "Supported DeCo-Attention recipes"),
+            ("TRTLLM", dict(algorithm="deco_attention"), None, "is a CUTEDSL backend option"),
             (
                 "CUTEDSL",
-                dict(qk_dtype="nvfp4", v_block_size=1),
-                None,
-                "Supported DeCo-Attention recipes",
-            ),
-            ("CUTEDSL", dict(qk_dtype="nvfp4", smooth_v=True), None, "are SageAttention options"),
-            (
-                "CUTEDSL",
-                dict(qk_dtype="nvfp4"),
+                dict(algorithm="deco_attention"),
                 VideoSparseAttentionConfig(vsa_sparsity=0.9),
-                "deco_attention does not compose with sparse_attention",
+                "DeCo-Attention does not compose with sparse_attention",
+            ),
+            ("CUTEDSL", dict(algorithm="deco"), None, "Unknown quant_attention_config algorithm"),
+            (
+                "CUTEDSL",
+                dict(qk_dtype="nvfp4", q_channels=32),
+                None,
+                "Extra inputs are not permitted",
+            ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", v_block_size=0, vc_attention=False),
+                None,
+                "Extra inputs are not permitted",
+            ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", q_channels=96, k_channels=48),
+                None,
+                "at most 128 compensation channels",
+            ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", basis="separate", gram_weight=0.25),
+                None,
+                "does not apply to basis='separate'",
+            ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", scale_rule="widest"),
+                None,
+                "Input should be 'max', 'band' or 'search'",
+            ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", q_channels=0, k_channels=0, equalize=True),
+                None,
+                "equalize takes its statistics",
+            ),
+            (
+                "CUTEDSL",
+                dict(algorithm="deco_attention", q_channels=0, k_channels=0, center_k=True),
+                None,
+                "center_k takes its statistics",
             ),
         ],
-        ids=["other_backend", "other_recipe", "block_size", "sage_smoothing", "sparse_attention"],
+        ids=[
+            "other_backend",
+            "sparse_attention",
+            "unknown_algorithm",
+            "fields_without_algorithm",
+            "recipe_fields_with_algorithm",
+            "too_many_channels",
+            "gram_weight_with_separate",
+            "unknown_scale_rule",
+            "equalize_without_channels",
+            "center_k_without_channels",
+        ],
     )
     def test_deco_attention_rejections(self, backend, quant, sparse, match):
-        """DeCo-Attention is CUTEDSL only, takes nvfp4 Q/K with fp8 or nvfp4 V at block sizes 0,
-        and never composes with SageAttention smoothing or a sparse algorithm."""
-        quant = {"deco_attention": True, **quant}
+        """One rejection per rule of the config: DeCo-Attention is CUTEDSL only and never
+        composes with a sparse algorithm; an algorithm other than its own is unknown; a config
+        without an algorithm takes none of its fields, and its config none of the block size,
+        smoothing or VC-Attention fields of the other recipes; the two terms take at most 128
+        compensation channels; the Gram weight belongs to the shared basis; a scale rule is one
+        of the three of the kernels; a transformation needs compensation channels."""
         with pytest.raises(ValidationError, match=match):
             AttentionConfig(
-                backend=backend,
-                quant_attention_config=QuantAttentionConfig(**quant),
-                sparse_attention_config=sparse,
+                backend=backend, quant_attention_config=quant, sparse_attention_config=sparse
             )
 
     @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])

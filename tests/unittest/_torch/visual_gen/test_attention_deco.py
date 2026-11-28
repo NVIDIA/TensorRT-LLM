@@ -21,6 +21,7 @@ and fails it when the kernel package does not import.
 import importlib
 import itertools
 import multiprocessing
+from typing import get_args
 
 import pytest
 import torch
@@ -40,7 +41,12 @@ from tensorrt_llm._torch.visual_gen.attention.backends.utils import (
 )
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.deco_attention.runtime import num_sms
-from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    BaseQuantAttentionConfig,
+    DeCoAttentionConfig,
+    QuantAttentionConfig,
+)
 
 HEAD_DIM = 128
 V_DTYPES = ("fp8", "nvfp4")
@@ -85,7 +91,7 @@ def _kernels_serve_short_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(deco_backend, "MIN_SEQ_LEN", 1)
 
 
-def _backend(num_heads: int, recipe: QuantAttentionConfig) -> DeCoAttention:
+def _backend(num_heads: int, recipe: DeCoAttentionConfig) -> DeCoAttention:
     """A DeCo layer from the factory."""
     attn = create_attention(
         backend="CUTEDSL",
@@ -136,11 +142,16 @@ def _kernels(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, v_dtype: str = "fp8", **kwargs
 ) -> torch.Tensor:
     """The output of the kernel package on a workspace of its own; ``kwargs`` go to
-    ``prepare``, and a ``rank`` among them sizes the workspace as well."""
+    ``prepare``, and a ``rank`` or ``bases`` among them size the workspace as well."""
     batch_size, seq_len, num_heads, _ = q.shape
-    rank = kwargs.get("rank", deco_attention.constants.DEFAULT_RANK)
     num_bytes = deco_attention.workspace_size(
-        batch_size, seq_len, num_heads, q.device, v_dtype, rank
+        batch_size,
+        seq_len,
+        num_heads,
+        q.device,
+        v_dtype,
+        kwargs.get("rank"),
+        bases=kwargs.get("bases", "shared"),
     )
     workspace = torch.empty(num_bytes, dtype=torch.uint8, device=q.device)
     operands = deco_attention.prepare(q, k, v, workspace, v_dtype, **kwargs)
@@ -168,9 +179,11 @@ def _multi_launch_call(device: torch.device, v_dtype: str = "fp8") -> tuple[int,
 
     Its plan, asserted from ``split_plan`` of the kernels:
 
-    * tcgen05: two waves of whole units in the main launch and a tail in the split launch. The
-      valid rows end in the first tail unit, so the tail has units without a valid query and
-      pieces without a valid key.
+    * tcgen05: two waves of whole units in the main launch and a tail, a last partial wave. A
+      GPU whose kernels have the split launch (``kv_split`` of their tuning) runs the tail
+      there, in pieces of the key sequence; the others run it in the main launch. The valid
+      rows end in the first tail unit, so the tail has units without a valid query and, where
+      it is split, pieces without a valid key.
     * SM120: whole units and a split tail in the attention launch, and more (batch, head) pairs
       than a quarter of the SMs, so the V pass of the preparation is a launch of its own. The
       valid rows end in the first key half of the sequence.
@@ -180,8 +193,14 @@ def _multi_launch_call(device: torch.device, v_dtype: str = "fp8") -> tuple[int,
         seq_len, num_heads = 256 * (sms // 4 + 1), 8
         plan = _split_plan("tcgen05.fp8pv")(seq_len, num_heads, 1, sms)
         units, main_units, pieces = plan
-        assert main_units >= 2 * sms and units > main_units and pieces > 1, (plan, sms)
-        return 1, seq_len, num_heads, seq_len - 256 * (units - main_units) + 100
+        tail_units = units % sms
+        assert units >= 2 * sms and tail_units > 0, (plan, sms)
+        tuning = importlib.import_module(f"{deco_attention.__name__}.tcgen05.fp8pv.tuning")
+        if tuning.tuning().kv_split:
+            assert main_units == units - tail_units and pieces > 1, (plan, sms)
+        else:
+            assert main_units == units and pieces == 1, (plan, sms)
+        return 1, seq_len, num_heads, seq_len - 256 * tail_units + 100
     seq_len, num_heads = 3072, sms // 4 + 1
     tiles = seq_len // 128
     if v_dtype == "fp8":
@@ -194,10 +213,9 @@ def _multi_launch_call(device: torch.device, v_dtype: str = "fp8") -> tuple[int,
 
 
 def test_deco_selection(deco_recipe) -> None:
-    """CUTEDSL keeps its dense backend unless the quantization recipe asks for DeCo-Attention,
-    which takes the padding of a call as a key padding mask with the padding of every sample
-    behind its tokens."""
-    assert not QuantAttentionConfig().deco_attention
+    """CUTEDSL keeps its dense backend unless the quantization config is that of
+    DeCo-Attention, which takes the padding of a call as a key padding mask with the padding of
+    every sample behind its tokens."""
     plain = QuantAttentionConfig(qk_dtype="nvfp4")
     assert get_quant_algorithm(None) is None and get_quant_algorithm(plain) is None
     assert get_quant_algorithm(deco_recipe()) == "deco_attention"
@@ -222,7 +240,7 @@ def test_deco_selection(deco_recipe) -> None:
     # (supports_mask, supports_length, requires_trailing): a quantized FLASHINFER recipe rejects
     # a mask and a quantized TRTLLM recipe the valid prefix, which their classes alone do not say.
     # The configs skip the recipe validator, which binds a recipe to the GPU generation.
-    def config(backend: str, quant_attention_config: QuantAttentionConfig | None = None):
+    def config(backend: str, quant_attention_config: BaseQuantAttentionConfig | None = None):
         return AttentionConfig.model_construct(
             backend=backend, quant_attention_config=quant_attention_config
         )
@@ -282,14 +300,22 @@ def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels, deco_r
 
 
 def test_deco_layer_construction(require_deco_kernels, deco_recipe, kernel_calls: list) -> None:
-    """A layer needs a recipe with a kernel on this GPU (NVFP4 PV: SM120 only). A layer whose
-    head dimension or K/V head count the kernels do not take is built and runs all its calls on
-    VANILLA."""
+    """A layer needs a DeCo-Attention config with a kernel on this GPU (NVFP4 PV: SM120 only)
+    and no more compensation channels than its kernels offer. A layer whose head dimension or
+    K/V head count the kernels do not take is built and runs all its calls on VANILLA."""
     device = require_deco_kernels()
     args = dict(num_heads=4, head_dim=HEAD_DIM, quant_attention_config=deco_recipe())
+    with pytest.raises(ValueError, match="needs a DeCoAttentionConfig"):
+        DeCoAttention(**{**args, "quant_attention_config": QuantAttentionConfig(qk_dtype="nvfp4")})
     if "nvfp4" not in deco_backend.supported_v_dtypes():
-        with pytest.raises(ValueError, match="no kernel for qk_dtype='nvfp4', v_dtype='nvfp4'"):
+        with pytest.raises(ValueError, match="no kernel for v_dtype='nvfp4'"):
             DeCoAttention(**{**args, "quant_attention_config": deco_recipe("nvfp4")})
+    # A term the config leaves open takes half of the channels of the GPU, which is too much
+    # next to a term that takes them all.
+    max_channels = deco_attention.max_comp_channels()
+    assert DeCoAttention(**args)._rank == (max_channels // 2, max_channels // 2)
+    with pytest.raises(ValueError, match=f"has {max_channels} compensation channels"):
+        DeCoAttention(**{**args, "quant_attention_config": deco_recipe(q_channels=max_channels)})
 
     for geometry in ({"head_dim": 64}, {"num_kv_heads": 2}):
         attn = DeCoAttention(**{**args, **geometry})
@@ -343,8 +369,9 @@ def test_deco_forward_matches_sdpa(
 def test_deco_whole_units_and_split_tail_follow_the_scores(
     require_deco_kernels, v_dtype: str, with_lengths: bool
 ) -> None:
-    """A call whose plan has whole units and a split tail (``_multi_launch_call``) follows the
-    scores, with and without valid lengths, and a second call returns the same bits."""
+    """A call whose plan has whole units and a tail, split where the kernels of the GPU split it
+    (``_multi_launch_call``), follows the scores, with and without valid lengths, and a second
+    call returns the same bits."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads, valid_seq_len = _multi_launch_call(device, v_dtype)
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
@@ -392,14 +419,279 @@ def test_deco_compensation_follows_the_shared_directions(
     assert error < max_share * error_one_token
 
 
-def test_deco_rank_64_follows_the_scores(require_deco_kernels) -> None:
-    """Rank 64 doubles the compensation channels and runs its own QK kernel where the GPU
-    offers it."""
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+@pytest.mark.parametrize(
+    "fields, kernel_arguments",
+    [
+        (dict(q_channels=0, k_channels=48), dict(rank=(0, 48))),
+        (dict(basis="separate"), dict(bases="separate")),
+        (dict(gram_weight=1.0), dict(gram_weight=1.0)),
+        (dict(q_channels=96, k_channels=32), dict(rank=(96, 32))),
+    ],
+    ids=["uneven_split", "separate_bases", "gram_weight", "128_channels"],
+)
+def test_deco_compensation_fields_follow_the_scores(
+    require_deco_kernels, deco_recipe, v_dtype: str, fields: dict, kernel_arguments: dict
+) -> None:
+    """Each compensation field of the config reaches the kernels through the backend: an
+    uneven split with a term of no channels and a zero block, separate bases, a Gram weight
+    that takes Q alone, and 128 channels where the GPU offers them. The output follows the
+    scores, is the output of the kernels under the same arguments, and differs from that of
+    the default config."""
+    device = require_deco_kernels(v_dtype)
+    channels = fields.get("q_channels", 0) + fields.get("k_channels", 0)
+    if channels > deco_attention.max_comp_channels():
+        pytest.skip(f"{channels} compensation channels have no kernel on this GPU.")
+    num_heads = 2
+    q, k, v = _random_qkv(1, 1024, num_heads, device, q_scale=4.0)
+
+    out = _backend(num_heads, deco_recipe(v_dtype, **fields)).forward(q, k, v)
+
+    _assert_follows_the_scores(out, q, k, v)
+    assert torch.equal(out, _kernels(q, k, v, v_dtype, **kernel_arguments))
+    assert not torch.equal(out, _backend(num_heads, deco_recipe(v_dtype)).forward(q, k, v))
+
+
+def test_deco_scale_rules_follow_the_scores(require_deco_kernels, deco_recipe) -> None:
+    """The scale rule of the config reaches the kernels through the backend: each rule gives
+    the output of the kernels under that rule, which follows the scores, and no two rules give
+    the same output. The config names the rules of the kernel package and its default."""
     device = require_deco_kernels()
-    if 64 not in deco_attention.ranks():
-        pytest.skip("Rank 64 has no kernel on this GPU.")
-    q, k, v = _random_qkv(1, 1024, 2, device, q_scale=4.0)
-    _assert_follows_the_scores(_kernels(q, k, v, rank=64), q, k, v)
+    rules = deco_attention.constants.SCALE_RULES
+    field = DeCoAttentionConfig.model_fields["scale_rule"]
+    assert get_args(field.annotation) == rules
+    assert field.default == deco_attention.constants.DEFAULT_SCALE_RULE
+    num_heads = 2
+    q, k, v = _random_qkv(1, 1024, num_heads, device, q_scale=4.0)
+
+    outs = []
+    for rule in rules:
+        out = _backend(num_heads, deco_recipe(scale_rule=rule)).forward(q, k, v)
+        _assert_follows_the_scores(out, q, k, v)
+        assert torch.equal(out, _kernels(q, k, v, scale_rule=rule))
+        outs.append(out)
+
+    assert not any(torch.equal(a, b) for a, b in itertools.combinations(outs, 2))
+
+
+def test_deco_center_k_removes_what_the_keys_share(require_deco_kernels, deco_recipe) -> None:
+    """One vector added to K on every token moves the scores of a query by one constant and
+    leaves the attention unchanged. With ``center_k`` the error against FP32 SDPA on such keys
+    is less than half of the error without it."""
+    device = require_deco_kernels()
+    num_heads = 2
+    q, k, v = _random_qkv(1, 1024, num_heads, device, q_scale=4.0)
+    gen = torch.Generator(device=device).manual_seed(3)
+    shared = 4.0 * torch.randn((1, 1, num_heads, HEAD_DIM), generator=gen, device=device)
+    k = (k.float() + shared).bfloat16()
+    ref = _sdpa(q, k, v)
+    assert _relative_error(_sdpa(q, k.float() - shared, v), ref) < 1e-3
+
+    errors = [
+        _relative_error(_backend(num_heads, deco_recipe(center_k=on)).forward(q, k, v), ref)
+        for on in (False, True)
+    ]
+
+    assert errors[1] < 0.5 * errors[0], errors
+
+
+def test_deco_equalize_balances_the_channels_of_q_and_k(require_deco_kernels, deco_recipe) -> None:
+    """A power of two that divides a channel of Q and multiplies the same channel of K leaves
+    every score unchanged. With ``equalize`` the error against FP32 SDPA on such operands is
+    less than half of the error without it."""
+    device = require_deco_kernels()
+    num_heads = 2
+    q, k, v = _random_qkv(1, 1024, num_heads, device, q_scale=4.0)
+    ref = _sdpa(q, k, v)
+    factors = torch.ones(HEAD_DIM, device=device)
+    factors[::8] = 16.0
+    q, k = (q.float() / factors).bfloat16(), (k.float() * factors).bfloat16()
+    assert _relative_error(_sdpa(q, k, v), ref) < 1e-6
+
+    errors = [
+        _relative_error(_backend(num_heads, deco_recipe(equalize=on)).forward(q, k, v), ref)
+        for on in (False, True)
+    ]
+
+    assert errors[1] < 0.5 * errors[0], errors
+
+
+def test_deco_center_k_takes_the_video_tokens_of_the_draw(
+    require_deco_kernels, deco_recipe, kernel_inputs: list
+) -> None:
+    """With token tags ``center_k`` takes the mean of K over the video tokens among the sampled
+    tokens: the backend passes the kernels the count of the leading video rows of its draw. The
+    output is that of the kernels with that count, and differs from their output when every
+    sampled row counts, for text keys that carry another mean than the video keys."""
+    device = require_deco_kernels()
+    seq_len, num_heads, num_text = 2048, 2, 512
+    q, k, v = _random_qkv(1, seq_len, num_heads, device, q_scale=4.0)
+    gen = torch.Generator(device=device).manual_seed(3)
+    text_mean = torch.randn((1, 1, num_heads, HEAD_DIM), generator=gen, device=device)
+    k[:, -num_text:] = (k[:, -num_text:].float() + text_mean).bfloat16()
+    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    token_tags[-num_text:] = 1
+
+    out = _backend(num_heads, deco_recipe(center_k=True)).forward(q, k, v, token_tags=token_tags)
+
+    assert torch.isfinite(out).all()
+    rows = kernel_inputs[-1][0]
+    rank = deco_attention.max_comp_channels() // 2
+    video_rows = deco_attention.video_rows(seq_len, device, token_tags, rank, rate=1 / 256)
+    assert 0 < int(video_rows) < rows.numel()
+    assert torch.equal(out, _kernels(q, k, v, rows=rows, center_k=True, video_rows=video_rows))
+    assert not torch.equal(out, _kernels(q, k, v, rows=rows, center_k=True))
+
+
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_deco_sample_rates_and_minimum_set_the_basis_rows(
+    require_deco_kernels, deco_recipe, kernel_inputs: list, v_dtype: str
+) -> None:
+    """The sample rates and the minimum of sampled tokens of the config set the rows that reach
+    the preparation: the kernels' own draw under the defaults, one set for equal rates and a
+    pair (rows of Q, rows of K) for different ones, each of its rate of the sequence and at
+    least the minimum. Under a mask every sample draws its rows from its own tokens, and both
+    draws are kept for the next call that passes the same mask tensor. With token tags half of
+    each draw comes from the text tokens of the sample."""
+    device = require_deco_kernels(v_dtype)
+    batch_size, seq_len, num_heads = 2, 4096, 2
+    q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
+
+    _backend(num_heads, deco_recipe(v_dtype)).forward(q, k, v)
+    assert kernel_inputs[-1][0] is None
+    equal_rates = deco_recipe(v_dtype, q_sample_rate=1 / 32, k_sample_rate=1 / 32)
+    _backend(num_heads, equal_rates).forward(q, k, v)
+    assert kernel_inputs[-1][0].shape == (seq_len // 32,)
+
+    num_q_rows, num_k_rows = 100, seq_len // 16
+    attn = _backend(
+        num_heads,
+        deco_recipe(
+            v_dtype, q_sample_rate=1 / 128, k_sample_rate=1 / 16, min_sample_rows=num_q_rows
+        ),
+    )
+    out = attn.forward(q, k, v)
+    rows_q, rows_k = kernel_inputs[-1][0]
+    assert rows_q.shape == (num_q_rows,) and rows_k.shape == (num_k_rows,)
+    _assert_follows_the_scores(out, q, k, v)
+
+    lengths = torch.tensor([3000, 500], device=device)
+    key_padding_mask = torch.arange(seq_len, device=device) < lengths[:, None]
+    out = attn.forward(q, k, v, key_padding_mask=key_padding_mask)
+    (rows_q, rows_k), valid_seq_lens = kernel_inputs[-1]
+    assert valid_seq_lens.tolist() == lengths.tolist()
+    assert rows_q.shape == (batch_size, num_q_rows) and rows_k.shape == (batch_size, num_k_rows)
+    assert (rows_q < lengths[:, None]).all() and (rows_k < lengths[:, None]).all()
+    assert not out[~key_padding_mask].any() and torch.isfinite(out).all()
+    attn.forward(q, k, v, key_padding_mask=key_padding_mask)
+    assert kernel_inputs[-1][0][0] is rows_q and kernel_inputs[-1][0][1] is rows_k
+
+    num_text = 200
+    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    token_tags[:num_text] = 1
+    out = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=key_padding_mask)
+    for rows, num_rows in zip(kernel_inputs[-1][0], (num_q_rows, num_k_rows)):
+        assert rows.shape == (batch_size, num_rows) and (rows < lengths[:, None]).all()
+        assert ((rows < num_text).sum(dim=1) == num_rows // 2).all()
+    assert not out[~key_padding_mask].any() and torch.isfinite(out).all()
+
+
+def _spectrum_tokens(
+    num_tokens: int, num_heads: int, device: torch.device, seed: int
+) -> torch.Tensor:
+    """Tokens ``[1, num_tokens, H, 128]`` of a chosen spectrum per head, as bfloat16.
+
+    Token i is direction ``i % 128`` of a random orthonormal set of its head, with a random
+    sign: 16 directions of decaying scale, then 112 directions of one scale. Whole rounds of
+    the 128 directions give a Gram matrix with 16 distinct leading eigenvalues above a tail
+    of nearly equal ones.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    directions = torch.linalg.qr(
+        torch.randn((num_heads, HEAD_DIM, HEAD_DIM), generator=gen, device=device)
+    ).Q
+    scales = torch.full((HEAD_DIM,), 2.0**-3, device=device)
+    scales[:16] = 2.0 ** (-torch.arange(16, device=device) / 8)
+    index = torch.arange(num_tokens, device=device) % HEAD_DIM
+    signs = torch.randint(0, 2, (num_tokens,), generator=gen, device=device) * 2 - 1
+    tokens = (signs * scales[index])[:, None, None] * directions[:, index].transpose(0, 1)
+    return tokens[None].bfloat16().contiguous()
+
+
+def _basis_gaps(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    rows: torch.Tensor,
+    basis: tuple[torch.Tensor, ...],
+    terms: list[tuple[float, tuple[int, ...]]],
+) -> tuple[float, float]:
+    """Hold a basis of the preparation against ``torch.linalg.eigh`` on the same rows.
+
+    * Reference: the float64 Gram matrices of the sampled tokens of Q and of K in the rotated
+      frame, each over its trace, summed per basis tensor with its weight of Q.
+    * terms: Per basis tensor, the weight of Q and the channels of the terms that take its
+      leading directions, which are its last rows.
+
+    Returns:
+        The largest share of the trace that the leading directions of a term miss against as
+        many leading eigenvectors, and the largest deviation of those directions from
+        orthonormal rows.
+    """
+    rotation = deco_attention.inputs.hadamard(q.device).double()
+    grams = []
+    for x in (q, k):
+        tokens = x[:, rows.long()].double().transpose(1, 2) @ rotation
+        gram = tokens.transpose(2, 3) @ tokens
+        grams.append(gram / gram.diagonal(dim1=2, dim2=3).sum(-1)[..., None, None])
+    share_gap, deviation = 0.0, 0.0
+    for directions, (q_weight, channels) in zip(basis, terms):
+        gram = q_weight * grams[0] + (1.0 - q_weight) * grams[1]
+        eigenvalues = torch.linalg.eigvalsh(gram)
+        for num_channels in channels:
+            leading = directions[:, :, -num_channels:].double()
+            span = torch.linalg.qr(leading.transpose(2, 3)).Q
+            share = (span.transpose(2, 3) @ gram @ span).diagonal(dim1=2, dim2=3).sum(-1)
+            missed = eigenvalues[..., -num_channels:].sum(-1) - share
+            share_gap = max(share_gap, float(missed.max()))
+            eye = torch.eye(num_channels, dtype=torch.float64, device=q.device)
+            off = leading @ leading.transpose(2, 3) - eye
+            deviation = max(deviation, float(off.abs().max()))
+    return share_gap, deviation
+
+
+@pytest.mark.parametrize(
+    "rank, bases",
+    [(None, "shared"), ((16, 48), "shared"), (None, "separate"), ((96, 32), "shared")],
+    ids=["default", "wide_term", "separate_bases", "128_channels"],
+)
+def test_deco_basis_spans_the_leading_eigenspace(
+    require_deco_kernels, rank: tuple[int, int] | None, bases: str
+) -> None:
+    """The compensation basis of the preparation holds against ``torch.linalg.eigh`` on the
+    same rows: the directions of every term are orthonormal and carry the share of the trace
+    of as many leading eigenvectors. The rows give a Gram matrix whose nearly equal eigenvalues
+    run across the last direction of a term, and then fewer distinct rows than directions."""
+    device = require_deco_kernels()
+    max_channels = deco_attention.max_comp_channels()
+    r_q, r_k = rank or (max_channels // 2, max_channels // 2)
+    if r_q + r_k > max_channels:
+        pytest.skip(f"{r_q + r_k} compensation channels have no kernel on this GPU.")
+    seq_len, num_heads = 2048, 3
+    q, k = (_spectrum_tokens(seq_len, num_heads, device, seed) for seed in (0, 1))
+    v = _random_qkv(1, seq_len, num_heads, device)[2]
+    # Shared bases: one tensor of the equal-weight sum for both terms. Separate bases: the
+    # Q-residual term on the Gram matrix of K, the K-residual term on that of Q.
+    terms = [(0.0, (r_q,)), (1.0, (r_k,))] if bases == "separate" else [(0.5, (r_q, r_k))]
+    num_bytes = deco_attention.workspace_size(
+        1, seq_len, num_heads, device, "fp8", rank, bases=bases
+    )
+    workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+    rounds = torch.arange(3 * HEAD_DIM, dtype=torch.int32, device=device)
+    for rows in (rounds, rounds % 5):
+        operands = deco_attention.prepare(q, k, v, workspace, "fp8", rank, rows=rows, bases=bases)
+        basis = operands.basis if isinstance(operands.basis, tuple) else (operands.basis,)
+        share_gap, deviation = _basis_gaps(q, k, rows, basis, terms)
+        assert share_gap <= 1e-5 and deviation <= 1e-5, (share_gap, deviation)
 
 
 def test_deco_large_caller_draw_follows_the_scores(require_deco_kernels) -> None:
@@ -448,7 +740,8 @@ def _two_stream_rounds(device_index: int, result) -> None:
         torch.cuda.set_device(device)
         shapes = [(1, 16384, 4)]
         if deco_attention.target.kernel_family() == "tcgen05":
-            # The tail of this shape runs in the split launch, whose pieces merge.
+            # The tail of this shape runs in the split launch, whose pieces merge, on a GPU
+            # whose kernels have one.
             shapes.append(_multi_launch_call(device)[:3])
         for shape in shapes:
             _run_on_two_streams(device, shape)
@@ -460,8 +753,9 @@ def _two_stream_rounds(device_index: int, result) -> None:
 def test_deco_preparations_on_two_streams_finish(require_deco_kernels) -> None:
     """Two calls with workspaces of their own run their preparations side by side on two
     streams and come back as alone: no CTA of a launch waits for another CTA of its grid, so
-    the launches need not be resident together. On the tcgen05 kernels a second shape adds the
-    split launch, whose pieces merge next to the launches of the other stream. The rounds run
+    the launches need not be resident together. On the tcgen05 kernels a second shape adds a
+    tail, which the split launch runs where the GPU has one: its pieces merge next to the
+    launches of the other stream. The rounds run
     in a child process that a hang cannot leave stuck on the device: the test kills it on the
     timeout."""
     device = require_deco_kernels()
@@ -592,6 +886,24 @@ def test_deco_constant_v_comes_back_as_the_constant(require_deco_kernels, v_dtyp
         out = _kernels(q, k, v, v_dtype)
         assert torch.isfinite(out).all()
         torch.testing.assert_close(out, v, rtol=2e-2, atol=0)
+
+
+def test_deco_very_large_score_takes_the_whole_row(require_deco_kernels, deco_recipe) -> None:
+    """One key whose scores are about 2^30 log2 units takes the whole weight of the queries it
+    scores highest for: the output is finite, and those rows are the V row of that key within
+    the rounding of the V format."""
+    device = require_deco_kernels()
+    num_heads, key = 2, 300
+    q, k, v = _random_qkv(1, 1024, num_heads, device)
+    k[:, key] = (k[:, key].float() * 2.0**28).bfloat16()
+    scores = torch.einsum("bqhd,bhd->bqh", q.float(), k[:, key].float())
+
+    out = _backend(num_heads, deco_recipe()).forward(q, k, v)
+
+    assert torch.isfinite(out).all()
+    sees_key = scores > 0.5 * scores.amax(dim=1, keepdim=True)
+    v_row = v[:, key].float()[:, None].expand_as(out)
+    assert _relative_error(out[sees_key], v_row[sees_key]) < 0.05
 
 
 def test_deco_call_leaves_no_workspace_behind(require_deco_kernels, deco_recipe) -> None:
@@ -1082,15 +1394,26 @@ def test_deco_token_tags_with_a_key_padding_mask(
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
+@pytest.mark.parametrize(
+    "fields",
+    [
+        dict(),
+        dict(q_sample_rate=0.0078125, k_sample_rate=0.00390625, min_sample_rows=512),
+        dict(equalize=True, center_k=True),
+    ],
+    ids=["default_sampling", "one_count_for_two_rates", "both_transformations"],
+)
 def test_deco_cuda_graph_with_a_key_padding_mask(
-    require_deco_kernels, deco_recipe, v_dtype: str
+    require_deco_kernels, deco_recipe, kernel_inputs: list, v_dtype: str, fields: dict
 ) -> None:
     """A captured forward with a mask and token tags computes its token counts and basis rows
     inside the graph: a replay follows the content of the mask and tags tensors of the capture,
-    which the eager forward before it has not seen."""
+    which the eager forward before it has not seen. Two sample rates that give one count of
+    rows for the sequence draw one set of rows, in the eager forward and in the capture alike.
+    With both transformations the capture also holds the count of the video rows of the draw."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads = 2, 2048, 2
-    attn = _backend(num_heads, deco_recipe(v_dtype))
+    attn = _backend(num_heads, deco_recipe(v_dtype, **fields))
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
     token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
     token_tags[1800:] = 1
@@ -1099,6 +1422,7 @@ def test_deco_cuda_graph_with_a_key_padding_mask(
     key_padding_mask = positions < lengths
 
     attn.forward(q, k, v, token_tags=token_tags.clone(), key_padding_mask=key_padding_mask.clone())
+    assert torch.is_tensor(kernel_inputs[-1][0])
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_out = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=key_padding_mask)

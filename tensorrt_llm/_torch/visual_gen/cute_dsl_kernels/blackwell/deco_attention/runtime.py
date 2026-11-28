@@ -30,6 +30,9 @@ from tensorrt_llm.logger import logger
 from .constants import ALIGN
 
 Layout = dict[str, tuple[torch.dtype, tuple[int, ...]]]
+# A compensation basis below the host API: the tensor of a shared basis, or the two of separate bases (that of the
+# Q-residual term, that of the K-residual term); each FP32 [B, H, directions, 128], the leading direction last
+Basis = tuple[torch.Tensor, ...]
 
 
 def _aligned_bytes(dtype: torch.dtype, shape: tuple[int, ...]) -> int:
@@ -72,6 +75,29 @@ def carve(workspace: torch.Tensor, layout: Layout) -> dict[str, torch.Tensor]:
     return views
 
 
+def check_caller_basis(given: Basis, own: Basis, workspace: torch.Tensor, layout: Layout) -> None:
+    """Check a caller's basis against the basis that the buffers of the call hold (own: views of the workspace).
+
+    * ValueError for a tensor with other directions than its place in the buffers has.
+    * ValueError for a tensor that overlaps the bytes of the call in the workspace, those of the layout, anywhere
+      but at that place: the call would write over it. What lies behind those bytes is not written.
+    """
+    start = workspace.data_ptr()
+    end = start + workspace_bytes(layout)
+    for u, mine in zip(given, own):
+        if u.shape[2] != mine.shape[2]:
+            raise ValueError(
+                f"a basis of this rank and bases has {' and '.join(str(m.shape[2]) for m in own)} directions, "
+                f"got {u.shape[2]}"
+            )
+        first, last = u.data_ptr(), u.data_ptr() + u.numel() * u.element_size()
+        if first < end and last > start and first != mine.data_ptr():
+            raise ValueError(
+                "the basis overlaps the workspace at another place than the basis of this call: pass a clone, "
+                "or the basis of a call of this shape, rank and bases"
+            )
+
+
 def gmem_ptr(dtype: type, t: torch.Tensor, align: int = ALIGN) -> cute.Pointer:
     """Return a pointer to tensor t's data, assumed aligned to `align` bytes."""
     return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
@@ -106,16 +132,18 @@ def _num_sms(index: int) -> int:
     return torch.cuda.get_device_properties(index).multi_processor_count
 
 
-def compiled(
-    cache: dict, key: tuple, make: Callable[[], object], *args: object, **kwargs: object
-) -> Callable:
-    """Return cache[key], compiled for args from make() on first use (make builds the kernel object, or returns the jit
-    function, only on a miss). A miss logs the key and the compile time; a miss under CUDA graph capture raises."""
+def compiled(cache: dict, key: tuple, make: Callable[[], tuple], **options: object) -> Callable:
+    """Return cache[key], compiled on first use.
+
+    * make() returns the kernel object or jit function, then the arguments it is compiled for; it runs only on a
+      miss. options go to the compiler.
+    * A miss logs the key and the compile time; a miss under CUDA graph capture raises.
+    """
     fn = cache.get(key)
     if fn is None:
         not_under_capture(torch.device("cuda"), f"kernel {key}")
         start = time.perf_counter()
-        fn = cache[key] = cute.compile(make(), *args, **kwargs)
+        fn = cache[key] = cute.compile(*make(), **options)
         logger.info(f"Compiled DeCo-Attention kernel {key} in {time.perf_counter() - start:.1f} s")
     return fn
 

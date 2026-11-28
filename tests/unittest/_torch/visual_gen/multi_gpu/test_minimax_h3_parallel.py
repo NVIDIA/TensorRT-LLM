@@ -24,7 +24,7 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 imp
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, DeCoAttentionConfig, ParallelConfig
 
 from ._worker_pool import run_distributed
 
@@ -34,12 +34,7 @@ _WIDE_HEAD_BACKENDS = ("FA4", "TRTLLM", "FLASHINFER", "DECO")
 
 def _attention_config(backend: str) -> AttentionConfig:
     if backend == "DECO":
-        return AttentionConfig(
-            backend="CUTEDSL",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
-            ),
-        )
+        return AttentionConfig(backend="CUTEDSL", quant_attention_config=DeCoAttentionConfig())
     return AttentionConfig(backend=backend)
 
 

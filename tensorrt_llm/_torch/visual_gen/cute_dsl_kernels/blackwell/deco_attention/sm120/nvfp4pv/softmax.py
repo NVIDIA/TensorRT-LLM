@@ -22,9 +22,9 @@ Scores of a thread (Sacc):
     * Sacc[8 s + 4 h + i]: the four accumulators of n-tile i of the 32-key group (s, h), elements 2 rr + e of row
       g + 8 rr, key 64 s + 32 h + 8 t + 2 i + e of the tile.
 Per row, with c the score scale (the multiplier of the raw scores in log2 units):
-    * anchor: the running row max of c s, moved only when a tile's max exceeds it by more than T = RESCALE_THRESHOLD
-      (lazy rescale: a move rescales O and the row sum by 2^(old - new), anchor_update); the P block scales carry T
-      binades of headroom.
+    * anchor: the running row max of c s, moved only when a tile's max exceeds it by more than T, the rescale
+      threshold of the kernel build (st.rescale_threshold; lazy rescale: a move rescales O and the row sum by
+      2^(old - new), anchor_update); the P block scales carry T binades of headroom.
     * block scale: a = UE4M3(448 * 2^(c bm - anchor - T)) with bm the exact max of the block's 16 scores, encoded and
       read back (block_scales2). The decoded scale is what the MMA multiplies by, so the elements are coded against it.
     * elements (I-ExpCast): E2M1(6 * 2^(c (s - bm) + d)), d the log2 of the unrounded scale over the decoded one.
@@ -111,7 +111,9 @@ def emit_p(st, Sacc, bm, ma_dst, ma_off):
     for h_ in range(2):
         b0 = Float32(cutlass.select_(par != 0, bm[1][h_][0], bm[0][h_][0]))
         b1 = Float32(cutlass.select_(par != 0, bm[1][h_][1], bm[0][h_][1]))
-        sch[h_], e4[h_], d0, d1 = block_scales2(b0, b1, st.c, st.anchor[0], st.anchor[1])
+        sch[h_], e4[h_], d0, d1 = block_scales2(
+            b0, b1, st.c, st.anchor[0], st.anchor[1], st.rescale_threshold
+        )
         own = [d0, d1]
         peer = [
             cute.arch.shuffle_sync_bfly(d0, offset=1),
@@ -175,7 +177,17 @@ def softmax_phase(st, Sacc, masked: cutlass.Constexpr, cur_odd: cutlass.Constexp
     # Full row reductions, correction exp2s and guard votes run only on a possible move (need_vote, anchor_update).
     vneed = need_vote(bml, thr[0], thr[1])
     a0, a1, f0, f1, t0, t1, s0, s1, sf = anchor_update(
-        vneed, bml, anchor[0], anchor[1], thr[0], thr[1], lsum[0], lsum[1], safe[0], st.c
+        vneed,
+        bml,
+        anchor[0],
+        anchor[1],
+        thr[0],
+        thr[1],
+        lsum[0],
+        lsum[1],
+        safe[0],
+        st.c,
+        st.rescale_threshold,
     )
     anchor[0] = a0
     anchor[1] = a1

@@ -22,8 +22,15 @@ like any other backend.
 
 * Kernel calls: one sequence attending itself, bfloat16 q, k and v of one shape
   ``[B, S, H, 128]`` on a CUDA device, at least ``MIN_SEQ_LEN`` rows, no mask other than padding.
-  The backend runs the kernel package's default compensation rank of 32.
-  ``QuantAttentionConfig`` does not offer a rank field yet.
+* Compensation: ``DeCoAttentionConfig`` gives the channels of the Q-residual and of the
+  K-residual term, the bases kind with its Gram weight, and the sampling of the tokens the
+  bases are estimated on. A layer resolves the channels the config leaves open from the kernel
+  package and checks the config against the GPU when it is built.
+* Quantizer of Q and K: ``scale_rule`` of the config is the rule for the scale of an NVFP4
+  block of the head channels.
+* Transformations of Q and K: ``equalize`` and ``center_k`` of the config reach the
+  preparation, which takes their statistics from the sampled tokens. With token tags
+  ``center_k`` takes the mean of K over the video tokens of the draw.
 * VANILLA calls (unquantized): every other call, that is cross-attention, a causal
   ``attention_mask``, other dtypes or devices, shorter sequences, and every call of a layer whose
   head dimension or K/V head count the kernels do not take.
@@ -35,16 +42,26 @@ like any other backend.
   padded rows are excluded as keys and come back zero as queries. The Attention module builds
   its cross-attention layers on VANILLA, so such a call is self-attention; a direct caller
   whose cross-attention has as many queries as keys must not use this backend.
+* Sampled tokens: the kernels' default draw under the default sample rates and minimum. With
+  other rates or another minimum the backend draws the rows, for every sample from its own
+  tokens under a mask: one set, or one each for Q and K when their rates give different
+  counts of rows for the sequence.
 * Token tags: with ``token_tags``, half of the tokens that the kernels sample for the
   compensation channels are text and audio tokens of a packed sequence, for every sample from
   its own tokens.
 * Device only: the token counts and the sampled tokens of a call are computed on the device and
-  nothing is read back to the host. The layers of a forward share one draw: the kernel package
-  keeps the last one while the model passes the same mask and tags tensors.
-* CUDA graphs: first use (a kernel variant, the inputs of a sequence length) runs eagerly, as
-  in the warm-up of a graph runner, and raises ``RuntimeError`` under capture. A captured call
-  computes its token counts and sampled tokens inside the graph: a replay follows the content
-  of the captured mask and tags tensors.
+  nothing is read back to the host. The layers of a forward share their draws: the kernel
+  package keeps the last two while the model passes the same mask and tags tensors. A bool
+  mask on the device of q reaches the kernels as the tensor the model passed; a mask of
+  another dtype or device is converted on every call, and its rows are drawn on every call.
+* CUDA graphs: a capture follows one eager call with the same shape and arguments: that call
+  compiles the kernels of the call and builds the sampled rows and the rotation matrix, and
+  a first use of any of them under capture raises a ``RuntimeError``. The warm-up of a graph
+  runner is that call. The channels of the two terms, the bases kind, the scale rule, the
+  transformations of Q and K, one or two row sets, the presence of a mask and the shape of a
+  call each select kernel variants.
+  A captured call computes its token counts and sampled tokens inside the graph: a replay
+  follows the content of the captured mask and tags tensors.
 """
 
 from typing import Any
@@ -52,7 +69,7 @@ from typing import Any
 import torch
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import DeCoAttentionConfig
 
 from .....attention.backends.interface import PredefinedAttentionMask
 from ..interface import AttentionBackend, AttentionTensorLayout
@@ -94,29 +111,39 @@ class DeCoAttention(AttentionBackend):
         head_dim: int = 128,
         num_kv_heads: int | None = None,
         dtype: torch.dtype | None = None,
-        quant_attention_config: QuantAttentionConfig | None = None,
+        quant_attention_config: DeCoAttentionConfig | None = None,
         **kwargs,
     ):
         if _deco_import_error is not None:
             raise ImportError(
                 f"DeCo-Attention kernels are not available. Import error: {_deco_import_error}"
             ) from _deco_import_error
-        if quant_attention_config is None or not quant_attention_config.deco_attention:
-            raise ValueError(
-                "DeCoAttention needs a quant_attention_config with deco_attention=True."
-            )
+        if not isinstance(quant_attention_config, DeCoAttentionConfig):
+            raise ValueError("DeCoAttention needs a DeCoAttentionConfig as quant_attention_config.")
         num_kv_heads = num_kv_heads or num_heads
-        # The V format of the recipe names the PV format of the kernel; Q/K are always NVFP4.
+        # The V format of the recipe names the PV format of the kernel.
         v_dtypes = supported_v_dtypes()
         if not v_dtypes:
             raise ValueError(
                 "DeCo-Attention has kernels for SM100, SM103, SM107 and SM120 GPUs only."
             )
-        qk_dtype, v_dtype = quant_attention_config.qk_dtype, quant_attention_config.v_dtype
-        if qk_dtype != "nvfp4" or v_dtype not in v_dtypes:
+        v_dtype = quant_attention_config.v_dtype
+        if v_dtype not in v_dtypes:
             raise ValueError(
-                f"DeCo-Attention has no kernel for qk_dtype={qk_dtype!r}, v_dtype={v_dtype!r} on "
-                f"this GPU, whose kernels take qk_dtype='nvfp4' with v_dtype in {v_dtypes}."
+                f"DeCo-Attention has no kernel for v_dtype={v_dtype!r} on this GPU, whose "
+                f"kernels take v_dtype in {v_dtypes}."
+            )
+        # A term the config leaves open takes half of the compensation channels of the GPU.
+        max_channels = deco_attention.max_comp_channels()
+        q_channels, k_channels = (
+            max_channels // 2 if channels is None else channels
+            for channels in (quant_attention_config.q_channels, quant_attention_config.k_channels)
+        )
+        if q_channels + k_channels > max_channels:
+            raise ValueError(
+                f"DeCo-Attention has {max_channels} compensation channels on this GPU, got "
+                f"q_channels={q_channels} and k_channels={k_channels}; a term the config "
+                f"leaves open takes {max_channels // 2}."
             )
 
         self.layer_idx = layer_idx
@@ -125,6 +152,17 @@ class DeCoAttention(AttentionBackend):
         self.num_kv_heads = num_kv_heads
         self.dtype = dtype
         self.quant_attention_config = quant_attention_config
+        # What the config resolves to for the kernels:
+        # * _rank: Channels of the Q-residual and of the K-residual term.
+        # * _sample_rates: One rate for the rows of both operands, or the pair (Q, K).
+        # * _default_draw: The kernels draw the rows of a call without token tags themselves.
+        self._rank = (q_channels, k_channels)
+        q_rate, k_rate = quant_attention_config.q_sample_rate, quant_attention_config.k_sample_rate
+        self._sample_rates = (q_rate,) if q_rate == k_rate else (q_rate, k_rate)
+        self._default_draw = (
+            self._sample_rates == (1.0 / deco_attention.constants.SAMPLE_FRAC,)
+            and quant_attention_config.min_sample_rows is None
+        )
         # A layer of another head dimension or K/V head count runs all its calls on VANILLA.
         kernel_head_dim = deco_attention.constants.HEAD_DIM
         self._has_kernel_geometry = head_dim == kernel_head_dim and num_kv_heads == num_heads
@@ -211,13 +249,16 @@ class DeCoAttention(AttentionBackend):
         """Run the preparation and the attention kernel. Everything that reads a tensor address
         or launches a kernel is here, outside compiled code.
 
-        What the padding and the tags give the kernels is computed on the device:
+        What the padding, the tags and the sampling of the config give the kernels is computed
+        on the device:
 
         * token_counts: Tokens per sample, int32 ``[B]`` (the kernels' ``valid_seq_lens``); None
           without a mask.
-        * rows: Tokens that estimate the compensation basis, drawn by modality from the tokens
-          of every sample (the kernels' ``sample_rows``, which keeps the last draw); None, the
-          kernels' own draw, without tags.
+        * rows: Tokens that estimate the compensation bases (the kernels' ``sample_rows``, which
+          keeps the last two draws of a mask or of tags), drawn from the tokens of every sample
+          and by modality with tags; one set, or the pair (rows of Q, rows of K) when the sample
+          rates give different counts of rows for the sequence. None, the kernels' own draw,
+          under the default sampling without tags.
         """
         # The kernels read the slices of a fused projection in place; a tensor of another
         # layout, or at an address that is not aligned, is copied.
@@ -236,16 +277,48 @@ class DeCoAttention(AttentionBackend):
                 f"DeCo-Attention got {token_tags.numel()} token tags for a sequence of "
                 f"{seq_len} tokens."
             )
-        token_counts, rows = None, None
+        token_counts, rows, video_rows = None, None, None
         if key_padding_mask is not None:
             key_padding_mask = key_padding_mask.to(q.device)
             token_counts = key_padding_mask.sum(dim=1, dtype=torch.int32)
-        if token_tags is not None:
-            rows = deco_attention.sample_rows(
-                seq_len, q.device, token_tags, tokens=key_padding_mask
+        config = self.quant_attention_config
+        if token_tags is not None or not self._default_draw:
+            min_rows = config.min_sample_rows
+            if min_rows is not None:
+                min_rows = min(min_rows, seq_len)
+            # Rates that give one count of rows for this sequence share one draw.
+            rate_of_count = {}
+            for rate in self._sample_rates:
+                count = deco_attention.inputs.sample_count(seq_len, self._rank, rate, min_rows)
+                rate_of_count.setdefault(count, rate)
+            draws = tuple(
+                deco_attention.sample_rows(
+                    seq_len,
+                    q.device,
+                    token_tags,
+                    self._rank,
+                    tokens=key_padding_mask,
+                    rate=rate,
+                    min_rows=min_rows,
+                )
+                for rate in rate_of_count.values()
             )
-        pv = self.quant_attention_config.v_dtype
-        num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, q.device, pv)
+            rows = draws[0] if len(draws) == 1 else draws
+            if config.center_k and token_tags is not None:
+                # The video rows of the draw that serves the rows of K, which is the last one.
+                video_rows = deco_attention.video_rows(
+                    seq_len,
+                    q.device,
+                    token_tags,
+                    self._rank,
+                    tokens=key_padding_mask,
+                    rate=list(rate_of_count.values())[-1],
+                    min_rows=min_rows,
+                )
+        pv = config.v_dtype
+        num_bytes = deco_attention.workspace_size(
+            batch_size, seq_len, num_heads, q.device, pv, self._rank, bases=config.basis
+        )
         # The kernels compile and launch on the current device, which is the device of q here.
         with torch.cuda.device(q.device):
             operands = deco_attention.prepare(
@@ -254,8 +327,16 @@ class DeCoAttention(AttentionBackend):
                 v,
                 torch.empty(num_bytes, dtype=torch.uint8, device=q.device),
                 pv,
+                self._rank,
                 rows=rows,
                 valid_seq_lens=token_counts,
+                bases=config.basis,
+                # The kernels take a Gram weight with shared bases only.
+                gram_weight=config.gram_weight if config.basis == "shared" else None,
+                scale_rule=config.scale_rule,
+                equalize=config.equalize,
+                center_k=config.center_k,
+                video_rows=video_rows,
             )
             return deco_attention.attention(operands, torch.empty_like(q))
 

@@ -36,6 +36,12 @@ class Tuning(NamedTuple):
     # The softmax step does the bookkeeping of a means batch (block-sum read-back, zeroing, A-operand store, row-sum
     # add) in one branch on the step after the batch ended.
     vs_batched: bool
+    # The units of a last partial wave run in a split launch, each in KV pieces over the SMs the wave leaves idle
+    # (launch.py); without it they run in the main launch, and the output does not depend on the SM count.
+    kv_split: bool
+    # The QK builds of at least this many channels stage the Q' scale factors of a QK right after the QK before it
+    # is issued, ahead of the PV between the two, instead of right before the QK; 0: no build does.
+    q_scales_early: int
     # The warp roles (among load, mma, softmax, epilogue, store) that read the valid prefix lengths with loads of their
     # own in a main launch with lengths (kernel.py, _role_work); the others read them as data that no thread writes.
     lens_own_loads: tuple[str, ...]
@@ -47,6 +53,8 @@ TUNING = {
         s_probe=False,
         rescale_loop=True,
         vs_batched=False,
+        kv_split=True,
+        q_scales_early=0,
         lens_own_loads=("load", "mma"),
     ),
     "sm_103": Tuning(
@@ -54,6 +62,8 @@ TUNING = {
         s_probe=True,
         rescale_loop=False,
         vs_batched=False,
+        kv_split=True,
+        q_scales_early=0,
         lens_own_loads=("mma", "softmax", "epilogue", "store"),
     ),
     "sm_107": Tuning(
@@ -61,6 +71,8 @@ TUNING = {
         s_probe=False,
         rescale_loop=False,
         vs_batched=True,
+        kv_split=False,
+        q_scales_early=256,
         lens_own_loads=("load", "mma", "softmax", "epilogue", "store"),
     ),
 }

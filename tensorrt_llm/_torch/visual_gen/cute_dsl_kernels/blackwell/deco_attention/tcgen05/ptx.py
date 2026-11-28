@@ -17,11 +17,12 @@
 The module docstring of common/ptx.py states the contract and the names of the wrappers. Here:
     * the encodings of the shared-memory matrix descriptors and of the instruction descriptors;
     * tcgen05.mma of kind::f8f6f4 with A in tensor memory and the means MMA of the attention;
-    * the bounded mbarrier wait of the Q/K pass and tcgen05.commit; E2M1 decoding and an opaque identity;
+    * the bounded mbarrier wait of the Q/K pass and tcgen05.commit; E2M1 decoding, the packed BF16 minimum and
+      maximum and an opaque identity;
     * the load of the score scale by the epilogue warpgroup of the attention.
 """
 
-from cutlass.cute.typing import Float32, Int32, Int64
+from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 from cutlass.cutlass_dsl import dsl_user_op
 
 from ..common.ptx import asm, i32, i64, u32
@@ -190,6 +191,22 @@ def e2m1x8_to_f32x8(w, *, loc=None, ip=None):
         side_effects=False,
         loc=loc,
         ip=ip,
+    )
+
+
+@dsl_user_op
+def min_bf16x2(a, b, *, loc=None, ip=None):
+    """Return the u32 word of the two BF16 minima of the halves of the words a and b (min.bf16x2); no side effects."""
+    return asm(
+        "min.bf16x2 $0, $1, $2;", [u32(a), u32(b)], Uint32, side_effects=False, loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
+def max_bf16x2(a, b, *, loc=None, ip=None):
+    """Return the u32 word of the two BF16 maxima of the halves of the words a and b (max.bf16x2); no side effects."""
+    return asm(
+        "max.bf16x2 $0, $1, $2;", [u32(a), u32(b)], Uint32, side_effects=False, loc=loc, ip=ip
     )
 
 

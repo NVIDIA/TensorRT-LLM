@@ -20,6 +20,7 @@ smoothed E4M3 V, its means and its non-finite flags, next to Q', K' and their sc
 
 import torch
 
+from ...inputs import Compensation, Transforms
 from ..prep import chain
 from .softmax import MIN_SCORE_LOG2
 from .v_pass import V_THREADS, basis_kernel, v_kernel
@@ -27,7 +28,8 @@ from .v_pass import V_THREADS, basis_kernel, v_kernel
 _host = chain.make_host(basis_kernel, v_kernel, V_THREADS, 4)
 _compiled = {}
 
-# the buffers of a call whose addresses the host function takes after q, k, v, the rows and the rotation, in its order
+# the buffers of a call whose addresses the host function takes after q, k, v, the rows, the basis addresses and
+# the rotation, in its order
 _HOST_BUFFERS = (
     "q4",
     "k4",
@@ -38,28 +40,44 @@ _HOST_BUFFERS = (
     "v_mean",
     "v8_scale",
     "v_flags",
-    "ut",
     "vmax",
     "gmax",
     "prov",
     "done",
+    "transform",
 )
 
 
-# the scratch of the chain at a shape on a device of nsm SMs, name -> (dtype, shape): that of both chains
+# the scratch of the chain at a shape on a device of nsm SMs for a rank and a bases kind, name -> (dtype, shape):
+# that of both chains
 scratch = chain.scratch
+# the records of the transformations of Q and K, the last buffer of a layout
+transform_record = chain.transform_record
 
 
 def run(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    rows: torch.Tensor,
     buffers: dict[str, torch.Tensor],
-    lens: torch.Tensor | None = None,
-    map_rows: bool = False,
+    lens: torch.Tensor | None,
+    comp: Compensation,
+    scale_rule: str,
+    transforms: Transforms,
 ) -> None:
-    """Fill the operands of the attention from raw q, k, v: Q'/K', score_scale (>= 2^MIN_SCORE_LOG2), smoothed V."""
+    """Fill the operands of the attention from raw q, k, v: Q'/K', score_scale (>= 2^MIN_SCORE_LOG2), smoothed V.
+    lens, comp, scale_rule, transforms: as in chain.run."""
     chain.run(
-        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, rows, buffers, lens, map_rows
+        _host,
+        _compiled,
+        _HOST_BUFFERS,
+        MIN_SCORE_LOG2,
+        q,
+        k,
+        v,
+        buffers,
+        lens,
+        comp,
+        scale_rule,
+        transforms,
     )

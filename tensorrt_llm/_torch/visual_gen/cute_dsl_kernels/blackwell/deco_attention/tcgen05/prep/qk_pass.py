@@ -15,20 +15,30 @@
 """Q'/K' pass of the DeCo preparation: rotation, NVFP4 quantization and compensation channels of every 128-token tile.
 
 * A tile of q or k is rotated by the Hadamard matrix (BF16 MMA) and quantized to NVFP4 in 16-channel blocks; the
-  quantization residual dq and the body x - dq are projected on the compensation basis U of RANK directions (TF32
-  MMAs) and quantized the same way into the 2 x RANK compensation channels.
-* Q' = [x - dq | dq U | (x - dq) U] and K' = [x - dq | (x - dq) U | dq U]: Q' K'^T adds the two first-order error
-  terms dq (k - dk)^T and (q - dq) dk^T, projected on U, to the product of the quantized bodies.
-* Out: E2M1 codes to q4 / k4 (128 + 2 RANK channels per token); block scales, as BF16, in a write-coalesced tile layout
-  that the Q/K scale encoding (encode.py) converts to UE4M3; the maxima of each tensor's three scale groups to gmax.
+  quantization residual dq and the body x - dq are projected on the directions of the two compensation terms (TF32
+  MMAs) and quantized the same way into the compensation channels.
+* RANK = (r_q, r_k): Q' = [x - dq | dq B_q | (x - dq) B_k] and K' = [x - dk | (x - dk) B_q | dk B_k], B_q the r_q
+  directions of the Q-residual term and B_k the r_k directions of the K-residual term: Q' K'^T adds the two
+  first-order error terms dq (k - dk)^T and (q - dq) dk^T, projected on B_q and on B_k, to the product of the
+  quantized bodies. A term of 0 directions is absent.
+* Basis: the leading r_q and r_k directions of one basis (the last rows of its U^T), or with SEPARATE each term's
+  directions of its own basis.
+* Out: E2M1 codes to q4 / k4 (the head channels, the two terms, then zero codes up to the channels of the QK build,
+  constants.qk_channels); block scales, as BF16, in a write-coalesced tile layout that the Q/K scale encoding
+  (encode.py) converts to UE4M3; the maxima of each tensor's three scale groups (head channels, Q-residual term,
+  K-residual term) to gmax.
 * QPRE, the score prescale log2(e) / sqrt(128), multiplies the rotated Q before its quantization: the scores arrive
   in the log2 units the attention exponentiates while the score scale stays a power of two.
 
 TMEM columns of a CTA:
-    * Two rotated tiles (2 x 128), the residual dq as the A operand of the projections (128) and the projections
-      [dq U | (x - dq) U] (2 RANK columns per buffer).
-    * Rank 32: two projection buffers alternate, so the MMA warp projects a tile while the compensation warps still
-      read the previous one. Rank 64: one buffer in the 512 columns; the MMA warp reuses it once those warps loaded it.
+    * Two rotated tiles (2 x 128), the residual dq as the A operand of the projections (128) and, from TM_D on, the
+      projections of a tile (_d_layout):
+        - "pair": two buffers of r_q + r_k columns alternate, so the MMA warp projects a tile while the compensation
+          warps still read the previous one;
+        - "ring": three slots of D_SLOT columns, a term per slot, where two such buffers do not fit: the MMA warp
+          reuses a slot once the compensation warps loaded the term in it;
+        - "single": one buffer, where a term is wider than a slot; the MMA warp reuses it once those warps loaded it.
+    * The CTA allocates 512 columns, or all of the target's when the projections reach beyond them.
 
 Kernel body (qk_kernel): the setup of the CTA and one role per warp, each a function of this module.
     * A CTA takes a contiguous range of tiles in the order (batch, head), 128-token block, q then k; every role walks
@@ -38,6 +48,18 @@ Kernel body (qk_kernel): the setup of the CTA and one role per warp, each a func
     * The state object holds what the roles share: the thread's warp and lane, the shared-memory and TMEM addresses,
       the tile range and the trace-time constants.
 
+Transformations of Q and K (prepare: equalize, center_k; qk_transform_kernel), from the (batch, head) records that the
+eigensolver launch wrote (basis.py):
+    * equalize: two rotation operands in shared memory, diag(d) Hd for the Q tiles and diag(1 / d) Hd for the K tiles.
+    * center_k: the rotated centers of two (batch, head)s in shared memory, in two slots that the (batch, head)s of
+      the CTA take in turn; the math warps subtract the center of a rotated K tile from it, take the block maxima of
+      the result and store it back to TMEM for the projections, as they store a prescaled Q tile (_centered). The
+      load warp notes the slot of every tile it copies (eight notes, by the tile's index).
+    * The load warp stages the operands and the center of a (batch, head) before it copies the first tile of that
+      (batch, head), after the first one once the rotation of the tile before is done (_stage_transform): the
+      rotation of the new tile follows its copy, and the slot that the center takes was last read two (batch, head)s
+      earlier. With equalize no thread stages the plain Hadamard operand.
+
 Mbarriers, on which the roles meet. A full barrier completes when its producer has published the data, an empty barrier
 when its consumers have released it; the arrivals of a phase are in parentheses.
     XFULL, XEMPTY    per X ring stage: the tile is copied (the TMA bytes); the rotation that read it is done (MMA warp)
@@ -45,8 +67,8 @@ when its consumers have released it; the arrivals of a phase are in parentheses.
                      done (MMA warp)
     AFULL, AEMPTY    the residual dq, and the prescaled values of a Q tile, are in TMEM (the 16 math warps); the
                      projections that read them are done (MMA warp)
-    DFULL, DEMPTY    per projection buffer: the projections are done (MMA warp); their last channels are in registers
-                     (the 4 compensation warps)
+    DFULL, DEMPTY    per projection buffer or slot: the projections are done (MMA warp); their last channels are in
+                     registers (the 4 compensation warps)
     UFULL, UEMPTY    per U operand stage: the basis of a (batch, head) is staged (load warp); the last projection that
                      reads the stage is done (MMA warp)
 """
@@ -58,11 +80,23 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint16, Uint32
 from cutlass.cute.nvgpu import cpasync
 
 from ... import target
-from ...common.dsl import Tcgen05Fence, tcgen05_fence
+from ...common.dsl import (
+    CTAGroup,
+    ReductionKind,
+    Tcgen05Fence,
+    Tcgen05LdStShape,
+    Tcgen05MMAKind,
+    Tcgen05Wait,
+    make_tmem_ptr,
+    tcgen05_fence,
+    tcgen05_ld_red,
+    tcgen05_mma,
+    tcgen05_wait,
+)
 from ...common.expmath import f2u, warp_max
-from ...common.mem import gptr, load_invariant, sptr, store_vector
+from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
 from ...common.state import State
-from ...constants import QPRE
+from ...constants import HEAD_DIM, QK_BLOCK, QPRE, qk_channels
 from ..ptx import idesc_bf16, idesc_tf32, mbar_wait_bounded, smem_desc_sw128
 from ..tmem import (
     ld_tmem_16x32bx2_f32_x32_absmax_wait,
@@ -72,13 +106,24 @@ from ..tmem import (
     tc_mma,
 )
 from ..valid_len import valid_len
-from .basis import GMAX_K, GMAX_Q
+from .basis import (
+    GMAX_K,
+    GMAX_Q,
+    TRANSFORM_BYTES,
+    TRANSFORM_CENTER,
+    TRANSFORM_D,
+    TRANSFORM_INV_D,
+    eig_directions,
+)
 from .encode import sfv_tile_bytes
-from .quant import quant16, quant16_dq_knownmax
+from .quant import absmax, quant16, quant16_dq_knownmax
 
 QK_THREADS = 22 * 32  # 16 math warps, load warp 16, MMA warp 17, compensation warps 18-21
 X_STAGES = 3  # input tile ring depth
+# Rows of the U operand up to which two stages of it fit the shared memory of a CTA beside the X ring and the rotation
+U_TWO_STAGE_ROWS = 96
 TM_XR, TM_DQ, TM_D = 0, 256, 384
+D_SLOT = 64  # columns of a slot of the projection ring
 # mbarrier slots (module docstring: Mbarriers)
 B_XFULL, B_XEMPTY, B_XRFULL, B_XREMPTY = 0, X_STAGES, 2 * X_STAGES, 2 * X_STAGES + 2
 B_AFULL, B_AEMPTY, B_DFULL, B_DEMPTY = (
@@ -89,21 +134,104 @@ B_AFULL, B_AEMPTY, B_DFULL, B_DEMPTY = (
 )
 B_UFULL, B_UEMPTY = 2 * X_STAGES + 10, 2 * X_STAGES + 12
 QK_NBARS = 2 * X_STAGES + 14
+# the projection ring has barriers of its own after those: DFULL and DEMPTY of its three slots
+B_RFULL, B_REMPTY, QK_RING_NBARS = QK_NBARS, QK_NBARS + 3, QK_NBARS + 6
 
 
-def _d_buffer(parity, stages):
-    """Return the projection buffer of a tile of this parity in the ring of `stages` buffers (two or one)."""
-    return parity if stages == 2 else 0
+def _d_layout(rank, columns):
+    """Return the layout of the projections of a tile in the TMEM columns from TM_D on, of the `columns` columns a
+    CTA can allocate (module docstring: TMEM columns): "pair" where two buffers of all projected channels fit;
+    "ring" where three slots of D_SLOT columns fit and each of the two terms fits a slot; else "single"."""
+    r_q, r_k = rank
+    if TM_D + 2 * (r_q + r_k) <= columns:
+        return "pair"
+    if TM_D + 3 * D_SLOT <= columns and 0 < r_q <= D_SLOT and 0 < r_k <= D_SLOT:
+        return "ring"
+    return "single"
 
 
-def _d_rounds(i, stages):
-    """Return the earlier uses of tile i's projection buffer in the ring of `stages` buffers."""
-    return i >> 1 if stages == 2 else i
+def _d_columns(rank, layout):
+    """Return the TMEM columns that the projections take from TM_D on in a layout of _d_layout."""
+    comp = rank[0] + rank[1]
+    return {"pair": 2 * comp, "ring": 3 * D_SLOT, "single": comp}[layout]
+
+
+def _d_buffer(st, i, term):
+    """Return the projection buffer or ring slot of term `term` (0: the Q-residual term, 1: the K-residual term) of
+    tile i, and its first DFULL and DEMPTY barrier.
+
+    * "pair", "single": one buffer for both terms, that of the tile's parity or the only one.
+    * "ring": slot 2 i mod 3 for the Q-residual term, the slot after it for the K-residual term.
+    """
+    if st.d_layout == "ring":
+        return (2 * i + term) % 3, B_RFULL, B_REMPTY
+    return (i & 1 if st.d_layout == "pair" else 0), B_DFULL, B_DEMPTY
+
+
+def _d_rounds(st, i, term):
+    """Return the earlier uses of the projection buffer or ring slot of a term of tile i (_d_buffer)."""
+    if st.d_layout == "ring":
+        return (2 * i + term) // 3
+    return i >> 1 if st.d_layout == "pair" else i
+
+
+def _d_column(st, i, term):
+    """Return the first TMEM column after TM_D of the buffer or ring slot of a term of tile i (_d_buffer); in a
+    buffer the K-residual term follows the Q-residual term."""
+    buffer = _d_buffer(st, i, term)[0]
+    return buffer * (D_SLOT if st.d_layout == "ring" else st.comp)
+
+
+def _d_loads(rank, layout):
+    """Return the 32-column TMEM loads of a tile's projected channels by a compensation warp, in order: per load (the
+    term whose buffer or slot it reads from its first column on (_d_column), its first column there, the 16-channel
+    blocks it holds, numbered over the compensation channels, whether it is the last load of that buffer or slot).
+    Outside the ring the loads run through both terms from the columns of the Q-residual term on."""
+    blocks_q, blocks_k = rank[0] // QK_BLOCK, rank[1] // QK_BLOCK
+    spans = [(0, 0, blocks_q + blocks_k)]
+    if layout == "ring":
+        spans = [(0, 0, blocks_q), (1, blocks_q, blocks_q + blocks_k)]
+    loads = []
+    for term, first, end in spans:
+        for j in range(first, end, 2):
+            loads.append(
+                (term, (j - first) * QK_BLOCK, list(range(j, min(j + 2, end))), j + 2 >= end)
+            )
+    return loads
+
+
+def _u_stage(ucount, stages):
+    """Return the U operand stage of the CTA's (batch, head) number ucount in the ring of `stages` stages (two or
+    one)."""
+    return ucount & 1 if stages == 2 else 0
+
+
+def _u_rounds(ucount, stages):
+    """Return the earlier uses of the U operand stage of (batch, head) number ucount in the ring of `stages` stages."""
+    return ucount >> 1 if stages == 2 else ucount
+
+
+def _u_rows(rank, separate):
+    """Return the rows of the U operand of the projections: (rows staged, first row of the Q-residual term, first row
+    of the K-residual term, per block of 16 staged rows its (basis, first row counted from the end of the basis)).
+
+    * One basis: its last max(r_q, r_k) rows are staged; a term takes the last r of them.
+    * Separate bases: the last r_q rows of the basis of the Q-residual term (0), then the last r_k rows of the basis
+      of the K-residual term (1).
+    """
+    r_q, r_k = rank
+    if separate:
+        source = [(0, r_q - row) for row in range(0, r_q, QK_BLOCK)]
+        source += [(1, r_k - row) for row in range(0, r_k, QK_BLOCK)]
+        return r_q + r_k, 0, r_q, source
+    rows = max(r_q, r_k)
+    return rows, rows - r_q, rows - r_k, [(0, rows - row) for row in range(0, rows, QK_BLOCK)]
 
 
 # ------------------------------------------------------------------------------------------------ setup
-def _init_barriers(bars):
-    """Thread 0: every mbarrier of the CTA, with the arrivals of one phase (16 on AFULL, 4 on each DEMPTY, else one)."""
+def _init_barriers(bars, ring):
+    """Thread 0: every mbarrier of the CTA, with the arrivals of one phase (16 on AFULL, 4 on each DEMPTY, else one);
+    ring: those of the projection ring too."""
     for i in range(X_STAGES):
         cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_XFULL + i)), 1)
         cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_XEMPTY + i)), 1)
@@ -116,6 +244,10 @@ def _init_barriers(bars):
         cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_UEMPTY + i)), 1)
     cute.arch.mbarrier_init(sptr(Int64, bars + 8 * B_AFULL), 16)
     cute.arch.mbarrier_init(sptr(Int64, bars + 8 * B_AEMPTY), 1)
+    if ring:
+        for i in range(3):
+            cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_RFULL + i)), 1)
+            cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_REMPTY + i)), 4)
     cute.arch.mbarrier_init_fence()
 
 
@@ -143,6 +275,46 @@ def _stage_hadamard(hadamard, tidx, ht_base):
                     + ((((kb >> 3) ^ (nn & 7)) << 4) | ((kb & 7) * 2))
                 )
                 cute.arch.store(sptr(Uint16, dst), hv.to(Uint16))
+
+
+@cute.jit
+def _stage_transform(st, bh, slot):
+    """Load warp: stage the transformations of (batch, head) bh from its record.
+
+    * equalize: the two rotation operands, in place of those of the (batch, head) before: element (k, n) of the
+      Hadamard matrix with the magnitude d_k in the operand of the Q tiles and 1 / d_k in that of the K tiles, in the
+      layout of _stage_hadamard. A lane takes the 16-byte chunks of eight channels k of every row n: their signs
+      from the transposed matrix, eight chunks loaded at a time; d and 1 / d of its channels once.
+    * center_k: the rotated center in the slot.
+    """
+    record = st.records + Int64(bh) * Int64(TRANSFORM_BYTES)
+    if cutlass.const_expr(st.equalize):
+        kc = st.lane & 15
+        d = load_invariant(Uint32, record + Int64(TRANSFORM_D) + Int64(kc) * Int64(16), 4)
+        inv_d = load_invariant(Uint32, record + Int64(TRANSFORM_INV_D) + Int64(kc) * Int64(16), 4)
+        for group in cutlass.range(8):
+            loaded = []
+            for e in cutlass.range_constexpr(8):
+                ch = st.lane + 32 * (8 * group + e)
+                loaded.append((ch, load_invariant(Uint32, st.had_t + Int64(ch) * Int64(16), 4)))
+            for e in cutlass.range_constexpr(8):
+                n = loaded[e][0] >> 4
+                signs = [w & Uint32(0x80008000) for w in loaded[e][1]]
+                off = (kc >> 3) * 16384 + n * 128 + (((kc & 7) ^ (n & 7)) << 4)
+                store_vector(
+                    sptr(Uint32, st.ht_base + off, 16), tuple(signs[w] | d[w] for w in range(4))
+                )
+                store_vector(
+                    sptr(Uint32, st.hk_base + off, 16), tuple(signs[w] | inv_d[w] for w in range(4))
+                )
+    if cutlass.const_expr(st.center_k):
+        c = load_invariant(
+            Float32, record + Int64(TRANSFORM_CENTER) + Int64(st.lane) * Int64(16), 4
+        )
+        store_vector(
+            sptr(Float32, st.c_base + slot * 512 + st.lane * 16, 16), (c[0], c[1], c[2], c[3])
+        )
+    cute.arch.fence_proxy("async.shared", space="cta")
 
 
 # ------------------------------------------------------------------------------------------------ steps of the roles
@@ -262,35 +434,30 @@ def _x_views(st, tma, tiles):
 
 
 @cute.jit
-def _stage_basis(st, ut_base, bh, ucount):
-    """Load warp: stage the basis of (batch, head) bh, U^T (FP32 [RANK][128]) at the global address ut_base, into U
-    stage ucount & 1 as the K-major SW128 TF32 B operand of the projections: 4 K-boxes of RANK rows x 128 B. Waits
-    UEMPTY of the stage and arrives on its UFULL."""
-    us = ucount & 1
-    mbar_wait_bounded(st.bars + 8 * (B_UEMPTY + us), ((ucount >> 1) + 1) & 1)
-    for blk in cutlass.range_constexpr(st.RANK // 16):
+def _stage_basis(st, ut_addrs, bh, ucount):
+    """Load warp: stage the rows of the basis of (batch, head) bh that the projections read (st.u_source; a basis is
+    U^T, FP32 [st.directions][128] per (batch, head), at its global address in ut_addrs) into the U stage of ucount
+    as the K-major SW128 TF32 B operand: 4 K-boxes of st.urows rows x 128 B. Waits UEMPTY of the stage and arrives on
+    its UFULL."""
+    us = _u_stage(ucount, st.u_stages)
+    mbar_wait_bounded(st.bars + 8 * (B_UEMPTY + us), (_u_rounds(ucount, st.u_stages) + 1) & 1)
+    for blk in cutlass.range_constexpr(st.urows // QK_BLOCK):
+        basis, from_end = st.u_source[blk]
+        src = ut_addrs[basis] + (
+            Int64(bh) * Int64(st.directions) + Int64(st.directions - from_end)
+        ) * Int64(512)
         uws = []
         for it in cutlass.range_constexpr(16):
-            qq = st.lane + 32 * (blk * 16 + it)  # 16-byte chunk of the operand
-            nrow = qq >> 5
-            cc = qq & 31
-            uws.append(
-                load_invariant(
-                    Uint32,
-                    ut_base
-                    + ((Int64(bh) * Int64(st.RANK) + Int64(nrow)) * Int64(512) + Int64(cc * 16)),
-                    4,
-                )
-            )
+            # lane: 16-byte chunk of row it of the block
+            uws.append(load_invariant(Uint32, src + Int64(it * 512 + st.lane * 16), 4))
         for it in cutlass.range_constexpr(16):
-            qq = st.lane + 32 * (blk * 16 + it)
-            nrow = qq >> 5
-            cc = qq & 31
+            nrow = blk * 16 + it
+            cc = st.lane
             w = uws[it]
             dst = (
                 st.u_base
                 + us * st.ustage
-                + (cc >> 3) * (st.RANK * 128)
+                + (cc >> 3) * (st.urows * 128)
                 + nrow * 128
                 + (((cc & 7) ^ (nrow & 7)) << 4)
             )
@@ -300,11 +467,16 @@ def _stage_basis(st, ut_base, bh, ucount):
 
 
 @cute.jit
-def _load_warp(st, ut_base, scales):
-    """Load warp (16): stage the U operand of each (batch, head) from the basis at ut_base; copy tiles to the X ring.
+def _load_warp(st, ut_addrs, scales):
+    """Load warp (16): stage the U operand of each (batch, head) from the basis at ut_addrs; copy tiles to the X ring.
 
-    * _stage_basis waits UEMPTY and arrives on UFULL at the first tile of a (batch, head).
+    * _stage_basis waits UEMPTY and arrives on UFULL at the first tile of a (batch, head): with two U stages before
+      the copy of that tile, with one stage after it. The one stage is released by the projections of the tile
+      before, and the MMA warp rotates the first tile ahead of them: its copy must be on the way.
     * A tile waits XEMPTY of its ring stage (the rotation that read the stage is done); its TMA copy completes XFULL.
+    * With a transformation, before the copy of the first tile of a (batch, head): the transformations of that
+      (batch, head), after the CTA's first one once the rotation of the tile before is done (_stage_transform); with
+      center_k the slot of the center of every tile is noted before its copy.
     """
     gQ = cute.local_tile(st.tma_q.tma_tensor, (128, 128), (None, 0, None))
     gK = cute.local_tile(st.tma_k.tma_tensor, (128, 128), (None, 0, None))
@@ -313,11 +485,29 @@ def _load_warp(st, ut_base, scales):
     bh_prev = Int32(-1)
     ucount = Int32(-1)
     kind, sblk, bh, h, b = _first_tile(st)
+    # the (batch, head) whose transformations are staged (none at the start) and its center slot: the first one
+    # takes slot 0
+    bh_staged = Int32(-1)
+    slot = Int32(1)
     for i in cutlass.range(st.n):
-        if bh != bh_prev:
-            ucount = ucount + 1
-            bh_prev = bh
-            _stage_basis(st, ut_base, bh, ucount)
+        if cutlass.const_expr(st.urows > 0 and st.u_stages == 2):
+            if bh != bh_prev:
+                ucount = ucount + 1
+                bh_prev = bh
+                _stage_basis(st, ut_addrs, bh, ucount)
+        if cutlass.const_expr(st.equalize or st.center_k):
+            if bh != bh_staged:
+                bh_staged = bh
+                slot = slot ^ 1
+                if i > 0:
+                    # the rotation of the tile before, the last one of its (batch, head), has released its ring stage
+                    mbar_wait_bounded(
+                        st.bars + 8 * (B_XEMPTY + (i - 1) % X_STAGES), ((i - 1) // X_STAGES) & 1
+                    )
+                _stage_transform(st, bh, slot)
+            if cutlass.const_expr(st.center_k):
+                if st.lane == 0:
+                    cute.arch.store(sptr(Int32, st.slot_base + (i & 7) * 4), slot)
         xs = i % X_STAGES
         mbar_wait_bounded(st.bars + 8 * (B_XEMPTY + xs), ((i // X_STAGES) + 1) & 1)
         if st.lane == 0:
@@ -339,6 +529,11 @@ def _load_warp(st, ut_base, scales):
                 tKs[(None, xs)],
                 tma_bar_ptr=st.bars_p + (B_XFULL + xs),
             )
+        if cutlass.const_expr(st.urows > 0 and st.u_stages == 1):
+            if bh != bh_prev:
+                ucount = ucount + 1
+                bh_prev = bh
+                _stage_basis(st, ut_addrs, bh, ucount)
         kind, sblk, bh, h, b = _next_tile(st, kind, sblk, bh, h, b)
     if cutlass.const_expr(st.lens is not None):
         _zero_scales(st, scales)
@@ -367,9 +562,12 @@ def _zero_scales(st, scales):
 
 
 # ------------------------------------------------------------------------------------------------ MMA warp
-def _qk_rotation(st, j, idesc):
+def _qk_rotation(st, j, idesc, operand=None):
     """MMA warp: rotate tile j, xr[j & 1] = X[j % X_STAGES] * Hd. Waits XFULL of the ring stage and XREMPTY of the
-    rotated tile buffer; commits XRFULL of the buffer and XEMPTY of the stage."""
+    rotated tile buffer; commits XRFULL of the buffer and XEMPTY of the stage. operand: the shared address of the
+    rotation operand of the tile where it is not the Hadamard operand of the CTA."""
+    if operand is None:
+        operand = st.ht_base
     xs = j % X_STAGES
     s = j & 1
     mbar_wait_bounded(st.bars + 8 * (B_XFULL + xs), (j // X_STAGES) & 1)
@@ -381,7 +579,7 @@ def _qk_rotation(st, j, idesc):
         tc_mma(
             st.tm + TM_XR + s * 128,
             smem_desc_sw128(xa + off),
-            smem_desc_sw128(st.ht_base + off),
+            smem_desc_sw128(operand + off),
             idesc,
             Int32(kk),
             kind="f16",
@@ -391,24 +589,147 @@ def _qk_rotation(st, j, idesc):
     tc_commit(st.bars + 8 * (B_XEMPTY + xs))
 
 
-def _project(st, d, a, ua, idesc, accumulate):
-    """MMA warp: the RANK TMEM columns at d = (or, with accumulate, +=) the 128 TMEM columns at a times the U operand
-    at the shared address ua, as 16 MMAs of kind::tf32 (K = 8 each)."""
+def _rotation_operand(st, kind):
+    """Return the shared address of the rotation operand of a tile of the kind (equalize): diag(d) Hd for a Q tile,
+    diag(1 / d) Hd for a K tile."""
+    return Int32(cutlass.select_(kind == 0, st.ht_base, st.hk_base))
+
+
+def _by_kind(q_tile, for_q, for_k):
+    """Return for_q for a Q tile and for_k for a K tile: a trace-time value when both are equal."""
+    return for_q if for_q == for_k else Int32(cutlass.select_(q_tile, Int32(for_q), Int32(for_k)))
+
+
+def _project(st, d, a, ua, row, idesc, accumulate):
+    """MMA warp: the TMEM columns at d = (or, with accumulate, +=) the 128 TMEM columns at a times the rows of the U
+    operand at the shared address ua from byte offset `row` on, as 16 MMAs of kind::tf32 (K = 8 each) of the
+    descriptor idesc, which holds the number of columns."""
     for kk in range(16):
-        bd = smem_desc_sw128(ua + (kk >> 2) * (st.RANK * 128) + (kk & 3) * 32)
+        bd = smem_desc_sw128(ua + (kk >> 2) * (st.urows * 128) + row + (kk & 3) * 32)
         tc_mma(d, a + 8 * kk, bd, idesc, Int32(1 if accumulate else kk), kind="tf32", a_tmem=True)
 
 
-def _qk_projections(st, p, dp, us, idesc, idesc_neg):
-    """MMA warp: the projections of the tile in xr[p] into projection buffer dp, with the basis in U stage us: the
-    residual dq U (dq FP32 in the A region) into the first half and the body (x - dq) U = x U + (-dq) U (x still in
-    xr[p]) into the second; the negated product uses the descriptor's negate-A bit (idesc_neg)."""
+def _project_run(st, d, a, ua, row, idesc, first):
+    """MMA warp: _project with the 16 MMAs issued by one elected lane; first: an Int32 value, nonzero when the first
+    MMA accumulates on the columns at d (the others always do)."""
+    with cute.arch.elect_one():
+        for kk in range(16):
+            bd = smem_desc_sw128(ua + (kk >> 2) * (st.urows * 128) + row + (kk & 3) * 32)
+            tcgen05_mma(
+                Tcgen05MMAKind("tf32"),
+                CTAGroup.CTA_1,
+                make_tmem_ptr(d, Float32),
+                make_tmem_ptr(a + 8 * kk, Float32),
+                Int64(bd),
+                Int32(idesc),
+                (first if kk == 0 else Int32(1)) != 0,
+            )
+
+
+@cute.jit
+def _qk_projections(st, kind, i, us):
+    """MMA warp: the projections of tile i, in xr[i & 1] (kind 0: a Q tile, 1: a K tile), with the basis in U stage
+    us, at the columns of the tile's compensation channels in its buffer (_d_column): the Q-residual term (r_q
+    columns), then the K-residual term (r_k columns). The ring has _ring_projections.
+
+    * Q tile: the Q-residual term is the residual dq B_q, the K-residual term the body (x - dq) B_k.
+    * K tile: the Q-residual term is the body (x - dk) B_q, the K-residual term the residual dk B_k.
+    * The residual is FP32 in the A region; a body is x B + (-residual) B with x still in xr[p], the negated product
+      by the descriptor's negate-A bit. A term of 0 columns has no MMA.
+    * A tile of either kind takes the same MMAs, the residual projection first; the rows of the U operand, the
+      descriptors and the columns of the two projections follow the kind as values.
+    """
+    r_q, r_k = st.RANK
     ua = st.u_base + us * st.ustage
-    d = st.tm + TM_D + dp * (2 * st.RANK)
+    d = st.tm + TM_D + _d_column(st, i, 0)
     dq = st.tm + TM_DQ
-    _project(st, d, dq, ua, idesc, False)
-    _project(st, d + st.RANK, st.tm + p * 128, ua, idesc, False)
-    _project(st, d + st.RANK, dq, ua, idesc_neg, True)
+    x = st.tm + (i & 1) * 128
+    rows = (st.u_row_q * 128, st.u_row_k * 128)
+    idesc = (idesc_tf32(128, r_q), idesc_tf32(128, r_k))
+    neg = 1 << 13
+    q_tile = kind == 0
+    if cutlass.const_expr(r_q > 0 and r_k > 0):
+        row_res = _by_kind(q_tile, rows[0], rows[1])
+        row_body = _by_kind(q_tile, rows[1], rows[0])
+        d_res = d + _by_kind(q_tile, 0, r_q)
+        d_body = d + _by_kind(q_tile, r_q, 0)
+        _project(st, d_res, dq, ua, row_res, Int32(_by_kind(q_tile, idesc[0], idesc[1])), False)
+        _project(st, d_body, x, ua, row_body, Int32(_by_kind(q_tile, idesc[1], idesc[0])), False)
+        _project(
+            st,
+            d_body,
+            dq,
+            ua,
+            row_body,
+            Int32(_by_kind(q_tile, idesc[1] | neg, idesc[0] | neg)),
+            True,
+        )
+    elif cutlass.const_expr(r_q > 0):
+        # the Q-residual term alone: the residual of a Q tile, the body of a K tile
+        if q_tile:
+            _project(st, d, dq, ua, rows[0], Int32(idesc[0]), False)
+        else:
+            _project(st, d, x, ua, rows[0], Int32(idesc[0]), False)
+            _project(st, d, dq, ua, rows[0], Int32(idesc[0] | neg), True)
+    elif cutlass.const_expr(r_k > 0):
+        # the K-residual term alone: the body of a Q tile, the residual of a K tile
+        if q_tile:
+            _project(st, d, x, ua, rows[1], Int32(idesc[1]), False)
+            _project(st, d, dq, ua, rows[1], Int32(idesc[1] | neg), True)
+        else:
+            _project(st, d, dq, ua, rows[1], Int32(idesc[1]), False)
+
+
+@cute.jit
+def _ring_projections(st, kind, i, us):
+    """MMA warp, projection ring: the projections of tile i (as _qk_projections forms them), each term into its slot.
+
+    * The slot of the Q-residual term is free when the tile starts. The slot of the K-residual term held the
+      Q-residual term of the tile before: its DEMPTY is waited for after the first MMAs into the other slot.
+    * Q tile: the residual dq B_q; then the body x B_k and - dq B_k. K tile: the body x B_q and - dk B_q; then the
+      residual dk B_k. Three runs of 16 MMAs for either kind, each issued by one elected lane (_project_run): the
+      first into the slot of the Q-residual term, the last into that of the K-residual term; the operands, the rows
+      of U, the descriptors, the slot of the second run and what the second and third run accumulate on follow the
+      kind as values.
+    * Commits DFULL of each slot after its last run.
+    """
+    r_q, r_k = st.RANK
+    ua = st.u_base + us * st.ustage
+    d_q = st.tm + TM_D + _d_column(st, i, 0)
+    d_k = st.tm + TM_D + _d_column(st, i, 1)
+    dq = st.tm + TM_DQ
+    x = st.tm + (i & 1) * 128
+    rows = (st.u_row_q * 128, st.u_row_k * 128)
+    idesc = (idesc_tf32(128, r_q), idesc_tf32(128, r_k))
+    neg = 1 << 13
+    q_tile = kind == 0
+    _project_run(
+        st, d_q, Int32(cutlass.select_(q_tile, dq, x)), ua, rows[0], Int32(idesc[0]), Int32(0)
+    )
+    slot, full, empty = _d_buffer(st, i, 1)
+    mbar_wait_bounded(st.bars + 8 * (empty + slot), (_d_rounds(st, i, 1) + 1) & 1)
+    tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
+    _project_run(
+        st,
+        Int32(cutlass.select_(q_tile, d_k, d_q)),
+        Int32(cutlass.select_(q_tile, x, dq)),
+        ua,
+        _by_kind(q_tile, rows[1], rows[0]),
+        Int32(_by_kind(q_tile, idesc[1], idesc[0] | neg)),
+        Int32(cutlass.select_(q_tile, Int32(0), Int32(1))),
+    )
+    slot_q, full_q, _ = _d_buffer(st, i, 0)
+    tc_commit(st.bars + 8 * (full_q + slot_q))
+    _project_run(
+        st,
+        d_k,
+        dq,
+        ua,
+        rows[1],
+        Int32(_by_kind(q_tile, idesc[1] | neg, idesc[1])),
+        Int32(cutlass.select_(q_tile, Int32(1), Int32(0))),
+    )
+    tc_commit(st.bars + 8 * (full + slot))
 
 
 @cute.jit
@@ -417,15 +738,15 @@ def _mma_warp(st):
 
     * The rotation (_qk_rotation) runs one tile ahead: the math warps work on tile i + 1, the compensation warps on i.
     * The projections of tile i wait UFULL at the first tile of a (batch, head), AFULL (the math warps have stored the
-      residual) and DEMPTY of the tile's projection buffer; they commit DFULL, AEMPTY and XREMPTY, and UEMPTY after
-      the last tile of the (batch, head) or of the CTA.
+      residual) and DEMPTY of the tile's projection buffer (in the ring: of the slot of the Q-residual term;
+      _ring_projections); they commit DFULL of the same, AEMPTY and XREMPTY, and UEMPTY after the last tile of the
+      (batch, head) or of the CTA.
     """
     idesc1 = Int32(idesc_bf16(128, 128))
-    idesc2 = Int32(idesc_tf32(128, st.RANK))
-    idesc2n = Int32(idesc_tf32(128, st.RANK) | (1 << 13))
 
-    if st.n > 0:
-        _qk_rotation(st, Int32(0), idesc1)
+    if cutlass.const_expr(not st.equalize):
+        if st.n > 0:
+            _qk_rotation(st, Int32(0), idesc1)
     bh_prev = Int32(-1)
     ucount = Int32(-1)
     if cutlass.const_expr(st.lens is not None):
@@ -433,48 +754,94 @@ def _mma_warp(st):
         rem = Int32(0)
     else:
         bh, rem = _tile_origin(st)
+        kind = rem & 1
+    if cutlass.const_expr(st.equalize):
+        # the tiles alternate between Q and K: each takes the rotation operand of its kind
+        if st.n > 0:
+            _qk_rotation(st, Int32(0), idesc1, _rotation_operand(st, kind))
     for i in cutlass.range(st.n):
-        if i + 1 < st.n:
-            _qk_rotation(st, i + 1, idesc1)
+        if cutlass.const_expr(st.equalize):
+            if i + 1 < st.n:
+                _qk_rotation(st, i + 1, idesc1, _rotation_operand(st, kind ^ 1))
+        else:
+            if i + 1 < st.n:
+                _qk_rotation(st, i + 1, idesc1)
         if bh != bh_prev:
             ucount = ucount + 1
             bh_prev = bh
-            mbar_wait_bounded(st.bars + 8 * (B_UFULL + (ucount & 1)), (ucount >> 1) & 1)
+            if cutlass.const_expr(st.urows > 0):
+                mbar_wait_bounded(
+                    st.bars + 8 * (B_UFULL + _u_stage(ucount, st.u_stages)),
+                    _u_rounds(ucount, st.u_stages) & 1,
+                )
+        us = _u_stage(ucount, st.u_stages)
         p = i & 1
-        dp = _d_buffer(p, st.d_stages)
+        dp, full, empty = _d_buffer(st, i, 0)
         mbar_wait_bounded(st.bars + 8 * B_AFULL, i & 1)
-        mbar_wait_bounded(st.bars + 8 * (B_DEMPTY + dp), (_d_rounds(i, st.d_stages) + 1) & 1)
+        mbar_wait_bounded(st.bars + 8 * (empty + dp), (_d_rounds(st, i, 0) + 1) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
-        _qk_projections(st, p, dp, ucount & 1, idesc2, idesc2n)
-        tc_commit(st.bars + 8 * (B_DFULL + dp))
+        if cutlass.const_expr(st.d_layout == "ring"):
+            _ring_projections(st, kind, i, us)
+        else:
+            _qk_projections(st, kind, i, us)
+            tc_commit(st.bars + 8 * (full + dp))
         tc_commit(st.bars + 8 * B_AEMPTY)
         tc_commit(st.bars + 8 * (B_XREMPTY + p))
         # the tile's position in its (batch, head): the U stage is released after the last one
         if cutlass.const_expr(st.lens is not None):
             # with lengths the last one is the k tile of the last live block of the batch element
-            if (i + 1 == st.n) or ((kind == 1) & (sblk + 1 == _live_blocks(st, b))):
-                tc_commit(st.bars + 8 * (B_UEMPTY + (ucount & 1)))
+            if cutlass.const_expr(st.urows > 0):
+                if (i + 1 == st.n) or ((kind == 1) & (sblk + 1 == _live_blocks(st, b))):
+                    tc_commit(st.bars + 8 * (B_UEMPTY + us))
             kind, sblk, bh, h, b = _next_tile(st, kind, sblk, bh, h, b)
         else:
             rem = rem + 1
             if rem == st.nb2:
                 rem = 0
-            if (i + 1 == st.n) or (rem == 0):
-                tc_commit(st.bars + 8 * (B_UEMPTY + (ucount & 1)))
+            if cutlass.const_expr(st.urows > 0):
+                if (i + 1 == st.n) or (rem == 0):
+                    tc_commit(st.bars + 8 * (B_UEMPTY + us))
             if rem == 0:
                 bh = bh + 1
+            kind = kind ^ 1
 
 
 # ------------------------------------------------------------------------------------------------ compensation warps
+def _ld_blocks_absmax_wait(addr, count):
+    """Return `count` 16-channel blocks of the thread's TMEM lane from the TMEM address addr on, as lists of 16 f32,
+    and the max |x| of each: one tcgen05.ld.red (32x32b, max.abs) per block and one wait for the loads."""
+    blocks, maxima = [], []
+    for block in range(count):
+        data, maximum = tcgen05_ld_red(
+            Tcgen05LdStShape.SHAPE_32X32B,
+            make_tmem_ptr(addr + 16 * block, Float32),
+            ReductionKind.MAX,
+            num=16,
+            abs=True,
+        )
+        data = cutlass.Vector(data, dtype=Float32)
+        blocks.append([data[i] for i in range(16)])
+        maxima.append(Float32(maximum))
+    tcgen05_wait(Tcgen05Wait.LOAD)
+    return blocks, maxima
+
+
 @cute.jit
 def _compensation_warps(st, codes, scales, gmax):
     """Compensation warps (18-21), one per TMEM lane quadrant: quantize the projected channels of every tile to NVFP4.
 
-    * A thread takes the full row of the 2 RANK projected channels of its token ([dq U | (x - dq) U] in D; K stores the
-      halves swapped), loaded 32 channels at a time, and stores their NVFP4 codes and block scales; the maxima of the
-      scales of each half go to gmax. codes, scales, gmax: the global addresses of (q4, k4), (q_sfv, k_sfv) and gmax.
+    * A thread takes the full row of the projected channels of its token (the tile's compensation channels in D),
+      loaded 32 channels at a time, and stores their NVFP4 codes and block scales; the maxima of the scales of each
+      term go to gmax. codes, scales, gmax: the global addresses of (q4, k4), (q_sfv, k_sfv) and gmax.
+    * Where the target has it, the load of a block returns its max |x| (tcgen05.ld.red).
+    * The compensation channels after the two terms get zero codes; their scales are zero in the scale encoding.
     * A tile waits DFULL of its projection buffer; the warp arrives on DEMPTY once its last channels are in registers.
+      In the ring a term waits DFULL of its slot, and the warp arrives on the slot's DEMPTY once the term's last
+      channels are in registers.
     """
+    r_q = st.RANK[0]
+    blocks = st.comp // QK_BLOCK  # 16-channel blocks of the two terms
+    loads = _d_loads(st.RANK, st.d_layout)  # 32-channel loads that hold them
     lq = st.warp & 3
     row = lq * 32 + st.lane
     tl = (lq * 32) << 16
@@ -486,58 +853,78 @@ def _compensation_warps(st, codes, scales, gmax):
     rstride = Int64(st.H) * Int64(128)
     thr_off = Int64(row) * rstride
     for i in cutlass.range(st.n):
-        dp = _d_buffer(i & 1, st.d_stages)
-        mbar_wait_bounded(st.bars + 8 * (B_DFULL + dp), _d_rounds(i, st.d_stages) & 1)
+        dp, full, empty = _d_buffer(st, i, 0)
+        mbar_wait_bounded(st.bars + 8 * (full + dp), _d_rounds(st, i, 0) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
         tok = sblk * 128 + row
         if cutlass.const_expr(st.lens is not None):
             n_tok = valid_len(st.lens, b, st.S)
         code_base, scale_base, row0 = _tile_outputs(st, codes, scales, rstride, kind, sblk, b, h)
         soff = _scale_tile(st, bh, sblk) + Int64(1024 + lq * 32 + st.lane)
-        for part in cutlass.range_constexpr(st.RANK // 16):
-            half = part // (st.RANK // 32)
-            dv = ld_tmem_f32_x32_wait(st.tm + tl + TM_D + dp * (2 * st.RANK) + part * 32)
-            if cutlass.const_expr(part == st.RANK // 16 - 1):
-                # the last channels are in registers: release the D buffer to the MMA warp
+        if cutlass.const_expr(len(loads) == 0):
+            _warp_arrive(st, empty + dp)
+        for number in cutlass.range_constexpr(len(loads)):
+            term, column, held, last = loads[number]
+            if cutlass.const_expr(term == 1 and column == 0):
+                # the ring: the K-residual term has a slot of its own
+                dp, full, empty = _d_buffer(st, i, 1)
+                mbar_wait_bounded(st.bars + 8 * (full + dp), _d_rounds(st, i, 1) & 1)
+                tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
+            d_addr = st.tm + tl + TM_D + _d_column(st, i, term) + column
+            if cutlass.const_expr(target.has_tmem_ld_red()):
+                dv, dv_max = _ld_blocks_absmax_wait(d_addr, len(held))
+            else:
+                loaded = ld_tmem_f32_x32_wait(d_addr)
+                dv, dv_max = [loaded[0:16], loaded[16:32]], [None, None]
+            if cutlass.const_expr(last):
+                # the last channels are in registers: release the buffer or slot to the MMA warp
                 tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
-                _warp_arrive(st, B_DEMPTY + dp)
+                _warp_arrive(st, empty + dp)
             ws = []
             for grp in cutlass.range_constexpr(2):
-                cq = part * 2 + grp
-                sg, w0, w1 = quant16(dv[16 * grp : 16 * grp + 16])
-                if cutlass.const_expr(st.lens is not None):
-                    sg = Float32(cutlass.select_(tok < n_tok, sg, Float32(0.0)))
-                ws.append(w0)
-                ws.append(w1)
-                sg_dst = scale_base + Int64((soff + Int64(cq * 128)) * 2)
-                sg_bits = sg.to(BFloat16).bitcast(Uint16)
-                cute.arch.store(gptr(Uint16, sg_dst), sg_bits)
-                if kind == 1:
-                    if cutlass.const_expr(half == 1):
-                        mk1 = cute.arch.fmax(mk1, sg)
+                if cutlass.const_expr(grp < len(held)):
+                    j = held[grp]
+                    sg, w0, w1 = quant16(dv[grp], dv_max[grp])
+                    if cutlass.const_expr(st.lens is not None):
+                        sg = Float32(cutlass.select_(tok < n_tok, sg, Float32(0.0)))
+                    ws.append(w0)
+                    ws.append(w1)
+                    sg_dst = scale_base + Int64((soff + Int64(j * 128)) * 2)
+                    sg_bits = sg.to(BFloat16).bitcast(Uint16)
+                    cute.arch.store(gptr(Uint16, sg_dst), sg_bits)
+                    if kind == 1:
+                        if cutlass.const_expr(j * QK_BLOCK < r_q):
+                            mk1 = cute.arch.fmax(mk1, sg)
+                        else:
+                            mk2 = cute.arch.fmax(mk2, sg)
                     else:
-                        mk2 = cute.arch.fmax(mk2, sg)
-                else:
-                    if cutlass.const_expr(half == 0):
-                        mq1 = cute.arch.fmax(mq1, sg)
-                    else:
-                        mq2 = cute.arch.fmax(mq2, sg)
-            # the half's RANK / 2 bytes of the token row: the first after the head channels' 64 for dq U of Q
-            # and (x - dq) U of K
-            slot = Int32(half) ^ kind
+                        if cutlass.const_expr(j * QK_BLOCK < r_q):
+                            mq1 = cute.arch.fmax(mq1, sg)
+                        else:
+                            mq2 = cute.arch.fmax(mq2, sg)
+            # the blocks of the load: 8 bytes each in the token row, after the 64 bytes of the head channels; one
+            # store where they start at a multiple of their size
+            at = 64 + held[0] * 8
+            pieces = [ws] if at % (4 * len(ws)) == 0 else [ws[0:2], ws[2:4]]
             if tok < st.S:
-                store_vector(
-                    gptr(
-                        Uint32,
-                        code_base
-                        + row0
-                        + thr_off
-                        + Int64(64 + part % (st.RANK // 32) * 16)
-                        + Int64(slot * (st.RANK // 2)),
-                        16,
-                    ),
-                    ws,
-                )
+                for nth in cutlass.range_constexpr(len(pieces)):
+                    store_vector(
+                        gptr(
+                            Uint32,
+                            code_base + row0 + thr_off + Int64(at + 8 * nth),
+                            4 * len(pieces[nth]),
+                        ),
+                        pieces[nth],
+                    )
+        # zero codes in the blocks after the two terms, 16 bytes at a time from an even block on
+        if cutlass.const_expr(blocks < st.comp_blocks):
+            if tok < st.S:
+                z = Uint32(0)
+                rest = code_base + row0 + thr_off + Int64(64)
+                if cutlass.const_expr(blocks % 2 == 1):
+                    store_vector(gptr(Uint32, rest + Int64(blocks * 8), 8), (z, z))
+                for zb in cutlass.range_constexpr(blocks + blocks % 2, st.comp_blocks, 2):
+                    store_vector(gptr(Uint32, rest + Int64(zb * 8), 16), (z, z, z, z))
         kind, sblk, bh, h, b = _next_tile(st, kind, sblk, bh, h, b)
     _reduce_maxima(
         st, gmax, ((GMAX_Q + 1, mq1), (GMAX_Q + 2, mq2), (GMAX_K + 1, mk1), (GMAX_K + 2, mk2))
@@ -555,6 +942,16 @@ def _prescaled(x, am0, am1):
     return xs, am0 * pre, am1 * pre
 
 
+def _centered(x, addr):
+    """Return the 32 values x minus the 32 FP32 values at the shared address addr, and the largest magnitudes of the
+    two 16-value blocks of the result."""
+    xs = []
+    for j in range(0, 32, 4):
+        c = load_vector(sptr(Float32, addr + j * 4, 16), 4)
+        xs += [x[j + e] - c[e] for e in range(4)]
+    return xs, absmax(xs[0:16]), absmax(xs[16:32])
+
+
 @cute.jit
 def _math_warps(st, codes, scales, gmax):
     """Math warps (0-15): quantize the rotated tiles to NVFP4 and write the residual for the projections.
@@ -563,7 +960,8 @@ def _math_warps(st, codes, scales, gmax):
       writes the quantization residual to the A columns of the projections and stores the codes and the block scales;
       the maxima of the scales go to gmax. codes, scales, gmax: as in _compensation_warps.
     * A tile waits XRFULL of its rotated buffer, and AEMPTY (the projections of the tile before are done) before the
-      residual is overwritten; the warp arrives on AFULL once its residual and a Q tile's prescaled values are in TMEM.
+      residual is overwritten; the warp arrives on AFULL once its residual and a Q tile's prescaled values (with
+      center_k also a K tile's centered values) are in TMEM.
     """
     lq = st.warp & 3
     row_half = (st.warp >> 2) & 1
@@ -590,8 +988,14 @@ def _math_warps(st, codes, scales, gmax):
         if kind == 0:
             x, am0, am1 = _prescaled(x, am0, am1)
             st_tmem_16x32bx2_f32_x32_wait(xr, x)
-        sc0, w0, w1, dq0 = quant16_dq_knownmax(x[0:16], am0)
-        sc1, w2, w3, dq1 = quant16_dq_knownmax(x[16:32], am1)
+        if cutlass.const_expr(st.center_k):
+            # K tiles lose the center of their (batch, head): the centered tile goes back to TMEM like a scaled Q tile
+            if kind == 1:
+                slot = cute.arch.load(sptr(Int32, st.slot_base + (i & 7) * 4), Int32)
+                x, am0, am1 = _centered(x, st.c_base + slot * 512 + cq * 128)
+                st_tmem_16x32bx2_f32_x32_wait(xr, x)
+        sc0, w0, w1, dq0 = quant16_dq_knownmax(x[0:16], am0, st.scale_rule)
+        sc1, w2, w3, dq1 = quant16_dq_knownmax(x[16:32], am1, st.scale_rule)
         mbar_wait_bounded(st.bars + 8 * B_AEMPTY, (i + 1) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
         st_tmem_16x32bx2_f32_x32_wait(st.tm + tl + TM_DQ + n_pair * 64, dq0 + dq1)
@@ -627,13 +1031,36 @@ def _math_warps(st, codes, scales, gmax):
 # ------------------------------------------------------------------------------------------------ kernel
 @cute.jit
 def _qk_body(
-    tiled_mma, tma_q, tma_k, hadamard, uT, q4, k4, q_sfv, k_sfv, gmax, S, H, NB, ntiles, RANK, lens
+    tiled_mma,
+    tma_q,
+    tma_k,
+    hadamard,
+    ut_addrs,
+    q4,
+    k4,
+    q_sfv,
+    k_sfv,
+    gmax,
+    S,
+    H,
+    NB,
+    ntiles,
+    RANK,
+    lens,
+    scale_rule,
+    transform=None,
 ):
     """Run the Q'/K' pass of the CTA's share of the ntiles tiles: the setup, the role of the thread's warp, the release.
 
-    * RANK: the directions of the basis uT [B, H, RANK, 128].
+    * RANK: (r_q, r_k), the channels of the two compensation terms. ut_addrs: the global address of the basis U^T
+      [B, H, directions, 128] of both terms, directions = eig_directions(RANK), or of two of them: the basis of the
+      Q-residual term and that of the K-residual term.
     * lens: None, or the global address of the valid prefix lengths: the block scales of the tokens past the length of
       their batch element are then zero and stay out of the maxima, and the CTAs share the live tiles (_live_tiles).
+    * scale_rule: the rule for the scale of an NVFP4 block of the head channels (quant.py); the compensation terms
+      take the residual at that scale, and a block of the compensation channels has the scale of the rule "max".
+    * transform: None, or (equalize, center_k, the global address of the records of the transformations, the
+      global address of the transposed Hadamard matrix).
     """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -642,24 +1069,52 @@ def _qk_body(
     lane = tidx % 32
 
     smem = utils.SmemAllocator()
-    bars_p = smem.allocate_array(Int64, QK_NBARS, byte_alignment=8)
+    # the layout of the projections in TMEM and the columns of the CTA: 512, or the target's where the projections
+    # reach beyond them
+    d_layout = _d_layout(RANK, cute.arch.get_max_tmem_alloc_cols(target.arch_name()))
+    tmem_columns = max(512, TM_D + _d_columns(RANK, d_layout))
+    tmem_arch = target.arch_name() if tmem_columns > 512 else "sm_100"
+    nbars = QK_RING_NBARS if d_layout == "ring" else QK_NBARS
+    equalize = transform is not None and transform[0]
+    center_k = transform is not None and transform[1]
+    bars_p = smem.allocate_array(Int64, nbars, byte_alignment=8)
     hold_p = smem.allocate_array(Int32, 4, byte_alignment=16)
     sX = smem.allocate_tensor(
         BFloat16, tma_q.smem_layout.outer, byte_alignment=1024, swizzle=tma_q.smem_layout.inner
     )
     sHT = smem.allocate_array(Uint8, 32768, byte_alignment=1024)
-    # two stages of the U operand (RANK rows of 128 FP32 each), and the projection buffers after TM_D that the
-    # 512 TMEM columns hold
-    ustage = RANK * 512
-    d_stages = 2 if TM_D + 4 * RANK <= 512 else 1
-    # BF16 block scales of a tile in the write-coalesced layout
-    sfv_tile = sfv_tile_bytes(RANK) // 2
-    sU = smem.allocate_array(Uint8, 2 * ustage, byte_alignment=1024)
+    # the U operand (urows rows of 128 FP32 each per stage), and the projection buffers of comp columns after TM_D
+    # that the 512 TMEM columns hold
+    comp = RANK[0] + RANK[1]
+    urows, u_row_q, u_row_k, u_source = _u_rows(RANK, len(ut_addrs) == 2)
+    ustage = urows * 512
+    u_stages = 2 if urows <= U_TWO_STAGE_ROWS else 1
+    # BF16 block scales of a tile in the write-coalesced layout, and the 16-channel blocks of the compensation
+    # channels of the QK build
+    channels = qk_channels(RANK)
+    sfv_tile = sfv_tile_bytes(channels) // 2
+    comp_blocks = (channels - HEAD_DIM) // QK_BLOCK
     bars = Int32(bars_p.toint())
     hold = Int32(hold_p.toint())
     x_base = Int32(sX.iterator.toint())
     ht_base = Int32(sHT.toint())
-    u_base = Int32(sU.toint())
+    u_base = Int32(0)
+    if cutlass.const_expr(urows > 0):
+        sU = smem.allocate_array(Uint8, u_stages * ustage, byte_alignment=1024)
+        u_base = Int32(sU.toint())
+    # with equalize: sHT is the rotation operand of the Q tiles and a second one that of the K tiles
+    hk_base = ht_base
+    if cutlass.const_expr(equalize):
+        sHK = smem.allocate_array(Uint8, 32768, byte_alignment=1024)
+        hk_base = Int32(sHK.toint())
+    # with center_k: two slots of a rotated center, and the notes of the slot of a tile
+    c_base = Int32(0)
+    slot_base = Int32(0)
+    if cutlass.const_expr(center_k):
+        sC = smem.allocate_array(Float32, 2 * HEAD_DIM, byte_alignment=16)
+        sSlot = smem.allocate_array(Int32, 8, byte_alignment=4)
+        c_base = Int32(sC.toint())
+        slot_base = Int32(sSlot.toint())
 
     # the tiles of this CTA: n tiles from t0
     t0 = (bidx * ntiles) // gdim
@@ -667,11 +1122,12 @@ def _qk_body(
     nb2 = NB * 2
 
     if tidx == 0:
-        _init_barriers(bars)
+        _init_barriers(bars, d_layout == "ring")
     if warp == 0:
-        cute.arch.alloc_tmem(512, sptr(Uint32, hold))
+        cute.arch.alloc_tmem(tmem_columns, sptr(Uint32, hold), arch=tmem_arch)
         cute.arch.relinquish_tmem_alloc_permit()
-    _stage_hadamard(hadamard, tidx, ht_base)
+    if cutlass.const_expr(not equalize):
+        _stage_hadamard(hadamard, tidx, ht_base)
     # the barriers, the TMEM address and the Hadamard operand are set for every thread after this barrier
     cute.arch.fence_proxy("async.shared", space="cta")
     tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -710,10 +1166,28 @@ def _qk_body(
         t0_all=t0_all,
         n_all=n_all,
         B=batch,
+        # the transformations: the switches, the records, the transposed rotation, the K operand of equalize, the
+        # center slots and their notes
+        equalize=equalize,
+        center_k=center_k,
+        records=transform[2] if transform is not None else None,
+        had_t=transform[3] if transform is not None else None,
+        hk_base=hk_base,
+        c_base=c_base,
+        slot_base=slot_base,
         # trace-time constants
+        scale_rule=scale_rule,
         RANK=RANK,
+        comp=comp,
+        comp_blocks=comp_blocks,
+        directions=eig_directions(RANK),
+        urows=urows,
+        u_row_q=u_row_q,
+        u_row_k=u_row_k,
+        u_source=u_source,
         ustage=ustage,
-        d_stages=d_stages,
+        u_stages=u_stages,
+        d_layout=d_layout,
         sfv_tile=sfv_tile,
         # the TMA of q and k and the MMA slice that partitions their tiles
         tma_q=tma_q,
@@ -724,7 +1198,7 @@ def _qk_body(
     if warp == 16:
         _load_warp(
             st,
-            Int64(uT.iterator.toint()),
+            ut_addrs,
             (Int64(q_sfv.iterator.toint()), Int64(k_sfv.iterator.toint())),
         )
     elif warp == 17:
@@ -749,7 +1223,9 @@ def _qk_body(
     tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
     if warp == 0:
         cute.arch.dealloc_tmem(
-            cute.make_ptr(Float32, tm, cute.AddressSpace.tmem, assumed_align=16), 512
+            cute.make_ptr(Float32, tm, cute.AddressSpace.tmem, assumed_align=16),
+            tmem_columns,
+            arch=tmem_arch,
         )
 
 
@@ -783,7 +1259,8 @@ def qk_kernel(
     tma_q: cpasync.TmaInfo,
     tma_k: cpasync.TmaInfo,
     hadamard: cute.Tensor,
-    uT: cute.Tensor,
+    ut_q: cute.Tensor,
+    ut_k: Int64,
     q4: cute.Tensor,
     k4: cute.Tensor,
     q_sfv: cute.Tensor,
@@ -796,14 +1273,20 @@ def qk_kernel(
     lens: Int64,
     RANK: cutlass.Constexpr,
     LENS: cutlass.Constexpr,
+    SEPARATE: cutlass.Constexpr,
 ):
-    """Run the Q'/K' pass (_qk_body); with LENS the call has valid prefix lengths, int32 [B] at the address lens."""
+    """Run the Q'/K' pass (_qk_body) of RANK = (r_q, r_k).
+
+    * ut_q: the basis U^T of both terms; with SEPARATE that of the Q-residual term, and ut_k the address of that of
+      the K-residual term (else ut_k is not read).
+    * With LENS the call has valid prefix lengths, int32 [B] at the address lens.
+    """
     _qk_body(
         tiled_mma,
         tma_q,
         tma_k,
         hadamard,
-        uT,
+        (Int64(ut_q.iterator.toint()), ut_k) if SEPARATE else (Int64(ut_q.iterator.toint()),),
         q4,
         k4,
         q_sfv,
@@ -815,4 +1298,104 @@ def qk_kernel(
         ntiles,
         RANK,
         lens if LENS else None,
+        "max",
+    )
+
+
+@cute.kernel
+def qk_rule_kernel(
+    tiled_mma: cute.TiledMma,
+    tma_q: cpasync.TmaInfo,
+    tma_k: cpasync.TmaInfo,
+    hadamard: cute.Tensor,
+    ut_q: cute.Tensor,
+    ut_k: Int64,
+    q4: cute.Tensor,
+    k4: cute.Tensor,
+    q_sfv: cute.Tensor,
+    k_sfv: cute.Tensor,
+    gmax: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    ntiles: Int32,
+    lens: Int64,
+    RANK: cutlass.Constexpr,
+    LENS: cutlass.Constexpr,
+    SEPARATE: cutlass.Constexpr,
+    SCALE_RULE: cutlass.Constexpr,
+):
+    """Run the Q'/K' pass (_qk_body) of RANK = (r_q, r_k) with the scale rule SCALE_RULE of the head blocks, "band" or
+    "search" (qk_kernel is the pass of "max"). The other arguments as for qk_kernel."""
+    _qk_body(
+        tiled_mma,
+        tma_q,
+        tma_k,
+        hadamard,
+        (Int64(ut_q.iterator.toint()), ut_k) if SEPARATE else (Int64(ut_q.iterator.toint()),),
+        q4,
+        k4,
+        q_sfv,
+        k_sfv,
+        gmax,
+        S,
+        H,
+        NB,
+        ntiles,
+        RANK,
+        lens if LENS else None,
+        SCALE_RULE,
+    )
+
+
+@cute.kernel
+def qk_transform_kernel(
+    tiled_mma: cute.TiledMma,
+    tma_q: cpasync.TmaInfo,
+    tma_k: cpasync.TmaInfo,
+    hadamard: cute.Tensor,
+    ut_q: cute.Tensor,
+    ut_k: Int64,
+    q4: cute.Tensor,
+    k4: cute.Tensor,
+    q_sfv: cute.Tensor,
+    k_sfv: cute.Tensor,
+    gmax: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    ntiles: Int32,
+    lens: Int64,
+    records: Int64,
+    rotation_t: Int64,
+    RANK: cutlass.Constexpr,
+    LENS: cutlass.Constexpr,
+    SEPARATE: cutlass.Constexpr,
+    SCALE_RULE: cutlass.Constexpr,
+    EQUALIZE: cutlass.Constexpr,
+    CENTER_K: cutlass.Constexpr,
+):
+    """Run the Q'/K' pass (_qk_body) of RANK = (r_q, r_k) with the scale rule SCALE_RULE and the transformations of Q
+    and K, EQUALIZE, CENTER_K or both, from the records at the global address records (module docstring);
+    rotation_t: with EQUALIZE, the global address of the transposed Hadamard matrix. The other arguments as for
+    qk_kernel."""
+    _qk_body(
+        tiled_mma,
+        tma_q,
+        tma_k,
+        hadamard,
+        (Int64(ut_q.iterator.toint()), ut_k) if SEPARATE else (Int64(ut_q.iterator.toint()),),
+        q4,
+        k4,
+        q_sfv,
+        k_sfv,
+        gmax,
+        S,
+        H,
+        NB,
+        ntiles,
+        RANK,
+        lens if LENS else None,
+        SCALE_RULE,
+        (EQUALIZE, CENTER_K, records, rotation_t),
     )

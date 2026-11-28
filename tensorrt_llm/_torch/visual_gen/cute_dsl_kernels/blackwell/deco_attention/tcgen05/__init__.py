@@ -14,13 +14,15 @@
 # limitations under the License.
 """DeCo-Attention on the tcgen05 targets (B200 sm_100a, GB300 sm_103a, Rubin sm_107a).
 
-    workspace_size(b, s, h, device, pv, rank)             # bytes of the caller's workspace for one call
-    prepare(q, k, v, workspace, pv, rank, rows)           # BF16 q, k, v [B, S, H, 128] -> the buffers of the call
-    attention(buffers, o, pv, rank)                       # the buffers -> BF16 o [B, S, H, 128]
+    workspace_size(b, s, h, device, pv, rank, bases)      # bytes of the caller's workspace for one call
+    prepare(q, k, v, workspace, pv, ...)                  # BF16 q, k, v [B, S, H, 128] -> the buffers of the call
+    attention(buffers, o, pv, rank, ...)                  # the buffers -> BF16 o [B, S, H, 128]
+    basis(buffers, pv, bases)                             # the compensation basis of the call
 
 Kernels:
     * One kernel, of PV format "fp8" (fp8pv/): NVFP4 QK and FP8 PV with V smoothing.
-    * Compensation rank 32 on every target; targets with the K = 128 block-scaled MMA also offer rank 64 (qk.ranks).
+    * rank is the pair (r_q, r_k) of the compensation channels of the two terms, r_q + r_k at most
+      max_comp_channels(): 64, and 128 on the targets with the K = 128 block-scaled MMA.
 Files (what does not depend on the PV format is at this level):
     ptx.py   the inline PTX that the family alone issues
     tmem.py  tensor-memory loads and stores of register values
@@ -35,19 +37,24 @@ Calls:
     * The callers' arguments are checked by deco_attention.api, not here.
 """
 
+import functools
+
 import torch
 
-from ..runtime import carve, num_sms, workspace_bytes
+from .. import target
+from ..constants import COMP_CHANNELS
+from ..inputs import Compensation, Transforms
+from ..runtime import Basis, carve, check_caller_basis, num_sms, workspace_bytes
 from . import fp8pv
-from .qk import ranks
 
 __all__ = [
     "DEFAULT_PV",
     "attention",
+    "basis",
+    "max_comp_channels",
     "min_seq_len",
     "prepare",
     "pv_formats",
-    "ranks",
     "workspace_size",
 ]
 
@@ -66,9 +73,18 @@ def min_seq_len(pv: str) -> int:
     return 1
 
 
-def workspace_size(b: int, s: int, h: int, device: torch.device | str, pv: str, rank: int) -> int:
-    """Return the bytes of the workspace of one call of this shape, PV format and compensation rank on `device`."""
-    return workspace_bytes(_KERNELS[pv].layout(b, s, h, rank, num_sms(device)))
+@functools.cache
+def max_comp_channels() -> int:
+    """Return the most compensation channels r_q + r_k of the compile target: those of the 256-channel QK build with
+    the K = 128 instruction, else those of the 192-channel build."""
+    return 2 * COMP_CHANNELS if target.has_k128_fp4_mma() else COMP_CHANNELS
+
+
+def workspace_size(
+    b: int, s: int, h: int, device: torch.device | str, pv: str, rank: tuple[int, int], bases: str
+) -> int:
+    """Return the bytes of the workspace of one call of this shape, PV format, rank and bases on `device`."""
+    return workspace_bytes(_KERNELS[pv].layout(b, s, h, rank, bases, num_sms(device)))
 
 
 def prepare(
@@ -77,19 +93,26 @@ def prepare(
     v: torch.Tensor,
     workspace: torch.Tensor,
     pv: str,
-    rank: int,
-    rows: torch.Tensor,
-    valid_seq_lens: torch.Tensor | None = None,
-    map_rows: bool = False,
+    valid_seq_lens: torch.Tensor | None,
+    comp: Compensation,
+    scale_rule: str,
+    transforms: Transforms,
 ) -> dict[str, torch.Tensor]:
     """Carve the buffers of a call from the workspace and fill the operands from raw q, k, v, on the current stream.
 
-    rows, valid_seq_lens, map_rows: see fp8pv.prep.run (rows, lens, map_rows). Returns the buffers, name -> tensor.
+    * valid_seq_lens, comp: the valid prefix lengths and the compensation of the call (fp8pv.prep.run).
+    * scale_rule: the rule for the scale of a head block of Q' and K' (constants.SCALE_RULES).
+    * transforms: the transformations of Q and K (inputs.Transforms).
+    * A caller's basis has the directions of the basis of these buffers, and one that overlaps the bytes of the
+      call in the workspace is that basis (runtime.check_caller_basis). Returns the buffers, name -> tensor.
     """
     b, s, h, _ = q.shape
     kernel = _KERNELS[pv]
-    buffers = carve(workspace, kernel.layout(b, s, h, rank, num_sms(q.device)))
-    kernel.prepare(q, k, v, rows, buffers, rank, valid_seq_lens, map_rows)
+    layout = kernel.layout(b, s, h, comp.rank, comp.bases, num_sms(q.device))
+    buffers = carve(workspace, layout)
+    if comp.basis is not None:
+        check_caller_basis(comp.basis, kernel.basis(buffers, comp.bases), workspace, layout)
+    kernel.prepare(q, k, v, buffers, valid_seq_lens, comp, scale_rule, transforms)
     return buffers
 
 
@@ -97,9 +120,17 @@ def attention(
     buffers: dict[str, torch.Tensor],
     o: torch.Tensor,
     pv: str,
-    rank: int,
-    valid_seq_lens: torch.Tensor | None = None,
+    rank: tuple[int, int],
+    valid_seq_lens: torch.Tensor | None,
+    rescale_threshold: float,
 ) -> None:
     """Run the attention on the buffers of prepare into BF16 o [B, S, H, 128], on the current stream. valid_seq_lens:
-    the lengths that prepare took."""
-    _KERNELS[pv].attention(buffers, o, rank, valid_seq_lens)
+    the lengths that prepare took; rescale_threshold: one of constants.RESCALE_THRESHOLDS[pv]."""
+    _KERNELS[pv].attention(buffers, o, rank, valid_seq_lens, rescale_threshold)
+
+
+def basis(buffers: dict[str, torch.Tensor], pv: str, bases: str) -> Basis:
+    """Return the compensation basis that the eigensolver of prepare left in the buffers of a call: FP32
+    [B, H, eig_directions(rank), 128] in the rotated frame, the leading direction last; one tensor, or with bases
+    "separate" the two (basis of the Q-residual term, basis of the K-residual term)."""
+    return _KERNELS[pv].basis(buffers, bases)
