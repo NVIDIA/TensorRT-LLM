@@ -7,7 +7,8 @@
 (``config`` for ``trtllm-serve disaggregated -c``, the ``context`` and ``generation`` servers'
 ``--config``). The flow serves it, reading only each side's ``num_instances`` and a server's
 ``tensor_parallel_size`` x ``pipeline_parallel_size`` (:func:`plan_layout`), and holds the
-unit's benchmark through the proxy (``harness/disagg_driver.py``) to the accuracy gate's floor.
+unit's benchmark, run through the proxy (``harness/disagg_driver.py``) under the unit's
+``accuracy.evaluator_kwargs``, to its statistical floor (``checks/eval_score.py``).
 
 **A test** (``test``): a pytest the run writes beside the tree's own, run from the tree's
 pytest root; with ``nodes > 1`` one process per node of one allocation
@@ -19,7 +20,6 @@ from __future__ import annotations
 
 import shlex
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -35,21 +35,20 @@ from ..spec.task_schema import (
     DISAGG_SIDES,
     gpus_per_node,
     parse_parallel_segment,
-    resolve_per_unit,
 )
-from . import check_config
+from ..spec.verification import RUN_DISAGG, RUN_PYTEST, Test
+from . import check_config, pytest_node
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
+from .eval_score import eval_arguments, judge_score
 from .harness import disagg_driver, workload_io
+from .pytest_node import ARTIFACTS_ENV, PYTEST_ROOT_MARKERS, pytest_root
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
 GATE_NAME = "disagg"
-#: Where the test keeps what it writes for after it: under the gate's work directory, never
-#: in the read-only snapshot it runs in, which is pruned once the gate ends.
-ARTIFACTS_ENV = "MV2FLOW_GATE_ARTIFACTS"
 #: Seconds the test may take: two engines to start and a benchmark to score.
 DEFAULT_TIMEOUT_S = 7200
-#: What marks the directory pytest runs a test from, as pytest itself decides its root.
-PYTEST_ROOT_MARKERS: tuple[str, ...] = ("pytest.ini",)
+#: What a passing report says the tests did.
+PASSED_AS = "passed through the disaggregated hop"
 #: The client of a deployment, run under the measured tree's interpreter.
 DISAGG_DRIVER = Path(__file__).resolve().parent / "harness" / "disagg_driver.py"
 #: A side's role in its servers' names, and as ``trtllm-serve --server_role`` takes it.
@@ -136,31 +135,44 @@ class DisaggSpec:
             raise ValueError("disagg nodes must be positive")
 
     @classmethod
-    def from_task(cls, task_data: Mapping[str, Any]) -> "DisaggSpec | None":
-        block = (task_data.get(ACCURACY_FIELD) or {}).get("disagg")
-        if not isinstance(block, Mapping):
+    def from_deployment(
+        cls,
+        deployment: Mapping[str, str],
+        *,
+        timeout: int = DEFAULT_TIMEOUT_S,
+        env: Mapping[str, str] | None = None,
+        node_gpus: int | None = None,
+    ) -> "DisaggSpec | None":
+        """Build a stated-deployment ``DisaggSpec`` from ``{config, context, generation}``."""
+        config, *files = (deployment.get(key) for key in DISAGG_FILES)
+        if not config or not all(files):
             return None
-        config, *files = (block.get(key) for key in DISAGG_FILES)
         fleets = check_config.load_llm_api_options(config)
         sides = []
-        for role, key, path in zip(ROLES, DISAGG_SIDES, files if config and all(files) else ()):
+        for role, key, path in zip(ROLES, DISAGG_SIDES, files):
             own = check_config.load_llm_api_options(path)
             ranks = int(own.get("tensor_parallel_size") or 1)
             ranks *= int(own.get("pipeline_parallel_size") or 1)
             instances = int((fleets.get(f"{key}_servers") or {}).get("num_instances") or 1)
             sides.append(Side(role, str(path), instances, ranks))
-        if not block.get("test") and not sides:
-            return None
         return cls(
-            test=str(block.get("test") or ""),
-            sides=tuple(sides) if not block.get("test") else (),
-            config=str(config or ""),
-            devices=int(block["devices"]) if block.get("devices") else None,
-            timeout=int(block.get("timeout") or DEFAULT_TIMEOUT_S),
-            env={str(k): str(v) for k, v in (block.get("env") or {}).items()},
+            sides=tuple(sides),
+            config=str(config),
+            timeout=int(timeout or DEFAULT_TIMEOUT_S),
+            env={str(k): str(v) for k, v in (env or {}).items()},
+            node_gpus=node_gpus,
+        )
+
+    @classmethod
+    def from_test(cls, test: Test, task_data: Mapping[str, Any]) -> "DisaggSpec | None":
+        """Build a ``DisaggSpec`` for a ``verification.Test`` carrying a ``deployment``."""
+        if test.runner != RUN_DISAGG or not test.deployment:
+            return None
+        return cls.from_deployment(
+            test.deployment,
+            timeout=test.timeout,
+            env=test.env,
             node_gpus=gpus_per_node(task_data),
-            nodes=int(block.get("nodes", 1)),
-            tests=tuple(block.get("tests") or ()),
         )
 
     @property
@@ -197,83 +209,34 @@ class DisaggSpec:
         return min(count, self.node_gpus) if self.node_gpus else count
 
 
-def job_span(task_data: Mapping[str, Any], gate: str, engine_nodes: int) -> tuple[int, bool]:
-    """``(nodes, lead)``: the nodes a check of ``gate`` holds, and whether the lead runs it.
+def job_span(task_data: Mapping[str, Any], test: Test, engine_nodes: int) -> tuple[int, bool]:
+    """``(nodes, lead)``: the nodes a check of ``test`` holds, and whether the lead runs it.
 
     The lead runs what starts a world across nodes: an engine wider than one
-    (``engine_nodes``) or a deployment's servers; a test is a process on each node.
+    (``engine_nodes``) or a deployment's servers; a per-node gang pytest
+    (``test.gang_nodes > 1``) runs one process on each node.
     """
-    if gate != GATE_NAME:
-        return engine_nodes, engine_nodes > 1
-    spec = DisaggSpec.from_task(task_data)
-    nodes = spec.job_nodes() if spec else 1
-    return nodes, bool(spec and spec.served and nodes > 1)
-
-
-def pytest_root(repo: str | Path, test_file: str) -> Path:
-    """Where pytest runs ``test_file`` from: the nearest directory above it marked as a root.
-
-    The tree's integration tests run from the directory holding their
-    ``pytest.ini``, as CI runs them; without one, the repository root.
-    """
-    root = Path(repo)
-    here = (root / test_file).parent
-    while here != root and root in here.parents:
-        if any((here / marker).is_file() for marker in PYTEST_ROOT_MARKERS):
-            return here
-        here = here.parent
-    return root
+    if test.runner == RUN_DISAGG:
+        spec = DisaggSpec.from_test(test, task_data)
+        nodes = spec.job_nodes() if spec else 1
+        return nodes, nodes > 1
+    if test.runner == RUN_PYTEST and test.gang_nodes > 1:
+        return test.gang_nodes, False
+    return engine_nodes, engine_nodes > 1
 
 
 def disagg_command(
     environment: RunEnvironment, repo: str | Path, spec: DisaggSpec, report: Path
 ) -> str:
     """``spec.test`` under the tree's interpreter, from its pytest root, with a JUnit report."""
-    file, _, rest = spec.test.partition("::")
-    root = pytest_root(repo, file)
-    node = (Path(repo) / file).relative_to(root).as_posix() + (f"::{rest}" if rest else "")
-    # What the test keeps goes beside the report, outside the snapshot it runs in (pruned after).
-    kept = {ARTIFACTS_ENV: str(report.parent / f"{report.stem}.artifacts")}
-    env = with_mode(
-        replace(environment, env={**environment.env, **kept, **(spec.env or {})}), MODE_REQUIRE
-    )
-    argv = ["-m", "pytest", node, "-q", "-rs", "-p", "no:cacheprovider"]
-    if spec.nodes == 1:
-        argv.append(f"--junitxml={report}")
-        return f"cd {shlex.quote(str(root))} && {env.python_command(argv, single_process=True)}"
-    report_arg = (
-        shlex.quote(str(report.with_suffix("")))
-        + '.node"${MV2FLOW_JOB_NODE_RANK:?missing gang node rank}".xml'
-    )
-    invocation = shlex.join(argv) + f" --junitxml={report_arg}"
-    return (
-        f'test "${{MV2FLOW_JOB_NODES:?missing gang node count}}" -eq {spec.nodes} && '
-        f"cd {shlex.quote(str(root))} && {env.python_command(invocation, single_process=True)}"
+    return pytest_node.node_command(
+        environment, repo, spec.test, report, env=spec.env, nodes=spec.nodes
     )
 
 
 def judge_report(report: Path) -> tuple[bool, str]:
     """Whether every test the JUnit ``report`` holds passed, and what it says."""
-    try:
-        cases = ET.parse(report).getroot().iter("testcase")
-    except (OSError, ET.ParseError) as exc:
-        return False, f"no test report ({exc})"
-    passed, problems = 0, []
-    for case in cases:
-        name = f"{case.get('classname', '')}::{case.get('name', '')}".strip(":")
-        outcome = next(
-            (child for child in case if child.tag in ("failure", "error", "skipped")), None
-        )
-        if outcome is None:
-            passed += 1
-            continue
-        message = (outcome.get("message") or outcome.text or "").strip().splitlines()
-        problems.append(f"{name} {outcome.tag}: {message[0][:200] if message else ''}")
-    if problems:
-        return False, "; ".join(problems)
-    if not passed:
-        return False, "the node id selected no test"
-    return True, f"{passed} test(s) passed through the disaggregated hop"
+    return pytest_node.judge_report(report, PASSED_AS)
 
 
 # ------------------------------------------------------------ a stated deployment
@@ -288,29 +251,40 @@ def run_served_gate(
     runner: ShellRunner,
     unit: str | None,
     member: str | None,
+    test: Test | None = None,
 ) -> GateResult:
-    """Serve the stated deployment; hold the unit's benchmark through its proxy to its floor.
+    """Serve the stated deployment; hold the test's benchmark through its proxy to its floor.
 
     The job's script starts each server as one world (a step across nodes, an engine's own
     launch on one), then the client (``steps.servers_script``).
     """
-    from .accuracy import judge_score, resolve_model_key, resolve_reference
+    from .accuracy import reference_discriminators, resolve_model_key, resolve_reference
 
     _verdict = verdict_factory(inspect_tree(task_data))
     accuracy = dict(task_data.get(ACCURACY_FIELD) or {})
-    benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or "gsm8k")
-    arguments = [str(arg) for arg in resolve_per_unit(accuracy, "benchmark_args", unit) or ()]
-    common: dict[str, Any] = dict(name=GATE_NAME, member=member)
+    benchmark = str(test.benchmarks[0] if test and test.benchmarks else "gsm8k")
+    protocol = {
+        **dict(accuracy.get("evaluator_kwargs") or {}),
+        **dict((test.evaluator_kwargs if test else None) or {}),
+    }
+    arguments = eval_arguments(protocol)
+    gate_name = test.gate if test is not None else GATE_NAME
+    common: dict[str, Any] = dict(name=gate_name, member=member)
     try:  # before any load
+        discriminators = reference_discriminators(task_data, unit) if unit else None
         reference = resolve_reference(
-            task_data, model_key=resolve_model_key(task_data, unit), unit=unit
+            task_data,
+            model_key=resolve_model_key(task_data, unit),
+            discriminators=discriminators,
+            unit=unit,
+            benchmark=benchmark,
         )
         nodes, layout = spec.placement()
     except (KeyError, OSError, TypeError, ValueError) as exc:
         return _verdict(passed=False, detail=f"nothing was loaded: {exc}", **common)
     common["reference"] = reference
     model = str(task_data["checkpoint_path"])
-    directory = gate_workdir(Path(workdir) / f"disagg.{unit or 'unit'}.{member or 'member'}")
+    directory = gate_workdir(Path(workdir) / f"{gate_name}.{unit or 'unit'}.{member or 'member'}")
     env = with_mode(replace(environment, env={**environment.env, **(spec.env or {})}), MODE_REQUIRE)
     worlds = []
     for side in spec.sides:
@@ -367,7 +341,8 @@ def run_served_gate(
     if result.returncode != 0:
         return _verdict(passed=False, detail=f"{served}; {benchmark} through it: {why}", **ran)
     said = f"{served}; {benchmark} through the proxy measured"
-    return _verdict(**judge_score(accuracy, unit, benchmark, reference, combined, said=said), **ran)
+    judged = judge_score(benchmark, reference, combined, evaluator_kwargs=protocol, said=said)
+    return _verdict(**judged, **ran)
 
 
 def run_disagg_gate(
@@ -379,20 +354,20 @@ def run_disagg_gate(
     unit: str | None = None,
     member: str | None = None,
     spec: DisaggSpec | None = None,
+    test: Test | None = None,
 ) -> GateResult:
     """Score a benchmark across the hop: the stated deployment, or the tree's own test."""
     _verdict = verdict_factory(inspect_tree(task_data))
-    spec = spec or DisaggSpec.from_task(task_data)
+    spec = spec or (DisaggSpec.from_test(test, task_data) if test is not None else None)
     environment = replace(environment, nodes=1)  # the gate places its own servers
+    gate_name = test.gate if test is not None else GATE_NAME
     if spec is None:
         return _verdict(
-            name=GATE_NAME,
+            name=gate_name,
             member=member,
             passed=False,
-            detail="`accuracy.disagg` states nothing to run: state the deployment (`context` "
-            "and `generation`), which the flow serves and scores itself, or write the target's "
-            "disaggregated accuracy test beside the tree's own (the tests that serve through "
-            "`trtllm-serve disaggregated`) and name its node id in `accuracy.disagg.test`",
+            detail="no disaggregated deployment stated: declare `deployment: {config, context, "
+            "generation}` or a `pytest:` test under `verification.disagg`",
         )
     if spec.served:
         return run_served_gate(
@@ -403,6 +378,7 @@ def run_disagg_gate(
             runner=runner,
             unit=unit,
             member=member,
+            test=test,
         )
     if spec.tests:
         parts = []
@@ -419,53 +395,29 @@ def run_disagg_gate(
             parts.append(part)
             if not part.passed:
                 break
-        last = parts[-1]
-        return replace(
-            last,
-            command="\n".join(part.command for part in parts),
-            duration_s=sum(part.duration_s for part in parts),
-            stdout_tail="\n".join("\n".join(part.stdout_tail for part in parts).splitlines()[-40:]),
-            detail=f"{len(parts)}/{len(spec.tests)} native jobs: "
-            + "; ".join(part.detail for part in parts),
-        )
-    directory = gate_workdir(workdir)
-    report = directory / f"disagg.{unit or 'unit'}.{member or 'member'}.xml"
-    reports = (
-        [report.with_name(f"{report.stem}.node{rank}.xml") for rank in range(spec.nodes)]
-        if spec.nodes > 1
-        else [report]
-    )
-    for item in reports:
-        item.unlink(missing_ok=True)
-    command = disagg_command(environment, task_data["trtllm_repo_path"], spec, report)
-    started = time.monotonic()
-    result = runner(command, None, spec.timeout)
-    combined = result.stdout + result.stderr
-    ran = dict(
+        return pytest_node.combine(parts, len(spec.tests), "native jobs")
+    return pytest_node.run_node(
+        environment,
         name=GATE_NAME,
+        node=spec.test,
+        task_data=task_data,
+        workdir=workdir,
+        timeout=spec.timeout,
+        runner=runner,
+        env=spec.env,
+        nodes=spec.nodes,
+        unit=unit,
         member=member,
-        command=command,
-        duration_s=time.monotonic() - started,
-        stdout_tail="\n".join(combined.splitlines()[-40:]),
+        passed_as=PASSED_AS,
+        what="native disagg command",
     )
-    if result.infrastructure:
-        return _verdict(**lost_session(result), **ran)
-    if result.timed_out:
-        return _verdict(passed=False, detail=ended_early(result, spec.timeout), **ran)
-    if result.returncode != 0:
-        return _verdict(
-            passed=False, detail=f"native disagg command exited {result.returncode}", **ran
-        )
-    outcomes = [judge_report(item) for item in reports]
-    passed = all(ok for ok, _ in outcomes)
-    detail = "; ".join(
-        f"node{rank}: {said}" if spec.nodes > 1 else said for rank, (_, said) in enumerate(outcomes)
-    )
-    return _verdict(passed=passed, detail=f"{spec.test}: {detail}", **ran)
 
 
 __all__ = [
+    "ARTIFACTS_ENV",
     "DEFAULT_TIMEOUT_S",
+    "PASSED_AS",
+    "PYTEST_ROOT_MARKERS",
     "GATE_NAME",
     "DisaggSpec",
     "disagg_command",

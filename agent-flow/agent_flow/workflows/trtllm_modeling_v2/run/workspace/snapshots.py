@@ -12,7 +12,7 @@ past its commit, a snapshot no lease holds is removed.
 
 What a check imported is read from what its commands print
 (:class:`CheckTree`): the spool's resolve hook names the file each process
-imported the package from, and the engine driver names it once per engine. A
+imported the package from (a pytest check runs uncaptured for it to reach the output). A
 file inside a snapshot names that snapshot's commit; any other names a tree no
 commit pins. A check whose commands imported more than one tree, or a tree no
 commit pins, is void. What each process imported of the tree is read too (the

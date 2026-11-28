@@ -17,14 +17,22 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import disagg, serve
+from agent_flow.workflows.trtllm_modeling_v2.checks import (
+    check_runtime,
+    disagg,
+    e2e,
+    pytest_node,
+    serve,
+    user_tests,
+)
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute import placement, provenance, sessions
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute import scheduler as sched
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import datasets, preflight
+from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
-from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema, verification
 
 ALLOCATION = "4242"
 A, B = "nodeA", "nodeB"
@@ -71,9 +79,16 @@ def site(tmp_path, monkeypatch):
             "sessions": [gates],
         },
         "accuracy": {
-            "benchmark": "gsm8k",
             "reference_yaml": str(tmp_path / "reference.yaml"),
-            "disagg": _deployment(tmp_path / "stated", env={"UCX_TLS": "^cuda_ipc"}, timeout=120),
+        },
+        "verification": {
+            "disagg": {
+                "e2e": {
+                    "deployment": _deployment(tmp_path / "stated"),
+                    "env": {"UCX_TLS": "^cuda_ipc"},
+                    "timeout": 120,
+                }
+            }
         },
     }
 
@@ -106,16 +121,48 @@ def _lines(directory):
     return [*(line for line in script if line.startswith("{ ")), script[script.index("rc=$?") - 1]]
 
 
+def _disagg_test(task, name="e2e", world=4):
+    return next(
+        t for t in contract_mod.run_tests(task, world) if t.feature == "disagg" and t.name == name
+    )
+
+
 def test_a_spec_states_a_deployment_and_its_layout(site):
-    stated = site["accuracy"]["disagg"]
+    disagg_test = _disagg_test(site)
     # A side's servers are the proxy's config's, a server's ranks its own options'.
-    assert disagg.DisaggSpec.from_task(site).servers() == [("ctx0", 2), ("ctx1", 2), ("gen0", 4)]
-    test = "tests/x/test_y.py::TestZ::test_hop"
-    kept = disagg.DisaggSpec.from_task({"accuracy": {"disagg": {"test": test, "nodes": 2}}})
-    assert not kept.served and kept.job_nodes() == 2
+    assert disagg.DisaggSpec.from_test(disagg_test, site).servers() == [
+        ("ctx0", 2),
+        ("ctx1", 2),
+        ("gen0", 4),
+    ]
+    gang = verification.declared(
+        "disagg",
+        "two_node_hop",
+        {
+            "purpose": "2-node disagg pytest",
+            "pytest": "tests/x/test_y.py::TestZ::test_hop",
+            "devices": 4,
+            "nodes": 2,
+        },
+    )
+    assert gang.gang_nodes == 2 and disagg.job_span(site, gang, 1) == (2, False)
     found: list[str] = []
-    task_schema._validate_disagg({**stated, "test": test}, found)
-    assert "state one of the two" in found[0]
+    verification.validate(
+        {
+            "verification": {
+                "disagg": {
+                    "e2e": {
+                        "deployment": site["verification"]["disagg"]["e2e"]["deployment"],
+                        "pytest": "tests/x/test_y.py::TestZ::test_hop",
+                    }
+                }
+            }
+        },
+        found,
+        features={"core", "disagg"},
+        member_error=lambda _: None,
+    )
+    assert any("both 'deployment' and 'pytest'" in msg for msg in found), found
 
     def layout(*servers, per_node=4):
         nodes, slots = disagg.plan_layout(servers, per_node)
@@ -152,22 +199,30 @@ def test_the_specs_of_the_real_cases_load_and_size_their_checks_jobs(
         sessions=[{"name": "gates", "spool": str(spool), "role": "gates", "nodes": max(nodes, 4)}],
     )
     _deployment(task_file.parent / "stated", ctx, gen)  # named relative to the spec
-    spec["accuracy"]["disagg"] = {key: f"stated/{key}.yaml" for key in task_schema.DISAGG_FILES}
+    spec["verification"] = {
+        "disagg": {
+            "e2e": {
+                "deployment": {key: f"stated/{key}.yaml" for key in task_schema.DISAGG_FILES},
+            }
+        }
+    }
     task_file.write_text(yaml.safe_dump(spec))
     task = task_schema.load_and_validate_task_yaml(task_file)
     runner = CheckRunner.__new__(CheckRunner)
     runner.workflow = SimpleNamespace(_gate_env=lambda: resolve_environment(task, world_size=4))
     wide = runner._member_env(members[0]).nodes
-    assert disagg.job_span(task, "disagg", wide) == (nodes, lead)
-    assert disagg.job_span(task, "boot", wide) == ((4, True) if wide > 1 else (1, False))
+    disagg_test = _disagg_test(task)
+    boot_test = verification.Test("boot", "core", "boot", verification.RUN_DATASETS)
+    assert disagg.job_span(task, disagg_test, wide) == (nodes, lead)
+    assert disagg.job_span(task, boot_test, wide) == ((4, True) if wide > 1 else (1, False))
     assert preflight.check_disagg_placement(task, 4) == []
     # A stated deployment reads the staged data of its own benchmark.
     staged = {"gsm8k": "/staged/gsm8k", "mmlu": "/staged/mmlu"}
     monkeypatch.setattr(datasets, "status", lambda workspace: staged)
     monkeypatch.setattr(datasets, "wait", lambda workspace, name: staged[name])
     runner.workspace = tmp_path
-    own = {**task["accuracy"], "benchmark": {"default": "gsm8k", "disagg": "mmlu"}}
-    given = runner._with_dataset({**task, "accuracy": own}, "disagg", "disagg")
+    mmlu_test = replace(disagg_test, datasets=("mmlu",))
+    given = runner._with_dataset(task, "disagg", mmlu_test)
     assert given["accuracy"]["dataset_path"] == "/staged/mmlu"
 
 
@@ -424,15 +479,19 @@ def test_a_member_across_two_nodes_is_one_world_and_serve_is_judged_as_on_one(si
 
 
 def test_a_deployment_on_one_node_is_served_and_scored_with_no_lead_and_no_step(site, tmp_path):
-    stated = _deployment(tmp_path / "one", (1, 1), (2, 1), timeout=120)
-    task = {**site, "accuracy": {**site["accuracy"], "disagg": stated}}
-    assert disagg.DisaggSpec.from_task(task).device_count("tep4") == 3
+    stated = _deployment(tmp_path / "one", (1, 1), (2, 1))
+    task = {
+        **site,
+        "verification": {"disagg": {"e2e": {"deployment": stated, "timeout": 120}}},
+    }
+    test = _disagg_test(task)
+    assert disagg.DisaggSpec.from_test(test, task).device_count("tep4") == 3
     environment = replace(resolve_environment(task, world_size=4), kind="local")
 
-    def gate(said, code=0, task=task):
+    def gate(said, code=0, task=task, test=test):
         return disagg.run_disagg_gate(
             environment, task_data=task, workdir=tmp_path / "gates",
-            runner=_answers(said, code), unit="disagg", member="tep4",
+            runner=_answers(said, code), unit="disagg", member="tep4", test=test,
         )  # fmt: skip
 
     result = gate(UP + "lm-eval gsm8k average accuracy: 41.70\n")
@@ -440,7 +499,7 @@ def test_a_deployment_on_one_node_is_served_and_scored_with_no_lead_and_no_step(
     assert result.detail.startswith("2 server(s) on 1 node(s) and their proxy came up; ")
     assert (result.measured, result.reference, result.samples) == (41.70, 41.77, 1319)
     # Each server on devices of the job's own with its role, an engine's launch above one rank.
-    directory = tmp_path / "gates" / "disagg.disagg.tep4"
+    directory = tmp_path / "gates" / "e2e.disagg.tep4"
     ctx, gen, client = _lines(directory)
     assert "srun --" not in ctx + gen + client
     assert ctx.startswith("{ CUDA_VISIBLE_DEVICES=${DEVICES[0]} ") and " mpirun " not in ctx
@@ -454,16 +513,22 @@ def test_a_deployment_on_one_node_is_served_and_scored_with_no_lead_and_no_step(
     config = yaml.safe_load((directory / "options.gen.yaml").read_text())
     assert config == dict(tensor_parallel_size=2, moe_expert_parallel_size=2, modeling_v2="require")
     assert "--servers ctx0,gen0 --timeout 120 gsm8k'" in client
-    # The unit's protocol reaches the evaluator, and its score pattern picks the row.
+    # The unit's protocol reaches the evaluator as trtllm-eval's flags; the score is the last
+    # lm-eval line, the average.
     turns = {
         **task["accuracy"],
-        "benchmark_args": ["--apply_chat_template", "--fewshot_as_multiturn"],
-        "score_pattern": r"lm-eval gsm8k flexible-extract accuracy:\s*([0-9.]+)",
+        "evaluator_kwargs": {
+            "apply_chat_template": True,
+            "fewshot_as_multiturn": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
     }
     rows = "lm-eval gsm8k flexible-extract accuracy: 41.60\nlm-eval gsm8k average accuracy: 41.70\n"
     row = gate(UP + rows, task={**task, "accuracy": turns})
-    assert row.passed and row.measured == 41.60, row.detail
-    assert _lines(directory)[-1].endswith(" gsm8k --apply_chat_template --fewshot_as_multiturn'")
+    assert row.passed and row.measured == 41.70, row.detail
+    client = _lines(directory)[-1]
+    assert " gsm8k --apply_chat_template --fewshot_as_multiturn --chat_template_kwargs " in client
+    assert '{"enable_thinking": false}' in client
     # What the client says of servers that did not come up, or of a benchmark that failed, is the verdict.
     why = "ctx0 ended with 3 before every server was healthy; its log says: Failed to create NIXL backend"
     down = gate(
@@ -484,7 +549,8 @@ def test_a_deployment_on_one_node_is_served_and_scored_with_no_lead_and_no_step(
 
 
 def test_a_deployment_across_nodes_is_one_step_a_server_run_once_by_the_lead(site, tmp_path):
-    assert disagg.DisaggSpec.from_task(site).device_count("tep4") is None
+    test = _disagg_test(site)
+    assert disagg.DisaggSpec.from_test(test, site).device_count("tep4") is None
     result = disagg.run_disagg_gate(
         replace(resolve_environment(site, world_size=4), nodes=1),
         task_data=site,
@@ -492,10 +558,11 @@ def test_a_deployment_across_nodes_is_one_step_a_server_run_once_by_the_lead(sit
         runner=_answers(UP + "lm-eval gsm8k average accuracy: 41.70\n"),
         unit="disagg",
         member="tep4",
+        test=test,
     )
     assert result.passed, result.detail
     assert result.detail.startswith("3 server(s) on 2 node(s) and their proxy came up; ")
-    directory = tmp_path / "gates" / "disagg.disagg.tep4"
+    directory = tmp_path / "gates" / "e2e.disagg.tep4"
     assert "run once by the session's lead" in (directory / "servers.sh").read_text()
     *servers, client = _lines(directory)
     # A step a server: its ranks, its node, its devices there, and its role in every rank.
@@ -526,7 +593,7 @@ def test_a_deployment_across_nodes_is_one_step_a_server_run_once_by_the_lead(sit
 
 def test_preflight_refuses_what_no_gates_session_holds(site):
     held = site["environment"]["sessions"][0]
-    wide = {**site, "features": [], "members": ["tep4", "dep16"]}
+    wide = {**site, "features": [], "members": ["tep4", "dep16"], "verification": {}}
     wide["environment"] = {**site["environment"], "sessions": []}
     with pytest.raises(preflight.PreflightError, match="needs 4 nodes in one session_spool"):
         preflight.check_disagg_placement(wide, 16)
@@ -534,9 +601,410 @@ def test_preflight_refuses_what_no_gates_session_holds(site):
     assert preflight.check_disagg_placement(wide, 16) == []
     with pytest.raises(preflight.PreflightError, match="`tep6` is one world of 6 ranks"):
         preflight.check_disagg_placement({**wide, "members": ["tep6"]}, 6)
-    variant = {**site, "features": [], "variants": {"wide": {"members": ["tep16"]}}}
+    variant = {
+        **site,
+        "features": [],
+        "verification": {},
+        "variants": {"wide": {"members": ["tep16"]}},
+    }
     with pytest.raises(preflight.PreflightError, match="needs 4 nodes in one session_spool"):
         preflight.check_disagg_placement(variant, 4)
     short = {**site, "environment": {**site["environment"], "sessions": []}}
     with pytest.raises(preflight.PreflightError, match="needs 2 nodes in one session_spool"):
         preflight.check_disagg_placement(short, 4)
+    # Explicit wide members and oversized module tests in verification are checked too.
+    wide_custom = {
+        **site,
+        "features": [],
+        "verification": {
+            "core": {
+                "wide_ctx": {
+                    "purpose": "wide check",
+                    "pytest": "tests/x/test_w.py::test_a",
+                    "members": ["tep16"],
+                }
+            }
+        },
+    }
+    with pytest.raises(preflight.PreflightError, match="needs 4 nodes in one session_spool"):
+        preflight.check_disagg_placement(wide_custom, 4)
+    oversized_module = {
+        **site,
+        "features": [],
+        "verification": {
+            "core": {
+                "too_wide": {
+                    "purpose": "module test wider than a node",
+                    "pytest": "tests/x/test_m.py::test_a",
+                    "devices": 8,
+                }
+            }
+        },
+    }
+    with pytest.raises(preflight.PreflightError, match="more than the 4 devices one node holds"):
+        preflight.check_disagg_placement(oversized_module, 4)
+    # Custom multi-node per-node gang disagg pytest under verification.disagg without e2e.
+    custom_gang = {
+        **site,
+        "features": ["disagg"],
+        "environment": {**site["environment"], "sessions": [{**held, "nodes": 2}]},
+        "verification": {
+            "disagg": {
+                "two_node_hop": {
+                    "purpose": "verify KV hand-off across 2 nodes",
+                    "pytest": "tests/x/test_d.py::test_hop",
+                    "devices": 4,
+                    "nodes": 2,
+                    "stage": "delivery",
+                }
+            }
+        },
+    }
+    assert any("2 node(s)" in n for n in preflight.check_disagg_placement(custom_gang, 4))
+    tests = contract_mod.run_tests(custom_gang, 4)
+    assert [
+        (t.feature, t.name, t.runner, t.gang_nodes) for t in tests if t.feature == "disagg"
+    ] == [("disagg", "two_node_hop", verification.RUN_PYTEST, 2)]
+
+
+def test_e2e_and_whole_model_pytest_launch_the_engine_world_by_topology(site, tmp_path):
+    tree = Path(site["trtllm_repo_path"])
+    (tree / "tests" / "integration" / "defs").mkdir(parents=True)
+    (tree / "tests" / "integration" / "defs" / "pytest.ini").write_text("[pytest]\n")
+    task = {**site, "features": [], "members": ["tp1", "tep4", "tep8"]}
+    base_env = replace(resolve_environment(task, world_size=4), python="/venv/bin/python")
+    e2e_test = verification.Test(
+        name="e2e",
+        feature="core",
+        purpose="e2e",
+        runner=verification.RUN_DATASETS,
+        datasets=("generate", "gsm8k"),
+    )
+    whole_test = verification.Test(
+        name="long_ctx",
+        feature="core",
+        purpose="whole-model pytest",
+        runner=verification.RUN_PYTEST,
+        nodes=("tests/integration/defs/test_w.py::test_long[{member}]",),
+        members=("tep4", "tep8"),
+    )
+    module_test = verification.Test(
+        name="routing",
+        feature="core",
+        purpose="module pytest",
+        runner=verification.RUN_PYTEST,
+        nodes=("tests/unittest/test_r.py::test_route",),
+        devices=2,
+    )
+
+    def capture(call):
+        seen: list[str] = []
+
+        def runner(command, env=None, timeout=0):
+            seen.append(command)
+            return CommandResult(returncode=1)
+
+        call(runner)
+        return seen[0]
+
+    # tp1: single scrubbed process with TLLM_WORKER_USE_SINGLE_PROCESS=1, no launcher.
+    tp1_cmd = capture(
+        lambda r: e2e.run_e2e(
+            base_env.at_width(1),
+            task_data=task,
+            test=e2e_test,
+            member="tp1",
+            node=e2e.node_id("fam", "tgt", "core", "e2e", "tp1"),
+            workdir=tmp_path / "g1",
+            runner=r,
+        )
+    )
+    assert "TLLM_WORKER_USE_SINGLE_PROCESS=1" in tp1_cmd
+    assert (
+        "mpirun " not in tp1_cmd
+        and "srun " not in tp1_cmd
+        and "trtllm-llmapi-launch" not in tp1_cmd
+    )
+    assert f"{e2e.RESULTS_ENV}=" in tp1_cmd
+
+    # Single-node multi-GPU (tep4): mpirun + trtllm-llmapi-launch for both e2e and whole-model pytest.
+    for cmd in (
+        capture(
+            lambda r: e2e.run_e2e(
+                base_env.at_width(4),
+                task_data=task,
+                test=e2e_test,
+                member="tep4",
+                node=e2e.node_id("fam", "tgt", "core", "e2e", "tep4"),
+                workdir=tmp_path / "g4",
+                runner=r,
+            )
+        ),
+        capture(
+            lambda r: user_tests.run_user_test(
+                base_env.at_width(4),
+                task_data=task,
+                test=whole_test,
+                workdir=tmp_path / "u4",
+                runner=r,
+                member="tep4",
+                features=[],
+            )
+        ),
+    ):
+        assert "mpirun -n 4 --oversubscribe --allow-run-as-root trtllm-llmapi-launch " in cmd
+        assert "TLLM_WORKER_USE_SINGLE_PROCESS" not in cmd and "srun " not in cmd
+
+    # Cross-node (tep8 on 2x4-GPU nodes): srun --mpi=pmix + trtllm-llmapi-launch across all hosts.
+    across = (
+        "srun --overlap --mpi=pmix --kill-on-bad-exit=1 --nodes=2 --ntasks=8 "
+        '--ntasks-per-node=4 --nodelist="$MV2FLOW_JOB_HOSTS"'
+    )
+    for cmd in (
+        capture(
+            lambda r: e2e.run_e2e(
+                base_env.at_width(8),
+                task_data=task,
+                test=e2e_test,
+                member="tep8",
+                node=e2e.node_id("fam", "tgt", "core", "e2e", "tep8"),
+                workdir=tmp_path / "g8",
+                runner=r,
+            )
+        ),
+        capture(
+            lambda r: user_tests.run_user_test(
+                base_env.at_width(8),
+                task_data=task,
+                test=whole_test,
+                workdir=tmp_path / "u8",
+                runner=r,
+                member="tep8",
+                features=[],
+            )
+        ),
+    ):
+        assert across in cmd
+        assert (
+            " CUDA_VISIBLE_DEVICES=0,1,2,3 trtllm-llmapi-launch /venv/bin/python -m pytest " in cmd
+        )
+        assert "--mpi=none" not in cmd and "TLLM_WORKER_USE_SINGLE_PROCESS" not in cmd
+        assert "MV2FLOW_JOB_NODE_RANK" not in cmd
+
+    # Module pytest stays single-process (no mpirun / launcher).
+    mod_cmd = capture(
+        lambda r: user_tests.run_user_test(
+            base_env.at_width(2),
+            task_data=task,
+            test=module_test,
+            workdir=tmp_path / "m2",
+            runner=r,
+            member="tp2",
+        )
+    )
+    assert "mpirun " not in mod_cmd and "trtllm-llmapi-launch" not in mod_cmd
+
+    # Per-node gang pytest via user_tests (verification with nodes=2) stays one scrubbed pytest per node.
+    gang_test = verification.Test(
+        name="two_node_hop",
+        feature="disagg",
+        purpose="2-node disagg hop",
+        runner=verification.RUN_PYTEST,
+        nodes=("tests/integration/defs/test_d.py::test_hop",),
+        devices=4,
+        gang_nodes=2,
+    )
+    gang_cmd = capture(
+        lambda r: user_tests.run_user_test(
+            base_env.at_width(8),
+            task_data=task,
+            test=gang_test,
+            workdir=tmp_path / "dg",
+            runner=r,
+            member="tp4",
+        )
+    )
+    assert 'test "${MV2FLOW_JOB_NODES:?missing gang node count}" -eq 2' in gang_cmd
+    assert "trtllm-llmapi-launch" not in gang_cmd and "srun " not in gang_cmd
+
+    # launch_world and per-node gang (nodes > 1) are mutually exclusive.
+    with pytest.raises(ValueError, match="launch_world"):
+        pytest_node.node_command(
+            base_env.at_width(8),
+            tree,
+            "tests/integration/defs/test_w.py::test_a",
+            tmp_path / "r.xml",
+            nodes=2,
+            launch_world=True,
+        )
+
+
+def test_flow_env_vars_survive_llmapi_launch_mpi_blacklist():
+    launcher = Path(__file__).resolve().parents[4] / "tensorrt_llm/llmapi/trtllm-llmapi-launch"
+    text = launcher.read_text(encoding="utf-8")
+    match = re.search(r"mpi_blacklist=\(([^)]+)\)", text)
+    assert match is not None, f"mpi_blacklist not found in {launcher}"
+    prefixes = tuple(match.group(1).split())
+    assert "MV2_" in prefixes
+    forwarded = (
+        e2e.RESULTS_ENV,
+        e2e.REFERENCES_ENV,
+        e2e.DATASETS_ENV,
+        e2e.MODELS_ROOT_ENV,
+        *verification.HANDOVER_ENV,
+        pytest_node.ARTIFACTS_ENV,
+        check_runtime.MODELING_V2_ENV,
+        check_runtime.STEP_CONTRACT_ENV,
+        "HF_DATASETS_OFFLINE",
+        "HF_HUB_OFFLINE",
+    )
+    stripped = [
+        (name, prefix) for name in forwarded for prefix in prefixes if name.startswith(prefix)
+    ]
+    assert stripped == [], f"trtllm-llmapi-launch would strip {stripped}"
+
+
+def test_relative_workdir_still_produces_absolute_report_and_results_paths(
+    site, tmp_path, monkeypatch
+):
+    tree = Path(site["trtllm_repo_path"])
+    (tree / "tests" / "integration" / "defs").mkdir(parents=True)
+    (tree / "tests" / "integration" / "defs" / "pytest.ini").write_text("[pytest]\n")
+    monkeypatch.chdir(tmp_path)
+    task = {**site, "features": [], "members": ["tp1"]}
+    env = resolve_environment(task, world_size=1)
+    test = verification.Test(
+        name="e2e",
+        feature="core",
+        purpose="e2e",
+        runner=verification.RUN_DATASETS,
+        datasets=("generate",),
+    )
+    seen: list[str] = []
+
+    def runner(command, env=None, timeout=0):
+        seen.append(command)
+        junit = re.search(r"--junitxml=('[^']*'|\S+)", command)
+        results = re.search(rf"{e2e.RESULTS_ENV}=('[^']*'|\S+)", command)
+        assert junit and results
+        junit_path = Path(junit.group(1).strip("'"))
+        results_path = Path(results.group(1).strip("'"))
+        assert junit_path.is_absolute() and results_path.is_absolute()
+        junit_path.write_text('<testsuite><testcase name="t"/></testsuite>', encoding="utf-8")
+        results_path.write_text(
+            json.dumps({"dataset": "generate", "kind": "generate", "passed": True}) + "\n",
+            encoding="utf-8",
+        )
+        return CommandResult(returncode=0)
+
+    result, lines = e2e.run_e2e(
+        env,
+        task_data=task,
+        test=test,
+        member="tp1",
+        node=e2e.node_id("fam", "tgt", "core", "e2e", "tp1"),
+        workdir=Path("relative-gates/core"),
+        runner=runner,
+    )
+    assert result.passed and len(lines) == 1 and seen
+
+
+def test_stated_disagg_uses_same_reference_discriminators_as_preflight(site, tmp_path):
+    ref_path = tmp_path / "reference.yaml"
+    ref_path.write_text(
+        yaml.safe_dump(
+            {"org/model": [{"accuracy": 41.77}, {"spec_dec_algo": "MTP", "accuracy": 88.50}]}
+        ),
+        encoding="utf-8",
+    )
+    task = {**site, "features": ["mtp", "disagg"]}
+    test = _disagg_test(task)
+    notes = preflight.check_accuracy_anchors(task, ["core", "mtp", "disagg"])
+    assert any("accuracy anchor [disagg]:" in n and "88.5" in n for n in notes), notes
+    result = disagg.run_disagg_gate(
+        replace(resolve_environment(task, world_size=4), nodes=1),
+        task_data=task,
+        workdir=tmp_path / "gates",
+        runner=_answers(UP + "lm-eval gsm8k average accuracy: 88.40\n"),
+        unit="disagg",
+        member="tep4",
+        test=test,
+    )
+    assert result.passed, result.detail
+    assert result.reference == 88.50
+
+
+def test_verification_unifies_custom_disagg_deployments_gang_pytests_and_serve(site, tmp_path):
+    alt = _deployment(tmp_path / "alt", (1, 1), (1, 1))
+    ref_dir = Path(site["trtllm_repo_path"]) / "tests/integration/defs/accuracy/references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    (ref_dir / "mmlu.yaml").write_text(yaml.safe_dump({"org/model": [{"accuracy": 72.0}]}))
+    task = {
+        **site,
+        "accuracy": {"evaluator_kwargs": {"apply_chat_template": True}},
+        "verification": {
+            "core": {
+                "serve": {
+                    "enabled": True,
+                    "prompt": "Hello world",
+                    "max_tokens": 16,
+                    "timeout": 900,
+                }
+            },
+            "disagg": {
+                "e2e": {
+                    "deployment": site["verification"]["disagg"]["e2e"]["deployment"],
+                    "env": {"UCX_TLS": "^cuda_ipc"},
+                    "timeout": 120,
+                },
+                "alt_mmlu": {
+                    "purpose": "custom deployment scoring mmlu",
+                    "deployment": alt,
+                    "datasets": ["mmlu"],
+                    "evaluator_kwargs": {"num_samples": 16},
+                    "timeout": 600,
+                    "stage": "delivery",
+                },
+                "two_node_hop": {
+                    "purpose": "custom 2-node gang disagg pytest",
+                    "pytest": "tests/integration/defs/accuracy/test_d.py::test_hop",
+                    "devices": 4,
+                    "nodes": 2,
+                    "stage": "delivery",
+                },
+            },
+        },
+    }
+    tests = {(t.feature, t.name): t for t in contract_mod.run_tests(task, 4)}
+    serve_test = tests[("core", "serve")]
+    serve_spec = serve.ServeSpec.from_test(serve_test)
+    assert (serve_spec.prompt, serve_spec.max_tokens, serve_spec.timeout) == (
+        "Hello world",
+        16,
+        900,
+    )
+    alt_test = tests[("disagg", "alt_mmlu")]
+    assert (alt_test.runner, alt_test.datasets, alt_test.stage) == (
+        verification.RUN_DISAGG,
+        ("mmlu",),
+        verification.STAGE_DELIVERY,
+    )
+    # Optional accuracy.reference_yaml defaults to references/<dataset>.yaml and merges per-test evaluator_kwargs.
+    res = disagg.run_disagg_gate(
+        replace(resolve_environment(task, world_size=4), kind="local"),
+        task_data=task,
+        workdir=tmp_path / "gates",
+        runner=_answers(UP + "lm-eval mmlu average accuracy: 73.0\n"),
+        unit="disagg",
+        member="tep4",
+        test=alt_test,
+    )
+    assert res.passed and res.reference == 72.0 and res.name == "alt_mmlu", res.detail
+    client = _lines(tmp_path / "gates" / "alt_mmlu.disagg.tep4")[-1]
+    assert " mmlu --apply_chat_template --num_samples 16'" in client
+    # Custom gang pytest has nodes=2 and lead=False.
+    gang_test = tests[("disagg", "two_node_hop")]
+    assert disagg.job_span(task, gang_test, 1) == (2, False)
+    assert preflight.check_disagg_placement(task, 4) == [
+        "disagg.two_node_hop: runs on 4 device(s) per node across 2 node(s)"
+    ]

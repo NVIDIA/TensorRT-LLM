@@ -2,7 +2,7 @@
 SPDX-License-Identifier: Apache-2.0 -#}
 {{ heading }}
 
-Planning preview of the shared public LLM configuration (`checks/check_config.py`, `launch_captures`). Request checks and trtllm-eval receive the same options. The engine can filter batches by launch limits; these previews are not actual capture evidence. Worker observations remain necessary.
+Planning preview of the shared public LLM configuration (`checks/check_config.py`, `launch_captures`). Every check of the run (the e2e test, trtllm-serve) receives the same options. The engine can filter batches by launch limits; these previews are not actual capture evidence. Worker observations remain necessary.
 
 {% if error is not none -%}
 - the units' lists cannot be resolved ({{ error }}); preflight names the cause

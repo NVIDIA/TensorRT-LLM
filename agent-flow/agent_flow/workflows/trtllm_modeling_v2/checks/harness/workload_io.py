@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-#: One per request the engine driver ran.
+#: One per request the serve driver sent.
 RECORD_MARKER = "MV2FLOW_RECORD"
 #: What the driver imported, once, before the engine starts.
 DRIVER_MARKER = "MV2FLOW_DRIVER"

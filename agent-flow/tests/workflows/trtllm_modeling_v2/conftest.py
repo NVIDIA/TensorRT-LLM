@@ -48,10 +48,8 @@ def task_file(tmp_path, repo, checkpoint):
             "env": {"TMPDIR": SCRATCH, "CLAUDE_CODE_TMPDIR": SCRATCH},
         },
         "accuracy": {
-            "benchmark": "gsm8k",
             "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
             "model_key": "openai/gpt-oss-120b",
-            "tolerance": 5.0,
         },
     }
     path = tmp_path / "task.yaml"
@@ -101,3 +99,11 @@ def _no_dataset_downloads(monkeypatch):
     from agent_flow.workflows.trtllm_modeling_v2.run.startup import datasets
 
     monkeypatch.setattr(datasets, "start", lambda *args, **kwargs: None)
+
+
+@pytest.fixture(autouse=True)
+def _one_run_token(monkeypatch):
+    """Every pytest check's report and results are named ``...run.xml`` here."""
+    from agent_flow.workflows.trtllm_modeling_v2.checks import pytest_node
+
+    monkeypatch.setattr(pytest_node, "run_token", lambda: "run")

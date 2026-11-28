@@ -1,6 +1,6 @@
 ---
 name: trtllm-modeling-v2-features
-description: Load when working on, testing or debugging a TensorRT-LLM engine feature around a ModelingV2 target -- KV-cache block (prefix) reuse, disaggregated serving, chunked prefill, KV-cache dtype (fp8/nvfp4 and their scales), CUDA graphs and the overlap scheduler, multimodal inputs, speculative decoding, expert-parallel load balancing (EPLB), or attention-DP/TP/EP where it changes one of those -- or a number that moves only with a feature on. Says which engine stage owns the feature and what the target must honour, where its code and tests are in the tree, and how to prove it from a CPU check up to the flow's accuracy, disagg or acceptance gate. Not needed to write or certify one catalog entry (trtllm-modeling-v2-entry) or to debug core accuracy with every feature at its default.
+description: Load when working on, testing or debugging a TensorRT-LLM engine feature around a ModelingV2 target -- KV-cache block (prefix) reuse, disaggregated serving, chunked prefill, KV-cache dtype (fp8/nvfp4 and their scales), CUDA graphs and the overlap scheduler, multimodal inputs, speculative decoding, expert-parallel load balancing (EPLB), or attention-DP/TP/EP where it changes one of those -- or a number that moves only with a feature on. Says which engine stage owns the feature and what the target must honour, where its code and tests are in the tree, and how to prove it from a CPU check up to the flow's e2e, disagg or serve test. Not needed to write or certify one catalog entry (trtllm-modeling-v2-entry) or to debug core accuracy with every feature at its default.
 ---
 
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
@@ -11,7 +11,7 @@ description: Load when working on, testing or debugging a TensorRT-LLM engine fe
 ## When to load
 
 Load when a task names one of these features, when the disagg test or the
-acceptance gate fails, or when a result moves only with a feature on. No
+acceptance in the e2e test fails, or when a result moves only with a feature on. No
 verdict names a feature field: the table below says which check observes
 each feature.
 Open the feature's section in `references/features.md`, read the code it points
@@ -69,33 +69,33 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
    its shape for the target's own case: an op cell with a cached prefix, a
    manager test carrying the target's side buffer, a transfer test with its
    role. *Blind to* the target's forward under the real scheduler.
-3. **One-member boot with the feature on.** `trtllm-modeling-v2 gate boot
-   --task task.yaml --unit <unit or variant> --member <m>` runs it as the
-   orchestrator does, with `modeling_v2="require"` for target evidence;
-   `--mode off` reruns the same command on the stock path as a control. The
-   gate sends the unit's options and does not read back what the engine
+3. **One member with the feature on.** `trtllm-modeling-v2 gate e2e
+   --task task.yaml --unit <unit or variant> --member <m>` runs the unit's case
+   of the generated e2e test as the orchestrator does, with
+   `modeling_v2="require"` for target evidence: the boot prompts first (a few
+   short continuations must not be empty; the reuse probe and a split prompt
+   where the unit is about them), then the benchmark (`accuracy_core`, against
+   its references row) and, on a speculator, the acceptance, on one engine. The
+   test sends the unit's options and does not read back what the engine
    resolved: whether a setting took effect is in the engine's own log.
-   *Blind to* accuracy: boot checks only that a few short continuations are
-   not empty.
-4. **Accuracy, disagg, acceptance.** `gate accuracy` runs the benchmark
-   with CUDA graphs; `gate disagg --unit disagg` serves the
-   deployment `accuracy.disagg` states and scores it through its proxy, or
-   runs the target's disaggregated-serving test as CI does when it states a
-   `test`; `gate acceptance` judges
-   speculators. *Blind spots* are per feature in the reference; they are why
-   each feature carries a proof of its own.
+4. **Disagg, serve.** `gate disagg --unit disagg` serves the deployment
+   `accuracy.disagg` states and scores it through its proxy, or runs the
+   target's disaggregated-serving test as CI does when it states a `test`;
+   `gate serve` serves it through `trtllm-serve`. *Blind spots* are per
+   feature in the reference; they are why each feature carries a proof of its
+   own.
 
 | feature | on in `task.yaml` by | proof that it ran | judged by |
 |---|---|---|---|
-| block reuse | a `reuse` variant (`runtime: {kv_cache_reuse: true}`); off in core | reuse probe of a boot or an acceptance load: a repeated prompt reports `cached_tokens` > 0. A variant with `gates: [accuracy]` runs neither | variant accuracy |
-| chunked prefill | a `chunked` variant with a small `max_num_tokens`; off in core | benchmark prompts longer than `max_num_tokens`, served and scored; a boot of the variant, where it owes one, sends one such prompt | variant accuracy |
-| KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | the loader's KV-quantization log line, which no gate reads | variant accuracy |
-| CUDA graphs | `runtime.cuda_graph` (default on) | the options sent; no gate reads the captures | accuracy |
+| block reuse | a `reuse` variant (`runtime: {kv_cache_reuse: true}`); off in core | the reuse probe after the boot prompts: a repeated prompt reports `cached_tokens` > 0 | variant e2e |
+| chunked prefill | a `chunked` variant with a small `max_num_tokens`; off in core | benchmark prompts longer than `max_num_tokens`, served and scored; the boot prompts of the variant send one such prompt | variant e2e |
+| KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | the loader's KV-quantization log line, which no check reads | variant e2e |
+| CUDA graphs | `runtime.cuda_graph` (default on) | the options sent; no check reads the captures | e2e |
 | overlap scheduler | `runtime.overlap_scheduler` (default on, core) | the argument only | nothing of its own |
 | disaggregation | feature `disagg` + `accuracy.disagg` (`config`/`context`/`generation`, or `test`) | a benchmark scored through `trtllm-serve disaggregated` | the flow's own serving of the stated deployment, or the tree's disaggregated-serving test |
-| multimodal | feature `multimodal` | an image prompt answered | boot image, image benchmark |
-| speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | accepted tokens per iteration | acceptance gate |
-| EPLB | a variant setting `llm_api_options.moe_config.load_balancer` at a `dep` member, `modeling_v2: require` | the engine builds the target (a mode missing from its `EPLB_MODES` refuses it) | variant accuracy |
+| multimodal | feature `multimodal` | an image prompt answered | e2e boot image, image benchmark |
+| speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | accepted tokens per iteration | e2e acceptance |
+| EPLB | a variant setting `llm_api_options.moe_config.load_balancer` at a `dep` member, `modeling_v2: require` | the engine builds the target (a mode missing from its `EPLB_MODES` refuses it) | variant e2e |
 
 ## Rules that save hours
 

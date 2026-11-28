@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The benchmark datasets, staged in the background from preflight on, never a blocker.
 
-Every accuracy gate runs offline (``HF_DATASETS_OFFLINE=1``), so the dataset must be on
-disk where the evaluator looks, before the first benchmark: ``trtllm-eval`` takes it as
-``--dataset_path``, and the tree's own accuracy tests (the disaggregated-serving one among
-them) read it under ``$LLM_MODELS_ROOT/datasets/...`` (``accuracy_core.py``). A run that
+Every benchmark runs offline (``HF_DATASETS_OFFLINE=1``), so the dataset must be on
+disk where the evaluator looks, before the first benchmark: the tree's own accuracy tests
+(the target's e2e test and the disaggregated-serving one) read it under
+``$LLM_MODELS_ROOT/datasets/...`` (``accuracy_core.py``). A run that
 found it missing there lost its benchmarks to it.
 
 :func:`start` runs beside the run's first turns: per benchmark, the spec's
@@ -74,10 +74,20 @@ def _holds_files(path: Path) -> bool:
 
 
 def benchmarks(task_data: Mapping[str, Any]) -> list[str]:
-    """The known benchmarks the run's units score."""
-    value = (task_data.get("accuracy") or {}).get("benchmark") or "gsm8k"
-    names = value.values() if isinstance(value, Mapping) else [value]
-    return sorted({str(n).lower() for n in names if str(n).lower() in KNOWN})
+    """The known benchmarks the run's tests score."""
+    from ..validation import contract as contract_mod
+
+    try:
+        tests = contract_mod.run_tests(task_data, 1)
+    except Exception:
+        return ["gsm8k"]
+    found = {
+        str(name).lower()
+        for test in tests
+        for name in test.benchmarks
+        if str(name).lower() in KNOWN
+    }
+    return sorted(found)
 
 
 def stage(

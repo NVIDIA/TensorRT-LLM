@@ -122,7 +122,24 @@ must change before that.
 
 1. **Specify and prepare:** derive or validate `task.yaml`, check the environment and agent access,
    survey available operators, and compile a contract of required checks. A unit is core or a
-   feature; a member is a parallel configuration. One check of any kind covers a feature.
+   feature; a member is a parallel configuration. One check of any kind covers a feature. The
+   checks are the run's tests at each member (`<feature>:<test>@<member>`): the flow derives an
+   `e2e` test per feature (the boot prompts, the benchmark and, on a speculator, its acceptance,
+   on one engine) and the serve and disaggregated-serving tests the spec asks for; the spec's
+   `verification` changes them by name, turns them off, or adds its own (`datasets` from the
+   catalog, or `pytest` nodes of the tree), each at a stage. `e2e` is each feature's foundation
+   test: the feature's whole configuration, the full benchmark judged against its reference, not
+   cut down. It promises no particular path; a path that runs only at some length, shape or
+   switch (sparse attention past its TopK budget, chunked prefill) is a test of the spec's own,
+   with its own `config` (LLM-API options laid over the feature's), `evaluator_kwargs` and
+   `extra_checks` (names of functions `f(result)` that judge what its datasets did, in the
+   target's `extra_checks.py` or the shared `_extra_checks.py`, defined by `_e2e.py`'s "Extra
+   checks"; a new kind of evidence is a new function, not a flow change).
+   Before the first turn the flow
+   writes the target's e2e test into the tree and commits it
+   (`tests/integration/defs/accuracy/modeling_v2/<family>/<target>/test_e2e.py` and
+   `e2e_cases.yaml`, run by `_e2e.py` beside them); the run's checks and CI run that same test,
+   and benchmarks are judged by `accuracy_core` against their references rows.
 2. **Plan and execute:** the planner proposes a dependency graph; Python admits and schedules it.
    Workers use separate worktrees. Kernel tasks certify or add operators; assemblers build the
    target. Commits are audited and integrated. What a change to shared code does to other
@@ -130,7 +147,7 @@ must change before that.
    catalog entry lands a local variant in the target's own `ops/`, and the target is delivered
    with it: the run never changes a shared entry, so other models are not disturbed mid-run.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.
-   Three rules decide when a check runs:
+   Four rules decide when a check runs:
    - *A pass is kept.* Every required check passes once. A pass does not run again because
      other code changed; a check that has not passed (it failed, or no landing ran it) runs
      again on what the work left.
@@ -139,9 +156,16 @@ must change before that.
      what it landed, passed before or not. A run that gives no result leaves them owed.
    - *The final code is scored once.* Before delivery a benchmark has passed on the final
      tree; if none has, the cheapest one runs.
+   - *One measurement runs once.* A test of datasets that another test of the same feature,
+     member and settings measures (and more) takes that test's pass on the same tree. A
+     speculator's `e2e` scores its base's model at the same member, so a landing that names both
+     runs the speculator's alone; the base's, whose decode path without drafts that does not
+     reach, runs once the work is done unless what it reads is unchanged since it passed.
 
-   The report names the commit each check measured. Delivery requires the contract, tests
-   and files to agree.
+   Each check runs at one of two stages: `landing`, when a landing names it, or `delivery`,
+   once the work is done and every other required check has passed (a landing that names it
+   then only owes it). The report names the commit each check measured. Delivery requires the
+   contract, tests and files to agree.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    you or the launching agent handle cluster allocations and session renewal.
@@ -158,6 +182,6 @@ must change before that.
 | `run/execution/` | Task dispatch, kernel-specific preparation and decision/receipt handoffs |
 | `run/validation/` | Contract, check runner, test jobs, completion and coverage |
 | `run/workspace/`, `run/records/` | Worktrees/snapshots; recovery state, journal and metrics |
-| `checks/`, `checks/harness/` | Verdict rules and evidence; programs executed in the measured environment |
+| `checks/`, `checks/harness/` | Verdict rules and evidence; the generated e2e test (`e2e.py`); programs executed in the measured environment |
 | `infra/compute/`, `infra/monitor/` | Execution, sessions, scheduler and provenance; status and heartbeat |
 | `infra/git.py`, `infra/files.py` | Shared Git/worktree operations and atomic file I/O |

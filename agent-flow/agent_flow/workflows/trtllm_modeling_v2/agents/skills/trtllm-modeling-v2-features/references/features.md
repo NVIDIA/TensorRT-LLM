@@ -6,7 +6,9 @@ How to read this, and what to do when a path below has moved, is in `SKILL.md`.
 Integration node ids are relative to the integration tests' `defs/` directory
 and need the checkpoints its conftest's `llm_models_root` resolves. Every flag named here
 exists in `examples/llm-api/quickstart_advanced.py`, `trtllm-serve`,
-`trtllm-eval` or `trtllm-modeling-v2 gate`.
+`trtllm-eval` or `trtllm-modeling-v2 gate`. The flow's own checks are tests of
+the run (`spec/verification.py`): `e2e` and `boot` run the target's generated
+`accuracy/modeling_v2/<family>/<target>/test_e2e.py` (`checks/e2e.py`).
 
 ## 0. Common machinery
 
@@ -15,10 +17,10 @@ exists in `examples/llm-api/quickstart_advanced.py`, `trtllm-serve`,
   feature units in `features`; configuration `variants` overlay `runtime`,
   `llm_api_options` or `env` on a unit. `task.example.yaml` documents each key,
   `spec/INTAKE.md` says which variant each request needs.
-- **Running one check.** `trtllm-modeling-v2 gate <boot|accuracy|acceptance|serve|disagg>
-  --task task.yaml --unit <unit or variant> --member <m>`; `--mode off` (boot
-  only) runs the stock path; `--tree <dir>` measures a worktree as it is;
-  `--json` prints the verdict.
+- **Running one check.** `trtllm-modeling-v2 gate <test> --task task.yaml --unit <unit or
+  variant> --member <m>` (`e2e`, `boot`, `serve`, `serve_one_rank`, `disagg` or a test of the
+  spec's own); `--reference <dataset>=<score>` judges a benchmark against a score;
+  `--tree <dir>` measures a worktree as it is; `--json` prints the verdict.
 - **What a gate knows of the configuration.** A gate sends the unit's options
   to the engine and does not read back what the engine resolved.
   `modeling_v2="require"` makes the engine raise rather than fall back to its
@@ -478,9 +480,10 @@ statistics (`numAcceptedTokens`).
   (`--draft_model_dir` for a separate drafter); greedy output with drafting off
   should agree up to near-ties, and acceptance is in the iteration statistics.
 
-**Flow proof.** Features `mtp`, `eagle3`, `dflash` and `dspark` owe the
-acceptance gate (`checks/acceptance.py`; `gate acceptance --unit <feature>
---member <m>`): accepted tokens per iteration, iteration-weighted over the
+**Flow proof.** Features `mtp`, `eagle3`, `dflash` and `dspark` measure
+acceptance in their `e2e` test (the `acceptance` dataset, `checks/acceptance.py`
+for its workload; `gate e2e --unit <feature> --member <m>`): accepted tokens per
+iteration, iteration-weighted over the
 workload (32 prompts and 32 draft iterations by default), in one load. It
 fails at or below 1.0 and under the floor of the unit's `accuracy.acceptance`
 entry (`min_absolute`, or `measured_reference`, with its `floor_source`). A
@@ -580,7 +583,7 @@ weights load.
 
 **Flow proof.** The flow has no `eplb` feature yet. Prove it as a variant that
 sets `llm_api_options.moe_config.load_balancer` at a `dep` member, with
-`modeling_v2: require`, and read the accuracy gate. The engine read-back does
+`modeling_v2: require`, and read its e2e test. The engine read-back does
 not report the registered layers, so the target's own tests carry that.
 
 **Blind spots.**

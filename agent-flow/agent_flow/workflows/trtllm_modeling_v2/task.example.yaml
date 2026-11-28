@@ -41,15 +41,16 @@ features: []
 #   kv_fp8:
 #     unit: core                    # default core
 #     members: [tep4]               # default: the unit's, and the benchmark runs at one of them
-#     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at the
-#                                   # members of its unit its benchmark does not run at; accuracy
-#                                   # alone judges the setting by its score (spec/INTAKE.md).
-#                                   # `acceptance` needs a speculator unit
+#     gates: [accuracy]             # default [boot, accuracy]: its e2e test (the benchmark) at one
+#                                   # member, and with boot its `boot` test at the members of its
+#                                   # unit its benchmark does not run at; accuracy alone judges the
+#                                   # setting by its score (spec/INTAKE.md). `acceptance` (in its
+#                                   # e2e test) needs a speculator unit
 #     runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # over the unit's; flags appended
 #     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
-#     env: {}                       # added to the gate command's environment
-#     # Where they differ: benchmark, reference_yaml, model_key, discriminators, benchmark_args,
-#     # samples, acceptance, anchor. Naming no row of its own, a variant is judged against its
+#     env: {}                       # added to the check command's environment
+#     # Where they differ: benchmark, reference_yaml, model_key, discriminators,
+#     # evaluator_kwargs, acceptance, anchor. Naming no row of its own, a variant is judged against its
 #     # unit's own score at the same member and target (`anchor: relative`: KV fp8 against auto).
 #     # With a row: `{discriminators: {kv_cache_quant_algo: FP8}}`, layered over the unit's.
 #     note: KV cache stored as FP8
@@ -58,11 +59,55 @@ features: []
 #   # proves the axis, so add it only when the request names it.
 
 # `smoke` (a unit's boot alone), `bringup` (each unit at its cheapest member; no variant, no
-# delivery check, and no CI files: the accuracy test, its test list entry, the anchor's row,
+# delivery check, and no CI files: the e2e test's test list entry, the anchor's row,
 # when every unit is smoke or bringup), `standard` (the default: this file as written), `certified` (also the
 # serve gate, and each benchmark at every member). For the
 # run, or per unit and variant over `default`. A switch the spec sets itself keeps its value.
 # profile: {default: standard, multimodal: smoke}
+
+# The run's tests, by the feature each proves (core, a feature or a variant). The flow derives
+# its own from this file: per feature an `e2e` test (one engine per member: the boot prompts, the
+# benchmark and, on a speculator, its acceptance), `boot` where the benchmark does not run,
+# `serve` and `serve_one_rank` when it serves, `disagg` for the disagg feature (`--dry-run`
+# lists them). An entry of one of those names changes it, flat, key by key, and `enabled: false`
+# turns it off; any other name is a test of the spec's own, with a `purpose` and `datasets` or
+# `pytest`. `datasets` run in order on one engine through the target's generated e2e test
+# (`generate`, `acceptance`, and the accuracy_core benchmarks: gsm8k, mmlu, gpqa_diamond, mmmu,
+# cnn_dailymail, json_mode_eval, longbench_v1, longbench_v2, passkey_retrieval_64k,
+# passkey_retrieval_128k), each benchmark judged against its references row. `pytest` names nodes
+# of the tree, judged by their JUnit report (a skip fails it); with `members` once per member
+# with that member's configuration (`MV2FLOW_LLM_OPTIONS`, `MV2FLOW_MODEL`, `MV2FLOW_FEATURE`,
+# `MV2FLOW_MEMBER`), with `devices` (default 1) once. A test runs at a stage: `landing` (the
+# default, when a landing names it) or `delivery` (once the work is done). Keep `landing` lean
+# (~60 min total pure run time excluding model load on a ~1T-class MoE reference; see
+# spec/INTAKE.md "Stage placement and landing budget") and put heavy benchmarks (`gpqa_diamond`,
+# `longbench_v1`, `longbench_v2`), thinking-mode runs, or `members: all` custom tests on
+# `stage: delivery` (`--dry-run` reports the stage breakdown and warns past budget). Its checks are
+# `<feature>:<name>@<member>`. `e2e` is each feature's foundation test, not cut down and about
+# no particular path; a path that runs only at some length or switch is a test of its own, with
+# `config` (LLM-API options laid over the feature's at the member), `evaluator_kwargs` (laid
+# over `accuracy.evaluator_kwargs`) and `extra_checks` (names of functions `f(result)` that judge
+# what its datasets did, in the target's extra_checks.py or the shared _extra_checks.py; see
+# "Extra checks" in tests/integration/defs/accuracy/modeling_v2/_e2e.py). A test of datasets
+# another test of the same feature, member and settings already measures takes that test's
+# pass on the same tree.
+# verification:
+#   core:
+#     e2e:                          # the flow's own, with MMLU too, at delivery
+#       datasets: [generate, gsm8k, mmlu]
+#       stage: delivery
+#     long_ctx:
+#       purpose: a 64k-token passkey is retrieved on every member, past the sparse TopK budget
+#       datasets: [passkey_retrieval_64k]
+#       config: {max_seq_len: 70000, enable_chunked_prefill: true}
+#       extra_checks: [sparse_topk_exceeded]
+#       members: all
+#       stage: delivery
+#     moe_routing:
+#       purpose: the router picks the experts the HF reference picks, on 64 prompts
+#       pytest: tests/unittest/_torch/modeling_v2/test_moe_routing.py
+#       devices: 1
+#       timeout: 1800
 
 # REQUIRED: the checkout the target is built in.
 trtllm_repo_path: /path/to/TensorRT-LLM
@@ -159,35 +204,14 @@ environment:
   # session_wait: 1h
 
 # ---------------------------------------------------------------- accuracy
-# REQUIRED. The release criterion: measured >= reference - k x SE (see `floor`). The anchor comes
-# from TensorRT-LLM's own accuracy references, never from the run; preflight resolves every row.
+# Reference anchors, shared scoring protocol, built-in workloads and engine limits.
+# Test selection, serving, disaggregated deployments, timeouts and custom tests live under
+# `verification:` below.
 
 accuracy:
-  # REQUIRED, both; each also takes the per-unit form, {default: ..., <unit>: ...}.
-  benchmark: gsm8k
+  # Optional; defaults to tests/integration/defs/accuracy/references/<dataset>.yaml.
+  # Also takes the per-unit form, {default: ..., <unit>: ...}.
   reference_yaml: tests/integration/defs/accuracy/references/gsm8k.yaml
-
-  # `statistical` (default): reference - k x SE, the SE binomial over the benchmark's sample count
-  # (0.75 points for GSM8K's 1319 questions at 92 %: k = 2 puts the floor 1.5 points down);
-  # `tolerance`: reference - `tolerance`.
-  # floor:
-  #   rule: statistical
-  #   k: 2.0                   # default
-
-  # In benchmark points; read only under `floor.rule: tolerance`. Default 5.0.
-  tolerance: 5.0
-
-  # Seconds one complete benchmark command may take (default 14400, four hours). Preflight refuses
-  # a timeout longer than a gates session's time limit: leave room in it for loading and teardown.
-  # timeout: 14400
-
-  # The sample count for the SE where the eval's output and `--num_samples` do not say it and the
-  # benchmark's is not known (gsm8k, mmlu, mmmu, gpqa_*): a count, or per unit.
-  # samples: {default: 1319, multimodal: 900}
-
-  # Where each unit's benchmark runs: `every` member (the default), or the one member named
-  # (`dep4`). A configuration variant's runs at one member either way (attention DP first).
-  # benchmark_members: every
 
   # Anchors are in percent; one of 1 or less is refused. Where no written or measured anchor exists
   # yet, record a low placeholder (e.g. 10 on GSM8K) and replace it when one is measured (the
@@ -202,44 +226,7 @@ accuracy:
   # the untagged row: for a quantized checkpoint the bf16 number. Flat, or per unit:
   # discriminators: {core: {quant_algo: NVFP4}, mtp: {quant_algo: NVFP4, spec_dec_algo: MTP}}
 
-  # The DISAGG gate: a benchmark scored across the hop of disaggregated serving. REQUIRED with the
-  # disagg feature, in one of two forms.
-  #
-  # The deployment, stated with the three files the tree's own disaggregated examples use, which
-  # the flow serves itself: one `trtllm-serve --config <its side's file>` per instance with its
-  # role, `trtllm-serve disaggregated -c` over them, then the disagg unit's benchmark through the
-  # proxy, held to the floor the accuracy gate holds that unit to (a text benchmark: one that
-  # reads the engine's input processor, as the multimodal ones do, has none there). The flow reads
-  # from the files only how many servers a side has (`<side>_servers.num_instances`) and a server's
-  # ranks (`tensor_parallel_size` x `pipeline_parallel_size`), one device a rank: one job on one
-  # node when it fits, else a job of whole nodes (2 x DEP4 + 3 x TEP4 on 4-GPU nodes: 5 nodes).
-  # Every server of a side gets that side's file as it is (a side of unlike servers, or several
-  # servers sharing one world, cannot be stated: write each as an instance of its own), and both
-  # files state `cache_transceiver_config.backend`. `env` is what the servers need: where a
-  # site's containers inherit `UCX_TLS=tcp`, NIXL refuses it ("Invalid UCX_TLS=tcp"), and the
-  # value to state is the one the tree's own disaggregated tests choose for the GPU (search
-  # them for `UCX_TLS`).
-  # disagg:
-  #   config: disagg_config.yaml                     # trtllm-serve disaggregated -c
-  #   context: ctx_config.yaml                       # trtllm-serve --config of every context server
-  #   generation: gen_config.yaml                    # ... of every generation server
-  #   env: {UCX_TLS: "^cuda_ipc"}                    # what the servers need
-  #   timeout: 7200
-  #
-  # Or the tree's own kind of test: a pytest node that serves the model through `trtllm-serve
-  # disaggregated` and scores a benchmark across that hop. The run writes it beside the tree's
-  # tests that already do so for other models; the gate runs it from its pytest root, as CI does,
-  # and passes only when every test the node id selects passed (a skip fails it).
-  # disagg:
-  #   test: tests/integration/defs/accuracy/test_disaggregated_serving.py::TestMyModel::test_auto_dtype
-  #   env: {LLM_MODELS_ROOT: /path/to/models}   # what the test reads
-  #   devices: 4                   # per node; default: two engines at the member's width, at most a node
-  #   nodes: 1                     # default; N > 1 runs one pytest per node of a gates session of N
-  #                                # nodes (MV2FLOW_JOB_NODE_RANK/HOSTS/NODES); every node's report must pass
-  #   tests: []                    # more node ids, each run as a job of its own
-  #   timeout: 7200                # default, seconds
-
-  # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration over the
+  # The ACCEPTANCE dataset of a speculator's e2e test: accepted tokens per iteration over the
   # workload, in one load, held to 1.0 (every draft rejected) and to the floor the unit declares:
   # `measured_reference` (floor 0.95 x it) or `min_absolute`, with its `floor_source`. A unit that
   # declares none is held to 1.0 alone, and its verdict says so.
@@ -255,7 +242,7 @@ accuracy:
   #   mtp: {min_absolute: 1.5, floor_source: "03-plan/acceptance-spike.md: reference 2.31"}
   #   dspark: {measured_reference: 3.32}   # floor 3.15
 
-  # The BOOT gate's workload, run-wide or per unit. An answer must not be empty; what it
+  # The boot prompts (the GENERATE dataset), run-wide or per unit. An answer must not be empty; what it
   # says is the benchmark's to judge. A `multimodal` unit with no image prompt sends the
   # tree's tests/integration/test_input_files/merlion.png.
   # boot:
@@ -270,31 +257,61 @@ accuracy:
   #         images: [examples/images/carrots.jpeg]   # beside this file, or in the tree
   #         render: raw                              # pre-rendered; or `loader`
 
-  # The SERVE gate: `trtllm-serve` starts each unit's target with the accuracy gate's options at its
-  # widest member and answers one completion (and an image chat for a unit whose boot sends one).
-  # On by default wherever `max_seq_len` (below, or in the run-wide options file) bounds the server.
-  # serve:
-  #   enabled: true
-  #   prompt: "The capital of France is"   # default
-  #   max_tokens: 32               # default
-  #   timeout: 1800                # default, seconds for /health
-
-  # `trtllm-eval`'s own flags. Without `max_seq_len` the eval sizes its KV cache for the
-  # checkpoint's `max_position_embeddings` and dies.
+  # The e2e test's engine limits. Without `max_seq_len` the engine sizes its KV cache for the
+  # checkpoint's `max_position_embeddings` and may not fit. When `max_seq_len` is bounded, the
+  # flow also derives a default `serve` test per unit (customizable under `verification.<unit>.serve`).
   # max_seq_len: 8192
   # max_batch_size: 32
 
-  # MMLU only: trtllm-eval's download URL 404s, which reads as a corrupt archive. A local copy:
-  # dataset_path: /path/to/datasets/mmlu
+  # Where the benchmark's dataset is, for a models root that lacks it (staged beside it):
+  # dataset_path: /path/to/datasets/gsm8k
 
-  # The LLM-API YAML the accuracy gate runs under: a path, or per unit, relative to THIS FILE. A
-  # speculator unit's carries its `speculative_config`, or its gates re-measure the base path; the
-  # boot and acceptance gates read the draft depth there (`max_draft_len`; DSpark: `block_size`).
+  # The LLM-API YAML every check's engine runs under: a path, or per unit, relative to THIS FILE. A
+  # speculator unit's carries its `speculative_config`, or its checks re-measure the base path; the
+  # draft depth is read there (`max_draft_len`; DSpark: `block_size`).
   # llm_api_options: {core: scripts/core_llm_api.yaml, mtp: scripts/mtp_llm_api.yaml}
 
-  # The benchmark subcommand's own options: the PROTOCOL, which must match the anchor's (a chat
-  # template in one and not the other reads as a large regression). Flat, or per unit.
-  # benchmark_args: [--apply_chat_template]
+  # The benchmark's PROTOCOL, which must match the anchor's (a chat template in one and not the
+  # other reads as a large regression): accuracy_core's `extra_evaluator_kwargs`, as the tree's
+  # own test of the model passes them. Run-wide; a variant or verification test may override it.
+  # evaluator_kwargs: {apply_chat_template: true, fewshot_as_multiturn: true,
+  #                    chat_template_kwargs: {enable_thinking: false}}
+
+# ------------------------------------------------------------ verification
+# Optional per-feature test overrides and custom tests. Every test — built-in (`e2e`, `boot`,
+# `serve`, `serve_one_rank`) and custom (`datasets:`, `pytest:`, or `deployment:`) — is declared
+# here with its own `stage`, `timeout`, `env`, `members`/`devices`/`nodes`, and `evaluator_kwargs`.
+#
+# verification:
+#   core:
+#     e2e:
+#       datasets: [generate, gsm8k]
+#       members: all
+#       timeout: 14400
+#     serve:
+#       enabled: true
+#       prompt: "The capital of France is"
+#       max_tokens: 32
+#       timeout: 1800
+#   disagg:
+#     # Stated deployment (three YAMLs served via trtllm-serve + trtllm-serve disaggregated):
+#     e2e:
+#       deployment:
+#         config: disagg_config.yaml
+#         context: ctx_config.yaml
+#         generation: gen_config.yaml
+#       datasets: [gsm8k]                  # optional, default [gsm8k]
+#       env: {UCX_TLS: "^cuda_ipc"}
+#       timeout: 7200
+#     # Or custom single/multi-node disaggregated pytest (nodes > 1 runs one pytest per node):
+#     two_node_hop:
+#       purpose: verify KV transfer across 2 nodes
+#       pytest: tests/integration/defs/accuracy/test_disaggregated_serving.py::TestMyModel::test_hop
+#       devices: 4
+#       nodes: 2
+#       env: {LLM_MODELS_ROOT: /path/to/models}
+#       timeout: 7200
+#       stage: delivery
 
 # ------------------------------------------------------- agent backends
 # REQUIRED: the model every role runs on. The launching agent writes its own backend, model and

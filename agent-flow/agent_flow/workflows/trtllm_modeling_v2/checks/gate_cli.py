@@ -1,18 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-r"""``trtllm-modeling-v2 gate <name>``: run one gate exactly as the orchestrator does.
+r"""``trtllm-modeling-v2 gate <test>``: run one check of the run exactly as the orchestrator does.
 
-The workflow's own gate functions, with the environment, runner and flags
+``<test>`` is a test of the run (``spec/verification.py``: ``e2e``, ``boot``,
+``serve``, ``serve_one_rank``, ``disagg`` or one of the spec's own) of the
+feature ``--unit``, at ``--member``, with the environment, runner and flags
 resolved from the same task.yaml. Like the orchestrator's checks, it measures
 a snapshot of one commit of ``trtllm_repo_path`` (``run/workspace/snapshots.py``): the
 commit the checkout is at, or ``--commit``. ``--tree`` measures another tree
 as it is::
 
-    trtllm-modeling-v2 gate acceptance --task task.yaml \
+    trtllm-modeling-v2 gate e2e --task task.yaml \
         --unit dspark --member tep4 --tree .dev-worktrees/pre-fix
 
-Exit status: 0 when the gate passed, 1 when it failed, 2 on a usage or spec
+A test of datasets runs its case of the target's generated e2e test
+(``checks/e2e.py``), which the tree measured must hold. Each benchmark is judged
+against its references row; ``--reference <dataset>=<score>`` judges it against a
+score instead, and a configuration variant whose anchor is relative is judged
+against its unit's score, measured here first. ``--datasets generate`` runs only
+the datasets named (the boot prompts, in a few minutes): a debugging run's cut of
+the check, never its verdict.
+
+Exit status: 0 when the check passed, 1 when it failed, 2 on a usage or spec
 error. ``--json`` prints the verdict as JSON instead of its summary line.
 """
 
@@ -25,53 +35,45 @@ import shlex
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
-from ..infra.compute.environment import RunEnvironment, resolve_environment, scheduler_owns_devices
+from ..infra.compute.environment import resolve_environment, scheduler_owns_devices
 from ..infra.compute.executor import FEATURE, select_command_executor, shell_runner_for
 from ..infra.git import resolve_commit
 from ..spec import variants as variants_mod
+from ..spec import verification as verification_mod
 from ..spec.task_schema import (
     TaskSchemaError,
     assembly_units,
     load_and_validate_task_yaml,
-    members_for,
     parse_parallel_segment,
     widest_world_size,
 )
-from . import acceptance as acceptance_checks
-from . import accuracy as accuracy_checks
 from . import boot as boot_checks
-from . import check_config, check_runtime
+from . import check_config, check_runtime, e2e, user_tests
 from . import verdict as check_result
-
-#: The gates this command runs, by the name it takes.
-GATE_NAMES: tuple[str, ...] = (
-    "boot",
-    "accuracy",
-    "acceptance",
-    "serve",
-    "disagg",
-)
 
 
 def _parse(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2 gate",
-        description="Run one trtllm_modeling_v2 gate standalone, as the orchestrator runs it.",
+        description="Run one check of a trtllm_modeling_v2 run standalone, as the orchestrator "
+        "runs it.",
     )
-    parser.add_argument("name", choices=GATE_NAMES, help="the gate to run")
+    parser.add_argument(
+        "name",
+        help="the test to run: e2e, boot, serve, serve_one_rank, disagg, or one of the spec's",
+    )
     parser.add_argument("--task", type=Path, required=True, help="the run's task.yaml")
     parser.add_argument(
         "--unit",
         default="core",
-        help="the assembly unit whose configuration to gate (default core); disagg "
-        "gates the disagg unit",
+        help="the feature (a unit or a variant) whose test to run (default core)",
     )
     parser.add_argument(
         "--member",
         default=None,
-        help="the parallel configuration to serve at (default: the unit's cheapest member)",
+        help="the member to run at (default: the test's first)",
     )
     tree = parser.add_mutually_exclusive_group()
     tree.add_argument(
@@ -101,7 +103,7 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         "--workdir",
         type=Path,
         default=Path("trtllm-modeling-v2-gates"),
-        help="where the gate writes the files its job reads; on the shared filesystem when the "
+        help="where the check writes the files its job reads; on the shared filesystem when the "
         "job runs elsewhere (a spool session). Default ./trtllm-modeling-v2-gates",
     )
     parser.add_argument(
@@ -119,10 +121,17 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--timeout", type=int, default=None, help="seconds")
     parser.add_argument(
-        "--mode",
-        choices=(check_runtime.MODE_REQUIRE, check_runtime.MODE_OFF),
-        default=check_runtime.MODE_REQUIRE,
-        help="boot only: off runs the same command on the stock path, as a control",
+        "--reference",
+        action="append",
+        default=[],
+        metavar="DATASET=SCORE",
+        help="judge a benchmark of a test of datasets against this score instead of its row",
+    )
+    parser.add_argument(
+        "--datasets",
+        default=None,
+        help="a test of datasets: run only these of its case, comma-separated (generate, "
+        "gsm8k, ..., and its extra checks by function name), to debug what one of them shows",
     )
     parser.add_argument("--json", action="store_true", help="print the verdict as JSON")
     return parser.parse_args(argv)
@@ -169,31 +178,75 @@ def _snapshot(args: argparse.Namespace, task_data: Mapping[str, Any]) -> Iterato
         yield snapshots_mod.CheckTree(commit=commit, tree=tree, snapshots=snapshots)
 
 
+def _references(values: list[str]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for value in values:
+        name, sep, score = value.partition("=")
+        try:
+            out[name.strip()] = float(score)
+        except ValueError:
+            raise TaskSchemaError(f"--reference {value!r}: say <dataset>=<score>") from None
+        if not sep or not name.strip():
+            raise TaskSchemaError(f"--reference {value!r}: say <dataset>=<score>")
+    return out
+
+
+def _test(task_data: Mapping[str, Any], unit: str, name: str, world: int) -> verification_mod.Test:
+    from ..run.validation import contract as contract_mod
+
+    tests = contract_mod.run_tests(task_data, world)
+    test = next((t for t in tests if t.feature == unit and t.name == name), None)
+    if test is None:
+        names = ", ".join(t.name for t in tests if t.feature == unit) or "none"
+        raise TaskSchemaError(f"{unit} has no test {name!r} in this run (its tests: {names})")
+    return test
+
+
+def target_identity(task_data: Mapping[str, Any]) -> tuple[str, str]:
+    """The run's ``(family, target_rel)``, as preflight resolves them."""
+    from ..run.startup.preflight import PreflightError, resolve_target_identity
+
+    config_path = Path(str(task_data["checkpoint_path"])) / "config.json"
+    try:
+        checkpoint_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        checkpoint_config = {}
+    try:
+        return resolve_target_identity(task_data, checkpoint_config)
+    except PreflightError as exc:
+        raise TaskSchemaError(str(exc)) from exc
+
+
 def run_gate(args: argparse.Namespace) -> check_result.GateResult:
-    """Resolve everything from the task and run the named gate on the tree it measures."""
+    """Resolve everything from the task and run the named test's check on the tree it measures."""
     from . import disagg
 
     task_data = load_and_validate_task_yaml(args.task)
     declared = task_data
     unit = args.unit
-    world = args.world_size
-    member = args.member
+    world = args.world_size or widest_world_size(task_data, 1)
+    test = _test(task_data, unit, args.name, world)
+    if args.timeout:
+        test = replace(test, timeout=args.timeout)
+    from ..run.validation import contract as contract_mod
+
+    members = contract_mod.test_members(task_data, test, world)
+    member = args.member or members[0]
     if variants_mod.is_variant(task_data, unit):
         task_data = check_config.variant_spec(
             task_data,
             unit,
-            world_size=widest_world_size(task_data, world or 1),
+            world_size=world,
             options_dir=args.workdir.resolve() / variants_mod.OPTIONS_DIRNAME,
         )
-    if member is None:
-        members = members_for(task_data, unit, world or 1)
-        member = check_config.order_members_by_cost(members)[0]
-    if world is None:
-        world = parse_parallel_segment(member)[1] or 1
-    # The disaggregated-serving test starts two engines, so it asks for both, as the
-    # orchestrator's run does.
-    spec = disagg.DisaggSpec.from_task(task_data) if args.name == "disagg" else None
-    gpus = (spec.device_count(member) if spec else None) or world
+    size = parse_parallel_segment(member)[1] or 1
+    spec = disagg.DisaggSpec.from_test(test, task_data)
+    if spec is not None:
+        gpus = spec.device_count(member) or size
+    elif test.runner == verification_mod.RUN_PYTEST and not test.whole_model:
+        gpus = test.devices or size
+    else:
+        gpus = size
     if args.devices:
         devices = tuple(int(d) for d in args.devices.split(","))
     elif scheduler_owns_devices(str((task_data.get("environment") or {}).get("kind", "local"))):
@@ -202,13 +255,16 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         devices = ()
     else:
         devices = tuple(range(gpus))
-    environment = resolve_environment(task_data, devices=devices).at_width(world)
-    # The unit's own, without a variant's overlay: what a relative variant is judged against.
-    unit_environment = resolve_environment(declared, devices=devices).at_width(world)
-    nodes, lead = disagg.job_span(task_data, args.name, environment.nodes)
+    environment = resolve_environment(task_data, devices=devices).at_width(size)
+    nodes, lead = disagg.job_span(task_data, test, environment.nodes)
     if args.python:
         environment = replace(environment, python=args.python)
-        unit_environment = replace(unit_environment, python=args.python)
+    features = (
+        [f for f in args.features.split(",") if f]
+        if args.features is not None
+        else features_for(task_data, unit)
+    )
+    family, target_rel = target_identity(declared)
     with _snapshot(args, task_data) as pin:
         tree = pin.tree if pin is not None else args.tree
         if pin is not None:
@@ -224,123 +280,114 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         )  # fmt: skip
         runner = shell_runner_for(executor)
         runner = pin.runner(runner) if pin is not None else check_runtime.in_tree(runner, tree)
-        result = _run_named(
-            args,
-            task_data,
-            environment,
-            runner,
-            unit=unit,
-            member=member,
-            declared=(declared, unit_environment),
-        )
+        run = Run(
+            args=args, declared=declared, environment=environment, runner=runner,
+            family=family, target_rel=target_rel, world=world,
+        )  # fmt: skip
+        result = run.check(test, task_data, member, features)
         return pin.stamp(result) if pin is not None else result
 
 
-def _run_named(
-    args: argparse.Namespace,
-    task_data: dict[str, Any],
-    environment: RunEnvironment,
-    runner: Callable[..., Any],
-    *,
-    unit: str,
-    member: str,
-    declared: tuple[dict[str, Any], RunEnvironment] | None = None,
-) -> check_result.GateResult:
-    """Run the gate ``args.name`` names, with everything already resolved.
+class Run:
+    """What one standalone check runs with, resolved once."""
 
-    ``declared`` is the spec as written and its environment, before a variant's
-    overlay: a variant whose anchor is relative is judged against its unit's
-    benchmark, run here first under them.
-    """
-    from ..checks.accuracy import resolve_model_key
-    from . import disagg, serve
+    def __init__(self, *, args, declared, environment, runner, family, target_rel, world) -> None:
+        self.args = args
+        self.declared = declared
+        self.environment = environment
+        self.runner = runner
+        self.family = family
+        self.target_rel = target_rel
+        self.world = world
 
-    features = (
-        [f for f in args.features.split(",") if f]
-        if args.features is not None
-        else features_for(task_data, unit)
-    )
-    workdir = args.workdir.resolve()
-    timeout = {"timeout": args.timeout} if args.timeout else {}
-    common = dict(task_data=task_data, runner=runner, unit=unit, member=member)
+    def check(
+        self,
+        test: verification_mod.Test,
+        task_data: Mapping[str, Any],
+        member: str,
+        features: list[str],
+    ) -> check_result.GateResult:
+        """Run ``test`` at ``member`` under ``task_data``; its verdict, named by the test."""
+        from . import disagg, serve
 
-    if args.name == "boot":
-        return boot_checks.run_boot_gate(
-            environment,
-            spec=boot_checks.resolve_boot_spec(task_data, unit, features),
-            features=features,
-            workdir=workdir / unit,
-            mode=args.mode,
-            **timeout,
-            **common,
-        )
-    spec, unit_environment = declared or (task_data, environment)
-    if args.name == "accuracy" and (
-        declared is not None
-        and variants_mod.anchor_state(spec, unit) == variants_mod.ANCHOR_RELATIVE
-    ):
-        base = variants_mod.base_unit(spec, unit)
-        try:
-            anchor = accuracy_checks.resolve_reference(
-                spec, model_key=resolve_model_key(spec, base), unit=base
+        workdir = self.args.workdir.resolve() / test.feature
+        unit = test.feature
+        if test.runner == verification_mod.RUN_DATASETS:
+            result = self._datasets(test, task_data, member, workdir)
+        elif test.runner == verification_mod.RUN_SERVE:
+            spec = serve.ServeSpec.from_test(test)
+            result = serve.run_serve_gate(
+                self.environment, task_data=task_data, runner=self.runner, unit=unit,
+                member=member, features=features, workdir=workdir,
+                boot=boot_checks.resolve_boot_spec(task_data, unit, features),
+                spec=replace(spec, timeout=self.args.timeout) if self.args.timeout else spec,
+            )  # fmt: skip
+        elif test.runner == verification_mod.RUN_DISAGG:
+            spec = disagg.DisaggSpec.from_test(test, task_data)
+            if spec is not None and self.args.timeout:
+                spec = replace(spec, timeout=self.args.timeout)
+            result = disagg.run_disagg_gate(
+                self.environment, workdir=workdir, spec=spec, test=test, task_data=task_data,
+                runner=self.runner, unit=unit, member=member,
+            )  # fmt: skip
+        else:
+            result = user_tests.run_user_test(
+                self.environment, task_data=task_data, test=test, workdir=workdir,
+                runner=self.runner, member=member, features=features,
+            )  # fmt: skip
+        return result if result.name == test.name else replace(result, name=test.name)
+
+    def _datasets(
+        self,
+        test: verification_mod.Test,
+        task_data: Mapping[str, Any],
+        member: str,
+        workdir: Path,
+    ) -> check_result.GateResult:
+        unit = test.feature
+        repo = Path(str(task_data["trtllm_repo_path"]))
+        path, _ = e2e.generated_paths(self.family, self.target_rel)
+        if not (repo / path).is_file():
+            raise TaskSchemaError(
+                f"{repo} holds no {path}: the run writes the target's e2e test when it starts"
             )
-        except (KeyError, FileNotFoundError, TypeError, ValueError):
-            anchor = 0.0  # only the score it measures is used, as the variant's anchor
-        first = accuracy_checks.run_accuracy_gate(
-            unit_environment,
-            reference=anchor,
-            workdir=workdir / base,
-            **timeout,
-            **{**common, "task_data": spec, "unit": base},
-        )
-        if first.infrastructure or first.measured is None:
-            return replace(
-                first,
-                passed=False,
-                detail=f"{base}'s benchmark at {member} measured no score ({first.detail}), so "
-                f"{unit}, whose anchor is that score, has nothing to be judged against",
+        references = _references(self.args.reference)
+        only = [d.strip() for d in (self.args.datasets or "").split(",") if d.strip()]
+        runs = [*test.datasets, *test.extra_checks]
+        unknown = [d for d in only if d not in runs]
+        if unknown:
+            raise TaskSchemaError(
+                f"--datasets {','.join(unknown)}: {unit}'s {test.name} runs {runs}"
             )
-        return accuracy_checks.run_accuracy_gate(
-            environment,
-            reference=first.measured,
-            workdir=workdir / unit,
-            relative=True,
-            **timeout,
-            **common,
-        )
-    if args.name == "accuracy":
-        reference = accuracy_checks.resolve_reference(
-            task_data, model_key=resolve_model_key(task_data, unit), unit=unit
-        )
-        return accuracy_checks.run_accuracy_gate(
-            environment,
-            reference=reference,
-            workdir=workdir / unit,
-            **timeout,
-            **common,
-        )
-    if args.name == "acceptance":
-        return acceptance_checks.run_acceptance_gate(
-            environment,
-            features=features,
-            workdir=workdir / unit,
-            **timeout,
-            **common,
-        )
-    if args.name == "serve":
-        spec = serve.ServeSpec.from_task(task_data)
-        return serve.run_serve_gate(
-            environment,
-            features=features,
-            workdir=workdir / unit,
-            boot=boot_checks.resolve_boot_spec(task_data, unit, features),
-            spec=replace(spec, timeout=args.timeout) if args.timeout else spec,
-            **common,
-        )
-    spec = disagg.DisaggSpec.from_task(task_data)
-    if spec is not None and args.timeout:
-        spec = replace(spec, timeout=args.timeout)
-    return disagg.run_disagg_gate(environment, workdir=workdir / unit, spec=spec, **common)
+        if (
+            test.benchmarks
+            and (not only or test.benchmarks[0] in only)
+            and test.benchmarks[0] not in references
+            and variants_mod.is_variant(self.declared, unit)
+            and variants_mod.anchor_state(self.declared, unit) == variants_mod.ANCHOR_RELATIVE
+        ):
+            base = variants_mod.base_unit(self.declared, unit)
+            first = self.check(
+                _test(self.declared, base, verification_mod.E2E, self.world),
+                self.declared,
+                member,
+                features_for(self.declared, base),
+            )
+            if first.infrastructure or first.measured is None:
+                return replace(
+                    first,
+                    name=test.name,
+                    passed=False,
+                    detail=f"{base}'s benchmark at {member} measured no score ({first.detail}), "
+                    f"so {unit}, whose anchor is that score, has nothing to be judged against",
+                )
+            references[test.benchmarks[0]] = first.measured
+        node = e2e.node_id(self.family, self.target_rel, unit, test.name, member)
+        result, _ = e2e.run_e2e(
+            self.environment, task_data=task_data, test=test, member=member, node=node,
+            workdir=workdir, runner=self.runner, references=references, datasets=only,
+        )  # fmt: skip
+        return result
 
 
 #: The workflow's CLI as the run's agents call it: ``<workspace>/bin/<this>``.
@@ -372,11 +419,8 @@ def install_cli(workspace: str | Path) -> Path:
 
 
 def invocation(task: str | Path, workdir: str | Path, unit: str, cli: str = CLI_NAME) -> str:
-    """The command an agent uses to rerun one of the orchestrator's gates by hand."""
-    return (
-        f"{cli} gate <{'|'.join(GATE_NAMES)}> --task {task} --unit {unit} "
-        f"--member <member> --workdir {workdir}"
-    )
+    """The command an agent uses to rerun one of the orchestrator's checks by hand."""
+    return f"{cli} gate <test> --task {task} --unit {unit} --member <member> --workdir {workdir}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -399,9 +443,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
-    "GATE_NAMES",
+    "Run",
     "features_for",
     "invocation",
     "main",
     "run_gate",
+    "target_identity",
 ]

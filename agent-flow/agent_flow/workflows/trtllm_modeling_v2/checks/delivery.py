@@ -528,7 +528,7 @@ def check_target(repo_root: Path, target_rel: str) -> list[Check]:
     """The workflow's model and weight-loading products exist and are valid Python.
 
     Model lifecycle methods may be inherited or delegated; prefill/decode classes and
-    weight tables are implementation choices. Boot and accuracy gates prove execution.
+    weight tables are implementation choices. The run's e2e test proves execution.
     """
     target = repo_root / target_rel
     checks = []
@@ -640,24 +640,15 @@ def check_accuracy_reference(repo_root: Path, reference_yaml: str, model_key: st
 
 
 def accuracy_test_path(repo_root: Path | str, family: str, target: str) -> str:
-    """A target's CI accuracy test under ``ACCURACY_TESTS_DIR``, in the tree's own layout.
+    """A target's CI accuracy test under ``ACCURACY_TESTS_DIR``: the e2e test the run generates.
 
-    Current trees give each target a directory of its own,
-    ``modeling_v2/<family>/<target>/test_accuracy.py``. Older ones keep a
-    family's targets in one file, ``modeling_v2/test_<family>.py``, and the
-    oldest keep it beside the rest, as ``test_modeling_v2_<family>.py``. The
-    package's presence, and whether it still holds per-family files, says which.
+    ``modeling_v2/<family>/<target>/test_e2e.py`` (``checks/e2e.py``).
     """
-    package = Path(repo_root) / ACCURACY_TESTS_DIR / "modeling_v2"
-    if not package.is_dir():
-        return f"test_modeling_v2_{family}.py"
-    if any(package.glob("test_*.py")):
-        return f"modeling_v2/test_{family}.py"
-    return f"modeling_v2/{family}/{target}/test_accuracy.py"
+    return f"modeling_v2/{family}/{Path(target).name}/test_e2e.py"
 
 
 def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
-    """The accuracy gate is on a list CI actually reads."""
+    """The target's e2e test is in the tree and on a list CI actually reads."""
     test_path = repo_root / ACCURACY_TESTS_DIR / accuracy_test
     checks = [
         Check(

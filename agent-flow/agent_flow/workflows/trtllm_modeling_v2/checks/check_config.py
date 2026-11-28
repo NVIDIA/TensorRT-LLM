@@ -803,6 +803,10 @@ def variant_spec(
             "llm_api_options", accuracy.get("llm_api_options"), name, str(path)
         )
     for key, value in (entry.get("accuracy") or {}).items():
+        if key == "evaluator_kwargs":
+            # Run-wide, and this spec is the variant's alone: its protocol replaces the unit's.
+            accuracy[key] = copy.deepcopy(dict(value or {}))
+            continue
         if key == "discriminators" and isinstance(value, Mapping):
             # Over the unit's row: a KV-dtype variant adds `kv_cache_quant_algo` to the
             # unit's `quant_algo`, it does not drop it.

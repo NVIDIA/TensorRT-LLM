@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_flow.workflows.trtllm_modeling_v2.checks import e2e
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import MODELING_V2_PACKAGE
@@ -62,6 +63,10 @@ def _task(tmp_path, **overrides):
     checkpoint = tmp_path / "ckpt"
     checkpoint.mkdir(exist_ok=True)
     (checkpoint / "config.json").write_text(json.dumps({"architectures": ["Qwen3MoeForCausalLM"]}))
+    # The tree's runner of the target's e2e test, which every test of datasets runs through.
+    runner = tmp_path / e2e.RUNNER_MODULE
+    runner.parent.mkdir(parents=True, exist_ok=True)
+    runner.write_text("", encoding="utf-8")
     task = {
         "checkpoint_path": str(checkpoint),
         "arch": "sm_103",
@@ -114,16 +119,19 @@ def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_pa
         tmp_path,
         parallel="unified",
         members=["tp4", "dep4"],
-        accuracy={"benchmark": "gsm8k", "reference_yaml": "x.yaml", "benchmark_members": "tp4"},
+        accuracy={"reference_yaml": "x.yaml"},
+        verification={"core": {"e2e": {"members": ["tp4"]}}},
         variants={"kv_fp8": {**fp8, "gates": ["accuracy"]}},
     )
     with pytest.raises(PreflightError, match="`core`'s benchmark at none of dep4"):
         preflight.check_variant_anchors(task, 4)
-    del task["accuracy"]["benchmark_members"]
+    del task["verification"]
     assert "relative, core's own score at dep4" in preflight.check_variant_anchors(task, 4)[0]
     task["features"] = ["disagg"]
     task["environment"]["gpus_per_node"] = 4
-    task["accuracy"]["disagg"] = {"test": "tests/test_d.py::TestM::test_auto_dtype", "devices": 8}
+    task["verification"] = {
+        "disagg": {"e2e": {"pytest": "tests/test_d.py::TestM::test_auto_dtype", "devices": 8}}
+    }
     with pytest.raises(PreflightError, match="more than the 4 devices one node holds"):
         preflight.check_disagg_placement(task)
 
@@ -139,14 +147,19 @@ def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_
         },
         "accuracy": {},
     }
-    with pytest.raises(preflight.PreflightError, match="accuracy.timeout is 14400s"):
+    with pytest.raises(preflight.PreflightError, match="verification.core.e2e.timeout is 14400s"):
         preflight.check_gate_budgets(task)
-    task["accuracy"]["timeout"] = 5400
+    task["verification"] = {"core": {"e2e": {"timeout": 5400}}}
     (note,) = preflight.check_gate_budgets(task)
-    assert "accuracy.timeout 5400s" in note and "7200s" in note
-    # A slow load gets a longer boot or acceptance leg; the longest one declared counts.
-    task["accuracy"]["boot"] = {"timeout": 3600, "core": {"timeout": 9000}}
-    with pytest.raises(preflight.PreflightError, match="accuracy.boot.timeout is 9000s"):
+    assert "verification.core.e2e.timeout 5400s" in note and "7200s" in note
+    # A test the spec gives a timeout of its own is held to the same bound.
+    task["verification"] = {
+        "core": {
+            "e2e": {"timeout": 3600},
+            "long": {"purpose": "long", "pytest": "tests/x.py::test_a", "timeout": 9000},
+        }
+    }
+    with pytest.raises(preflight.PreflightError, match="verification.core.long.timeout is 9000s"):
         preflight.check_gate_budgets(task)
     assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []
 
@@ -158,12 +171,12 @@ def test_one_check_of_any_kind_covers_a_feature_and_a_bare_one_is_named():
     task = {"features": ["mtp"], "variants": {"kv_fp8": {"llm_api_options": {}}}}
     contract = c.Contract(
         checks=(
-            c.Check("core", "accuracy[gsm8k]", "tp4", c.TIER_INNER),
-            c.Check("mtp", "boot", "tp1", c.TIER_INNER),
+            c.Check("core", "e2e", "tp4", c.STAGE_LANDING),
+            c.Check("mtp", "boot", "tp1", c.STAGE_LANDING),
         )
     )
     coverage = requirements.feature_checks(task, contract)
-    assert coverage == {"core": ["core:accuracy[gsm8k]@tp4"], "mtp": ["mtp:boot@tp1"], "kv_fp8": []}
+    assert coverage == {"core": ["core:e2e@tp4"], "mtp": ["mtp:boot@tp1"], "kv_fp8": []}
     assert requirements.uncovered(coverage) == ["kv_fp8"]
     assert "| kv_fp8 | **no check** |" in requirements.render(coverage)
 

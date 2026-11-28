@@ -36,7 +36,6 @@ def _valid_spec(tmp_path) -> dict:
             "env": {"TRTLLM_MODELING_V2": "require", "TMPDIR": "/scratch/tmp"},
         },
         "accuracy": {
-            "benchmark": "gsm8k",
             "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
         },
     }
@@ -53,9 +52,16 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
     del spec["arch"]
     del spec["environment"]
     spec["checkpoint_path"] = "/definitely/not/here"
-    # A disabled gate's fields are still validated.
-    spec["accuracy"]["serve"] = {"enabled": False, "max_tokens": True, "prompt": " "}
+    spec["accuracy"]["serve"] = {"enabled": False}
     spec["accuracy"]["score_pattern"] = "accuracy: [0-9.]+"
+    spec["accuracy"]["benchmark"] = "gsm8k"
+    spec["accuracy"]["benchmark_members"] = "tp1"
+    spec["accuracy"]["timeout"] = 3600
+    spec["accuracy"]["disagg"] = {"test": "tests/x.py::test_a"}
+    spec["accuracy"]["boot"] = {"timeout": 60}
+    spec["verification"] = {
+        "core": {"serve": {"enabled": False, "max_tokens": True, "prompt": " "}}
+    }
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     message = str(excinfo.value)
@@ -63,9 +69,15 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
         "arch",
         "environment",
         "non-existent path",
-        "accuracy.serve.max_tokens",
-        "accuracy.serve.prompt",
-        "'accuracy.score_pattern' needs a group around the score",
+        "verification.core.serve.max_tokens",
+        "verification.core.serve.prompt",
+        "'accuracy.score_pattern' is no longer read",
+        "'accuracy.boot.timeout' is no longer read",
+        "'accuracy.benchmark' is no longer read",
+        "'accuracy.benchmark_members' is no longer read",
+        "'accuracy.timeout' is no longer read",
+        "'accuracy.serve' is no longer read",
+        "'accuracy.disagg' is no longer read",
     ):
         assert expected in message
 
@@ -73,12 +85,12 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
 def test_a_misspelled_key_is_refused_with_its_spelling_at_any_depth(tmp_path):
     # A misspelled `features` must not silently build core only.
     spec = _valid_spec(tmp_path) | {"feature": ["mtp"]}
-    spec["accuracy"]["toleranace"] = "x"
+    spec["accuracy"]["model_keyy"] = "org/model"
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert "unknown key 'feature'" in str(excinfo.value)
     assert "did you mean 'features'" in str(excinfo.value)
-    assert "did you mean 'accuracy.tolerance'" in str(excinfo.value)
+    assert "did you mean 'accuracy.model_key'" in str(excinfo.value)
 
 
 def test_source_restriction_is_not_a_supported_production_task_option(tmp_path):
@@ -150,7 +162,7 @@ def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
         defaults={"disagg": {"env": {"LLM_MODELS_ROOT": "/models"}}},
     )
     # The node id is named beside the tree's disaggregated launcher: asked for until it is found.
-    with pytest.raises(derive.DeriveError, match="accuracy.disagg.test"):
+    with pytest.raises(derive.DeriveError, match="verification.disagg.e2e.pytest"):
         _derive(tmp_path, goal, **site)
     launcher = tmp_path / "repo" / DISAGG_LAUNCHER
     launcher.parent.mkdir(parents=True)
@@ -171,9 +183,9 @@ def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
     assert "--kv_cache_dtype=fp8" not in spec["runtime"]["extra_flags"]
     assert spec["variants"]["kv_fp8"]["gates"] == ["accuracy"]
     assert spec["variants"]["kv_fp8"]["llm_api_options"] == {"kv_cache_config": {"dtype": "fp8"}}
-    assert spec["accuracy"]["disagg"] == {
+    assert spec["verification"]["disagg"]["e2e"] == {
         "env": {"LLM_MODELS_ROOT": "/models"},
-        "test": f"{DISAGG_LAUNCHER}::TestNewModel::test_auto_dtype",
+        "pytest": f"{DISAGG_LAUNCHER}::TestNewModel::test_auto_dtype",
     }
     assert "--max_seq_len=1280" in spec["runtime"]["extra_flags"]
     # The batch holds the goal's concurrency, whatever the default says.
@@ -223,9 +235,9 @@ def test_a_unit_entry_under_acceptance_or_boot_names_a_unit_of_the_spec(tmp_path
 def test_a_spec_that_says_nothing_of_block_reuse_leaves_it_off(tmp_path):
     spec = load_and_validate_task_yaml(_write(tmp_path, _valid_spec(tmp_path)))
     assert spec["runtime"]["kv_cache_reuse"] is False
-    # So its core is gated as a derived spec's is: no boot beside its benchmark.
+    # So its core is gated as a derived spec's is: one e2e test, its boot prompts and benchmark.
     contract = contract_mod.compile_contract(spec, world_size=4)
-    assert [check.key for check in contract.checks] == ["core:accuracy[gsm8k]@tp1"]
+    assert [check.key for check in contract.checks] == ["core:e2e@tp1"]
 
 
 def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_variant(tmp_path):

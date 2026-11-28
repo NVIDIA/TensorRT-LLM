@@ -16,8 +16,11 @@ checks run with the unit's spec overlaid with the variant's switches::
         accuracy: {discriminators: {}}   # accuracy keys that differ from the unit's
         note: KV cache stored as FP8
 
-Each check is named by the variant (``kv_fp8:accuracy[gsm8k]@tep4``), so its
-verdicts are its own, never the unit's.
+Each check is named by the variant (``kv_fp8:e2e@tep4``), so its verdicts are
+its own, never the unit's. ``gates`` picks the variant's tests
+(``run/validation/contract.flow_tests``): ``accuracy`` its ``e2e`` with the
+benchmark, ``acceptance`` the acceptance in it, ``boot`` the boot prompts at its
+other members.
 ``checks/check_config.variant_spec`` applies and materializes the overlay.
 """
 
@@ -47,17 +50,15 @@ VARIANT_GATES: tuple[str, ...] = ("boot", "accuracy", "acceptance")
 DEFAULT_VARIANT_GATES: tuple[str, ...] = ("boot", "accuracy")
 #: Accuracy keys a variant may set for itself; every other key is the unit's.
 VARIANT_ACCURACY_KEYS: tuple[str, ...] = (
-    "benchmark",
     "reference_yaml",
     "model_key",
     "discriminators",
-    "benchmark_args",
-    "samples",
+    "evaluator_kwargs",
     "acceptance",
     "anchor",
 )
 #: The variant accuracy keys that name a reference row of the variant's own.
-VARIANT_ROW_KEYS: tuple[str, ...] = ("benchmark", "reference_yaml", "model_key", "discriminators")
+VARIANT_ROW_KEYS: tuple[str, ...] = ("reference_yaml", "model_key", "discriminators")
 RUNTIME_OVERLAY_KEYS: tuple[str, ...] = (
     "cuda_graph",
     "chunked_prefill",

@@ -32,11 +32,11 @@ from ...operators.inventory import (
     surface_names,
     write_surface_file,
 )
-from ...spec.task_schema import assembly_units
+from ...spec.task_schema import TaskSchemaError, assembly_units
 from ..records.state import WorkflowState
 from ..validation import contract as contract_mod
 from ..validation import requirements as requirements_mod
-from . import agent_probe
+from . import agent_probe, e2e_tests
 from .preflight import (
     PreflightError,
     PreflightResult,
@@ -165,6 +165,16 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
     if not _check_processor(workflow, result, log):
         return False
     _note_coverage(workflow, log)
+    try:
+        e2e_tests.write(workflow, log)
+    except (TaskSchemaError, ValueError, RuntimeError, OSError) as exc:
+        print_message(
+            f"[bold red]✘ the target's e2e test could not be written: "
+            f"{escape_markup(str(exc))}[/bold red]",
+            log,
+        )
+        workflow.journal.section("e2e test not written", str(exc))
+        return False
 
     _take_survey(workflow, result, log)
 
@@ -309,9 +319,14 @@ def _note_coverage(workflow, log) -> None:
     The coverage (``requirements.py``) goes to ``coverage.yaml``. A feature no
     check covers is said here and stops nothing.
     """
-    workflow._contract = contract_mod.compile_contract(
-        workflow.task_data, workflow._gate_env().world_size
+    world_size = workflow._gate_env().world_size
+    workflow._contract = contract_mod.compile_contract(workflow.task_data, world_size)
+    workflow._landing_budget = contract_mod.landing_budget(
+        workflow.task_data, workflow._contract, world_size
     )
+    print_message(f"→ {escape_markup(workflow._landing_budget.summary_line())}", log)
+    for warning in workflow._landing_budget.warnings:
+        print_message(f"[bold yellow]⚠ {escape_markup(warning)}[/bold yellow]", log)
     coverage = workflow._coverage = requirements_mod.feature_checks(
         workflow.task_data, workflow._contract
     )
@@ -329,9 +344,13 @@ def _note_coverage(workflow, log) -> None:
 def _write_contract(workflow) -> None:
     """Write the contract compiled with the coverage, and say what it holds."""
     contract_mod.write_contract(workflow.workspace, workflow._contract)
+    rendered = workflow._contract.render()
+    budget = getattr(workflow, "_landing_budget", None)
+    if budget is not None:
+        rendered = f"{rendered}\n\n{budget.render()}"
     workflow.journal.section(
         f"contract: {len(workflow._contract.required())} required check(s)",
-        workflow._contract.render(),
+        rendered,
     )
     workflow.journal.section(
         "coverage: the checks behind each feature",

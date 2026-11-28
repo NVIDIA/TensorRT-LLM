@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
@@ -400,14 +399,15 @@ def test_a_check_measures_one_commit_while_integrations_move_the_checkout(
             kwargs["runner"](f"leg {leg}", None, 10)
         return check_result.GateResult(name="boot", member="tp1", passed=True, detail="legs agree")
 
-    monkeypatch.setattr(boot_checks, "run_boot_gate", two_legs)
-    monkeypatch.setattr(boot_checks, "resolve_boot_spec", lambda *args: None)
+    monkeypatch.setattr(
+        CheckRunner, "_test_call", lambda self, check: lambda runner: two_legs(None, runner=runner)
+    )
     workflow = _workflow(tmp_path, shell_runner=shell, git_runner=None)
     workflow.task_data = {"trtllm_repo_path": str(repo)}
     workflow.environment = RunEnvironment(kind="local", python="/py", world_size=1)
     workflow._snapshots = snapshots_mod.Snapshots(repo, workflow.workspace / "snapshots")
     marker = workflow._target_marker()
-    check = contract_mod.Check("core", "boot", "tp1", contract_mod.TIER_INNER)
+    check = contract_mod.Check("core", "boot", "tp1", contract_mod.STAGE_LANDING)
 
     result = CheckRunner(workflow)._run_contract_check(check, None)
     status = contract_mod.ContractStatus.load(workflow.workspace)
