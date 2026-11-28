@@ -15,8 +15,12 @@
 include(FetchContent)
 
 set(SRCS
-    bufferManagerNvls.cpp utils/debugUtils.cu ipcUtils.cpp
-    mcastDeviceMemory.cpp moeLoadBalancer/moeLoadBalancer.cpp
+    bufferManagerNvls.cpp
+    utils/debugUtils.cu
+    ipcUtils.cpp
+    mcastDeviceMemory.cpp
+    moeLoadBalancer/moeLoadBalancer.cpp
+    moeLoadBalancer/unbackedSlotMemory.cpp
     ncclCommunicator.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)

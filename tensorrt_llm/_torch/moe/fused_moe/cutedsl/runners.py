@@ -101,7 +101,12 @@ class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
         num_local_experts: int,
         local_expert_offset: int,
         spread_num_tokens: bool = False,
+        tuner_num_local_experts: int | None = None,
     ) -> None:
+        # Generated routing passes through this rank's runtime moe_sort, so keep the runtime offset.
+        num_experts, num_local_experts, _ = self.tuner_expert_layout(
+            num_experts, num_local_experts, local_expert_offset, tuner_num_local_experts
+        )
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -176,6 +181,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         workload_identity: tuple | None = None,
         prime_inner_tactics: bool = False,
         spread_tuning_tokens: bool = False,
+        tuner_num_local_experts: int | None = None,
     ) -> None:
         super().__init__()
         self.forward_impl = forward_impl
@@ -183,6 +189,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
+        self.tuner_num_local_experts = tuner_num_local_experts
+        # Keys the tuning results by the active slots only, as for a layer without spare slots.
+        self.active_layout = GroupedGemmInputsHelper.tuner_expert_layout(
+            num_experts, num_local_experts, local_expert_offset, tuner_num_local_experts
+        )
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
@@ -203,11 +214,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.spread_tuning_tokens = spread_tuning_tokens
 
     def unique_id(self) -> tuple:
+        num_experts, num_local_experts, local_expert_offset = self.active_layout
         identity = (
-            self.num_experts,
+            num_experts,
             self.top_k,
-            self.num_local_experts,
-            self.local_expert_offset,
+            num_local_experts,
+            local_expert_offset,
             self.enable_finalize_fusion,
             self.enable_alltoall,
             self.output_dtype,
@@ -242,7 +254,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         return 128
 
     def get_tuning_config(self) -> TuningConfig:
-        key = (self.unique_id(), self.spread_tuning_tokens)
+        # The helper routes to this rank's slots, so the key also takes their offset.
+        key = (self.unique_id(), self.local_expert_offset, self.spread_tuning_tokens)
         if key not in self.__class__.tuning_config_cache:
             if self.use_direct_expert_metadata:
                 # One tuning profile is shared by the 128- and 256-row
@@ -280,6 +293,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     self.num_local_experts,
                     self.local_expert_offset,
                     spread_num_tokens=self.spread_tuning_tokens,
+                    tuner_num_local_experts=self.tuner_num_local_experts,
                 )
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(

@@ -187,6 +187,23 @@ def skip_num_gpus_less_than(num_gpus: int):
 skip_single_gpu = skip_num_gpus_less_than(2)
 
 
+def skip_no_mnnvl_fabric_handles(num_gpus: int):
+    """Skip unless ``num_gpus`` GPUs share MNNVL memory through fabric handles.
+
+    Wide-EP fault tolerance needs such memory to remap MNNVL memory after a rank fails.
+    """
+    from tensorrt_llm._torch.distributed import mnnvl_memory
+
+    fabric = mnnvl_memory.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    if (torch.cuda.device_count() < num_gpus
+            or not mnnvl_memory.MnnvlMemory.supports_mnnvl()
+            or mnnvl_memory.MnnvlMemory.get_allocation_prop(
+                torch.cuda.current_device()).requestedHandleTypes != fabric):
+        pytest.skip(
+            f"needs {num_gpus} GPUs sharing MNNVL memory through fabric handles"
+        )
+
+
 def compose_decorator(*decorators):
 
     def composed_decorator(f):
