@@ -20,8 +20,9 @@ have arrived in earlier responses and already been decoded incrementally, so
 the final ``.text`` has to be decoded again from the kept ids: otherwise it
 keeps the start of the stop string (``"<answer>42</answer"``), or ends in
 U+FFFD when the decoder still holds the lead bytes of a character that only
-the stop word completes (a Thai digit such as ``"๒"``). CPU-only; no engine
-needed.
+the stop word completes (a Thai digit such as ``"๒"``). With n > 1, a stop
+string found in one candidate's text finishes only that candidate. CPU-only; no
+engine needed.
 """
 
 from types import SimpleNamespace
@@ -270,3 +271,108 @@ def test_trimmed_candidate_is_decoded_once_when_siblings_stream_on(tokenizer, mo
     assert full_decodes == [THAI_GENERATED[:-3]]
     assert second.text == "ข้อ <answer>42"
     assert second.finish_reason == "length"
+
+
+SIBLING = [5, 6, 7, 8]
+SIBLING_TEXT = "ข้อ <answer>42"
+
+
+@pytest.mark.parametrize("n", [2, 1], ids=["n_2", "best_of_2_n_1"])
+def test_stop_string_in_one_candidate_does_not_end_its_siblings(tokenizer, n):
+    """A stop string in the text of one of several candidates finishes only that candidate.
+
+    With include_stop_str_in_output the stop ids stay in token_ids, so the text
+    of the candidate that stops first contains the stop string. The request has
+    to wait for the other candidate, including when best_of > n ranks them.
+    """
+    sampling_params = _sampling_params(
+        "๒",
+        THAI_DIGIT_TWO,
+        include_stop_str_in_output=True,
+        n=n,
+        best_of=2,
+        temperature=0.8,
+        top_p=0.9,
+    )
+    result = DetokenizedGenerationResultBase(
+        0, sampling_params, tokenizer=tokenizer, streaming=False
+    )
+    first, second = result._outputs
+
+    result._handle_response(
+        _response(THAI_GENERATED, False, tllm.FinishReason.STOP_WORDS, sequence_index=0)
+    )
+    assert first.finish_reason == "stop"
+    assert not result._done
+
+    result._handle_response(_response(SIBLING, True, tllm.FinishReason.LENGTH, sequence_index=1))
+    assert result._done
+    assert first.token_ids == THAI_GENERATED
+    assert second.token_ids == SIBLING
+    assert second.finish_reason == "length"
+
+
+def test_text_stopped_candidate_is_kept_while_the_engine_generates_it(tokenizer):
+    """A candidate stopped by a stop string found only in its text keeps its output.
+
+    The engine did not match the stop word by token id (as when the model
+    tokenizes the stop string differently), so it keeps generating that
+    candidate. Its later tokens and its own finish must not change the output,
+    and the request ends with its last sibling.
+    """
+    sampling_params = _sampling_params(
+        "</answer>", ANSWER_CLOSE, n=2, best_of=2, temperature=0.8, top_p=0.9
+    )
+    result = DetokenizedGenerationResultBase(
+        0, sampling_params, tokenizer=tokenizer, streaming=True
+    )
+    first, second = result._outputs
+    first_steps = [(token_id, tllm.FinishReason.NOT_FINISHED) for token_id in ANSWER_GENERATED]
+    # Tokens the engine generates after the stop string, up to its length limit.
+    after_stop = [(6, tllm.FinishReason.NOT_FINISHED), (5, tllm.FinishReason.LENGTH)]
+    sibling_steps = [
+        (
+            token_id,
+            tllm.FinishReason.LENGTH
+            if index == len(SIBLING) - 1
+            else tllm.FinishReason.NOT_FINISHED,
+        )
+        for index, token_id in enumerate(SIBLING)
+    ]
+
+    for token_id, finish_reason in first_steps:
+        result._handle_response(_response([token_id], False, finish_reason, sequence_index=0))
+    assert (first.text, first.finish_reason, first.stop_reason) == (
+        "<answer>42",
+        "stop",
+        "</answer>",
+    )
+    assert not result._done
+
+    first_diffs_after_stop = []
+    for token_id, finish_reason in after_stop:
+        result._handle_response(_response([token_id], False, finish_reason, sequence_index=0))
+        first_diffs_after_stop.append(first.text_diff)
+    for index, (token_id, finish_reason) in enumerate(sibling_steps):
+        is_final = index == len(sibling_steps) - 1
+        assert not result._done
+        result._handle_response(_response([token_id], is_final, finish_reason, sequence_index=1))
+        first_diffs_after_stop.append(first.text_diff)
+
+    assert result._done
+    assert first_diffs_after_stop == [""] * (len(after_stop) + len(sibling_steps))
+    assert first.token_ids == ANSWER_GENERATED
+    assert (first.text, first.finish_reason) == ("<answer>42", "stop")
+    assert (second.text, second.finish_reason) == (SIBLING_TEXT, "length")
+
+
+def test_stop_string_in_text_ends_single_candidate_request(tokenizer):
+    """With one candidate, a stop string found in the text still ends the request at once."""
+    result = DetokenizedGenerationResultBase(
+        0, _sampling_params("</answer>", ANSWER_CLOSE), tokenizer=tokenizer, streaming=True
+    )
+    for token_id in ANSWER_GENERATED:
+        result._handle_response(_response([token_id], False, tllm.FinishReason.NOT_FINISHED))
+
+    assert result._done
+    assert (result.outputs[0].text, result.outputs[0].finish_reason) == ("<answer>42", "stop")
