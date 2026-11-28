@@ -176,9 +176,10 @@ class Engine:
         self.llm_id = "shared-engine"
         self.args = SimpleNamespace(guided_decoding_backend=None)
         self.tokenizer = None
+        self.engine_dead = False
         self._executor = Mock(spec=GenerationExecutorProxy)
         self._executor.multi_frontend_attach_info.return_value = {"mode": "classic"}
-    def _check_health(self):
+    def check_health(self):
         return not (
             frontend == 0 and sys.argv[3] == "child-startup-engine-failure"
             and (root / "initializing").exists()

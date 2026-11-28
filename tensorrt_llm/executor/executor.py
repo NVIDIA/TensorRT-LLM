@@ -341,6 +341,16 @@ class GenerationExecutor(ABC):
         """Return True if the executor is shutting down or fatally errored."""
         return self.doing_shutdown or self._fatal_error is not None
 
+    @property
+    def fatal_error(self) -> Optional[BaseException]:
+        """The unrecoverable engine error recorded by ``_set_fatal_error``, or None."""
+        return self._fatal_error
+
+    @property
+    def engine_dead(self) -> bool:
+        """Whether the engine is known dead (an unrecoverable error was recorded)."""
+        return self._fatal_error is not None
+
     def check_health(self) -> bool:
         """Check whether the executor is healthy and able to process requests.
 

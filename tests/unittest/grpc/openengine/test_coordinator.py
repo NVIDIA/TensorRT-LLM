@@ -202,6 +202,7 @@ async def test_generate_cleanup_failure_preserves_grpc_status(model, expected_co
 
         handle = ResultHandle()
         llm = SimpleNamespace(
+            engine_dead=False,
             llm_id="shared-engine",
             args=SimpleNamespace(guided_decoding_backend=None),
             tokenizer=None,
@@ -252,10 +253,11 @@ async def test_generate_cleanup_failure_preserves_grpc_status(model, expected_co
 async def test_standard_health_tracks_frontend_group_readiness():
     async with group() as (coordinator, (frontend, _), _):
         llm = SimpleNamespace(
+            engine_dead=False,
             llm_id="shared-engine",
             args=SimpleNamespace(guided_decoding_backend=None),
             tokenizer=None,
-            _check_health=lambda: True,
+            check_health=lambda: True,
         )
         server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", frontend=frontend)
         await server.start()
@@ -314,10 +316,11 @@ async def test_health_probe_cleanup_failure_is_unavailable():
                 return None
 
         llm = SimpleNamespace(
+            engine_dead=False,
             llm_id="shared-engine",
             args=SimpleNamespace(guided_decoding_backend=None),
             tokenizer=None,
-            _check_health=lambda: True,
+            check_health=lambda: True,
             generate_async=lambda *args, **kwargs: ProbeHandle(),
         )
         original_request = frontend.request
@@ -354,6 +357,7 @@ async def test_oversized_request_id_does_not_stop_group(request_id):
     """A rejected public ID must not kill unrelated requests or strand ownership."""
     async with group() as (_, (first, second), failures):
         llm = SimpleNamespace(
+            engine_dead=False,
             llm_id="shared-engine",
             args=SimpleNamespace(guided_decoding_backend=None),
             tokenizer=None,

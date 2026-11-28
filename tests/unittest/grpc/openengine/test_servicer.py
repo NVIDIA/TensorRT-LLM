@@ -95,6 +95,7 @@ class _FakeLlm:
         self.tokenizer = _FakeTokenizer()
         self.result_handle = _FakeResultHandle(results)
         self.generate_kwargs = None
+        self.engine_dead = False
 
     def generate_async(self, **kwargs: Any) -> _FakeResultHandle:
         self.generate_kwargs = kwargs

@@ -236,8 +236,8 @@ def test_encode_add_special_tokens_false(bert_encode_llm):
 
 
 def test_check_health_encoder_only(bert_encode_llm):
-    """_check_health() returns True for a live encoder-only LLM."""
-    assert bert_encode_llm._check_health() is True
+    """check_health() returns True for a live encoder-only LLM."""
+    assert bert_encode_llm.check_health() is True
 
 
 # --------------------------------------------------------------------------- #
