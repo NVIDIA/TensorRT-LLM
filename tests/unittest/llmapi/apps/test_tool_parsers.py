@@ -765,6 +765,22 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
 
         assert len(result.calls) == 0
 
+    @pytest.mark.parametrize("chunk_size", [1, 7, 1000])
+    def test_undefined_tool_is_not_streamed(self, sample_tools,
+                                            tool_parser_test_cases, chunk_size):
+        """Streaming filters undefined tools as detect_and_parse does."""
+        text = tool_parser_test_cases.undefined_tool
+        parser = KimiK2ToolParser()
+
+        calls = []
+        for start in range(0, len(text), chunk_size):
+            calls += parser.parse_streaming_increment(
+                text[start:start + chunk_size], sample_tools).calls
+        calls += parser.finish(sample_tools).calls
+
+        assert calls == []
+        assert parser.prev_tool_call_arr == []
+
     def test_kimi_k2_format_compliance(self, sample_tools, parser):
         """Test that KimiK2ToolParser follows the documented format structure."""
 
@@ -862,6 +878,12 @@ _KIMI_K2_OUTPUTS = {
     "call_without_arguments":
     ("<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
      "<|tool_call_argument_begin|>{}<|tool_call_end|>"
+     "<|tool_calls_section_end|>"),
+    # Both parses skip a call to a function the request does not declare.
+    "undeclared_call_between_calls":
+    ("<|tool_calls_section_begin|>" + _KIMI_K2_WEATHER_CALL +
+     "<|tool_call_begin|>functions.undefined_func:1<|tool_call_argument_begin|>"
+     '{"arg": "any value"}<|tool_call_end|>' + _KIMI_K2_SEARCH_CALL +
      "<|tool_calls_section_end|>"),
     # Neither parse reads a call whose id lacks the ":<index>" suffix.
     "id_without_index_then_a_call":

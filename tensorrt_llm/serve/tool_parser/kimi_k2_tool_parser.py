@@ -170,6 +170,18 @@ class KimiK2ToolParser(BaseToolParser):
             return []
         function_name = m.group("name")
 
+        if not self.current_tool_name_sent and function_name not in self._tool_indices:
+            # detect_and_parse skips a call to an undeclared function, so it is
+            # dropped here once its end token arrives, without a tool index.
+            call_end = current_text.find(
+                self.tool_call_end_token, match.start("function_arguments")
+            )
+            if call_end == -1:
+                return []
+            logger.warning(f"Model attempted to call undefined function: {function_name}")
+            self._buffer = current_text[call_end + len(self.tool_call_end_token) :]
+            return []
+
         # Initialize state if this is the first tool call
         if self.current_tool_id == -1:
             self.current_tool_id = 0
