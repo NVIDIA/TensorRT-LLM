@@ -149,6 +149,13 @@ there are no peers to strand.
 | Variable | Default | Meaning |
 |---|---|---|
 | `TLLM_RANK_CRASH_HARD_KILL_GRACE` | `10` | Seconds to wait before killing the job. `0` kills immediately. Any negative value (e.g. `-1`) **disables** the kill entirely — peers then fall back to the hang detector. Unparsable and non-finite values (`nan`, `inf`) fall back to the default. |
+| `TRTLLM_NCCL_COMM_INIT_TIMEOUT_SEC` | `120` | Per-rank polling budget, in seconds, for the pipeline-parallel NCCL communicator initialization probe. Positive integers override the budget; when unset or `<= 0`, the default applies. This is not a deadline for the whole model startup. |
+
+The NCCL probe timeout is separate from executor crash handling. Waiting for peer
+ranks can consume the probe's budget. Expiry on one rank does not coordinate
+cleanup on the other ranks, which may remain blocked. Stop and restart the entire
+distributed job before retrying. The budget also does not bound the subsequent
+blocking communicator initialization.
 
 ```bash
 # Opt out: let the hang detector handle it instead (slower, but no world kill).

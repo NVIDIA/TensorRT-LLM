@@ -36,7 +36,7 @@ using namespace tensorrt_llm::runtime;
 namespace
 {
 #if ENABLE_MULTI_DEVICE
-constexpr int kDefaultNcclCommInitTimeoutSec = 60;
+constexpr int kDefaultNcclCommInitTimeoutSec = 120;
 constexpr int kNcclCommInitPollIntervalMs = 20;
 constexpr char const* kNcclCommInitTimeoutEnv = "TRTLLM_NCCL_COMM_INIT_TIMEOUT_SEC";
 
@@ -96,8 +96,9 @@ void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int ran
         {
             TLLM_THROW(
                 "NCCL communicator probe initialization timed out after %d seconds on rank %d of %d in "
-                "NcclCommunicator::createComm. This indicates NCCL init is hung. TensorRT-LLM will not retry "
-                "in-process. Set %s to adjust the timeout.",
+                "NcclCommunicator::createComm. TensorRT-LLM will not retry "
+                "in-process. Other ranks may remain blocked; restart the entire distributed job before retrying. "
+                "Set %s to adjust the timeout.",
                 timeoutSec, rank, worldSize, kNcclCommInitTimeoutEnv);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{kNcclCommInitPollIntervalMs});
