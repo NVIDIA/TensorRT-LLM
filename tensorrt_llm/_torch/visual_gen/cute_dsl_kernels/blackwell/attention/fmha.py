@@ -2261,6 +2261,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                     skip_softmax_count,
                     total_softmax_count,
                 )
+            # Fence T2R loads before we release S to MMA
+            cute.arch.fence_view_async_tmem_load()
             si_handle.release()
             # S0 -> P1 / S1 -> P0
             inplace_producer.commit()
@@ -2305,6 +2307,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 2, 2, 0, 0])
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 3, 2, 0, 0])
                 cute.arch.fence_view_async_tmem_store()
+                # Fence T2R loads before we release S to MMA: the last quarter is
+                # still in flight and is only consumed after the release below
+                cute.arch.fence_view_async_tmem_load()
                 si_handle.release()
                 # S0 -> P1 / S1 -> P0
                 inplace_producer.commit()
