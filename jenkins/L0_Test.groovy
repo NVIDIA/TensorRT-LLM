@@ -2199,6 +2199,9 @@ def getPytestBaseCommandLine(
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
         "-o junit_logging=${jUnitLogging}",
+        // The outer pytest never runs xdist workers. With xdist loaded, pytest-rerunfailures opens a
+        // localhost status-DB listener whose per-connection threads fail the thread-leak check.
+        "-p no:xdist",
         // Coverage capture: eligible CBTS stages instrument via cbts_plugin / sitecustomize.
         cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
