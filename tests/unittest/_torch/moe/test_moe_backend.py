@@ -4848,10 +4848,11 @@ def test_nvfp4_streaming_refuses_pre_quant_scale_without_gating() -> None:
         )
 
 
-def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
+def test_megamoe_cutedsl_tuning_mode_keeps_the_chunk_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Profiling scratch is sized for the largest adaptive bucket.
+    # The opt-in tunes every bucket on scratch sized for it (bucket priming),
+    # so tuning launches the bucket serving would.
     monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
     moe = _make_megamoe_cutedsl_for_ctor_test()
     buckets = moe._maxt_buckets
@@ -4859,7 +4860,7 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
     small_hint = buckets[0]
     assert moe._select_launch_max_tokens(small_hint) == buckets[0]
     monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
-    assert moe._select_launch_max_tokens(small_hint) == buckets[-1]
+    assert moe._select_launch_max_tokens(small_hint) == buckets[0]
 
 
 @pytest.mark.cpu_only
@@ -4884,19 +4885,21 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
     assert (len(decode), len(prefill)) == (decode_count, prefill_count)
-    assert all(len(t) == 12 for t in decode + prefill)
-    assert {t[-3] for t in decode} == {(1, 1)}
-    assert {t[-3] for t in prefill} == {(2, 4)}
-    assert {t[-2] for t in decode + prefill} == {"expert"}
-    assert {t[-1] for t in decode + prefill} == {False}
+    assert all(len(t) == 13 for t in decode + prefill)
+    assert {t[9] for t in decode} == {(1, 1)}
+    assert {t[9] for t in prefill} == {(2, 4)}
+    assert {t[10] for t in decode + prefill} == {"expert"}
+    assert {t[11] for t in decode + prefill} == {False}
+    assert {t[12] for t in decode + prefill} == {1}
     for tactic in decode + prefill:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     default_tactics = [
         megamoe_op.default_megamoe_tactic(num_tokens) for num_tokens in (64, 4096, 16384)
     ]
-    assert all(len(tactic) == 12 for tactic in default_tactics)
-    assert {tactic[-2] for tactic in default_tactics} == {"expert"}
-    assert {tactic[-1] for tactic in default_tactics} == {False}
+    assert all(len(tactic) == 13 for tactic in default_tactics)
+    assert {tactic[10] for tactic in default_tactics} == {"expert"}
+    assert {tactic[11] for tactic in default_tactics} == {False}
+    assert {tactic[12] for tactic in default_tactics} == {1}
     for tactic in default_tactics:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     if sm_version == 107:
@@ -4910,7 +4913,7 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
                 in_kernel_fc2_reduce=False,
                 combine_format="bf16",
             )
-            assert len(selected) == 12
+            assert len(selected) == 13
             assert selected == megamoe_op._unpack_tactic(tactic)
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
     invalid_tactic[3] = ("grouped", 0)
@@ -4919,7 +4922,8 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
     assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
-    for legacy_len in (11, 10):  # v5 (no combine_dedup) and v4 (no READY granularity)
+    # v6 (no epilogue_warpgroups), v5 (no combine_dedup) and v4 (no READY granularity)
+    for legacy_len in (12, 11, 10):
         legacy = megamoe_op.default_megamoe_tactic(64)[:legacy_len]
         megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
         assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
@@ -5030,6 +5034,10 @@ def test_sm107_glm52_genphase_rows_apply_to_their_key_only(monkeypatch: pytest.M
     if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
         pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
     monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
+    # get_valid_tactics builds each shortlist member; construction only needs the cluster occupancy
+    # (the measured SM107 values), which otherwise needs a device.
+    occupancy = {1: 212, 2: 106, 4: 46, 8: 22}
+    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: occupancy[size])
     runner = megamoe_op.Sm100MegaMoENvfp4Runner(
         local_rank=0,
         output_dtype=torch.bfloat16,
@@ -5193,6 +5201,8 @@ def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
     monkeypatch.setattr(megamoe_op, "RubinInferenceGenphaseMegaMoE", Genphase)
     monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
     monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
+    # Offered lists resolved by an earlier query would skip the builds this test counts.
+    monkeypatch.setattr(megamoe_op, "_MEGAMOE_OFFERED_TACTICS_CACHE", {})
     query = dict(
         world_size=4,
         num_topk=6,
@@ -5204,7 +5214,7 @@ def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
         gate_up_clamp=10.0,
     )
     # A decode default the generation-phase kernel refuses runs its own tile on the generic
-    # kernel, not the non-bulk fallback.
+    # kernel, not the non-bulk fallback; the query tries each tactic once.
     warnings.clear()
     assert megamoe_op.query_megamoe_kernel_properties(**query) == (4096, False)
     assert built == [("genphase", tuple(default[3])), ("generic", ("phase_interleave", None))]

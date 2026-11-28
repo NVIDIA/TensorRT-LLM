@@ -1209,11 +1209,15 @@ class _MetadataPushRouter(AdaptiveRouteMixin, KernelComponent):
         register_count = cute.size(expert_registers)
         within_expert_indices = cute.make_rmem_tensor((register_count,), cutlass.Int32)
         for register_idx in cutlass.range_constexpr(register_count):
-            within_expert_indices[register_idx] = Int32(
-                cute.arch.atomic_add(
-                    histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
+            # TensorRT-LLM local patch: count valid routes only. Every padded or invalid slot carries the trash
+            # bucket; counting them serialises the CTA on that one SMEM word, and nothing reads the trash count.
+            within_expert_indices[register_idx] = Int32(0)
+            if expert_registers[register_idx] < Int32(self.expert_count):
+                within_expert_indices[register_idx] = Int32(
+                    cute.arch.atomic_add(
+                        histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
+                    )
                 )
-            )
         # The bulk copies to the peers read this histogram through the async proxy.
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
@@ -1231,13 +1235,16 @@ class _MetadataPushRouter(AdaptiveRouteMixin, KernelComponent):
     ) -> None:
         register_count = cute.size(expert_registers)
         for register_idx in cutlass.range_constexpr(register_count):
-            token_idx, topk_slot = self._router_value_coordinate(register_idx, topk_index_type)
-            flat_topk_index = token_idx * Int32(self.topk) + topk_slot
-            destination = expert_run_starts[expert_registers[register_idx]] + within_expert_indices[register_idx]
-            if cutlass.const_expr(self.apply_topk_at_fc1):
-                sorted_elements[destination] = _SortedElement(flat_topk_index, score_registers[register_idx]).pack()
-            else:
-                sorted_elements[destination] = _SortedElement(flat_topk_index, None).pack()
+            # TensorRT-LLM local patch: invalid slots hold no within-expert index (see _build_histogram) and nothing
+            # reads the trash run, so they are not stored.
+            if expert_registers[register_idx] < Int32(self.expert_count):
+                token_idx, topk_slot = self._router_value_coordinate(register_idx, topk_index_type)
+                flat_topk_index = token_idx * Int32(self.topk) + topk_slot
+                destination = expert_run_starts[expert_registers[register_idx]] + within_expert_indices[register_idx]
+                if cutlass.const_expr(self.apply_topk_at_fc1):
+                    sorted_elements[destination] = _SortedElement(flat_topk_index, score_registers[register_idx]).pack()
+                else:
+                    sorted_elements[destination] = _SortedElement(flat_topk_index, None).pack()
 
     @cute.jit
     def _router_value_coordinate(self, register_idx: int, topk_index_type: type) -> Tuple[Int32, Int32]:

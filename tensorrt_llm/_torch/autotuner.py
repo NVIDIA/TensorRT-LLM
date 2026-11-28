@@ -22,6 +22,7 @@ import fcntl
 import inspect
 import itertools
 import json
+import math
 import os
 import threading
 import time
@@ -69,11 +70,16 @@ class DistributedTuningStrategy(enum.Enum):
         PARALLEL: All ranks participate in tuning; each rank times its share of a profile's
             (runner, tactic) pairs and the merge keeps the fastest. A rank times every pair of
             a profile that some other rank of the group does not tune.
+        COLLECTIVE: For an op launched as one collective kernel across the
+            group: all ranks time the same candidates in lockstep, a candidate
+            scores the time of its slowest rank, and every rank keeps the
+            candidate with the lowest score (see TuningConfig.process_group)
     """
     BROADCAST = "broadcast"
     INDEPENDENT = "independent"
     MERGE = "merge"
     PARALLEL = "parallel"
+    COLLECTIVE = "collective"
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -170,7 +176,8 @@ class TuningConfig:
             the CPUs this rank may run on, divided by the ranks on the node unless the
             rank is pinned to a subset, up to 32: neighbouring sweep points often select
             the same kernel and compile it twice, so more threads keep paying off.
-            TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
+            TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count. COLLECTIVE ops
+            never run it: their kernel spans the group's ranks.
         build_strategy (BuildStrategy): How the ranks split the op's kernel builds. PER_RANK:
             each rank builds every kernel it needs. SHARED: when the ranks share JIT builds
             (tensorrt_llm._jit_share), each kernel is built by the rank that claims it and loaded
@@ -185,6 +192,27 @@ class TuningConfig:
             (``TunableRunner.build``; tensorrt_llm._torch.build_pool), then profiles. For ops whose
             builds are long enough to repay a worker. The runners and tactics must pickle and must
             not be collective. Warmups without a build pass build as without it.
+        process_group: COLLECTIVE only. The torch.distributed process group the op's kernel
+            spans. The op's tuning collectives (cache agreement, the barrier before each timed
+            loop, the exchange of timings) run over it. None uses the tuning group (TP, times CP
+            under Helix).
+        profiling_workloads (Tuple[Callable, ...]): COLLECTIVE only. Each maps the profiling
+            inputs (after ``inputs_pre_hook``) to the inputs of one workload; it may restage
+            shared input tensors in place, since it is called right before its own launch.
+            Every candidate is timed on each, and scores the mean over workloads of its
+            slowest-rank time relative to the fallback tactic's; that score, not a time, is what
+            the cache keeps. Empty times the profiling inputs as they are.
+        collective_warmup_launches (int): COLLECTIVE only. Untimed launches of the candidate on
+            the timed inputs between the barrier before each timed loop and its start. A kernel
+            that spans the ranks takes as long as its last rank to arrive, so without them the
+            first timed launch also times how far apart the ranks left the barrier; for short
+            kernels that skew can exceed the gaps between candidates, and it varies with what
+            ran before, so the winner can depend on the order candidates are timed in.
+        cover_host_launches (bool): Eager profiling only (``use_cuda_graph=False``). Size the
+            delay kernel before each timed loop to the host time its launches took in the
+            previous, shorter loop, so the GPU runs them back to back. For runners whose host
+            side of a launch takes longer than their kernel, the timed loop otherwise measures
+            how fast the host launches, which neither ranks the kernels nor repeats.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -198,6 +226,24 @@ class TuningConfig:
     build_strategy: BuildStrategy = BuildStrategy.PER_RANK
     cold_l2_flush_bytes: int = 0
     use_build_pool_in_warmup: bool = False
+    process_group: Any = None
+    profiling_workloads: Tuple[Callable, ...] = ()
+    collective_warmup_launches: int = 0
+    cover_host_launches: bool = False
+
+    def __post_init__(self):
+        if (self.profiling_workloads and self.distributed_tuning_strategy
+                != DistributedTuningStrategy.COLLECTIVE):
+            raise ValueError(
+                "TuningConfig.profiling_workloads requires the COLLECTIVE strategy"
+            )
+        if self.collective_warmup_launches < 0 or (
+                self.collective_warmup_launches
+                and self.distributed_tuning_strategy
+                != DistributedTuningStrategy.COLLECTIVE):
+            raise ValueError(
+                "TuningConfig.collective_warmup_launches must be >= 0 and "
+                "needs the COLLECTIVE strategy")
 
 
 @dataclass(frozen=True)
@@ -388,6 +434,26 @@ class TunableRunner(ABC):
         This default distinguishes every profile and tactic.
         """
         return (profile.get_opt_shapes(), str(tactic))
+
+    def fallback_tactic(self, inputs: List[torch.Tensor],
+                        profile: OptimizationProfile, **kwargs) -> Any:
+        """The entry of ``get_valid_tactics`` that ``tactic=-1`` runs, or -1 if none is.
+
+        COLLECTIVE tuning keeps it unless another candidate scores lower by
+        more than ``AutoTuner.COLLECTIVE_TIE_RTOL``.
+        """
+        return -1
+
+    def prepare_tactic(self, inputs: List[torch.Tensor], tactic: Any,
+                       **kwargs) -> None:
+        """Validate and build what ``tactic`` runs on ``inputs`` without launching it.
+
+        COLLECTIVE tuning calls it on every rank before timing ``tactic`` and
+        skips the tactic on all ranks if it raises on any, so a rank-local
+        refusal never leaves its peers inside a launch that spans the ranks.
+        The default does nothing.
+        """
+        del inputs, tactic, kwargs
 
 
 # A tensor spec keeps the values of a tensor whose storage has up to this many elements: scales,
@@ -1246,6 +1312,9 @@ class AutoTuner:
         stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 1000)
     """
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
+    # COLLECTIVE tuning keeps the runner's fallback tactic unless another
+    # candidate's score is lower than the fallback's by more than this fraction.
+    COLLECTIVE_TIE_RTOL = 0.005
     _instance = None
 
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
@@ -1264,6 +1333,9 @@ class AutoTuner:
         self._keys_profiled_in_process: set[Tuple] = set()
         # The build keys of the tune-mode builds asked of the rank's worker processes.
         self._pool_build_keys: set[str] = set()
+        # COLLECTIVE entries every rank of the op's group agreed on while tuning, by cache key:
+        # the only entries a multi-rank COLLECTIVE op replays outside tuning.
+        self._collective_agreed: Dict[Tuple, Tuple[int, Any]] = {}
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
         # nvMatmulHeuristics guidance for CuTe DSL GEMM/BMM runners; None
@@ -1476,6 +1548,14 @@ class AutoTuner:
 
         input_shapes = tuple(self._get_input_sizes(inputs))
 
+        if (not self.is_tuning_mode
+                and tuning_config.distributed_tuning_strategy
+                == DistributedTuningStrategy.COLLECTIVE
+                and self._needs_rank_agreement(
+                    DistributedTuningStrategy.COLLECTIVE, tuning_config)):
+            return self._agreed_collective_entry(custom_op, runners,
+                                                 input_shapes, tuning_config)
+
         # For ops opted out of the persistent cache (e.g. JIT-driven
         # kernels whose "tuning" triggers compilation as a side effect),
         # mark them in the cache so save_cache filters them out, and
@@ -1525,9 +1605,19 @@ class AutoTuner:
 
         # Collective strategies tune in lockstep, but ranks can load different
         # caches from a shared file: tune unless every rank has the entry.
-        if self._needs_rank_agreement(
-                tuning_config.distributed_tuning_strategy):
-            is_cache_hit = self._hit_on_all_ranks(is_cache_hit)
+        if self._needs_rank_agreement(tuning_config.distributed_tuning_strategy,
+                                      tuning_config):
+            if (tuning_config.distributed_tuning_strategy ==
+                    DistributedTuningStrategy.COLLECTIVE):
+                is_cache_hit = self._same_entry_on_all_ranks(
+                    custom_op, tuning_config, is_cache_hit, best_runner_id,
+                    best_tactic)
+                if is_cache_hit:
+                    self._record_agreed_entry(custom_op, runners, input_shapes,
+                                              tuning_config, best_runner_id,
+                                              best_tactic)
+            else:
+                is_cache_hit = self._hit_on_all_ranks(is_cache_hit)
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
@@ -1569,15 +1659,31 @@ class AutoTuner:
                     apply_map_to_tuning_buckets=False,
                 )[0]
 
-            # Every rank profiles under MERGE / PARALLEL, so they agree on the profiles to tune.
+            # Every rank profiles under MERGE / PARALLEL / COLLECTIVE, so they agree on the
+            # profiles to tune.
+            def cached_entry(p: OptimizationProfile) -> Optional[Tuple]:
+                hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    p.get_opt_shapes(),
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False,
+                )
+                return (runner_id, repr(tactic)) if hit else None
+
             # PARALLEL deals the tactics of a profile only when every rank of the group profiles
             # it: ranks build profiles from their own input shapes (attention DP).
             agreed_hits = None
             undealt = set()
-            if (self._needs_rank_agreement(strategy)
+            if (self._needs_rank_agreement(strategy, tuning_config)
                     and strategy != DistributedTuningStrategy.BROADCAST):
+                # COLLECTIVE compares the entries themselves: ranks holding
+                # different tactics for a profile (stale or mixed caches) tune it again.
+                held = ([cached_entry(p) for p in profiles]
+                        if strategy == DistributedTuningStrategy.COLLECTIVE else
+                        [is_cached(p) for p in profiles])
                 hits, undealt = self._agree_profiles_across_ranks(
-                    profiles, [is_cached(p) for p in profiles])
+                    profiles, held, tuning_config)
                 agreed_hits = dict(
                     zip((p.get_opt_shapes() for p in profiles), hits))
 
@@ -1649,8 +1755,11 @@ class AutoTuner:
                         for p in profiles:
                             profile_one(p)
 
-        self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
-                                    custom_op)
+        if strategy == DistributedTuningStrategy.COLLECTIVE:
+            # Every rank kept the winner of the same gathered timings; verify it.
+            self._check_collective_agreement(custom_op, tuning_config)
+        else:
+            self._maybe_sync_cache_data(strategy, custom_op)
         self._prime_cached_tactics(custom_op, runners, tuning_config, inputs,
                                    **kwargs)
 
@@ -1667,8 +1776,19 @@ class AutoTuner:
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
-        _, runner_id, tactic, _ = self.profiling_cache.search_cache(
+        is_hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
             custom_op, runners, input_shapes, tuning_config)
+        if (strategy == DistributedTuningStrategy.COLLECTIVE
+                and self._needs_rank_agreement(strategy, tuning_config)):
+            # Serving replays only an entry every rank holds; confirm the one kept here.
+            if self._same_entry_on_all_ranks(custom_op, tuning_config, is_hit,
+                                             runner_id, tactic):
+                self._record_agreed_entry(custom_op, runners, input_shapes,
+                                          tuning_config, runner_id, tactic)
+            else:
+                self._forget_agreed_entry(custom_op, runners, input_shapes,
+                                          tuning_config)
+                runner_id, tactic, _ = self.profiling_cache.fallback_entry()
 
         tuning_end_time = time.perf_counter()
         self.stats.tuned_op_time_cost[
@@ -1695,7 +1815,8 @@ class AutoTuner:
         call that builds its kernel."""
         if tuning_config.distributed_tuning_strategy in (
                 DistributedTuningStrategy.MERGE,
-                DistributedTuningStrategy.PARALLEL):
+                DistributedTuningStrategy.PARALLEL,
+                DistributedTuningStrategy.COLLECTIVE):
             return False
         first = next((p for p in profiles if is_pending(p)), None)
         if first is None:
@@ -1708,10 +1829,12 @@ class AutoTuner:
     def _builds_in_pool(self, tuning_config: TuningConfig) -> bool:
         """Whether tune mode builds the op's kernels in the rank's worker processes before it
         profiles: an op that sets ``use_build_pool_in_warmup``, whose runners are not collective
-        (MERGE), while the workers take builds (inside a build pass, ``TLLM_KERNEL_BUILDER`` on)."""
+        (MERGE, COLLECTIVE), while the workers take builds (inside a build pass,
+        ``TLLM_KERNEL_BUILDER`` on)."""
         return (tuning_config.use_build_pool_in_warmup
                 and tuning_config.distributed_tuning_strategy
-                != DistributedTuningStrategy.MERGE
+                not in (DistributedTuningStrategy.MERGE,
+                        DistributedTuningStrategy.COLLECTIVE)
                 and BuildPool.get().accepting())
 
     def _build_in_pool(self, custom_op: str, runners: List[TunableRunner],
@@ -1945,7 +2068,9 @@ class AutoTuner:
             return
         # Cache hits may differ across ranks; collective runners must stay
         # inside lockstep profiling, including profiling scratch allocation.
-        if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
+        if tuning_config.distributed_tuning_strategy in (
+                DistributedTuningStrategy.MERGE,
+                DistributedTuningStrategy.COLLECTIVE):
             return
         # A runner need not subclass TunableRunner, which declares primes_cached_tactics.
         jit_classes = {
@@ -2076,14 +2201,15 @@ class AutoTuner:
             candidates.append(
                 (runner_id, runner, runner_arg_names, all_valid_tactics))
 
-        # MERGE/PARALLEL strategies rely on comparing per-rank timings to
-        # pick the winning tactic across ranks. If a rank's local set of
-        # tactics has only one entry we must still time it — the shortcut
-        # would record min_time=0.0, which collides with peer ranks' 0.0
-        # in the tie-break and silently drops slower tactics on the floor.
+        # MERGE/PARALLEL/COLLECTIVE strategies rely on comparing per-rank
+        # timings to pick the winning tactic across ranks. If a rank's local
+        # set of tactics has only one entry we must still time it — the
+        # shortcut would record min_time=0.0, which collides with peer ranks'
+        # 0.0 in the tie-break and silently drops slower tactics on the floor.
         if total_pairs == 1 and tuning_config.distributed_tuning_strategy not in (
                 DistributedTuningStrategy.MERGE,
-                DistributedTuningStrategy.PARALLEL):
+                DistributedTuningStrategy.PARALLEL,
+                DistributedTuningStrategy.COLLECTIVE):
             # Single-pair shortcut. There is nothing to compare against, so
             # the timed warmup + profile-repeat loop is pure overhead. We
             # fire one forward call on every rank to drive any JIT side
@@ -2141,6 +2267,17 @@ class AutoTuner:
             # at every shape.
             pair_offset = self._parallel_deal_start(
                 custom_op, profile, tuning_config.distributed_tuning_strategy)
+            collective = (tuning_config.distributed_tuning_strategy ==
+                          DistributedTuningStrategy.COLLECTIVE)
+            # Multi-rank COLLECTIVE: every launch spans the ranks, so each rank's
+            # failures are agreed on before the next launch (see _time_collectively).
+            coordinated = (collective
+                           and self._collective_group(tuning_config)[0] > 1)
+            if collective:
+                self._agree_on_candidates(custom_op, profile, candidates,
+                                          tuning_config)
+            # (runner_id, tactic, time) of every pair this rank timed, in order.
+            timed = []
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = (self._maybe_parallelize_tactics(
                     all_valid_tactics,
@@ -2158,16 +2295,39 @@ class AutoTuner:
                     )
 
                 for tac in valid_tactics:
+                    workloads = tuning_config.profiling_workloads
+                    workload_times = None
                     try:
                         with nvtx_range(f"r{runner_id}, tactic {tac}"):
-                            time_measured = self._profile_single_kernel(
-                                runner=runner,
-                                inputs=input_tensors,
-                                tactic=tac,
-                                tuning_config=tuning_config,
-                                use_cuda_graph=tuning_config.use_cuda_graph,
-                                **kwargs,
-                            )
+                            if coordinated:
+                                workload_times = self._time_collectively(
+                                    runner, tac, input_tensors, tuning_config,
+                                    **kwargs)
+                                time_measured = sum(workload_times)
+                                if not workloads:
+                                    workload_times = None
+                            elif workloads:
+                                workload_times = [
+                                    self._profile_single_kernel(
+                                        runner=runner,
+                                        inputs=workload(input_tensors),
+                                        tactic=tac,
+                                        tuning_config=tuning_config,
+                                        use_cuda_graph=tuning_config.
+                                        use_cuda_graph,
+                                        **kwargs,
+                                    ) for workload in workloads
+                                ]
+                                time_measured = sum(workload_times)
+                            else:
+                                time_measured = self._profile_single_kernel(
+                                    runner=runner,
+                                    inputs=input_tensors,
+                                    tactic=tac,
+                                    tuning_config=tuning_config,
+                                    use_cuda_graph=tuning_config.use_cuda_graph,
+                                    **kwargs,
+                                )
                     except Exception as e:
                         # Synchronize to clear any pending CUDA errors left by the
                         # failed tactic.  Without this, the stale error propagates
@@ -2177,7 +2337,7 @@ class AutoTuner:
                             torch.cuda.synchronize()
                         except Exception:
                             pass
-                        if jit_share.is_busy(e):
+                        if jit_share.is_busy(e) and not coordinated:
                             raise  # Not a failure: the caller runs this profile later.
 
                         # Handle None tensors for optional inputs
@@ -2200,15 +2360,25 @@ class AutoTuner:
                         # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                         # or some runtime error occurs during profiling.
                         time_measured = float('inf')
+                        workload_times = [float('inf')] * len(workloads or ())
                         has_tuning_failure_occurred = True
                     self._debug_logger(
                         f"[Autotuner] Candidate: custom_op={custom_op}, "
                         f"runner={runner}, tactic={tac}, "
                         f"shapes={profile.get_opt_shapes()}, "
-                        f"time={time_measured:.3f}ms")
+                        f"time={time_measured:.3f}ms" +
+                        (f" (per workload {[round(t, 4) for t in workload_times]})"
+                         if workloads else ""))
+                    timed.append(
+                        (runner_id, tac,
+                         workload_times if workloads else time_measured))
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
+            if collective:
+                best_runner_id, best_tactic, min_time = self._collective_choice(
+                    custom_op, runners, input_tensors, profile, tuning_config,
+                    timed, **kwargs)
 
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
@@ -2271,6 +2441,11 @@ class AutoTuner:
         offset: the threads run the ones this process claims, and the sweep
         then finds them run, and waits for the ones other processes claimed.
         """
+        if (tuning_config.distributed_tuning_strategy ==
+                DistributedTuningStrategy.COLLECTIVE):
+            # The op launches one kernel across its group's ranks; launches from a thread pool
+            # would run it outside the lockstep the group needs.
+            return
         num_threads = int(
             os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP",
                            tuning_config.parallel_jit_warmup))
@@ -2443,8 +2618,14 @@ class AutoTuner:
         short_profile_threshold_ms = 1
 
         avg_time = float('inf')
+        warmup_launches = (tuning_config.collective_warmup_launches
+                           if tuning_config.distributed_tuning_strategy
+                           == DistributedTuningStrategy.COLLECTIVE else 0)
+        # Host seconds per launch of the last timed loop (cover_host_launches).
+        host_launch_s = None
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
+            nonlocal host_launch_s
             graph = torch.cuda.CUDAGraph()
 
             @contextlib.contextmanager
@@ -2513,12 +2694,34 @@ class AutoTuner:
                 if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
                     # Currently only AllReduce will use this strategy, and only MPI parallel will enable tuning.
                     self._dist.tp_barrier()
+                elif (tuning_config.distributed_tuning_strategy ==
+                      DistributedTuningStrategy.COLLECTIVE):
+                    self._collective_barrier(tuning_config)
 
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
                 if use_cuda_graph:
                     delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
                 else:
-                    delay_kernel(self.stream_delay_micro_secs, stream)
+                    delay_us = self.stream_delay_micro_secs
+                    if tuning_config.cover_host_launches and host_launch_s is not None:
+                        # Long enough for the host to queue every launch below before the GPU
+                        # reaches them, with margin for host jitter.
+                        delay_us = max(
+                            delay_us,
+                            math.ceil(1.5e6 * host_launch_s *
+                                      (warmup_launches + repeat)))
+                    delay_kernel(delay_us, stream)
+                host_start = time.perf_counter()
+
+                # Queued behind the delay, these untimed launches of a kernel that spans the ranks
+                # end together on every rank, so the timed loop starts with the ranks lined up.
+                for r in range(warmup_launches):
+                    self._run_profile_runner(
+                        runner,
+                        input_tensor_batches[r % len(input_tensor_batches)],
+                        tactic,
+                        **kwargs,
+                    )
 
                 record_start()
 
@@ -2534,6 +2737,9 @@ class AutoTuner:
                         )
 
                 record_end()
+                if not use_cuda_graph:
+                    host_launch_s = (time.perf_counter() -
+                                     host_start) / (warmup_launches + repeat)
                 stream.synchronize()
 
                 return elapsed_time() / repeat
@@ -2548,9 +2754,11 @@ class AutoTuner:
         disable_short_profile = os.environ.get(
             "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
 
-        # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
+        # Disable this feature for lockstep strategies to avoid potential hang due to asymmetric tuning.
         if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \
-            and tuning_config.distributed_tuning_strategy != DistributedTuningStrategy.MERGE:
+            and tuning_config.distributed_tuning_strategy not in (
+                DistributedTuningStrategy.MERGE,
+                DistributedTuningStrategy.COLLECTIVE):
             # directly use the few repeat estimated time to avoid redundant profiling
             avg_time = fewer_repeat_avg_time
         else:
@@ -2877,6 +3085,9 @@ class AutoTuner:
         self.profiling_cache.clear()
         self._keys_profiled_in_process.clear()
         self._pool_build_keys.clear()
+        # Every rank of a COLLECTIVE group must clear together: the agreed
+        # entries are what keeps their serving lookups identical.
+        self._collective_agreed.clear()
         if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
             torch.ops.trtllm.clear_allreduce_tactic_cache()
 
@@ -3056,38 +3267,337 @@ class AutoTuner:
         """Check if we're in a distributed environment."""
         return self._dist is not None and self._tuning_group()[0] > 1
 
-    def _needs_rank_agreement(self,
-                              strategy: DistributedTuningStrategy) -> bool:
+    def _needs_rank_agreement(
+            self,
+            strategy: DistributedTuningStrategy,
+            tuning_config: Optional[TuningConfig] = None) -> bool:
         """Whether ranks must agree on cache hits under ``strategy``.
 
         Never for a choose_one() reached from a runner this rank is profiling:
         under BROADCAST rank 0 profiles alone, so a collective there never
         completes.
         """
-        return (strategy != DistributedTuningStrategy.INDEPENDENT
-                and self._is_distributed() and not self._profiling_depth)
+        if (strategy == DistributedTuningStrategy.INDEPENDENT
+                or self._profiling_depth):
+            return False
+        if (strategy == DistributedTuningStrategy.COLLECTIVE
+                and tuning_config is not None):
+            return self._collective_group(tuning_config)[0] > 1
+        return self._is_distributed()
 
     def _hit_on_all_ranks(self, is_cache_hit: bool) -> bool:
         """Whether ``is_cache_hit`` holds on every rank (host all-gather)."""
         return all(self._dist.tp_cp_allgather(obj=bool(is_cache_hit)))
 
     def _agree_profiles_across_ranks(
-            self, profiles: list[OptimizationProfile],
-            hits: list[bool]) -> tuple[list[bool], set[tuple]]:
+        self,
+        profiles: list[OptimizationProfile],
+        hits: list[Any],
+        tuning_config: Optional[TuningConfig] = None
+    ) -> tuple[list[bool], set[tuple]]:
         """Per profile, whether every rank that tunes it has it cached; and the shapes of the
-        profiles that some rank of the group does not tune (one host all-gather).
+        profiles that some rank of the group does not tune (one host all-gather over the ranks
+        the op tunes across, see ``_group_allgather``).
 
         Ranks make their profiles from their own input shapes (attention DP), so the lists may differ.
+        ``hits`` are booleans, or the cached entries (None on a miss): then ranks
+        holding different entries for a profile count as a miss.
         """
         keys = [p.get_opt_shapes() for p in profiles]
-        missed = set()
+        held = [
+            hit if hit is None or isinstance(hit, tuple) else bool(hit)
+            for hit in hits
+        ]
+        missed, seen = set(), {}
         everywhere = set(keys)
-        for rank_keys, rank_hits in self._dist.tp_cp_allgather(
-                obj=(keys, [bool(hit) for hit in hits])):
-            missed.update(key for key, hit in zip(rank_keys, rank_hits)
-                          if not hit)
+        for rank_keys, rank_held in self._group_allgather((keys, held),
+                                                          tuning_config):
+            for key, value in zip(rank_keys, rank_held):
+                if not value or seen.setdefault(key, value) != value:
+                    missed.add(key)
             everywhere.intersection_update(rank_keys)
         return [key not in missed for key in keys], set(keys) - everywhere
+
+    @staticmethod
+    def _explicit_process_group(tuning_config: Optional[TuningConfig]) -> Any:
+        """The process group a COLLECTIVE op names, or None for the tuning group."""
+        if (tuning_config is None or tuning_config.distributed_tuning_strategy
+                != DistributedTuningStrategy.COLLECTIVE):
+            return None
+        return tuning_config.process_group
+
+    def _collective_group(self, tuning_config: TuningConfig) -> Tuple[int, int]:
+        """``(size, index)`` of the group a COLLECTIVE op tunes across."""
+        group = self._explicit_process_group(tuning_config)
+        if group is None:
+            return self._tuning_group() if self._dist is not None else (1, 0)
+        return (torch.distributed.get_world_size(group),
+                torch.distributed.get_rank(group))
+
+    def _group_allgather(
+            self,
+            obj: Any,
+            tuning_config: Optional[TuningConfig] = None) -> List[Any]:
+        """All-gather ``obj`` (host objects) over the ranks the op tunes across, in group order."""
+        group = self._explicit_process_group(tuning_config)
+        if group is None:
+            return self._dist.tp_cp_allgather(obj=obj)
+        gathered = [None] * torch.distributed.get_world_size(group)
+        torch.distributed.all_gather_object(gathered, obj, group=group)
+        return gathered
+
+    def _collective_barrier(self, tuning_config: TuningConfig) -> None:
+        """Host barrier over the group of a COLLECTIVE op."""
+        if self._collective_group(tuning_config)[0] <= 1:
+            return
+        group = self._explicit_process_group(tuning_config)
+        if group is None:
+            # The tuning group may span CP ranks too; its all-gather does.
+            self._dist.tp_cp_allgather(obj=None)
+        else:
+            torch.distributed.barrier(group=group)
+
+    def _same_entry_on_all_ranks(self, custom_op: str,
+                                 tuning_config: TuningConfig,
+                                 is_cache_hit: bool, runner_id: int,
+                                 tactic: Any) -> bool:
+        """Whether every rank of a COLLECTIVE op holds this cache entry (one host all-gather).
+
+        One kernel spans the ranks, so ranks holding different tactics for the
+        entry (different cache files, a stale entry) would launch mismatched
+        kernels: that counts as a miss on every rank, so all tune it again.
+        """
+        held = self._group_allgather(
+            (runner_id, repr(tactic)) if is_cache_hit else None, tuning_config)
+        if any(entry is None for entry in held):
+            return False
+        if len(set(held)) > 1:
+            logger.warning(
+                f"[AutoTuner] {custom_op}: the ranks of a collective op hold "
+                f"different cached tactics for one entry, by rank (runner, "
+                f"tactic): {held}; tuning it again on every rank.")
+            return False
+        return True
+
+    def _agreed_entry_key(self, custom_op: str, runners: List[TunableRunner],
+                          input_shapes: Tuple,
+                          tuning_config: TuningConfig) -> Tuple:
+        """The cache key an agreed COLLECTIVE entry is kept under (``runners[0]``'s)."""
+        return self.profiling_cache.get_cache_key(
+            custom_op,
+            runners[0],
+            input_shapes,
+            tuning_config,
+            apply_map_to_tuning_buckets=True)
+
+    def _record_agreed_entry(self, custom_op: str, runners: List[TunableRunner],
+                             input_shapes: Tuple, tuning_config: TuningConfig,
+                             runner_id: int, tactic: Any) -> None:
+        self._collective_agreed[self._agreed_entry_key(
+            custom_op, runners, input_shapes,
+            tuning_config)] = (runner_id, tactic)
+
+    def _forget_agreed_entry(self, custom_op: str, runners: List[TunableRunner],
+                             input_shapes: Tuple,
+                             tuning_config: TuningConfig) -> None:
+        self._collective_agreed.pop(
+            self._agreed_entry_key(custom_op, runners, input_shapes,
+                                   tuning_config), None)
+
+    def _agreed_collective_entry(
+            self, custom_op: str, runners: List[TunableRunner],
+            input_shapes: Tuple,
+            tuning_config: TuningConfig) -> Tuple[TunableRunner, Any]:
+        """Serving lookup of a multi-rank COLLECTIVE op: no communication.
+
+        One kernel spans the ranks, so every rank must launch the same tactic.
+        Only entries all ranks agreed on while tuning (see
+        ``_same_entry_on_all_ranks``) are replayed; any other shape, including
+        one whose cache entry was only loaded or is held by some ranks, takes
+        the fallback (runner 0, tactic -1) on every rank alike.
+        """
+        agreed = self._collective_agreed.get(
+            self._agreed_entry_key(custom_op, runners, input_shapes,
+                                   tuning_config))
+        if agreed is None:
+            logger.warning_once(
+                f"[AutoTuner] {custom_op} using the fallback tactic: no entry "
+                f"agreed by every rank while tuning for input shapes="
+                f"{input_shapes}",
+                key=(custom_op, "warning_collective_unagreed_fallback"))
+            runner_id, tactic, _ = self.profiling_cache.fallback_entry()
+            return runners[runner_id], tactic
+        runner_id, tactic = agreed
+        return runners[runner_id], tactic
+
+    def _check_collective_agreement(self, custom_op: str,
+                                    tuning_config: TuningConfig) -> None:
+        """Drop, on every rank, each cache key of a COLLECTIVE op the ranks all
+        hold with different tactics (one host all-gather), so that a later
+        lookup misses on every rank and tunes it again."""
+        if self._collective_group(tuning_config)[0] <= 1:
+            return
+        mine = {
+            key: (value[0], repr(value[1]))
+            for key, value in self.profiling_cache.get_specific_custom_op(
+                custom_op).items()
+        }
+        per_rank = self._group_allgather(mine, tuning_config)
+        for key in sorted(set(mine).intersection(*per_rank), key=repr):
+            held = [entries[key] for entries in per_rank]
+            if len(set(held)) > 1:
+                logger.warning(
+                    f"[AutoTuner] {custom_op}: the ranks of a collective op "
+                    f"hold different tactics for {key}, by rank (runner, "
+                    f"tactic): {held}; dropping the entry on every rank.")
+                self.profiling_cache.cache.pop(key, None)
+
+    def _agree_on_candidates(self, custom_op: str, profile: OptimizationProfile,
+                             candidates: List[Tuple],
+                             tuning_config: TuningConfig) -> None:
+        """Raise unless every rank of a COLLECTIVE op is about to time the same
+        (runner, tactic) pairs in the same order (one host all-gather).
+
+        Each timed launch is collective, so lists that differ would leave
+        ranks waiting in different kernels; compare them before any launch.
+        """
+        if self._collective_group(tuning_config)[0] <= 1:
+            return
+        mine = (profile.get_opt_shapes(), [
+            (runner_id, repr(tactic)) for runner_id, _, _, tactics in candidates
+            for tactic in tactics
+        ])
+        lists = self._group_allgather(mine, tuning_config)
+        differing = [rank for rank, other in enumerate(lists) if other != mine]
+        if differing:
+            raise RuntimeError(
+                f"[AutoTuner] {custom_op}: the ranks of a collective op must "
+                f"time the same candidates in the same order, but group ranks "
+                f"{differing} differ from this rank's (shapes, [(runner, "
+                f"tactic), ...]) {mine}; first differing: {lists[differing[0]]}"
+            )
+
+    class _FailedOnAnotherRank(RuntimeError):
+        """A COLLECTIVE candidate this rank ran, but a peer failed: no rank keeps it."""
+
+    def _all_ranks_ok(self, ok: bool, tuning_config: TuningConfig) -> bool:
+        """Whether ``ok`` holds on every rank of a COLLECTIVE op (one host all-gather)."""
+        return all(self._group_allgather(bool(ok), tuning_config))
+
+    def _time_collectively(self, runner: TunableRunner, tactic: Any,
+                           input_tensors: List[torch.Tensor],
+                           tuning_config: TuningConfig,
+                           **kwargs) -> List[float]:
+        """Per-workload times of ``tactic`` on a multi-rank COLLECTIVE op (one workload: the inputs).
+
+        Each launch spans the ranks, so a rank must not launch while a peer
+        has stopped. Before each workload's launch the ranks build its inputs
+        (and, before the first, the tactic: ``TunableRunner.prepare_tactic``)
+        without launching and agree that all succeeded; after each workload's
+        timing they agree again. A workload may restage shared input tensors
+        in place, so its inputs are built right before its own launch. A
+        failure on any rank raises on every rank at the same point (this
+        rank's error, or ``_FailedOnAnotherRank``), so all of them drop the
+        tactic and move to the next one together. A failure inside a launch
+        that left peers waiting in the kernel cannot be recovered here.
+        """
+        workloads = tuning_config.profiling_workloads or (None, )
+        times = []
+        for index, workload in enumerate(workloads):
+            error = None
+            batch = None
+            try:
+                batch = input_tensors if workload is None else workload(
+                    input_tensors)
+                if index == 0:
+                    runner.prepare_tactic(batch, tactic, **kwargs)
+            except Exception as e:  # noqa: BLE001 - any rank-local failure is agreed on before a launch
+                error = e
+            if not self._all_ranks_ok(error is None, tuning_config):
+                raise error or self._FailedOnAnotherRank(
+                    f"tactic {tactic} failed to build on another rank")
+            try:
+                times.append(
+                    self._profile_single_kernel(
+                        runner=runner,
+                        inputs=batch,
+                        tactic=tactic,
+                        tuning_config=tuning_config,
+                        use_cuda_graph=tuning_config.use_cuda_graph,
+                        **kwargs,
+                    ))
+            except Exception as e:  # noqa: BLE001 - agreed on before the next launch
+                error = e
+            if not self._all_ranks_ok(error is None, tuning_config):
+                raise error or self._FailedOnAnotherRank(
+                    f"tactic {tactic} failed to run on another rank")
+        return times
+
+    def _collective_choice(self, custom_op: str, runners: List[TunableRunner],
+                           input_tensors: List[torch.Tensor],
+                           profile: OptimizationProfile,
+                           tuning_config: TuningConfig,
+                           timed: List[Tuple[int, Any, float]],
+                           **kwargs) -> Tuple[Optional[int], Any, float]:
+        """``(runner_id, tactic, score)`` every rank of a COLLECTIVE op keeps.
+
+        A candidate's score is its time on its slowest rank (one host
+        all-gather of every rank's times), so a candidate that failed on any
+        rank scores inf and is never kept. With ``profiling_workloads`` the
+        score is the mean over workloads of that slowest-rank time divided by
+        the fallback tactic's (or, if the fallback is not a timed candidate
+        that ran everywhere, the first such candidate's). The lowest score wins,
+        the earliest candidate on an exact tie; the fallback tactic of
+        ``runners[0]`` is kept instead unless the winner scores below the
+        fallback by more than ``COLLECTIVE_TIE_RTOL``. Every rank decides from
+        the same gathered times and group rank 0's fallback, so all keep the
+        same entry.
+        """
+        fallback = runners[0].fallback_tactic(input_tensors, profile, **kwargs)
+        fallback_index = next((i
+                               for i, (runner_id, tactic, _) in enumerate(timed)
+                               if runner_id == 0 and tactic == fallback), None)
+        mine = ([time for *_, time in timed], fallback_index)
+        per_rank = (self._group_allgather(mine, tuning_config)
+                    if self._collective_group(tuning_config)[0] > 1 else [mine])
+        fallback_index = per_rank[0][1]
+        workloads = bool(tuning_config.profiling_workloads)
+        # Per candidate, the slowest rank's time (per workload, with workloads).
+        slowest = [([max(column)
+                     for column in zip(*times)] if workloads else max(times))
+                   for times in zip(*(t for t, _ in per_rank))]
+        if workloads:
+            ran = [
+                i for i, times in enumerate(slowest) if all(
+                    math.isfinite(t) for t in times)
+            ]
+            if not ran:
+                return None, None, float('inf')
+            reference = slowest[fallback_index if fallback_index in
+                                ran else ran[0]]
+            scores = [
+                sum(t / r for t, r in zip(times, reference)) / len(reference)
+                for times in slowest
+            ]
+        else:
+            scores = slowest
+        finite = [i for i, score in enumerate(scores) if math.isfinite(score)]
+        if not finite:
+            return None, None, float('inf')
+        best = min(finite, key=scores.__getitem__)
+        if (fallback_index in finite and scores[best] > scores[fallback_index] *
+            (1 - self.COLLECTIVE_TIE_RTOL)):
+            best = fallback_index
+        runner_id, tactic, _ = timed[best]
+        self._debug_logger(
+            f"[Autotuner] Collective choice: custom_op={custom_op}, "
+            f"shapes={profile.get_opt_shapes()}, kept candidate {best} "
+            f"(runner={runners[runner_id]}, tactic={tactic}), "
+            f"score={scores[best]:.4f}, fallback candidate {fallback_index}, "
+            f"scores={[round(score, 4) for score in scores]}" +
+            (f", slowest-rank ms per candidate and workload={slowest}"
+             if workloads else ""))
+        return runner_id, tactic, scores[best]
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
                              strategy: DistributedTuningStrategy) -> int:
@@ -3193,6 +3703,7 @@ class AutoTuner:
                 DistributedTuningStrategy.INDEPENDENT,
                 DistributedTuningStrategy.MERGE,
                 DistributedTuningStrategy.PARALLEL,
+                DistributedTuningStrategy.COLLECTIVE,
         }:
             # All ranks tune independently
             return True

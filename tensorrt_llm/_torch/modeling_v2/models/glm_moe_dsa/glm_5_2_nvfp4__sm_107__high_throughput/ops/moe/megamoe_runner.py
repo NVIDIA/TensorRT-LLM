@@ -193,9 +193,12 @@ class RubinMegaMoERunner(Sm100MegaMoENvfp4Runner):
             epi_flag_batch,
             token_back_ready_granularity,
             combine_dedup,
+            epilogue_warpgroups,
         ) = _unpack_tactic(tactic)
         if combine_dedup:
             raise ValueError("The GLM Rubin runner does not support combine_dedup.")
+        if epilogue_warpgroups != 1:
+            raise ValueError("The GLM Rubin runner does not support epilogue_warpgroups=2.")
         (
             launch_cluster_count,
             preferred_cluster_count,

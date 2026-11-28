@@ -121,7 +121,9 @@ def op(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     module.IS_MEGAMOE_OP_AVAILABLE = True
     module.RubinInferenceGenphaseMegaMoE = _GenphaseMetadata
     module.RubinInferenceMegaMoE = _GenericMetadata
-    monkeypatch.setattr(module, "_max_active_clusters", lambda *args: 46)
+    # Measured SM107 cluster occupancy: the [2, 1, 1] fallback of the [4, 1, 1] defaults holds more CTAs.
+    occupancy = {1: 212, 2: 106, 4: 46, 8: 22}
+    monkeypatch.setattr(module, "_max_active_clusters", lambda size, *args: occupancy[size])
     return module
 
 
@@ -209,13 +211,15 @@ def test_bf16_localized_query_and_runner_share_consumer(
         assert kernel.implementation["weight_layout"] == (
             "n_split" if layout == "n_split" else "standard"
         )
-    assert len(calls) == 2
+    # The query builds the default, plus a load-balanced launch's non-dedup default when the default
+    # dedups (one workspace serves both); the runner builds the default.
+    assert len(calls) == (3 if op._unpack_tactic(tactic)[11] else 2)
     # The query leaves helper_expert_count and the fused shared expert to the constructor defaults.
     for call in calls:
         call["common"].setdefault("helper_expert_count", 0)
         call["common"].setdefault("shared_intermediate_size", None)
         call["common"].setdefault("shared_gate_up_clamp", None)
-    assert calls[0] == calls[1]
+    assert calls[0] == calls[-1]
     assert calls[0]["ugpu_weight_layout"] == layout
     ordinary = op.Sm100MegaMoENvfp4Runner(**{**problem, "ugpu_weight_layout": "none"})
     assert runner.unique_id() != ordinary.unique_id()

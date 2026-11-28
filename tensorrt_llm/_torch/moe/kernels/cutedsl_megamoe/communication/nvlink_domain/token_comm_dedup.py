@@ -1206,18 +1206,25 @@ class _DedupMetadataPushRouter(KernelComponent):
                 score = None
                 if cutlass.const_expr(self.carry_topk_scores):
                     score = score_slab[local_token * Int32(topk) + physical_slot]
-                sorted_elements[destination] = _SortedElement(flat_topk_index, copy_info, score).pack()
+                # TensorRT-LLM local patch: invalid routes hold no within-expert index (see _build_histogram) and
+                # nothing reads the trash run, so they are not stored.
+                if expert < expert_count:
+                    sorted_elements[destination] = _SortedElement(flat_topk_index, copy_info, score).pack()
 
     @cute.jit
     def _build_histogram(self, expert_registers: cute.Tensor, histogram: cute.Tensor) -> cute.Tensor:
         register_count = cute.size(expert_registers)
         within_expert_indices = cute.make_rmem_tensor((register_count,), cutlass.Int32)
         for register_idx in cutlass.range_constexpr(register_count):
-            within_expert_indices[register_idx] = Int32(
-                cute.arch.atomic_add(
-                    histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
+            # TensorRT-LLM local patch: count valid routes only. Every padded or invalid route carries the trash
+            # bucket; counting them serialises the CTA on that one SMEM word, and nothing reads the trash count.
+            within_expert_indices[register_idx] = Int32(0)
+            if expert_registers[register_idx] < Int32(self.expert_count):
+                within_expert_indices[register_idx] = Int32(
+                    cute.arch.atomic_add(
+                        histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
+                    )
                 )
-            )
         cute.arch.sync_threads()
         return within_expert_indices
 

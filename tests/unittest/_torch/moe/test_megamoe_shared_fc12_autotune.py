@@ -475,7 +475,7 @@ class CpuContractTests(unittest.TestCase):
             os=os,
             inspect=inspect,
             nvtx_range=lambda name: nullcontext(),
-            DistributedTuningStrategy=SimpleNamespace(MERGE=object()),
+            DistributedTuningStrategy=SimpleNamespace(MERGE=object(), COLLECTIVE=object()),
         )
         exec(
             compile(
