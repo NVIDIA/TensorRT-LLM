@@ -41,6 +41,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
@@ -57,6 +58,7 @@
 #include <cuda_fp8.h>
 #include <math.h>
 #include <sstream>
+#include <string>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -108,6 +110,33 @@ auto deduce_layout_sf()
     {
         return (void*) nullptr;
     }
+}
+
+//! Builds the error message for a failed GemmUniversalAdapter<GemmKernel>::initialize().
+//!
+//! initialize() returns kErrorInternal when cudaFuncSetAttribute() for the kernel's dynamic shared memory fails, and it
+//! clears the CUDA error before returning, so the status alone does not say what went wrong. This repeats that call to
+//! recover the CUDA error. Only call it after initialize() has failed: it makes CUDA runtime calls.
+template <typename GemmKernel>
+std::string describeGemmInitFailure(cutlass::Status initStatus)
+{
+    int const smemSize = static_cast<int>(GemmKernel::SharedStorageSize);
+    cudaError_t const setAttributeError = cudaFuncSetAttribute(
+        cutlass::device_kernel<GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize);
+    std::string message = tensorrt_llm::common::fmtstr(
+        "Failed to initialize cutlass TMA WS grouped gemm. Error: %s. Retried "
+        "cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize, %d): %s (%s).",
+        cutlass::cutlassGetStatusString(initStatus), smemSize, cudaGetErrorName(setAttributeError),
+        cudaGetErrorString(setAttributeError));
+    if (setAttributeError != cudaSuccess)
+    {
+        // Reset the last-error state so that a later, unrelated cudaGetLastError() does not report this failure. A
+        // sticky error stays in the CUDA context, and later CUDA calls keep returning it.
+        static_cast<void>(cudaGetLastError());
+        message += " A sticky error such as cudaErrorIllegalAddress or cudaErrorLaunchFailure means a kernel launched "
+                   "earlier on this device faulted; rerun with CUDA_LAUNCH_BLOCKING=1 to find that kernel.";
+    }
+    return message;
 }
 
 template <typename ArchTag, typename T, typename WeightType, typename OutputType, typename EpilogueSchedule,
@@ -703,9 +732,8 @@ using namespace cutlass::epilogue;
                     + std::string(cutlass::cutlassGetStatusString(can_implement)));                                                                                                                                                                                                                                         \
                                                                                                                                                                                                                                                                                                                             \
             auto init_status = gemm.initialize(args, tma_ws_input.gemm_workspace);                                                                                                                                                                                                                                          \
-            TLLM_CHECK_WITH_INFO(init_status == cutlass::Status::kSuccess,                                                                                                                                                                                                                                                  \
-                "Failed to initialize cutlass TMA WS grouped gemm. Error: "                                                                                                                                                                                                                                                 \
-                    + std::string(cutlass::cutlassGetStatusString(init_status)));                                                                                                                                                                                                                                           \
+            TLLM_CHECK_WITH_INFO(                                                                                                                                                                                                                                                                                           \
+                init_status == cutlass::Status::kSuccess, describeGemmInitFailure<GemmKernel>(init_status));                                                                                                                                                                                                                \
             auto run_status = gemm.run(stream, nullptr, tensorrt_llm::common::getEnvEnablePDL());                                                                                                                                                                                                                           \
             TLLM_CHECK_WITH_INFO(run_status == cutlass::Status::kSuccess,                                                                                                                                                                                                                                                   \
                 "Failed to run cutlass TMA WS grouped gemm. Error: "                                                                                                                                                                                                                                                        \
