@@ -268,6 +268,28 @@ def test_zero_real_padding_uses_distinct_low_and_high_dummies():
     assert sum(1 + row.py_verify_len for row in batch.generation_requests) == 14
 
 
+@pytest.mark.cpu_only
+def test_uncaptured_boundary_width_pads_only_a_captured_shape():
+    runner = _runner_stub(CUDAGraphRunner)
+    runner.enabled = runner.padding_enabled = True
+    runner.max_supported_batch_size = 4
+    runner.config = SimpleNamespace(enable_attention_dp=False, batch_size=4)
+    runner.spec_config = SimpleNamespace(
+        max_draft_len=7, get_runtime_tokens_per_gen_step=lambda k: k + 1
+    )
+    runner.padding_dummy_requests = {}
+    runner.graphs = {KeyType(4, 7): object(), KeyType(2, 2): object()}
+    runner._can_run_cuda_graph_batch = lambda batch: True
+    runner._round_up_batch_size_with_draft_len = lambda *args: 4
+    runner._get_or_create_padding_dummy = Mock(return_value=object())
+    batch = _Batch([object()] * 3)
+    assert runner._get_padded_batch(batch, None, 2) == 0
+    runner._get_or_create_padding_dummy.assert_not_called()
+    runner.graphs[KeyType(4, 2)] = object()
+    assert runner._get_padded_batch(batch, None, 2) == 1
+    runner._get_or_create_padding_dummy.assert_called_once_with(None, 2)
+
+
 def test_releasing_padding_dummies_invalidates_the_cached_agreement():
     runner = _runner_stub()
     low = object()

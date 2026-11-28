@@ -2919,6 +2919,11 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         """The Mamba metadata class of the language model's recurrent layers."""
         return getattr(self.llm, "mamba_metadata_cls", None)
 
+    @property
+    def requires_fixed_draft_width(self) -> bool:
+        """Whether the inner language model requires a fixed speculative verify width."""
+        return bool(getattr(self.llm, "requires_fixed_draft_width", False))
+
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
         super().__init__(config)

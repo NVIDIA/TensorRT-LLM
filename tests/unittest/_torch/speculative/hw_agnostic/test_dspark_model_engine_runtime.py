@@ -317,6 +317,54 @@ def test_publish_gen_token_layout_uses_call_draft_length(runtime_draft_len: int)
     assert not hasattr(engine, "runtime_draft_len")
 
 
+@pytest.mark.cpu_only
+def test_static_mtp_publishes_bounded_stride_before_attention_prepare():
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+    engine = _engine(_runner(), [])
+    engine._dspark_trims_submitted_tokens = False
+    engine._dspark_confidence_enabled = False
+    config = MTPDecodingConfig(max_draft_len=7)
+    engine.mapping = SimpleNamespace(has_cp_helix=lambda: False)
+    engine.use_beam_search = False
+    engine.model = SimpleNamespace(
+        model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+    )
+    engine._config.disable_overlap_scheduler = True
+    engine._config.attention_backend = "TRTLLM"
+    engine.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
+    host = SimpleNamespace(
+        runtime_draft_len=2,
+        locality_domain_reorder=False,
+        lists=SimpleNamespace(
+            num_cached_tokens_per_seq=[29],
+            gen_request_seq_slots=[0],
+            extend_requests=[],
+            request_ids=[1],
+            prompt_lengths=[28],
+        ),
+    )
+    batch = SimpleNamespace(
+        generation_requests=[SimpleNamespace()], context_requests=[], num_context_requests=0
+    )
+    metadata = SimpleNamespace(is_cuda_graph=True, runtime_tokens_per_gen_step=8)
+    observed = []
+    metadata.prepare = lambda: observed.append(metadata.runtime_tokens_per_gen_step)
+    engine._prepare_attn_metadata(
+        host, batch, None, metadata, None, config, enable_spec_decode=True, is_dummy=False
+    )
+    no_spec_metadata = SimpleNamespace(is_cuda_graph=True, runtime_tokens_per_gen_step=8)
+    no_spec_observed = []
+    no_spec_metadata.prepare = lambda: no_spec_observed.append(
+        no_spec_metadata.runtime_tokens_per_gen_step
+    )
+    engine._prepare_attn_metadata(
+        host, batch, None, no_spec_metadata, None, None, enable_spec_decode=False, is_dummy=False
+    )
+    assert observed == [3]
+    assert no_spec_observed == [8]
+
+
 def test_attach_ragged_layout_refreshes_persistent_buffers_in_place() -> None:
     runner = _engine(_runner(), [])
     runner._pinned_host_cache = {}

@@ -205,6 +205,55 @@ class TestBaseWorkerPriorityDefault:
         priority = self._captured_tllm_request_priority(1.0)
         assert priority == 1.0
 
+    def test_deduce_max_tokens_subtracts_admission_draft_reserve(self):
+        captured = {}
+
+        class CapturingRequest:
+            def __init__(self, *args, **kwargs):
+                captured["max_new_tokens"] = kwargs.get("max_new_tokens")
+                self.py_num_logprobs = None
+                self.py_lora_path = None
+                self.py_logprobs_mode = None
+
+            def __setattr__(self, name, value):
+                object.__setattr__(self, name, value)
+
+        worker = MagicMock()
+        worker.llm_args = MagicMock()
+        worker.llm_args.max_beam_width = 1
+        worker.llm_args.return_perf_metrics = False
+        worker.mapping = MagicMock()
+        worker.mapping.cp_size = 1
+        worker.mapping.has_cp_helix.return_value = False
+        worker.max_seq_len = 64
+        worker.engine = MagicMock()
+        worker.engine.is_generation_model = True
+        worker.engine._admission_draft_reserve = 7
+        worker.engine.enqueue_request = MagicMock(return_value=42)
+
+        from tensorrt_llm.executor import base_worker as bw_mod
+        from tensorrt_llm.executor.base_worker import BaseWorker
+
+        req = GenerationRequest(
+            prompt_token_ids=list(range(32)),
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        req.set_id(42)
+        with patch.object(bw_mod.tllm, "Request", CapturingRequest):
+            BaseWorker._enqueue_request(worker, req, result_wait_queue=None)
+        assert captured["max_new_tokens"] == 25
+
+        over_req = GenerationRequest(
+            prompt_token_ids=list(range(57)),
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        over_req.set_id(43)
+        with (
+            patch.object(bw_mod.tllm, "Request", CapturingRequest),
+            pytest.raises(Exception, match="maximum context length is 57"),
+        ):
+            BaseWorker._enqueue_request(worker, over_req, result_wait_queue=None)
+
 
 # ---------------------------------------------------------------------------
 # BaseLLM.generate - scalar and list priority

@@ -83,7 +83,7 @@ def _decoder(cls):
     decoder.stream = MagicMock(name="stream")
     decoder.token_event = MagicMock(name="token_event")
     decoder.bitmask_event = MagicMock(name="bitmask_event")
-    decoder.requests = []
+    decoder.requests = GuidedRequests([], num_contexts=0, num_generations=0, max_num_draft_tokens=1)
     decoder.active = True
     decoder.max_num_draft_tokens = 1
     for name in (
@@ -119,6 +119,16 @@ def _call(decoder, method):
         return lambda: decoder.execute_draft_batch(MagicMock(name="logits"), draft_step=0)
     assert method == "rollback_rejected_batch"
     return lambda: decoder.rollback_rejected_batch(MagicMock(name="num_accepted_tokens"))
+
+
+def test_rollback_at_end_of_shortened_draft():
+    decoder = _decoder(CapturableGuidedDecoder)
+    decoder.max_num_draft_tokens = 4
+    decoder.requests.max_num_draft_tokens = 2
+    _run(lambda: decoder.execute_draft_batch(MagicMock(), draft_step=0), capturing=False)
+    decoder.rollback_draft_tokens.assert_not_called()
+    _run(lambda: decoder.execute_draft_batch(MagicMock(), draft_step=1), capturing=False)
+    decoder.rollback_draft_tokens.assert_called_once_with()
 
 
 _ENQUEUE_METHODS = ["execute", "execute_draft_batch", "rollback_rejected_batch"]

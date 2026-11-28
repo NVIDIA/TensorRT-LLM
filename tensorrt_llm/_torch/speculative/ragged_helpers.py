@@ -36,12 +36,30 @@ __all__ = [
     "scatter_ragged_to_padded",
     "count_accepted_ragged",
     "fill_padded_rows_onehot",
+    "expand_mapped_draft_probs",
     "ragged_gather_index_lists",
     "RaggedPadSplit",
     "resolve_ragged_pad_split",
     "fill_bucket_device",
     "build_row_maps_device",
 ]
+
+
+def expand_mapped_draft_probs(
+    out: torch.Tensor,
+    draft_probs: torch.Tensor,
+    target_indices: torch.Tensor,
+    draft_tokens: torch.Tensor,
+) -> None:
+    """Expand proposals into target vocabulary, including synthetic target-token-zero rows."""
+    # Zero may be absent from the map. Clear padding left by a previous use of this buffer.
+    out[..., 0] = 0
+    out[..., target_indices] = draft_probs
+    # A sampled real token has positive proposal probability. A synthetic zero whose
+    # point mass mapped elsewhere is the only zero proposal missing that probability.
+    padding = (draft_tokens == 0) & (out[..., 0] == 0) & (draft_probs[..., 0] == 1)
+    out[..., target_indices[:1]] = draft_probs[..., :1].masked_fill(padding.unsqueeze(-1), 0)
+    out[..., 0].masked_fill_(padding, 1)
 
 
 def build_qo_indptr(verify_lens: torch.Tensor) -> torch.Tensor:

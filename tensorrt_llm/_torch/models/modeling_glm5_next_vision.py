@@ -1105,6 +1105,11 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
         return self.llm.mamba_metadata_cls
 
     @property
+    def requires_fixed_draft_width(self) -> bool:
+        """Whether the inner causal LM requires a fixed speculative verify width."""
+        return bool(getattr(self.llm, "requires_fixed_draft_width", False))
+
+    @property
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
 

@@ -18,6 +18,7 @@ import numpy as np
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings.executor import Request
+from tensorrt_llm.executor.sequence_limits import longest_helix_prompt_slice
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -322,13 +323,17 @@ def merge_helix_requests(
             locality_domain_id=req_item.locality_domain_id,
             vocab_size=vocab_size,
         )
-        req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
         # The prompt tokens a multi-token stop word ending at the first
         # generated token can span, which this rank's slice may not hold.
         tail_len = max((len(word) - 1 for word in req.py_stop_words_list or ()), default=0)
         prompt_tail = input_token_ids[max(0, len(input_token_ids) - tail_len) :].tolist()
+        # Every rank must admit the same output length. Rank zero owns the
+        # first block of each round, so its slice is the longest.
+        longest_slice = longest_helix_prompt_slice(input_len, cp_size, tokens_per_block)
         for request in (req, *req.child_requests):
+            request.py_cp_prompt_skew = longest_slice - len(input_ids_this_rank)
+            request.total_input_len_cp = input_len
             request.py_helix_prompt_tail = prompt_tail
         req_with_children.append(req)
         if req.child_requests:

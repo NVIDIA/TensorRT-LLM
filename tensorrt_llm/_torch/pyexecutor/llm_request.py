@@ -1143,6 +1143,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_use_chunked_generation_logits = use_chunked_generation_logits
         self.py_logits_chunk_size = logits_chunk_size if not self.streaming else 1
 
+        self.py_cp_prompt_skew = 0
         self._initialize_execution_state(seq_slot=seq_slot,
                                          orig_prompt_len=self.orig_prompt_len)
 
@@ -1299,6 +1300,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # count (e.g. one-model flow, which tracks lengths in its sample
         # state instead).
         self.py_draft_tokens_effective_len = None
+        # Real draft proposal count installed on the request by SpecSampler for
+        # the upcoming step (before any CUDA-graph/full-width zero padding).
+        self.py_num_proposed_draft_tokens = None
         self.py_last_context_chunk = (None, None)
         # Established only after the Global cache claim succeeds. The physical
         # replay prefix is additional compute, never logical context progress.

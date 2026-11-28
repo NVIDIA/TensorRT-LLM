@@ -471,6 +471,11 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     _VISION_MODEL_CLS = KimiK3VisionModel
     mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
 
+    @property
+    def requires_fixed_draft_width(self) -> bool:
+        """Whether the inner causal LM requires a fixed speculative verify width."""
+        return bool(getattr(self.llm, "requires_fixed_draft_width", False))
+
     @classmethod
     def get_recurrent_state_spec(
         cls,

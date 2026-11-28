@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from bisect import bisect_right
 from typing import Dict, List, Optional, final
@@ -76,8 +79,10 @@ class Drafter(ABC):
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
+        *,
+        draft_budget: Optional[int] = None,
     ) -> None:
-        """Pad draft tokens to the static max for CUDA graph compatibility.
+        """Pad draft tokens to the verification width selected for this batch.
 
         When draft_len_schedule reduces draft length below the static max,
         prepare_resources allocates KV cache capacity for the shorter length.
@@ -87,8 +92,13 @@ class Drafter(ABC):
         the exact delta from its internal tracking.
         """
         pad_to = self._static_max_total_draft_tokens
+        if draft_budget is not None:
+            pad_to = min(pad_to, draft_budget)
         for req in scheduled_requests.generation_requests:
             num_draft_tokens = get_draft_token_length(req)
+            if num_draft_tokens > pad_to:
+                req.py_draft_tokens = req.py_draft_tokens[:pad_to]
+                num_draft_tokens = pad_to
             # Record the real proposal count before padding: the sampler uses
             # it as the acceptance-rate denominator (see
             # py_num_draft_tokens_verified in LlmRequest), while py_rewind_len

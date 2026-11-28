@@ -1773,6 +1773,15 @@ class CUDAGraphRunner:
         if padding_size + batch.batch_size > self.config.batch_size:
             return 0
 
+        # A boundary width can run eagerly. Only pin a dummy if its padded
+        # batch shape has a graph to replay.
+        config = getattr(self, "spec_config", None)
+        if (config is not None and runtime_draft_len < config.max_draft_len
+                and runtime_draft_len not in self.padding_dummy_requests):
+            width = config.get_runtime_tokens_per_gen_step(runtime_draft_len) - 1
+            if not any(key[:2] == (padded_batch_size, width) for key in self.graphs):
+                return 0
+
         # No padding if it would create too many concurrent requests.
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
@@ -2036,7 +2045,10 @@ class CUDAGraphRunner:
             # requests unschedulable. That executor is discarded anyway, so
             # preallocation only matters for the final one.
             return
-        for draft_len in sorted({key[1] for key in self.graphs}):
+        widths = {key[1] for key in self.graphs}
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.is_pard():
+            widths = {(width + 1) // 2 for width in widths}
+        for draft_len in sorted(widths):
             if not self._can_pad_any_batch(draft_len):
                 continue
             if self._get_or_create_padding_dummy(resource_manager,

@@ -316,6 +316,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     # Set where the engine's steady MTP prepare reads a step's output rows: the store update then
     # runs on the D2H side stream.
     stores_on_side_stream = False
+    is_pard: bool = False
 
     SampleState = SampleStateSpec
 
@@ -494,6 +495,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         fused_sampling: bool = False,
         watermark_unsupported_reason: Optional[str] = None,
         logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
+        is_pard: bool = False,
     ):
         """
         Initialize the speculative sampler.
@@ -518,6 +520,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self._watermark_unsupported_reason = watermark_unsupported_reason
         self._fused_sampling = fused_sampling
         self._logit_edits_unsupported = logit_edits_unsupported
+        self.is_pard = is_pard
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -628,6 +631,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.spec_step_fold = spec_step_fold
         spec_step_fold.bind_sampler_store(self.store)
 
+    def _proposal_count(self, width: int) -> int:
+        """Convert wire draft width to logical proposal rows (PARD carries K-1 mask slots)."""
+        if self.is_pard and width > 0:
+            return (width + 1) // 2
+        return width
+
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -708,7 +717,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 token_windows[req_idx] - 1 if token_windows is not None else runtime_draft_len
             )
             drafted_len = draft_lens[req_idx] if draft_lens is not None else 0
-            req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
+            previous_proposed = getattr(req, "py_num_proposed_draft_tokens", None)
+            verified = min(
+                self._proposal_count(drafted_len),
+                self._proposal_count(verified_len),
+            )
+            if previous_proposed is not None:
+                verified = min(verified, previous_proposed)
+            req.py_num_draft_tokens_verified = verified
+            req.py_num_proposed_draft_tokens = self._proposal_count(runtime_draft_len)
             req.py_rewind_len = verified_len - num_accepted
             req.py_draft_tokens = next_draft_tokens_list[seq_slot][:runtime_draft_len]
             req.py_decoding_iter += 1

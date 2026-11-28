@@ -3,9 +3,8 @@
 
 import json
 import os
-from bisect import bisect_left
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -22,6 +21,8 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
+from .draft_budget import get_draft_len_for_batch_size as get_draft_len_for_batch_size
+from .draft_budget import resolve_draft_len
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
 from .dspark import DSparkSpecMetadata, DSparkWorker, DSv4DSparkWorker
@@ -731,7 +732,8 @@ def get_spec_decoder(
             fused_sampling=fused_sampling,
             watermark_unsupported_reason=_watermark_unsupported_reason(
                 spec_config, sampler_args.watermark_config),
-            logit_edits_unsupported=logit_edits_unsupported_reason(spec_config))
+            logit_edits_unsupported=logit_edits_unsupported_reason(spec_config),
+            is_pard=spec_config.spec_dec_mode.is_pard())
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -1022,48 +1024,6 @@ class SpecDecodingTensor:
     generation_lengths: Optional[torch.Tensor] = None
 
 
-def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
-                                 batch_size: int, max_draft_len: int) -> int:
-    """
-    Get the appropriate draft length for the given batch size using binary search.
-
-    This is a standalone function that can be used by both drafters (e.g. NGram)
-    and the model engine / spec workers (one-model path).
-
-    New semantics: Keys represent specific batch sizes (transition points).
-    Values represent draft_len to use for batch sizes UP TO that key.
-
-    Args:
-        draft_len_schedule: Mapping from batch size thresholds to draft lengths.
-                            Example: {4: 4, 8: 2, 32: 1} means:
-                            - batch size 1-4:   use draft_len=4 (up to key 4)
-                            - batch size 5-8:   use draft_len=2 (up to key 8)
-                            - batch size 9-32:  use draft_len=1 (up to key 32)
-                            - batch size 33+:   use draft_len=0 (speculation disabled, implicit)
-        batch_size: Current batch size.
-        max_draft_len: Maximum draft length to use if no schedule is provided.
-
-    Returns:
-        The draft length to use for this batch size.
-    """
-    if draft_len_schedule is None:
-        return max_draft_len
-
-    # Binary search to find the first threshold >= batch_size
-    # draft_len_schedule is already sorted by config validator
-    schedule_batch_sizes = list(draft_len_schedule.keys())
-
-    # bisect_left finds where to insert batch_size to keep list sorted
-    # This gives us the index of the first key >= batch_size
-    idx = bisect_left(schedule_batch_sizes, batch_size)
-
-    if idx < len(schedule_batch_sizes):
-        return draft_len_schedule[schedule_batch_sizes[idx]]
-
-    # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
-    return 0
-
-
 def get_static_draft_len(spec_config: Optional["DecodingBaseConfig"]) -> int:
     """Return logical K for linear modes or total tree tokens for tree modes.
 
@@ -1077,70 +1037,11 @@ def get_static_draft_len(spec_config: Optional["DecodingBaseConfig"]) -> int:
     return spec_config.tokens_per_gen_step - 1
 
 
-def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
-                      scheduled_batch: "ScheduledRequests",
-                      *,
-                      max_draft_len: int,
-                      static_draft_len: int,
-                      draft_len: Optional[int] = None,
-                      speculation_permanently_disabled: bool = False) -> int:
-    """Synchronize this batch's draft buffers and return its draft length.
-
-    Dynamic and explicit lengths pad or truncate generation-request buffers to
-    a uniform width, as required by CUDA graph replay and the attention kernel.
-    Static decoding preserves the drafter's proposals instead.
-    """
-    if speculation_permanently_disabled:
-        for request in scheduled_batch.generation_requests:
-            request.py_draft_tokens = []
-        return 0
-
-    if draft_len is None:
-        if (spec_config is not None
-                and spec_config.draft_len_schedule is not None
-                and spec_config.spec_dec_mode.support_dynamic_draft_len()):
-            draft_len = get_draft_len_for_batch_size(
-                spec_config.draft_len_schedule, scheduled_batch.batch_size,
-                max_draft_len)
-        else:
-            # Static decoding preserves the proposals produced by the drafter,
-            # including requests intentionally entering with no draft tokens.
-            return static_draft_len
-
-    draft_buffer_pad = 0  # Buffer sentinel, not PARD mask_token_id.
-    rejection_on = getattr(spec_config, "use_rejection_sampling", False)
-    for request in scheduled_batch.generation_requests:
-        current_num_draft_tokens = len(request.py_draft_tokens)
-        # A generation request without a prior proposal has no draft-probability
-        # scatter. Preserve that fact before padding so input preparation can
-        # populate the one-hot placeholder instead of reading a stale row.
-        request.py_needs_onehot_draft_probs |= (rejection_on and
-                                                current_num_draft_tokens == 0)
-        if spec_config is not None and spec_config.spec_dec_mode.is_pard():
-            # PARD carries K proposals followed by K-1 placeholders.
-            buffer_width = spec_config.get_runtime_tokens_per_gen_step(
-                draft_len) - 1
-            current_draft_len = ((current_num_draft_tokens + 1) //
-                                 2 if current_num_draft_tokens > 0 else 0)
-            draft_tokens = request.py_draft_tokens[:min(current_draft_len,
-                                                        draft_len)]
-            draft_tokens.extend([draft_buffer_pad] *
-                                (draft_len - len(draft_tokens)))
-            request.py_draft_tokens = draft_tokens + [draft_buffer_pad] * (
-                buffer_width - len(draft_tokens))
-        elif current_num_draft_tokens < draft_len:
-            request.py_draft_tokens.extend(
-                [draft_buffer_pad] * (draft_len - current_num_draft_tokens))
-        elif current_num_draft_tokens > draft_len:
-            request.py_draft_tokens = request.py_draft_tokens[:draft_len]
-
-    return draft_len
-
-
 def update_draft_len(model_engine: "ModelEngine",
                      scheduled_batch: "ScheduledRequests",
                      *,
                      draft_len: Optional[int] = None,
+                     draft_budget: Optional[int] = None,
                      speculation_permanently_disabled: bool = False) -> int:
     """Synchronize this batch's draft buffers and return its draft length.
 
@@ -1153,4 +1054,5 @@ def update_draft_len(model_engine: "ModelEngine",
         max_draft_len=model_engine.max_draft_len,
         static_draft_len=get_static_draft_len(model_engine.spec_config),
         draft_len=draft_len,
+        draft_budget=draft_budget,
         speculation_permanently_disabled=speculation_permanently_disabled)

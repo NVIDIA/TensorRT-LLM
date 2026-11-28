@@ -692,7 +692,7 @@ class DFlashSpecMetadata(SpecMetadata):
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
         if worker is not None and worker._ctx_buf_inited:
-            # Requests paused in place (GEN slot preemption) keep their slot.
+            # Requests paused in place or deferred from a terminal-only step keep their slot.
             current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
             # Slot lengths (and bases) written in one batch: evicted slots are
             # emptied, newly assigned ones seeded below.
@@ -2874,8 +2874,8 @@ class DFlashWorker(SpecWorkerBase):
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
             gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
 
-            total_tokens_per_req = self._draft_tokens_per_req  # K+1
             K = spec_metadata.runtime_draft_len
+            total_tokens_per_req = K + 1
 
             # Get captured multi-layer hidden states from spec_metadata
             captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
@@ -2895,14 +2895,12 @@ class DFlashWorker(SpecWorkerBase):
                 num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
             )
 
-            K_plus_1 = K + 1
-
             bonus_idx = (gen_num_accepted - 1).clamp_min(0).long().unsqueeze(1)
             bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
             ctx_len_gen = self._ctx_len[slots]
             j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
-            offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
+            offsets_kp1 = torch.arange(total_tokens_per_req, dtype=torch.long, device="cuda")
 
             # _ctx_len is clamped to _max_ctx only AFTER this step's accepted
             # tokens are folded in (see the update below), so the running length
@@ -2928,7 +2926,7 @@ class DFlashWorker(SpecWorkerBase):
                 if getattr(draft_model, "lilicorr", None) is not None:
                     # The last accepted output is predicted by the corresponding input
                     # row; the newly committed token itself has no target row yet.
-                    projected_rows = projected_to_store.reshape(num_gens, K_plus_1, -1)
+                    projected_rows = projected_to_store.reshape(num_gens, total_tokens_per_req, -1)
                     lilicorr_anchor = last_accepted_hidden(projected_rows, gen_num_accepted)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)

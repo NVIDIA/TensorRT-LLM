@@ -74,6 +74,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     SerializableSchedulerOutput,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
+    SchedulerOutput,
     split_encoder_from_decoder_context_requests,
 )
 from tensorrt_llm.bindings.executor import RequestType
@@ -5073,6 +5074,151 @@ class TestOneModelMTPDraftTokenScheduling:
         assert gen.py_needs_onehot_draft_probs
         assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
 
+    def test_boundary_reservation_matches_verifier_and_preserves_prefill(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        ctx = self._make_llm_request(2, LlmRequestState.CONTEXT_INIT)
+        ctx.max_new_tokens = ctx.py_max_new_tokens = 1
+        ex = self._make_one_model_mtp_executor([ctx, gen])
+        ex.model_engine.spec_config = MTPDecodingConfig(max_draft_len=7)
+        ex.model_engine.max_draft_len = ex.max_total_draft_tokens = 7
+        ex.max_seq_len = gen.get_num_tokens(0) + 3
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [ctx]
+        batch.generation_requests = [gen]
+        gen.py_draft_tokens = list(range(1, 8))
+
+        ex._reserve_one_model_draft_tokens()
+        ex._handle_dynamic_draft_len(batch)
+        assert ex.runtime_draft_len == gen.num_draft_tokens == 2
+        assert gen.py_draft_tokens == [1, 2]
+
+        gen.add_new_token(1, 0)
+        gen.add_new_token(2, 0)
+        batch.context_requests_last_chunk = []
+        ex._reserve_one_model_draft_tokens()
+        ex._handle_dynamic_draft_len(batch)
+        assert ex.runtime_draft_len == gen.num_draft_tokens == 0
+        assert gen.py_draft_tokens == []
+
+    def test_terminal_forward_defers_prefill_and_retains_live_drafter_state(self):
+        terminal = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        continuing = self._make_llm_request(2, LlmRequestState.GENERATION_IN_PROGRESS)
+        ctx = self._make_llm_request(3, LlmRequestState.CONTEXT_INIT)
+        ctx_chunk2 = self._make_llm_request(4, LlmRequestState.CONTEXT_INIT)
+        ctx_chunk2.context_chunk_size = 4
+        ctx_chunk2.move_to_next_context_chunk()
+        assert not ctx_chunk2.is_first_context_chunk
+        terminal.add_new_token(9, 0)
+        ex = self._make_one_model_mtp_executor([terminal, continuing, ctx, ctx_chunk2])
+        ex.max_seq_len = terminal.get_num_tokens(0) + 1
+        ex.max_draft_len = 7
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        ex.ctx_decoder_batcher = None
+        ex.is_encoder_decoder = ex.enable_batch_waiting = False
+        ex.inflight_req_ids = set()
+        ex.kv_cache_manager = Mock()
+        ex.scheduler = Mock()
+        ex.scheduler.take_lost_kv_requests.return_value = []
+        ex.scheduler.schedule_request.return_value = SchedulerOutput(
+            [], [ctx, ctx_chunk2], [terminal, continuing], [], [], 4
+        )
+        ex._get_ctx_mla_kv_len_cap = Mock(return_value=None)
+        ex._revert_context_chunks = Mock()
+        ex._revert_unexecuted_alloc = Mock()
+
+        scheduled, _, _ = PyExecutor._schedule(ex)
+        assert scheduled.generation_requests == [terminal]
+        assert scheduled.context_requests == []
+        assert scheduled.paused_in_place_ids == {
+            continuing.request_id,
+            ctx_chunk2.request_id,
+        }
+        ex._revert_context_chunks.assert_called_once_with([ctx, ctx_chunk2])
+        assert ex._revert_unexecuted_alloc.call_args.args[0].generation_requests == [continuing]
+
+    @pytest.mark.parametrize("disabled,pending", [(True, 3), (False, 0)])
+    def test_overlap_waits_only_when_pending_burst_can_exhaust_context(self, disabled, pending):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        gen.max_new_tokens = gen.py_max_new_tokens = 1
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.max_draft_len = 3
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        ex.inflight_req_ids = set()
+        state = types.SimpleNamespace(requests=[gen], runtime_draft_len=3)
+        ex.previous_batch = types.SimpleNamespace(sample_state=state)
+        ex.max_seq_len = gen.get_num_tokens(0) + 8
+        assert not ex._pending_speculative_tail_ids()
+        ex.max_seq_len -= 1
+        assert ex._pending_speculative_tail_ids() == {gen.request_id}
+        ex.speculation_permanently_disabled = disabled
+        state.runtime_draft_len = pending
+        assert not ex._pending_speculative_tail_ids()
+
+    def test_held_tail_reenters_next_scheduler_pass(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.max_draft_len = 3
+        ex.max_seq_len = gen.get_num_tokens(0) + 3
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        ex.previous_batch = types.SimpleNamespace(
+            sample_state=types.SimpleNamespace(requests=[gen], runtime_draft_len=2)
+        )
+
+        class Inflight(set):
+            insert = set.add
+            erase = set.remove
+
+        ex.inflight_req_ids = Inflight()
+
+        def schedule():
+            batch = ScheduledRequests()
+            batch.generation_requests = [
+                r for r in ex.active_requests if r.request_id not in ex.inflight_req_ids
+            ]
+            return batch, [], 0
+
+        ex._schedule = schedule
+        held, _, _ = ex._schedule_with_pending_tail_hold()
+        assert held.generation_requests == []
+        assert held.paused_in_place_ids == {gen.request_id}
+        assert not ex.inflight_req_ids
+        ex.previous_batch = None
+        resumed, _, _ = ex._schedule_with_pending_tail_hold()
+        assert resumed.generation_requests == [gen]
+
+    def test_separate_drafter_reserves_reenabled_batch_width(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.max_seq_len = 64
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        gen.py_disable_speculative_decoding = True
+        ex.use_spec_decode = False
+        ex._prepare_draft_requests()
+        assert gen.num_draft_tokens == 0
+        ex.use_spec_decode = True
+        ex._prepare_draft_requests()
+        assert gen.num_draft_tokens == gen.py_draft_pages_allocated == ex.max_total_draft_tokens
+        assert len(gen.py_draft_tokens) == gen.num_draft_tokens
+
+    def test_acceptance_gate_observes_verified_width_before_metrics_clear_it(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.dist = types.SimpleNamespace(has_pp=False)
+        ex.max_draft_len = 7
+        ex.iter_counter = 1
+        ex.sampler = Mock()
+        ex.speculation_gate = Mock()
+        ex.speculation_gate.record_acceptance_rate.return_value = False, 1.0
+        gen.draft_tokens = [0] * 7
+        gen.py_num_accepted_draft_tokens = gen.py_num_draft_tokens_verified = 2
+        state = types.SimpleNamespace(requests=[gen])
+        ex._update_requests(state)
+        ex.speculation_gate.record_acceptance_rate.assert_called_once_with(1.0, sample_id=1)
+        assert gen.py_num_draft_tokens_verified == 0
+        ex._update_requests(state)
+        assert ex.speculation_gate.record_acceptance_rate.call_count == 1
+
     def test_one_model_mtp_preserves_sampler_draft_tokens(self) -> None:
         sampler_drafts = [7, 8]
         gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
@@ -5083,6 +5229,159 @@ class TestOneModelMTPDraftTokenScheduling:
 
         assert gen.py_draft_tokens == sampler_drafts
         assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+
+    def test_bare_py_executor_exposes_speculative_class_defaults(self) -> None:
+        ex = object.__new__(PyExecutor)
+        assert ex.speculation_gate is None
+        assert not ex.speculation_permanently_disabled
+        assert ex._admission_draft_reserve == 0
+        assert ex._speculative_headroom == 0
+
+    def test_accumulate_spec_dec_stats_clamps_accepted_to_verified(self) -> None:
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        gen.py_num_draft_tokens_verified = 3
+        gen.py_num_accepted_draft_tokens = 6
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.max_draft_len = 7
+        ex._accumulate_spec_dec_stats(types.SimpleNamespace(requests=[gen]))
+        assert gen.py_num_draft_tokens_verified == 0
+        assert gen.py_total_draft_tokens == 3
+        assert gen.py_total_accepted_draft_tokens == 3
+        assert gen.py_per_pos_drafted[:3] == [1, 1, 1]
+        assert gen.py_per_pos_accepted[:3] == [1, 1, 1]
+
+    def test_compute_speculative_limits_covers_headroom_and_recurrent_replay(
+        self, monkeypatch
+    ) -> None:
+        from tensorrt_llm._torch.modules.fla import cache_manager as fla_cm
+        from tensorrt_llm._torch.modules.kimi_kda import cache_manager as kda_cm
+        from tensorrt_llm._torch.modules.mamba import cache_manager as mamba_cm
+        from tensorrt_llm._torch.pyexecutor import _util as util_mod
+        from tensorrt_llm._torch.pyexecutor import config_utils
+        from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+        class _V2Cls:
+            pass
+
+        class _DisaggCls:
+            pass
+
+        spec_config = types.SimpleNamespace(
+            max_draft_len=3,
+            tokens_per_gen_step=4,
+            is_linear_tree=True,
+            use_dynamic_tree=False,
+            sa_config=None,
+            spec_dec_mode=types.SimpleNamespace(
+                is_sa=lambda: False,
+                support_overlap_scheduler=lambda: True,
+            ),
+        )
+        mapping = types.SimpleNamespace(
+            pp_size=1,
+            tp_size=1,
+            enable_attention_dp=False,
+            has_cp_helix=lambda: False,
+        )
+        monkeypatch.setattr(util_mod, "MambaHybridCacheManagerV2", _V2Cls)
+        monkeypatch.setattr(util_mod, "MixedMambaHybridCacheManager", _V2Cls)
+        monkeypatch.setattr(util_mod, "CppMambaHybridCacheManager", _DisaggCls)
+        monkeypatch.setattr(util_mod, "get_num_extra_kv_tokens", lambda _cfg: 0)
+        monkeypatch.setattr(util_mod, "is_kimi_linear", lambda mc: mc.arch == "kimi")
+        monkeypatch.setattr(config_utils, "is_glm5_next", lambda _mc: False)
+        monkeypatch.setattr(util_mod, "is_qwen3_hybrid", lambda mc: mc.arch == "qwen")
+        monkeypatch.setattr(util_mod, "is_qwen4_exp", lambda _mc: False)
+        monkeypatch.setattr(util_mod, "is_nemotron_hybrid", lambda mc: mc.arch == "nemotron")
+        monkeypatch.setattr(kda_cm, "get_kda_replay_num_spec", lambda *_a, **_kw: 3)
+        monkeypatch.setattr(fla_cm, "_gdn_replay_gate", lambda *_a, **_kw: (True, "replay"))
+        monkeypatch.setattr(
+            mamba_cm,
+            "_mamba2_replay_gate",
+            lambda _sc, dtype, stochastic: (not (stochastic and dtype == torch.float16), "replay"),
+        )
+
+        # KDA replay, GDN on V2/Cpp cache managers, Mamba2 replay, and target-declared fixed width
+        # all reserve fixed-width steps; headroom absorbs the reserve when max_pos permits.
+        for arch, kv_cls, requires_fixed in [
+            ("kimi", _V2Cls, False),
+            ("qwen", _DisaggCls, False),
+            ("nemotron", object, False),
+            ("dense", object, True),
+        ]:
+            model_cfg = types.SimpleNamespace(
+                arch=arch,
+                quant_config=types.SimpleNamespace(mamba_ssm_stochastic_rounding=False),
+                pretrained_config=types.SimpleNamespace(max_position_embeddings=135),
+            )
+            engine = types.SimpleNamespace(
+                model=types.SimpleNamespace(
+                    model_config=model_cfg, requires_fixed_draft_width=requires_fixed
+                )
+            )
+            reserve, admission_reserve, headroom = util_mod.compute_speculative_limits(
+                engine,
+                spec_config,
+                mapping,
+                max_seq_len=128,
+                disaggregated=False,
+                overlap=True,
+                kv_cache_manager_cls=kv_cls,
+            )
+            assert reserve == 7
+            assert headroom == 6
+            assert admission_reserve == 1
+
+        # Stochastic fp16 Mamba2 does not use fixed-width replay.
+        stochastic_cfg = types.SimpleNamespace(
+            arch="nemotron",
+            quant_config=types.SimpleNamespace(
+                mamba_ssm_stochastic_rounding=True, mamba_ssm_cache_dtype=torch.float16
+            ),
+            pretrained_config=types.SimpleNamespace(max_position_embeddings=135),
+        )
+        assert not util_mod.uses_fixed_width_recurrent_replay(
+            stochastic_cfg, spec_config, object
+        )
+
+        # Without extra RoPE margin beyond max_seq_len, headroom is 0 and full reserve applies.
+        tight_model_cfg = types.SimpleNamespace(
+            arch="kimi",
+            quant_config=types.SimpleNamespace(mamba_ssm_stochastic_rounding=False),
+            pretrained_config=types.SimpleNamespace(max_position_embeddings=128),
+        )
+        tight_engine = types.SimpleNamespace(
+            model=types.SimpleNamespace(
+                model_config=tight_model_cfg, requires_fixed_draft_width=False
+            )
+        )
+        assert util_mod.compute_speculative_limits(
+            tight_engine,
+            spec_config,
+            mapping,
+            max_seq_len=128,
+            disaggregated=False,
+            overlap=True,
+            kv_cache_manager_cls=_V2Cls,
+        ) == (7, 7, 0)
+
+        # Suffix Automaton cannot use KV headroom above max_seq_len.
+        sa_cfg = types.SimpleNamespace(
+            max_draft_len=3,
+            tokens_per_gen_step=4,
+            sa_config=None,
+            spec_dec_mode=SpeculativeDecodingMode.SA,
+        )
+        assert (
+            util_mod.compute_speculative_headroom(
+                sa_cfg,
+                types.SimpleNamespace(
+                    pretrained_config=types.SimpleNamespace(max_position_embeddings=256)
+                ),
+                128,
+                overlap=True,
+            )
+            == 0
+        )
 
 
 class TestAdpBalanceExcludesPadDummies:

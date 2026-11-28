@@ -146,3 +146,51 @@ def test_update_requests_matches_handle_stop_criteria(monkeypatch, seed):
     for runner in actual[:NUM_LONG_RUNNERS]:
         assert runner.state == LlmRequestState.GENERATION_IN_PROGRESS
         assert len(runner.get_tokens(0)) >= 1 + NUM_STEPS
+
+
+@pytest.mark.parametrize(
+    "is_pard, step1_width, expected_proposed, step2_width",
+    [
+        (False, 3, 3, 7),
+        (True, 5, 3, 7),
+    ],
+)
+def test_update_requests_records_verified_drafts_from_previous_proposed_count(
+    is_pard, step1_width, expected_proposed, step2_width
+):
+    sampler = SpecSampler.__new__(SpecSampler)
+    sampler.max_seq_len = MAX_SEQ_LEN
+    sampler.draft_len = DRAFT_LEN
+    sampler.max_accepted_path_len = DRAFT_LEN + 1
+    sampler.is_pard = is_pard
+
+    req = _request(0, random.Random(123))
+    req.py_draft_tokens = [10] * step1_width
+
+    def make_state(width: int) -> SampleStateSpec:
+        host = SampleStateTensorsSpec(
+            new_tokens=torch.ones(width + 1, 1, 1, dtype=torch.int32),
+            new_tokens_lens=torch.tensor([2], dtype=torch.int32),
+            next_draft_tokens=torch.zeros(1, width, dtype=torch.int32),
+        )
+        return SampleStateSpec(
+            requests=[req],
+            device=host,
+            host=host,
+            sampler_event=SimpleNamespace(synchronize=lambda: None),
+            runtime_draft_len=width,
+            draft_lens=[width],
+        )
+
+    # First step installs drafts of step1_width while prior proposal count is unset.
+    sampler.update_requests(make_state(step1_width))
+    assert req.py_num_proposed_draft_tokens == expected_proposed
+    assert req.py_num_draft_tokens_verified == expected_proposed
+
+    # Second step runs after padded/widened draft buffers (step2_width > expected_proposed);
+    # verified count must remain bounded by what the previous step actually proposed.
+    sampler.update_requests(make_state(step2_width))
+    assert req.py_num_draft_tokens_verified == expected_proposed
+    assert req.py_num_proposed_draft_tokens == (
+        (step2_width + 1) // 2 if is_pard else step2_width
+    )
