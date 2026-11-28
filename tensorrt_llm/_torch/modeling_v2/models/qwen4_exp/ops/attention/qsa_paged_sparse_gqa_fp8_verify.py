@@ -37,6 +37,7 @@ max moves differently. A target has to call it.
 
 from __future__ import annotations
 
+import os
 from typing import NamedTuple, Optional
 
 import cutlass
@@ -45,6 +46,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass import const_expr
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32, Int64
@@ -62,19 +64,35 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sp
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
     MAX_SPLITS,
     _asm,
+    _bf2_hi,
+    _bf2_lo,
+    _bf2_pack,
     _cp16z,
     _e4m3x2,
+    _f32_bits,
     _ir,
     _ldg1,
+    _ldg4,
     _lds1,
     _lds4,
     _ptr,
+    _stg1,
     _sts1,
     _sts4,
 )
 
-from .qsa_nvfp4_verify_ptx import ctz, groups8, popc, red_or_shared, spread4
-from .qsa_paged_sparse_gqa_nvfp4_verify import _compile_merge, _num_sms, _phase
+from .qsa_nvfp4_verify_ptx import (
+    ctz,
+    groups8,
+    popc,
+    red_or_shared,
+    spread4,
+    stg4,
+    stg4f,
+    tcgen05_fence_after,
+    tcgen05_fence_before,
+)
+from .qsa_paged_sparse_gqa_nvfp4_verify import _compile_merge, _num_sms, _phase, _sigmoid_fast
 from .qsa_paged_sparse_gqa_nvfp4_verify import _VerifyKernel as _Nvfp4VerifyKernel
 
 try:
@@ -93,6 +111,40 @@ def _red_max_shared(saddr, v, *, loc=None, ip=None):
         [_ir(saddr, Int32, loc, ip), _ir(v, Int32, loc, ip)],
         "{ red.shared.max.s32 [$1], $2; mov.u32 $0, 0; }",
         "=r,r,r",
+        loc,
+        ip,
+        side=True,
+    )
+
+
+@dsl_user_op
+def tmem_ld16x2(taddr, n: int, off: int, *, loc=None, ip=None):
+    """`tcgen05.ld.16x32bx2.x<n>` (32-bit values): threads 0-15 of the warp read lanes
+    taddr.lane + i at columns taddr.col .. + n - 1, threads 16-31 the same lanes at columns
+    taddr.col + off .. + n - 1. `tcgen05.wait::ld` (`fence_view_async_tmem_load`) before use."""
+    regs = ", ".join(f"${i}" for i in range(n))
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * n),
+        [_ir(taddr, Int32, loc, ip)],
+        f"tcgen05.ld.sync.aligned.16x32bx2.x{n}.b32 {{{regs}}}, [${n}], {off};",
+        "=f," * n + "r",
+        loc,
+        ip,
+        side=True,
+    )
+    return [Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(n)]
+
+
+@dsl_user_op
+def tmem_st16x2(taddr, vals, off: int, *, loc=None, ip=None):
+    """`tcgen05.st.16x32bx2.x<len(vals)>`: the store of `tmem_ld16x2`'s layout."""
+    n = len(vals)
+    regs = ", ".join(f"${i + 2}" for i in range(n))
+    _asm(
+        T.i32(),
+        [_ir(taddr, Int32, loc, ip)] + [_ir(v, Float32, loc, ip) for v in vals],
+        f"{{ tcgen05.st.sync.aligned.16x32bx2.x{n}.b32 [$1], {off}, {{{regs}}}; mov.u32 $0, 0; }}",
+        "=r,r" + ",f" * n,
         loc,
         ip,
         side=True,
@@ -150,6 +202,20 @@ SMALL_MIN_GROUPS = 2
 #: widest union (39-76 request groups at 2 KV heads on 148-152 SMs): two waves of split units
 #: and a merge. GB300, 45 requests a rank: -0.15 ms a step.
 TWO_WAVE_SPLITS = 2
+#: Opt-in: `TRTLLM_QWEN4_EXP_DP_GQA_SOFTMAX_SPLIT=1` puts verify row t's q heads on tensor-memory
+#: lanes 32 t + h (h < 16), so all four softmax warps hold live rows, and splits each row's tile
+#: between two threads (`tcgen05.ld/st .16x32bx2`: thread h takes positions 0-31, thread 16 + h
+#: positions 32-63; `_VerifyKernel.softmax_tiles_s2`). The two threads agree on the tile max by one
+#: shuffle, the second continues the first's row-sum chain, and the rescale and epilogue split O's
+#: columns between them: S, the reference max, P, O and l are the default kernel's, bit for bit.
+#: Read at import; the launch entries take `softmax_split=` to override it. Up to four rows a
+#: request and 16 q heads a KV head; other geometries take the default kernel.
+SOFTMAX_SPLIT_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_SOFTMAX_SPLIT"
+SOFTMAX_SPLIT = os.environ.get(SOFTMAX_SPLIT_ENV, "0").strip() == "1"
+
+
+def _softmax_split_fits(rpr: int, group: int) -> bool:
+    return rpr <= SOFT_WARPS and group <= 16
 
 
 def _roff_shift(k_strides) -> int:
@@ -259,6 +325,7 @@ class _VerifyKernel(_Nvfp4VerifyKernel):
         req64,
         gated,
         pdl,
+        softmax_split=False,
     ):
         lay = _layout(rpr, group, width, bt_width, tpb, 1 if tail else splits)
         assert lay is not None, "no shared-memory plan for this geometry (see `_layout`)"
@@ -277,6 +344,12 @@ class _VerifyKernel(_Nvfp4VerifyKernel):
         self.rows_m = rpr * group
         #: softmax warps holding live MMA rows (the rest only keep the barriers' counts)
         self.live_warps = -(-self.rows_m // 32)
+        #: lane split (`SOFTMAX_SPLIT`): MMA lane 32 t + h holds verify row t, q head h; thread
+        #: 32 t + 16 s + h takes positions 32 s .. 32 s + 31 of each tile of that row
+        self.split = bool(softmax_split)
+        if self.split:
+            assert _softmax_split_fits(rpr, group)
+            self.live_warps = rpr
         self.ngw, self.nw, self.ug_max, self.tmax = lay.ngw, lay.nw, lay.ug_max, lay.tmax
         self.raw_k = RAW_K
         self.raw_v = RAW_K
@@ -841,6 +914,7 @@ class _VerifyKernel(_Nvfp4VerifyKernel):
             cute.arch.relinquish_tmem_alloc_permit()
         cute.arch.sync_threads()
         tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, 16, storage.tmem_holding.ptr)
+        tb = cutlass.Int32(tmem_ptr.toint())
 
         qk_thr = qk_mma.get_slice(0)
         pv_thr = pv_mma_acc.get_slice(0)
@@ -908,9 +982,22 @@ class _VerifyKernel(_Nvfp4VerifyKernel):
         t_row = m // group
         h = m % group
         live = (m < self.rows_m) & (r0 + t_row < rows)
+        # the thread that copies this MMA row's q into raw slot 1, and whether its own tensor
+        # memory lane holds a live q row
+        stager = m < self.rows_m
+        q_live = live
+        if const_expr(self.split):
+            t_row = tidx // 32
+            h = tidx % 16
+            lane_ok = (h < group) & (t_row < rpr)
+            m = t_row * group + cutlass.min(h, group - 1)
+            live = lane_ok & (r0 + t_row < rows)
+            stager = lane_ok & ((tidx % 32) < 16)
+            q_live = live & ((tidx % 32) < 16)
         safe_row = cutlass.min(r0 + t_row, rows - 1)
         qs0, qs1 = self.qs
-        q_row = q_base + (cutlass.Int64(safe_row) * qs0 + cutlass.Int64(kvh * group + h) * qs1) * 2
+        q_head = kvh * group + cutlass.min(h, group - 1)
+        q_row = q_base + (cutlass.Int64(safe_row) * qs0 + cutlass.Int64(q_head) * qs1) * 2
         q_s = s_raw + self.u_q + cutlass.min(m, self.rows_m - 1) * Q_LD
 
         if const_expr(self.pdl):
@@ -926,7 +1013,7 @@ class _VerifyKernel(_Nvfp4VerifyKernel):
                     store_o, rZ, cute.make_tensor(tStO.iterator + c * CHUNK_COLS, tStO.layout)
                 )
             cute.arch.fence_view_async_tmem_store()
-            if m < self.rows_m:
+            if stager:
                 qn = cutlass.Int32(cutlass.select_(live, cutlass.Int32(16), cutlass.Int32(0)))
                 for i in cutlass.range_constexpr(HEAD_DIM // 8):
                     _cp16z(q_s + 16 * i, q_row + cutlass.Int64(16 * i), qn)
@@ -1046,23 +1133,41 @@ class _VerifyKernel(_Nvfp4VerifyKernel):
                     )
                 else:
                     if q_pending != 0:
-                        self.stage_q(q_s, live, tview, q_full)
+                        self.stage_q(q_s, q_live, tview, q_full)
                         q_pending = cutlass.Int32(0)
-                    row_max, row_sum = self.softmax_tiles(
-                        g,
-                        n_loc,
-                        row_max,
-                        row_sum,
-                        live,
-                        t_row,
-                        warp,
-                        s_tab,
-                        scale_log2,
-                        tview,
-                        s_full,
-                        p_full,
-                        o_full,
-                    )
+                    if const_expr(self.split):
+                        row_max, row_sum = self.softmax_tiles_s2(
+                            g,
+                            n_loc,
+                            row_max,
+                            row_sum,
+                            live,
+                            t_row,
+                            tidx,
+                            warp,
+                            s_tab,
+                            scale_log2,
+                            tb,
+                            s_full,
+                            p_full,
+                            o_full,
+                        )
+                    else:
+                        row_max, row_sum = self.softmax_tiles(
+                            g,
+                            n_loc,
+                            row_max,
+                            row_sum,
+                            live,
+                            t_row,
+                            warp,
+                            s_tab,
+                            scale_log2,
+                            tview,
+                            s_full,
+                            p_full,
+                            o_full,
+                        )
                 g = g + n_loc
                 if const_expr(self.wide):
                     # the next pass's bitmaps overwrite the K/V slots: every MMA of this pass
@@ -1078,32 +1183,60 @@ class _VerifyKernel(_Nvfp4VerifyKernel):
         if warp == MMA_WARP:
             with cute.arch.elect_one():
                 tcgen05.commit(o_final)
-        if warp < SOFT_WARPS:
-            cute.arch.cp_async_wait_group(0)
-            self.epilogue(
-                row_max,
-                row_sum,
-                live,
-                warp,
-                m,
-                r0,
-                rows,
-                kvh,
-                split,
-                nsplit,
-                tail_row0,
-                mGs,
-                scale_log2,
-                out_base,
-                part_base,
-                lse_base,
-                gate_base,
-                gate_stride,
-                tview,
-                o_final,
-                tidx,
-                s_k16,
-            )
+        if const_expr(self.split):
+            if warp < SOFT_WARPS:
+                cute.arch.cp_async_wait_group(0)
+                self.epilogue_s2(
+                    row_max,
+                    row_sum,
+                    live,
+                    warp,
+                    m,
+                    r0,
+                    rows,
+                    kvh,
+                    split,
+                    nsplit,
+                    tail_row0,
+                    mGs,
+                    scale_log2,
+                    out_base,
+                    part_base,
+                    lse_base,
+                    gate_base,
+                    gate_stride,
+                    tb,
+                    o_final,
+                    tidx,
+                    s_k16,
+                )
+        else:
+            if warp < SOFT_WARPS:
+                cute.arch.cp_async_wait_group(0)
+                self.epilogue(
+                    row_max,
+                    row_sum,
+                    live,
+                    warp,
+                    m,
+                    r0,
+                    rows,
+                    kvh,
+                    split,
+                    nsplit,
+                    tail_row0,
+                    mGs,
+                    scale_log2,
+                    out_base,
+                    part_base,
+                    lse_base,
+                    gate_base,
+                    gate_stride,
+                    tview,
+                    o_final,
+                    tidx,
+                    s_k16,
+                )
         # every role done with tensor memory (the softmax warps read O last)
         cute.arch.sync_threads()
         if warp == MMA_WARP:
@@ -1227,6 +1360,264 @@ class _VerifyKernel(_Nvfp4VerifyKernel):
                     _e4m3x2(b),
                     _e4m3x2(b >> 16),
                 )
+
+    # ---- lane split (`SOFTMAX_SPLIT`): softmax and epilogue, two threads a row ------------
+    @cute.jit
+    def softmax_tiles_s2(
+        self,
+        g,
+        n_loc,
+        row_max,
+        row_sum,
+        live,
+        t_row,
+        tidx,
+        warp,
+        s_tab,
+        scale_log2,
+        tb,
+        s_full,
+        p_full,
+        o_full,
+    ):
+        """`softmax_tiles` with each row's tile split between two threads (`.16x32bx2` tensor-memory
+        accesses on lanes 32 t .. 32 t + 15): thread half s holds positions 32 s .. 32 s + 31.
+        Bit for bit the default kernel's: the halves agree on the tile max (max is exact), apply
+        the same reference-max rule, write P (f16) for their own positions, and the second half
+        continues the first half's row-sum chain (the default kernel's order: two packed
+        accumulators over positions 0, 4, 8, ...); the O rescale splits O's columns."""
+        rpr: cutlass.Constexpr = self.T
+        hb: cutlass.Constexpr = BN // 2
+        s_bits = s_tab + self.t_bits * 4
+        tau = Float32(RESCALE_TH)
+        neg_inf = -Float32.inf
+        live_warp = warp < self.live_warps
+        half = (tidx // 16) % 2
+        lanes = tb + ((warp * 32) << 16)
+        for kl in cutlass.range(n_loc, unroll=1):
+            gg = g + kl
+            buf = gg % 2
+            cute.arch.mbarrier_wait(s_full + buf, _phase(gg, 2))
+            tcgen05_fence_after()
+            if live_warp:
+                word = cutlass.Int32(0)
+                if live:
+                    word = _lds1(s_bits + (kl * rpr + t_row) * 8 + 4 * half)
+                sv = tmem_ld16x2(lanes + (TMEM_S0 + buf * BN), hb, hb)
+                cute.arch.fence_view_async_tmem_load()
+                rS = cute.make_rmem_tensor((hb,), Float32)
+                tile_max = neg_inf
+                for i in cutlass.range_constexpr(hb):
+                    x = sv[i]
+                    x = x if (word & (1 << i)) != 0 else neg_inf
+                    rS[i] = x
+                    tile_max = cute.arch.fmax(tile_max, x)
+                tile_max = cute.arch.fmax(
+                    tile_max, cute.arch.shuffle_sync_bfly(tile_max, offset=16)
+                )
+                new_max = cute.arch.fmax(row_max, tile_max)
+                use_max = row_max
+                factor = Float32(1.0)
+                if row_max == neg_inf:
+                    use_max = new_max
+                elif (new_max - row_max) * scale_log2 > tau:
+                    use_max = new_max
+                    factor = cute.math.exp2((row_max - new_max) * scale_log2, fastmath=True)
+                need = factor != Float32(1.0)
+                if cute.arch.vote_any_sync(need):
+                    # O holds PV(..gg - 1): wait for it, then rescale this warp's rows, the first
+                    # half's threads O columns 0-127, the second half's 128-255
+                    cute.arch.mbarrier_wait(o_full, (gg - 1) % 2)
+                    tcgen05_fence_after()
+                    for c in cutlass.range_constexpr(HEAD_DIM // (2 * CHUNK_COLS)):
+                        ov = tmem_ld16x2(
+                            lanes + (TMEM_O + c * CHUNK_COLS), CHUNK_COLS, HEAD_DIM // 2
+                        )
+                        cute.arch.fence_view_async_tmem_load()
+                        tmem_st16x2(
+                            lanes + (TMEM_O + c * CHUNK_COLS),
+                            [x * factor for x in ov],
+                            HEAD_DIM // 2,
+                        )
+                    cute.arch.fence_view_async_tmem_store()
+                row_max = use_max
+                safe = use_max
+                if use_max == neg_inf:
+                    safe = Float32(0.0)
+                neg = -safe * scale_log2
+                for i in cutlass.range_constexpr(0, hb, 4):
+                    e = cute.make_rmem_tensor((4,), Float32)
+                    e[0], e[1] = cute.arch.fma_packed_f32x2(
+                        (rS[i], rS[i + 1]), (scale_log2, scale_log2), (neg, neg)
+                    )
+                    e[2], e[3] = cute.arch.fma_packed_f32x2(
+                        (rS[i + 2], rS[i + 3]), (scale_log2, scale_log2), (neg, neg)
+                    )
+                    for u in cutlass.range_constexpr(4):
+                        rS[i + u] = cute.math.exp2(e[u], fastmath=True)
+                # the row-sum chain: the first half from 0, the second from the first's partials
+                a0 = (Float32(0.0), Float32(0.0))
+                a1 = (Float32(0.0), Float32(0.0))
+                for i in cutlass.range_constexpr(0, hb, 4):
+                    a0 = cute.arch.add_packed_f32x2(a0, (rS[i], rS[i + 1]))
+                    a1 = cute.arch.add_packed_f32x2(a1, (rS[i + 2], rS[i + 3]))
+                b0 = (
+                    cute.arch.shuffle_sync_bfly(a0[0], offset=16),
+                    cute.arch.shuffle_sync_bfly(a0[1], offset=16),
+                )
+                b1 = (
+                    cute.arch.shuffle_sync_bfly(a1[0], offset=16),
+                    cute.arch.shuffle_sync_bfly(a1[1], offset=16),
+                )
+                for i in cutlass.range_constexpr(0, hb, 4):
+                    b0 = cute.arch.add_packed_f32x2(b0, (rS[i], rS[i + 1]))
+                    b1 = cute.arch.add_packed_f32x2(b1, (rS[i + 2], rS[i + 3]))
+                ts = (b0[0] + b0[1]) + (b1[0] + b1[1])
+                ts_other = cute.arch.shuffle_sync_bfly(ts, offset=16)
+                tile_sum = ts if half != 0 else ts_other
+                row_sum = row_sum * factor + tile_sum
+                p16 = cute.make_rmem_tensor((hb,), F16)
+                p16.store(rS.load().to(F16))
+                pw = cute.make_tensor(
+                    cute.recast_ptr(p16.iterator, dtype=Float32), cute.make_layout((hb // 2,))
+                )
+                tmem_st16x2(lanes + (TMEM_S0 + buf * BN), [pw[j] for j in range(hb // 2)], hb // 2)
+                cute.arch.fence_view_async_tmem_store()
+            tcgen05_fence_before()
+            cute.arch.mbarrier_arrive(p_full + buf)
+        return row_max, row_sum
+
+    @cute.jit
+    def epilogue_s2(
+        self,
+        row_max,
+        row_sum,
+        live,
+        warp,
+        m,
+        r0,
+        rows,
+        kvh,
+        split,
+        nsplit,
+        tail_row0,
+        mGs,
+        scale_log2,
+        out_base,
+        part_base,
+        lse_base,
+        gate_base,
+        gate_stride,
+        tb,
+        o_final,
+        st,
+        s_stage,
+    ):
+        """`epilogue` over the lane split: the first half's thread of a row stores O columns
+        0-127, the second 128-255 (O and l are the default kernel's, so the same values); the
+        first writes the log2-sum-exp."""
+        group: cutlass.Constexpr = self.group
+        heads: cutlass.Constexpr = self.heads
+        splits: cutlass.Constexpr = self.splits
+        tailm: cutlass.Constexpr = self.tail
+        has_whole: cutlass.Constexpr = tailm or splits == 1
+        has_split: cutlass.Constexpr = tailm or splits > 1
+        gated_whole: cutlass.Constexpr = has_whole and self.gated
+        rows_m: cutlass.Constexpr = self.rows_m
+        cpr: cutlass.Constexpr = HEAD_DIM // 8  # 16-byte chunks a row
+        n_gc: cutlass.Constexpr = -(-(rows_m * cpr) // (32 * SOFT_WARPS))
+        neg_inf = -Float32.inf
+        half = (st // 16) % 2
+        lane_ok = ((st % 16) < group) & (warp < self.T)
+        lanes = tb + ((warp * 32) << 16)
+        row = r0 + m // group
+        h = m % group
+        head = kvh * group + h
+        prow = cutlass.Int64(row - tail_row0)
+        prows = cutlass.Int64(rows - tail_row0)
+        whole = nsplit == 1
+        gregs = []
+        if const_expr(gated_whole):
+            for j in cutlass.range_constexpr(n_gc):
+                k = st + 32 * SOFT_WARPS * j
+                gm = cutlass.min(k // cpr, rows_m - 1)
+                grow = cutlass.min(r0 + gm // group, rows - 1)
+                ghead = kvh * group + gm % group
+                gregs.append(
+                    _ldg4(
+                        gate_base
+                        + (cutlass.Int64(grow) * gate_stride + ghead * HEAD_DIM + (k % cpr) * 8) * 2
+                    )
+                )
+        cute.arch.mbarrier_wait(o_final, 0)
+        tcgen05_fence_after()
+        if warp < self.live_warps:
+            gv = mGs[2]
+            inv = Float32(0.0)
+            if row_sum > Float32(0.0):
+                inv = gv / row_sum
+            for c in cutlass.range_constexpr(HEAD_DIM // (2 * CHUNK_COLS)):
+                ov = tmem_ld16x2(lanes + (TMEM_O + c * CHUNK_COLS), CHUNK_COLS, HEAD_DIM // 2)
+                cute.arch.fence_view_async_tmem_load()
+                for v8 in cutlass.range_constexpr(CHUNK_COLS // 8):
+                    vals = [ov[8 * v8 + i] * inv for i in range(8)]
+                    d0 = half * (HEAD_DIM // 2) + c * CHUNK_COLS + 8 * v8
+                    oaddr = out_base + ((cutlass.Int64(row) * heads + head) * HEAD_DIM + d0) * 2
+                    paddr = (
+                        part_base
+                        + (((cutlass.Int64(split) * prows + prow) * heads + head) * HEAD_DIM + d0)
+                        * 4
+                    )
+                    packed = [_bf2_pack(vals[2 * e], vals[2 * e + 1]) for e in range(4)]
+                    saddr = s_stage + cutlass.min(m, rows_m - 1) * Q_LD + d0 * 2
+                    if const_expr(has_whole):
+                        if whole:
+                            if const_expr(gated_whole):
+                                if lane_ok:
+                                    _sts4(saddr, packed[0], packed[1], packed[2], packed[3])
+                            else:
+                                if live:
+                                    stg4(oaddr, packed[0], packed[1], packed[2], packed[3])
+                    if const_expr(has_split):
+                        if live & (nsplit > 1):
+                            stg4f(paddr, vals[0], vals[1], vals[2], vals[3])
+                            stg4f(paddr + 16, vals[4], vals[5], vals[6], vals[7])
+            if const_expr(has_split):
+                if live & (nsplit > 1) & (half == 0):
+                    lse = neg_inf
+                    if row_sum > Float32(0.0):
+                        lse = row_max * scale_log2 + cute.math.log2(row_sum)
+                    _stg1(
+                        lse_base + ((cutlass.Int64(split) * prows + prow) * heads + head) * 4,
+                        _f32_bits(lse),
+                    )
+        if const_expr(gated_whole):
+            if whole:
+                cute.arch.barrier(barrier_id=1, number_of_threads=32 * SOFT_WARPS)
+                for j in cutlass.range_constexpr(n_gc):
+                    k = st + 32 * SOFT_WARPS * j
+                    gm = cutlass.min(k // cpr, rows_m - 1)
+                    grow = r0 + gm // group
+                    ghead = kvh * group + gm % group
+                    a4 = _lds4(s_stage + gm * Q_LD + (k % cpr) * 16)
+                    g4 = gregs[j]
+                    res = [
+                        _bf2_pack(
+                            _bf2_lo(a4[e]) * _sigmoid_fast(_bf2_lo(g4[e])),
+                            _bf2_hi(a4[e]) * _sigmoid_fast(_bf2_hi(g4[e])),
+                        )
+                        for e in range(4)
+                    ]
+                    if (k < rows_m * cpr) & (grow < rows):
+                        stg4(
+                            out_base
+                            + ((cutlass.Int64(grow) * heads + ghead) * HEAD_DIM + (k % cpr) * 8)
+                            * 2,
+                            res[0],
+                            res[1],
+                            res[2],
+                            res[3],
+                        )
 
     # The MMAs (warp 4), softmax and epilogue (warps 0-3) are the base class's.
 
@@ -1391,11 +1782,13 @@ def fp8_sparse_gqa_verify_grouped(
     pdl: bool = True,
     splits: Optional[int] = None,
     min_groups: Optional[int] = None,
+    softmax_split: Optional[bool] = None,
 ) -> torch.Tensor:
     """The grouped kernel (and the merge with more than one split), whatever the row count;
-    `splits` overrides the plan. `fp8_sparse_gqa_verify` is the routed entry. The first call of
-    a geometry compiles the plans of `min_groups` (`MIN_GROUPS` by default) up to the block
-    table's rows groups: the floor a caller routes from (`takes_grouped(..., min_groups)`).
+    `splits` overrides the plan, `softmax_split` the `SOFTMAX_SPLIT` switch.
+    `fp8_sparse_gqa_verify` is the routed entry. The first call of a geometry compiles the plans
+    of `min_groups` (`MIN_GROUPS` by default) up to the block table's rows groups: the floor a
+    caller routes from (`takes_grouped(..., min_groups)`).
     """
     rows, num_q_heads, head_dim = q.shape
     num_pages, num_kv_heads, tpb, packed = k_cache.shape
@@ -1417,6 +1810,8 @@ def fp8_sparse_gqa_verify_grouped(
     assert request_indices.is_contiguous() and request_indices.dtype in (torch.int32, torch.int64)
     group = num_q_heads // num_kv_heads
     width = selected_tokens.shape[1]
+    use_split = SOFTMAX_SPLIT if softmax_split is None else bool(softmax_split)
+    use_split = use_split and _softmax_split_fits(rpr, group)
     out = torch.empty((rows, num_q_heads, head_dim), dtype=torch.bfloat16, device=q.device)
     if rows == 0:
         return out
@@ -1464,6 +1859,7 @@ def fp8_sparse_gqa_verify_grouped(
         req64,
         gated,
         use_pdl,
+        use_split,
     )
     if merged > 0:
         part = torch.empty(
@@ -1521,6 +1917,7 @@ def fp8_sparse_gqa_verify_grouped(
         req64=req64,
         gated=gated,
         pdl=use_pdl,
+        softmax_split=use_split,
     )
     # A launch plan depends on the call's row count: an eager step (a mixed step's
     # generation rows) meeting a new one would compile mid-serving, for seconds. The first
