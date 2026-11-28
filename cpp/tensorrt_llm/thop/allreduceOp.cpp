@@ -1724,6 +1724,19 @@ void endNCCLWindowTensorScope(
     endTrackedNCCLWindowTensorScope(inputs, outputs, failed, -1);
 }
 
+void releaseNCCLWindowTensorScopeLeases(
+    torch::List<torch::Tensor> const& inputs, torch::List<torch::Tensor> const& outputs)
+{
+#if ENABLE_MULTI_DEVICE
+    auto const device = getTensorScopeInputs(inputs).second;
+    tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().releaseTensorLeaseScopeLeases(
+        getTensorStorages(outputs), device, at::cuda::getCurrentCUDAStream(device));
+#else
+    (void) inputs;
+    (void) outputs;
+#endif
+}
+
 namespace
 {
 
@@ -2560,11 +2573,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("begin_nccl_window_tensor_scope.tracked(Tensor[] inputs) -> int");
     m.def(
         "end_nccl_window_tensor_scope.tracked(Tensor[] inputs, Tensor[] outputs, bool failed, int entry_depth) -> ()");
+    // Releases the innermost scope's leases, except the outputs', as its exit would; the scope stays open.
+    m.def("release_nccl_window_tensor_scope_leases(Tensor[] inputs, Tensor[] outputs) -> ()");
     m.def("set_nccl_window_graph_owner(int owner) -> ()");
     m.def("release_nccl_window_graph_owner(int owner) -> ()");
     m.def("set_nccl_window_allocation_suppressed(bool suppressed) -> bool");
     m.def("get_nccl_window_buffer_release_epoch() -> int");
     m.def("get_nccl_window_usage(int device) -> int[]");
+    m.def("has_requested_nccl_window_buffers() -> bool");
     m.def("promote_nccl_window_buffer_releases(int device, int release_epoch) -> ()");
     m.def(
         "minimax_allreduce_rms("
@@ -2605,6 +2621,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("end_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::endNCCLWindowTensorScope);
     m.impl("begin_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::beginTrackedNCCLWindowTensorScope);
     m.impl("end_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::endTrackedNCCLWindowTensorScope);
+    m.impl("release_nccl_window_tensor_scope_leases", &tensorrt_llm::torch_ext::releaseNCCLWindowTensorScopeLeases);
     m.impl("is_nccl_window_buffer", &tensorrt_llm::torch_ext::isNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
     m.impl("minimax_allreduce_rms_qk", &tensorrt_llm::torch_ext::minimax_allreduce_rms_qk);
@@ -2649,6 +2666,8 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
             return std::vector<int64_t>{static_cast<int64_t>(usage.bufferCount), static_cast<int64_t>(usage.totalBytes),
                 static_cast<int64_t>(usage.inUseBytes)};
         });
+    m.impl("has_requested_nccl_window_buffers",
+        []() { return tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().hasRequestedBuffers(); });
     m.impl("promote_nccl_window_buffer_releases",
         [](int64_t device, int64_t releaseEpoch)
         {
@@ -2662,6 +2681,7 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
     m.impl("set_nccl_window_allocation_suppressed", [](bool) { return false; });
     m.impl("get_nccl_window_buffer_release_epoch", []() { return int64_t{0}; });
     m.impl("get_nccl_window_usage", [](int64_t) { return std::vector<int64_t>{0, 0, 0}; });
+    m.impl("has_requested_nccl_window_buffers", []() { return false; });
     m.impl("promote_nccl_window_buffer_releases", [](int64_t, int64_t) {});
 #endif
 }
@@ -2685,4 +2705,6 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
         [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&, bool, int64_t) { return; });
     m.impl("end_nccl_window_tensor_scope",
         [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&, bool) { return; });
+    m.impl("release_nccl_window_tensor_scope_leases",
+        [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&) { return; });
 }
