@@ -411,6 +411,77 @@ def test_scheduler_output_block_hashes_read_through():
         assert call.args == (req, )
 
 
+class _TokenCopyCountingRequest:
+    """The token accessors of an LlmRequest, counting the tokens each call copies."""
+
+    def __init__(self, request_id, tokens):
+        self.request_id = request_id
+        self.tokens = list(tokens)
+        self.state = LlmRequestState.CONTEXT_INIT
+        self.context_current_position = 0
+        self.context_remaining_length = len(self.tokens)
+        self.context_chunk_size = len(self.tokens)
+        self.py_draft_tokens = []
+        self.kv_cache_retention_config = None
+        self.cache_salt = None
+        self.copied_tokens = 0
+
+    def get_tokens(self, beam):
+        self.copied_tokens += len(self.tokens)
+        return list(self.tokens)
+
+    def get_num_tokens(self, beam):
+        return len(self.tokens)
+
+    def get_tokens_range(self, beam, begin, end):
+        tokens = self.tokens[begin:end]
+        self.copied_tokens += len(tokens)
+        return tokens
+
+
+def test_scheduler_output_copies_only_new_tokens():
+    """Each iteration reports and copies only the tokens added since the last one.
+
+    The scheduler output is built for every scheduled request on every
+    iteration, so copying a request's whole token list would make each
+    iteration cost its sequence length.
+    """
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0, 1]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    manager = KvCacheConnectorSchedulerOutputManager()
+    req = _TokenCopyCountingRequest(9, range(100, 164))
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+    output = manager.build_scheduler_output(batch, AsyncRequests({}, {}),
+                                            kv_cache_manager)
+    reported = output.new_requests[0]
+    assert reported.new_tokens == list(range(100, 164))
+    assert reported.computed_position == 0
+
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    batch = ScheduledRequests()
+    batch.generation_requests = [req]
+    for appended in ([7], [], [8, 9, 10]):
+        req.tokens.extend(appended)
+        output = manager.build_scheduler_output(batch, AsyncRequests({}, {}),
+                                                kv_cache_manager)
+        reported = output.cached_requests[0]
+        assert reported.new_tokens == appended
+        assert reported.computed_position == len(req.tokens) - 1
+
+    assert req.copied_tokens == len(req.tokens)
+
+    # A shorter token list reports no new tokens.
+    del req.tokens[-2:]
+    output = manager.build_scheduler_output(batch, AsyncRequests({}, {}),
+                                            kv_cache_manager)
+    reported = output.cached_requests[0]
+    assert reported.new_tokens == []
+    assert reported.computed_position == len(req.tokens) - 1
+
+
 class _MinimalWorker(KvCacheConnectorWorker):
     """A worker satisfying the ABC and nothing more."""
 
