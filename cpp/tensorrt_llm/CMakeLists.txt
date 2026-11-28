@@ -223,7 +223,6 @@ set(TRTLLM_LINK_LIBS
     ${CUBLASLT_LIB}
     ${CURAND_LIB}
     ${CMAKE_DL_LIBS}
-    common_src
     kernels_src
     flash_mla_src
     context_attention_src
@@ -321,6 +320,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_batch_request_info
     tllm_batch_rnn_cache_routing
     tllm_batch_scheduler
+    tllm_common_attention_workspace
     tllm_common_cublas
     tllm_common_cuda
     tllm_common_cuda_architectures
@@ -336,6 +336,8 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_common_op_utils
     tllm_common_profiler
     tllm_common_safetensors
+    tllm_common_sage_quant
+    tllm_common_sage_scale_geometry
     tllm_context_transfer_consensus
     tllm_executor_agent_connection
     tllm_executor_agent_name

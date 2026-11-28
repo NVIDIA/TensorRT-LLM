@@ -212,10 +212,38 @@ target_compile_definitions(
     TRTLLM_BUILT_CUDA_ARCHITECTURES=${TRTLLM_BUILT_CUDA_ARCHITECTURES}
     TRTLLM_SUPPORTED_CUDA_ARCHITECTURES=${TRTLLM_SUPPORTED_CUDA_ARCHITECTURES})
 
-add_library(common_src OBJECT sageQuant.cu)
-add_cuda_architectures(common_src 89)
-set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_library(tllm_common_sage_scale_geometry STATIC sageScaleGeometry.cpp)
+add_library(tllm::common_sage_scale_geometry ALIAS
+            tllm_common_sage_scale_geometry)
+target_link_libraries(tllm_common_sage_scale_geometry
+                      PUBLIC tllm::common_headers)
+target_compile_features(tllm_common_sage_scale_geometry PUBLIC cxx_std_20)
+set_target_properties(tllm_common_sage_scale_geometry
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_common_attention_workspace STATIC attentionWorkspace.cpp)
+add_library(tllm::common_attention_workspace ALIAS
+            tllm_common_attention_workspace)
 target_link_libraries(
-  common_src PUBLIC trtllm_gen_fmha_interface tllm::common_cublas
-                    tllm::common_native_memory tllm::common_nccl_comm)
+  tllm_common_attention_workspace
+  PUBLIC tllm::common_headers
+  PRIVATE tllm::common_sage_scale_geometry)
+target_include_directories(tllm_common_attention_workspace SYSTEM
+                           PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+target_compile_features(tllm_common_attention_workspace PUBLIC cxx_std_20)
+set_target_properties(tllm_common_attention_workspace
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_common_sage_quant STATIC sageQuant.cu)
+add_library(tllm::common_sage_quant ALIAS tllm_common_sage_quant)
+target_link_libraries(
+  tllm_common_sage_quant
+  PUBLIC tllm::common_cuda tllm::common_sage_scale_geometry
+  PRIVATE tllm::kernel_cutlass_headers)
+
+target_compile_features(tllm_common_sage_quant PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_common_sage_quant
+  PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(tllm_common_sage_quant 89)

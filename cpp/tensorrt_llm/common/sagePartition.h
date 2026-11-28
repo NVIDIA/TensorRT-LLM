@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "sageScaleGeometry.h"
+
 #include <cute/tensor.hpp>
 
 namespace tensorrt_llm::common
@@ -35,13 +37,7 @@ namespace tensorrt_llm::common
 // swizzled. Expressing both as a layout lets one quantizer serve both: it just evaluates
 // partition(i, g).
 //
-//   ScaleAlign is the alignment, in scales, that the consumer needs a sequence's scale base to
-//   have. The SM90 K path loads its four scales as one float4, so it needs 4; everything else
-//   needs 1.
-//
-//   HeadStrideCountsBlocks selects how the consumer derives the head stride of a scale buffer.
-//   The two conventions agree on where a sequence's scales start and differ only in the total,
-//   so a partition has to declare the one its consumer was built with.
+//   ScaleGeometry declares the scale-buffer addressing convention used by the consumer.
 
 // -------------------------------------------------------------------------------------------
 // SM100 / contiguous: a tile is one group of BlockSize consecutive tokens.
@@ -50,9 +46,7 @@ struct ContiguousPartition
 {
     using Layout = cute::Layout<cute::Shape<cute::Shape<cute::Int<BlockSize>>, cute::Shape<cute::_1>>,
         cute::Stride<cute::Stride<cute::_1>, cute::Stride<cute::Int<BlockSize>>>>;
-    static constexpr int ScaleAlign = 1;
-    // Head stride: started blocks over the whole batch, plus one spare per extra sequence.
-    static constexpr bool HeadStrideCountsBlocks = true;
+    using ScaleGeometry = ContiguousScaleGeometry<BlockSize>;
 };
 
 // -------------------------------------------------------------------------------------------
@@ -67,9 +61,7 @@ struct HopperQPartition
 {
     using Layout = cute::Layout<cute::Shape<cute::Shape<cute::_2>, cute::Shape<cute::_8, cute::_4>>,
         cute::Stride<cute::Stride<cute::_8>, cute::Stride<cute::_1, cute::_16>>>;
-    static constexpr int ScaleAlign = 1;
-    // Head stride: the sequence base function evaluated at (sumSeqLens, batchSize).
-    static constexpr bool HeadStrideCountsBlocks = false;
+    using ScaleGeometry = HopperQScaleGeometry;
 };
 
 // -------------------------------------------------------------------------------------------
@@ -85,9 +77,7 @@ struct HopperKPartition
     using Layout = cute::Layout<cute::Shape<cute::Shape<cute::_2, cute::_8>, cute::Shape<cute::_4, cute::_4>>,
         cute::Stride<cute::Stride<cute::_1, cute::_8>, cute::Stride<cute::_64, cute::_2>>>;
     // The consumer loads a thread's four chunk scales with one 128-bit access.
-    static constexpr int ScaleAlign = 4;
-    // Head stride: the sequence base function evaluated at (sumSeqLens, batchSize).
-    static constexpr bool HeadStrideCountsBlocks = false;
+    using ScaleGeometry = HopperKScaleGeometry;
 };
 
 // -------------------------------------------------------------------------------------------
@@ -103,36 +93,22 @@ struct PartitionTraits
     static constexpr int ScalesPerTile = cute::size<1>(Layout{});
     // Tokens in one tile.
     static constexpr int TileTokens = cute::size(Layout{});
-    static constexpr int ScaleAlign = Partition::ScaleAlign;
 
     static_assert(TileTokens == TokensPerScale * ScalesPerTile, "partition must be a bijection");
     static_assert(cute::cosize(Layout{}) == TileTokens, "partition must tile densely");
-    static_assert(ScaleAlign > 0 && (ScaleAlign & (ScaleAlign - 1)) == 0, "ScaleAlign must be 2^k");
 
-    // A sequence reserves one spare tile's worth of scales, because a partial final tile still
-    // indexes all ScalesPerTile of them, plus ScaleAlign - 1 to absorb the base round-up. Rounded
-    // up to a multiple of ScaleAlign so that every base stays aligned.
-    static constexpr int SlotsPerSeq = ((ScalesPerTile + ScaleAlign - 1) + ScaleAlign - 1) / ScaleAlign * ScaleAlign;
+    using ScaleGeometry = typename Partition::ScaleGeometry;
+    static_assert(TokensPerScale == ScaleGeometry::kTokensPerScale);
+    static_assert(ScalesPerTile == ScaleGeometry::kScalesPerTile);
 
-    // Where sequence seqIdx's scales start within a head.
     CUTE_HOST_DEVICE static constexpr int scaleBase(int cuSeqLen, int seqIdx)
     {
-        return ((cuSeqLen / TokensPerScale + ScaleAlign - 1) / ScaleAlign) * ScaleAlign + seqIdx * SlotsPerSeq;
+        return ScaleGeometry::scaleBase(cuSeqLen, seqIdx);
     }
 
-    // Scales per head, i.e. the head stride of the scale buffer. Depends only on the batch size and
-    // the total token count, never on the longest sequence. The consumer kernels are not passed
-    // this value; they recompute it, so it has to match the convention they were built with.
     CUTE_HOST_DEVICE static constexpr int scaleHeadStride(int sumSeqLens, int batchSize)
     {
-        if constexpr (Partition::HeadStrideCountsBlocks)
-        {
-            return (sumSeqLens + TokensPerScale - 1) / TokensPerScale + batchSize - 1;
-        }
-        else
-        {
-            return scaleBase(sumSeqLens, batchSize);
-        }
+        return ScaleGeometry::scaleHeadStride(sumSeqLens, batchSize);
     }
 
     // Token index inside a tile for intra-group element i of group g.
