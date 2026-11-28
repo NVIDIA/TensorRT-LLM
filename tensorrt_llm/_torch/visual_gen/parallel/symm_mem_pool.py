@@ -23,8 +23,7 @@ identically on every rank and (c) allocated once, outside CUDA-graph capture.
 ``torch.distributed._symmetric_memory`` gives exactly that: ``empty`` + ``rendezvous`` return a
 handle whose ``get_buffer(peer, ...)`` is a tensor view of the peer's copy of the allocation and
 whose signal pad carries the ``put_signal`` / ``wait_signal`` flags that order a consumer's reads
-after a producer's copies. Nothing in the tree uses the pool yet: the first follow-up is the
-copy-engine all-gather of VisualGen's token-sharded tensor parallelism. Each
+after a producer's copies. The shared copy-engine transport orders peer copies and signals. Each
 :class:`SymmMemPool` is one allocation; a group may carry several (one per protocol), nothing
 ties a group to one.
 
@@ -141,6 +140,7 @@ from types import ModuleType
 import torch
 import torch.distributed as dist
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
 
@@ -165,6 +165,7 @@ disables the deadline."""
 
 _SIGNAL_BYTES = 4  # one uint32 flag per (channel, rank) on the signal pad
 _MARKER_BYTES = 8  # one int64 marker per rank for the addressing check
+_MAX_WAIT_DESCRIPTORS = 128  # Keep graph-visible addresses stable and bound storage per allocation.
 
 
 def _symm_mem() -> ModuleType:
@@ -435,6 +436,8 @@ class SymmMemPool:
         self._base_offset: int = 0  # bytes from the block's data buffer start to the pool tensor
         self._pad_nbytes: int = 0  # the signal pad size the current allocation was made with
         self._peer_buffers: dict[int, torch.Tensor] = {}
+        self._wait_indices: dict[tuple[tuple[int, int], ...], torch.Tensor] = {}
+        self._local_signal_pad: torch.Tensor | None = None
 
     # --- state ------------------------------------------------------------------------------
 
@@ -846,6 +849,44 @@ class SymmMemPool:
         self._check_channel(channel, "wait")
         self._handle.wait_signal(src, channel, self.timeout_ms)
 
+    def try_wait_many(self, signals: tuple[tuple[int, int], ...]) -> bool:
+        """Consume distinct flags in one kernel, or return False for an uncached set in capture.
+
+        The caller warms the kernel first. Eager calls prepare descriptors on the ordered
+        consumer stream. The first cached descriptors stay live until pool release so graphs
+        can reuse their addresses. Additional flag sets use temporary descriptors eagerly.
+        """
+        self._require_reserved("try_wait_many")
+        if not signals:
+            return True
+        indices = self._wait_indices.get(signals)
+        if indices is None:
+            if len(set(signals)) != len(signals):
+                raise ValueError("SymmMemPool.try_wait_many requires distinct signals.")
+            words = []
+            for src, channel in signals:
+                self._check_peer(src, "try_wait_many")
+                self._check_channel(channel, "try_wait_many")
+                # CUDA symmetric memory addresses its local uint32 pad by [channel, source].
+                words.append(channel * self.world_size + src)
+            if _is_capturing():
+                return False
+            words.extend([-1] * (-len(words) % 32))
+            host = torch.tensor(words, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned())
+            indices = host.to(self.device, non_blocking=True)
+            if self._local_signal_pad is None:
+                self._local_signal_pad = self._handle.get_signal_pad(
+                    self.rank, (self._pad_nbytes // _SIGNAL_BYTES,), torch.int32
+                )
+            if len(self._wait_indices) < _MAX_WAIT_DESCRIPTORS:
+                self._wait_indices[signals] = indices
+
+        from ._wait_many import wait_signal_words
+
+        assert self._local_signal_pad is not None
+        wait_signal_words(self._local_signal_pad, indices, self.timeout_ms)
+        return True
+
     # --- teardown ---------------------------------------------------------------------------
 
     def release(self) -> None:
@@ -887,6 +928,8 @@ class SymmMemPool:
                         "pool was released; freeing without the fence."
                     )
         finally:
+            self._wait_indices.clear()
+            self._local_signal_pad = None
             self._peer_buffers.clear()
             self._handle = None
             self._buf = None
