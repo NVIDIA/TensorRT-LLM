@@ -2409,7 +2409,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # forward (the GDN cache manager's in-forward snapshots); 0 = none.
     inforward_snapshot_rows: int = 0
     periodic_snapshot_capacity: int = 0
-    periodic_snapshot_alignment: int = 64
+    periodic_snapshot_alignment: int = 0
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
     # Deferred KvCache closes of finished generation-only requests (enable_deferred_close);

@@ -9,6 +9,7 @@ import torch
 
 from tensorrt_llm._torch.modules.fla import inforward_snapshot
 from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     mamba_cache_manager_v2 as module,
 )
@@ -23,7 +24,7 @@ def _manager(max_tokens):
         _periodic_snapshot_supports_tp=True,
         _periodic_snapshot_model_support=True,
         _periodic_snapshot_max_tokens=max_tokens,
-        periodic_snapshot_alignment=64,
+        periodic_snapshot_alignment=inforward_snapshot.InforwardSnapshotHost.periodic_snapshot_alignment,
         tokens_per_block=64,
         num_locality_domains=1,
         enable_block_reuse=True,
@@ -57,6 +58,11 @@ def _manager(max_tokens):
         lambda: inforward_snapshot.InforwardSnapshotHost._periodic_snapshot_compatible(manager)
     )
     return manager
+
+
+def test_gdn_declares_the_periodic_snapshot_alignment():
+    assert KVCacheManagerV2.periodic_snapshot_alignment == 0
+    assert inforward_snapshot.InforwardSnapshotHost.periodic_snapshot_alignment == 64
 
 
 @pytest.mark.parametrize("max_tokens, expected_rows", [(1024, 0), (8192, 4)])

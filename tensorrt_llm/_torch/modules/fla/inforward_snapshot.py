@@ -291,6 +291,7 @@ class InforwardSnapshotHost:
     # Whether the model's recurrent layers implement the split; a manager may
     # decide per instance.
     _supports_inforward_snapshot = True
+    periodic_snapshot_alignment = 64
     _periodic_snapshot_requires_staging = True
     _periodic_snapshot_supports_tp = True
     _periodic_snapshot_supports_mixed_decode = True

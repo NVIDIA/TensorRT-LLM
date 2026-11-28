@@ -199,7 +199,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_draft: bool = False,
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
         enable_periodic_snapshots: bool = False,
-        periodic_snapshot_alignment: int = 64,
+        periodic_snapshot_alignment: int | None = None,
         **kwargs,
     ) -> None:
         """See the class docstring."""
@@ -246,7 +246,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._mamba_layer_mask = list(mamba_layer_mask)
         self._periodic_snapshot_model_support = enable_periodic_snapshots
         self._periodic_snapshot_max_tokens = kwargs.get("max_num_tokens") or max_seq_len
-        self.periodic_snapshot_alignment = periodic_snapshot_alignment
+        if periodic_snapshot_alignment is not None:
+            self.periodic_snapshot_alignment = periodic_snapshot_alignment
         self.periodic_snapshot_plan: Dict[int, PeriodicSnapshotReservation] = {}
         self.periodic_snapshot_capacity = 0
         self.periodic_snapshot_requires_consensus = mapping.world_size > 1
