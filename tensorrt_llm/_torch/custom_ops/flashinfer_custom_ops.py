@@ -15,7 +15,7 @@ if IS_FLASHINFER_AVAILABLE:
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
     @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
     def flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-        return silu_and_mul(x, enable_pdl=get_env_enable_pdl())
+        return silu_and_mul(x.contiguous(), enable_pdl=get_env_enable_pdl())
 
     @flashinfer_silu_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
@@ -24,7 +24,7 @@ if IS_FLASHINFER_AVAILABLE:
     @torch.library.custom_op("trtllm::flashinfer_gelu_tanh_and_mul",
                              mutates_args=())
     def flashinfer_gelu_tanh_and_mul(x: torch.Tensor) -> torch.Tensor:
-        return gelu_tanh_and_mul(x, enable_pdl=get_env_enable_pdl())
+        return gelu_tanh_and_mul(x.contiguous(), enable_pdl=get_env_enable_pdl())
 
     @flashinfer_gelu_tanh_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
