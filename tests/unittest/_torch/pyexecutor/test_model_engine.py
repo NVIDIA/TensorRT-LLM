@@ -854,7 +854,7 @@ class ModelEngineTestCase(unittest.TestCase):
 
     def test_breakable_with_local_image_encoder_requires_wrapper_opt_in(self) -> None:
         engine = object.__new__(ModelEngine)
-        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model = torch.nn.Module()
         engine.model.llm = Mock(spec=DecoderModelForCausalLM)
         engine.model.mm_encoder = torch.nn.Identity()
         engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
