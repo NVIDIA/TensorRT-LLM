@@ -35,10 +35,10 @@ namespace tensorrt_llm::batch_manager
 class ContextTransferCoordinator::Impl
 {
 public:
-    explicit Impl(std::shared_ptr<CacheTransceiverComm> comm)
+    explicit Impl(std::shared_ptr<CacheTransceiverComm> comm, bool timeoutIsFailure)
         : mComm(std::move(comm))
         , mCoordinatorRank(0)
-        , mReducer(mComm ? mComm->getSize() : 1)
+        , mReducer(mComm ? mComm->getSize() : 1, timeoutIsFailure)
     {
         TLLM_CHECK_WITH_INFO(mComm != nullptr, "Context-transfer coordination requires a communicator.");
         TLLM_CHECK_WITH_INFO(mComm->isMpi(), "Asynchronous context-transfer coordination requires MPI.");
@@ -366,8 +366,9 @@ private:
     bool mCloseAcknowledged{false};
 };
 
-ContextTransferCoordinator::ContextTransferCoordinator(std::shared_ptr<CacheTransceiverComm> comm)
-    : mImpl(std::make_unique<Impl>(std::move(comm)))
+ContextTransferCoordinator::ContextTransferCoordinator(
+    std::shared_ptr<CacheTransceiverComm> comm, bool timeoutIsFailure)
+    : mImpl(std::make_unique<Impl>(std::move(comm), timeoutIsFailure))
 {
 }
 

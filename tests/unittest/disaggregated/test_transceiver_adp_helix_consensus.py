@@ -38,6 +38,8 @@ def _transceiver(mapping, dist) -> KvCacheTransceiverV2:
     tc = object.__new__(KvCacheTransceiverV2)
     tc._mapping = mapping
     tc._dist = dist
+    tc._recv_reqs = {}
+    tc._send_reqs = {}
     tc._init_sync_policy()
     return tc
 
@@ -152,7 +154,7 @@ def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_
             pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
             # Peer CP rank: rid 9 cancelled and already retirable there; nothing
             # write-verified (payload = cancelled, failed, completed, retirable, verified).
-            cp_allgather=lambda payload: [payload, [[9], [], [], [9], []]],
+            cp_allgather=lambda payload: [payload, [[9], [], [], [9], [], []]],
         )
         tc = _transceiver(
             _mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist
@@ -160,11 +162,11 @@ def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_
         tc._recv_sessions = {9: session}
         return tc._gen_consensus_outcome([9], local_cancelled, [], [], [])
 
-    assert run(local_drained=False, local_cancelled=[9]) == ([], [], [], set())
-    assert run(local_drained=True, local_cancelled=[9]) == ([9], [], [], set())
+    assert run(local_drained=False, local_cancelled=[9]) == ([], [], [], set(), set())
+    assert run(local_drained=True, local_cancelled=[9]) == ([9], [], [], set(), set())
     # A cancellation observed only on the CP peer still reaches this rank, which
     # proves the outcome went through the CP gather rather than local state.
-    assert run(local_drained=True, local_cancelled=[]) == ([9], [], [], set())
+    assert run(local_drained=True, local_cancelled=[]) == ([9], [], [], set(), set())
 
 
 def test_kv_size_rank_factor_is_the_tp_scale() -> None:

@@ -132,27 +132,6 @@ std::chrono::milliseconds getTransferFutureWaitInterval(
     return std::chrono::milliseconds(std::max(1, waitMs));
 }
 
-enum class TransferConsensusState : std::uint64_t
-{
-    kCompleted = 1,
-    kFailed = 2,
-    kTimedOut = 3,
-};
-
-struct TransferStateCounts
-{
-    int completedCount{0};
-    int failedCount{0};
-    int timedOutCount{0};
-};
-
-struct TransferConsensusOutcome
-{
-    std::unordered_set<RequestIdType> completedRequestIds;
-    std::unordered_set<RequestIdType> failedRequestIds;
-    std::unordered_set<RequestIdType> timedOutRequestIds;
-};
-
 template <typename CancelFn>
 bool requestCancellationNoThrow(RequestIdType requestId, char const* transferKind, CancelFn&& cancelFn) noexcept
 {
@@ -227,7 +206,8 @@ std::vector<std::uint64_t> gatherPackedTransferStates(
 TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverComm> const& comm,
     std::unordered_set<RequestIdType> const& completedRequestIds,
     std::unordered_set<RequestIdType> const& failedRequestIds,
-    std::unordered_set<RequestIdType> const& timedOutRequestIds)
+    std::unordered_set<RequestIdType> const& timedOutRequestIds, bool const timeoutIsFailure,
+    std::unordered_set<RequestIdType> const& cancelledRequestIds = {})
 {
     std::vector<std::uint64_t> localStates;
     localStates.reserve((completedRequestIds.size() + failedRequestIds.size() + timedOutRequestIds.size()) * 2);
@@ -240,7 +220,9 @@ TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverCo
     }
     for (auto const requestId : failedRequestIds)
     {
-        appendPackedTransferState(localStates, requestId, TransferConsensusState::kFailed);
+        appendPackedTransferState(localStates, requestId,
+            cancelledRequestIds.count(requestId) ? TransferConsensusState::kCancelled
+                                                 : TransferConsensusState::kFailed);
     }
     for (auto const requestId : timedOutRequestIds)
     {
@@ -251,54 +233,19 @@ TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverCo
     auto const gatheredStates
         = ((comm != nullptr) && syncSize > 1) ? gatherPackedTransferStates(comm, localStates) : std::move(localStates);
 
-    constexpr size_t kPackedStateFields = 2;
-    TLLM_CHECK_WITH_INFO(gatheredStates.size() % kPackedStateFields == 0,
-        "Packed transfer state consensus payload must contain request/state pairs.");
-
-    std::unordered_map<RequestIdType, TransferStateCounts> stateCounts;
-    for (size_t idx = 0; idx < gatheredStates.size(); idx += kPackedStateFields)
-    {
-        auto const requestId = gatheredStates.at(idx);
-        auto const state = static_cast<TransferConsensusState>(gatheredStates.at(idx + 1));
-        auto& counts = stateCounts[requestId];
-        switch (state)
-        {
-        case TransferConsensusState::kCompleted: counts.completedCount++; break;
-        case TransferConsensusState::kFailed: counts.failedCount++; break;
-        case TransferConsensusState::kTimedOut: counts.timedOutCount++; break;
-        }
-    }
-
-    TransferConsensusOutcome outcome;
-    for (auto const& [requestId, counts] : stateCounts)
-    {
-        auto const terminalCount = counts.completedCount + counts.failedCount;
-        if (counts.timedOutCount > 0)
-        {
-            outcome.timedOutRequestIds.insert(requestId);
-        }
-        if (terminalCount == syncSize && (counts.failedCount > 0 || counts.timedOutCount > 0))
-        {
-            outcome.failedRequestIds.insert(requestId);
-        }
-        else if (counts.completedCount == syncSize)
-        {
-            outcome.completedRequestIds.insert(requestId);
-        }
-    }
-    return outcome;
+    return reducePackedTransferStates(gatheredStates, syncSize, timeoutIsFailure);
 }
 
 TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverComm> const& firstComm,
     std::shared_ptr<CacheTransceiverComm> const& secondComm,
     std::unordered_set<RequestIdType> const& completedRequestIds,
     std::unordered_set<RequestIdType> const& failedRequestIds,
-    std::unordered_set<RequestIdType> const& timedOutRequestIds)
+    std::unordered_set<RequestIdType> const& timedOutRequestIds, bool const timeoutIsFailure)
 {
     auto const firstOutcome
-        = reduceTransferStates(firstComm, completedRequestIds, failedRequestIds, timedOutRequestIds);
-    return reduceTransferStates(
-        secondComm, firstOutcome.completedRequestIds, firstOutcome.failedRequestIds, firstOutcome.timedOutRequestIds);
+        = reduceTransferStates(firstComm, completedRequestIds, failedRequestIds, timedOutRequestIds, timeoutIsFailure);
+    return reduceTransferStates(secondComm, firstOutcome.completedRequestIds, firstOutcome.failedRequestIds,
+        firstOutcome.timedOutRequestIds, timeoutIsFailure);
 }
 
 void recordLocalTransferOutcome(RequestIdType requestId, std::shared_ptr<LlmRequest> request, bool failed,
@@ -460,7 +407,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
 
     // Calibrate steady_clock across ranks so that cross-node allgather
-    // in batchUpdateKVCacheTransferBW can compare time points.
+    // in batchGenTransferSummary can compare time points.
     // globalSteadyClockOffset() reads a single process-global copy shared with
     // the nanobind module, so if the Python runtime already calibrated the offset
     // (PyExecutor::_set_global_steady_clock_offset) it is visible here and we skip;
@@ -722,7 +669,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     if (worldConfig.getPipelineParallelism() > 1 && useMPI())
     {
         TLLM_CHECK(mGroupPipeParaComm != nullptr);
-        constexpr std::uint64_t kCoordinatorProtocolVersion = 1;
+        constexpr std::uint64_t kCoordinatorProtocolVersion = 2;
         std::uint64_t const localVersion = coordinatorTopologyEligible ? kCoordinatorProtocolVersion : 0;
         bool const cancellationEnabled = common::getEnvDisaggEnableInflightCancel();
         std::uint64_t const localProtocolMode = (localVersion << 1) | static_cast<std::uint64_t>(cancellationEnabled);
@@ -733,7 +680,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             "Context-transfer consensus protocol version or cancellation mode differs across PP ranks.");
         if (localVersion != 0)
         {
-            mContextTransferCoordinator = std::make_unique<ContextTransferCoordinator>(mGroupPipeParaComm);
+            mContextTransferCoordinator
+                = std::make_unique<ContextTransferCoordinator>(mGroupPipeParaComm, cancellationEnabled);
             TLLM_LOG_INFO(
                 "Enable asynchronous context-transfer consensus version %llu for PP group of size %d; in-flight "
                 "cancellation=%s.",
@@ -934,6 +882,7 @@ void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequ
             requestId, contextRequestId);
         return;
     }
+    llmRequest->setKvCacheTransferLocalSize(llmRequest->getKvCacheSize());
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 }
 
@@ -988,7 +937,7 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     return retData;
 }
 
-void batchUpdateKVCacheTransferBW(
+std::vector<executor::DisServingRequestStats> batchGenTransferSummary(
     std::shared_ptr<CacheTransceiverComm> const& comm, std::vector<LlmRequest*> const& requests)
 {
     // Key-based merge: each rank serializes (requestId, start, end, size)
@@ -1080,18 +1029,20 @@ void batchUpdateKVCacheTransferBW(
         }
     }
 
-    // --- Step 4: Update local requests ---
+    std::vector<executor::DisServingRequestStats> summary;
+    summary.reserve(requests.size());
     for (auto* req : requests)
     {
         auto reqId = req->getContextPhaseParams().value().getReqId();
-        auto it = merged.find(reqId);
-        if (it != merged.end())
-        {
-            req->setKvCacheTransferStart(it->second.minStart);
-            req->setKvCacheTransferEnd(it->second.maxEnd);
-            req->setKvCacheSize(it->second.totalSize);
-        }
+        auto const& entry = merged.at(reqId);
+        req->setKvCacheTransferLocalDuration(req->getKvCacheTransferTimeMS() / 1000.0);
+        req->setKvCacheTransferStart(entry.minStart);
+        req->setKvCacheTransferEnd(entry.maxEnd);
+        req->setKvCacheSize(entry.totalSize);
+        auto const ms = std::chrono::duration<double, std::milli>(entry.maxEnd - entry.minStart).count();
+        summary.push_back({ms, entry.totalSize});
     }
+    return summary;
 }
 
 RequestStatuses CacheTransceiver::checkContextTransferStatus(
@@ -1169,7 +1120,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     auto recordTimeout = [&](RequestIdType const requestId)
     {
         bool const inserted = mTimedOutSenderIds.insert(requestId).second;
-        if (inserted && inflightCancelEnabled && mContextTransferCoordinator)
+        if (inserted && mContextTransferCoordinator)
         {
             mContextTransferCoordinator->publishTimeout(requestId);
         }
@@ -1215,13 +1166,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             bool failed = false;
             try
             {
+                if (blockAll)
+                {
+                    future.wait();
+                }
                 auto const status = blockAll ? std::future_status::ready : future.wait_for(futureWaitInterval);
                 if (status == std::future_status::ready)
                 {
-                    future.get();
-                    if (kvTransferTimeoutMs.has_value())
+                    auto const transferEnd = request->getKvCacheTransferEnd();
+                    if (kvTransferTimeoutMs.has_value() && transferEnd != LlmRequest::TimePoint{})
                     {
-                        auto const elapsedMs = getTransferElapsedMs(request, request->getKvCacheTransferEnd());
+                        auto const elapsedMs = getTransferElapsedMs(request, transferEnd);
                         if (elapsedMs > kvTransferTimeoutMs.value() && recordTimeout(requestId))
                         {
                             TLLM_LOG_WARNING(
@@ -1231,6 +1186,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                                 inflightCancelEnabled ? "failing request" : "observe-only");
                         }
                     }
+                    future.get();
                     failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
                     terminal = true;
                 }
@@ -1305,6 +1261,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             && consensusOutcome.completedRequestIds.size() + consensusOutcome.failedRequestIds.size()
                 < mSenderRequestsAwaitingConsensus.size());
 
+        mTimedOutSenderIds.insert(
+            consensusOutcome.timedOutRequestIds.begin(), consensusOutcome.timedOutRequestIds.end());
         if (inflightCancelEnabled)
         {
             // A timeout update is transmitted once, but cancellation may be declined transiently. Keep the globally
@@ -1315,7 +1273,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     else
     {
         consensusOutcome = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds,
-            mFailedSenderRequestIds, inflightCancelEnabled ? mTimedOutSenderIds : std::unordered_set<RequestIdType>{});
+            mFailedSenderRequestIds, mTimedOutSenderIds, inflightCancelEnabled);
     }
     if (inflightCancelEnabled)
     {
@@ -1350,6 +1308,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             continue;
         }
+        if (mTimedOutSenderIds.count(requestId) || consensusOutcome.timedOutRequestIds.count(requestId))
+        {
+            requestIt->second->setKvCacheTransferTimedOut();
+        }
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         requestsStatus.errorRequestIds.insert(requestId);
         mTimedOutSenderIds.erase(requestId);
@@ -1363,6 +1325,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         if (requestIt == mSenderRequestsAwaitingConsensus.end())
         {
             continue;
+        }
+        if (mTimedOutSenderIds.count(requestId) || consensusOutcome.timedOutRequestIds.count(requestId))
+        {
+            requestIt->second->setKvCacheTransferTimedOut();
         }
         requestsStatus.completedRequestIds.insert(requestId);
         if (markComplete)
@@ -1505,13 +1471,17 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             try
             {
+                if (blockAll)
+                {
+                    it->second.wait();
+                }
                 auto const status = blockAll ? std::future_status::ready : it->second.wait_for(futureWaitInterval);
                 if (status == std::future_status::ready)
                 {
-                    it->second.get();
-                    if (kvTransferTimeoutMs.has_value())
+                    auto const transferEnd = request->getKvCacheTransferEnd();
+                    if (kvTransferTimeoutMs.has_value() && transferEnd != LlmRequest::TimePoint{})
                     {
-                        auto const elapsedMs = getTransferElapsedMs(request, request->getKvCacheTransferEnd());
+                        auto const elapsedMs = getTransferElapsedMs(request, transferEnd);
                         if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(requestId).second)
                         {
                             TLLM_LOG_WARNING(
@@ -1521,6 +1491,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                                 inflightCancelEnabled ? "failing request" : "observe-only");
                         }
                     }
+                    it->second.get();
                     recordLocalTransferOutcome(requestId, request, /*failed=*/false, mCompletedRequesterRequestIds,
                         mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
                 }
@@ -1574,9 +1545,16 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
 
     // Publish after local polling and before collectives, which may be the point at which a rank hangs.
     publishStatusSnapshot();
-    auto const consensusOutcome
-        = reduceTransferStates(syncComm, mCompletedRequesterRequestIds, mFailedRequesterRequestIds,
-            inflightCancelEnabled ? mTimedOutRequesterIds : std::unordered_set<RequestIdType>{});
+    std::unordered_set<RequestIdType> cancelledRequestIds;
+    for (auto const requestId : mFailedRequesterRequestIds)
+    {
+        if (mRequesterRequestsAwaitingConsensus.at(requestId)->getKvCacheTransferCancelled())
+        {
+            cancelledRequestIds.insert(requestId);
+        }
+    }
+    auto const consensusOutcome = reduceTransferStates(syncComm, mCompletedRequesterRequestIds,
+        mFailedRequesterRequestIds, mTimedOutRequesterIds, inflightCancelEnabled, cancelledRequestIds);
     if (inflightCancelEnabled)
     {
         for (auto const requestId : consensusOutcome.timedOutRequestIds)
@@ -1608,6 +1586,14 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             continue;
         }
+        if (consensusOutcome.timedOutRequestIds.count(requestId))
+        {
+            requestIt->second->setKvCacheTransferTimedOut();
+        }
+        else if (consensusOutcome.backendFailedRequestIds.count(requestId))
+        {
+            requestIt->second->markKvCacheTransferFailed();
+        }
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         mTimedOutRequesterIds.erase(requestId);
         mCancelRequestedRequesterIds.erase(requestId);
@@ -1625,6 +1611,11 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             continue;
         }
+        if (consensusOutcome.timedOutRequestIds.count(requestId))
+        {
+            requestIt->second->setKvCacheTransferTimedOut();
+        }
+        requestIt->second->setKvCacheTransferLocalSize(requestIt->second->getKvCacheSize());
         requestIt->second->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
         completedRequests.push_back(requestIt->second.get());
         mTimedOutRequesterIds.erase(requestId);
@@ -1638,12 +1629,12 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     // the gen-side transfer summary CSV.
     if (!completedRequests.empty() && !common::getEnvKVCacheTimeOutputPath().empty())
     {
-        batchUpdateKVCacheTransferBW(syncComm, completedRequests);
-        writeGenTransferSummary(completedRequests);
+        writeGenTransferSummary(completedRequests, batchGenTransferSummary(syncComm, completedRequests));
     }
 }
 
-void CacheTransceiver::writeGenTransferSummary(std::vector<LlmRequest*> const& completedRequests)
+void CacheTransceiver::writeGenTransferSummary(
+    std::vector<LlmRequest*> const& completedRequests, std::vector<executor::DisServingRequestStats> const& summary)
 {
     std::lock_guard<std::mutex> lock(mGenTransferSummaryMutex);
     if (!mGenTransferSummaryFile.is_open())
@@ -1658,10 +1649,11 @@ void CacheTransceiver::writeGenTransferSummary(std::vector<LlmRequest*> const& c
             filePath.string().c_str());
         mGenTransferSummaryFile << "RequestID,gen_side_transfer_time(ms),kv_cache_size" << '\n';
     }
-    for (auto* req : completedRequests)
+    for (size_t i = 0; i < completedRequests.size(); ++i)
     {
+        auto* req = completedRequests[i];
         auto reqId = req->getContextPhaseParams().value().getReqId();
-        mGenTransferSummaryFile << reqId << "," << req->getKvCacheTransferTimeMS() << "," << req->getKvCacheSize()
+        mGenTransferSummaryFile << reqId << "," << summary[i].kvCacheTransferMS << "," << summary[i].kvCacheSize
                                 << '\n';
     }
     mGenTransferSummaryFile << std::flush;
@@ -1687,11 +1679,28 @@ bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
     }
     if (llmRequest->isContextOnlyRequest())
     {
-        return mCacheSender->cancelRequest(*llmRequest);
+        if (mCacheSender->cancelRequest(*llmRequest))
+        {
+            llmRequest->markKvCacheTransferCancelled();
+            return true;
+        }
     }
     else if (llmRequest->isGenerationOnlyRequest())
     {
-        return mCacheReceiver->cancelRequest(*llmRequest);
+        auto const requestId = llmRequest->mRequestId;
+        auto const future = std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
+            [requestId](auto const& entry) { return entry.first->mRequestId == requestId; });
+        if (mRequesterRequestsAwaitingConsensus.count(requestId)
+            || (future != mRequesterFutures.end()
+                && future->second.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready))
+        {
+            return false;
+        }
+        if (mCacheReceiver->cancelRequest(*llmRequest))
+        {
+            llmRequest->markKvCacheTransferCancelled();
+            return true;
+        }
     }
     return false;
 }

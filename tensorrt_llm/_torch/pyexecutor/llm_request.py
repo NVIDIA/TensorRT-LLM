@@ -4,7 +4,7 @@
 
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional,
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Optional,
                     Sequence, Union, cast)
 
 import numpy as np
@@ -1088,6 +1088,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        # A transfer outcome ("timeout" or "error") that a session committed
+        # or the ranks' outcome vote agreed. It drives outcome accounting only,
+        # never transfer cleanup.
+        self.py_kv_transfer_committed_cause: Optional[Literal["timeout",
+                                                              "error"]] = None
         # Set once a received generation request's first token is found not
         # to end it, so the executor does not recheck it while it waits.
         self.py_first_token_checked = False

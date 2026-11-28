@@ -525,15 +525,31 @@ def test_attention_dp_idle_wait_exchanges_before_parking(executor, clock):
     assert executor._plan_idle_heartbeat_wait(poll) == (poll, None)
 
 
-def test_attention_dp_idle_wait_parks_once_peer_rows_are_current(executor):
+def test_attention_dp_idle_wait_parks_once_peer_rows_are_current(executor, clock):
     executor.enable_attention_dp = True
     adp_stats = executor._adp_iter_stats
     adp_stats.last_finalize_settled = True
     adp_stats.last_idle_rank_states = [object(), object()]
     assert executor._plan_idle_heartbeat_wait(None) == (None, executor._idle_heartbeat_tick)
 
+    adp_stats.next_payload = lambda: SimpleNamespace(
+        has_iter_stats=0, kv_transfer_outcomes=(1, 0, 0)
+    )
+    assert executor._plan_idle_heartbeat_wait(None) == (None, executor._idle_heartbeat_tick)
+
+    executor._next_adp_activity_refresh = clock.value + 599
+    assert executor._plan_idle_heartbeat_wait(None) == (
+        datetime.timedelta(seconds=599),
+        executor._idle_heartbeat_tick,
+    )
+    clock.value += 599
+    assert executor._plan_idle_heartbeat_wait(None) == (
+        datetime.timedelta(0),
+        executor._idle_heartbeat_tick,
+    )
+
     # Snapshots still queued behind the fanned-out one drain one per pass.
-    adp_stats.next_payload = lambda: object()
+    adp_stats.next_payload = lambda: SimpleNamespace(has_iter_stats=1)
     assert executor._plan_idle_heartbeat_wait(None) == (datetime.timedelta(0), None)
     # Ranks that are not aligned settle nothing: wait instead of spinning.
     adp_stats.last_finalize_settled = False
@@ -593,6 +609,7 @@ def _attention_dp_rank(rank, clock):
         "_append_queue_snapshot",
         "_export_adp_fanout",
         "_publish_adp_iter_stats",
+        "_publish_rank_observations",
         "_idle_heartbeat_tick",
         "_plan_idle_heartbeat_wait",
     )
@@ -751,7 +768,12 @@ def _fetch_stub(**overrides):
     )
     for name, value in overrides.items():
         setattr(stub, name, value)
-    _bind(stub, "_plan_idle_heartbeat_wait")
+    _bind(
+        stub,
+        "_plan_idle_heartbeat_wait",
+        "_publish_rank_observations",
+        "_has_pending_context_retirement",
+    )
     return stub
 
 
@@ -849,6 +871,120 @@ def test_idle_fetch_parks_with_local_heartbeats(clock, attention_dp):
         None, wait_for_batch=True, idle_tick=stub._idle_heartbeat_tick
     )
     stub.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=True)
+
+
+@pytest.mark.parametrize("poll_seconds", [None, 1.0, 0.25])
+def test_idle_fetch_publishes_rank_observations_before_wait(clock, poll_seconds):
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    activity = ConversationActivityStats(0, 1, 0, 0, 1, 0, 0, 0)
+    manager = (
+        Mock(
+            snapshot_activity=Mock(return_value=activity),
+            next_refresh=Mock(return_value=float("inf")),
+        )
+        if poll_seconds
+        else None
+    )
+    poll = datetime.timedelta(seconds=poll_seconds) if poll_seconds else None
+    stub = _fetch_stub(
+        enable_attention_dp=False,
+        stats=[],
+        stats_lock=threading.Lock(),
+        max_stats_len=2,
+        _last_rank_observations={},
+        _pending_rank_observations={},
+        _disagg_coordinator=SimpleNamespace(transfer_outcomes=(0, 1, 0)),
+        _idle_kv_transfer_poll_timeout=lambda: poll,
+        _conversation_activity=manager,
+        _conversation_activity_refresh=float("inf"),
+        _conversation_activity_capture_time=float("-inf"),
+        _conversation_activity_cached=None,
+    )
+    _bind(stub, "_snapshot_transfer_outcomes", "_snapshot_conversation_activity")
+    row = {"attentionDpRank": 0, "kvTransferOutcomes": {"success": 0, "error": 1, "timeout": 0}}
+    kwargs = {"wait_for_batch": True, "idle_tick": stub._idle_heartbeat_tick}
+    if manager is not None:
+        row["conversationActivity"] = activity.to_dict()
+
+    def fetch(timeout, **options):
+        assert (timeout, options) == (poll, kwargs)
+        assert PyExecutor.get_latest_iteration_stats(stub) == []
+        existing = {
+            "attentionDpRank": 0,
+            "iter": 3,
+            "inflightBatchingStats": {},
+            "iterLatencyMS": 2,
+        }
+        stub.stats.append(json.dumps(existing))
+        assert PyExecutor.get_latest_iteration_stats(stub) == [("per_rank_dict", existing | row)]
+        return []
+
+    stub.executor_request_queue.get_from_request_queue.side_effect = fetch
+    PyExecutor._fetch_and_enqueue_requests(stub, _WaitingQueue(), 0)
+    stub._publish_rank_observations()
+    assert not stub._pending_rank_observations
+    if manager is not None:
+        manager.snapshot_activity.assert_called_once_with(clock.value)
+    stub.enable_iter_perf_stats = False
+    stub._disagg_coordinator.transfer_outcomes = (0, 2, 0)
+    stub._publish_rank_observations()
+    assert not stub._pending_rank_observations
+
+
+@pytest.mark.parametrize("payload_kind", ["idle", "queued", "synthetic"])
+@pytest.mark.parametrize(("refresh_ms", "idle_wait_s"), [(2300, 2.3), (5, 1.0)])
+def test_adp_exchange_publishes_current_peer_observations(
+    clock, payload_kind, refresh_ms, idle_wait_s
+):
+    from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
+
+    rank0, rank1 = (_attention_dp_rank(rank, clock) for rank in (0, 1))
+    rank0._last_rank_observations = {}
+    rank0._pending_rank_observations = {}
+    rank0.max_stats_len = 0
+    rank0.stats.append(json.dumps({"attentionDpRank": 1, "iter": 3, "inflightBatchingStats": {}}))
+    activity = ConversationActivityStats(1, 1, 0, 0, 2, 0, 0, 0, refresh_after_ms=refresh_ms)
+    outcomes = Mock(return_value=(0, 0, 0))
+    rank1._adp_iter_stats = ADPIterStatsBuffer(
+        activity_snapshot=lambda: activity, transfer_outcomes_snapshot=outcomes
+    )
+    if payload_kind == "queued":
+        rank1._adp_iter_stats.queue(rank1.make_stats(), is_rank0=False)
+    elif payload_kind == "synthetic":
+        rank1._adp_iter_stats._ensure_zero_payload(rank1.iter_counter)
+
+    def exchange():
+        peer = RankState(rank=1, iter_stats=rank1._adp_iter_stats.payload_for_exchange())
+        for executor in (rank0, rank1):
+            executor._publish_adp_iter_stats(
+                [RankState(rank=0), RankState.deserialize(peer.serialize())],
+                idle_wait_follows=False,
+            )
+        assert rank1.stats == []
+
+    for count in (1, 2):
+        outcomes.return_value = (0, count, 0)
+        exchange()
+    assert rank0._next_adp_activity_refresh == pytest.approx(clock.value + idle_wait_s)
+    assert PyExecutor.get_latest_iteration_stats(rank0) == [
+        (
+            "per_rank_dict",
+            {
+                "attentionDpRank": 1,
+                "iter": 3,
+                "inflightBatchingStats": {},
+                "kvTransferOutcomes": {"success": 0, "error": 2, "timeout": 0},
+                "conversationActivity": activity.to_dict(),
+            },
+        ),
+    ]
+    exchange()
+    assert not PyExecutor.get_latest_iteration_stats(rank0)
 
 
 @pytest.mark.parametrize(

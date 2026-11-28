@@ -892,6 +892,12 @@ def launchReleaseCheck(pipeline, globalVars)
                     "*/3rdparty/*",
                     "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
                     "*/examples/scaffolding/contrib/mcp/weather/weather.py",
+                    // Grafana's log datasource identifier and the config key that names it.
+                    "*/examples/serve/grafana/README.md",
+                    "*/examples/serve/grafana/dashboard.py",
+                    "*/examples/serve/grafana/example.config.json",
+                    "*/examples/serve/grafana/templates/logs.json",
+                    "*/tests/unittest/metrics/test_grafana_dashboard.py",
                     "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz",
                     "*/triton_kernels/*.py"
                 ]

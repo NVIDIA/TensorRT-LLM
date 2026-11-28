@@ -20,6 +20,10 @@ from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    CtxTransferStatus,
+    GenTransferStatus,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import Receiver
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -133,20 +137,72 @@ def test_send_skips_requests_that_must_not_send() -> None:
 # -- reaping context sends ---------------------------------------------------
 
 
-def test_completed_send_releases_blocks_and_terminates_a_departed_request() -> None:
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "local_cancel",
+        "legacy_peer_cancel",
+        "owned_peer_cancel",
+        "peer_cancel_with_backend_failure",
+        "backend_error",
+        "native_timeout",
+    ],
+)
+def test_settled_send_releases_blocks_and_terminates_a_departed_request(outcome) -> None:
     """A request already out of active_requests (PP>1 early path) terminates
-    exactly once when its send completes."""
+    exactly once when its send settles."""
     h = _Harness()
     req = _Request(1)
     h.send(req)
-    h.transceiver.finish_send(req)
+    if outcome == "local_cancel":
+        h.coordinator._context_cancellation_drains.add(req.py_request_id)
+        h.transceiver.finish_send(req, outcome="error")
+    elif outcome == "success":
+        h.transceiver.finish_send(req)
+    elif outcome in ("backend_error", "native_timeout"):
+        h.registry.canceled = [req.py_request_id]
+        req.kv_cache_transfer_timed_out = outcome == "native_timeout"
+        h.transceiver.finish_send(req, outcome="error")
+    else:
+        errors = [req.py_request_id] if outcome == "owned_peer_cancel" else []
+        h.transceiver.check_context_transfer_status = Mock(
+            return_value=CtxTransferStatus(
+                [],
+                errors,
+                (req.py_request_id,),
+                (req.py_request_id,) if outcome == "peer_cancel_with_backend_failure" else (),
+            )
+        )
 
     h.coordinator.reap_context_sends(0)
 
+    assert h.coordinator.transfer_outcomes == (
+        int(outcome == "success"),
+        int(outcome in ("backend_error", "peer_cancel_with_backend_failure")),
+        int(outcome == "native_timeout"),
+    )
     assert not h.in_transfer(req)
     h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
     assert h.effects.terminated == [req]
     assert h.effects.staged_responses == []
+
+
+@pytest.mark.parametrize("polled_before_completion", [False, True])
+def test_native_send_completion_preserves_observed_deadline(polled_before_completion) -> None:
+    h = _Harness()
+    req = _Request(1)
+    h.send(req)
+    req.py_kv_transfer_start_time = 0.0
+    if polled_before_completion:
+        h.coordinator._flag_transfer_timeout(req, "context", 10, current_time=0.011)
+    req.kv_cache_transfer_timed_out = True
+    h.transceiver.finish_send(req)
+    h.coordinator.reap_context_sends()
+
+    assert h.coordinator.transfer_outcomes == (0, 0, 1)
+    assert not h.in_transfer(req)
+    assert h.effects.terminated == [req]
 
 
 def test_fast_completion_of_an_active_request_stages_its_response_first() -> None:
@@ -275,6 +331,53 @@ def test_send_completion_does_not_release_a_claim_the_connector_still_holds() ->
     assert h.effects.terminated == [req]
 
 
+@pytest.mark.parametrize(
+    "observed_during_receive", [False, True], ids=["clean-cancel", "observed-deadline"]
+)
+def test_connector_save_after_a_cancelled_receive_has_no_transfer_deadline(
+    clock, observed_during_receive: bool
+) -> None:
+    """Only the receive's own deadline counts; connector save time after a cancel does not."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    req = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        is_disagg_generation_transmission_in_progress=True,
+        py_kv_transfer_start_time=clock["t"],
+    )
+    h.active.append(req)
+    if observed_during_receive:
+        clock["t"] += 1.5
+        h.coordinator.check_transfer_timeouts()
+        assert req.py_kv_transfer_timed_out
+    # A client abort finishes the request: the executor's cancellation path counts
+    # an observed timeout and clears the flag, but the receive clock stays set.
+    req.py_kv_transfer_timed_out = False
+    req.is_disagg_generation_transmission_in_progress = False
+    req.is_finished = req.is_finished_due_to_cancellation = True
+    h.active.remove(req)
+    h.transfers.start_transfer(req)  # The KV connector accepts an asynchronous save.
+
+    clock["t"] += 10.0
+    for _ in range(2):
+        h.coordinator.check_transfer_timeouts()
+        h.coordinator.reap_context_sends(0)
+
+    assert h.coordinator.transfer_outcomes == ((0, 0, 1) if observed_during_receive else (0, 0, 0))
+    assert not req.py_kv_transfer_timed_out
+    assert h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    # A late outcome vote can still flag the retired receive; the save's claim stays.
+    req.py_kv_transfer_timed_out = True
+    h.coordinator.reap_context_sends(0)
+    assert h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    h.coordinator.release_transfer(req)  # The connector reports the save.
+    assert not h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
+
+
 def test_legacy_timeout_cancels_and_releases_a_queued_send(clock) -> None:
     """Without in-flight cancellation a timed-out send that the transceiver can
     cancel is released from the manager at once."""
@@ -332,6 +435,7 @@ def test_remote_cancellation_of_a_receive_fails_the_request_unless_the_user_canc
 
     h.coordinator.reap_gen_receives(0)
 
+    assert h.coordinator.transfer_outcomes == (0, 1, 0)
     assert remote.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert user.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
     assert h.effects.failed == [
@@ -579,10 +683,18 @@ def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
         state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
     )
 
+    h.registry.canceled = [cancelled.py_request_id, completed_late.py_request_id]
+    for request in (cancelled, completed_late):
+        request.py_kv_transfer_start_time = 1.0
+        h.coordinator._flag_transfer_timeout(request, "generation", 1000, current_time=2.5)
+    assert h.coordinator.transfer_outcomes == (0, 0, 2)
     h.coordinator.fail_timed_out([cancelled, completed_late])
 
     assert cancelled.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert completed_late.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    h.active.append(completed_late)
+    h.coordinator.reap_gen_receives()
+    assert h.coordinator.transfer_outcomes == (0, 0, 2)
     assert h.effects.failed == [
         ("Request 1 timed out", [cancelled], False),
         ("Request 2 timed out", [completed_late], False),
@@ -637,6 +749,7 @@ def test_receive_admission_fence_only_fails_the_unpublished_request(
         is_context_only_request=False,
         set_kv_cache_transfer_start=Mock(),
         set_kv_cache_size=Mock(),
+        set_kv_cache_transfer_local_size=Mock(),
     )
     h.active.extend((rejected, allowed))
     sender = Mock(_agent_failed=False, _shutdown_requested=False, _admission_lock=threading.Lock())
@@ -749,7 +862,7 @@ def test_timed_out_receive_is_cancelled_once_until_the_request_is_forgotten(
     assert "elapsed 2000ms > kv_transfer_timeout_ms=1000ms" in message
     assert "deadline_owner=executor_request" in message
 
-    h.coordinator.forget_request(1)
+    h.coordinator.forget_request(req)
     h.transceiver.request_and_receive_async(req)
     h.coordinator.poll_gen_transfers()
     assert h.transceiver.call_log.count("cancel_request:1") == 2
@@ -801,11 +914,123 @@ def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_
     h.coordinator.poll_gen_transfers()
     assert h.effects.failed == []
 
+    assert h.coordinator.transfer_outcomes == (0, 0, 0)
+    fail = h.effects.fail_requests
+
+    def fail_after_count(*args, **kwargs):
+        assert h.coordinator.transfer_outcomes == (0, 1, 0)
+        h.active.remove(error_req)
+        fail(*args, **kwargs)
+
+    h.effects.fail_requests = fail_after_count
     h.dist.tp_allreduce.return_value = 1
     h.coordinator.poll_gen_transfers()
+    assert h.coordinator.transfer_outcomes == (0, 1, 0)
     assert h.effects.failed == [
         ("Error in kv cache transfer for generation requests", [error_req], False)
     ]
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected"),
+    [
+        ("timeout", (0, 0, 1)),
+        ("error", (0, 1, 0)),
+        ("native_error", (0, 1, 0)),
+        ("cancel", (0, 0, 0)),
+    ],
+)
+def test_receive_outcome_preserves_backend_failure_after_abort(cause, expected) -> None:
+    h = _Harness()
+    req = _receiving(h, 1, started_at=0.0)
+    h.coordinator._started_gen_receives[1] = req
+    h.registry.canceled = [1]
+    req.kv_cache_transfer_timed_out = cause == "timeout"
+    req.kv_cache_transfer_failed = cause == "native_error"
+    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    status = GenTransferStatus(
+        [], [1] if cause == "error" else [], [req] if cause == "cancel" else []
+    )
+    h.transceiver.check_gen_transfer_status = Mock(return_value=status)
+
+    h.coordinator.reap_gen_receives()
+    h.coordinator.reap_gen_receives()
+
+    assert h.coordinator.transfer_outcomes == expected
+
+
+@pytest.mark.parametrize(
+    ("local_status", "peer_status", "peer_timed_out", "expected"),
+    [
+        ("error", "completed", False, (0, 1, 0)),
+        ("error", "cancelled", False, (0, 1, 0)),
+        ("cancelled", "error", False, (0, 1, 0)),
+        ("cancelled", "cancelled", False, (0, 0, 0)),
+        ("cancelled", "error", True, (0, 0, 1)),
+    ],
+)
+def test_pp_receive_counts_backend_evidence_during_client_abort(
+    local_status, peer_status, peer_timed_out, expected
+) -> None:
+    h = _Harness(world_size=2, pp_size=2, supports_inflight_cancellation=True)
+    req = _receiving(h, 1, started_at=0.0)
+    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    h.coordinator._started_gen_receives[1] = req
+    h.registry.canceled = [1]
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._gen_need_sync = True
+    transceiver._init_gen_idle_poll(False)
+    transceiver._gen_idle_probe = False
+    transceiver._ever_had_recv_session = True
+    transceiver._pending_rank_info_admissions = None
+    transceiver._rank_info_start_failures = {}
+    transceiver._dist = h.dist
+    local_failed = local_status == "error"
+    session = SimpleNamespace(
+        status=SessionStatus.ERROR if local_failed else SessionStatus.CANCELLED,
+        wait_complete=Mock(return_value=WaitResult.FAILED if local_failed else None),
+        is_completed=lambda: False,
+        has_failed=lambda: local_failed,
+        close=Mock(return_value=True),
+    )
+    transceiver._recv_sessions = {1: session}
+    transceiver._recv_reqs = {1: req}
+    transceiver._poll_rank_info_admissions = lambda _: (list(transceiver._recv_sessions), [])
+    peer = [
+        [1] if peer_status == "cancelled" else [],
+        [1] if peer_status == "error" else [],
+        [1] if peer_status == "completed" else [],
+        [1],
+        [],
+        [1] if peer_timed_out else [],
+    ]
+    transceiver._gen_allgather = lambda local: [local, peer if local[3] else local]
+    h.transceiver.check_gen_transfer_status = transceiver.check_gen_transfer_status
+
+    h.coordinator.reap_gen_receives()
+    h.coordinator.reap_gen_receives()
+
+    assert h.coordinator.transfer_outcomes == expected
+    assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+    session.close.assert_called_once_with()
+    if "cancelled" in (local_status, peer_status):
+        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        assert not h.effects.failed
+
+
+@pytest.mark.parametrize("polled_before_completion", [False, True])
+def test_native_receive_completion_preserves_observed_deadline(polled_before_completion) -> None:
+    h = _Harness()
+    req = _receiving(h, 1, started_at=0.0)
+    h.coordinator._started_gen_receives[1] = req
+    if polled_before_completion:
+        h.coordinator._flag_transfer_timeout(req, "generation", 10, current_time=0.011)
+    req.kv_cache_transfer_timed_out = True
+    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    h.coordinator.reap_gen_receives()
+
+    assert h.coordinator.transfer_outcomes == (0, 0, 1)
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
 
 
 # -- settling cancellations and hangs ----------------------------------------
@@ -838,7 +1063,7 @@ def _executor_cleans_up(h: _Harness, req: _Request) -> None:
     """What the executor's error path does after ``fail_requests``: the request
     leaves active_requests and the coordinator drops its bookkeeping."""
     h.active.remove(req)
-    h.coordinator.forget_request(req.py_request_id)
+    h.coordinator.forget_request(req)
 
 
 def test_refused_cancellation_is_settled_once_after_the_retry_is_accepted(

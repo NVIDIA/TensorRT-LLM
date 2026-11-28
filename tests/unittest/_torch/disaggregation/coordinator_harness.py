@@ -67,6 +67,10 @@ class TransferRequest(SimpleNamespace):
     def is_generation_only_request(self) -> bool:
         return not self.is_context_only_request
 
+    @property
+    def is_disagg_generation_transmission_complete(self) -> bool:
+        return self.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
 
 class CoordinatorHarness:
     """One coordinator with its rank-local collaborators.
@@ -125,6 +129,7 @@ class CoordinatorHarness:
             admission_controller=admission_controller,
             is_kv_manager_v2=is_kv_manager_v2,
             defer_unready_gen_receives=defer_unready_gen_receives,
+            enable_transfer_metrics=True,
         )
 
     def send(self, *requests: TransferRequest) -> None:

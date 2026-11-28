@@ -294,8 +294,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints,
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
-    float maxUtilForResume, Priority coldTierOffloadMinPriority, std::optional<BatchDesc> const& coldTypicalBatch)
-    : mLifeCycles(lifeCycles)
+    float maxUtilForResume, Priority coldTierOffloadMinPriority, std::optional<BatchDesc> const& coldTypicalBatch,
+    bool enableStats)
+    : mEnableStats(enableStats)
+    , mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mColdTierOffloadMinPriority(coldTierOffloadMinPriority)
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
@@ -1472,12 +1474,57 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
     }
 }
 
+void StorageManager::recordMigration(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId lifeCycle, size_t numPages)
+{
+    if (!mEnableStats || srcLevel == dstLevel)
+    {
+        return;
+    }
+    // Restore is attributed to the receiving hotter level; eviction to the departing level.
+    CacheLevel const level = dstLevel < srcLevel ? dstLevel : srcLevel;
+    auto& stats = mMovementStats[{level, getPoolGroupIndex(level, lifeCycle)}];
+    auto& count = dstLevel < srcLevel ? stats.restoredBlocks : stats.evictedBlocks;
+    count += static_cast<int64_t>(numPages);
+}
+
+void StorageManager::recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, bool belowPriorityThreshold)
+{
+    if (!mEnableStats || pages.empty())
+    {
+        return;
+    }
+    // These batches are already grouped by physical pool (or a single lifecycle).
+    auto const level = pages.front()->cacheLevel;
+    auto const poolGroup = getPoolGroupIndex(level, pages.front()->lifeCycle);
+    TLLM_CHECK_DEBUG(std::all_of(pages.begin(), pages.end(),
+        [&](auto const& page)
+        { return page->cacheLevel == level && getPoolGroupIndex(level, page->lifeCycle) == poolGroup; }));
+    auto& stats = mMovementStats[{level, poolGroup}];
+    auto& count = belowPriorityThreshold ? stats.priorityDroppedBlocks : stats.capacityDroppedBlocks;
+    count += static_cast<int64_t>(pages.size());
+}
+
+void StorageManager::recordDroppedPage(Page const& page, bool belowPriorityThreshold)
+{
+    if (!mEnableStats)
+    {
+        return;
+    }
+    auto& stats = mMovementStats[{page.cacheLevel, getPoolGroupIndex(page.cacheLevel, page.lifeCycle)}];
+    auto& count = belowPriorityThreshold ? stats.priorityDroppedBlocks : stats.capacityDroppedBlocks;
+    ++count;
+}
+
 void StorageManager::copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
     SlotId srcSlotId, CUstream stream)
 {
     LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(dstLevel, srcLevel, lifeCycle);
     PageIndexPair const pageIndex{slotIdToPageIndexValue(dstSlotId), slotIdToPageIndexValue(srcSlotId)};
     submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, &pageIndex, 1, stream);
+    if (dstLevel < srcLevel)
+    {
+        recordMigration(dstLevel, srcLevel, batchingLayerGroupId, 1);
+    }
 }
 
 CacheTier StorageManager::cacheTier(CacheLevel level) const
@@ -2057,6 +2104,10 @@ void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotC
                 }
             }
         }
+        for (auto const& pages : evicted)
+        {
+            recordDroppedPages(pages);
+        }
         rescheduleEvictedPagesOnFailure.cancel();
         return;
     }
@@ -2393,6 +2444,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 dropRecorder(ev, lvlId);
             }
+            recordDroppedPages(ev);
             ev.clear();
 
             freeAfterEviction = isFailed ? 0 : freeSlots(pgIdx);
@@ -2436,6 +2488,10 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                     {
                         dropRecorder(pages, fromLevel);
                     }
+                }
+                for (auto const& page : rejected)
+                {
+                    recordDroppedPage(*page);
                 }
                 rejected.clear();
             }
@@ -2515,6 +2571,10 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         for (auto const& pages : belowOffloadThreshold)
             if (!pages.empty())
                 dropRecorder(pages, kHotLevel);
+    for (auto const& pages : belowOffloadThreshold)
+    {
+        recordDroppedPages(pages, true);
+    }
     restoreBelowThreshold.cancel();
 }
 
@@ -2743,6 +2803,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 if (wasScheduled)
                     scheduleForEviction(*srcPages.at(i));
             }
+        }
+        if (updateSrc && !defrag)
+        {
+            recordMigration(dstLevel, srcLevel, batchingLayerGroupId, srcPages.size());
         }
         mDiskCopyCounters.reused += static_cast<uint64_t>(numSlots - numNewSlots);
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::move(dstSlots)};
@@ -2989,7 +3053,13 @@ StorageStatistics StorageManager::getStatistics(
     // evictable pages; available() counts both.
     SlotCount retainedCopies = mNumRetainedCopies.at(level).at(pgIdx);
     auto sizes = lvl.storage->slotSize(pgIdx);
-    return StorageStatistics{sizes, totalSlots, freeSlots, evictable, retainedCopies};
+    auto const it = mMovementStats.find({level, pgIdx});
+    return StorageStatistics{.slotSizes = sizes,
+        .total = totalSlots,
+        .free = freeSlots,
+        .evictable = evictable,
+        .retainedCopies = retainedCopies,
+        .movement = it == mMovementStats.end() ? StorageMovementStatistics{} : it->second};
 }
 
 TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(

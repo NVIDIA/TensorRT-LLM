@@ -403,7 +403,8 @@ def test_unpublished_receive_failure_waits_for_peer_retirement():
 
     def gather(local_vote):
         assert local_vote[3] == local_vote[-2] == [rid]
-        peer_vote = [[], [], [], [rid] if peer_drained else [], [], [], [1]]
+        # cancelled, failed, completed, retirable, verified, timed out, intents, agent ready
+        peer_vote = [[], [], [], [rid] if peer_drained else [], [], [], [], [1]]
         return [local_vote, peer_vote]
 
     node._gen_allgather = gather
@@ -444,10 +445,11 @@ def test_terminal_sets_are_built_once_per_poll(side):
     def vote(*args, **kwargs):
         assert args[6] == list(range(count + 1))
         assert intents.unions <= 1
+        # Both sides also vote timeouts and preserve failures ahead of the intents.
         return (
-            ([], [], [], args[6], set(), {count}, True)
+            ([], [], [], args[6], set(), set(), set(), {count}, True)
             if side == "gen"
-            else ([], [], [], args[6], {count}, True)
+            else ([], [], [], args[6], set(), set(), {count}, True)
         )
 
     node._consensus_outcome = vote

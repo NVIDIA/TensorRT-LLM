@@ -278,7 +278,7 @@ def test_context_retirement_coexists_with_replicated_gen_vote(
     group.run(cancel)
     group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
     for engine, request in zip(engines, requests):
-        assert engine.dist.calls == [("tp_allgather", ([], {}, [], []))] * 2
+        assert engine.dist.calls == [("tp_allgather", ([], {}, [], [], {}))] * 2
         assert not engine.active_requests and not engine.canceled_req_ids
         assert request.is_finished_due_to_cancellation
         assert engine.async_transfer_manager.requests_in_transfer() == {11: request}

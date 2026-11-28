@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -20,6 +21,12 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 pytestmark = pytest.mark.cpu_only
 
 GIB = 2**30
+# The per-pool fields this feature adds; the KV pool-group diagnostics are always printed.
+_POOL_FIELD = re.compile(r"kv_cache_\w+_pool_(?:util|gib) = ")
+
+
+def _has_pool_fields(line: str) -> bool:
+    return _POOL_FIELD.search(line) is not None
 
 
 def _capacity(total, free, evictable, slot_sizes=(GIB,)):
@@ -174,7 +181,7 @@ def test_pool_fields_follow_the_kv_cache_util_refresh(monkeypatch):
         profiler.expose_metrics(_loop(collector, read_kv_cache, kv_refresh_interval=2))
     assert read_kv_cache.call_count == 2
     assert len(lines) == 4
-    assert "pool" not in lines[1] and "pool" not in lines[3]
+    assert not _has_pool_fields(lines[1]) and not _has_pool_fields(lines[3])
     # The first sample also reports pool sizes; the pool fields follow the KV cache fields.
     assert (
         "kv_cache_util = 0.600, kv_reused_blocks = 0, kv_missed_blocks = 0, "
@@ -199,10 +206,10 @@ def test_iteration_stats_snapshots_trigger_one_sample_each(monkeypatch):
     collector.collect_rank({"kvCacheStats": {"maxNumBlocks": 100}}, capture_iter=0)
     profiler.expose_metrics(_loop(collector))
     profiler.expose_metrics(_loop(collector))
-    assert "pool_util" in lines[0] and "pool" not in lines[1]
+    assert "pool_util" in lines[0] and not _has_pool_fields(lines[1])
     # A loop without any KV snapshot has nothing to line up with.
     profiler.expose_metrics(_loop(PerfMetricsCollector()))
-    assert "pool" not in lines[2]
+    assert not _has_pool_fields(lines[2])
 
 
 def test_pools_are_read_with_the_snapshot_not_at_print_time(monkeypatch):
@@ -227,7 +234,7 @@ def test_warmup_snapshot_is_not_sampled_after_warmup(monkeypatch):
     profiler.expose_metrics(_loop(collector, _kv_stats))
     executor.is_warmup = False
     profiler.expose_metrics(_loop(collector, _kv_stats))
-    assert all("pool" not in line for line in lines)
+    assert not any(_has_pool_fields(line) for line in lines)
     manager._get_storage_statistics.assert_not_called()
 
 
@@ -237,7 +244,7 @@ def test_disabled_and_legacy_paths_read_no_pools(monkeypatch, enabled, is_v2):
     executor = _executor(manager, is_v2=is_v2)
     profiler, lines = _profiler(executor, enabled, monkeypatch)
     profiler.expose_metrics(_record(profiler))
-    assert len(lines) == 1 and "pool" not in lines[0]
+    assert len(lines) == 1 and not _has_pool_fields(lines[0])
     manager._get_storage_statistics.assert_not_called()
 
 

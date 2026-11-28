@@ -8,6 +8,26 @@ from __future__ import annotations
 from dataclasses import MISSING, dataclass, field, fields, replace
 from typing import ClassVar, NamedTuple
 
+from ..kv_cache_stats import ConversationActivityStats
+
+
+class RankTransferOutcomes(NamedTuple):
+    success: int
+    error: int
+    timeout: int
+
+    @classmethod
+    def wire_size(cls) -> int:
+        return len(cls._fields)
+
+    @classmethod
+    def deserialize(cls, values: list[int | float]) -> RankTransferOutcomes:
+        if len(values) != cls.wire_size() or any(
+            value < 0 or value != int(value) for value in values
+        ):
+            raise ValueError("Transfer outcome counters must be nonnegative integers")
+        return cls(*(int(value) for value in values))
+
 
 class RankKvCacheStats(NamedTuple):
     """Immutable rank-local KV snapshot containing only transportable scalars."""
@@ -128,6 +148,7 @@ class RankIterStatsPayload:
     _ITER_STATS_FIELD_COUNT: ClassVar[int] = 9
     _KV_LOAD_FIELD_COUNT: ClassVar[int] = 3
     _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -3
+    _OBSERVATIONS_WIRE_VERSION: ClassVar[int] = -5
     _QUEUED_WIRE_VERSION: ClassVar[int] = -4
     _QUEUED_FIELDS: ClassVar[tuple[str, ...]] = (
         "num_queued_context_requests",
@@ -160,6 +181,8 @@ class RankIterStatsPayload:
     # Current activity is refreshed at each routing exchange, independently
     # of the sampled iteration whose counters travel in this payload.
     has_pending_work: bool = False
+    kv_transfer_outcomes: tuple[int, int, int] | None = None
+    conversation_activity: ConversationActivityStats | None = None
 
     def serialize(self, include_kv_cache_load: bool = False) -> list[int | float]:
         """Serialize to a flat list for allgather transport."""
@@ -189,22 +212,31 @@ class RankIterStatsPayload:
             self.scheduling_counters,
         )
         queued_values = [getattr(self, name) for name in self._QUEUED_FIELDS]
-        has_extended_stats = any(queued_values) or self.has_pending_work
+        observations = (self.kv_transfer_outcomes, self.conversation_activity)
+        has_observations = any(value is not None for value in observations)
+        has_extended_stats = any(queued_values) or self.has_pending_work or has_observations
         if any(snapshot is not None for snapshot in snapshots) or has_extended_stats:
-            # The negative version cannot be confused with has_iter_stats (0/1).
-            # Presence flags frame the snapshots and the independent load fields.
+            version = self._SNAPSHOT_WIRE_VERSION
+            if has_observations:
+                version = self._OBSERVATIONS_WIRE_VERSION
+            elif has_extended_stats:
+                version = self._QUEUED_WIRE_VERSION
             values = [
-                self._QUEUED_WIRE_VERSION if has_extended_stats else self._SNAPSHOT_WIRE_VERSION,
+                version,
                 int(include_kv_cache_load),
                 *(int(snapshot is not None) for snapshot in snapshots),
+                *(int(value is not None) for value in observations if has_observations),
                 *values,
             ]
             for snapshot in snapshots:
                 if snapshot is not None:
                     values.extend(snapshot)
-            if has_extended_stats:
-                values.extend(queued_values)
-                values.append(int(self.has_pending_work))
+        if has_extended_stats:
+            values.extend(queued_values)
+            values.append(int(self.has_pending_work))
+        for observation in observations:
+            if observation is not None:
+                values.extend(observation)
         return values
 
     @classmethod
@@ -220,20 +252,33 @@ class RankIterStatsPayload:
         Raises:
             ValueError: The header is incomplete or contains an unsupported version or flag.
         """
+        has_observations = bool(data) and data[0] == cls._OBSERVATIONS_WIRE_VERSION
+        header_size = cls._SNAPSHOT_HEADER_SIZE + 2 * has_observations
         if (
-            len(data) < cls._SNAPSHOT_HEADER_SIZE
-            or data[0] not in (cls._SNAPSHOT_WIRE_VERSION, cls._QUEUED_WIRE_VERSION)
-            or any(flag not in (0, 1) for flag in data[1 : cls._SNAPSHOT_HEADER_SIZE])
+            len(data) < header_size
+            or data[0]
+            not in (
+                cls._SNAPSHOT_WIRE_VERSION,
+                cls._QUEUED_WIRE_VERSION,
+                cls._OBSERVATIONS_WIRE_VERSION,
+            )
+            or any(flag not in (0, 1) for flag in data[1:header_size])
         ):
             raise ValueError("Invalid snapshot payload header")
         return (
-            cls._SNAPSHOT_HEADER_SIZE
+            header_size
             + cls._ITER_STATS_FIELD_COUNT
             + int(data[1]) * cls._KV_LOAD_FIELD_COUNT
             + int(data[2] + data[3]) * RankKvCacheStats.wire_size()
             + int(data[4]) * RankSpecDecodingStats.wire_size()
             + int(data[5]) * RankSchedulingCounters.wire_size()
-            + (len(cls._QUEUED_FIELDS) + 1 if data[0] == cls._QUEUED_WIRE_VERSION else 0)
+            + (
+                RankTransferOutcomes.wire_size() * int(data[6])
+                + ConversationActivityStats.wire_size() * int(data[7])
+                if has_observations
+                else 0
+            )
+            + (len(cls._QUEUED_FIELDS) + 1 if data[0] <= cls._QUEUED_WIRE_VERSION else 0)
         )
 
     @classmethod
@@ -244,12 +289,14 @@ class RankIterStatsPayload:
             expected_size = cls.snapshot_payload_size(values)
             if len(values) != expected_size:
                 raise ValueError(f"Snapshot payload requires {expected_size} fields")
+            has_observations = values[0] == cls._OBSERVATIONS_WIRE_VERSION
+            header_size = cls._SNAPSHOT_HEADER_SIZE + 2 * has_observations
             scalar_end = (
-                cls._SNAPSHOT_HEADER_SIZE
+                header_size
                 + cls._ITER_STATS_FIELD_COUNT
                 + int(values[1]) * cls._KV_LOAD_FIELD_COUNT
             )
-            result = cls(*values[cls._SNAPSHOT_HEADER_SIZE : scalar_end])
+            result = cls(*values[header_size:scalar_end])
             cursor = scalar_end
             if values[2]:
                 result.kv_cache_stats = RankKvCacheStats.deserialize(
@@ -271,11 +318,21 @@ class RankIterStatsPayload:
                     values[cursor : cursor + RankSchedulingCounters.wire_size()]
                 )
                 cursor += RankSchedulingCounters.wire_size()
-            if values[0] == cls._QUEUED_WIRE_VERSION:
+            if values[0] <= cls._QUEUED_WIRE_VERSION:
                 queue_end = cursor + len(cls._QUEUED_FIELDS)
                 for name, value in zip(cls._QUEUED_FIELDS, values[cursor:queue_end]):
                     setattr(result, name, int(value))
                 result.has_pending_work = bool(values[queue_end])
+                cursor = queue_end + 1
+            if has_observations and values[6]:
+                end = cursor + RankTransferOutcomes.wire_size()
+                result.kv_transfer_outcomes = RankTransferOutcomes.deserialize(values[cursor:end])
+                cursor = end
+            if has_observations and values[7]:
+                end = cursor + ConversationActivityStats.wire_size()
+                result.conversation_activity = ConversationActivityStats.deserialize(
+                    values[cursor:end]
+                )
             return result
         scalar_field_count = cls._ITER_STATS_FIELD_COUNT + cls._KV_LOAD_FIELD_COUNT
         if len(values) > scalar_field_count:

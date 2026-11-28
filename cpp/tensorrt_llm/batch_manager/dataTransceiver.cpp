@@ -994,6 +994,11 @@ private:
     {
         try
         {
+            if (auto* request = response.getRequest();
+                request != nullptr && request->getKvCacheTransferEnd() == LlmRequest::TimePoint{})
+            {
+                request->setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            }
             response.mPromise.set_exception(exception);
         }
         catch (std::future_error const& err)

@@ -143,7 +143,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     mStorage
         = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock, std::move(coldPageCodec),
             mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink,
-            mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority, mConfig.coldTypicalStep);
+            mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority, mConfig.coldTypicalStep, mConfig.enableStats);
     // The context the storage above lives in; teardown pushes it on threads that have none.
     cuCheck(cuCtxGetCurrent(&mCudaContext));
     TLLM_CHECK_WITH_INFO(mCudaContext != nullptr, "KVCacheManagerV2 requires a current CUDA context");

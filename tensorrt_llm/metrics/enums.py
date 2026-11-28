@@ -24,6 +24,8 @@ class MetricNames(Enum):
     PREFILL_TIME = "prefill_time"
     DECODE_TIME = "decode_time"
     INFERENCE_TIME = "inference_time"
+    KV_CACHE_TRANSFER_TIME = "kv_cache_transfer_time"
+    KV_CACHE_TRANSFER_BYTES = "kv_cache_transfer_bytes"
     PROMPT_TOKENS = "prompt_tokens"
     GENERATION_TOKENS = "generation_tokens"
     PROMPT_CACHE_CACHED_TOKENS = "prompt_cache_cached_tokens"
@@ -40,4 +42,6 @@ class RequestEventTiming(Enum):
     LAST_TOKEN_TIME = "last_token_time"  # nosec: B105
     KV_CACHE_TRANSFER_START = "kv_cache_transfer_start"
     KV_CACHE_TRANSFER_END = "kv_cache_transfer_end"
+    KV_CACHE_TRANSFER_LOCAL_DURATION = "kv_cache_transfer_local_duration"
+    KV_CACHE_TRANSFER_LOCAL_SIZE = "kv_cache_transfer_local_size"
     KV_CACHE_SIZE = "kv_cache_size"

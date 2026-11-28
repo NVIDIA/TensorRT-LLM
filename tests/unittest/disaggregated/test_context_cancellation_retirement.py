@@ -14,6 +14,7 @@ from fake_dist import FakeDistGroup, FakeDistRank
 from test_context_first_ownership import _KV_RESULT_REPORT_TOKEN, _native_pair, _request, _worker
 from test_transfer_ownership_regressions import _sole_piece
 
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
@@ -51,6 +52,7 @@ def _harness(
     session: transfer_mod.TxSession | None,
     *,
     dist: FakeDistRank | None = None,
+    enable_transfer_metrics: bool = False,
 ) -> SimpleNamespace:
     """Run real coordinator/transfer-manager/reaper code with controlled engine effects."""
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -90,6 +92,7 @@ def _harness(
         effects=effects,
         registry=registry,
         enable_attention_dp=False,
+        enable_transfer_metrics=enable_transfer_metrics,
     )
     return SimpleNamespace(
         transceiver=transceiver,
@@ -192,7 +195,7 @@ def test_native_failure_cannot_independently_rewrite_request_cancellation() -> N
     request = _context_request()
     tx = worker.create_tx_session(request)
     tx.send(_sole_piece(tokens=16))
-    harness = _harness(worker, request, tx)
+    harness = _harness(worker, request, tx, enable_transfer_metrics=True)
     harness.transfers.start_transfer(request)
     handle = TaskHandle(tx, tx.kv_tasks[0], token_end=16)
     tx.set_exception("rank-local transfer failure")
@@ -204,8 +207,10 @@ def test_native_failure_cannot_independently_rewrite_request_cancellation() -> N
     # of this native task's earlier outcome.
     request.state = LlmRequestState.GENERATION_COMPLETE
     harness.coordinator.reap_context_sends()
+    harness.coordinator.reap_context_sends()
 
     assert request.state is LlmRequestState.GENERATION_COMPLETE
+    assert harness.coordinator.transfer_outcomes == (0, 1, 0)
     assert isinstance(handle.poll(), Failed)
     harness.manager.unpin_blocks_by_id.assert_called_once_with(91)
     harness.effects.terminate_request.assert_called_once_with(request)
@@ -333,6 +338,140 @@ def _assert_transfer_only_progress(
     executor._fetch_and_enqueue_requests(executor.waiting_queue, len(harness.active))
     executor.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=False)
     return executor
+
+
+@pytest.mark.parametrize("connector_pending", [False, True], ids=["send-only", "connector-save"])
+def test_send_poll_counts_one_rank_observed_deadline_on_every_rank(
+    monkeypatch: pytest.MonkeyPatch, connector_pending: bool
+) -> None:
+    """Both writers finish, but only one rank's executor saw the 1 s deadline expire.
+
+    Every rank counts the timeout once, and a KV connector save that still reads the
+    pages keeps them pinned until the connector releases its own claim.
+    """
+    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+    monkeypatch.setattr(coordinator_mod, "prepare_response", Mock(return_value=None))
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = []
+    requests = []
+    for rank in range(2):
+        request = _context_request()
+        request.py_kv_transfer_start_time = 0.0
+        request.py_kv_transfer_committed_cause = None
+        request.is_disagg_generation_transmission_in_progress = False
+        session = SimpleNamespace(
+            _enforce_physical_ownership=False,
+            disagg_request_id=401,
+            is_completed=Mock(return_value=True),
+            has_failed=Mock(return_value=False),
+            wait_complete=Mock(return_value=WaitResult.COMPLETED),
+            status=SessionStatus.TRANSFERRED,
+            has_transferring_tasks=Mock(return_value=False),
+            timed_out=False,
+            close=Mock(return_value=True),
+        )
+        harness = _harness(
+            _worker(), request, session, dist=group.rank(rank), enable_transfer_metrics=True
+        )
+        harness.transfers.start_transfer(request)
+        if connector_pending:
+            harness.transfers.start_transfer(request)  # The connector's save claim.
+        harness.active.append(request)
+        # The executors observe 700 ms on rank 0 and 1100 ms on rank 1.
+        harness.coordinator._flag_transfer_timeout(
+            request, "context", 1000, current_time=1.1 if rank == 1 else 0.7
+        )
+        ranks.append(harness)
+        requests.append(request)
+    assert [request.py_kv_transfer_timed_out for request in requests] == [False, True]
+    assert [harness.coordinator.transfer_outcomes for harness in ranks] == [(0, 0, 0), (0, 0, 1)]
+
+    for _ in range(2):
+        group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+        for rank, (harness, request) in enumerate(zip(ranks, requests)):
+            assert harness.coordinator.transfer_outcomes == (0, 0, 1)
+            assert request.py_kv_transfer_committed_cause == "timeout"
+            # Only the rank whose own deadline expired keeps the executor flag.
+            assert request.py_kv_transfer_timed_out is (rank == 1)
+            assert not harness.transceiver._send_sessions
+            harness.effects.fail_requests.assert_not_called()
+            if connector_pending:
+                assert harness.transfers.requests_in_transfer() == {401: request}
+                harness.manager.unpin_blocks_by_id.assert_not_called()
+            else:
+                assert not harness.transfers.requests_in_transfer()
+                harness.manager.unpin_blocks_by_id.assert_called_once_with(91)
+
+    if connector_pending:
+        # The connector reports its save; only then are the pages released.
+        for harness, request in zip(ranks, requests):
+            harness.coordinator.release_transfer(request)
+            assert not harness.transfers.requests_in_transfer()
+            harness.manager.unpin_blocks_by_id.assert_called_once_with(91)
+            assert harness.coordinator.transfer_outcomes == (0, 0, 1)
+
+    assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]
+
+
+@pytest.mark.parametrize("local_abort", [False, True], ids=["protocol-cancel", "local-abort"])
+@pytest.mark.parametrize("peer_failed", [True, False], ids=["peer-backend-error", "cancel-only"])
+def test_cancelled_partial_send_counts_a_peer_backend_error_on_every_rank(
+    monkeypatch: pytest.MonkeyPatch, peer_failed: bool, local_abort: bool
+) -> None:
+    """A send that one rank failed before it was cancelled counts one error on each rank.
+
+    The cancellation comes from the generation peer, with or without a later client abort.
+
+    The send has no transfer-manager entry yet, as for an intermediate pipelined chunk,
+    so only the request keeps the agreed cause.
+    """
+    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = []
+    requests = []
+    for rank in range(2):
+        request = _context_request()
+        request.py_kv_transfer_committed_cause = None
+        request.is_disagg_generation_transmission_in_progress = False
+        session = SimpleNamespace(
+            _enforce_physical_ownership=False,
+            disagg_request_id=401,
+            is_completed=Mock(return_value=False),
+            has_failed=Mock(return_value=True),
+            wait_complete=Mock(return_value=WaitResult.FAILED),
+            status=SessionStatus.CANCELLED,
+            has_transferring_tasks=Mock(return_value=False),
+            timed_out=False,
+            # Only rank 1's send committed a backend error before the abort.
+            committed_failure=peer_failed and rank == 1,
+            close=Mock(return_value=True),
+        )
+        harness = _harness(
+            _worker(), request, session, dist=group.rank(rank), enable_transfer_metrics=True
+        )
+        harness.active.append(request)
+        ranks.append(harness)
+        requests.append(request)
+
+    expected = (0, 1, 0) if peer_failed else (0, 0, 0)
+    for _ in range(2):
+        group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+        # The reaper settles the agreed cause; the generation peer's cancel needs no
+        # local client abort to be counted.
+        for harness in ranks:
+            assert harness.coordinator.transfer_outcomes == expected
+    for harness, request in zip(ranks, requests):
+        assert not harness.transceiver._send_sessions
+        assert not harness.transfers.requests_in_transfer()
+        assert request.py_kv_transfer_committed_cause == ("error" if peer_failed else None)
+        if local_abort:
+            # A later client abort reaches the cancellation boundary without a second count.
+            harness.coordinator.record_cancelled_transfer_outcome(request)
+            harness.coordinator.record_cancelled_transfer_outcome(request)
+        assert harness.coordinator.transfer_outcomes == expected
+        harness.effects.fail_requests.assert_not_called()
+
+    assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]
 
 
 @pytest.mark.parametrize("result_already_sent", [False, True])

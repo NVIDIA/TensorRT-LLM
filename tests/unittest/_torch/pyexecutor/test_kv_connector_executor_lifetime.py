@@ -83,6 +83,8 @@ def _request(request_id: int = 1) -> SimpleNamespace:
         py_total_draft_tokens=0,
         py_total_accepted_draft_tokens=0,
         py_disaggregated_params=None,
+        py_kv_transfer_timed_out=False,
+        py_kv_transfer_committed_cause=None,
         create_response=Mock(return_value=response),
     )
 

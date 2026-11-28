@@ -78,6 +78,14 @@ private:
 // ---------------------------------------------------------------------------
 // StorageStatistics — per-pool-group slot counts.
 // ---------------------------------------------------------------------------
+struct StorageMovementStatistics
+{
+    int64_t restoredBlocks = 0;
+    int64_t evictedBlocks = 0;
+    int64_t capacityDroppedBlocks = 0;
+    int64_t priorityDroppedBlocks = 0;
+};
+
 struct StorageStatistics
 {
     TypedVec<PoolIndex, size_t> slotSizes;
@@ -86,6 +94,7 @@ struct StorageStatistics
     SlotCount evictable; // scheduled for eviction
     // Retained disk copies: duplicates of pages that live in a hotter level, released when the level needs the room.
     SlotCount retainedCopies{0};
+    StorageMovementStatistics movement{}; // cumulative storage-slot movement, never reset
 
     SlotCount available() const noexcept
     {
@@ -138,7 +147,7 @@ public:
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
         std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f,
         Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority,
-        std::optional<BatchDesc> const& coldTypicalBatch = std::nullopt);
+        std::optional<BatchDesc> const& coldTypicalBatch = std::nullopt, bool enableStats = false);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -624,6 +633,12 @@ private:
         return level == kHotLevel ? mHotPoolGroupMapping : mColdPoolGroupMapping;
     }
 
+    void recordMigration(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId lifeCycle, size_t numPages);
+    void recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, bool belowPriorityThreshold = false);
+    void recordDroppedPage(Page const& page, bool belowPriorityThreshold = false);
+
+    bool mEnableStats;
+    std::map<std::pair<CacheLevel, PoolGroupIndex>, StorageMovementStatistics> mMovementStats;
     LifeCycleRegistry const& mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
     Priority mColdTierOffloadMinPriority;

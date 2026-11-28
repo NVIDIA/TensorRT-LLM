@@ -170,6 +170,7 @@ def _make_transceiver(
             failed,
             completed,
             quiesced,
+            set(),
         )
     )
     return transceiver
@@ -452,7 +453,9 @@ def test_context_transfer_status_retires_quiesced_cancelled_session() -> None:
     req = _FakeRequest()
     transceiver = _make_transceiver({18: session}, {18: req})
 
-    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
+    status = transceiver.check_context_transfer_status(at_least_request_num=0)
+    completed, failed = status
+    assert status.cancelled_request_ids == (18,)
 
     assert completed == []
     assert failed == []
@@ -507,7 +510,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._recv_reqs = {}
     transceiver._gen_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [], set()))
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [], set(), set()))
     transceiver._close_failed_sessions = Mock()
 
     status = transceiver.check_gen_transfer_status(at_least_request_num=0)
@@ -545,34 +548,98 @@ def test_consensus_outcome_uses_single_batched_allgather() -> None:
     assert new_quiesced == [7]
 
 
-def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
+@pytest.mark.parametrize("peer_failed", [False, True])
+def test_ctx_tp_consensus_does_not_complete_when_peer_times_out(peer_failed) -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    req = SimpleNamespace(py_kv_transfer_timed_out=False, py_kv_transfer_committed_cause=None)
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {21: req}
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_need_pp_sync = False
     transceiver._dist = SimpleNamespace(
-        tp_allgather=lambda payload: [payload, [[], [], [], []]],
+        tp_allgather=lambda payload: [
+            payload,
+            [[], [21], [], [21], [21]] if peer_failed else [[], [], [], [], [21]],
+        ],
     )
 
-    cancelled, failed, completed, quiesced = transceiver._ctx_consensus_outcome(
+    cancelled, failed, completed, quiesced, _ = transceiver._ctx_consensus_outcome(
         [21], [], [], [21], [21]
     )
 
     assert cancelled == []
-    assert failed == []
+    assert failed == ([21] if peer_failed else [])
+    # The agreed timeout is accounting only; this rank's deadline did not expire.
+    assert req.py_kv_transfer_committed_cause == ("timeout" if peer_failed else None)
+    assert req.py_kv_transfer_timed_out is False
     assert completed == []
-    assert quiesced == []
+    assert quiesced == ([21] if peer_failed else [])
+
+
+@pytest.mark.parametrize("observed_here", [True, False], ids=["observed-here", "observed-on-peer"])
+def test_ctx_tp_vote_spreads_an_executor_observed_deadline(observed_here) -> None:
+    """A completed send counts the deadline one rank's executor observed on every rank."""
+    sent = []
+    req = SimpleNamespace(
+        py_kv_transfer_timed_out=observed_here, py_kv_transfer_committed_cause=None
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {21: SimpleNamespace(timed_out=False)}
+    transceiver._send_reqs = {21: req}
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_need_pp_sync = False
+
+    def tp_allgather(payload):
+        sent.append(payload)
+        # Both writers finished; only one rank's executor saw the deadline expire.
+        return [payload, [[], [], [21], [21], [] if observed_here else [21]]]
+
+    transceiver._dist = SimpleNamespace(tp_allgather=tp_allgather)
+
+    cancelled, failed, completed, quiesced, backend_failed = transceiver._ctx_consensus_outcome(
+        [21], [], [], [21], [21]
+    )
+
+    assert sent == [[[], [], [21], [21], [21] if observed_here else []]]
+    assert (cancelled, failed, completed, quiesced) == ([], [], [21], [21])
+    assert backend_failed == set()
+    # Every rank counts the agreed timeout; only the observing rank keeps the
+    # executor flag that arms its timeout cleanup.
+    assert req.py_kv_transfer_committed_cause == "timeout"
+    assert req.py_kv_transfer_timed_out is observed_here
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_ctx_consensus_keeps_failure_evidence_with_cancel(local_failure) -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_need_pp_sync = False
+    transceiver._dist = SimpleNamespace(
+        tp_allgather=lambda payload: [payload, [[21], [], [], [21], []]],
+    )
+
+    cancelled, failed, completed, quiesced, backend_failed = transceiver._ctx_consensus_outcome(
+        [21], [], [21] if local_failure else [], [] if local_failure else [21], [21]
+    )
+
+    assert (cancelled, failed, completed, quiesced) == ([21], [], [], [21])
+    assert backend_failed == ({21} if local_failure else set())
 
 
 def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = True
     transceiver._dist = SimpleNamespace(
         tp_allgather=Mock(side_effect=AssertionError("TP allgather must be skipped")),
-        pp_allgather=lambda payload: [payload, [[], [], [], []]],
+        pp_allgather=lambda payload: [payload, [[], [], [], [], []]],
     )
 
-    cancelled, failed, completed, quiesced = transceiver._ctx_consensus_outcome(
+    cancelled, failed, completed, quiesced, _ = transceiver._ctx_consensus_outcome(
         [22], [], [], [22], [22]
     )
 
@@ -609,7 +676,7 @@ def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
     transceiver._dist.allreduce = Mock(return_value=0)
     transceiver._ctx_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], [], set()))
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._close_failed_sessions = Mock()
 
@@ -1275,7 +1342,7 @@ def test_check_context_runs_consensus_after_a_send() -> None:
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_consensus = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], [], set()))
 
     transceiver.check_context_transfer_status(0)
     transceiver._ctx_consensus.assert_called_once()
@@ -1490,6 +1557,7 @@ def _gen_request(rid: int) -> SimpleNamespace:
         set_kv_cache_transfer_start=lambda _t: None,
         set_kv_cache_transfer_end=lambda _t: None,
         set_kv_cache_size=lambda _s: None,
+        set_kv_cache_transfer_local_size=lambda _s: None,
     )
 
 
@@ -1725,6 +1793,9 @@ def test_sync_receive_timeout_keeps_destination_until_silent_writer_reports(
     transceiver.request_and_receive_sync(request)
 
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    # The expired wait committed a timeout, which the request keeps for accounting.
+    assert session.timed_out is True
+    assert request.py_kv_transfer_timed_out is True
     assert closes == []
     assert session.status == SessionStatus.CANCELLED
     assert transceiver._recv_sessions == {rid: session}

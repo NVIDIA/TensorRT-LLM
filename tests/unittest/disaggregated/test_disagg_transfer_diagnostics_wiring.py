@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation import diagnostics
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
 from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
@@ -44,9 +46,15 @@ from tensorrt_llm._torch.disaggregation.orchestration.admission import (
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    LlmRequestType,
+    SamplingConfig,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler, ScheduleAction
 
 pytestmark = pytest.mark.cpu_only
@@ -58,6 +66,7 @@ def _disagg_request(
     return SimpleNamespace(
         py_request_id=local_id,
         request_id=local_id,
+        state=None,
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=canonical_id),
         prompt_len=prompt_len,
     )
@@ -115,7 +124,9 @@ def _coordinator(
             world_size=1,
         ),
         effects=SimpleNamespace(revert_ctx_alloc=Mock()),
-        registry=SimpleNamespace(active_requests=lambda: list(active_requests)),
+        registry=SimpleNamespace(
+            active_requests=lambda: list(active_requests), canceled_request_ids=lambda: ()
+        ),
         enable_attention_dp=False,
         admission_controller=controller,
         is_kv_manager_v2=True,
@@ -790,6 +801,7 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     operations = []
     session = SimpleNamespace(
         status=session_status,
+        kv_cache_size_bytes=64,
         _kv_tasks=[],
         wait_complete=Mock(side_effect=lambda blocking: operations.append("wait") or wait_result),
         has_transferring_tasks=Mock(return_value=False),
@@ -805,7 +817,16 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     session.receive = Mock(side_effect=receive)
     request = _disagg_request(41, 4041)
     request.state = LlmRequestState.DISAGG_GENERATION_INIT
-    request.set_kv_cache_size = Mock()
+    stats_request = LlmRequest(
+        request_id=41,
+        max_new_tokens=1,
+        input_tokens=[0],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    request.set_kv_cache_size = Mock(wraps=stats_request.set_kv_cache_size)
+    request.set_kv_cache_transfer_local_size = Mock()
     transceiver = _diagnostic_transceiver()
     transceiver._validate_bridge_req = Mock(return_value=True)
     transceiver._recv_sessions = {}
@@ -858,9 +879,16 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     )
     session.wait_complete.assert_called_once_with(blocking=True)
     if wait_result == WaitResult.COMPLETED:
+        request.set_kv_cache_transfer_local_size.assert_called_once_with(64)
         request.set_kv_cache_size.assert_called_once_with(128)
+        executor = object.__new__(PyExecutor)
+        executor.executor_request_queue = Mock()
+        executor.executor_request_queue.get_request_queue.return_value = queue.Queue()
+        [stats] = executor._populate_req_stats([stats_request], [], ScheduledRequests())
+        assert json.loads(stats.to_json_str())["disServingStats"]["kvCacheSize"] == 128
         transceiver._assert_disagg_history_declared.assert_called_once_with(request)
     else:
+        request.set_kv_cache_transfer_local_size.assert_not_called()
         request.set_kv_cache_size.assert_not_called()
         transceiver._assert_disagg_history_declared.assert_not_called()
 
@@ -1265,7 +1293,9 @@ def test_ctx_settlement_continues_when_diagnostic_emission_fails(
     transceiver._collect_done = Mock(return_value=([request_id], []))
     transceiver._ctx_consensus = Mock(side_effect=lambda request_ids: request_ids)
     transceiver._build_to_process = Mock(return_value=[request_id])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [request_id], [request_id]))
+    transceiver._ctx_consensus_outcome = Mock(
+        return_value=([], [], [request_id], [request_id], set())
+    )
 
     def retire_send_session(rid: int, **_kwargs) -> None:
         transceiver._send_sessions.pop(rid, None)
@@ -1325,9 +1355,9 @@ def test_ctx_settlement_continues_when_diagnostic_session_snapshot_is_stale(
     transceiver._ctx_consensus = Mock(side_effect=lambda request_ids: request_ids)
     transceiver._build_to_process = Mock(return_value=[request_id])
 
-    def retire_before_diagnostic_snapshot(*_args) -> tuple[list, list, list, list]:
+    def retire_before_diagnostic_snapshot(*_args) -> tuple[list, list, list, list, set]:
         transceiver._send_sessions.pop(request_id)
-        return [], [], [request_id], [request_id]
+        return [], [], [request_id], [request_id], set()
 
     transceiver._ctx_consensus_outcome = Mock(side_effect=retire_before_diagnostic_snapshot)
     transceiver._retire_send_session = Mock(
@@ -1368,6 +1398,7 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     )
     request = _disagg_request(5, request_id)
     request.set_kv_cache_size = Mock()
+    request.set_kv_cache_transfer_local_size = Mock()
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_idle_agreed = False
@@ -1377,7 +1408,9 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     transceiver._collect_done = Mock(return_value=([request_id], []))
     transceiver._gen_consensus = Mock(side_effect=lambda request_ids: request_ids)
     transceiver._build_to_process = Mock(return_value=[request_id])
-    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [request_id], [request_id]))
+    transceiver._gen_consensus_outcome = Mock(
+        return_value=([], [], [request_id], [request_id], set())
+    )
     transceiver._need_aux_transfer = Mock(return_value=False)
     transceiver._assert_disagg_history_declared = Mock()
     transceiver._close_session_or_raise = Mock()
@@ -1489,7 +1522,7 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
     assert request.py_request_id not in executor._prefetched_request_ids
-    executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)
+    executor._disagg_coordinator.forget_request.assert_called_once_with(request)
     for engine in (executor.model_engine, executor.draft_model_engine):
         engine.model.release_request_state.assert_called_once_with(request.py_request_id)
 
@@ -1747,3 +1780,36 @@ def test_native_profile_diagnostics_do_not_affect_worker_setup(
             rank_info=rank_info,
             profile="native_v1",
         )
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "timeout"])
+def test_shared_receive_outcome_is_counted_once_until_last_candidate_is_forgotten(outcome):
+    requests = [_disagg_request(i, 73) for i in (1, 2)]
+    for request in requests:
+        request.is_child, request.parent_request_id = True, 10
+        request.py_kv_transfer_timed_out = outcome == "timeout"
+    coordinator = _coordinator(active_requests=requests)
+    coordinator._transfer_outcomes = [0, 0, 0]
+    coordinator._started_gen_receives = {request.py_request_id: request for request in requests}
+    coordinator._check_transfer_errors = Mock()
+    coordinator.inflight_cancel_active = lambda: False
+    coordinator._transceiver.check_gen_transfer_status = Mock(
+        return_value=GenTransferStatus(
+            [73] if outcome == "success" else [], [73] if outcome != "success" else [], []
+        )
+    )
+    coordinator.reap_gen_receives()
+    expected = tuple(int(name == outcome) for name in ("success", "error", "timeout"))
+    assert coordinator.transfer_outcomes == expected
+    while requests:
+        request = requests.pop(0)
+        coordinator.forget_request(request)
+        coordinator.reap_gen_receives()
+        assert coordinator.transfer_outcomes == expected
+    requests.append(_disagg_request(3, 73))
+    coordinator._started_gen_receives[3] = requests[-1]
+    coordinator._transceiver.check_gen_transfer_status.return_value = GenTransferStatus(
+        [73], [], []
+    )
+    coordinator.reap_gen_receives()
+    assert coordinator.transfer_outcomes == (expected[0] + 1, expected[1], expected[2])

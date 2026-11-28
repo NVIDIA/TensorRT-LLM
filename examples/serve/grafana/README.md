@@ -11,7 +11,7 @@ use it separately from the TensorRT-LLM checkout. Rendering does not import
 TensorRT-LLM, resolve credentials, contact Grafana, or invoke Kubernetes.
 
 The metrics dashboard has E2E, Prefill, Decode and All views. Engine workers are
-discovered from current scrape targets on refresh. The 80 default panel templates
+discovered from current scrape targets on refresh. The default panel templates
 include request/queue latency, throughput, rank-local KV reuse/load, transfer
 outcomes, executor timing and physical tier pressure. Optional trace-PVC charts
 add two templates. Optional Loki support adds a separate 16-panel Logs dashboard.
@@ -157,13 +157,6 @@ Restore/evict turnover is `rate(moved_bytes) / capacity` in turnovers per second
 it can exceed one per second. Capacity/priority drops measure final prefix loss,
 not ordinary request release. Native counters count accepted submissions and do
 not confirm successful asynchronous DMA. Detailed tier rank coverage can be limited.
-
-Sampled migration latency is disabled unless
-`TRTLLM_KV_CACHE_TIMING_SAMPLE_INTERVAL` is positive before manager construction.
-It measures batch stream intervals, including codec/staging, and is distinct from
-completed-request KV-transfer duration. Neither is necessarily a request's restore
-stall. Compare source/destination paths and skipped timing samples; sparse or
-absent samples do not mean zero latency. Ratios and latencies are not stacked.
 
 ## Standalone tests
 

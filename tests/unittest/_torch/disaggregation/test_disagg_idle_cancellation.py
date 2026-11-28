@@ -20,7 +20,7 @@ from coordinator_harness import CoordinatorHarness
 from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.base import TokenRange
-from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import BindKvCacheTransceiver
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
@@ -135,6 +135,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
     engine = object.__new__(PyExecutor)
+    engine.enable_iter_perf_stats = False
     engine.active_requests = []
     engine.canceled_req_ids = []
     engine.waiting_queue = FCFSWaitingQueue()
@@ -1461,6 +1462,68 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     watchdog.stop()
 
 
+@pytest.mark.parametrize("abort_first", [False, True], ids=["poll-first", "abort-first"])
+def test_committed_receive_timeout_survives_either_cancellation_order(
+    executor: PyExecutor, abort_first: bool
+) -> None:
+    """A receive whose deadline has committed counts one timeout however a later abort lands.
+
+    Args:
+        executor: Real cancellation and retirement path with controlled resources.
+        abort_first: Whether the client abort is handled before the next receive poll.
+    """
+    request = _request(1)
+    executor.active_requests = [request]
+    executor._fatal_error = None
+    executor.perf_manager = Mock()
+    executor.iter_counter = 0
+    executor.stream_interval = 1
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor.disagg._transfer_outcomes = [0, 0, 0]
+    clock = [0.0]
+    watchdog = RetirementWatchdog(Mock(), clock=lambda: clock[0])
+    session, aux = _published_receive(executor, request, watchdog=watchdog)
+    executor.disagg._started_gen_receives[request.py_request_id] = request
+    transceiver = executor.kv_cache_transceiver
+
+    # The 1 s receive deadline commits a timeout; the writer settles within the grace.
+    clock[0] = 1.5
+    watchdog.progress()
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    assert session.timed_out
+    assert session.resources_drained()
+
+    if abort_first:
+        _abort(executor, request)
+        executor._cancel_waiting_disagg_requests([])
+        assert request.py_kv_transfer_committed_cause == "timeout"
+        assert not request.py_kv_transfer_timed_out
+        assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    executor.disagg.reap_gen_receives(0)
+    if not abort_first:
+        _abort(executor, request)
+        executor._cancel_waiting_disagg_requests([])
+    executor._flush_pending_transfer_responses()
+
+    assert executor.disagg.transfer_outcomes == (0, 0, 1)
+    assert executor.active_requests == []
+    (response,) = executor._response_channel.responses[request.py_request_id]
+    assert response.error_msg is not None
+    assert not request.is_finished_due_to_cancellation
+    assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    aux.free_slot.assert_called_once_with(0)
+    executor.disagg.reap_gen_receives(0)
+    executor._flush_pending_transfer_responses()
+    assert executor.disagg.transfer_outcomes == (0, 0, 1)
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    watchdog.require_retired()
+    watchdog.stop()
+
+
 @pytest.mark.parametrize("last_resource", ["kv", "aux"])
 def test_worker_cancel_retains_published_kv_and_aux_until_both_settle(
     executor: PyExecutor, last_resource: str
@@ -1956,6 +2019,7 @@ def test_adp_receive_retirement_snapshot_keeps_empty_peer_live(
     engines = []
     for rank in ranks:
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine._disagg_coordinator = rank.coordinator
         engine.dist = rank.dist
         engine.enable_attention_dp = True
@@ -2063,6 +2127,7 @@ def test_legacy_tp_cancel_reaches_multimodal_model_generation_work(
     requests = []
     for rank in range(2):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         engine.is_encoder_decoder = encoder_decoder
@@ -2146,6 +2211,7 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
     requests = []
     for rank in range(tp_size):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         request = _request(1)
@@ -2216,6 +2282,143 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
     )
 
 
+@pytest.mark.parametrize("poll_counted", [False, True], ids=["abort-first", "poll-first"])
+@pytest.mark.parametrize(
+    ("peer_cause", "expected"),
+    [
+        ("timeout", (0, 0, 1)),
+        ("executor-timeout", (0, 0, 1)),
+        ("failure", (0, 1, 0)),
+        (None, (0, 0, 0)),
+    ],
+    ids=["peer-timeout", "peer-executor-timeout", "peer-failure", "cancel-only"],
+)
+def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
+    executor: PyExecutor,
+    poll_counted: bool,
+    peer_cause: str | None,
+    expected: tuple[int, int, int],
+) -> None:
+    """The cancellation vote carries a peer shard's observed cause to every rank.
+
+    Rank 0's shard completes; only rank 1's shard times out or fails before the
+    client abort. Every rank counts the agreed cause once, as a receive poll does.
+
+    Args:
+        executor: Template executor whose state each rank copies.
+        poll_counted: Whether a receive poll already counted the agreed outcome.
+        peer_cause: Rank 1's committed cause, a timeout only its executor
+            observed, or None for a cancellation alone.
+        expected: Per-rank (success, error, timeout) counts.
+    """
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    engines = []
+    requests = []
+
+    def retire(req: LlmRequest, rank: int) -> bool:
+        """Retire the drained session, copying its committed cause as cancel_request does."""
+        if rank == 1 and peer_cause == "timeout":
+            req.py_kv_transfer_committed_cause = "timeout"
+        elif rank == 1 and peer_cause == "failure":
+            req.py_kv_transfer_committed_cause = "error"
+        return True
+
+    for rank in range(2):
+        engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        request = _request(1)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        engine.active_requests = [request]
+        engine.canceled_req_ids = [1]
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine.previous_batch = None
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+            enable_transfer_metrics=True,
+        )
+        engine.disagg.request_cancellation = Mock(side_effect=lambda req, r=rank: retire(req, r))
+        engine._try_cancel_request = Mock(side_effect=lambda req, r=rank: retire(req, r))
+        if peer_cause == "executor-timeout":
+            # A 1 s deadline: rank 0's executor sees 700 ms, rank 1's sees 1100 ms
+            # and counts the timeout locally; the writer then completes.
+            request.py_kv_transfer_start_time = 0.0
+            engine.disagg._flag_transfer_timeout(
+                request, "generation", 1000, current_time=1.1 if rank == 1 else 0.7
+            )
+            assert request.py_kv_transfer_timed_out is (rank == 1)
+            if poll_counted:
+                # Both writers finish before the abort: the next receive poll
+                # retires a completed session on each rank.
+                transceiver._ever_had_recv_session = True
+                transceiver._gen_need_sync = True
+                transceiver._gen_allgather = engine.dist.tp_allgather
+                transceiver._need_aux_transfer = Mock(return_value=False)
+                transceiver._assert_disagg_history_declared = Mock()
+                transceiver._recv_sessions = {
+                    1: SimpleNamespace(
+                        _enforce_physical_ownership=False,
+                        is_completed=Mock(return_value=True),
+                        has_failed=Mock(return_value=False),
+                        wait_complete=Mock(return_value=WaitResult.COMPLETED),
+                        status=SessionStatus.TRANSFERRED,
+                        timed_out=False,
+                        transfer_end_time=None,
+                        kv_cache_size_bytes=0,
+                        kv_write_verified=Mock(return_value=True),
+                        close=Mock(return_value=True),
+                    )
+                }
+                transceiver._recv_reqs = {1: request}
+                engine.disagg._started_gen_receives[1] = request
+                engine.canceled_req_ids = []
+        elif poll_counted and peer_cause is not None:
+            # The receive poll's rank-synchronized outcome already counted the cause.
+            outcome = "timeout" if peer_cause == "timeout" else "error"
+            engine.disagg._record_transfer_outcome(request, outcome, backend_failure=True)
+        engines.append(engine)
+        requests.append(request)
+
+    if poll_counted and peer_cause == "executor-timeout":
+        for _ in range(2):
+            group.run(lambda rank: engines[rank].disagg.reap_gen_receives(0))
+            for rank, engine in enumerate(engines):
+                # The poll vote spreads rank 1's observed deadline to rank 0.
+                assert engine.disagg.transfer_outcomes == expected
+                assert engine.kv_cache_transceiver._recv_sessions == {}
+                assert requests[rank].py_kv_transfer_timed_out
+                assert requests[rank].state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        for engine in engines:
+            engine.canceled_req_ids = [1]
+
+    for _ in range(2):
+        group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+        for rank, engine in enumerate(engines):
+            request = requests[rank]
+            assert engine.disagg.transfer_outcomes == expected
+            assert request.is_finished_due_to_cancellation
+            assert not request.py_kv_transfer_timed_out
+            assert engine.active_requests == []
+            assert engine.canceled_req_ids == []
+            # One cancellation response and one release per rank, none added by the repeat.
+            assert [rid for rid, _ in engine._pending_transfer_responses] == [1]
+            assert engine._pending_response_terminations == [request]
+
+
 @pytest.mark.parametrize("peer_owns_receive", [False, True])
 @pytest.mark.parametrize("cancel_rank", [0, 1])
 def test_legacy_tp_cancel_with_request_missing_on_peer(
@@ -2228,6 +2431,7 @@ def test_legacy_tp_cancel_with_request_missing_on_peer(
     request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
     for rank in range(2):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         engine.active_requests = [request] if rank == 0 else []
@@ -2274,6 +2478,7 @@ def test_legacy_tp_cancel_propagates_to_peer_with_active_request(executor: PyExe
     requests = []
     for rank in range(2):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         request = _request(1)
@@ -2331,6 +2536,7 @@ def test_legacy_tp_cp_cancel_vote_covers_cp_ranks_with_missing_replica(
     ready[1] = False  # peer whose receive is not drained
     for rank in range(ranks):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         transceiver = object.__new__(KvCacheTransceiverV2)
@@ -2421,6 +2627,7 @@ def test_legacy_tp_cancel_with_capacity_connector_completes_consensus(
     ready[-1] = False
     for rank in range(tp_size):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         transceiver = object.__new__(KvCacheTransceiverV2)

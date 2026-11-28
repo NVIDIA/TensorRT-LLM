@@ -3,6 +3,7 @@
 """Collection/exposure parity without a GPU, model, source drain or logger scrape."""
 
 import json
+import math
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -57,6 +58,8 @@ def test_categories_own_the_source_and_preserve_legacy_wire_shape() -> None:
         "futureMeasurement": [1, 2],
         "requestStats": [{"id": 9, "numGeneratedTokens": 4}],
         "kvCacheStats": {"usedNumBlocks": 2, "maxNumBlocks": 10},
+        "kvTransferOutcomes": {"success": 3, "error": 2, "timeout": 1},
+        "kvCacheNumConversations": 4,
         "kvCacheIterationStatsByPoolGroup": [{"slotSize": [64]}],
     }
     record = PerfMetricsCollector.collect_iteration(source)
@@ -66,6 +69,10 @@ def test_categories_own_the_source_and_preserve_legacy_wire_shape() -> None:
         record.iteration_view()["kvCacheStats"]["usedNumBlocks"] = 99
     assert "requestStats" in record.per_req
     assert "hostStepTimeMS" in record.per_iter
+    assert record.per_rank["kvTransferOutcomes"]["success"] == 3
+    assert record.per_rank["kvCacheNumConversations"] == 4
+    assert "kvCacheNumConversations" not in record.per_iter
+    assert "kvTransferOutcomes" not in record.per_iter
     assert "kvCacheStats" in record.per_rank
     assert record.per_iter["attentionDpRank"] == 2
     source["kvCacheStats"]["usedNumBlocks"] = 9
@@ -201,6 +208,12 @@ def test_loop_identity_is_independent_of_delayed_batch_and_fanout_rank() -> None
     prom.emit(batch)
     assert batch.per_iter["iter"] == 7
     assert batch.per_iter["executorLoop"]["per_iter"]["iter"] == 9
+    labels = {**prom.labels, "global_rank": "4"}
+    prom.emit(batch)  # A repeated snapshot must not increment the counter twice.
+    assert prom.loop_requests_fetched.labels(**labels)._value.get() == 8
+    next_loop = runtime.collect_loop(_loop(10, fetched=10))
+    prom.emit(next_loop)
+    assert prom.loop_requests_fetched.labels(**labels)._value.get() == 10
     # A peer row without a measured loop must not create a rank-1 zero placeholder.
     prom.emit(
         PerfMetricsCollector.collect_iteration({"attentionDpRank": 1, "numActiveRequests": 99})
@@ -331,3 +344,69 @@ def test_prometheus_missing_used_count_does_not_infer_utilization() -> None:
         )
     )
     assert prom.kv_cache_utilization.collect()[0].samples == []
+
+
+def test_logger_and_prometheus_share_hot_pool_window_values() -> None:
+    from prometheus_client.parser import text_string_to_metric_families
+
+    logs = []
+    logger = LoggerExposure(logs.append)
+    perf = PerfMetricsCollector()
+    prom = _prometheus()
+
+    def samples(suffix: str, **labels: str) -> list[float]:
+        return [
+            sample.value
+            for family in text_string_to_metric_families(generate_latest(prom._registry).decode())
+            for sample in family.samples
+            if sample.name == f"trtllm_kv_cache_movement_window_blocks{suffix}"
+            and all(sample.labels.get(key) == value for key, value in labels.items())
+        ]
+
+    report = {
+        "attentionDpRank": 2,
+        "batchIter": 17,
+        "numPausedRequests": 3,
+        "kvCacheStats": {"allocTotalBlocks": 50, "allocNewBlocks": 20},
+        "kvCacheStorageStats": [
+            {"cacheLevel": 0, "poolGroupId": 4, "freeNumBlocks": 0, "evictableNumBlocks": 7},
+            {"cacheLevel": 0, "poolGroupId": 9, "freeNumBlocks": 2, "evictableNumBlocks": 1},
+            {"cacheLevel": 1, "poolGroupId": 4, "freeNumBlocks": 100, "evictableNumBlocks": 0},
+        ],
+        "kvCacheIterationStatsByPoolGroup": {
+            "4": {"iterOffloadBlocks": 5, "iterOnboardBlocks": 0},
+            9: {"iterOffloadBlocks": 2},
+        },
+    }
+    perf.collect_rank(report, capture_iter=18)
+    first = perf.collect_loop(_loop(18))
+    logger.emit(first)
+    logger.emit(first)
+    for fragment in (
+        "num_paused_requests = 3",
+        "kv_alloc_total_blocks = 50",
+        "kv_alloc_new_blocks = 20",
+        "kv_pool_group_ids = 4/9",
+        "kv_free_blocks_by_pg = 0/2",
+        "kv_evictable_blocks = 8",
+        "kv_offload_blocks = 7",
+        "kv_onboard_blocks_by_pg = 0/N/A",
+        "batch_iter = 17",
+        "kv_capture_iter = 18",
+        "kv_movement_fresh = true",
+    ):
+        assert fragment in logs[0]
+    assert "kv_offload_blocks = N/A" in logs[1]
+    assert "kv_movement_fresh = false" in logs[1]
+
+    prom.emit(first)
+    prom.emit(first)
+    assert samples("", dp_rank="2", operation="offload") == [7]
+    assert samples("_by_pool", dp_rank="2", pool_group="4", operation="onboard") == [0]
+    assert math.isnan(samples("", dp_rank="2", operation="onboard")[0])
+
+    prom.log_iteration_stats({"attentionDpRank": 2})
+    assert samples("", dp_rank="2", operation="offload") == [7]
+    prom.log_iteration_stats({"attentionDpRank": 2, "kvCacheIterationStatsByPoolGroup": {}})
+    assert samples("", dp_rank="2", operation="offload") == [0]
+    assert math.isnan(samples("_by_pool", dp_rank="2", pool_group="4", operation="offload")[0])
