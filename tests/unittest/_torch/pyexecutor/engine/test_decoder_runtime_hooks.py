@@ -123,3 +123,44 @@ def test_an_msa_policy_reaches_the_metadata_and_the_cache():
     assert metadata.attn_metadata.msa_policy is policy
     assert manager.skip_unchanged_block_offsets is True
     assert manager.reuse_pool_views is False
+
+
+def test_a_qsa_policy_that_fails_to_arm_leaves_no_metadata_behind(monkeypatch):
+    """`setup_attention` keeps its metadata only once the model's policies are armed: a QSA
+    policy over a backend without QSA metadata raises on every call, not only the first (a
+    retry would otherwise get the unarmed metadata back from the cached return)."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import metadata as decoder_metadata
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import QsaRuntimePolicy
+
+    built = []
+
+    def build(*args, **kwargs):
+        built.append(kwargs["kv_cache_manager"])
+        return object.__new__(TrtllmAttentionMetadata)
+
+    monkeypatch.setattr(decoder_metadata, "build_attention_metadata", build)
+    monkeypatch.setattr(decoder_metadata, "resolve_mamba_metadata_cls", lambda *a: None)
+    metadata = _metadata(RuntimeHooks(qsa=QsaRuntimePolicy(steady_decode=True)), None)
+    metadata.model = SimpleNamespace(
+        model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+    )
+    metadata._config = SimpleNamespace(
+        max_batch_size=4,
+        max_num_tokens=64,
+        max_beam_width=1,
+        attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
+        max_total_draft_tokens=0,
+        spec_config=None,
+    )
+    metadata._attention_runtime_features = None
+    metadata.mapping = None
+    metadata._buffers = SimpleNamespace(cache_indirection=None)
+    metadata._host_uploader = None
+    metadata.keep_steady_growth_blocks = False
+    manager = object()
+
+    for attempt in range(2):
+        with pytest.raises(ValueError, match="requires the QSA sparse attention backend"):
+            metadata.setup_attention(manager)
+        assert metadata.attn_metadata is None, attempt
+    assert built == [manager, manager]

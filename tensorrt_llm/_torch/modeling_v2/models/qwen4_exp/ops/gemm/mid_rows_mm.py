@@ -30,6 +30,19 @@ at kernel start, and the CTA gives up its tensor-memory allocation permit as soo
 allocated, so a CTA of the next launch is scheduled beside it (two CTAs an SM) and fills its
 own ring meanwhile. `fp8_row_quant` releases its dependents at its start, so the GEMM after it
 launches and streams its weight while the quantization runs.
+
+Inject mode (`mid_mm_inject`, compile-time `inj` = C, bf16 split-K only): the output projection
+of an attention-DP block also performs the next hyper-connection site's injection. The owner of
+a unit (32 weight rows = 32 hidden columns, 4 activation rows) sums its `KS` partials in rank
+order as above and rounds them to bf16 (`b`, the bits the plain GEMM stores), but does not store
+`b`. For each of the unit's rows and the C streams it stores the injected residual
+`hc'[r, s H + n] = bf16(fma(inject[r, s], b, hc[r, s H + n]))` (the statement of
+`qwen4_exp_hc_inject_norm`, so `hc'` is bitwise that op's residual), the stream before its rstd
+`y[r, s H + n] = bf16(hc' * (1 + w[s H + n]))`, and the unit's sum of `hc'^2` into
+`ss[r, s, n // 32]` (fp32, a fixed order). The norm is a reduction over the whole row, which
+no CTA owns, so the rstd is left to the consumers (the first projection's `ss` form). `hc` and
+`inject` are the previous launches' outputs: the store loop reads them behind the accumulator,
+so behind the TMA warp's grid-dependency wait, with coherent loads.
 """
 
 from __future__ import annotations
@@ -105,8 +118,13 @@ def _ldg_v4(addr, *, loc=None, ip=None):
 
 @dsl_user_op
 def _ldg_f32(addr, *, loc=None, ip=None):
+    """One fp32 from global by a coherent load. Not `ld.global.nc`: the activation scales are
+    the previous launch's output, read after a `griddepcontrol.wait` that is not the kernel's
+    first statement, and ptxas may hoist a non-coherent load above such a wait (it treats the
+    data as read-only for the kernel's lifetime). `test_modeling_v2_mid_rows_mm_sass.py` holds
+    every variant to no non-coherent global load."""
     return cutlass.Float32(
-        _asm(T.f32(), [cutlass.Int64(addr)], "ld.global.nc.f32 $0, [$1];", "=f,l", loc, ip, True)
+        _asm(T.f32(), [cutlass.Int64(addr)], "ld.global.f32 $0, [$1];", "=f,l", loc, ip, True)
     )
 
 
@@ -273,6 +291,81 @@ def _mbar_expect_tx(addr, nbytes, *, loc=None, ip=None):
         loc,
         ip,
         True,
+    )
+
+
+@dsl_user_op
+def _ldg_bf16(addr, *, loc=None, ip=None):
+    """One bf16 from global as fp32 (exact), by a coherent load (see `_ldg_f32`)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Int64(addr)],
+            "{ .reg .b16 h; ld.global.b16 h, [$1]; cvt.f32.bf16 $0, h; }",
+            "=f,l",
+            loc,
+            ip,
+            True,
+        )
+    )
+
+
+@dsl_user_op
+def _fma_rn(a, b, c, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(a), cutlass.Float32(b), cutlass.Float32(c)],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _mul_rn(a, b, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(a), cutlass.Float32(b)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _add_rn(a, b, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(a), cutlass.Float32(b)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _bf16_half(w, hi: bool, *, loc=None, ip=None):
+    """The low or high bf16 of a word, as fp32 (exact)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Int32(w)],
+            "{ .reg .b32 t; and.b32 t, $1, 0xFFFF0000; mov.b32 $0, t; }"
+            if hi
+            else "{ .reg .b32 t; shl.b32 t, $1, 16; mov.b32 $0, t; }",
+            "=f,r",
+            loc,
+            ip,
+        )
     )
 
 
@@ -465,7 +558,12 @@ class _MidMm:
     the weight-scale mode (0 none / 1 one fp32 / 2 one a weight row). Runtime: the row count
     (<= mpad) and the pointers."""
 
-    def __init__(self, *, n, k, plan: Plan, mpad, fp8, w_mode, pdl):
+    def __init__(self, *, n, k, plan: Plan, mpad, fp8, w_mode, pdl, inj=0):
+        # `inj`: the stream count C of the folded injection (`mid_mm_inject`); 0: the plain GEMM.
+        self.inj = int(inj)
+        if self.inj:
+            assert self.inj == 4 and not fp8 and w_mode == 0, "inject mode: bf16, 4 streams"
+            assert plan.ks >= 2 and n % BM == 0, "inject mode: split-K, whole weight tiles"
         epi_cols = min(plan.epi, mpad)
         assert mpad % 16 == 0 and 16 <= mpad <= 256 and mpad % epi_cols == 0
         self.n, self.k, self.plan, self.mpad, self.fp8, self.w_mode, self.pdl = (
@@ -561,6 +659,11 @@ class _MidMm:
         out_t: cute.Tensor,
         sx_ptr: cute.Pointer,
         sw_ptr: cute.Pointer,
+        hc_ptr: cute.Pointer,
+        inj_ptr: cute.Pointer,
+        nw_ptr: cute.Pointer,
+        y_ptr: cute.Pointer,
+        ss_ptr: cute.Pointer,
         stream: cuda.CUstream,
     ):
         k = self.k
@@ -590,6 +693,11 @@ class _MidMm:
             w_ptr.toint(),
             sx_ptr.toint(),
             sw_ptr.toint(),
+            hc_ptr.toint(),
+            inj_ptr.toint(),
+            nw_ptr.toint(),
+            y_ptr.toint(),
+            ss_ptr.toint(),
             m,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
@@ -628,6 +736,11 @@ class _MidMm:
         w_base: cutlass.Int64,
         sx_base: cutlass.Int64,
         sw_base: cutlass.Int64,
+        hc_base: cutlass.Int64,
+        inj_base: cutlass.Int64,
+        nw_base: cutlass.Int64,
+        y_base: cutlass.Int64,
+        ss_base: cutlass.Int64,
         m: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1036,15 +1149,99 @@ class _MidMm:
                             sc = _ldg_f32(sw_base + cutlass.Int64(n2) * 4)
                         if const_expr(self.fp8):
                             s4 = _lds_v4f(sx_s + cq * 16)
-                        for e in cutlass.range_constexpr(4):
-                            v = acc[e] * sc
-                            if const_expr(self.fp8):
-                                v = v * s4[e]
-                            if cq * 4 + e < m:
-                                _stg_bf16(
-                                    out_base
-                                    + (cutlass.Int64(cq * 4 + e) * self.n + cutlass.Int64(n2)) * 2,
-                                    v,
+                        if const_expr(self.inj == 0):
+                            for e in cutlass.range_constexpr(4):
+                                v = acc[e] * sc
+                                if const_expr(self.fp8):
+                                    v = v * s4[e]
+                                if cq * 4 + e < m:
+                                    _stg_bf16(
+                                        out_base
+                                        + (cutlass.Int64(cq * 4 + e) * self.n + cutlass.Int64(n2))
+                                        * 2,
+                                        v,
+                                    )
+                        else:
+                            # Inject mode (module docstring): `out_base` is `hc'`; the
+                            # unit's first mailbox slot (512 bytes) is dead once every
+                            # lane has loaded its partials. Every lane of the warp runs
+                            # this (N is a multiple of BM), so the full-mask warp syncs
+                            # are safe; the row count is a multiple of 4 (no row guard).
+                            ub = mbox + (j * ks) * 512
+                            nc: cutlass.Constexpr = self.inj
+                            wid: cutlass.Constexpr = self.inj * self.n
+                            r0 = cq * 4
+                            # Every lane has loaded its partials before any lane
+                            # overwrites the slot.
+                            cute.arch.sync_warp()
+                            # (a) The unit's block output rounded to bf16, as
+                            # [row][column], into the slot.
+                            for e in cutlass.range_constexpr(4):
+                                _sts_bf16(ub + (e * 32 + ln) * 2, acc[e] * sc)
+                            cute.arch.sync_warp()
+                            # (b) Two items a lane; an item is 8 columns (16 bytes) of
+                            # one (row, stream): lane -> (column group g_, stream s_,
+                            # row pair).
+                            g_ = ln % 4
+                            s_ = (ln // 4) % nc
+                            col0 = n0 + w_ * 32 + g_ * 8
+                            sc0 = cutlass.Int64(s_) * self.n + cutlass.Int64(col0)
+                            ww = _ldg_v4(nw_base + sc0 * 2)
+                            xws = []
+                            gss = []
+                            els = []
+                            for h in cutlass.range_constexpr(2):
+                                rw = cutlass.Int64(r0 + ln // 16 + 2 * h)
+                                el = (rw * wid + sc0) * 2
+                                els.append(el)
+                                xws.append(_ldg_v4(hc_base + el))
+                                gss.append(_ldg_bf16(inj_base + (rw * nc + cutlass.Int64(s_)) * 2))
+                            w1 = [
+                                _add_rn(_bf16_half(ww[i // 2], i % 2 == 1), cutlass.Float32(1.0))
+                                for i in range(8)
+                            ]
+                            for h in cutlass.range_constexpr(2):
+                                e_ = ln // 16 + 2 * h
+                                bw = _lds_v4(ub + (e_ * 32 + g_ * 8) * 2)
+                                hw = []
+                                yw = []
+                                sq = cutlass.Float32(0.0)
+                                for p in cutlass.range_constexpr(4):
+                                    x0 = _fma_rn(
+                                        gss[h],
+                                        _bf16_half(bw[p], False),
+                                        _bf16_half(xws[h][p], False),
+                                    )
+                                    x1 = _fma_rn(
+                                        gss[h], _bf16_half(bw[p], True), _bf16_half(xws[h][p], True)
+                                    )
+                                    wd = _bf16x2(x0, x1)
+                                    f0 = _bf16_half(wd, False)
+                                    f1 = _bf16_half(wd, True)
+                                    hw.append(wd)
+                                    yw.append(
+                                        _bf16x2(_mul_rn(f0, w1[2 * p]), _mul_rn(f1, w1[2 * p + 1]))
+                                    )
+                                    sq = _fma_rn(f0, f0, sq)
+                                    sq = _fma_rn(f1, f1, sq)
+                                _stg_v4(out_base + els[h], hw[0], hw[1], hw[2], hw[3])
+                                _stg_v4(y_base + els[h], yw[0], yw[1], yw[2], yw[3])
+                                _sts_f32(ub + 256 + ((e_ * nc + s_) * 4 + g_) * 4, sq)
+                            # Every lane's 8-column sums are in the slot before (c).
+                            cute.arch.sync_warp()
+                            # (c) One lane a (row, stream) sums its four 8-column
+                            # sums, ((g0 + g1) + (g2 + g3)).
+                            if ln < 4 * nc:
+                                p4 = _lds_v4f(ub + 256 + ln * 16)
+                                _stg_f32(
+                                    ss_base
+                                    + (
+                                        (cutlass.Int64(r0 + ln // nc) * nc + cutlass.Int64(ln % nc))
+                                        * (self.n // 32)
+                                        + cutlass.Int64(nt * 4 + w_)
+                                    )
+                                    * 4,
+                                    _add_rn(_add_rn(p4[0], p4[1]), _add_rn(p4[2], p4[3])),
                                 )
 
 
@@ -1101,9 +1298,89 @@ def _compiled_mm(n: int, k: int, plan: Plan, mpad: int, fp8: bool, w_mode: int, 
         from_dlpack(out, assumed_align=16).mark_layout_dynamic(leading_dim=1),
         make_ptr(cutlass.Float32, s.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, s.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        # The inject mode's five pointers: never read by the plain GEMM.
+        *[make_ptr(dt, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16) for _ in range(5)],
         _stream(),
         options="--opt-level 2 --enable-tvm-ffi",
     )
+
+
+#: Hidden columns of one inject-mode unit: the last dimension of `ss` is N / 32.
+INJECT_UNIT_COLS = 32
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_mm_inject(n: int, k: int, plan: Plan, mpad: int, pdl: bool, hc: int):
+    """`_compiled_mm` for the bf16 split-K GEMM in inject mode (`inj` = `hc`)."""
+    kern = _MidMm(n=n, k=k, plan=plan, mpad=mpad, fp8=False, w_mode=0, pdl=pdl, inj=hc)
+    assert kern.smem_bytes() <= _SMEM_CAP, (plan, kern.smem_bytes())
+    dev = "cuda"
+    bf, gm = cutlass.BFloat16, cute.AddressSpace.gmem
+    x = torch.empty(64, dtype=torch.uint8, device=dev)
+    out = torch.empty(4, hc * n, dtype=torch.bfloat16, device=dev)
+    s = torch.empty(4, dtype=torch.float32, device=dev)
+    return cute.compile(
+        kern,
+        cutlass.Int32(4),
+        make_ptr(bf, x.data_ptr(), gm, assumed_align=16),
+        make_ptr(bf, x.data_ptr(), gm, assumed_align=16),
+        from_dlpack(out, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+        make_ptr(cutlass.Float32, s.data_ptr(), gm, assumed_align=4),
+        make_ptr(cutlass.Float32, s.data_ptr(), gm, assumed_align=16),
+        make_ptr(bf, x.data_ptr(), gm, assumed_align=16),
+        make_ptr(bf, x.data_ptr(), gm, assumed_align=16),
+        make_ptr(bf, x.data_ptr(), gm, assumed_align=16),
+        make_ptr(bf, x.data_ptr(), gm, assumed_align=16),
+        make_ptr(cutlass.Float32, s.data_ptr(), gm, assumed_align=16),
+        _stream(),
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+def mid_mm_inject(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    plan: Plan,
+    hc: torch.Tensor,
+    inject: torch.Tensor,
+    norm_w: torch.Tensor,
+    pdl: bool = True,
+    mpad: int | None = None,
+    compile_only: bool = False,
+):
+    """`x [M, K] @ w [N, K]^T` (bf16, both contiguous) on the split-K GEMM in inject mode, with
+    the next hyper-connection site's operands: `hc [M, C N]` the residual, `inject [M, C]` the
+    injection, `norm_w [C N]` the site's norm weight (all bf16, contiguous, 16-byte aligned), C
+    = 4, M a multiple of 4. Returns fresh `(hc', y, ss)`: bf16 `[M, C N]` twice and fp32
+    `[M, C, N / 32]` (module docstring); the projection output itself is not stored.
+    `compile_only`: compile the kernel and launch nothing (placeholder operands allowed)."""
+    m, k = x.shape
+    n = w.shape[0]
+    c = inject.shape[1]
+    mpad = mma_rows(m) if mpad is None else mpad
+    fn = _compiled_mm_inject(n, k, plan, mpad, bool(pdl and _env_pdl()), c)
+    if compile_only:
+        return None
+    assert x.dtype == w.dtype == hc.dtype == inject.dtype == norm_w.dtype == torch.bfloat16
+    assert m % 4 == 0 and m <= mpad and tuple(hc.shape) == (m, c * n) and norm_w.numel() == c * n
+    hc_out = torch.empty((m, c * n), dtype=torch.bfloat16, device=x.device)
+    y = torch.empty((m, c * n), dtype=torch.bfloat16, device=x.device)
+    ss = torch.empty((m, c, n // INJECT_UNIT_COLS), dtype=torch.float32, device=x.device)
+    unused = hc_out.data_ptr()  # the FP8 mode's scale pointers: not read
+    fn(
+        m,
+        x.data_ptr(),
+        w.data_ptr(),
+        hc_out,
+        unused,
+        unused,
+        hc.data_ptr(),
+        inject.data_ptr(),
+        norm_w.data_ptr(),
+        y.data_ptr(),
+        ss.data_ptr(),
+    )
+    return hc_out, y, ss
 
 
 def fp8_row_quant(x: torch.Tensor, pdl: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1130,18 +1407,28 @@ def mid_mm_raw(
     sx: torch.Tensor | None = None,
     sw: torch.Tensor | None = None,
     pdl: bool = True,
+    mpad: int | None = None,
 ) -> torch.Tensor:
     """The GEMM alone: `x [M, K]` (e4m3 with `sx [M]`, or bf16) contiguous, `w [N, K]` of the
-    same dtype contiguous, `sw` None / fp32 [1] / fp32 [N]. Returns a fresh bf16 `[M, N]`."""
+    same dtype contiguous, `sw` None / fp32 [1] / fp32 [N]. Returns a fresh bf16 `[M, N]`.
+    `mpad`: the MMA N (a multiple of 16, at least `M`, and a multiple of the plan's epilogue
+    width `min(plan.epi, mpad)`); default `mma_rows(M)`. A row's output depends on that row
+    alone and TMA zero-fills the tile past `M`, so any such `mpad` gives the same bits; a
+    smaller one streams fewer activation bytes."""
     m, k = x.shape
     n = w.shape[0]
     fp8 = x.dtype == torch.float8_e4m3fn
     assert w.dtype == x.dtype and w.shape[1] == k and x.is_contiguous() and w.is_contiguous()
     assert 1 <= m <= MAX_ROWS and n % 16 == 0
     assert fp8 == (sx is not None)
+    mpad = mma_rows(m) if mpad is None else mpad
+    assert m <= mpad <= MAX_ROWS and mpad % 16 == 0, (m, mpad)
+    # The epilogue stores `min(plan.epi, mpad)` columns a pass: checked here, before the output
+    # is allocated or the kernel compiled.
+    assert mpad % min(plan.epi, mpad) == 0, f"mpad {mpad} is not a multiple of epi {plan.epi}"
     w_mode = 0 if sw is None else (1 if sw.numel() == 1 else 2)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    fn = _compiled_mm(n, k, plan, mma_rows(m), fp8, w_mode, bool(pdl and _env_pdl()))
+    fn = _compiled_mm(n, k, plan, mpad, fp8, w_mode, bool(pdl and _env_pdl()))
     dummy = out.data_ptr()
     fn(
         m,
@@ -1150,6 +1437,11 @@ def mid_mm_raw(
         out,
         dummy if sx is None else sx.data_ptr(),
         dummy if sw is None else sw.data_ptr(),
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
     )
     return out
 

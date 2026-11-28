@@ -120,8 +120,8 @@ class CausalConv1dTritonUpdate(OpWrapper):
     # deep, default 1), slots, snapshots (rows of the snapshot buffer),
     # snapshot_steps (the buffer's step depth, default seqlen), snapshot_layers
     # (the buffer the first layer's view of one this many layers deep, default
-    # 1), launch_dependent_kernels (default False). Every cell is the call site: `x` the
-    # token-major q|k|v columns of a
+    # 1), launch_dependent_kernels, launch_with_pdl_wait, hoist_x (default False each).
+    # Every cell is the call site: `x` the token-major q|k|v columns of a
     # [n * p, x_row_stride] projection seen as [n, C, p], bf16, W 4, no bias,
     # SiLU, pad_slot_id -1, no accepted-token roll.
     CELLS: tuple[Cell, ...] = tuple(
@@ -163,6 +163,16 @@ class CausalConv1dTritonUpdate(OpWrapper):
         Cell(
             why="tep4 verify, 4 rows x 4 tok, launch_dependent_kernels (largest ll graph batch)",
             spec=dict(_tep4(4, 4), launch_dependent_kernels=True),
+        ),
+        Cell(
+            why="tep4 verify, 1 row x 4 tok, PDL wait on the in_proj + hoisted x + replay chain",
+            spec=dict(
+                _tep4(1, 4), launch_dependent_kernels=True, launch_with_pdl_wait=True, hoist_x=True
+            ),
+        ),
+        Cell(
+            why="tep4 verify, 8 rows x 4 tok (32 rows), PDL wait on the in_proj + hoisted x",
+            spec=dict(_tep4(8, 4), launch_with_pdl_wait=True, hoist_x=True),
         ),
         Cell(
             why="tep4 verify, 128 rows (max_batch_size) x 4 tok (MTP3) at 2560 / stride 4120",
@@ -233,6 +243,14 @@ class CausalConv1dTritonUpdate(OpWrapper):
     `griddepcontrol.launch_dependents` at the kernel's start: certified at the tep4 shape,
     1 and 4 rows x 4 tokens, held to the reference like every other cell.
 
+    `launch_with_pdl_wait=True` (a tep4 rank's verify step at 4..32 rows: the conv is a PDL
+    dependent of the input projection that writes `x`) launches the kernel with programmatic
+    dependent launch and reads `x` only after `griddepcontrol.wait`; the slots, the taps, the
+    pool and the snapshot rows (data of earlier steps) may be read before it. `hoist_x=True`
+    (width 4, no accepted-token roll, no tree) loads every token's x row before the first store;
+    same values and arithmetic. Both are the kernel's own (`causal_conv1d_triton`), certified at
+    the tep4 shape, 1 and 8 rows x 4 tokens, held to the reference like every other cell.
+
     Accepted but not exposed: `cache_seqlens` (ignored by the kernel --
     there is no ring mode), the eagle-tree mask trio, `validate_data`,
     `metadata`, the `_block_n`/`_num_warps`/`_num_stages` overrides. A
@@ -260,6 +278,8 @@ class CausalConv1dTritonUpdate(OpWrapper):
         intermediate_conv_window: Optional[torch.Tensor] = None,
         intermediate_state_indices: Optional[torch.Tensor] = None,
         launch_dependent_kernels: bool = False,
+        launch_with_pdl_wait: bool = False,
+        hoist_x: bool = False,
     ) -> torch.Tensor:
         return _causal_conv1d_triton_update(
             x,
@@ -273,6 +293,8 @@ class CausalConv1dTritonUpdate(OpWrapper):
             intermediate_state_indices=intermediate_state_indices,
             pad_slot_id=pad_slot_id,
             launch_dependent_kernels=launch_dependent_kernels,
+            launch_with_pdl_wait=launch_with_pdl_wait,
+            hoist_x=hoist_x,
         )
 
     def reference(
@@ -288,9 +310,12 @@ class CausalConv1dTritonUpdate(OpWrapper):
         intermediate_conv_window: Optional[torch.Tensor] = None,
         intermediate_state_indices: Optional[torch.Tensor] = None,
         launch_dependent_kernels: bool = False,
+        launch_with_pdl_wait: bool = False,
+        hoist_x: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """`(out, conv_state, intermediate_conv_window)` as the call leaves
-        them; mutates nothing. `launch_dependent_kernels` is ignored.
+        them; mutates nothing. `launch_dependent_kernels`, `launch_with_pdl_wait` and `hoist_x`
+        (launch attributes and a load order) are ignored.
 
         Rows the op leaves unwritten (padded) are NaN in `out`; the test
         skips them. Products are formed in the operand dtype, as the kernel
@@ -348,6 +373,8 @@ class CausalConv1dTritonUpdate(OpWrapper):
         intermediate_conv_window: Optional[torch.Tensor] = None,
         intermediate_state_indices: Optional[torch.Tensor] = None,
         launch_dependent_kernels: bool = False,
+        launch_with_pdl_wait: bool = False,
+        hoist_x: bool = False,
     ) -> None:
         dim = x.shape[1]
         seqlen = 1 if x.dim() == 2 else x.shape[2]

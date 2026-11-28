@@ -173,6 +173,84 @@ def test_second_expert_copy_kept_only_where_its_launches_can_happen(
     assert M._moe_prefill_copy(one_rank, backend, max_num_tokens) is kept
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "one_rank, prefill_router, rows, launches",
+    [
+        (True, True, 12288, [12288]),
+        (True, True, 16384, [16384]),
+        (True, True, 24576, [24576]),
+        (True, True, 8192, [8192]),
+        (True, True, 24577, [8192, 8192, 8192, 1]),
+        (True, False, 12288, [8192, 4096]),
+        (False, True, 12288, [8192, 4096]),
+    ],
+)
+def test_one_rank_context_launch_up_to_24576_rows_is_one_runner_call(
+    monkeypatch, one_rank, prefill_router, rows, launches
+):
+    """Without the CuteDSL copy a one-rank context launch of 8193..24576 rows is one runner
+    call; its router logits still come from 8192-row GEMMs (cuBLAS picks its kernel by the row
+    count). A decode router, another layout or more rows keep the chunks."""
+    router_rows, runner_rows = [], []
+
+    def router(x, w):
+        router_rows.append(x.shape[0])
+        # Each row's id (exact in fp32) from its two bf16 digits.
+        ids = x[:, 0].float() * 256 + x[:, 1].float()
+        return ids[:, None].expand(-1, 4).contiguous()
+
+    def runner(logits, xq, xsf, *args):
+        assert xsf.numel() == xq.shape[0] * 2
+        ids = logits[:, 0].long()
+        # The codes and block scales handed with each chunk belong to the chunk's rows.
+        assert torch.equal(xq[:, 0].long(), ids % 256) and torch.equal(xq[:, 1].long(), ids // 256)
+        assert torch.equal(xsf.view(torch.uint8).view(-1, 2)[:, 0].long(), ids % 256)
+        runner_rows.append(logits.shape[0])
+        return logits[:, :1].expand(-1, 8).contiguous()
+
+    monkeypatch.setattr(M, "cublas_mm", router)
+    monkeypatch.setattr(M, "fp4_block_scale_moe_renorm_routed", runner)
+    core = SimpleNamespace(
+        one_rank=one_rank,
+        trunk_moe_backend="TRTLLM",
+        num_experts=4,
+        topk=2,
+        expert_inter=8,
+        expert_offset=0,
+        local_experts=4,
+    )
+    layer = SimpleNamespace(
+        router=None,
+        fc1_w_cd=None,
+        fc1_w=None,
+        fc1_s=None,
+        fc2_w=None,
+        fc2_s=None,
+        out1_scale=None,
+        out1_gate_scale=None,
+        out2_scale=None,
+    )
+    ids = torch.arange(rows)
+    x = torch.zeros(rows, 32, dtype=torch.bfloat16)
+    x[:, 0], x[:, 1] = (ids // 256).to(torch.bfloat16), (ids % 256).to(torch.bfloat16)
+    # NVFP4 codes (two a byte) and linear e4m3 block scales (one per 16 columns), flat; row-
+    # distinct, so a chunk handed another chunk's codes or scales fails the runner's check.
+    codes = torch.zeros(rows, 16, dtype=torch.uint8)
+    codes[:, 0], codes[:, 1] = (ids % 256).to(torch.uint8), (ids // 256).to(torch.uint8)
+    scales = torch.zeros(rows, 2, dtype=torch.uint8)
+    scales[:, 0] = (ids % 256).to(torch.uint8)
+    fp4 = (codes, scales.view(-1))
+    out = M._routed_experts(
+        core, x, layer, fp4, router if prefill_router else (lambda x, w: router(x, w))
+    )
+    assert out.shape == (rows, 8)
+    # Every row's output is its own, in row order, across the chunk boundaries.
+    assert torch.equal(out[:, 0], ids.float())
+    assert runner_rows == launches
+    assert router_rows == [min(8192, rows - lo) for lo in range(0, rows, 8192)]
+
+
 # ---- CuteDSL: the experts' geometry and gates ---------------------------------------------
 
 #: The trunk's routed experts: count, top-k, hidden, intermediate, NVFP4 block.
@@ -657,8 +735,13 @@ def test_draft_shared_expert_overlap_preserves_serial_output(draft_experts, rows
         sh_gate=sh_gu[2 * INTER :].t(),
     )
     target = object.__new__(M.DecodeTarget)
+    # One rank: the routed window is `_mtp_routed_nvfp4`, as `serial` composes it.
     target.core = SimpleNamespace(
-        **vars(core), _mtp=weights, _side_stream=torch.cuda.Stream(), shared_inter=INTER
+        **vars(core),
+        _mtp=weights,
+        _side_stream=torch.cuda.Stream(),
+        shared_inter=INTER,
+        one_rank=True,
     )
     x = torch.randn(rows, H, generator=gen, device=DEV).to(torch.bfloat16)
 

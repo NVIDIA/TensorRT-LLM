@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA sparse GQA for context batches: several query rows per program, K/V read once per tile.
 
-The first launch turns each row's selection (the columns the prefill bound
-lets it read) into a bitmap over logical token positions. A plan launch forms,
-per group of consecutive rows of one request, the union of its rows' resident
-selected tokens as a packed list of physical cache slots, and each row's
-bitmap re-indexed onto that list. The row-tile launch is persistent: one
+A plan launch forms, per group of consecutive rows of one request, the union of
+its rows' resident selected tokens (the columns the prefill bound lets each row
+read) as a packed list of physical cache slots, and each row's selection
+re-indexed onto that list as bits (the group plan, one CTA a group holding the
+union in shared memory; where it does not fit, a bitmap pass over the table's
+logical tokens and a plan pass over those bitmaps). The row-tile launch is persistent: one
 program per SM takes (group, KV head) items longest first and walks each packed
 list in 64-slot tiles, each tile's K/V loaded once for every row and head of the
 group, each row masked to its own bits. A group whose rows span requests
@@ -20,8 +21,10 @@ width.
 
 from __future__ import annotations
 
+import functools
 import math
 
+import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -246,6 +249,630 @@ def _row_bits(
         _ROW_BITS[key] = fn
     fn(*args, rows)
     return bits, row_info
+
+
+# --------------------------------------------------------------------------------------
+# The group plan (CuTe DSL): the bitmap pass and the plan pass in one launch, one CTA a row
+# group, 128 threads. The entry takes it wherever it fits (`_group_plan_fits`); a launch it does
+# not fit takes the two passes below it (`_row_bits`, `_rowtile_plan_kernel`).
+#
+# The two passes it replaces write, per row, a bitmap over every logical token of the block
+# table (4034 words a row at an 8068-page table: 0.53 GB a 16,384-row launch) and then, per
+# group, walk every 64-token word up to the group's highest token (64 words x 64 lanes a loop
+# step): work that follows the request's history, 1.1 ms a layer at 90k tokens of it (GB300,
+# a 16384-row launch: 13.3 ms a 12-layer step per 100k tokens of one request's history, against
+# 0.04 for the group plan; 14.7 -> 3.4 ms a step at 16384 rows over 4 x 87.5k tokens). Here a
+# CTA holds its group's union bitmap in shared memory (8 B a word of the table) and
+#   stage   a row's selection is staged in shared memory with coalesced loads, as the bitmap
+#           pass stages it (a warp's load is 128 contiguous bytes; a thread issues its loads
+#           before it stores any), a row ahead of the row being walked (two buffers);
+#   pass 1  walks the group's selected columns (16 consecutive columns a thread a row, as the
+#           bitmap pass does), ORs each readable token into the union (one
+#           `red.shared.or.b64` a run of columns in one word) and reduces each row's highest
+#           readable token (`row_info`, exactly the bitmap pass's);
+#   prefix  clears the tokens of pages that are not resident (a word of the union spans
+#           64 / tokens_per_block table pages: their entries are loaded a word, not a token)
+#           and counts the union's bits before each word (a shuffle scan a warp);
+#   list    writes each set bit's physical slot `page * tokens_per_block + offset` at its rank
+#           (the page entries are still in the thread's registers);
+#   pass 2  walks the columns again and sets, per row, the bit at each selected token's rank
+#           (`packed_bits`, staged in shared memory a row, written out while the next row
+#           is walked);
+#   plan    `group_plan[group] = (tiles or -1, listed)` by the plan pass's rule, and the rows of
+#           a group the row-tile pass does not take appended to the lone list.
+# What it writes is what the two passes write: `slots[group, :listed]`, `packed_bits` (words
+# past a group's list stay zero), `group_plan`, `row_info`, the lone count and the lone rows
+# (their order in the list is the launch's, as the plan pass's is). A group whose rows span
+# requests lists nothing and joins the lone list, as the plan pass does. Both walks take four
+# columns at a time where they hold four consecutive tokens of one 4-aligned block (the
+# expansion's shape) and a column at a time elsewhere, so nothing about the selection's shape
+# is assumed: any int32 selection the two passes take gives the same outputs.
+# --------------------------------------------------------------------------------------
+
+_GP_THREADS = 128
+#: Consecutive selected columns a thread walks.
+_GP_RUN = 16
+#: The CTA's shared memory: the union bitmap, the prefix counts and one row's re-indexed bits.
+_GP_MAX_SMEM = 200 << 10  # capacity: fixed: a launch above it takes the two passes
+_GP_MAX_ROWS = 32  # capacity: fixed: rows a group (10 at a dep4 rank, 20 at a tp4 / tep4 one)
+#: The plan the last `qsa_rowtile_sparse_gqa` call took, "group plan" or "two passes": read by
+#: the target's context-forms log line (diagnostic only; no launch reads it).
+last_plan = ""
+
+
+@dsl_user_op
+def _red_max_shared(addr, val, *, loc=None, ip=None):
+    llvm.inline_asm(
+        T.i32(),
+        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+        "{ red.shared.max.s32 [$1], $2; mov.u32 $0, 0; }",
+        "=r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+class _GroupPlanKernel:
+    """`slots`, `packed_bits`, `group_plan`, `row_info` and the lone list, one CTA a group."""
+
+    def __init__(
+        self, topk, compress_ratio, tokens_per_block, table_width, rows_per_tile, packed_words
+    ):  # fmt: skip
+        self.topk, self.cr, self.tpb = topk, compress_ratio, tokens_per_block
+        self.width = table_width
+        self.block_topk = (topk - compress_ratio + 1) // compress_ratio
+        self.num_words = (table_width * tokens_per_block + 63) // 64
+        self.rpt, self.packed_words = rows_per_tile, packed_words
+        self.chunk = (self.num_words + _GP_THREADS - 1) // _GP_THREADS
+        self.pk_chunk = (packed_words + _GP_THREADS - 1) // _GP_THREADS
+        self.runs = (topk + _GP_THREADS * _GP_RUN - 1) // (_GP_THREADS * _GP_RUN)
+        # A 64-token word of the union spans `ppw` table pages; page p of a word holds the
+        # bits `page_masks[p]` (as a signed 64-bit constant).
+        assert 64 % tokens_per_block == 0
+        self.ppw = 64 // tokens_per_block
+        masks = [((1 << tokens_per_block) - 1) << (p * tokens_per_block) for p in range(self.ppw)]
+        self.page_masks = [m - (1 << 64) if m >= (1 << 63) else m for m in masks]
+        #: A staged row: its columns with one padding slot every `_GP_RUN` (conflict-free runs).
+        self.staged = topk + topk // _GP_RUN + 1
+        self.stage_loads = (topk + _GP_THREADS - 1) // _GP_THREADS
+        self.smem_bytes = self.smem(
+            topk, table_width, tokens_per_block, rows_per_tile, packed_words
+        )
+
+    @staticmethod
+    def smem(topk, table_width, tokens_per_block, rows_per_tile, packed_words) -> int:
+        """Shared memory of a CTA: the union (8 B a word) and its prefix counts (4 B), two
+        staged rows, two rows of re-indexed bits, the per-row scalars."""
+        num_words = (table_width * tokens_per_block + 63) // 64
+        staged = topk + topk // _GP_RUN + 1
+        return (
+            num_words * 12 + 2 * staged * 4 + 2 * packed_words * 8
+            + (3 * rows_per_tile + _GP_THREADS // 32) * 4 + 256
+        )  # fmt: skip
+
+    @cute.jit
+    def __call__(
+        self,
+        sel: cute.Pointer, qp: cute.Pointer, req: cute.Pointer, table: cute.Pointer,
+        slots: cute.Pointer, packed: cute.Pointer, plan: cute.Pointer, info: cute.Pointer,
+        lone: cute.Pointer, lone_count: cute.Pointer,
+        rows: cutlass.Int32, num_groups: cutlass.Int32, num_requests: cutlass.Int32,
+        num_pages: cutlass.Int32, sel_stride: cutlass.Int32,
+        table_stride_request: cutlass.Int32, table_stride_page: cutlass.Int32,
+        slots_stride: cutlass.Int32, packed_stride: cutlass.Int32,
+        stream,
+    ):  # fmt: skip
+        self.kernel(
+            sel, qp, req, table, slots, packed, plan, info, lone, lone_count,
+            rows, num_requests, num_pages, sel_stride, table_stride_request, table_stride_page,
+            slots_stride, packed_stride,
+        ).launch(
+            grid=[num_groups, 1, 1],
+            block=[_GP_THREADS, 1, 1],
+            smem=self.smem_bytes,
+            stream=stream,
+        )  # fmt: skip
+
+    @cute.jit
+    def columns_read(self, position: cutlass.Int32):
+        """The columns the per-row kernel reads: the prefill bound rounded up to its tile (the
+        bitmap pass's `columns_read`)."""
+        visible = position + 1
+        selected_blocks = cutlass.min(visible // self.cr, cutlass.Int32(self.block_topk))
+        valid = selected_blocks * self.cr + visible % self.cr
+        bounded = cutlass.min(valid, cutlass.Int32(self.topk))
+        columns = cutlass.min(
+            (bounded + _BOUND_TILE - 1) // _BOUND_TILE * _BOUND_TILE, cutlass.Int32(self.topk)
+        )
+        return cutlass.max(columns, cutlass.Int32(0))
+
+    @cute.jit
+    def stage(
+        self, sel: cute.Pointer, sel_stride: cutlass.Int32, row: cutlass.Int32,
+        tidx: cutlass.Int32, sel_s, at: cutlass.Int32,
+    ):  # fmt: skip
+        """A row's selection into shared memory at `at`, one padding slot every `_GP_RUN`
+        columns: thread t loads columns t, t + 128, .. (a warp's load is 128 contiguous
+        bytes), all of them before it stores any (the loads are independent)."""
+        mSel = cute.make_tensor(
+            sel + cutlass.Int64(row) * cutlass.Int64(sel_stride), cute.make_layout((1 << 30,))
+        )
+        v = cute.make_rmem_tensor((self.stage_loads,), cutlass.Int32)
+        for i in cutlass.range_constexpr(self.stage_loads):
+            v[i] = mSel[cutlass.min(tidx + i * _GP_THREADS, cutlass.Int32(self.topk - 1))]
+        for i in cutlass.range_constexpr(self.stage_loads):
+            c = tidx + i * _GP_THREADS
+            if c < self.topk:
+                sel_s[at + c + c // _GP_RUN] = v[i]
+
+    @cute.kernel
+    def kernel(
+        self,
+        sel: cute.Pointer, qp: cute.Pointer, req: cute.Pointer, table: cute.Pointer,
+        slots: cute.Pointer, packed: cute.Pointer, plan: cute.Pointer, info: cute.Pointer,
+        lone: cute.Pointer, lone_count: cute.Pointer,
+        rows: cutlass.Int32, num_requests: cutlass.Int32, num_pages: cutlass.Int32,
+        sel_stride: cutlass.Int32, table_stride_request: cutlass.Int32,
+        table_stride_page: cutlass.Int32, slots_stride: cutlass.Int32,
+        packed_stride: cutlass.Int32,
+    ):  # fmt: skip
+        Int32, Int64 = cutlass.Int32, cutlass.Int64
+        NT = _GP_THREADS
+        R = self.rpt
+        tidx, _, _ = cute.arch.thread_idx()
+        group, _, _ = cute.arch.block_idx()
+        smem = cutlass.utils.SmemAllocator()
+        words = smem.allocate_tensor(
+            Int64, cute.make_layout((self.num_words,), stride=(1,)), byte_alignment=16
+        )
+        # Two rows' re-indexed bits and two staged rows: row j uses buffer j % 2, so the next
+        # row is staged (and the previous row's bits written out) while this one is walked.
+        pk = smem.allocate_tensor(
+            Int64, cute.make_layout((2 * self.packed_words,), stride=(1,)), byte_alignment=16
+        )
+        pref = smem.allocate_tensor(
+            Int32, cute.make_layout((self.num_words,), stride=(1,)), byte_alignment=16
+        )
+        sel_s = smem.allocate_tensor(
+            Int32, cute.make_layout((2 * self.staged,), stride=(1,)), byte_alignment=16
+        )
+        hi_s = smem.allocate_tensor(Int32, cute.make_layout((R,), stride=(1,)), byte_alignment=16)
+        # Per row of the group: its request index and the columns it reads (0 past the launch).
+        rq_s = smem.allocate_tensor(Int32, cute.make_layout((R,), stride=(1,)), byte_alignment=16)
+        cols_s = smem.allocate_tensor(Int32, cute.make_layout((R,), stride=(1,)), byte_alignment=16)
+        wt = smem.allocate_tensor(
+            Int32, cute.make_layout((NT // 32,), stride=(1,)), byte_alignment=16
+        )
+        words_base = Int32(words.iterator.toint())
+        pk_base = Int32(pk.iterator.toint())
+        hi_base = Int32(hi_s.iterator.toint())
+        mQp = cute.make_tensor(qp, cute.make_layout((1 << 30,)))
+        mReq = cute.make_tensor(req, cute.make_layout((1 << 30,)))
+        first = group * R
+        last_row = rows - 1
+
+        # The union starts empty; the rows' requests and columns; the first row staged.
+        for i in cutlass.range_constexpr(self.chunk):
+            w = tidx + i * NT
+            if w < self.num_words:
+                words[w] = Int64(0)
+        if tidx < R:
+            hi_s[tidx] = Int32(-1)
+            rq_s[tidx] = Int32(0)
+            cols_s[tidx] = Int32(0)
+            if first + tidx < rows:
+                # Range-checked at the index's own width before it narrows (an int64 2^32
+                # would read as request 0): -1 keeps an out-of-range row out of the
+                # one-request test, as the two passes' plan keeps it.
+                rq = Int64(mReq[first + tidx])
+                rq_s[tidx] = Int32(-1)
+                if rq >= Int64(0) and rq < Int64(num_requests):
+                    rq_s[tidx] = Int32(rq)
+                cols_s[tidx] = self.columns_read(Int32(mQp[first + tidx]))
+        self.stage(sel, sel_stride, cutlass.min(first, last_row), tidx, sel_s, Int32(0))
+        cute.arch.sync_threads()
+        # The group's request, as the plan pass decides it: one request, inside the table.
+        lowest = Int32(0x7FFFFFFF)
+        highest_request = Int32(-1)
+        live_rows = Int32(0)
+        own_tiles = Int32(0)
+        for j in cutlass.range_constexpr(R):
+            if first + j < rows:
+                rq = rq_s[j]
+                lowest = cutlass.min(lowest, rq)
+                highest_request = cutlass.max(highest_request, rq)
+                live_rows = live_rows + 1
+                own_tiles = own_tiles + (cols_s[j] + BLOCK_N - 1) // BLOCK_N
+        one = Int32(0)
+        request = Int32(0)
+        if lowest == highest_request and lowest >= 0 and lowest < num_requests:
+            one = Int32(1)
+            request = lowest
+        mT = cute.make_tensor(
+            table + Int64(request) * Int64(table_stride_request), cute.make_layout((1 << 30,))
+        )
+
+        # Pass 1: each row's highest readable token (a column below the bound naming a token
+        # >= 0 whose page is inside the table), and the union of the rows' readable tokens.
+        # While row j is walked from its buffer, row j + 1 is staged into the other one.
+        tq = cute.make_rmem_tensor((4,), Int32)
+        for j in cutlass.range(0, R, 1, unroll=1):
+            row = first + j
+            at = (j % 2) * self.staged
+            if j + 1 < R:
+                self.stage(
+                    sel, sel_stride, cutlass.min(row + 1, last_row), tidx, sel_s,
+                    Int32(self.staged) - at,
+                )  # fmt: skip
+            if row < rows:
+                columns = cols_s[j]
+                highest = Int32(-1)
+                for run in cutlass.range_constexpr(self.runs):
+                    c0 = (run * NT + tidx) * _GP_RUN
+                    if c0 < columns:
+                        cur_w = Int32(-1)
+                        cur_m = Int64(0)
+                        # Four columns at a time: four consecutive readable tokens of one
+                        # 4-aligned block (one word, one page) are one OR of four bits;
+                        # any other four columns are walked singly, as below.
+                        for q in cutlass.range_constexpr(_GP_RUN // 4):
+                            qc = c0 + 4 * q
+                            for k in cutlass.range_constexpr(4):
+                                cc = cutlass.min(qc + k, Int32(self.topk - 1))
+                                tq[k] = sel_s[at + cc + cc // _GP_RUN]
+                            t0 = tq[0]
+                            if (
+                                qc + 3 < columns
+                                and t0 >= 0
+                                and (t0 & 3) == 0
+                                and tq[1] == t0 + 1
+                                and tq[2] == t0 + 2
+                                and tq[3] == t0 + 3
+                                and t0 // self.tpb < self.width
+                            ):
+                                highest = cutlass.max(highest, t0 + 3)
+                                w = t0 >> 6
+                                if w != cur_w:
+                                    if cur_w >= 0:
+                                        _red_or_shared(words_base + cur_w * 8, cur_m)
+                                    cur_w = w
+                                    cur_m = Int64(0)
+                                cur_m = cur_m | (Int64(15) << Int64(t0 & 63))
+                            else:
+                                for k in cutlass.range_constexpr(4):
+                                    t = Int32(-1)
+                                    if qc + k < columns:
+                                        t = tq[k]
+                                    if t >= 0:
+                                        if t // self.tpb < self.width:
+                                            highest = cutlass.max(highest, t)
+                                            w = t >> 6
+                                            if w != cur_w:
+                                                if cur_w >= 0:
+                                                    _red_or_shared(words_base + cur_w * 8, cur_m)
+                                                cur_w = w
+                                                cur_m = Int64(0)
+                                            cur_m = cur_m | (Int64(1) << Int64(t & 63))
+                        if cur_w >= 0:
+                            _red_or_shared(words_base + cur_w * 8, cur_m)
+                if highest >= 0:
+                    _red_max_shared(hi_base + j * 4, highest)
+            cute.arch.sync_threads()
+
+        if tidx < R:
+            if first + tidx < rows:
+                mInfo = cute.make_tensor(info, cute.make_layout((1 << 30,)))
+                mInfo[(first + tidx) * 2] = hi_s[tidx]
+                mInfo[(first + tidx) * 2 + 1] = cols_s[tidx]
+
+        # Residency. Thread t owns words t, t + 128, ..: it loads the table entries of their
+        # pages first (unconditional loads, clamped inside the row, issued together; a warp's
+        # load spans 256 bytes of the row), then keeps, per word, the bits of the pages whose
+        # entry is a pool page (a group of several requests keeps nothing) and leaves the
+        # word's count in `pref`.
+        pgs = cute.make_rmem_tensor((self.chunk * self.ppw,), Int32)
+        for i in cutlass.range_constexpr(self.chunk):
+            for p in cutlass.range_constexpr(self.ppw):
+                pgs[i * self.ppw + p] = mT[
+                    cutlass.min((tidx + i * NT) * self.ppw + p, Int32(self.width - 1))
+                    * table_stride_page
+                ]
+        for i in cutlass.range_constexpr(self.chunk):
+            w = tidx + i * NT
+            if w < self.num_words:
+                keep = Int64(0)
+                for p in cutlass.range_constexpr(self.ppw):
+                    page = pgs[i * self.ppw + p]
+                    if w * self.ppw + p < self.width and page >= 0 and page < num_pages:
+                        keep = keep | Int64(self.page_masks[p])
+                m = Int64(0)
+                if one != 0:
+                    m = words[w] & keep
+                words[w] = m
+                pref[w] = Int32(cute.arch.popc(m))
+        cute.arch.sync_threads()
+        # The listed tokens before each word: thread t sums the counts of words [t * chunk,
+        # (t + 1) * chunk), a shuffle scan gives the warp's exclusive prefix, the warps' totals
+        # the rest.
+        local = Int32(0)
+        for i in cutlass.range_constexpr(self.chunk):
+            w = tidx * self.chunk + i
+            if w < self.num_words:
+                count = pref[w]
+                pref[w] = local
+                local = local + count
+        lane = tidx % 32
+        inclusive = local
+        for off in cutlass.range_constexpr(5):
+            up = cute.arch.shuffle_sync_up(inclusive, offset=1 << off)
+            if lane >= (1 << off):
+                inclusive = inclusive + up
+        if lane == 31:
+            wt[tidx // 32] = inclusive
+        cute.arch.sync_threads()
+        base = inclusive - local
+        listed = Int32(0)
+        for wi in cutlass.range_constexpr(NT // 32):
+            if wi < tidx // 32:
+                base = base + wt[wi]
+            listed = listed + wt[wi]
+        for i in cutlass.range_constexpr(self.chunk):
+            w = tidx * self.chunk + i
+            if w < self.num_words:
+                pref[w] = pref[w] + base
+        used = (listed + 63) // 64
+        if one != 0:
+            # Ahead of pass 2: both buffers of re-indexed bits zeroed, the first row staged.
+            for i in cutlass.range_constexpr(self.pk_chunk):
+                pw = tidx + i * NT
+                if pw < used:
+                    pk[pw] = Int64(0)
+                    pk[self.packed_words + pw] = Int64(0)
+            self.stage(sel, sel_stride, cutlass.min(first, last_row), tidx, sel_s, Int32(0))
+        cute.arch.sync_threads()
+
+        # The list: each set bit's physical slot at its rank, in logical order (a word's bits
+        # by its pages' entries, still in the thread's registers; the threads of a warp own
+        # consecutive words, so their stores land side by side).
+        mSlots = cute.make_tensor(
+            slots + Int64(group) * Int64(slots_stride), cute.make_layout((1 << 30,))
+        )
+        for i in cutlass.range_constexpr(self.chunk):
+            w = tidx + i * NT
+            if w < self.num_words:
+                m = words[w]
+                rank = pref[w]
+                while m != Int64(0):
+                    low = m & (Int64(0) - m)
+                    b = Int32(cute.arch.popc(low - Int64(1)))
+                    page = pgs[i * self.ppw]
+                    for p in cutlass.range_constexpr(1, self.ppw):
+                        if b >= p * self.tpb:
+                            page = pgs[i * self.ppw + p]
+                    mSlots[rank] = page * self.tpb + b % self.tpb
+                    rank = rank + 1
+                    m = m ^ low
+
+        if one != 0:
+            # Pass 2: each row's bits re-indexed onto the list. While row j is walked into its
+            # buffer of `pk` (ORs), the owner of a word writes row j - 1's out of the other
+            # buffer and zeroes it, and row j + 1 is staged; one barrier a row.
+            for j in cutlass.range(0, R + 1, 1, unroll=1):
+                row = first + j
+                at = (j % 2) * self.staged
+                pk_at = (j % 2) * self.packed_words
+                if j >= 1:
+                    if row - 1 < rows:
+                        mPacked = cute.make_tensor(
+                            packed + Int64(row - 1) * Int64(packed_stride),
+                            cute.make_layout((1 << 30,)),
+                        )
+                        for i in cutlass.range_constexpr(self.pk_chunk):
+                            pw = tidx + i * NT
+                            if pw < used:
+                                mPacked[pw] = pk[self.packed_words - pk_at + pw]
+                                pk[self.packed_words - pk_at + pw] = Int64(0)
+                if j + 1 < R:
+                    self.stage(
+                        sel, sel_stride, cutlass.min(row + 1, last_row), tidx, sel_s,
+                        Int32(self.staged) - at,
+                    )  # fmt: skip
+                if j < R and row < rows:
+                    columns = cols_s[j]
+                    for run in cutlass.range_constexpr(self.runs):
+                        c0 = (run * NT + tidx) * _GP_RUN
+                        if c0 < columns:
+                            cur_w = Int32(-1)
+                            cur_m = Int64(0)
+                            uw_w = Int32(-1)
+                            uw = Int64(0)
+                            pf = Int32(0)
+                            # Four columns at a time: four consecutive tokens of one
+                            # 4-aligned block that are all listed take four consecutive
+                            # ranks; inside one word of the row's bits they are one OR.
+                            for q in cutlass.range_constexpr(_GP_RUN // 4):
+                                qc = c0 + 4 * q
+                                for k in cutlass.range_constexpr(4):
+                                    cc = cutlass.min(qc + k, Int32(self.topk - 1))
+                                    tq[k] = sel_s[at + cc + cc // _GP_RUN]
+                                t0 = tq[0]
+                                fast = Int32(0)
+                                if (
+                                    qc + 3 < columns
+                                    and t0 >= 0
+                                    and (t0 & 3) == 0
+                                    and tq[1] == t0 + 1
+                                    and tq[2] == t0 + 2
+                                    and tq[3] == t0 + 3
+                                    and t0 // self.tpb < self.width
+                                ):
+                                    w = t0 >> 6
+                                    if w != uw_w:
+                                        uw_w = w
+                                        uw = words[w]
+                                        pf = pref[w]
+                                    first_bit = Int64(1) << Int64(t0 & 63)
+                                    four = Int64(15) << Int64(t0 & 63)
+                                    if (uw & four) == four:
+                                        rank = pf + Int32(
+                                            cute.arch.popc(uw & (first_bit - Int64(1)))
+                                        )
+                                        if (rank & 63) <= 60:
+                                            fast = Int32(1)
+                                            pw = pk_at + (rank >> 6)
+                                            if pw != cur_w:
+                                                if cur_w >= 0:
+                                                    _red_or_shared(pk_base + cur_w * 8, cur_m)
+                                                cur_w = pw
+                                                cur_m = Int64(0)
+                                            cur_m = cur_m | (Int64(15) << Int64(rank & 63))
+                                if fast == 0:
+                                    for k in cutlass.range_constexpr(4):
+                                        t = Int32(-1)
+                                        if qc + k < columns:
+                                            t = tq[k]
+                                        if t >= 0:
+                                            if t // self.tpb < self.width:
+                                                w = t >> 6
+                                                if w != uw_w:
+                                                    uw_w = w
+                                                    uw = words[w]
+                                                    pf = pref[w]
+                                                bit = Int64(1) << Int64(t & 63)
+                                                if (uw & bit) != Int64(0):
+                                                    rank = pf + Int32(
+                                                        cute.arch.popc(uw & (bit - Int64(1)))
+                                                    )
+                                                    pw = pk_at + (rank >> 6)
+                                                    if pw != cur_w:
+                                                        if cur_w >= 0:
+                                                            _red_or_shared(
+                                                                pk_base + cur_w * 8, cur_m
+                                                            )
+                                                        cur_w = pw
+                                                        cur_m = Int64(0)
+                                                    cur_m = cur_m | (Int64(1) << Int64(rank & 63))
+                            if cur_w >= 0:
+                                _red_or_shared(pk_base + cur_w * 8, cur_m)
+                cute.arch.sync_threads()
+
+        # The plan pass's rule: the row-tile pass takes a one-request group whose list's tiles
+        # cost no more than its rows' own columns; any other group's rows join the lone list.
+        if tidx == 0:
+            mPlan = cute.make_tensor(plan, cute.make_layout((1 << 30,)))
+            tiles = (listed + BLOCK_N - 1) // BLOCK_N
+            mPlan[group * 2 + 1] = listed
+            if one != 0 and tiles * _SHARED_TILE_COST <= own_tiles * 4:
+                mPlan[group * 2] = tiles
+            else:
+                mPlan[group * 2] = Int32(-1)
+                mLone = cute.make_tensor(lone, cute.make_layout((1 << 30,)))
+                at0 = cute.arch.atomic_add(lone_count, live_rows)
+                for j in cutlass.range_constexpr(R):
+                    if first + j < rows:
+                        mLone[at0 + j] = first + j
+
+
+@functools.lru_cache(maxsize=None)
+def _group_plan_compiled(
+    topk, compress_ratio, tokens_per_block, table_width, rows_per_tile, packed_words, qp64, req64
+):  # fmt: skip
+    """The group plan's launch, compiled once a geometry (2-3 s; the table's width is fixed by
+    `max_seq_len`, so one compile a process in serving). Pointer and scalar arguments are
+    runtime values; the stream is the caller's."""
+    kernel = _GroupPlanKernel(
+        topk, compress_ratio, tokens_per_block, table_width, rows_per_tile, packed_words
+    )
+    gm = cute.AddressSpace.gmem
+
+    def fake(dtype, align):
+        return make_ptr(dtype, 16 * 1024, gm, assumed_align=align)
+
+    i32, i64 = cutlass.Int32, cutlass.Int64
+    args = (
+        fake(i32, 4), fake(i64 if qp64 else i32, 4), fake(i64 if req64 else i32, 4), fake(i32, 4),
+        fake(i32, 4), fake(i64, 8), fake(i32, 4), fake(i32, 4), fake(i32, 4), fake(i32, 4),
+        1, 1, 1, 1, 1, 1, 1, 1, 1,
+        cuda_drv.CUstream(0),
+    )  # fmt: skip
+    return cute.compile(kernel, *args)
+
+
+def _group_plan_fits(
+    selected_tokens, query_positions, request_indices, block_table, tokens_per_block,
+    rows_per_tile, packed_words,
+) -> bool:  # fmt: skip
+    """Whether a launch fits the group plan; one that does not takes the two passes."""
+    return (
+        rows_per_tile <= _GP_MAX_ROWS
+        and tokens_per_block in (8, 16, 32, 64)
+        and _GroupPlanKernel.smem(
+            selected_tokens.shape[1],
+            block_table.shape[1],
+            tokens_per_block,
+            rows_per_tile,
+            packed_words,
+        )
+        <= _GP_MAX_SMEM
+        and selected_tokens.dtype == torch.int32
+        and block_table.dtype == torch.int32
+        and query_positions.dtype in _INTEGER_DTYPES
+        and request_indices.dtype in _INTEGER_DTYPES
+    )
+
+
+def _group_plan(
+    selected_tokens, query_positions, request_indices, block_table, compress_ratio,
+    tokens_per_block, num_cache_pages, rows_per_tile, slots, packed_bits, group_plan, lone_rows,
+    lone_count,
+):  # fmt: skip
+    """The bitmap pass and the plan pass in one launch. `slots` `[groups, n]` int32,
+    `packed_bits` `[rows, words]` int64 zeros, `group_plan` `[groups, 2]` int32, `lone_rows`
+    `[rows]` int32 and `lone_count` `[1]` int32 zero are the plan pass's operands; returns
+    `row_info` `[rows, 2]` int32."""
+    rows, final_topk = selected_tokens.shape
+    device = selected_tokens.device
+    table_width = block_table.shape[1]
+    row_info = torch.empty((rows, 2), dtype=torch.int32, device=device)
+    query_positions = query_positions.contiguous()
+    key = (
+        final_topk, compress_ratio, tokens_per_block, table_width, rows_per_tile,
+        packed_bits.shape[1], query_positions.dtype == torch.int64,
+        request_indices.dtype == torch.int64,
+    )  # fmt: skip
+    fn = _group_plan_compiled(*key)
+    gm = cute.AddressSpace.gmem
+    i32, i64 = cutlass.Int32, cutlass.Int64
+
+    def ptr(t, dtype, align):
+        return make_ptr(dtype, t.data_ptr(), gm, assumed_align=align)
+
+    fn(
+        ptr(selected_tokens, i32, 4),
+        ptr(query_positions, i64 if key[6] else i32, 4),
+        ptr(request_indices, i64 if key[7] else i32, 4),
+        ptr(block_table, i32, 4),
+        ptr(slots, i32, 4),
+        ptr(packed_bits, i64, 8),
+        ptr(group_plan, i32, 4),
+        ptr(row_info, i32, 4),
+        ptr(lone_rows, i32, 4),
+        ptr(lone_count, i32, 4),
+        rows,
+        group_plan.shape[0],
+        block_table.shape[0],
+        num_cache_pages,
+        selected_tokens.stride(0),
+        block_table.stride(0),
+        block_table.stride(1),
+        slots.stride(0),
+        packed_bits.stride(0),
+        cuda_drv.CUstream(torch.cuda.current_stream(device).cuda_stream),
+    )
+    return row_info
 
 
 @triton.jit
@@ -544,6 +1171,26 @@ def _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_ind
         )
 
 
+def _byte_span(t: torch.Tensor) -> tuple[int, int]:
+    """The bytes `t` addresses, `[first, last + 1)`, from its pointer, shape and strides (a
+    tensor's strides are never negative); `(0, 0)` when it is empty."""
+    if t.numel() == 0:
+        return 0, 0
+    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return t.data_ptr(), t.data_ptr() + (last + 1) * t.element_size()
+
+
+def _overlapping_input(out: torch.Tensor, inputs: dict) -> str | None:
+    """The name of the first of `inputs` whose bytes `out`'s bytes meet, or None. A span test:
+    two strided views can share a span without sharing an element, which it refuses too."""
+    lo, hi = _byte_span(out)
+    for name, t in inputs.items():
+        t_lo, t_hi = _byte_span(t)
+        if lo < t_hi and t_lo < hi:
+            return name
+    return None
+
+
 def rows_per_group(group_size: int) -> int:
     """Rows of one request a row-tile item serves: the most whose `rows x group_size` MMA
     rows fill whole 8-row swizzle atoms of the 128-row tile (10 at 12 heads, 20 at 6)."""
@@ -565,22 +1212,47 @@ def qsa_rowtile_sparse_gqa(
     softmax_scale: float,
     query_positions: torch.Tensor,
     compress_ratio: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Bitmap pass, plan pass, lone-row pass, row-tile pass (`qsa_rowtile_attention_cute`);
-    returns `[rows, Hq, D]` contiguous."""
+    """Group plan (or bitmap pass and plan pass), lone-row pass, row-tile pass
+    (`qsa_rowtile_attention_cute`); returns `[rows, Hq, D]` contiguous: `out` when given (q's
+    dtype and device, contiguous, 16-byte aligned, apart from every input), written in place,
+    else a fresh tensor."""
     _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_indices,
                   tokens_per_block, softmax_scale, query_positions, compress_ratio)  # fmt: skip
     rows, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     group_size = num_q_heads // num_kv_heads
-    output = torch.empty((rows, num_q_heads, head_dim), dtype=q.dtype, device=q.device)
+    if out is None:
+        output = torch.empty((rows, num_q_heads, head_dim), dtype=q.dtype, device=q.device)
+    elif (
+        out.shape != (rows, num_q_heads, head_dim)
+        or out.dtype != q.dtype
+        or out.device != q.device
+        or not out.is_contiguous()
+        or out.data_ptr() % 16
+    ):
+        raise ValueError(
+            "QSA row-tile `out` must be a contiguous, 16-byte-aligned [rows, Hq, D] of q's dtype"
+        )
+    else:
+        # The passes read the inputs while they write `out`: a view into one (a cache plane,
+        # the projection q is read from) would be overwritten, and read back by a later call.
+        overlapped = _overlapping_input(
+            out,
+            dict(
+                q=q, k_cache=k_cache, v_cache=v_cache, block_table=block_table,
+                selected_tokens=selected_tokens, request_indices=request_indices,
+                query_positions=query_positions,
+            ),
+        )  # fmt: skip
+        if overlapped is not None:
+            raise ValueError(f"QSA row-tile `out` must not overlap `{overlapped}`")
+        output = out
     if rows == 0:
         return output
     table_width = block_table.shape[1]
     num_words = triton.cdiv(table_width * tokens_per_block, 64)
-    bits, row_info = _row_bits(
-        selected_tokens, query_positions, compress_ratio, tokens_per_block, table_width, num_words
-    )
     rows_per_tile = rows_per_group(group_size)
     rows_pow2 = triton.next_power_of_2(rows_per_tile)
     kv_strides = (
@@ -601,6 +1273,12 @@ def qsa_rowtile_sparse_gqa(
     # far below the table's tokens at a deep position.
     listed_cap = min(num_words * 64, rows_per_tile * selected_tokens.shape[1])
     packed_words = triton.cdiv(listed_cap, 64)
+    group_planned = _group_plan_fits(
+        selected_tokens, query_positions, request_indices, block_table, tokens_per_block,
+        rows_per_tile, packed_words,
+    )  # fmt: skip
+    global last_plan
+    last_plan = "group plan" if group_planned else "two passes"
     slots = torch.empty((num_groups, packed_words * 64), dtype=torch.int32, device=q.device)
     packed_bits = torch.zeros((rows, packed_words), dtype=torch.int64, device=q.device)
     group_plan = torch.empty((num_groups, 2), dtype=torch.int32, device=q.device)
@@ -608,16 +1286,27 @@ def qsa_rowtile_sparse_gqa(
     # [0]: the lone list's length; [1]: the row-tile pass's work-ticket counter.
     counters = torch.zeros((2,), dtype=torch.int32, device=q.device)
     lone_count = counters[:1]
-    _rowtile_plan_kernel[(num_groups,)](
-        request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
-        lone_rows, lone_count, rows,
-        bits.stride(0), packed_bits.stride(0), block_table.stride(0), block_table.stride(1),
-        slots.stride(0), block_table.shape[0], k_cache.shape[0],
-        ROWS_PER_TILE=rows_per_tile, ROWS_POW2=rows_pow2, BLOCK_N=BLOCK_N,
-        SHARED_TILE_COST=_SHARED_TILE_COST, PAGE_TABLE_WIDTH=table_width,
-        TOKENS_PER_BLOCK=tokens_per_block, PLAN_WORDS=_PLAN_WORDS.get(rows_pow2, 16),
-        num_warps=_PLAN_WARPS,
-    )  # fmt: skip
+    if group_planned:
+        row_info = _group_plan(
+            selected_tokens, query_positions, request_indices, block_table, compress_ratio,
+            tokens_per_block, k_cache.shape[0], rows_per_tile, slots, packed_bits, group_plan,
+            lone_rows, lone_count,
+        )  # fmt: skip
+    else:
+        bits, row_info = _row_bits(
+            selected_tokens, query_positions, compress_ratio, tokens_per_block, table_width,
+            num_words,
+        )  # fmt: skip
+        _rowtile_plan_kernel[(num_groups,)](
+            request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
+            lone_rows, lone_count, rows,
+            bits.stride(0), packed_bits.stride(0), block_table.stride(0), block_table.stride(1),
+            slots.stride(0), block_table.shape[0], k_cache.shape[0],
+            ROWS_PER_TILE=rows_per_tile, ROWS_POW2=rows_pow2, BLOCK_N=BLOCK_N,
+            SHARED_TILE_COST=_SHARED_TILE_COST, PAGE_TABLE_WIDTH=table_width,
+            TOKENS_PER_BLOCK=tokens_per_block, PLAN_WORDS=_PLAN_WORDS.get(rows_pow2, 16),
+            num_warps=_PLAN_WARPS,
+        )  # fmt: skip
     use_pdl = get_env_enable_pdl()
     _rowtile_lone_kernel[(min(rows, _LONE_PROGRAMS), num_kv_heads)](
         q, k_cache, v_cache, block_table, selected_tokens, request_indices, row_info,
@@ -809,6 +1498,7 @@ class QsaSparseGqaRowtile(OpWrapper):
         softmax_scale: float,
         query_positions: torch.Tensor,
         compress_ratio: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return qsa_rowtile_sparse_gqa(
             q=q,
@@ -821,6 +1511,7 @@ class QsaSparseGqaRowtile(OpWrapper):
             softmax_scale=softmax_scale,
             query_positions=query_positions,
             compress_ratio=compress_ratio,
+            out=out,
         )
 
     def reference(
@@ -836,11 +1527,13 @@ class QsaSparseGqaRowtile(OpWrapper):
         softmax_scale: float,
         query_positions: torch.Tensor,
         compress_ratio: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The reference `qsa_paged_sparse_gqa` certifies against: fp32 sparse
         GQA over every resident selected token, rounded once. The prefill pair
         is ignored, as there: on a prefix-packed selection the bound reads
-        exactly the valid entries."""
+        exactly the valid entries. `out` only names where the call writes; the
+        reference returns a fresh tensor."""
         return _per_row_entry.reference(
             q=q,
             k_cache=k_cache,

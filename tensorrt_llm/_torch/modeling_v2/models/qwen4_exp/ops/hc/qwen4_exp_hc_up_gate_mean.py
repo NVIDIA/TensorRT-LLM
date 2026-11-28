@@ -13,6 +13,18 @@ is 128 rows by `C * BH` up-projection outputs: the `BH`-wide hidden slice
 `[h0, h0 + BH)` of every stream, read through a strided view of the unmodified
 `[C*H, R]` weight (no copy, no re-layout), so the stream reduction stays inside
 one thread.
+
+Two compile-time forms for small decode batches (attention DP, `qwen4_exp`'s NVFP4 target):
+`tm=64` runs the MMA on 64-row M tiles (half the `low` / normed bytes a CTA at up to 64
+rows, or two tiles at 65..128 rows), and `release_early` lets the two warps that read the
+previous launch's outputs issue `griddepcontrol.launch_dependents` just before their own
+`griddepcontrol.wait`. Neither changes a value: each output element is formed by the same
+statements as with the defaults.
+
+The deferred-rstd form (`rstd=`, compile-time `ss`): the staged stream is
+`y = bf16(hc * (1 + w))`, a site's stream before its rstd, and the epilogue multiplies each
+element by its `(row, stream)` rstd (fp32 `[rows, C]`, written by the first projection's own
+deferred-rstd form and read after this kernel's waits) where the default reads `normed`.
 """
 
 from __future__ import annotations
@@ -193,6 +205,19 @@ class HcUpGateMeanKernel:
     e2m1 `[T, H/2]` and linear e4m3 scales `[T, H/16]` under the global scale
     `gs`). Runtime: the row count and the pointers; without `fp4` the `xq`,
     `sf` and `gs` pointers are never read.
+
+    `release_early` (default False: the kernel as it was): the TMA warp (`low`) and the
+    normed warp (`normed`) issue `griddepcontrol.launch_dependents` immediately before
+    their own `griddepcontrol.wait`, so the next launch of the stream is scheduled while
+    this grid still runs. The kernel's own reads do not move. It is correct only when every
+    launch that can then be in flight beside this grid reads this grid's output (`mixed`),
+    and anything the launches this grid waits for wrote, after its own
+    `griddepcontrol.wait`: the caller's contract, not checked here.
+
+    `tm` (128 or 64): the MMA M tile, one grid-x CTA column per `tm` rows. At 64 an
+    epilogue thread owns two rows 16 apart and the row guard looks at the first only, so
+    `mixed` must be allocated in whole 64-row tiles (`hc_up_gate_mean` does); the rows of
+    the caller are bitwise the 128-row kernel's.
     """
 
     def __init__(
@@ -204,9 +229,18 @@ class HcUpGateMeanKernel:
         num_n_stage: int = 2,
         fp4: bool = False,
         wide: bool = False,
+        release_early: bool = False,
+        tm: int = 128,
+        ss: bool = False,
     ):
         assert block_h in (32, 64) and hidden % block_h == 0 and rank % 64 == 0
+        # The deferred-rstd form: bf16 out only, four epilogue warps, no early release.
+        self.ss = bool(ss)
+        assert not (self.ss and (fp4 or wide or release_early)), "ss: the plain bf16 kernel"
         assert not (wide and fp4), "the NVFP4 epilogue stores 32-column rows"
+        assert tm in (64, 128) and not (tm == 64 and (wide or fp4)), "64-row tiles: bf16, 4 warps"
+        self.tm = tm
+        self.release_early = bool(release_early)
         self.bh, self.hc, self.hidden, self.rank = block_h, hc, hidden, rank
         self.fp4 = fp4
         # `wide`: eight epilogue warps; warps w and w + 4 read the same TMEM lane quarter and
@@ -214,7 +248,7 @@ class HcUpGateMeanKernel:
         self.wide = wide
         self.acc_dtype = cutlass.Float32
         self.io_dtype = cutlass.BFloat16
-        self.mma_tiler = (128, hc * block_h, 1)
+        self.mma_tiler = (tm, hc * block_h, 1)
         self.epi_cols = 32
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
@@ -285,6 +319,7 @@ class HcUpGateMeanKernel:
         xq_ptr: cute.Pointer,
         sf_ptr: cute.Pointer,
         gs_ptr: cute.Pointer,
+        rstd_ptr: cute.Pointer,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -309,6 +344,11 @@ class HcUpGateMeanKernel:
         xq = cute.make_tensor(xq_ptr, cute.make_layout((m, hid // 8), stride=(hid // 8, 1)))
         xsf = cute.make_tensor(sf_ptr, cute.make_layout((m, hid // 16), stride=(hid // 16, 1)))
         gsc = cute.make_tensor(gs_ptr, cute.make_layout(1))
+        # The deferred-rstd form's rstd [m, C], seen as the accumulator's N is: element
+        # (row, (b, s, t)) is rstd[row, s]. Never read without `ss`.
+        rst = cute.make_tensor(
+            rstd_ptr, cute.make_layout((m, (bh, hc, nt), 1), stride=(hc, (0, 1, 0), 0))
+        )
         k_major = utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
         tiled_mma = self._setup(k_major, k_major)
 
@@ -335,7 +375,7 @@ class HcUpGateMeanKernel:
         # same rows, so the normed reads in flight cover whole rows rather than
         # one 64-byte column block of many rows.
         sched = utils.PersistentTileSchedulerParams(
-            ((m + 127) // 128, nt, 1), (*self.cluster_shape_mn, 1), 1, False
+            ((m + self.tm - 1) // self.tm, nt, 1), (*self.cluster_shape_mn, 1), 1, False
         )
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(sched, max_active_clusters)
         self.kernel(
@@ -350,6 +390,7 @@ class HcUpGateMeanKernel:
             xq,
             xsf,
             gsc,
+            rst,
             m,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
@@ -379,6 +420,7 @@ class HcUpGateMeanKernel:
         mQ: cute.Tensor,
         mSF: cute.Tensor,
         mGS: cute.Tensor,
+        mR_mnl: cute.Tensor,
         m: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -535,6 +577,8 @@ class HcUpGateMeanKernel:
                     tma_bar_ptr=handle.barrier,
                 )
                 pre.append(handle)
+            if cutlass.const_expr(self.release_early):
+                cute.arch.griddepcontrol_launch_dependents()
             cute.arch.griddepcontrol_wait()
             for kk in cutlass.range_constexpr(self.n_pre):
                 handle = pre[kk]
@@ -588,6 +632,8 @@ class HcUpGateMeanKernel:
             ab_producer.tail()
 
         if warp_idx == self.nrm_warp_id:
+            if cutlass.const_expr(self.release_early):
+                cute.arch.griddepcontrol_launch_dependents()
             cute.arch.griddepcontrol_wait()
             halves = self.bh // self.epi_cols
             col_blocks = self.hidden // self.epi_cols
@@ -686,6 +732,15 @@ class HcUpGateMeanKernel:
             nfrag = cute.size(tTR_rAcc)
             halves = self.bh // self.epi_cols
             rN = cute.make_rmem_tensor(frag_shape, self.io_dtype)
+            if cutlass.const_expr(self.ss):
+                # rstd partitioned exactly as `mixed` is: each thread reads the rstd of the
+                # (row, stream) of every element whose mix it forms.
+                gR_mnl = cute.local_tile(mR_mnl, tile_mn, (None, None, None))
+                tCgR = thr_mma.partition_C(gR_mnl)
+                tTR_gR = thr_copy_t2r.partition_D(
+                    cute.flat_divide(tCgR[((None, None), 0, 0, None, None, None)], epi_tile)
+                )
+                rR = cute.make_rmem_tensor(frag_shape, self.acc_dtype)
             inv_hc = cutlass.Float32(1.0 / self.hc)
             if cutlass.const_expr(self.fp4):
                 # A thread owns one row's `epi_cols` consecutive columns (the
@@ -710,6 +765,9 @@ class HcUpGateMeanKernel:
                 cX_t = tTR_cX[(None, None, None, None, None, *crd)]
                 cX_t = cute.group_modes(cX_t, 3, cute.rank(cX_t))
                 row_ok = cX_t[(0, 0, 0, 0)][0] < m
+                if cutlass.const_expr(self.ss):
+                    gR_t = tTR_gR[(None, None, None, None, None, *crd)]
+                    gR_t = cute.group_modes(gR_t, 3, cute.rank(gR_t))
 
                 acc_pipeline.consumer_wait(acc_consumer_state)
                 if cutlass.const_expr(self.wide):
@@ -751,12 +809,17 @@ class HcUpGateMeanKernel:
                             tTR_tAcc[(None, None, None, s * halves + half)],
                             tTR_rAcc,
                         )
+                        if cutlass.const_expr(self.ss):
+                            cute.autovec_copy(gR_t[(None, None, None, s * halves + half)], rR)
                         for i in cutlass.range_constexpr(nfrag):
                             gate = _sigmoid(tTR_rAcc[i])
+                            xn = rN[i].to(self.acc_dtype)
+                            if cutlass.const_expr(self.ss):
+                                xn = xn * rR[i]
                             if cutlass.const_expr(s == 0):
-                                tTR_rSum[i] = gate * rN[i].to(self.acc_dtype)
+                                tTR_rSum[i] = gate * xn
                             else:
-                                tTR_rSum[i] = tTR_rSum[i] + gate * rN[i].to(self.acc_dtype)
+                                tTR_rSum[i] = tTR_rSum[i] + gate * xn
                     cute.arch.sync_warp()
                     n_handle.release()
                     for i in cutlass.range_constexpr(nfrag):
@@ -801,15 +864,34 @@ _COMPILED: dict = {}
 
 
 def _launcher(
-    block_h: int, hc: int, hidden: int, rank: int, ptrs, fp4: bool = False, wide: bool = False
+    block_h: int,
+    hc: int,
+    hidden: int,
+    rank: int,
+    ptrs,
+    fp4: bool = False,
+    wide: bool = False,
+    release_early: bool = False,
+    tm: int = 128,
+    ss: bool = False,
 ):
     """Compile once per static configuration; later calls reuse the TVM-FFI entry,
     which launches on the caller's current stream (graph-capturable). `ptrs` is
-    `(low, up, normed, mixed tensor, xq, sf, gs)`."""
-    key = (block_h, hc, hidden, rank, fp4, wide)
+    `(low, up, normed, mixed tensor, xq, sf, gs, rstd)`."""
+    key = (block_h, hc, hidden, rank, fp4, wide, bool(release_early), tm, bool(ss))
     fn = _COMPILED.get(key)
     if fn is None:
-        kern = HcUpGateMeanKernel(block_h, hc, hidden, rank, fp4=fp4, wide=wide)
+        kern = HcUpGateMeanKernel(
+            block_h,
+            hc,
+            hidden,
+            rank,
+            fp4=fp4,
+            wide=wide,
+            release_early=release_early,
+            tm=tm,
+            ss=ss,
+        )
         cptrs = [
             make_ptr(cutlass.BFloat16, p, cute.AddressSpace.gmem, assumed_align=16)
             for p in ptrs[:3]
@@ -819,6 +901,7 @@ def _launcher(
             make_ptr(cutlass.Int32, ptrs[4], cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(cutlass.Uint8, ptrs[5], cute.AddressSpace.gmem, assumed_align=2),
             make_ptr(cutlass.Float32, ptrs[6], cute.AddressSpace.gmem, assumed_align=4),
+            make_ptr(cutlass.Float32, ptrs[7], cute.AddressSpace.gmem, assumed_align=16),
         ]
         fn = cute.compile(
             kern,
@@ -841,20 +924,64 @@ def hc_up_gate_mean(
     hc_count: int,
     block_h: int,
     wide: bool = False,
+    release_early: bool = False,
+    tm: int = 128,
+    rstd: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch the fused kernel; `up` is the `[R, C*H]` transposed view of the
-    `[C*H, R]` up weight, as `cublas_mm(low, up)` takes it."""
+    `[C*H, R]` up weight, as `cublas_mm(low, up)` takes it. `release_early` and `tm`:
+    see `HcUpGateMeanKernel`. At `tm` 64 `mixed` is allocated in whole 64-row tiles and
+    returned as its first `rows` rows (unit column stride, 16-byte aligned rows). `rstd`
+    (fp32 `[>= rows rounded up to tm, C]`, contiguous): the deferred-rstd form, `normed`
+    being the stream before its rstd."""
     rows, rank = low.shape
     hidden = normed.shape[1] // hc_count
-    mixed = torch.empty((rows, hidden), dtype=normed.dtype, device=normed.device)
+    if tm == 64:
+        pad = -(-rows // 64) * 64
+        mixed = torch.empty((pad, hidden), dtype=normed.dtype, device=normed.device)[:rows]
+    else:
+        mixed = torch.empty((rows, hidden), dtype=normed.dtype, device=normed.device)
     if rows > 0:
         ptrs = (low.data_ptr(), up.data_ptr(), normed.data_ptr())
-        # The NVFP4 pointers are never read without `fp4`.
+        # The NVFP4 pointers are never read without `fp4`, the rstd pointer without `rstd`.
         unused = (mixed.data_ptr(),) * 3
-        _launcher(block_h, hc_count, hidden, rank, (*ptrs, mixed, *unused), wide=wide)(
-            rows, *ptrs, mixed, *unused
-        )
+        rp = mixed.data_ptr() if rstd is None else rstd.data_ptr()
+        _launcher(
+            block_h,
+            hc_count,
+            hidden,
+            rank,
+            (*ptrs, mixed, *unused, rp),
+            wide=wide,
+            release_early=release_early,
+            tm=tm,
+            ss=rstd is not None,
+        )(rows, *ptrs, mixed, *unused, rp)
     return mixed
+
+
+def precompile(hc_count: int, hidden: int, rank: int, device, variants, ss: bool = False) -> None:
+    """Compile the bf16 kernel's `(release_early, tm)` variants in `variants` for this
+    geometry now, without launching: a variant first met by a serving step or a graph
+    capture would stall it for the compile. Placeholder operands (the compile reads only
+    their addresses and the `mixed` layout). `ss`: the deferred-rstd form of each."""
+    low = torch.empty((128, rank), dtype=torch.bfloat16, device=device)
+    up = torch.empty((hc_count * hidden, rank), dtype=torch.bfloat16, device=device)
+    normed = torch.empty((128, hc_count * hidden), dtype=torch.bfloat16, device=device)
+    mixed = torch.empty((128, hidden), dtype=torch.bfloat16, device=device)
+    ptrs = (low.data_ptr(), up.data_ptr(), normed.data_ptr())
+    unused = (mixed.data_ptr(),) * 3
+    for release_early, tm in variants:
+        _launcher(
+            _BLOCK_H,
+            hc_count,
+            hidden,
+            rank,
+            (*ptrs, mixed, *unused, mixed.data_ptr()),
+            release_early=release_early,
+            tm=tm,
+            ss=ss,
+        )
 
 
 def hc_up_gate_mean_fp4(
@@ -875,7 +1002,7 @@ def hc_up_gate_mean_fp4(
     xsf = torch.empty((rows * (hidden // 16),), dtype=torch.uint8, device=dev)
     if rows > 0:
         ptrs = (low.data_ptr(), up.data_ptr(), normed.data_ptr())
-        qptrs = (xq.data_ptr(), xsf.data_ptr(), global_scale.data_ptr())
+        qptrs = (xq.data_ptr(), xsf.data_ptr(), global_scale.data_ptr(), mixed.data_ptr())
         _launcher(block_h, hc_count, hidden, rank, (*ptrs, mixed, *qptrs), fp4=True)(
             rows, *ptrs, mixed, *qptrs
         )
@@ -911,6 +1038,28 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
             )
         )
         + (Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),)
+        # Attention-DP decode on 64-row tiles (NVFP4 target, dep4 / dep8 verify rows).
+        + tuple(
+            Cell(why=why, spec=dict(rows=t, tm=64, release_early=r))
+            for t, r, why in (
+                (5, False, "64-row tile, 5 rows: the smallest row count it takes"),
+                (36, False, "64-row tile, 36 rows: a partial tile (the row guard's case)"),
+                (64, True, "64-row tile, 64 rows, releasing early (trunk site A)"),
+                (96, False, "two 64-row tiles, 96 rows (the second one partial)"),
+                (128, False, "two 64-row tiles, 128 rows"),
+            )
+        )
+        # The deferred-rstd form (`rstd=`): attention-DP site B behind a folded output
+        # projection (`DP_OUT_PROJ_INJECT_ENV`), on the tile `_hc_mixer` gives those rows.
+        + tuple(
+            Cell(why=why, spec=dict(rows=t, tm=tm, ss=True))
+            for t, tm, why in (
+                (20, 64, "deferred rstd, 64-row tile, 20 rows: dep8 at 5 requests a rank"),
+                (64, 64, "deferred rstd, 64-row tile, 64 rows: dep8 at 16 requests a rank"),
+                (80, 64, "deferred rstd, two 64-row tiles, 80 rows: dep8 at 20"),
+                (144, 128, "deferred rstd, two 128-row tiles, 144 rows: the fold's last"),
+            )
+        )
         # The tp4 / tep4 / dep4 target: the mixer runs on the full 4 x 2560
         # residual on every rank, so only the row count moves per member.
         + tuple(
@@ -943,6 +1092,15 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     `wide=True` runs the epilogue on eight warps instead of four, each element in the
     four-warp form's arithmetic, so the bits are the same (bf16 output only).
 
+    `tm=64` runs the MMA on 64-row tiles and `release_early=True` releases the next launch
+    before this one's wait (see `HcUpGateMeanKernel`); neither changes a bit. The cells with
+    `tm=64` drive 5 / 36 / 64 rows (one tile) and 96 / 128 rows (two tiles).
+
+    `rstd` (fp32 `[>= T rounded up to tm, C]`): `normed` is the stream before its rstd and
+    the epilogue multiplies each element by its (row, stream) rstd in fp32; the reference
+    applies it unrounded. Cells at 20 / 64 / 80 rows on 64-row tiles and 144 rows on 128-row
+    tiles, the row counts of the call site.
+
     Certified: bf16 at the checkpoint's 4 x 2560, rank 320, at 1 and 32 rows
     (part of one tile), 128 (one full tile), 1024, 8192, 16384 and 16390 rows
     (a partial last tile); graph replay.
@@ -969,8 +1127,11 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
         normed: torch.Tensor,
         hc_count: int,
         wide: bool = False,
+        release_early: bool = False,
+        tm: int = 128,
+        rstd: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return hc_up_gate_mean(low, up, normed, hc_count, _BLOCK_H, wide)
+        return hc_up_gate_mean(low, up, normed, hc_count, _BLOCK_H, wide, release_early, tm, rstd)
 
     def reference(
         self,
@@ -979,13 +1140,19 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
         normed: torch.Tensor,
         hc_count: int,
         wide: bool = False,
+        release_early: bool = False,
+        tm: int = 128,
+        rstd: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """float64, one rounding. `wide` does not change the result."""
+        """float64, one rounding. `wide`, `release_early` and `tm` do not change the result;
+        `rstd` multiplies each stream of `normed` unrounded."""
         hidden = normed.shape[1] // hc_count
         gate = torch.sigmoid(F.linear(low.double(), up.double().t())).unflatten(
             -1, (hc_count, hidden)
         )
         x = normed.double().unflatten(-1, (hc_count, hidden))
+        if rstd is not None:
+            x = x * rstd[: x.shape[0]].double()[:, :, None]
         return (gate * x).mean(dim=-2).to(normed.dtype)
 
     def is_valid(
@@ -995,9 +1162,20 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
         normed: torch.Tensor,
         hc_count: int,
         wide: bool = False,
+        release_early: bool = False,
+        tm: int = 128,
+        rstd: torch.Tensor | None = None,
     ) -> None:
         # `wide` needs 32-column blocks and bf16: always true of this entry.
+        assert tm in (64, 128) and not (tm == 64 and wide), "tm: 128, or 64 without `wide`"
         rows, rank = low.shape
+        if rstd is not None:
+            assert not (wide or release_early), "rstd: the plain kernel"
+            assert rstd.dtype == torch.float32 and rstd.is_contiguous(), "fp32 contiguous rstd"
+            assert rstd.shape[0] >= -(-rows // tm) * tm and rstd.shape[1] == hc_count, (
+                "rstd [>= rows rounded up to tm, C]"
+            )
+            assert rstd.data_ptr() % 16 == 0, "16-byte aligned rstd"
         width = normed.shape[1]
         assert low.dtype == up.dtype == normed.dtype == torch.bfloat16, "bf16 operands"
         assert normed.shape[0] == rows and up.shape == (rank, width), "shapes"
