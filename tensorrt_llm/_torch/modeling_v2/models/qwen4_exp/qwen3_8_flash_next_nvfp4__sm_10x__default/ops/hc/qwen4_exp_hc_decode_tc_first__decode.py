@@ -470,14 +470,17 @@ class HcDecodeTcFirstKernel:
         p_base = cutlass.Int32(sP.iterator.toint())
         peers = [_mapa(p_base, j) for j in range(self.ks)]
         for it in cutlass.range_constexpr(self.red_iters):
-            fs = cutlass.min(base + tidx + it * nthr, total - 1)
+            local = tidx + it * nthr
+            f = base + local
+            fs = cutlass.min(f, total - 1)
             row = fs // self.bn
             col = fs - row * self.bn
             off = (row * self.p_stride + col) * 4
-            # Only the loads of a step this thread sums (the sum's own condition): every load is
+            # Only the loads of a step this thread sums: the sum's own condition, spelled as in
+            # the loop below (the unit test's source check compares the two). Every load is
             # consumed before the exit barrier, so none is in flight when the peers exit.
             live = cutlass.Int32(0)
-            if tidx + it * nthr < per and base + tidx + it * nthr < total:
+            if local < per and f < total:
                 live = cutlass.Int32(1)
             for j in cutlass.range_constexpr(self.ks):
                 vals[it * self.ks + j] = _ld_dsmem_f32_if(peers[j] + off, live)
