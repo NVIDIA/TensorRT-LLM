@@ -18,6 +18,13 @@ l0_b300:
       stage: pre_merge
       backend: pytorch
   tests:
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_gpqa_tolerance_scope[target]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_gpqa_tolerance_scope[target-low-score]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_gpqa_tolerance_scope[v2-cache]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_gpqa_tolerance_scope[expert-parallel]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_gpqa_tolerance_scope[other-tactic]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_gpqa_tolerance_scope[backend]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_gpqa_tolerance_scope[fp8-cache]
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
