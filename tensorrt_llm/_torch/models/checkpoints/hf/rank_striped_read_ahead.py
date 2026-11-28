@@ -81,20 +81,20 @@ def distribute_worker_budget(local_size: int) -> tuple[int, ...]:
 
 
 def build_local_plan(
-    files: Sequence[tuple[str, int]],
+    ranges: Sequence[tuple[str, int, int]],
     local_rank: int,
     local_size: int,
 ) -> ReadAheadPlan:
-    """Assign every checkpoint extent to exactly one node-local issuer."""
+    """Assign every checkpoint extent, in ``ranges`` order, to exactly one node-local issuer."""
     if not 0 <= local_rank < local_size:
         raise ValueError("local rank and size must describe a valid group")
 
     extents = []
-    for path, file_size in sorted(files):
-        if file_size < 0:
+    for path, start, length in ranges:
+        if length < 0:
             raise ValueError("checkpoint file sizes must be nonnegative")
-        for offset in range(0, file_size, _CHUNK_SIZE):
-            extents.append(ReadAheadExtent(path, offset, min(_CHUNK_SIZE, file_size - offset)))
+        for offset in range(start, start + length, _CHUNK_SIZE):
+            extents.append(ReadAheadExtent(path, offset, min(_CHUNK_SIZE, start + length - offset)))
 
     worker_counts = distribute_worker_budget(local_size)
     issuer_ranks = [rank for rank, workers in enumerate(worker_counts) if workers > 0]

@@ -107,7 +107,6 @@ from typing import (
 )
 
 import torch
-from safetensors import safe_open
 from torch import nn
 
 from ..._utils import get_sm_version, is_sm_100f
@@ -126,6 +125,7 @@ from ..distributed import (
 )
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
+from ..mmap_utils import SafetensorsPreader, release_file_page_cache
 from ..model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from ..modules.dwdp.dense.manager import get_global_dense_dwdp_manager
 from ..modules.gated_mlp import GatedMLP
@@ -4457,21 +4457,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         split_file_jobs.append((job, files))
 
             def drop_file_pages(file_name: str):
-                path = os.path.join(ckpt_dir, file_name)
-                try:
-                    fd = os.open(path, os.O_RDONLY)
-                    try:
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    pass
+                release_file_page_cache([os.path.join(ckpt_dir, file_name)])
 
             def load_expert_file(file_name: str, jobs: list):
                 if device.type == "cuda":
                     torch.cuda.set_device(device)
                 path = os.path.join(ckpt_dir, file_name)
-                with safe_open(path, framework="pt", device="cpu") as fh:
+                with SafetensorsPreader(path) as fh:
                     # A job lands here only when every key it needs -- optional
                     # ones included, see the grouping above -- is in this file,
                     # so presence in this file is the whole question.
@@ -4489,7 +4481,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                                 else None
                             ),
                         )
-                # Handle closed -> pages unmapped -> the drop takes effect.
+                # Read with pread, not mapped: the drop takes effect at once.
                 drop_file_pages(file_name)
 
             def load_split_file_expert(job, files):
@@ -4498,9 +4490,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 with ExitStack() as stack:
                     handles = {
                         file_name: stack.enter_context(
-                            safe_open(
-                                os.path.join(ckpt_dir, file_name), framework="pt", device="cpu"
-                            )
+                            SafetensorsPreader(os.path.join(ckpt_dir, file_name))
                         )
                         for file_name in files
                     }

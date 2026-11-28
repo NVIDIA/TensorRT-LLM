@@ -12,10 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import glob
 import json
 import multiprocessing
 import os
+import re
+import struct
 import threading
 import time
 from collections import OrderedDict
@@ -32,7 +35,9 @@ import tqdm
 from mpi4py import MPI as _MPI
 
 from tensorrt_llm._errors import ModelLoadError
-from tensorrt_llm._torch.mmap_utils import populate_file_pages
+from tensorrt_llm._torch.mmap_utils import (READ_AHEAD_DIRS, SafetensorsPreader,
+                                            populate_file_pages,
+                                            safetensors_layout_is_valid)
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
@@ -82,6 +87,97 @@ _PREFETCH_LOG_INTERVAL_SEC = 60.0
 # the lock makes the check-and-set atomic across concurrent prefetch threads.
 _PREFETCH_FALLBACK_LOGGED = threading.Event()
 _PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
+# Decoder layers only; other stacks (e.g. a vision encoder) are read everywhere.
+_LAYER_IN_NAME = re.compile(r"^(?:(?:language_)?model\.){0,2}layers\.(\d+)\.")
+_EXPERT_IN_NAME = re.compile(r"\.experts\.(\d+)\.")
+# _LAYER_IN_NAME on the raw JSON header, where each tensor name follows a quote.
+_LAYER_IN_HEADER = re.compile(
+    rb'"(?:(?:language_)?model\.){0,2}layers\.(\d+)\.')
+
+
+def _first_layer(path: str) -> int:
+    """The lowest decoder layer a SafeTensors file holds, or -1 if it holds none."""
+    with open(path, "rb") as file:
+        header = file.read(struct.unpack("<Q", file.read(8))[0])
+    return min(map(int, _LAYER_IN_HEADER.findall(header)), default=-1)
+
+
+@contextmanager
+def _gc_paused():
+    """Pause the cyclic GC while ~1M header entries are created: the
+    collections their allocations trigger rescan the whole process heap
+    (9 s -> 3 s per rank for Kimi K3's 96 shards)."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def _rank_read_set(mapping: Mapping, model) -> tuple | None:
+    """The PP layers and EP slice this rank loads; None if it loads all."""
+    config = getattr(model, "model_config", None)
+    if config is None:
+        return None
+    num_layers = getattr(config.pretrained_config, "num_hidden_layers", None)
+    layers = (frozenset(mapping.pp_layers(num_layers))
+              if mapping.has_pp() and num_layers else None)
+    # The MoE load balancer places experts by its own assignment.
+    ep_size = mapping.moe_ep_size if config.moe_load_balancer is None else 1
+    if layers is None and ep_size == 1:
+        return None
+    return (layers, num_layers, mapping.is_last_pp_rank(), ep_size,
+            mapping.moe_ep_rank)
+
+
+def _node_read_extents(stats, read_sets) -> list[tuple[str, int, int]]:
+    """The (path, offset, length) ranges any of a node's ranks reads."""
+    from tensorrt_llm._torch.moe.fused_moe.interface import \
+        _compute_ep_partition
+
+    def indices(name):  # (layer, expert), None where the name has none
+        return tuple(match and int(match.group(1))
+                     for match in (_LAYER_IN_NAME.search(name),
+                                   _EXPERT_IN_NAME.search(name)))
+
+    # Parse the headers directly: a validated checkpoint catalog of ~1M
+    # tensors (Kimi K3) takes ~13 s per rank, the headers ~2 s.
+    tensors = []  # (path, start, end, layer, expert)
+    for path, _ in stats:
+        _, header_bytes, header = _read_safetensors_header(path)
+        for name, info in header.items():
+            if name != "__metadata__":
+                begin, end = info["data_offsets"]
+                tensors.append((path, 8 + header_bytes + begin,
+                                8 + header_bytes + end, *indices(name)))
+    tensors.sort(key=lambda tensor: tensor[:2])
+    num_experts = 1 + max(
+        (tensor[4] for tensor in tensors if tensor[4] is not None), default=-1)
+
+    def is_read(layer, expert, read_set) -> bool:
+        layers, num_layers, is_last_stage, ep_size, ep_rank = read_set
+        if layers is not None and layer is not None:
+            if layer < num_layers and layer not in layers:
+                return False
+            # Layers past the decoder (e.g. MTP) live on the last stage.
+            if layer >= num_layers and not is_last_stage:
+                return False
+        if ep_size > 1 and expert is not None:
+            _, start, end = _compute_ep_partition(num_experts, ep_size, ep_rank)
+            return start <= expert < end
+        return True
+
+    extents = []  # [path, start, end], coalesced in file order
+    for path, start, end, layer, expert in tensors:
+        if not any(is_read(layer, expert, s) for s in read_sets):
+            continue
+        if extents and extents[-1][0] == path and extents[-1][2] >= start:
+            extents[-1][2] = end
+        else:
+            extents.append([path, start, end])
+    return [(path, start, end - start) for path, start, end in extents]
 
 
 class _LazySafetensorsWeights(ConsumableWeightsDict):
@@ -458,8 +554,8 @@ class HfWeightLoader(BaseWeightLoader):
             use_consolidated: bool = False) -> dict[str, Any]:
         """Return a dict of name -> lazy safetensors slices.
 
-        Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
-        indexing) materializes only the requested bytes from the mmapped
+        Values are PySafeSlice-like lazy slices (``SafetensorsPreader``):
+        ``v[:]`` (or any indexing) reads only the requested bytes of the
         file. This lets a model's ``load_weights`` stream a huge checkpoint
         and read only its rank-local shard (e.g. Kimi K3 expert-parallel
         expert slices) without ever holding the full checkpoint in RAM.
@@ -477,13 +573,12 @@ class HfWeightLoader(BaseWeightLoader):
             weight_files = filtered_weight_files
         weights: dict[str, Any] = {}
         handles = []
-        for file_name in weight_files:
-            handle = safetensors.safe_open(file_name,
-                                           framework="pt",
-                                           device="cpu")
-            handles.append(handle)
-            for name in handle.keys():
-                weights[name] = handle.get_slice(name)
+        with _gc_paused():
+            for file_name in weight_files:
+                handle = SafetensorsPreader(file_name)
+                handles.append(handle)
+                for name in handle.keys():
+                    weights[name] = handle.get_slice(name)
         logger.info(f"Lazily opened {len(weight_files)} safetensors files "
                     f"({len(weights)} tensors) from {checkpoint_dir}")
         # The slices need their file handles, but the checkpoint loader
@@ -627,6 +722,7 @@ class HfWeightLoader(BaseWeightLoader):
                 fail. When the with-block failed, its error is kept instead.
         """
         status = self._last_checkpoint_io_status
+        READ_AHEAD_DIRS.discard(getattr(self, "_read_ahead_dir", None))
         try:
             read_error = session.finish(body_error)
         except Exception as error:
@@ -870,13 +966,10 @@ class HfWeightLoader(BaseWeightLoader):
         weight_files = []
         stats = []
         available_memory = 0
+        read_set = None
         eligibility_reason = None
         preflight_error = None
         try:
-            if self._requires_lazy_safetensors(checkpoint_dir):
-                eligibility_reason = (
-                    "the checkpoint requires model-specific lazy SafeTensors loading"
-                )
             weight_files = self._files_with_key_prefixes(
                 self._selected_safetensors_files(checkpoint_dir,
                                                  use_consolidated),
@@ -890,6 +983,7 @@ class HfWeightLoader(BaseWeightLoader):
             elif (self._partial_model_loading
                   or int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0")) != 0):
                 eligibility_reason = "partial model loading was requested"
+            read_set = _rank_read_set(mapping, kwargs.get("model"))
             available_memory = effective_available_host_memory()
         except Exception as error:
             preflight_error = error
@@ -906,6 +1000,8 @@ class HfWeightLoader(BaseWeightLoader):
 
         local_rank = 0
         local_size = 1
+        read_sets = [read_set]
+        extents = []
         node_error = None
         try:
             backing_signature = tuple(
@@ -915,13 +1011,28 @@ class HfWeightLoader(BaseWeightLoader):
                 local_rank = node_communicator.Get_rank()
                 local_size = node_communicator.Get_size()
                 observations = node_communicator.allgather(
-                    (backing_signature, available_memory))
+                    (backing_signature, available_memory, read_set))
                 if any(observation[0] != observations[0][0]
                        for observation in observations[1:]):
                     eligibility_reason = (
                         "node-local ranks resolved different backing files")
                 available_memory = min(observation[1]
                                        for observation in observations)
+                read_sets = [observation[2] for observation in observations]
+            extents = [(path, 0, stat.st_size) for path, stat in stats]
+            # Whole files stream fastest; narrow to the node's tensors only
+            # when the checkpoint does not fit.
+            fits, _ = memory_admission(sum(s.st_size for _, s in stats),
+                                       available_memory)
+            if eligibility_reason is None and None not in read_sets and not fits:
+                with _gc_paused():
+                    extents = _node_read_extents(stats, read_sets)
+            # Models load layer by layer, but shard names sort layer 10 before
+            # layer 2: read ahead in layer order so the pages a rank needs next
+            # are the ones read first, and the oldest pages are the first evicted.
+            if eligibility_reason is None:
+                first_layer = {path: _first_layer(path) for path, _ in stats}
+                extents.sort(key=lambda e: (first_layer[e[0]], e[0], e[1]))
         except Exception as error:
             node_error = error
 
@@ -939,11 +1050,11 @@ class HfWeightLoader(BaseWeightLoader):
 
         file_sizes = [(path, stat.st_size) for path, stat in stats]
         checkpoint_bytes = sum(size for _, size in file_sizes)
-        admitted, headroom = memory_admission(checkpoint_bytes,
-                                              available_memory)
+        node_bytes = sum(length for _, _, length in extents)
+        admitted, headroom = memory_admission(node_bytes, available_memory)
         if eligibility_reason is None and not admitted:
             eligibility_reason = (
-                f"checkpoint bytes ({checkpoint_bytes}) exceed available "
+                f"bytes this node reads ({node_bytes}) exceed available "
                 f"host memory ({available_memory}) after startup headroom "
                 f"({headroom})")
 
@@ -977,12 +1088,12 @@ class HfWeightLoader(BaseWeightLoader):
         session = None
         setup_error = None
         try:
-            plan = build_local_plan(file_sizes, local_rank, local_size)
+            plan = build_local_plan(extents, local_rank, local_size)
             session = RankStripedReadAheadSession(
                 active_communicator,
                 node_communicator,
                 plan,
-                checkpoint_bytes=checkpoint_bytes).start()
+                checkpoint_bytes=node_bytes).start()
         except Exception as error:
             setup_error = error
         coordinated_setup_error = coordinate_error(active_communicator,
@@ -1008,9 +1119,11 @@ class HfWeightLoader(BaseWeightLoader):
         weights = None
         mapping_error = None
         try:
-            weights = self._load_weights_in_parallel(
-                weight_files, self._load_safetensors_file,
-                "Mapping safetensors weights in parallel")
+            if self._requires_lazy_safetensors(checkpoint_dir):
+                weights = self._load_lazy_safetensors(checkpoint_dir,
+                                                      use_consolidated)
+            else:
+                weights = self._map_safetensors_files(weight_files)
         except BaseException as error:
             mapping_error = error
         coordinated_mapping_error = coordinate_error(
@@ -1029,6 +1142,9 @@ class HfWeightLoader(BaseWeightLoader):
             self._log_checkpoint_io_status()
             raise coordinated_mapping_error
         assert weights is not None
+        # Registered only once mapped, so a failed mapping leaves no entry.
+        self._read_ahead_dir = os.path.abspath(checkpoint_dir)
+        READ_AHEAD_DIRS.add(self._read_ahead_dir)
         return weights, session
 
     def _load_weights_native(self,
@@ -1132,9 +1248,16 @@ class HfWeightLoader(BaseWeightLoader):
             else:
                 local_communicator.Barrier()
 
-        return self._load_weights_in_parallel(
-            weight_files, self._load_safetensors_file,
-            "Loading safetensors weights in parallel")
+        return self._map_safetensors_files(weight_files)
+
+    def _map_safetensors_files(
+            self, weight_files: List[str]) -> ConsumableWeightsDict:
+        # One file after another: mapping is per-tensor Python, so threads
+        # only contend for the GIL (26 threads took 5x as long as one).
+        weights = {}
+        for file in tqdm.tqdm(weight_files, desc="Mapping safetensors weights"):
+            weights.update(self._load_safetensors_file(file))
+        return ConsumableWeightsDict(weights)
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
                                   description: str) -> ConsumableWeightsDict:
@@ -1163,7 +1286,33 @@ class HfWeightLoader(BaseWeightLoader):
     @staticmethod
     def _load_safetensors_file(file: str) -> dict[str, torch.Tensor]:
         logger.info(f"Start to load safetensor file {file}")
-        return safetensors.torch.load_file(file)
+        # One mapping per file and a view per tensor: load_file builds every
+        # tensor separately, which costs tens of seconds per rank on
+        # checkpoints with ~100k tensors.
+        try:
+            file_size, header_bytes, header = _read_safetensors_header(file)
+        except ValueError:
+            return safetensors.torch.load_file(file)
+        if not safetensors_layout_is_valid(header,
+                                           file_size - 8 - header_bytes):
+            return safetensors.torch.load_file(file)  # reports the bad layout
+        dtypes = dict(getattr(safetensors.torch, "_TYPES", {}),
+                      F8_E8M0=torch.float8_e8m0fnu)
+        storage = torch.UntypedStorage.from_file(file,
+                                                 shared=False,
+                                                 nbytes=file_size)
+        try:
+            return {
+                name:
+                torch.empty(0, dtype=torch.uint8).set_(
+                    storage, 8 + header_bytes + begin, (end - begin, )).view(
+                        dtypes[info["dtype"]]).view(info["shape"])
+                for name, info in header.items() if name != "__metadata__"
+                for begin, end in [info["data_offsets"]]
+            }
+        # A dtype or tensor offset that a view cannot express.
+        except (KeyError, TypeError, RuntimeError):
+            return safetensors.torch.load_file(file)
 
     @staticmethod
     def _load_bin_or_path_file(file):

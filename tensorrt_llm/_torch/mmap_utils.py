@@ -26,10 +26,15 @@ that a tensor is file-backed before using `advise_tensor_pageout`.
 
 import ctypes
 import errno as errno_codes
+import functools
+import json
+import math
 import mmap
 import os
+import struct
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 
 __all__ = [
     "madvise_range",
@@ -39,6 +44,7 @@ __all__ = [
     "release_file_page_cache",
     "page_cache_bytes",
     "wait_for_page_migration_to_settle",
+    "SafetensorsPreader",
 ]
 
 _MADV_DONTNEED = 4
@@ -48,6 +54,7 @@ _MADV_POPULATE_WRITE = 23  # Requires Linux >= 5.14.
 _MADV_ADVICE_BY_MODE = {
     "dontneed": _MADV_DONTNEED,
     "pageout": _MADV_PAGEOUT,
+    "populate_read": _MADV_POPULATE_READ,
     "populate_write": _MADV_POPULATE_WRITE,
 }
 _MMAP_FAILED = ctypes.c_void_p(-1).value
@@ -70,6 +77,7 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
     mode : str, optional
         "dontneed" -> MADV_DONTNEED (immediate discard, default)
         "pageout"  -> MADV_PAGEOUT  (asynchronous pageout, Linux 4.5+)
+        "populate_read" -> MADV_POPULATE_READ (fault every page in readable, Linux 5.14+)
         "populate_write" -> MADV_POPULATE_WRITE (fault every page in writable, Linux 5.14+)
 
     Raises
@@ -84,7 +92,7 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
     try:
         advice = _MADV_ADVICE_BY_MODE[mode]
     except KeyError:
-        raise ValueError("mode must be 'pageout', 'dontneed' or 'populate_write'.")
+        raise ValueError(f"mode must be one of {sorted(_MADV_ADVICE_BY_MODE)}.")
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     ret = libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(size), ctypes.c_int(advice))
     if ret != 0:
@@ -277,8 +285,29 @@ def advise_tensor_pageout(tensor, mode: str = "dontneed"):
     madvise_range(start_aligned, end_aligned - start_aligned, mode)
 
 
+def populate_tensor_pages(tensor) -> None:
+    """Map a contiguous CPU tensor's pages (``MADV_POPULATE_READ``) on the CPU.
+
+    Best effort: a kernel without ``MADV_POPULATE_READ`` leaves the pages to
+    be faulted in by whatever reads them next.
+    """
+    nbytes = tensor.numel() * tensor.element_size()
+    if nbytes == 0:
+        return
+    start = tensor.data_ptr() & ~(mmap.PAGESIZE - 1)
+    try:
+        madvise_range(start, tensor.data_ptr() + nbytes - start, "populate_read")
+    except OSError:
+        pass
+
+
 _MEMINFO_PATH = "/proc/meminfo"
 _VMSTAT_PATH = "/proc/vmstat"
+
+
+# Checkpoint directories this process is reading ahead. Their pages are the
+# node's admitted share, which the node's other ranks may still be reading.
+READ_AHEAD_DIRS: set[str] = set()
 
 
 def release_file_page_cache(paths: Iterable[str]) -> int:
@@ -286,10 +315,13 @@ def release_file_page_cache(paths: Iterable[str]) -> int:
 
     Returns the total size in bytes of the files advised, not the bytes
     dropped: the kernel keeps pages that are dirty or mapped by a process.
-    Files that cannot be opened or advised are skipped.
+    Files that cannot be opened or advised, or that are being read ahead
+    (``READ_AHEAD_DIRS``), are skipped.
     """
     advised_bytes = 0
     for path in paths:
+        if os.path.dirname(os.path.abspath(path)) in READ_AHEAD_DIRS:
+            continue
         try:
             fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
         except OSError:
@@ -365,3 +397,157 @@ def wait_for_page_migration_to_settle(
         previous, previous_time = current, now
         if now - quiet_since >= quiet_s or now - start >= max_wait_s:
             return now - start
+
+
+_PREAD_CHUNK_BYTES = 16 << 20
+
+
+@functools.cache
+def _pread_pool() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(8, thread_name_prefix="trtllm-pread")
+
+
+def _pread_into(fd: int, buf: memoryview, offset: int) -> None:
+    while buf:
+        got = os.preadv(fd, [buf], offset)
+        if got <= 0:
+            raise EOFError(f"pread at offset {offset} returned {got}")
+        buf, offset = buf[got:], offset + got
+
+
+def safetensors_layout_is_valid(header: dict, payload_bytes: int | None) -> bool:
+    """Whether the tensors' ``data_offsets`` tile ``[0, payload_bytes)`` exactly, as SafeTensors
+    requires; with ``payload_bytes`` None, only that they tile from 0 without overlap or gap."""
+    end = 0
+    for begin, stop in sorted(
+        info["data_offsets"] for name, info in header.items() if name != "__metadata__"
+    ):
+        if begin != end or stop < begin:
+            return False
+        end = stop
+    return payload_bytes in (None, end)
+
+
+class SafetensorsPreader:
+    """A ``safetensors.safe_open(path, framework="pt")`` handle that reads with ``pread``.
+
+    Copying a ``safe_open`` view to the GPU faults its pages in one at a time;
+    ``pread`` fills ordinary host tensors at page-cache speed, or in large reads
+    when uncached.
+    """
+
+    def __init__(self, path: str):
+        import safetensors.torch
+        import torch
+
+        self.path, self._mapped = path, None
+        self._fd = os.open(path, os.O_RDONLY)  # one open per shard: a round trip on NFS
+        header_bytes = struct.unpack("<Q", os.pread(self._fd, 8, 0))[0]
+        header = bytearray(header_bytes)
+        _pread_into(self._fd, memoryview(header), 8)
+        self._header = json.loads(header)
+        self._header.pop("__metadata__", None)
+        self._data_start = 8 + header_bytes
+        # No size lookup: an fstat per shard is a server round trip on NFS. A short
+        # payload still fails at its read.
+        if not safetensors_layout_is_valid(self._header, None):
+            raise ValueError(f"invalid SafeTensors tensor layout in {path}")
+        self._dtypes = dict(getattr(safetensors.torch, "_TYPES", {}), F8_E8M0=torch.float8_e8m0fnu)
+
+    def keys(self) -> list[str]:
+        return sorted(self._header)
+
+    def get_slice(self, name: str) -> "_PreadSlice":
+        return _PreadSlice(self, name)
+
+    def get_tensor(self, name: str):
+        return self.get_slice(name)[...]
+
+    def _read(self, offset: int, nbytes: int):
+        import torch
+
+        out = torch.empty(nbytes, dtype=torch.uint8)
+        buf, offset = memoryview(out.numpy()), offset + self._data_start
+        starts = range(0, nbytes, _PREAD_CHUNK_BYTES)
+        if len(starts) < 2:
+            _pread_into(self._fd, buf, offset)
+        else:  # one loader thread would read a large tensor at one thread's speed
+            chunk = _PREAD_CHUNK_BYTES
+            list(
+                _pread_pool().map(
+                    lambda s: _pread_into(self._fd, buf[s : s + chunk], offset + s), starts
+                )
+            )
+        return out
+
+    def close(self) -> None:
+        if getattr(self, "_fd", -1) >= 0:
+            os.close(self._fd)
+            self._fd = -1
+        self._mapped = None
+
+    __del__ = close
+
+    def __enter__(self) -> "SafetensorsPreader":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+class _PreadSlice:
+    """The ``PySafeSlice`` interface (``get_shape``, ``get_dtype``, indexing) over ``pread``."""
+
+    __slots__ = ("_reader", "_name", "_info")
+
+    def __init__(self, reader: SafetensorsPreader, name: str):
+        self._reader, self._name, self._info = reader, name, reader._header[name]
+
+    def get_shape(self) -> list[int]:
+        return list(self._info["shape"])
+
+    def get_dtype(self) -> str:
+        return self._info["dtype"]
+
+    def _rows(self, index) -> tuple[int, int] | None:
+        """``index`` as a range ``[start, stop)`` of whole rows, or None."""
+        shape = self.get_shape()
+        index = index if isinstance(index, tuple) else (index,)
+        index = index[:-1] if index and index[-1] is Ellipsis else index
+        if not index:
+            return 0, shape[0] if shape else 1
+        if len(index) > len(shape) or not all(isinstance(i, slice) for i in index):
+            return None
+        bounds = [i.indices(n) for i, n in zip(index, shape)]
+        if bounds[0][2] != 1 or any(b != (0, n, 1) for b, n in zip(bounds[1:], shape[1:])):
+            return None
+        return bounds[0][0], max(bounds[0][:2])
+
+    def __getitem__(self, index):
+        rows = self._rows(index)
+        if rows is None:
+            # A column shard: while the read-ahead fills the page cache, the
+            # mapping copies just the shard's bytes; otherwise one pread of the
+            # whole tensor, which the node's TP ranks share through the page cache.
+            if os.path.dirname(os.path.abspath(self._reader.path)) not in READ_AHEAD_DIRS:
+                return self[...][index]
+            if self._reader._mapped is None:
+                import safetensors
+
+                self._reader._mapped = safetensors.safe_open(
+                    self._reader.path, framework="pt", device="cpu"
+                )
+            return self._reader._mapped.get_slice(self._name)[index]
+        shape = self.get_shape()
+        dtype = self._reader._dtypes[self._info["dtype"]]
+        row_bytes = math.prod(shape[1:]) * dtype.itemsize
+        begin = self._info["data_offsets"][0] + rows[0] * row_bytes
+        nbytes = (rows[1] - rows[0]) * row_bytes
+        out = self._reader._read(begin, nbytes).view(dtype)
+        if shape and 0 < rows[1] - rows[0] < shape[0]:
+            # Only this rank reads these rows (expert or row parallel): drop
+            # them, or under a page-cache cap they evict unread read-ahead pages.
+            os.posix_fadvise(
+                self._reader._fd, self._reader._data_start + begin, nbytes, os.POSIX_FADV_DONTNEED
+            )
+        return out.reshape(([rows[1] - rows[0]] + shape[1:]) if shape else shape)
