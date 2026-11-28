@@ -35,6 +35,7 @@ _SETTING_VARS = (
     settings.STACKS_ENV_VAR,
     settings.PERIODIC_INTERVAL_VAR,
     settings.OOM_INTERVAL_VAR,
+    "TLLM_MEM_MONITOR_OOM_SNAPSHOT",
     settings.DIR_VAR,
 )
 

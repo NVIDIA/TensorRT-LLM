@@ -223,7 +223,7 @@ def _oom(mod):
 
 
 @pytest.mark.cpu_only
-def test_torch_observer_only_records(armed):
+def test_torch_observer_only_records(armed, monkeypatch):
     mod, clock, emitted, reset = armed
 
     # A caller that catches the OOM and falls back must not cause a report.
@@ -245,6 +245,22 @@ def test_torch_observer_only_records(armed):
     clock[0] += 3600.0
     mod.notify_error(_TORCH_OOM)
     assert "could not allocate" not in emitted[0]["headline"]
+
+    # Neither error may consume an ambiguous snapshot, even after the first lookup.
+    reset()
+    _oom(mod)
+    _oom(mod)
+    assert mod._failed_allocation_of(mod._armed, _TORCH_OOM) is None
+    assert mod._failed_allocation_of(mod._armed, _TORCH_OOM) is None
+    # Repeated failures extend the window without reading the allocator again.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda, "memory_allocated", lambda _: pytest.fail("redundant OOM read"))
+        for _ in range(2):
+            clock[0] += mod._FAILED_ALLOCATION_WINDOW_S - 1
+            _oom(mod)
+    clock[0] += mod._FAILED_ALLOCATION_WINDOW_S + 1
+    _oom(mod)
+    assert mod._failed_allocation_of(mod._armed, _TORCH_OOM) is not None
 
 
 @pytest.mark.cpu_only
@@ -780,7 +796,7 @@ def test_baseline_is_taken_when_startup_completes(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_the_default_mode_installs_no_process_wide_hook(monkeypatch):
+def test_the_default_mode_only_attaches_the_allocator_observer(monkeypatch):
     import logging
 
     import tensorrt_llm._torch.memory.monitor.triggers as trig
@@ -796,7 +812,7 @@ def test_the_default_mode_installs_no_process_wide_hook(monkeypatch):
 
     assert install_oom_reporter(rank=0, device=0)  # the default mode, oom
     assert trig._log_filter not in logger.python_logger.filters
-    assert threading.excepthook is excepthook and attaches == []
+    assert threading.excepthook is excepthook and attaches == [trig._on_out_of_memory]
     # A logged error is not reported; the executor's own error handling is.
     logger.python_logger.handle(
         logging.LogRecord("TRT-LLM", logging.ERROR, __file__, 1, _TORCH_OOM, None, None)

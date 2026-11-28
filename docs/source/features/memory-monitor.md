@@ -28,8 +28,8 @@ The memory monitor is a prototype and its report format may change.
 
 | Value | Mode | What it does |
 |---|---|---|
-| unset or `oom` | out-of-memory reports (default) | A report for an out-of-memory error the executor's own error handling sees -- a failed request, a crashed executor loop, a failed wakeup -- once the executor has started. Nothing is recorded during startup or serving, and nothing is installed process-wide. |
-| `1` (or `full`) | full | Also records startup and reports when it finishes, compares later reports with that point, installs process-wide hooks so that errors from background threads and logged errors are reported too (see [Hooks](#hooks-installed-in-full-mode)), and enables periodic reports and, with a runtime-control key, `GET /memory_report`. |
+| unset or `oom` | out-of-memory reports (default) | A report for an out-of-memory error the executor's own error handling sees -- a failed request, a crashed executor loop, a failed wakeup -- once the executor has started. PyTorch allocator failures capture a snapshot by default. |
+| `1` (or `full`) | full | Also records startup and reports when it finishes, compares later reports with that point, installs process-wide hooks so that errors from background threads and logged errors are reported too (see [Hooks](#hooks-installed-by-the-monitor)), and enables periodic reports and, with a runtime-control key, `GET /memory_report`. |
 | `0` (or `off`) | off | No reports are produced on their own. |
 
 ```yaml
@@ -76,7 +76,7 @@ which memory ran out -- CUDA's generic `out of memory`, NCCL's
 `unhandled cuda error`, the KV cache manager's `CuOOMError` -- counts as one
 only when the device is nearly full.
 
-In the default mode a report has every row, but no breakdown by startup step
+In the default mode a captured OOM report has the component rows, but no breakdown by startup step
 and no comparison with warmup: both need startup to be recorded, which only
 the full mode does. With `TLLM_MEM_MONITOR=1` each worker process also
 reports:
@@ -121,9 +121,9 @@ survive. A directory that cannot be written is reported once, and reports are
 then only logged. Use a directory of your own, for example
 `TLLM_MEM_MONITOR_DIR=$HOME/memory-reports`.
 
-### Hooks installed in full mode
+### Hooks installed by the monitor
 
-The default `oom` mode installs nothing process-wide. In full mode, arming
+The default `oom` mode attaches only the PyTorch OOM observer when snapshots are enabled. In full mode, arming
 the monitor installs three hooks:
 
 * a `threading.excepthook` that reports a thread dying of an out-of-memory
@@ -284,6 +284,28 @@ While parts of the runtime are released with `LLM.release()`, the rows show
 only memory that is resident, and one line lists what is released and returns
 on resume.
 
+Both default and full monitoring capture the PyTorch allocator on failure
+after the executor is armed. Set `TLLM_MEM_MONITOR_OOM_SNAPSHOT=0` before
+startup to disable this capture. A matching OOM report includes the failed device's live
+and reserved bytes, largest live block, and up to eight allocation sites by
+live bytes. Enable full mode and `TLLM_MEM_MONITOR_STACKS=1` to identify allocation sites;
+blocks without frames are grouped together. The same allocator snapshot
+feeds weight attribution and the PyTorch pool breakdown. The observer also
+samples device/process usage, registered KV pools and native buffer ledgers
+before returning to the failing allocation. The component and driver reads
+are sequential; other threads and processes can still change memory during
+collection. The resulting report is frozen before exception unwinding and
+published only if the failure reaches error handling.
+
+The snapshot runs synchronously for allocator failures, including failures
+the application catches and recovers from. It temporarily uses host memory
+and can delay exception delivery. Only the rendered report of the most recent failure
+is retained. If a second failure arrives while an earlier failure is still pending,
+the monitor withholds attribution until the 30-second matching window expires.
+If there is no matching snapshot (including non-PyTorch OOMs
+and disabled capture), the report gives the error and marks the fault-time
+data unavailable. It does not substitute later component readings.
+
 ## Limitations
 
 * **Out-of-memory errors during startup are not reported in the default
@@ -324,8 +346,7 @@ on resume.
 
 ## Cost
 
-In the default `oom` mode nothing is installed process-wide and no work is
-done while serving until an error reaches the executor's error handling. When startup completes, the process's memory pools are classified
+In the default `oom` mode the allocator observer runs only when a PyTorch allocation fails. When startup completes, the process's memory pools are classified
 once, which walks the Python heap (about 100 ms per million objects), so
 that a later report does not have to. With `TLLM_MEM_MONITOR=1`, allocation
 history is recorded during startup only. Neither mode adds work to the

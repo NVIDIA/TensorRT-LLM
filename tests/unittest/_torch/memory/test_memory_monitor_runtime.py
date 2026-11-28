@@ -230,18 +230,28 @@ def test_real_out_of_memory_is_reported_once_it_escapes(monkeypatch, tmp_path):
     """A real PyTorch OOM through the armed observer, in full mode."""
     monkeypatch.setenv(triggers.DIR_VAR, str(tmp_path))
     assert triggers.install_oom_reporter(rank=0)
+    from tensorrt_llm._torch.memory.monitor.claims import claim_module_memory
+    from tensorrt_llm._torch.memory.monitor.names import WEIGHTS
+
+    model = torch.nn.Module()
+    model.register_buffer("weights", torch.empty(64 * MB, device="cuda", dtype=torch.uint8))
+    claim_module_memory(model, WEIGHTS)
     try:
         torch.empty(1 << 50, dtype=torch.uint8, device="cuda")
     except torch.OutOfMemoryError as exc:
         error = f"{type(exc).__name__}: {exc}"
     # Caught by its caller: nothing is reported.
     assert not list(tmp_path.iterdir()), "a caught OOM"
+    del model
     # What the executor's error handler passes on once the error escapes.
     triggers.notify_error(error)
     (path,) = tmp_path.glob("*_out_of_memory.txt")
     text = path.read_text()
     assert "PyTorch could not allocate 1048576.00 GiB" in text
     assert "This process uses" in text
+    assert any(
+        "0.06 GiB" in row for row in text.splitlines() if row.strip().startswith("Model weights")
+    )
 
 
 @needs_gpu
