@@ -164,6 +164,8 @@ class MsaDecodeFmha(PhasedFmha):
 
         kv_block_indexes = params.fwd.sparse_runtime_params.sparse_attn_indices
         if kv_block_indexes is not None:
+            if metadata.sparse_offload_state is not None:
+                block_table = metadata.fetch_sparse_blocks(params.attn.layer_idx, kv_block_indexes)
             self._run_sparse(params, kv_block_indexes, block_table, seq_lens)
         else:
             self._run_dense(params, block_table, seq_lens)
@@ -183,16 +185,25 @@ class MsaDecodeFmha(PhasedFmha):
         attn = params.attn
         head_dim = attn.head_dim
         num_tokens = params.num_tokens
-        k_paged, v_paged = msa_paged_kv(params.meta.kv_cache_manager, attn.layer_idx)
-        nvfp4_args = {}
         manager = params.meta.kv_cache_manager
+        # With offload, block_table names sparse cache arena cells rather than pages.
+        offloaded = params.meta.sparse_offload_state is not None
+        if offloaded:
+            arena = manager.get_sparse_arena_buffers(attn.layer_idx, "HND")
+            k_paged, v_paged = arena[:, 0], arena[:, 1]
+        else:
+            k_paged, v_paged = msa_paged_kv(manager, attn.layer_idx)
+        nvfp4_args = {}
         if getattr(manager, "is_nvfp4_layer", lambda _: False)(attn.layer_idx):
             from .msa_prefill import _aligned_nvfp4_dequant_scales
 
             if params.fwd.kv_scale_quant_orig is None:
                 raise RuntimeError("NVFP4 sparse decode requires dequantization scales")
             k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, params.fwd.kv_scale_quant_orig)
-            scales = manager.get_block_scale_buffers(attn.layer_idx, "HND")
+            if offloaded:
+                scales = manager.get_sparse_arena_buffers(attn.layer_idx, "HND", scales=True)
+            else:
+                scales = manager.get_block_scale_buffers(attn.layer_idx, "HND")
             nvfp4_args = dict(
                 k_block_scale=scales[:, 0],
                 v_block_scale=scales[:, 1],

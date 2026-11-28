@@ -60,8 +60,9 @@ from .accuracy_core import (GSM8K, MMLU, QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS,
                             GSM8KInferenceX, LlmapiAccuracyTestHarness,
                             LongBenchV2, acceptance_length_from_iteration_stats,
                             assert_acceptance_length, get_accuracy_task)
-from .sparse_offload_accuracy import (LONGBENCH_CASES, assert_host_fetches,
-                                      assert_token_parity, read_fetch_events,
+from .sparse_offload_accuracy import (LONGBENCH_CASES, assert_concurrent_decode,
+                                      assert_host_fetches, assert_token_parity,
+                                      make_boundary_prompts, read_fetch_events,
                                       wait_for_fetch_events)
 
 
@@ -743,21 +744,33 @@ def _test_sparse_offload_long_context(
     index_topk: int,
     unit_tokens: int,
     block_reuse: bool = False,
+    generation_prefix: str = "",
     server_waiting_timeout: int = 1200,
 ) -> None:
-    """Require exact resident/offload tokens and real host fetches on LongBench v2.
+    """Require exact resident/offload tokens and real host fetches.
 
-    Six complete documents cover the benchmark's domains. A repeated request
-    checks determinism (all six repeat when testing block reuse), and two
-    concurrent 256-token continuations cover sustained decode under eviction.
+    Six complete LongBench documents cover the benchmark's domains; answer scores
+    are informational. M3 also covers block-boundary continuations, repeated
+    requests, and concurrent decoding with equal and unequal output lengths.
     The same prefill worker serves both generation configurations.
+    M3 concurrent waves wait for all KV transfers before the first decode step;
+    paired runs must have identical batch schedules as well as output tokens.
 
     Exact comparisons use eager, deterministic TP attention. CUDA graph replay
     and request remapping remain covered by the native offload component tests.
+
+    ``generation_prefix`` is appended, as tokens, after the chat template's
+    generation prompt. A model whose template cannot disable thinking passes
+    the think-end token that opens a direct answer.
     """
-    output_len = 256
+    is_m3 = gen_server_config["sparse_attention_config"][
+        "algorithm"] == "minimax_m3"
+    output_len = 384 if is_m3 else 256
+    answer_len = 2048 if is_m3 else output_len
     tokens_per_block = 128
     max_batch_size = 2
+    units_per_page = tokens_per_block // unit_tokens
+    cache_units = (index_topk // units_per_page + 1) * units_per_page
     tokenizer = (DeepseekV4Tokenizer.from_pretrained(model_path)
                  if unit_tokens == 4 else load_hf_tokenizer(model_path))
     assert Path(LongBenchV2.DATASET_DIR).is_dir(), (
@@ -766,7 +779,7 @@ def _test_sparse_offload_long_context(
     evaluator = LongBenchV2Evaluator(dataset_path=LongBenchV2.DATASET_DIR,
                                      length="short",
                                      max_input_length=32768,
-                                     max_output_length=output_len)
+                                     max_output_length=answer_len)
     by_id = {sample["_id"]: sample for sample in evaluator.dataset}
     samples, prompts = [], []
     for sample_id, (digest, answer) in LONGBENCH_CASES.items():
@@ -777,6 +790,11 @@ def _test_sparse_offload_long_context(
         text = evaluator._format_prompt(sample, evaluator.templates["0shot"])
         assert hashlib.sha256(text.encode()).hexdigest() == digest, (
             f"LongBench v2 prompt changed for {sample_id}")
+        template_args = {
+            "thinking_mode": "disabled"
+        } if is_m3 else {
+            "enable_thinking": False
+        }
         prompt = tokenizer.apply_chat_template([{
             "role": "user",
             "content": text
@@ -784,7 +802,10 @@ def _test_sparse_offload_long_context(
                                                tokenize=True,
                                                return_dict=False,
                                                add_generation_prompt=True,
-                                               enable_thinking=False)
+                                               **template_args)
+        if generation_prefix:
+            prompt += tokenizer.encode(generation_prefix,
+                                       add_special_tokens=False)
         assert len(prompt) // unit_tokens > index_topk and len(
             prompt
         ) <= 32768, (
@@ -792,19 +813,31 @@ def _test_sparse_offload_long_context(
         samples.append(sample)
         prompts.append(prompt)
     assert len({sample["domain"] for sample in samples}) == 6
+    document_indices = list(range(len(samples)))
+    boundary_indices = []
+    if is_m3:
+        for case_id, prompt in make_boundary_prompts(
+                prompts,
+                cache_tokens=cache_units * unit_tokens,
+                tokens_per_block=tokens_per_block):
+            boundary_indices.append(len(samples))
+            samples.append({"_id": case_id, "answer": None})
+            prompts.append(prompt)
     # The single-row GVR path needs an aligned score width. Round the allocation,
     # never the input document, to a KV page so CR4 widths also stay aligned.
     max_seq_len = (
-        (max(map(len, prompts)) + output_len + tokens_per_block - 1) //
+        (max(map(len, prompts)) + answer_len + tokens_per_block - 1) //
         tokens_per_block * tokens_per_block)
     sparse_config = {
         **gen_server_config["sparse_attention_config"],
-        "index_topk": index_topk,
-        "enable_heuristic_topk": True,
-        "use_self_sampling_topk": True,
-        "gvr_deterministic_topk": True,
-        "enable_kv_cache_offload": False,
+        "enable_kv_cache_offload":
+        False,
     }
+    if not is_m3:
+        sparse_config.update(index_topk=index_topk,
+                             enable_heuristic_topk=True,
+                             use_self_sampling_topk=True,
+                             gvr_deterministic_topk=True)
     # Attention DP is off by design: the exact comparison uses TP attention.
     for config in (ctx_server_config, gen_server_config):
         config.update(max_batch_size=max_batch_size,
@@ -830,13 +863,20 @@ def _test_sparse_offload_long_context(
     # Keep prefill identical across paired runs. This profile tests reuse of
     # received decode KV; cached prefill would change the reference computation.
     ctx_server_config["kv_cache_config"]["enable_block_reuse"] = False
+    if block_reuse and is_m3:
+        # M3 offload publishes received prompts only. Resident decode must use
+        # the same policy so it cannot rebase generated KV onto prefill pages.
+        gen_server_config["kv_cache_config"]["block_reuse_config"] = {
+            "policy": "per_request"
+        }
     ctx_server_config.update(enable_chunked_prefill=True, max_num_tokens=8192)
+    if is_m3:
+        # Fixed prefill chunk shapes keep KV values independent of arrival timing.
+        ctx_server_config["max_batch_size"] = 1
     gen_server_config.update(enable_iter_perf_stats=True,
                              max_num_tokens=2048,
                              iter_stats_max_iterations=-1,
                              max_stats_len=-1)
-    units_per_page = tokens_per_block // unit_tokens
-    cache_units = (index_topk // units_per_page + 1) * units_per_page
     assert all(len(prompt) // unit_tokens > cache_units for prompt in prompts)
     assert (output_len - 1) // unit_tokens > cache_units - index_topk, (
         "Forced decode must append more history than the sparse cache's free slots"
@@ -873,6 +913,8 @@ def _test_sparse_offload_long_context(
     with tempfile.TemporaryDirectory(prefix="sparse-offload-") as directory:
         observer_dir = Path(directory) / "events"
         observer_dir.mkdir()
+        batch_control = observer_dir / "batch.json"
+        batch_control.write_text(json.dumps({"wave": 0, "prompt_lengths": []}))
         # Python imports sitecustomize in both the serving process and spawned
         # MPI interpreters. The observer itself imports no CUDA/MPI modules early.
         (Path(directory) / "sitecustomize.py").write_text(
@@ -889,6 +931,8 @@ def _test_sparse_offload_long_context(
                 os.environ.get("PYTHONPATH", "")
             ]),
         }
+        if is_m3:
+            observer_env["TLLM_TEST_SPARSE_BATCH_CONTROL"] = str(batch_control)
         with launch_disaggregated_llm(
                 copy.deepcopy(disaggregated_server_config),
                 copy.deepcopy(ctx_server_config),
@@ -898,7 +942,8 @@ def _test_sparse_offload_long_context(
                 max_workers=max_batch_size,
                 extra_env=deterministic_env,
                 gen_extra_env=observer_env,
-                assert_worker_log_contains="self-sampling GVR top-K engaged",
+                assert_worker_log_contains=None
+                if is_m3 else "self-sampling GVR top-K engaged",
                 assert_worker_log_excludes=(
                     "falling back to the CUDA",
                     "using the CUDA radix")) as llm, openai.OpenAI(
@@ -906,33 +951,42 @@ def _test_sparse_offload_long_context(
                         base_url=f"{llm.serve_url}/v1",
                         timeout=300,
                         max_retries=0) as client:
+            wave_number = 0
+            batch_schedules = {}
 
-            def request(index: int, stress: bool) -> dict:
+            def request(index: int, forced_tokens: int | None) -> dict:
+                limit = answer_len if forced_tokens is None else forced_tokens
                 response = client.completions.create(model=model_path,
                                                      prompt=prompts[index],
-                                                     max_tokens=output_len,
+                                                     max_tokens=limit,
                                                      temperature=0,
                                                      seed=0,
                                                      extra_body={
-                                                         "detokenize": False,
-                                                         "top_k": 1,
-                                                         "ignore_eos": stress
+                                                         "detokenize":
+                                                         False,
+                                                         "top_k":
+                                                         1,
+                                                         "ignore_eos":
+                                                         forced_tokens
+                                                         is not None
                                                      })
                 choice = response.choices[0]
                 token_ids = choice.model_dump()["token_ids"]
                 assert response.usage.prompt_tokens == len(prompts[index])
                 assert response.usage.completion_tokens == len(token_ids)
-                assert 0 < len(token_ids) <= output_len
+                assert 0 < len(token_ids) <= limit
                 assert choice.finish_reason in ("length", "stop")
-                if stress:
+                if forced_tokens is not None:
                     assert len(
                         token_ids
-                    ) == output_len and choice.finish_reason == "length"
+                    ) == forced_tokens and choice.finish_reason == "length"
                 prediction = tokenizer.decode(token_ids,
                                               skip_special_tokens=True)
                 answer = evaluator._extract_answer(
                     evaluator._post_process(prediction))
-                if not stress:
+                if not is_m3 and forced_tokens is None:
+                    # M3 answer scores are informational; the other models must
+                    # still answer each document they read in full.
                     assert answer is not None, f"No answer for {samples[index]['_id']}: {prediction}"
                 return {
                     "id":
@@ -947,29 +1001,50 @@ def _test_sparse_offload_long_context(
                     "answer":
                     answer,
                     "correct":
-                    answer == samples[index]["answer"],
+                    samples[index]["answer"] is not None
+                    and answer == samples[index]["answer"],
                 }
 
             def wave(indices: list[int],
                      *,
                      mode: str,
-                     stress: bool = False) -> tuple[list[dict], list[dict]]:
+                     forced_output_lengths: list[int] | None = None,
+                     concurrent: bool = False) -> tuple[list[dict], list[dict]]:
+                nonlocal wave_number
+                wave_number += 1
+                control_tmp = batch_control.with_suffix(".tmp")
+                control_tmp.write_text(
+                    json.dumps({
+                        "wave":
+                        wave_number,
+                        "prompt_lengths":
+                        [len(prompts[i])
+                         for i in indices] if concurrent else [],
+                    }))
+                control_tmp.replace(batch_control)
+                print(
+                    f"Sparse parity wave {mode}: prompt_tokens={[len(prompts[i]) for i in indices]}, "
+                    f"forced_output_lengths={forced_output_lengths}, concurrent={concurrent}"
+                )
                 _get_disagg_generation_stats(llm.serve_url)
                 rows = []
-                groups = [indices] if stress else [[index] for index in indices]
+                lengths = ([None] * len(indices) if forced_output_lengths
+                           is None else forced_output_lengths)
+                calls = list(zip(indices, lengths, strict=True))
+                groups = [calls] if concurrent else [[item] for item in calls]
                 for group in groups:
                     previous = len(read_fetch_events(observer_dir))
                     start_ns = time.monotonic_ns()
-                    if stress:
+                    if concurrent:
                         with ThreadPoolExecutor(
                                 max_workers=max_batch_size) as pool:
                             futures = [
-                                pool.submit(request, index, True)
-                                for index in group
+                                pool.submit(request, index, length)
+                                for index, length in group
                             ]
                             rows.extend(future.result() for future in futures)
                     else:
-                        rows.append(request(group[0], False))
+                        rows.append(request(*group[0]))
                     if mode == "offload":
                         # Drain cleanup before the next serial request so its
                         # native counter delta cannot include another request.
@@ -983,7 +1058,7 @@ def _test_sparse_offload_long_context(
                         ]
                         assert_host_fetches(
                             current,
-                            prompt_lengths=[len(prompts[i]) for i in group],
+                            prompt_lengths=[len(prompts[i]) for i, _ in group],
                             world_size=world_size,
                             index_topk=index_topk,
                             unit_tokens=unit_tokens)
@@ -992,21 +1067,23 @@ def _test_sparse_offload_long_context(
                             f"minimum batch-counter miss delta={min(e['misses'] for e in current)}"
                         )
                 stats = _get_disagg_generation_stats(llm.serve_url)
-                if stress:
-                    batched_steps = sum(
-                        stat.get("inflightBatchingStats", {}).get(
-                            "numGenRequests", 0) > 1 for stat in stats)
-                    assert batched_steps >= tokens_per_block, (
-                        f"Only {batched_steps} batched decode iterations")
+                if concurrent:
+                    trace = assert_concurrent_decode(
+                        stats,
+                        min_batched_steps=tokens_per_block,
+                        require_retirement=len(set(lengths)) > 1,
+                        expected_initial_batch_size=len(indices)
+                        if is_m3 else None)
+                    batch_schedules.setdefault(mode, []).append(trace)
                 return rows, stats
 
             for mode in ("resident", "offload"):
                 phase_start = time.monotonic()
                 if mode == "offload":
                     llm.restart_generation(offload_config)
-                normal, _ = wave(list(range(len(samples))), mode=mode)
-                repeat_indices = list(range(
-                    len(samples))) if block_reuse else [0]
+                normal, _ = wave(document_indices, mode=mode)
+                repeat_indices = document_indices if (is_m3
+                                                      or block_reuse) else [0]
                 repeated, repeat_stats = wave(repeat_indices, mode=mode)
                 for index, row in zip(repeat_indices, repeated, strict=True):
                     assert_token_parity(normal[index],
@@ -1016,19 +1093,67 @@ def _test_sparse_offload_long_context(
                     cached = sum(
                         sum(stat.get("iterCachedTokensByLevel", ()))
                         for stat in repeat_stats)
-                    minimum = (min(map(len, prompts)) -
-                               1) // tokens_per_block * tokens_per_block
+                    minimum = sum((len(prompts[index]) - 1) //
+                                  tokens_per_block * tokens_per_block
+                                  for index in repeat_indices)
+                    print(
+                        f"Sparse parity reuse {mode}: {cached} cached tokens, "
+                        f"minimum={minimum}")
                     assert cached >= minimum, f"Repeated round reused only {cached}/{minimum} tokens"
-                stress, _ = wave([0, 1], mode=mode, stress=True)
-                results[mode] = normal + repeated + stress
+                boundary, boundary_repeated = [], []
+                if boundary_indices:
+                    boundary, _ = wave(boundary_indices,
+                                       mode=mode,
+                                       forced_output_lengths=[output_len] *
+                                       len(boundary_indices))
+                    replay_indices = boundary_indices[::4]
+                    boundary_repeated, _ = wave(
+                        replay_indices,
+                        mode=mode,
+                        forced_output_lengths=[output_len] *
+                        len(replay_indices))
+                    by_case = {row["id"]: row for row in boundary}
+                    for row in boundary_repeated:
+                        assert_token_parity(
+                            by_case[row["id"]],
+                            row,
+                            label=f"{mode} boundary repeat {row['id']}")
+                stress, _ = wave([0, 1],
+                                 mode=mode,
+                                 forced_output_lengths=[output_len, output_len],
+                                 concurrent=True)
+                if is_m3:
+                    longest = max(document_indices,
+                                  key=lambda index: len(prompts[index]))
+                    for pair in ([boundary_indices[0],
+                                  longest], [longest, boundary_indices[0]]):
+                        mixed, _ = wave(
+                            pair,
+                            mode=mode,
+                            forced_output_lengths=[
+                                256 if index == boundary_indices[0] else 512
+                                for index in pair
+                            ],
+                            concurrent=True)
+                        stress.extend(mixed)
+                results[
+                    mode] = normal + repeated + boundary + boundary_repeated + stress
                 correct = sum(row["correct"] for row in normal)
                 print(
-                    f"LongBench v2 {model_name} {mode}: {correct}/{len(normal)} correct, "
+                    f"LongBench v2 {model_name} {mode}: {correct}/{len(normal)} correct (informational), "
                     f"{len(results[mode])} requests, {time.monotonic() - phase_start:.1f}s"
                 )
                 if mode == "resident":
                     assert not read_fetch_events(
                         observer_dir), "Resident baseline used offload"
+            if is_m3:
+                for index, (resident_schedule, offload_schedule) in enumerate(
+                        zip(batch_schedules["resident"],
+                            batch_schedules["offload"],
+                            strict=True)):
+                    assert resident_schedule == offload_schedule, (
+                        f"Concurrent wave {index}: resident/offload decode batch schedules differ"
+                    )
             differences = []
             for resident, offloaded in zip(results["resident"],
                                            results["offload"],
@@ -3306,8 +3431,74 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
+def _run_minimax_m3_kv_cache_offload(model_path: str,
+                                     model_name: str,
+                                     kv_dtype: str,
+                                     *,
+                                     block_reuse: bool,
+                                     generation_prefix: str = "") -> None:
+    """The MiniMax-M3 family's offload parity profile: CTX TP2/EP2 -> GEN TP2/EP2."""
+    common = {
+        "tensor_parallel_size": 2,
+        "moe_expert_parallel_size": 2,
+        "modeling_v2": "off",
+        "trust_remote_code": True,
+        "disable_overlap_scheduler": True,
+        "moe_config": {
+            "backend": "CUTLASS"
+        },
+        "kv_cache_config": {
+            "dtype": kv_dtype,
+            "free_gpu_memory_fraction": 0.6
+        },
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_transfer_timeout_ms": 600000,
+        },
+        "sparse_attention_config": {
+            "algorithm": "minimax_m3",
+            "implementation": "msa",
+            "indexer_kv_dtype": "fp8",
+        },
+    }
+    disagg = {
+        "hostname": "localhost",
+        "backend": "pytorch",
+        "context_servers": {
+            "num_instances": 1
+        },
+        "generation_servers": {
+            "num_instances": 1
+        },
+    }
+    _test_sparse_offload_long_context(
+        disagg,
+        copy.deepcopy(common),
+        copy.deepcopy(common),
+        model_path,
+        model_name=model_name,
+        index_topk=16 * 2,
+        unit_tokens=128,
+        block_reuse=block_reuse,
+        generation_prefix=generation_prefix,
+    )
+
+
 @skip_pre_blackwell
 class TestMiniMaxM3(LlmapiAccuracyTestHarness):
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8"])
+    def test_kv_cache_offload_block_reuse(self, kv_dtype: str) -> None:
+        """M3 repeated prompts reuse received KV and match resident decode exactly."""
+        _run_minimax_m3_kv_cache_offload(
+            f"{llm_models_root()}/MiniMax-M3-NVFP4",
+            "nvidia/MiniMax-M3-NVFP4",
+            kv_dtype,
+            block_reuse=True)
 
     @pytest.mark.skip_less_device(6)
     @pytest.mark.skip_less_device_memory(140000)
@@ -3501,3 +3692,24 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
                 f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
                 f"the drafter card)"
+
+
+@skip_pre_blackwell
+class TestMiniMaxM31Flash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "MiniMaxAI/MiniMax-M3.1-Flash"
+    MODEL_PATH = f"{llm_models_root()}/MiniMax-M3.1-Flash"
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["nvfp4"])
+    def test_kv_cache_offload_block_reuse(self, kv_dtype: str) -> None:
+        """Every layer is sparse and offloaded; repeated prompts reuse received KV."""
+        # The chat template has an adaptive thinking mode only. MiniMax-M3's template
+        # disables thinking by opening the answer with the think-end token, so the
+        # prompts here end with it too.
+        _run_minimax_m3_kv_cache_offload(self.MODEL_PATH,
+                                         self.MODEL_NAME,
+                                         kv_dtype,
+                                         block_reuse=True,
+                                         generation_prefix="</mm:think>")

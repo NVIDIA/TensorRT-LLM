@@ -114,6 +114,10 @@ struct SparseStepScratch
     //! selection, each copying the same units into its own cells.
     SparseWorkList fetchWork;
 
+    //! One optional partial-prefix restore per row. A fixed list, independent of a
+    //! pending selection, overwritten by every write-index preparation (no counter).
+    SparseWorkList restoreWork;
+
     //! The write-back's counterpart. A write-back crosses every layer of a row at once and
     //! the copy that consumes it walks buffers, so it takes one list per layer rather than
     //! the one the fetch folds away.
@@ -136,6 +140,11 @@ struct SparseStepScratch
     //! descriptors and differ only in which of them they launch over.
     SparseCopyDesc const* copyDesc = nullptr;
     int32_t numBuffers = 0;
+
+    //! Whether a fetch copies this life cycle's work items a CTA each, which a pool whose
+    //! chunks reach kSparseCtaCopyMinChunkBytes calls for. Set with the descriptors; sizes
+    //! the grids of the fetch and of the partial-prefix restore.
+    bool fetchCopiesByCta = false;
 };
 
 //! Per-row watermarks, in tokens. Everything a step needs about how far a request has got
@@ -143,7 +152,8 @@ struct SparseStepScratch
 //!
 //!     num_blocks     = historyLength / tokens_per_block     (valid page table entries)
 //!     history_units  = historyLength / unit_tokens          (selectable units)
-//!     capacity_units = capacity / unit_tokens               (the in-flight span's end)
+//!     capacity_units = capacity / unit_tokens               (the in-flight span's end,
+//!                      rounded up when the sparse cache includes partial units)
 //!
 //! Publishing the source rather than the three derived counts keeps one truth; the divisors
 //! are per-layer-group constants a kernel already has.
@@ -430,10 +440,9 @@ public:
     //! mis-serving them.
     //!
     //! `selected` is [maxBatchSize][selectionWidth] unit ordinals, negative where padded,
-    //! and must name only units below the history watermark -- a unit at or above it has
-    //! not been written back, so fetching it would copy stale bytes. That is a wrong
-    //! answer rather than a memory error, and the call cannot detect it, so it is the
-    //! selector's responsibility.
+    //! and must name only complete history units below the watermark. Partial-prefix
+    //! restoration is managed separately from the selection. The selector owns this
+    //! eligibility check; the fetch cannot distinguish stale or unwritten host bytes.
     //!
     //! `out` is [maxBatchSize][buffers.size()][selectionWidth], written in full, in the
     //! expanded index space getPageIndexConverter() produces: entry k is the index holding
@@ -460,8 +469,13 @@ public:
     //!
     //! Both halves are load-bearing: the resolve reads Batch state the publish wrote, and
     //! writes a row's residency back into state the next step rewrites on the Batch's stream.
+    //!
+    //! `unitMask`, when given, is [maxBatchSize][selectionWidth]: the chunks of each selected
+    //! unit that will be read -- for a head-major page, the KV heads that selected it. A
+    //! resident cell missing any of them is filled for just those; nothing else is copied.
+    //! Null reads every chunk, which is what a layout with one chunk per unit does.
     void fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-        int32_t* out, std::optional<CUstream> stream = std::nullopt);
+        int32_t* out, std::optional<CUstream> stream = std::nullopt, int32_t const* unitMask = nullptr);
 
     //! Resolve one selection, admitting what it names and listing what has to be copied.
     //!
@@ -478,7 +492,7 @@ public:
     //! running a group's layers together, as the SWA scratch already assumes of the
     //! currently executing layer.
     void resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-        std::optional<CUstream> stream = std::nullopt);
+        std::optional<CUstream> stream = std::nullopt, int32_t const* unitMask = nullptr);
 
     //! Copy one layer's share of a resolved selection into its cells, and write its indices.
     //!
@@ -490,10 +504,10 @@ public:
 
     //! Give the in-flight unit of each request a cell, and report where to write it.
     //!
-    //! The unit between the two watermarks is the one the model is about to produce. It has
-    //! no host copy yet -- a unit reaches its page only when resize() carries the watermark
-    //! past it -- so nothing is fetched here: the call assigns a cell and leaves its bytes
-    //! to the model.
+    //! The unit between the watermarks is the one the model is about to produce.
+    //! With includePartialUnits, a newly reserved cell restores its host prefix before
+    //! exposing the write index. A resident cell is left intact. Other units have no
+    //! host contents until complete, so they only reserve a cell.
     //!
     //! Needs only the watermarks, not the selection, so it runs before fetchSparsePages.
     //!
@@ -776,8 +790,8 @@ private:
     //! tables exist, because a descriptor names where in them a buffer's indices sit.
     void _allocateCopyDesc();
 
-    //! Device room for the per-row unit ranges a write-back reads:
-    //! [life cycle][2][maxBatchSize], as [from][to]. Allocated with the fetch scratch,
+    //! Device room for the per-row unit and token ranges a write-back reads:
+    //! [life cycle][4][maxBatchSize], as [fromUnit][toUnit][fromToken][toToken]. Allocated with the fetch scratch,
     //! which has the same lifetime.
     //! Yields the elements the write-back ranges need, then clears the slice.
     LayoutGenerator _layoutFlushRanges();

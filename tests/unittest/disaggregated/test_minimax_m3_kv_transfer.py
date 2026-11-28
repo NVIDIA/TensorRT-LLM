@@ -21,12 +21,11 @@ replicated INDEX_KEY cache. V2 storage coalesces buffers purely by (life
 cycle, size), so at TP degrees where K == V == INDEX_KEY bytes per block the
 index-K cache shares the K/V pool and the slot interleaves per layer; at
 other degrees it gets its own pool. The disagg page-table builder splits each
-pool into per-mapper-kind views, so both layouts (and transfers between them)
-are exercised by the topology matrix below.
+pool by mapper kind and dense/sparse layer class. Both layouts and transfers
+between them are exercised by the topology matrix below.
 """
 
 from collections.abc import Sequence
-from types import SimpleNamespace
 from typing import Any
 
 import kv_transfer_harness as transfer_harness
@@ -47,7 +46,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MiniMaxM3SparseAttentionConfig
 
 NUM_LAYERS = 4
 NUM_KV_HEADS = 2
@@ -139,7 +138,7 @@ def test_minimax_disagg_role_mapper_kinds(
         dtype=cache_dtype,
         sparse_layer_ids=[],
         disable_index_value_layer_ids=[],
-        sparse_attention_config=SimpleNamespace(
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
             implementation=implementation,
             indexer_kv_dtype="bf16",
         ),
@@ -155,7 +154,7 @@ def test_minimax_disagg_role_mapper_kinds(
             dtype=DataType.FP8,
             sparse_layer_ids=[],
             disable_index_value_layer_ids=[],
-            sparse_attention_config=SimpleNamespace(
+            sparse_attention_config=MiniMaxM3SparseAttentionConfig(
                 implementation="triton", indexer_kv_dtype="bf16"
             ),
         )
@@ -244,7 +243,7 @@ def _create_manager(
         sparse_layer_ids=sparse_layers if sparse_layers is not None else SPARSE_LAYERS,
         disable_index_value_layer_ids=sparse_layers if sparse_layers is not None else SPARSE_LAYERS,
         sparse_index_dim=INDEX_DIM,
-        sparse_attention_config=SimpleNamespace(
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
             implementation=implementation,
             indexer_kv_dtype="bf16",
         ),
@@ -253,56 +252,55 @@ def _create_manager(
     )
 
 
-def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
+@pytest.mark.parametrize("tp", [1, 2])
+def test_minimax_m3_pool_view_scheme_coalesced_vs_separate(tp: int) -> None:
     """Pool composition varies with TP; the view scheme must not.
 
     TP=2 makes kv_heads_per_rank == 1, so K == V == INDEX_KEY bytes per
     block and V2 coalesces all three into one pool whose slot interleaves
     the sparse layer's index-K between K/V regions (non-uniform layer
     stride). TP=1 doubles K/V, so index-K gets its own pool and strides are
-    uniform. Both layouts must yield the same two per-class views.
+    uniform. Both layouts must yield dense K/V, sparse K/V, and index-K views.
     """
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
         build_page_table_from_manager,
     )
     from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
 
-    # --- TP=2: coalesced, interleaved slot ---
     manager = _create_manager(
-        Mapping(world_size=2, rank=0, tp_size=2, pp_size=1), DataType.BF16, sparse_layers=[1]
+        Mapping(world_size=tp, rank=0, tp_size=tp, pp_size=1), DataType.BF16, sparse_layers=[1]
     )
     try:
         lg = build_page_table_from_manager(manager).layer_groups[0]
-        assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
+        assert len(lg.pool_views) == 3
+        kv_views = [pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND]
+        assert len(kv_views) == 2
         idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
-        assert kv_view.pool_role == frozenset({str(Role.KEY), str(Role.VALUE)})
+        for kv_view in kv_views:
+            assert kv_view.pool_role == frozenset({str(Role.KEY), str(Role.VALUE)})
         assert idx_view.pool_role == frozenset({str(Role.INDEX_KEY)})
-        # Coalesced: both views address the same physical pool.
-        assert kv_view.pool_idx == idx_view.pool_idx
-        starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
-        unit = bytes_per_layer // 2  # one K or V buffer per block
-        # Slot: L0K L0V L1K L1V L1IDX L2K L2V L3K L3V — the sparse layer's
-        # index-K makes the K/V layer stride non-uniform.
-        assert starts == {0: 0, 1: 2 * unit, 2: 5 * unit, 3: 7 * unit}
-        idx_starts, idx_bytes_per_layer = get_layer_byte_ranges(idx_view)
-        assert idx_starts == {1: 4 * unit}
-        assert idx_bytes_per_layer == unit
-    finally:
-        manager.shutdown()
-
-    # --- TP=1: separate pools, uniform strides ---
-    manager = _create_manager(
-        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1), DataType.BF16, sparse_layers=[1]
-    )
-    try:
-        lg = build_page_table_from_manager(manager).layer_groups[0]
-        assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
-        idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
-        assert kv_view.pool_idx != idx_view.pool_idx
-        starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
-        assert starts == {i: i * bytes_per_layer for i in range(NUM_LAYERS)}
+        kv_ranges = [get_layer_byte_ranges(pv) for pv in kv_views]
+        assert {frozenset(starts) for starts, _ in kv_ranges} == {
+            frozenset({0, 2, 3}),
+            frozenset({1}),
+        }
+        bytes_per_layer = kv_ranges[0][1]
+        assert all(size == bytes_per_layer for _, size in kv_ranges)
+        starts = {layer: offset for ranges, _ in kv_ranges for layer, offset in ranges.items()}
+        assert kv_views[0].pool_idx == kv_views[1].pool_idx
+        if tp == 2:
+            # All three views address the same physical pool.
+            assert kv_views[0].pool_idx == idx_view.pool_idx
+            unit = bytes_per_layer // 2  # one K or V buffer per block
+            # Slot: L0K L0V L1K L1V L1IDX L2K L2V L3K L3V — the sparse layer's
+            # index-K makes the K/V layer stride non-uniform.
+            assert starts == {0: 0, 1: 2 * unit, 2: 5 * unit, 3: 7 * unit}
+            idx_starts, idx_bytes_per_layer = get_layer_byte_ranges(idx_view)
+            assert idx_starts == {1: 4 * unit}
+            assert idx_bytes_per_layer == unit
+        else:
+            assert kv_views[0].pool_idx != idx_view.pool_idx
+            assert starts == {i: i * bytes_per_layer for i in range(NUM_LAYERS)}
     finally:
         manager.shutdown()
 

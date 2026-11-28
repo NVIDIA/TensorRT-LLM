@@ -160,12 +160,23 @@ inline constexpr SparseLeaseIndex kNoSparseLease{};
 struct SparseArenaView
 {
     //! Lease i's metadata begins at `metadataBase + i * leaseStride`: one SparseEntry word
-    //! per entry, holding the unit resident there and when it was last used.
+    //! per entry, holding the unit resident there and when it was last used, followed at
+    //! `validOffset` by one validity byte per entry.
     //!
     //! The words are dense rather than keyed: a fetch builds a hash over their ordinals in
     //! shared memory to answer "is this ordinal resident, and where".
+    //!
+    //! A validity byte has one bit per chunk of the unit -- per KV head for a head-major
+    //! page -- and says which chunks of the entry's cell hold the resident unit's data. A
+    //! cell may be resident with only some of its chunks filled, because a fetch copies only
+    //! the chunks a selection names. Bits beyond `unitChunks` are always clear.
     std::byte* metadataBase;
     uint64_t leaseStride;
+    //! Byte offset of a lease's validity bytes within its metadata block.
+    uint64_t validOffset = 0;
+    //! Chunks per unit, shared by every sparse buffer of the life cycle: 1 for a layout with
+    //! one latent row per token, the local KV head count for a head-major page. At most 8.
+    int32_t unitChunks = 1;
 
     //! [numBuffers] each buffer's index among those sharing its pool: where its cells sit
     //! inside that pool's arena region.
@@ -193,7 +204,16 @@ struct SparseArenaView
     {
         return numSelections * entriesPerSelection;
     }
+
+    //! Validity of every chunk: what a unit needs when all of its chunks are read.
+    [[nodiscard]] constexpr uint32_t fullChunkMask() const noexcept
+    {
+        return (1U << static_cast<uint32_t>(unitChunks)) - 1U;
+    }
 };
+
+//! Most chunks a unit may have, since a validity byte holds one bit per chunk.
+inline constexpr int32_t kMaxSparseUnitChunks = 8;
 
 // ---------------------------------------------------------------------------
 // SparseCacheInit — everything a request's cache state is built from, all of it
@@ -209,6 +229,8 @@ struct SparseCacheInit
     //! Cells one buffer gets, i.e. entriesPerSelection / unitsPerPage. A lease is this many
     //! cells per buffer, laid out buffer-major.
     int32_t cellsPerBuffer;
+    //! Chunks per unit, the same for every buffer: see SparseArenaView::unitChunks.
+    int32_t unitChunks = 1;
     //! [numBuffers] the layer each buffer belongs to, non-decreasing.
     std::vector<int32_t> bufferLayer;
     //! [numLayers] the metadata row each layer resolves within, every row named by at
@@ -291,6 +313,10 @@ public:
     //! resolve left on the Batch's stream, which no stream of the caller's orders it
     //! against, and so reports a moment rather than a state the caller can act on.
     [[nodiscard]] std::vector<int32_t> peekResidentOrdinals(SparseLeaseIndex slot) const;
+
+    //! The validity bits of every entry of a slot, in the order of peekResidentOrdinals().
+    //! Debugging and introspection only, with the same caveats.
+    [[nodiscard]] std::vector<int32_t> peekValidChunks(SparseLeaseIndex slot) const;
 
     //! How a kernel addresses this arena's leases. Constant once constructed, so a launch
     //! carries one of these rather than one descriptor per row.

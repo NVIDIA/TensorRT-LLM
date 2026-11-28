@@ -40,6 +40,13 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
+//! A life cycle's staged flush ranges hold these fields in order, each one batch wide.
+constexpr size_t kFlushFromUnit = 0;
+constexpr size_t kFlushToUnit = 1;
+constexpr size_t kFlushFromToken = 2;
+constexpr size_t kFlushToToken = 3;
+constexpr size_t kFlushRangeFields = 4;
+
 //! Largest batch and longest sequence the declared constraints describe, or zero when none
 //! were declared.
 std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
@@ -199,6 +206,12 @@ void Batch::_allocateCopyDesc()
 
         for (auto const& run : runs)
         {
+            // A fetch copies such a pool's units a CTA each, so its grid needs a CTA for
+            // every item the list can hold.
+            if (run.layout.chunkBytes >= kSparseCtaCopyMinChunkBytes)
+            {
+                scratch.fetchCopiesByCta = true;
+            }
             // A run is consecutive buffers of one pool, which can span layers: a pool holds
             // every layer's buffer of one size. An index table spec covers one layer's
             // run of a pool (sparseIndexTableSpecs), so each buffer names its own table,
@@ -222,10 +235,42 @@ void Batch::_allocateCopyDesc()
                 desc.deviceBase = run.deviceBase
                     + static_cast<uint64_t>(_sparseArena(lcId).shape().bufferSlotInPool[static_cast<size_t>(buffer)])
                         * run.cellsPerBuffer * run.bufferBytes;
-                desc.leaseStride = static_cast<uint32_t>(run.cellsPerLease) * run.bufferBytes;
+                desc.cellsPerLease = static_cast<uint32_t>(run.cellsPerLease);
                 desc.cellBytes = run.bufferBytes;
                 desc.layout = run.layout;
                 desc.width = run.width;
+                auto const unitTokens = mManager->sparseCacheUnitTokens(lcId);
+                if (mManager->sparseCacheIncludesPartialUnits(lcId))
+                {
+                    for (auto const& layer : mManager->config().layers)
+                    {
+                        if (std::visit([](auto const& cfg) { return cfg.layerId; }, layer) != id.layerId)
+                        {
+                            continue;
+                        }
+                        for (auto const& config : layerBuffers(layer))
+                        {
+                            if (config.role == id.role && config.sparseWriteBackGranularity != 0)
+                            {
+                                auto const grain = config.sparseWriteBackGranularity;
+                                TLLM_CHECK_WITH_INFO(grain <= UINT16_MAX && unitTokens % grain == 0
+                                        && desc.layout.chunkBytes % unitTokens == 0,
+                                    "Sparse write-back granularity %d of layer %d buffer '%s' must divide "
+                                    "unit_tokens=%d, "
+                                    "and each %u-byte chunk must hold whole tokens",
+                                    grain, id.layerId, config.role.c_str(), unitTokens, desc.layout.chunkBytes);
+                                desc.writeBackGranularity = static_cast<uint16_t>(grain);
+                            }
+                        }
+                    }
+                }
+                if (desc.writeBackGranularity != 0)
+                {
+                    auto tokenLayout = desc.layout;
+                    tokenLayout.chunkBytes = desc.layout.chunkBytes / unitTokens * desc.writeBackGranularity;
+                    tokenLayout.unitStride = tokenLayout.chunkBytes;
+                    desc.width = sparseCopyWidth(tokenLayout, run.hostPageStride, run.bufferBytes);
+                }
 
                 auto const width = static_cast<uint64_t>(sparseCopyWidthBytes(desc.width));
                 TLLM_CHECK_WITH_INFO(desc.hostBase % width == 0 && desc.deviceBase % width == 0,
@@ -265,8 +310,7 @@ int32_t Batch::_flushCapacity(LifeCycleId lifeCycle) const
     // `maxTotalInputTokens / unitTokens + maxBatchSize`. The bound is an aggregate one, and
     // usable only because the list is compacted: indexed by row, every row's slice would
     // have to allow for that row taking the whole budget.
-    int const perPage = mManager->sparseCacheUnitsPerPage(lifeCycle);
-    int const unitTokens = perPage > 0 ? mManager->config().tokensPerBlock / perPage : 0;
+    int const unitTokens = mManager->sparseCacheUnitTokens(lifeCycle);
     if (mMaxTotalInputTokens.has_value() && unitTokens > 0)
     {
         return *mMaxTotalInputTokens / unitTokens + mMaxBatchSize;
@@ -290,24 +334,29 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
     scratch.numLayers = mManager->_sparseCacheLayerCount(lcId);
     auto const layers = static_cast<size_t>(scratch.numLayers);
     // One list for the fetch, holding the worst case of every row missing its whole
-    // selection; one per layer for the write-back, each holding the units the step's token
+    // selection (a growing unit's prefix is restored through restoreWork instead); one per
+    // layer for the write-back, each holding the units the step's token
     // budget can carry across a watermark. The fetch's is the life cycle's, not the
     // selection's: every layer of the selection just resolved reads it, and the next
     // resolve of any selection here overwrites it.
     scratch.fetchWork.capacity = static_cast<int32_t>(rows) * width;
     scratch.fetchWork.numLists = 1;
+    scratch.restoreWork.capacity = mManager->sparseCacheIncludesPartialUnits(lcId) ? mMaxBatchSize : 0;
+    scratch.restoreWork.numLists = 1;
     scratch.flushWork.capacity = _flushCapacity(lcId);
     scratch.flushWork.numLists = scratch.numLayers;
 
     auto const listEntries = [](SparseWorkList const& work)
     { return static_cast<size_t>(work.capacity) * static_cast<size_t>(work.numLists); };
     auto const fetchEntries = listEntries(scratch.fetchWork);
+    auto const restoreEntries = listEntries(scratch.restoreWork);
     auto const flushEntries = listEntries(scratch.flushWork);
     auto const outSlot = rows * static_cast<size_t>(width);
     auto const inFlightSlot = rows * static_cast<size_t>(scratch.maxInFlightUnits);
     auto const flushCount = rows * layers;
 
-    int32_t* cursor = co_yield outSlot + rows + inFlightSlot + 3 * fetchEntries + 3 * flushEntries + flushCount;
+    int32_t* cursor
+        = co_yield outSlot + rows + inFlightSlot + 4 * (fetchEntries + restoreEntries + flushEntries) + flushCount;
 
     auto const carve = [&cursor](size_t count)
     {
@@ -323,8 +372,13 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
         work.row = carve(entries);
         work.ordinal = carve(entries);
         work.slot = carve(entries);
+        work.mask = carve(entries);
     };
     carveList(scratch.fetchWork, fetchEntries);
+    carveList(scratch.restoreWork, restoreEntries);
+    // A restore copies a growing unit's prefix through every chunk, and its fixed list is
+    // never given masks, so the copy must read none.
+    scratch.restoreWork.mask = nullptr;
     carveList(scratch.flushWork, flushEntries);
     scratch.flushCount = carve(flushCount);
     // -1 so that "no write-back has run" stays distinguishable from "one ran and found
@@ -574,8 +628,8 @@ Batch::LayoutGenerator Batch::_layoutFlushRanges()
         co_return;
     }
 
-    auto const elements
-        = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mManager->numLifeCycles().value());
+    auto const elements = kFlushRangeFields * static_cast<size_t>(mMaxBatchSize)
+        * static_cast<size_t>(mManager->numLifeCycles().value());
     mFlushRanges = co_yield elements;
     // An empty range asks for nothing, which is what a row that never flushes should read.
     cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mFlushRanges), 0, elements, cudaStream()));
@@ -585,12 +639,12 @@ Batch::LayoutGenerator Batch::_layoutFlushRanges()
 int32_t const* Batch::flushFromUnits(LifeCycleId lifeCycle) const
 {
     auto* base = mFlushRanges;
-    return base + 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lifeCycle.value());
+    return base + kFlushRangeFields * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lifeCycle.value());
 }
 
 int32_t const* Batch::flushToUnits(LifeCycleId lifeCycle) const
 {
-    return flushFromUnits(lifeCycle) + mMaxBatchSize;
+    return flushFromUnits(lifeCycle) + kFlushToUnit * static_cast<size_t>(mMaxBatchSize);
 }
 
 int Batch::flushedHistory(BatchRow row) const
@@ -632,13 +686,12 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
     bool anyWork = false;
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
-        int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
         if (!mManager->hasSparseFetchPath(lcId))
         {
             continue;
         }
-        int const unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
-        auto const base = static_cast<size_t>(2 * mMaxBatchSize * lcId.value());
+        int const unitTokens = mManager->sparseCacheUnitTokens(lcId);
+        auto const base = kFlushRangeFields * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lcId.value());
 
         // Bounded in aggregate rather than per row, which is what the compacted list allows
         // and what in-flight batching needs: one prefilling row may cross the whole step's
@@ -650,18 +703,33 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
             auto const& kvCache = mRows[row];
             int fromUnit = 0;
             int toUnit = 0;
+            int fromToken = 0;
+            int toToken = 0;
             if (kvCache != nullptr)
             {
                 TLLM_CHECK_WITH_INFO(newHistoryLengths[toSizeT(row)] >= kvCache->historyLength(),
                     "Batch::flushSparseUnits: history length cannot be decreased");
                 fromUnit = kvCache->historyLength() / unitTokens;
                 toUnit = newHistoryLengths[toSizeT(row)] / unitTokens;
+                fromToken = kvCache->historyLength();
+                toToken = newHistoryLengths[toSizeT(row)];
+                if (mManager->sparseCacheIncludesPartialUnits(lcId))
+                {
+                    // The flush ends at the unit its last appended token reaches, whole or not.
+                    toUnit = newHistoryLengths[toSizeT(row)] == kvCache->historyLength()
+                        ? fromUnit
+                        : sparseUnitsReached(newHistoryLengths[toSizeT(row)], unitTokens, true);
+                }
 
                 crossed += toUnit - fromUnit;
                 anyWork = anyWork || toUnit > fromUnit;
             }
-            mFlushRangeStaging[base + toSizeT(row)] = fromUnit;
-            mFlushRangeStaging[base + static_cast<size_t>(mMaxBatchSize) + toSizeT(row)] = toUnit;
+            auto const stage = [&](size_t field, int value)
+            { mFlushRangeStaging[base + field * static_cast<size_t>(mMaxBatchSize) + toSizeT(row)] = value; };
+            stage(kFlushFromUnit, fromUnit);
+            stage(kFlushToUnit, toUnit);
+            stage(kFlushFromToken, fromToken);
+            stage(kFlushToToken, toToken);
         }
 
         TLLM_CHECK_WITH_INFO(crossed <= mScratch[lcId].flushWork.capacity,
@@ -1692,14 +1760,9 @@ void Batch::prepareSparseWriteIndices(
     auto const marks = watermarks();
     auto const numRows = maxBatchSize();
 
-    // A resolve with no selection. It makes the in-flight unit resident -- reusing its entry
-    // when a previous step already pinned it -- and does nothing else: an in-flight unit's
-    // host page is not written until the watermark passes it, so there is nothing to copy.
-    //
-    // The selection and miss arrays are therefore left null, which the resolve tolerates only
-    // because it records a miss against the copy list under `ordinal < historyUnits`, and an
-    // in-flight ordinal never satisfies it. A change that made that write unconditional would
-    // fault here rather than quietly copying stale bytes over what the model wrote.
+    // A resolve with no selection reserves the in-flight unit. Partial units restore
+    // their host prefix on a miss, using a separate row-indexed list so a pending
+    // selection's copies remain intact. Hits never overwrite the model's live writes.
     SparseResolveArgs resolve;
     resolve.leases = leases;
     resolve.arena = arena;
@@ -1708,7 +1771,8 @@ void Batch::prepareSparseWriteIndices(
     resolve.selectionWidth = 0;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
-    resolve.unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
+    resolve.unitTokens = mManager->sparseCacheUnitTokens(lcId);
+    resolve.includePartialUnits = mManager->sparseCacheIncludesPartialUnits(lcId);
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
     resolve.missCount = scratch.missCount;
@@ -1716,7 +1780,30 @@ void Batch::prepareSparseWriteIndices(
     // No selection on this path, so there is nothing to resolve into a slot.
     resolve.selected = nullptr;
     resolve.outSlot = nullptr;
+    if (resolve.includePartialUnits)
+    {
+        resolve.work = scratch.restoreWork;
+    }
     launchSparseResolve(resolve, stream);
+
+    if (resolve.includePartialUnits)
+    {
+        // A newly seated request can start inside a block whose prefix arrived by
+        // transfer. Restore it before the model appends the next token. Cache hits
+        // contribute no copy, so repeated reservations cannot overwrite live writes.
+        SparseUnitCopyArgs copy;
+        copy.leases = leases;
+        copy.arena = arena;
+        copy.numRows = numRows;
+        copy.copyDesc = scratch.copyDesc;
+        copy.bufferBase = span.bufferBase;
+        copy.numBuffers = span.numBuffers;
+        copy.direction = SparseCopyDirection::kFetch;
+        copy.unitsPerPage = unitsPerPage;
+        copy.work = resolve.work;
+        copy.gridCtas = sparseCopyGridCtas(numRows, mManager->_smCount(), scratch.fetchCopiesByCta);
+        launchSparseUnitCopy(copy, stream);
+    }
 
     // The in-flight list stands in for a selection: the resolve writes kNoSparseSlot past the
     // span, so a row with nothing in flight needs no separate signal.
@@ -1797,10 +1884,17 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     copy.numBuffers = scratch.numBuffers;
     copy.direction = SparseCopyDirection::kWriteBack;
     copy.unitsPerPage = mManager->sparseCacheUnitsPerPage(lifeCycle);
+    if (mManager->sparseCacheIncludesPartialUnits(lifeCycle))
+    {
+        copy.unitTokens = mManager->sparseCacheUnitTokens(lifeCycle);
+        copy.fromTokens = flushFromUnits(lifeCycle) + kFlushFromToken * static_cast<size_t>(mMaxBatchSize);
+        copy.toTokens = flushFromUnits(lifeCycle) + kFlushToToken * static_cast<size_t>(mMaxBatchSize);
+    }
     // The work list is every layer of this row, which is what a write-back crosses at once,
     // unlike a fetch, which resolves one layer across the whole batch.
     copy.work = scratch.flushWork;
-    copy.gridCtas = sparseCopyGridCtas(scratch.flushWork.capacity, mManager->_smCount());
+    // A write-back copies a warp per item whatever its chunk size.
+    copy.gridCtas = sparseCopyGridCtas(scratch.flushWork.capacity, mManager->_smCount(), /*ctaPerItem=*/false);
     launchSparseUnitCopy(copy, stream);
 }
 
@@ -1858,18 +1952,18 @@ std::vector<int> Batch::sparseOutSlots(std::vector<BufferId> const& buffers) con
 }
 
 void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-    int32_t* out, std::optional<CUstream> streamOpt)
+    int32_t* out, std::optional<CUstream> streamOpt, int32_t const* unitMask)
 {
     auto const span = mManager->_sparseLayerSpan(buffers, "fetchSparsePages");
     TLLM_CHECK_WITH_INFO(mManager->_selectionLayerCount(span.lifeCycle, span.selectionSlot) == 1,
         "fetchSparsePages: this layer shares its selection_id, so its selection is resolved once for every "
         "layer naming it; call resolveSparseSelection() then fetchResolvedPages()");
-    resolveSparseSelection(buffers, selected, selectionWidth, streamOpt);
+    resolveSparseSelection(buffers, selected, selectionWidth, streamOpt, unitMask);
     fetchResolvedPages(buffers, selected, selectionWidth, out, streamOpt);
 }
 
 void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-    std::optional<CUstream> streamOpt)
+    std::optional<CUstream> streamOpt, int32_t const* unitMask)
 {
     CUstream const stream = streamOpt.value_or(cudaStream());
     TLLM_CHECK_WITH_INFO(selected != nullptr, "resolveSparseSelection: selected must be a device pointer");
@@ -1883,7 +1977,6 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     TLLM_CHECK_WITH_INFO(selectionWidth == scratch.selectionWidth,
         "resolveSparseSelection: selectionWidth must match the configured numSelectedBlocks");
 
-    int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
     auto const marks = watermarks();
 
     SparseResolveArgs resolve;
@@ -1893,9 +1986,11 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     resolve.selectionSlot = span.selectionSlot;
     resolve.selected = selected;
     resolve.selectionWidth = selectionWidth;
+    resolve.unitMask = unitMask;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
-    resolve.unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
+    resolve.unitTokens = mManager->sparseCacheUnitTokens(lcId);
+    resolve.includePartialUnits = mManager->sparseCacheIncludesPartialUnits(lcId);
     resolve.outSlot = scratch.outSlot;
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
@@ -1948,7 +2043,7 @@ void Batch::fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t con
     copy.direction = SparseCopyDirection::kFetch;
     copy.unitsPerPage = unitsPerPage;
     copy.work = layerWork;
-    copy.gridCtas = sparseCopyGridCtas(scratch.fetchWork.capacity, mManager->_smCount());
+    copy.gridCtas = sparseCopyGridCtas(scratch.fetchWork.capacity, mManager->_smCount(), scratch.fetchCopiesByCta);
     launchSparseUnitCopy(copy, stream);
 
     // The index table the attention kernel reads is derived from the resolve's slots alone:
@@ -2034,8 +2129,16 @@ void Batch::_buildSparseArenas()
             .numBuffers = mManager->sparseCacheBufferCount(lcId),
             .entriesPerSelection = cellsPerBuffer * mManager->sparseCacheUnitsPerPage(lcId),
             .cellsPerBuffer = cellsPerBuffer,
+            .unitChunks = static_cast<int32_t>(plan.front().layout.numChunks),
             .layerSelection = mManager->_sparseLayerSelection(lcId),
         };
+        for (auto const& entry : plan)
+        {
+            // One validity byte per entry serves every buffer of the life cycle, so they must
+            // agree on what a chunk is.
+            TLLM_CHECK_WITH_INFO(static_cast<int32_t>(entry.layout.numChunks) == shape.unitChunks,
+                "Sparse buffers of one life cycle must share a chunk count per unit");
+        }
         (void) checkedSparseResolveSharedBytes(shape.entriesPerSelection, mManager->_sparseCacheSelectionWidth(lcId),
             mManager->_sparseCacheMaxInFlightUnits(lcId));
 

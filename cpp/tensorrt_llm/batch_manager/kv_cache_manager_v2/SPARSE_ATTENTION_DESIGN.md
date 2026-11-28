@@ -18,8 +18,9 @@ attribute, so one layer may hold both sparse and dense buffers.
 sparse-specific -- see *Compression*.
 
 Out of scope, by decision rather than by omission: prefill, which a separate instance serves,
-and speculative decoding — see *Supported scope*; and per-KV-head selection, which no
-per-`(request, layer)` resident set can express — see *Device-side cache*. Kernel fusion
+and speculative decoding — see *Supported scope*; and a resident set per KV head. A model
+whose heads select independently is served through the union of its heads' selections — see
+*Device-side cache*. Kernel fusion
 remains future work; so do multi-beam requests. `ISparseUnitGather` is retired — see
 *Extraction interface*.
 
@@ -230,8 +231,10 @@ were allocated by an earlier resize and published then.
 
 An entry holds either a fetched copy of a history page or the live, still-growing block.
 The first is read-only by construction — fetch only ever targets ordinals below the
-watermark — and the second is written by definition. So the two populations are
-distinguished by the ordinal alone:
+watermark — and the second is written by definition. With `include_partial_units`, the
+growing block also receives its host prefix once, when it is reserved, before the model
+appends to it — see *Writing the in-flight unit*. So the two populations are distinguished by the
+ordinal alone:
 
 ```
 unflushed  <=>  entry_ordinal >= history_length / unit_tokens
@@ -356,11 +359,13 @@ resident set, because a selection unit is the tokens it spans across all of them
 that names a `selection_id` widens the scope rather than narrowing it: the members of a
 selection share one resident set between them, one per `(request, selection)` — see
 *Selection groups*. Their cells stay per layer and mirror. An
-algorithm that lets different heads select different units is not expressible here, and this
-is a real exclusion rather than a hypothetical: Rocket's selection indices are
-`[num_kv_heads, total_tokens]` and MiniMax-M3's are `[tokens, num_kv_heads, topk]` — both
-choose per head. Serving them would need a resident set per `(request, layer, head)`, which
-multiplies the metadata and the reservation by the head count.
+algorithm whose heads select different units keeps this scope by selecting their union:
+MiniMax-M3's indices are `[tokens, num_kv_heads, topk]`, and `merge_head_selections`
+(`attention/backends/sparse/offload_kernels.py`) deduplicates each request's heads into one
+selection of up to `num_kv_heads * topk` units, which the cache is sized for. After the
+fetch, `build_sparse_block_table` publishes each selected unit's cell by its ordinal, so
+every head reads its own selection unchanged. A resident set per `(request, layer, head)`
+remains unsupported: it would multiply the metadata and the reservation by the head count.
 
 **Scope is per request.** Two requests sharing a prefix do not share a cached copy. That
 closes a soundness hole by construction: entries are reachable only through their own
@@ -708,9 +713,10 @@ No host involvement, so the call enqueues and returns. Every shape is static acr
 The selection is not the only thing that needs a cell. The block being written needs one
 too, and needs it before the selection takes any victim. Both are resolved by the same
 probe, over one virtual list: the in-flight ordinals `[history_units, capacity_units)`
-first, then the selection. An in-flight unit differs in exactly one way — a miss allocates
-its cell but never joins the copy list, because its host page holds nothing to fetch until
-the watermark passes it.
+first, then the selection. A missing in-flight unit only reserves a cell. With
+`include_partial_units`, the growing unit's nonempty host prefix is restored on its first
+reservation, which only write preparation makes: a selection resolve leaves that unit to it
+(see *Writing the in-flight unit*).
 
 ### Writing the in-flight unit
 
@@ -725,9 +731,27 @@ can run first — which is the order the model requires. Idempotent while the wa
 the resolve probes residency before taking a victim, so the fetch's own resolve finds the
 entry and reuses it.
 
-Nothing is fetched for it. An in-flight unit's host page is not written until the watermark
-passes it, so the resolve excludes in-flight ordinals from the copy list (`ordinal <
-historyUnits`) — copying would read stale bytes over what the model just wrote.
+With `include_partial_units=False`, the default for the other sparse models, nothing is
+fetched for it. An in-flight unit's host page is not written until the watermark passes
+it, so the resolve excludes in-flight ordinals from the copy list
+(`ordinal < historyUnits`). This serves compressed units produced only when all their
+input tokens are available.
+
+MiniMax-M3 offload always sets `include_partial_units=True`; it is not configurable. Its
+blocks receive a token appended each step, which this mode serves. History units use
+`floor(history / unit_tokens)` and capacity units use
+`ceil(capacity / unit_tokens)`, reserving the growing block on every step. In write
+preparation, a miss for that block restores its host prefix before exposing the write index;
+a hit leaves live writes intact. A selection resolve never reserves or copies that block, so
+its fetch list holds complete history only: even a resolve that runs before write
+preparation queues no copy that could land on a token the model writes before the fetch. Write
+preparation has a separate fixed list with one entry per row, overwritten on each call;
+empty entries use `kNoSparseSlot`. It needs no counter or per-call memset and cannot
+clobber a pending selection's fetch list. Each advancing row flushes through
+`ceil(new_history / unit_tokens)` before resizing. This also keeps host pages current for
+`commit_min_snapshot` and `stopCommitting()`, which can publish partial prefixes while a
+request is still seated. Flushing only on removal would leave those reusable prefixes stale.
+Layers using partial units must have independent selections (`selection_id=None`).
 
 `out` is `[batch][buffers]`, one entry per request: `resize` bounds `capacity - history_length`
 to a token, so at most one unit is in flight. `BAD_PAGE_INDEX` is an ordinary outcome rather
@@ -842,6 +866,68 @@ page has no valid contents yet, so the result is stale data rather than unrelate
 A debug check against the flushed state can catch it; silence would be a wrong answer, not
 corruption.
 
+### Per-chunk residency
+
+A selection unit of a head-major layout (MiniMax-M3: a page of 128 tokens, one slice per local KV
+head) is stored as `numChunks` contiguous chunks, one per head, in every buffer: the K plane, the V
+plane and, for NVFP4, the two scale planes. A head reads only its own chunk of a cell, so a cell
+need not hold all of them.
+
+**What is tracked.** Each entry has one validity byte, one bit per chunk, stored after the entry
+words in the lease's metadata (`SparseArenaView::validOffset`). A bit says the cell holds that
+chunk of the resident unit. The ordinal word is unchanged; the bytes are cleared when a lease is
+initialised, and every admission overwrites its entry's byte.
+
+**What the resolve does.** The caller may pass `unitMask`, parallel to `selected`: the chunks that
+read each unit this step. Eviction and cell allocation still follow the union, so residency (and
+therefore the hit rate in units) is the same as before. Each selected unit then resolves to one of:
+
+| State of the unit | Listed for the copy | Validity afterwards |
+|---|---|---|
+| not resident | `(ordinal, new cell, mask)` | exactly `mask` |
+| resident, holds every chunk in `mask` | nothing (a hit) | unchanged |
+| resident, lacks chunks `need = mask & ~valid` | `(ordinal, its cell, need)` | `valid | need` |
+
+The work list therefore carries a chunk mask per entry (`SparseWorkList::mask`): one entry per
+unit with the chunks to move in it, rather than one entry per (unit, chunk). A mask costs a word
+per entry, keeps the list as short as the selection, and lets the copy resolve the page, the cell
+and the lease once per unit. An entry per chunk would multiply the list by the head count, and the
+copy would repeat the address arithmetic for each.
+
+The resolve reads every entry's validity into shared memory before it writes any, so all of a row's
+selections are decided against the state the launch began with. New validity is visible to the
+launches after it, which on one stream are after the copy that fills it.
+
+**What the copy does.** A chunk is one contiguous run per buffer (`chunkStride` apart), so a
+per-head copy is the same loop over `numChunks` with the chunks outside the mask skipped: no extra
+launches, no extra descriptors and no extra list entries. Each chunk is `128 tokens x head_dim`
+bytes per plane, so the runs are 16 KiB (FP8) and 8 KiB (NVFP4 data, NVFP4 scales are smaller);
+the warp or CTA that takes an entry moves the chunks of the mask in turn. An entry with fewer
+chunks finishes sooner, so a step moves fewer bytes over the same number of launches.
+
+**Other readers and writers of cells.**
+
+- The in-flight unit is written through every head (`write_layer_caches` takes all heads), so its
+  entry is marked complete when it is reserved, whether the cell is restored from the host prefix or
+  empty. Write-back therefore sees complete cells; it also copies only the chunks the entry's byte
+  names, so a stale chunk can never overwrite the host page.
+- Eviction, quota changes and releasing a lease need nothing: bytes are cleared by
+  `initialiseLease` and overwritten at admission. Moving a member between rows keeps its lease and
+  so its bytes with it.
+- Cells hold nothing the transfer path reads. A disaggregated generation server receives its
+  prefix into host pages and the arena restores partial prefixes from them, always whole.
+- A layer that reuses another's selection resolves once and copies per layer with the same mask
+  list, so every layer of the selection stays in step.
+- CUDA graphs: the masks live in a fixed buffer beside the selection, the validity bytes in the
+  lease, and the resolve and the copy keep their static shapes.
+- Layouts with one chunk per unit (DSA, DeepSeek-V4) pass no masks; the mask is the single chunk
+  and every cell is complete when it is admitted, so their behaviour is unchanged.
+
+**Trade-off.** A head that picks a unit later, which today would hit the cell another head filled,
+now takes a one-chunk copy before attention. The bytes it moves are bytes the earlier fill would
+have moved too; they move on the step that reads them rather than before. Chunks nobody reads
+before the unit is evicted are never moved.
+
 ### Measuring the hit rate
 
 A hit is a selected unit the cache already held; a miss is one the fetch copied from its
@@ -852,14 +938,14 @@ rather than inferred.
 obvious denominator — rows times selection width, which the host knows for free — counts
 things that are neither. A selection entry may be padded, and padding is negative and lives
 on the device, chosen by whatever selected the units. An in-flight unit is resolved in the
-same pass but is not a fetch: its host page is not written until the watermark passes it,
-so there is nothing to copy and nothing to miss. Counting either as a hit inflates the rate,
+same pass but is excluded from selection hit/miss statistics. Partial-prefix restoration
+is write preparation, not a selected-history lookup. Counting either as a hit inflates the rate,
 and does so worst where histories are short — early decode, short prompts — which is
 exactly the regime someone reads the rate to understand.
 
 So the resolve counts the selection entries that named real history, in the pass that
-already classifies them. The miss half is `claimed`, the run the row takes in the compacted
-list, which it computes anyway. The two are produced together and agree by construction on
+already classifies them. The miss half counts selected-history misses; partial-prefix restores happen only in
+write preparation and are never counted. The two are produced together and agree by construction on
 what they count; hits are their difference and are never stored.
 
 **Each row adds its own contribution, rather than anything reading a total afterwards.**
