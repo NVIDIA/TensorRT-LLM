@@ -77,6 +77,10 @@ def _inputs(gen, rows: int, device) -> torch.Tensor:
 
 
 def _check(name: str, got: torch.Tensor, want: torch.Tensor) -> None:
+    # Shapes first: `==` broadcasts, so a `[1, R, H]` result would pass against `[R, H]`.
+    assert got.shape == want.shape and got.dtype == want.dtype, (
+        f"{name}: {tuple(got.shape)} {got.dtype} vs {tuple(want.shape)} {want.dtype}"
+    )
     same = got.view(torch.int16) == want.view(torch.int16)
     assert bool(same.all()), f"{name}: {int((~same).sum())} of {same.numel()} lanes differ"
 
@@ -265,9 +269,44 @@ _BUILDS = [(w, s, w == 8) for w, s in GROUPS] + [(4, True, True)]
     ],
 )
 def test_round_trip_matches_nccl_ring(world, step, via_pointers):
-    import torch.multiprocessing as mp
+    _spawn_bounded(_rank_main, (_free_port(), world, step, via_pointers), world, TIMEOUT)
 
-    mp.spawn(_rank_main, args=(_free_port(), world, step, via_pointers), nprocs=world, join=True)
+
+def _build_failure_main(rank: int, port: int, world: int, failing: int) -> None:
+    """`build` with rank `failing`'s launch compile raising after the rendezvous: every rank
+    must leave `build` with a RuntimeError (none may wait in the readiness all-reduce)."""
+    import torch.distributed as dist
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        if rank == failing:
+
+            def refuse(*args, **kwargs):
+                raise ValueError("injected compile failure")
+
+            op._compile = refuse
+        try:
+            op.build(HIDDEN, 4, rank, world)
+        except RuntimeError as e:
+            want = "failed to build" if rank == failing else "another rank failed to build"
+            assert want in str(e), str(e)
+            if rank == failing:
+                assert isinstance(e.__cause__, ValueError), repr(e.__cause__)
+        else:
+            raise AssertionError(f"rank {rank}: build returned after rank {failing} failed")
+        torch.cuda.synchronize()
+    finally:
+        dist.destroy_process_group()
+
+
+@_skip(4)
+def test_a_rank_that_fails_to_build_fails_every_rank():
+    """A compile failure on one rank after the rendezvous: every rank exits `build` with an
+    error, bounded (`QWEN4_EXP_LAMPORT_TIMEOUT`) so a rank left in the all-reduce fails the
+    test instead of hanging it."""
+    _spawn_bounded(_build_failure_main, (_free_port(), 4, 2), 4, TIMEOUT)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device pointer")
@@ -372,6 +411,8 @@ def _spawn_bounded(fn, args, nprocs: int, timeout: float) -> None:
             for p in context.processes:
                 if p.is_alive():
                     p.kill()
+            for p in context.processes:
+                p.join(timeout=60)  # reaped before the failure is reported
             pytest.fail(f"the ranks did not finish within {timeout:.0f} s (a rank is polling)")
 
 
