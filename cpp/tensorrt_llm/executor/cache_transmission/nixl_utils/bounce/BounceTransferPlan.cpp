@@ -198,4 +198,24 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
     return plan;
 }
 
+std::optional<std::size_t> countScatterPieces(
+    std::vector<BounceScatterRun> const& runs, std::uint64_t regionBytes, std::size_t capacity)
+{
+    std::size_t pieces = 0;
+    for (auto const& run : runs)
+    {
+        if (run.count == 0 || run.count > capacity - pieces || run.bounceOffset > regionBytes)
+        {
+            return std::nullopt;
+        }
+        auto const span = static_cast<std::uint64_t>(run.count - 1) * run.bounceStride + run.pieceSize;
+        if (span > regionBytes - run.bounceOffset)
+        {
+            return std::nullopt;
+        }
+        pieces += run.count;
+    }
+    return pieces;
+}
+
 } // namespace tensorrt_llm::executor::kv_cache::bounce

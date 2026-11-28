@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import List, Optional
 
 import msgpack
@@ -109,6 +109,24 @@ class RankInfo:
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
         return msgpack.packb(data)
+
+    def bounce_writer_geometry(self) -> bytes:
+        """Export the rank layout used for projection, without backend metadata or device addresses."""
+        if self.page_table is None:
+            raise ValueError("Bounce writer layout requires a page table")
+        pools = [
+            replace(group, pools=[replace(pool, base_address=0) for pool in group.pools])
+            for group in self.page_table.pool_groups
+        ]
+        layout = replace(
+            self,
+            page_table=replace(self.page_table, pool_groups=pools),
+            transfer_engine_info=b"",
+            self_endpoint="",
+            sender_endpoints=[],
+            aux_meta=None,
+        )
+        return layout.to_bytes()
 
     @classmethod
     def from_kv_cache_manager(

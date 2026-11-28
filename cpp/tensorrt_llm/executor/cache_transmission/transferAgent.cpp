@@ -93,7 +93,19 @@ DynLibLoader::~DynLibLoader()
     }
 }
 
+namespace
+{
+constexpr char kWriterLayoutsTrailer[] = "TRTLLM_BOUNCE_LAYOUTS_V1";
+constexpr auto kTrailerBytes = sizeof(kWriterLayoutsTrailer) - 1;
+constexpr std::size_t kMaxWriterLayoutsBytes = 64ULL << 20;
+} // namespace
+
 std::string AgentDesc::serialize() const
+{
+    return serializeWithWriterLayouts({});
+}
+
+std::string AgentDesc::serializeWithWriterLayouts(std::string const& layouts) const
 {
     namespace su = executor::serialize_utils;
     std::ostringstream os;
@@ -107,16 +119,51 @@ std::string AgentDesc::serialize() const
         su::serialize(r.chunkSize, os);
     }
     su::serialize(mBounceHandshake, os); // NIXL-bounce capability handshake (empty when bounce disabled)
+    if (!layouts.empty())
+    {
+        TLLM_CHECK_WITH_INFO(layouts.size() <= kMaxWriterLayoutsBytes, "Writer roster exceeds metadata limit");
+        su::serialize(layouts, os);
+        os.write(kWriterLayoutsTrailer, kTrailerBytes);
+    }
     return os.str();
 }
 
 AgentDesc AgentDesc::deserialize(std::string const& data)
 {
+    return deserializeImpl(data, nullptr);
+}
+
+std::string AgentDesc::readWriterLayouts(std::string const& data)
+{
+    if (data.size() < kTrailerBytes
+        || data.compare(data.size() - kTrailerBytes, kTrailerBytes, kWriterLayoutsTrailer) != 0)
+    {
+        return {};
+    }
+    std::string layouts;
+    deserializeImpl(data, &layouts);
+    return layouts;
+}
+
+AgentDesc AgentDesc::deserializeImpl(std::string const& data, std::string* writerLayouts)
+{
     namespace su = executor::serialize_utils;
     std::istringstream is(data);
-    auto backendAgentDesc = su::deserialize<std::string>(is);
+    is.exceptions(std::ios::badbit | std::ios::failbit);
+    auto readBytes = [&is]()
+    {
+        auto const size = su::deserialize<std::size_t>(is);
+        TLLM_CHECK_WITH_INFO(size <= static_cast<std::size_t>(is.rdbuf()->in_avail()), "Truncated agent metadata");
+        std::string bytes(size, '\0');
+        is.read(bytes.data(), static_cast<std::streamsize>(size));
+        return bytes;
+    };
+    auto backendAgentDesc = readBytes();
     auto numRegions = su::deserialize<size_t>(is);
     std::vector<VramRegionMeta> regions;
+    constexpr size_t kRegionBytes = sizeof(uintptr_t) + 2 * sizeof(size_t);
+    auto const remaining = static_cast<size_t>(is.rdbuf()->in_avail());
+    TLLM_CHECK_WITH_INFO(numRegions <= remaining / kRegionBytes, "Truncated transfer region metadata");
     regions.reserve(numRegions);
     for (size_t i = 0; i < numRegions; ++i)
     {
@@ -128,14 +175,24 @@ AgentDesc AgentDesc::deserialize(std::string const& data)
     // Peers built before the handshake field existed end the stream right after the regions. An empty handshake
     // means "bounce not advertised" and the peer stays on standard NIXL (registerPeerHandshake treats it that way).
     std::string bounceHandshake;
-    if (is.peek() != std::char_traits<char>::eof())
+    if (is.rdbuf()->in_avail() > 0)
     {
-        bounceHandshake = su::deserialize<std::string>(is);
+        bounceHandshake = readBytes();
     }
     TLLM_CHECK_WITH_INFO(!is.fail(),
         "AgentDesc::deserialize failed: stream error after reading %zu/%zu regions (data size=%zu)", regions.size(),
         numRegions, data.size());
-    return AgentDesc{std::move(backendAgentDesc), std::move(regions), std::move(bounceHandshake)};
+    AgentDesc desc{std::move(backendAgentDesc), std::move(regions), std::move(bounceHandshake)};
+    if (writerLayouts)
+    {
+        auto const tailBytes = static_cast<std::size_t>(is.rdbuf()->in_avail());
+        TLLM_CHECK_WITH_INFO(tailBytes >= sizeof(std::size_t) + kTrailerBytes
+                && tailBytes - sizeof(std::size_t) - kTrailerBytes <= kMaxWriterLayoutsBytes,
+            "Invalid writer roster length");
+        *writerLayouts = readBytes();
+        TLLM_CHECK_WITH_INFO(is.rdbuf()->in_avail() == kTrailerBytes, "Invalid writer roster boundary");
+    }
+    return desc;
 }
 
 // ── VmmDescSplitter utilities (backend-agnostic, no NIXL dependency) ──

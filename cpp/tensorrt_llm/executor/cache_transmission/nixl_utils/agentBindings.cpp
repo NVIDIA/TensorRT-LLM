@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #ifdef ENABLE_NIXL
+#include "bounce/BounceWriteWindow.h"
 #include "transferAgent.h"
 #endif
 
@@ -31,6 +32,7 @@
 
 namespace nb = nanobind;
 namespace kvc = tensorrt_llm::executor::kv_cache;
+using Int64Array = nb::ndarray<std::int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
 {
@@ -135,6 +137,18 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             },
             nb::arg("backend_agent_desc"))
         .def(nb::init<std::string>(), nb::arg("backend_agent_desc"))
+        .def("serialize_with_writer_layouts",
+            [](kvc::AgentDesc const& desc, nb::bytes layouts)
+            {
+                auto data = desc.serializeWithWriterLayouts(std::string(layouts.c_str(), layouts.size()));
+                return nb::bytes(data.data(), data.size());
+            })
+        .def_static("read_writer_layouts",
+            [](nb::bytes data)
+            {
+                auto layouts = kvc::AgentDesc::readWriterLayouts(std::string(data.c_str(), data.size()));
+                return nb::bytes(layouts.data(), layouts.size());
+            })
         .def_prop_ro("backend_agent_desc",
             [](kvc::AgentDesc const& self)
             {
@@ -311,6 +325,54 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
             nb::call_guard<nb::gil_scoped_release>())
         // Programmatic bounce v2 observability (deployment checks and tests; no log parsing).
+        .def(
+            "submit_bounce_transfer",
+            [](kvc::NixlTransferAgent& agent, kvc::TransferRequest const& request, nb::bytes token)
+            {
+                std::string key(token.c_str(), token.size());
+                nb::gil_scoped_release release;
+                return agent.submitTransferWithWindow(request, key).release();
+            },
+            nb::rv_policy::take_ownership, nb::keep_alive<0, 1>())
+        .def_prop_ro("bounce_endpoint", &kvc::NixlTransferAgent::getBounceEndpoint)
+        .def("register_bounce_window",
+            [](kvc::NixlTransferAgent& agent, std::string const& peer, std::string const& endpoint, nb::bytes token,
+                kvc::MemoryDescs const& descs)
+            {
+                std::string key(token.c_str(), token.size());
+                nb::gil_scoped_release release;
+                agent.registerBounceWindow(peer, endpoint, key, descs);
+            })
+        .def(
+            "register_bounce_window_slots",
+            [](kvc::NixlTransferAgent& agent, std::string const& peer, std::string const& endpoint, nb::bytes token,
+                Int64Array slots, std::uint64_t base, std::uint64_t stride, std::uint64_t slotBytes,
+                std::uint64_t numSlots, Int64Array offsets, Int64Array lengths)
+            {
+                std::string key(token.c_str(), token.size());
+                std::span<std::int64_t const> selected(slots.data(), slots.size());
+                kvc::bounce::BounceSlotLayout layout{base, stride, slotBytes, numSlots,
+                    {offsets.data(), offsets.size()}, {lengths.data(), lengths.size()}};
+                nb::gil_scoped_release release;
+                agent.registerBounceWindowSlots(peer, endpoint, key, selected, layout);
+            },
+            nb::arg("peer"), nb::arg("endpoint"), nb::arg("key"), nb::arg("slots").noconvert(), nb::arg("base"),
+            nb::arg("stride"), nb::arg("slot_bytes"), nb::arg("num_slots"), nb::arg("offsets").noconvert(),
+            nb::arg("lengths").noconvert())
+        .def("seal_bounce_window",
+            [](kvc::NixlTransferAgent& agent, nb::bytes token)
+            {
+                std::string key(token.c_str(), token.size());
+                nb::gil_scoped_release release;
+                agent.sealBounceWindow(key);
+            })
+        .def("revoke_bounce_window",
+            [](kvc::NixlTransferAgent& agent, nb::bytes token)
+            {
+                std::string key(token.c_str(), token.size());
+                nb::gil_scoped_release release;
+                agent.revokeBounceWindow(key);
+            })
         .def_prop_ro("bounce_enabled", &kvc::NixlTransferAgent::isBounceEnabled)
         .def("peer_supports_bounce", &kvc::NixlTransferAgent::peerSupportsBounce, nb::arg("name"),
             nb::call_guard<nb::gil_scoped_release>())

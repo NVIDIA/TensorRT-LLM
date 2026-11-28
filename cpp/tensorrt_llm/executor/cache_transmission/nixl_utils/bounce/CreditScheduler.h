@@ -90,6 +90,11 @@ public:
     /// Flow announces the per-chunk byte sizes it wants to write (in order). EMPTY = cancel.
     [[nodiscard]] std::vector<Grant> onWant(std::string const& flow, std::vector<std::uint32_t> const& chunkBytes);
 
+    /// Start a new flow. A repeated request yields no grants and leaves its lease unchanged.
+    /// A request with a chunk outside (0, maxChunkBytes] returns nullopt without reserving a region.
+    [[nodiscard]] std::optional<std::vector<Grant>> startFlow(
+        std::string const& flow, std::vector<std::uint32_t> const& chunkBytes, std::size_t maxChunkBytes);
+
     /// A region finished scattering on the receiver -> free it and re-schedule. Idempotent.
     [[nodiscard]] std::vector<Grant> onScatterDone(std::string const& flow, std::uint64_t offset);
 
@@ -139,13 +144,6 @@ public:
     /// region this flow no longer owns (cancelled/reclaimed) — scattering a freed/re-granted region
     /// would corrupt another flow's data.
     [[nodiscard]] bool heldByFlow(std::string const& flow, std::uint64_t offset) const;
-
-    /// True if `flow` is currently tracked (has pending chunks and/or held regions). A non-empty
-    /// WANT has no retransmission path, so the transport drops a repeat one for a tracked flow —
-    /// re-queueing would re-grant over the still-held regions (the sender never writes the extras,
-    /// leaking them) and the lastProgress refresh would keep renewing the very lease that exists
-    /// to reclaim that state.
-    [[nodiscard]] bool knowsFlow(std::string const& flow) const;
 
     // ---- local (sender) role: gather staging from the SAME arena ----
     /// Allocate a region of `bytes` for local gather staging (non-blocking). Returns its offset, or
@@ -221,6 +219,7 @@ private:
     };
 
     std::vector<Grant> schedule(); // grant while the arena has room and eligible flows exist
+    std::vector<Grant> updateWant(std::string const& flow, std::vector<std::uint32_t> const& chunkBytes);
     // Book one issued grant (shared by schedule()'s drain branch and round-robin sweep): pop the
     // flow's head chunk, hold `offset`, renew the lease, append the Grant, and advance the cursor
     // past ring slot `ringIdx`. Caller must hold mMu and have alloc'd `offset` for the head chunk.
@@ -288,6 +287,47 @@ private:
     // from BuddyAllocator's size `order` (mArena), which is the power-of-two block exponent.
     std::vector<std::string> mRing;
     std::size_t mCursor{0}; // round-robin cursor into mRing
+};
+
+/// Tracks the scatter jobs holding reads of arena regions. Owned by the IO thread.
+class ScatterReservations
+{
+public:
+    [[nodiscard]] bool begin(CreditScheduler const& scheduler, std::string const& flow, std::uint64_t offset);
+    [[nodiscard]] bool hasFlow(std::string const& flow) const;
+    [[nodiscard]] std::unordered_set<std::uint64_t> offsets() const;
+    void markOrphaned(std::vector<std::uint64_t> const& deferred);
+
+    /// Remove the peer's pending flows before releasing its queued orphans. Running jobs retain their regions.
+    template <class SendGrants>
+    void forgetPeer(CreditScheduler& scheduler, std::string const& prefix, std::chrono::milliseconds quarantine,
+        std::vector<std::uint64_t> const& queuedOrphans, SendGrants send)
+    {
+        std::vector<std::uint64_t> deferred;
+        send(scheduler.reclaimByPrefix(prefix, offsets(), deferred, quarantine));
+        markOrphaned(deferred);
+        for (auto offset : queuedOrphans)
+        {
+            send(scheduler.freeOrphanRegion(offset));
+        }
+    }
+
+    /// Drop the job and report whether its flow has already been reclaimed.
+    [[nodiscard]] bool finish(std::uint64_t offset);
+
+    [[nodiscard]] bool empty() const
+    {
+        return mRegions.empty();
+    }
+
+private:
+    struct ActiveScatter
+    {
+        std::string flow;
+        bool orphaned{false};
+    };
+
+    std::unordered_map<std::uint64_t, ActiveScatter> mRegions;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

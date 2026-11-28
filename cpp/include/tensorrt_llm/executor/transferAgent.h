@@ -295,10 +295,15 @@ public:
     /// Deserialize an opaque string back into an AgentDesc.
     [[nodiscard]] static AgentDesc deserialize(std::string const& data);
 
+    /// Attach instance-level writer geometry to the wire metadata returned by the rank-info server.
+    [[nodiscard]] std::string serializeWithWriterLayouts(std::string const& layouts) const;
+    [[nodiscard]] static std::string readWriterLayouts(std::string const& data);
+
 private:
     std::string mBackendAgentDesc;
     std::vector<VramRegionMeta> mVramRegions;
     std::string mBounceHandshake;
+    static AgentDesc deserializeImpl(std::string const& data, std::string* writerLayouts);
 };
 
 // `TransferOp` is an enumeration that represents the types of transfer operations.

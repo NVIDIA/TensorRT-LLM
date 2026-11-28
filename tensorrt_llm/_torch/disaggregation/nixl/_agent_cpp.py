@@ -17,6 +17,9 @@ import os
 import time
 from collections.abc import Callable
 
+import numpy as np
+from numpy.typing import NDArray
+
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (  # noqa: E402
@@ -223,6 +226,51 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
     def load_remote_agent_by_connection(self, name: str, connection_info: str):
         """Load a remote agent by connection info."""
         self._cpp_agent.load_remote_agent_by_connection(name, connection_info)
+
+    @staticmethod
+    def with_bounce_writer_layouts(descriptor: bytes, layouts: bytes) -> bytes:
+        desc = AgentDesc.deserialize(descriptor)
+        return desc.serialize_with_writer_layouts(layouts)
+
+    @staticmethod
+    def get_bounce_writer_layouts(descriptor: bytes) -> bytes:
+        return AgentDesc.read_writer_layouts(descriptor)
+
+    def submit_bounce_transfer(self, request: TransferRequest, key: bytes) -> TransferStatus:
+        cpp_status = self._cpp_agent.submit_bounce_transfer(request, key)
+        return BindingsNixlTransferStatus(cpp_status, agent_name=self.name)
+
+    @property
+    def bounce_endpoint(self) -> str:
+        return self._cpp_agent.bounce_endpoint
+
+    def register_bounce_window(
+        self, peer: str, endpoint: str, key: bytes, destinations: MemoryDescs
+    ) -> None:
+        self._cpp_agent.register_bounce_window(peer, endpoint, key, destinations)
+
+    def register_bounce_window_slots(
+        self,
+        peer: str,
+        endpoint: str,
+        key: bytes,
+        slots: NDArray[np.int64],
+        base: int,
+        stride: int,
+        slot_bytes: int,
+        num_slots: int,
+        offsets: NDArray[np.int64],
+        lengths: NDArray[np.int64],
+    ) -> None:
+        self._cpp_agent.register_bounce_window_slots(
+            peer, endpoint, key, slots, base, stride, slot_bytes, num_slots, offsets, lengths
+        )
+
+    def seal_bounce_window(self, key: bytes) -> None:
+        self._cpp_agent.seal_bounce_window(key)
+
+    def revoke_bounce_window(self, key: bytes) -> None:
+        self._cpp_agent.revoke_bounce_window(key)
 
     def peer_supports_bounce(self, name: str) -> bool:
         supports = getattr(self._cpp_agent, "peer_supports_bounce", None)

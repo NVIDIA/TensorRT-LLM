@@ -21,10 +21,15 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
+
+/// Count scatter pieces without expanding the runs. Each source interval must fit the granted region.
+[[nodiscard]] std::optional<std::size_t> countScatterPieces(
+    std::vector<BounceScatterRun> const& runs, std::uint64_t regionBytes, std::size_t capacity);
 
 /// One chunk = the set of (src,dst) descriptors that get packed into a single bounce region
 /// and moved with one RDMA write. Offsets are byte offsets within that region.

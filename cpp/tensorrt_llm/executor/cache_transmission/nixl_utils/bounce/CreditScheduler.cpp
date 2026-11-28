@@ -287,6 +287,29 @@ void CreditScheduler::eraseIfDone(std::string const& flow)
 std::vector<Grant> CreditScheduler::onWant(std::string const& flow, std::vector<std::uint32_t> const& chunkBytes)
 {
     std::lock_guard<std::mutex> lk(mMu);
+    return updateWant(flow, chunkBytes);
+}
+
+std::optional<std::vector<Grant>> CreditScheduler::startFlow(
+    std::string const& flow, std::vector<std::uint32_t> const& chunkBytes, std::size_t maxChunkBytes)
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    if (mFlows.contains(flow))
+    {
+        TLLM_LOG_WARNING("CreditScheduler: dropped duplicate receive request");
+        return std::vector<Grant>{};
+    }
+    if (chunkBytes.empty()
+        || std::any_of(chunkBytes.begin(), chunkBytes.end(),
+            [maxChunkBytes](std::uint32_t bytes) { return bytes == 0 || bytes > maxChunkBytes; }))
+    {
+        return std::nullopt;
+    }
+    return updateWant(flow, chunkBytes);
+}
+
+std::vector<Grant> CreditScheduler::updateWant(std::string const& flow, std::vector<std::uint32_t> const& chunkBytes)
+{
     auto& st = mFlows[flow];
     st.pending.assign(chunkBytes.begin(), chunkBytes.end());
     st.blockedAtGrantSequence.reset();
@@ -442,12 +465,6 @@ bool CreditScheduler::heldByFlow(std::string const& flow, std::uint64_t offset) 
     return it != mFlows.end() && it->second.held.count(offset) > 0;
 }
 
-bool CreditScheduler::knowsFlow(std::string const& flow) const
-{
-    std::lock_guard<std::mutex> lk(mMu);
-    return mFlows.find(flow) != mFlows.end();
-}
-
 std::vector<Grant> CreditScheduler::freeOrphanRegion(std::uint64_t offset)
 {
     std::lock_guard<std::mutex> lk(mMu);
@@ -512,6 +529,41 @@ std::vector<Grant> CreditScheduler::releaseLocal(std::uint64_t offset)
         mArena.free(offset);
     }
     return schedule(); // freed bytes may now let a waiting remote flow alloc its next chunk
+}
+
+bool ScatterReservations::begin(CreditScheduler const& scheduler, std::string const& flow, std::uint64_t offset)
+{
+    return scheduler.heldByFlow(flow, offset) && mRegions.emplace(offset, ActiveScatter{flow}).second;
+}
+
+bool ScatterReservations::hasFlow(std::string const& flow) const
+{
+    return std::any_of(mRegions.begin(), mRegions.end(), [&](auto const& entry) { return entry.second.flow == flow; });
+}
+
+std::unordered_set<std::uint64_t> ScatterReservations::offsets() const
+{
+    std::unordered_set<std::uint64_t> busy;
+    busy.reserve(mRegions.size());
+    for (auto const& [offset, orphaned] : mRegions)
+    {
+        busy.insert(offset);
+    }
+    return busy;
+}
+
+void ScatterReservations::markOrphaned(std::vector<std::uint64_t> const& deferred)
+{
+    for (auto offset : deferred)
+    {
+        mRegions.at(offset).orphaned = true;
+    }
+}
+
+bool ScatterReservations::finish(std::uint64_t offset)
+{
+    auto region = mRegions.extract(offset);
+    return !region.empty() && region.mapped().orphaned;
 }
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

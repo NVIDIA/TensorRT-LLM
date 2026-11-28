@@ -731,11 +731,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return gathered
 
     def _exchange_rank_info(self):
-        endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
+        registrations = self._dist.allgather(
+            (self._transfer_worker.sender_endpoint, self._transfer_worker.bounce_writer_geometry())
+        )
+        endpoints, writer_layouts = zip(*registrations, strict=True)
         layer_num = len(self._kv_cache_manager.pp_layers)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
-            endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
+            endpoints=list(endpoints),
+            layer_num_per_pp=layer_num_per_pp,
+            writer_layouts=list(writer_layouts),
         )
         logger.info(f"transfer worker ctx_server_endpoints: {endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")

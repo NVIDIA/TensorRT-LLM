@@ -26,6 +26,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -38,6 +39,7 @@ namespace bounce
 // ENABLE_UCX), an empty struct otherwise; the member below is always present so the
 // NixlTransferAgent layout is identical across all translation units.
 struct NixlBounceState;
+struct BounceSlotLayout;
 
 /// Why NixlTransferAgent::shouldUseBounce declined a request (bounce enabled + built). `!mBounce`
 /// is "disabled", not a rejection, and is not counted. Order is the evaluation order of the gate.
@@ -47,6 +49,7 @@ enum class BounceRejectReason : std::uint8_t
     kNotVram,
     kSyncMessage,
     kNoPeerHandshake,
+    kNoReceiveWindow,
     kDescriptorCount,
     kSourceDevice,
     kDescriptorShape,
@@ -136,6 +139,14 @@ public:
     [[nodiscard]] virtual std::unique_ptr<TransferStatus> postXferRequest(TransferOp op, TransferDescs const& srcDescs,
         TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage);
 
+    /// Pin registered destinations through scatter stream completion.
+    [[nodiscard]] auto borrowScatterDestinations() const
+    {
+        return std::pair<std::shared_lock<std::shared_mutex>,
+            std::map<uintptr_t, std::pair<std::size_t, std::uint32_t>> const&>{
+            std::shared_lock<std::shared_mutex>(mLocalRegionMutex), mScatterDestinations};
+    }
+
     /// Register/deregister one raw device range with NIXL, WITHOUT the VMM split or the AgentDesc
     /// VRAM-region bookkeeping (the bounce arena must not enter the splitter's region maps).
     [[nodiscard]] virtual bool registerRegionImpl(void* base, std::size_t bytes, int deviceId);
@@ -163,6 +174,15 @@ public:
         return mBounce != nullptr;
     }
 
+    [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferWithWindow(
+        TransferRequest const& request, std::string const& windowKey);
+    [[nodiscard]] std::string getBounceEndpoint() const;
+    void registerBounceWindow(
+        std::string const& peer, std::string const& endpoint, std::string const& key, MemoryDescs const& destinations);
+    void registerBounceWindowSlots(std::string const& peer, std::string const& endpoint, std::string const& key,
+        std::span<std::int64_t const> slots, bounce::BounceSlotLayout const& layout);
+    void revokeBounceWindow(std::string const& key);
+    void sealBounceWindow(std::string const& key);
     [[nodiscard]] bool peerSupportsBounce(std::string const& name) const;
 
     /// Number of transfer requests routed to the bounce fast path so far.
@@ -224,6 +244,9 @@ private:
     mutable std::shared_mutex mLock;
 
     /// Local VMM region info (from registerMemory). Keyed by local virtual address.
+    // The bounce worker cannot acquire mLock: shutdown joins it while holding mLock.
+    mutable std::shared_mutex mLocalRegionMutex;
+    std::map<uintptr_t, std::pair<std::size_t, std::uint32_t>> mScatterDestinations;
     VramRegionMap mLocalVramRegionInfo;
 
     /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
@@ -244,7 +267,7 @@ private:
     /// Pure admission gate: nullopt when the request is eligible for the bounce fast path, else why not.
     [[nodiscard]] std::optional<bounce::BounceRejectReason> bounceRejectReason(TransferRequest const& request) const;
     /// bounceRejectReason() plus rejection accounting (counter + first-occurrence WARNING).
-    [[nodiscard]] bool shouldUseBounce(TransferRequest const& request) const;
+    [[nodiscard]] bool shouldUseBounce(TransferRequest const& request, bool hasWindow) const;
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent

@@ -191,6 +191,8 @@ def _make_owned_receiver() -> Receiver:
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {}
+    receiver._agent = SimpleNamespace(bounce_enabled=False)
+    receiver._bounce_writer_projections = {}
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
@@ -488,12 +490,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rid = 94
-    receiver = object.__new__(Receiver)
-    receiver._sessions_lock = threading.Lock()
-    receiver._sessions = {}
-    receiver._pre_cancelled_rids = {}
-    receiver._enforce_physical_ownership = True
-    receiver._shutdown = False
+    receiver = _make_owned_receiver()
     receiver_req = SimpleNamespace(
         unique_rid=rid,
         slice_id=0,
@@ -626,12 +623,7 @@ def test_partial_publication_waits_for_queued_writer_success(
 ) -> None:
     rid = 86
     queued_endpoints: list[str] = []
-    receiver = object.__new__(Receiver)
-    receiver._sessions_lock = threading.Lock()
-    receiver._sessions = {}
-    receiver._pre_cancelled_rids = {}
-    receiver._enforce_physical_ownership = True
-    receiver._shutdown = False
+    receiver = _make_owned_receiver()
     # This fixture delivers one result inline from the publication callback.
     # Production results arrive on the listener thread after the send returns.
     receiver._ownership_admission_lock = threading.RLock()
@@ -807,12 +799,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     thread_results: queue.Queue[Exception | None] = queue.Queue()
     result_recorded = threading.Event()
 
-    receiver = object.__new__(Receiver)
-    receiver._sessions_lock = threading.Lock()
-    receiver._sessions = {}
-    receiver._pre_cancelled_rids = {}
-    receiver._enforce_physical_ownership = True
-    receiver._shutdown = False
+    receiver = _make_owned_receiver()
     receiver._dealers = {}
     receiver._build_recv_req_info = Mock(
         return_value=SimpleNamespace(
@@ -1741,6 +1728,34 @@ def test_routed_cancel_preserves_fence_during_ack_registration(retired) -> None:
 
 
 @pytest.mark.cpu_only
+def test_bounce_failure_seals_writers_until_their_individual_drain_proofs():
+    session = _make_rx_session(_make_bounce_receiver_probe(), 122)
+    session.receive(_sole_piece())
+    _publish_report_tokens(session, ranks=(0, 1))
+    task = session._kv_tasks[0]
+    writers = [Mock(), Mock()]
+    keys = [bytes([rank + 1]) * 16 for rank in range(2)]
+    task._bounce_windows = {rank: (writers[rank], keys[rank]) for rank in range(2)}
+
+    session.process_kv_agent_result(0, 0, True, AgentResult.FAILED, _KV_RESULT_REPORT_TOKEN)
+    for writer, key in zip(writers, keys, strict=True):
+        writer.seal_bounce_window.assert_called_once_with(key)
+        writer.revoke_bounce_window.assert_not_called()
+    assert session.failed_receive_awaits_writers()
+    assert not session.close()
+
+    session.process_kv_agent_result(
+        0, 0, True, AgentResult.FAILED_QUIESCED, _KV_RESULT_REPORT_TOKEN
+    )
+    writers[0].revoke_bounce_window.assert_called_once_with(keys[0])
+    writers[1].revoke_bounce_window.assert_not_called()
+    assert session.failed_receive_awaits_writers()
+    session.process_kv_agent_result(1, 0, True, AgentResult.NOT_SUBMITTED, _KV_RESULT_REPORT_TOKEN)
+    writers[1].revoke_bounce_window.assert_called_once_with(keys[1])
+    assert not task._bounce_windows
+
+
+@pytest.mark.cpu_only
 def test_bounce_adp_success_closes_after_the_selected_group_finishes():
     rid = 119
     receiver = _make_bounce_receiver_probe()
@@ -1871,9 +1886,11 @@ def _capture_bounce_results(sender: transfer_mod.Sender, monkeypatch) -> Mock:
 
 
 def _bounce_kv_write_meta(ctx, rid, peer, *, is_last=True, expected_transfers=2):
-    return SimpleNamespace(
-        src_ptrs=np.zeros(1),
-        dst_ptrs=np.zeros(1),
+    return transfer_mod.WriteMeta(
+        peer_name=f"gen{peer}",
+        dst_device_id=0,
+        src_ptrs=np.zeros(1, dtype=np.int64),
+        dst_ptrs=np.zeros(1, dtype=np.int64),
         sizes=np.ones(1, dtype=np.int64),
         task=ctx.kv_tasks[0],
         unique_rid=rid,
@@ -5136,11 +5153,15 @@ def test_bounce_writer_settles_a_transfer_whose_creation_failed_before_posting(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("failure", ["send", "connect"])
-def test_interrupted_bounce_request_fan_out_stops_awaiting_only_unasked_writers(failure):
+@pytest.mark.parametrize("scoped", [False, True])
+def test_interrupted_bounce_request_fan_out_stops_awaiting_only_unasked_writers(failure, scoped):
     rid = 152
     receiver = _make_owned_receiver()
     receiver._enforce_physical_ownership = False
-    receiver._agent = SimpleNamespace(bounce_enabled=True)
+    receiver._agent = Mock(bounce_enabled=True)
+    info_endpoint = "cpu-peer-info"
+    projections = {rank: Mock() for rank in range(3)} if scoped else {}
+    receiver._bounce_writer_projections[info_endpoint] = projections
     receiver._build_recv_req_info = Mock(
         return_value=SimpleNamespace(unique_rid=rid, slice_id=0, to_bytes=Mock(return_value=b""))
     )
@@ -5149,11 +5170,22 @@ def test_interrupted_bounce_request_fan_out_stops_awaiting_only_unasked_writers(
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0),
     )
     receiver._get_sender_info = Mock(
-        return_value=SimpleNamespace(sender_endpoints=["ctx0", "ctx1", "ctx2"], dp_size=1)
+        return_value=SimpleNamespace(
+            instance_name="ctx", sender_endpoints=["ctx0", "ctx1", "ctx2"], dp_size=1
+        )
     )
     asked = []
 
-    def request_sender_data(endpoint: str, _payload: bytes, _token: bytes) -> None:
+    offered_keys = {}
+
+    def request_sender_data(endpoint: str, _payload: bytes, _token: bytes, *window: bytes) -> None:
+        rank = len(asked)
+        if scoped:
+            assert len(window) == 1
+            assert projections[rank].register_window.call_args.args[2] == window[0]
+            offered_keys[rank] = window[0]
+        else:
+            assert not window
         asked.append(endpoint)
         if endpoint == "ctx1":
             if failure == "connect":
@@ -5163,7 +5195,9 @@ def test_interrupted_bounce_request_fan_out_stops_awaiting_only_unasked_writers(
     receiver._request_sender_data = request_sender_data
     session = RxSession(
         request_id=rid,
-        params=DisaggregatedParams(disagg_request_id=rid, ctx_dp_rank=0),
+        params=DisaggregatedParams(
+            disagg_request_id=rid, ctx_dp_rank=0, ctx_info_endpoint=info_endpoint
+        ),
         receiver=receiver,
     )
     with pytest.raises(RuntimeError, match="send interrupted") as raised:
@@ -5176,6 +5210,18 @@ def test_interrupted_bounce_request_fan_out_stops_awaiting_only_unasked_writers(
     # connection proves it was never asked.
     awaited = (0, 1) if failure == "send" else (0,)
     assert set(tokens) == set(awaited)
+    if scoped:
+        keys = {
+            rank: projection.register_window.call_args.args[2]
+            for rank, projection in projections.items()
+        }
+        assert set(session._kv_tasks[0]._bounce_windows) == set(awaited)
+        assert {call.args[0] for call in receiver._agent.seal_bounce_window.call_args_list} == {
+            offered_keys[rank] for rank in awaited
+        }
+        assert {call.args[0] for call in receiver._agent.revoke_bounce_window.call_args_list} == {
+            key for rank, key in keys.items() if rank not in awaited
+        }
     slot = _OneSlotAllocator(rid)
     for rank in awaited:
         slot.apply_reuse_decision(session.close())

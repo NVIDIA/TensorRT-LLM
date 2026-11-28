@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -98,9 +99,9 @@ static_assert(sizeof(BounceCreditEntry) == 24, "BounceCreditEntry must be 24 byt
 static_assert(sizeof(BounceScatterRun) == 36, "BounceScatterRun must be 36 bytes");
 
 inline constexpr std::uint32_t kBounceMagic = 0x424E4332U; // 'B''N''C''2'
-// The handshake checks the control version before bounce is selected. Version 3 requires the
-// receiver to acknowledge cancellation after its destination scatters finish.
-inline constexpr std::uint16_t kBounceVersion = 3U;
+// Version 4 binds control messages, including the cancellation drain acknowledgement, to a receiver window.
+inline constexpr std::uint16_t kBounceVersion = 4U;
+inline constexpr std::size_t kBounceTagBytes = 16;
 
 // ---- encode (each returns a self-contained blob: header + payload) ----
 /// WANT carries the per-chunk byte sizes the sender will write (the receiver allocates a region of

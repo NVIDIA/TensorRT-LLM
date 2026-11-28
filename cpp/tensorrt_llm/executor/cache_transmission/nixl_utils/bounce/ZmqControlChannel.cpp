@@ -153,21 +153,24 @@ void ZmqControlChannel::sendTo(std::string const& peer, std::string const& blob)
 
 bool ZmqControlChannel::recv(std::string& outPeer, std::string& outBlob, int timeoutMs)
 {
-    std::array<zmq::pollitem_t, 1> items{{{mRouter.handle(), 0, ZMQ_POLLIN, 0}}};
-    zmq::poll(items.data(), items.size(), std::chrono::milliseconds(timeoutMs));
-    if ((items[0].revents & ZMQ_POLLIN) == 0)
+    if (timeoutMs != 0)
     {
-        return false;
+        std::array<zmq::pollitem_t, 1> items{{{mRouter.handle(), 0, ZMQ_POLLIN, 0}}};
+        zmq::poll(items.data(), items.size(), std::chrono::milliseconds(timeoutMs));
+        if ((items[0].revents & ZMQ_POLLIN) == 0)
+        {
+            return false;
+        }
     }
-    // A DEALER->ROUTER message arrives as [identity, body]. The span excludes the poll wait above
-    // (that's idle time, not work): it measures the frame reads + the blob copy out to the caller.
-    BounceNvtxScope recvScope(kNvtxZmqRecv, "zmqRecv");
+    // A busy reactor can take the first frame directly and return to its outstanding GPU work on EAGAIN.
     zmq::message_t idFrame;
-    auto r1 = mRouter.recv(idFrame, zmq::recv_flags::none);
+    auto r1 = mRouter.recv(idFrame, zmq::recv_flags::dontwait);
     if (!r1.has_value())
     {
         return false;
     }
+    // A DEALER-to-ROUTER message arrives as [identity, body].
+    BounceNvtxScope recvScope(kNvtxZmqRecv, "zmqRecv");
     zmq::message_t bodyFrame;
     auto r2 = mRouter.recv(bodyFrame, zmq::recv_flags::none);
     if (!r2.has_value())

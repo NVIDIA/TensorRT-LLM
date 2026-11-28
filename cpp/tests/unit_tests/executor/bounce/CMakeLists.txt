@@ -165,6 +165,17 @@ if(NIXL_ROOT)
     add_bounce_reactor_test(bounceTransportTest bounceTransportTest.cpp)
     target_link_libraries(bounceTransportTest PRIVATE CUDA::cuda_driver)
 
+    add_tllm_gtest(
+      bounceWriteWindowTest
+      OWNER
+      executor
+      SOURCES
+      bounceWriteWindowTest.cpp
+      LINK_LIBRARIES
+      tllm::executor_bounce_reactor
+      LABELS
+      "unit;executor;bounce;host")
+
     # Boundary, failure-path, and concurrency tests.
     add_bounce_reactor_test(bounceTransportFailureTest
                             bounceTransportFailureTest.cpp)
@@ -176,9 +187,11 @@ if(NIXL_ROOT)
     option(BOUNCE_TSAN
            "Build a ThreadSanitizer variant of the bounce reactor test" OFF)
     if(BOUNCE_TSAN)
+      find_package(OpenSSL REQUIRED COMPONENTS Crypto)
       add_library(
         tllm_executor_bounce_reactor_tsan STATIC EXCLUDE_FROM_ALL
         ${BOUNCE_DIR}/BounceTransport.cpp
+        ${BOUNCE_DIR}/BounceWriteWindow.cpp
         ${BOUNCE_DIR}/BounceTransferPlan.cpp
         ${BOUNCE_DIR}/BuddyAllocator.cpp
         ${BOUNCE_DIR}/CreditScheduler.cpp
@@ -194,6 +207,8 @@ if(NIXL_ROOT)
         PUBLIC tllm::common_cuda tllm::executor_transfer_agent NIXL::nixl
                PkgConfig::TLLM_BOUNCE_ZMQ Threads::Threads
         PRIVATE tllm::kv_cache_legacy)
+      target_link_libraries(tllm_executor_bounce_reactor_tsan
+                            PRIVATE OpenSSL::Crypto)
       target_include_directories(tllm_executor_bounce_reactor_tsan SYSTEM
                                  PUBLIC ${BOUNCE_TEST_INCS})
       target_compile_features(tllm_executor_bounce_reactor_tsan

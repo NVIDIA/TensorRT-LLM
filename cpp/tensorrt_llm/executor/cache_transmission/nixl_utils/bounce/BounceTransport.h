@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceMessage.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransferPlan.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceWriteWindow.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ControlChannel.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/CreditScheduler.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
@@ -34,6 +35,7 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -74,14 +76,14 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   1. recv() one control message (short timeout) and dispatch it:
 //        [S] GRANT(rid, credits)  -> attach credits to eager-gathered chunks or acquire a local
 //                                    arena region + ExecCtx and launch gather. postWrite is deferred
-//                                    to drainGatherReady() until both gather completion and credit
+//                                    to progressPostedChunks() until both gather completion and credit
 //                                    availability have been observed.
-//        [S] ACK(rid, chunk, h)   -> releaseLocal() that chunk's region; acked++;
+//        [S] ACK(rid, chunk, h)   -> count the completed remote scatter;
 //                                    all acked -> resolve the request's future SUCCESS.
 //        [R] WANT(rid, sizes[])   -> scheduler.onWant(peer:rid, sizes) -> send GRANT(s).
 //        [R] DATA(rid, chunk, h, plan) -> enqueue a scatter job over region `h`.
 //   2. poll every in-flight write (TransferStatus::wait(0)); on Done send DATA (data has
-//      landed at the remote) and mark on-wire. THIS is why no notifMsg is needed.
+//      landed at the remote) and recycle the local staging region after the handle is released.
 //   3. drain scatter completions posted by workers: release receiver regions and re-GRANT.
 //
 // Scatter workers (receiver): pop a job, scatter region->dst via the kernel, synchronize the
@@ -173,6 +175,7 @@ public:
     NixlTransferAgent& agent;  // data plane: postXferRequest (per-chunk RDMA writes)
     BounceArena* arena{};      // ONE shared data buffer: receiver grants + local gather both carve regions from it
     ExecPool* exec{};          // gather/scatter exec contexts (streams/scratch), borrowed per kernel
+    BounceWriteWindows windows;
     CreditScheduler scheduler; // shared region allocator; internally synchronized
     std::atomic<bool> stop{false};
 };
@@ -192,8 +195,10 @@ public:
     /// Join the scatter workers (call during shutdown after wake()).
     void joinWorkers();
 
-    void onWant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
-    void onData(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
+    void onWant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob,
+        std::shared_ptr<BounceWriteWindow> const& window);
+    void onData(std::string const& peer, BounceMsgHeader const& h, std::string const& blob,
+        std::shared_ptr<BounceWriteWindow> const& window);
     /// Drain scatter bookkeeping completions posted by workers, release regions, and re-grant newly
     /// available space. Successful workers have already sent ACK. Returns true if any were drained.
     bool drainScatterDone();
@@ -217,6 +222,7 @@ public:
 private:
     struct ScatterJob
     {
+        std::shared_ptr<BounceWriteWindow> window;
         std::string key; // "peer\x1f rid"
         std::string peer;
         std::uint64_t rid{};
@@ -234,9 +240,6 @@ private:
         bool destinationDrained{true};
     };
 
-    /// The set of incoming regions currently scattering — the `busy` set passed to the scheduler's
-    /// reclaim calls so a region a worker is still reading is deferred, not re-granted.
-    std::unordered_set<std::uint64_t> scatteringRegions() const;
     /// Shared reclaim bookkeeping (cancel / peer loss / lease expiry): run `reclaim` with the
     /// currently-scattering regions as the busy set, send the resulting grants, and flag every
     /// deferred region orphaned in mScattering so drainScatterDone frees it on completion.
@@ -268,14 +271,8 @@ private:
     // from re-granting an incoming region a worker is still reading; the orphaned flag decides whether
     // drainScatterDone frees the region via freeOrphanRegion (flow already gone) or onScatterDone
     // (normal completion).
-    struct ActiveScatter
-    {
-        std::string key;
-        bool orphaned{false};
-    };
-
-    std::unordered_map<std::uint64_t, ActiveScatter> mScattering;
-    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> mDrainAcks;
+    ScatterReservations mScattering;
+    std::unordered_map<std::string, std::pair<std::shared_ptr<BounceWriteWindow>, std::uint64_t>> mDrainAcks;
     bool mScatterDrainUnproven{false};
 
     std::chrono::steady_clock::time_point mNextSweep{}; // checkTimeouts() throttle (IO-thread-only)
@@ -295,20 +292,19 @@ public:
     /// Chunks are cut to cfg.maxChunkSizeBytes. NixlTransferAgent validates peer compatibility
     /// before calling this; direct users of BounceTransport must establish the same invariant
     /// themselves.
-    [[nodiscard]] std::shared_future<BounceResult> submit(
-        TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer);
+    [[nodiscard]] std::shared_future<BounceResult> submit(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
+        std::string const& peer, std::string const& windowKey);
 
     void onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
-    void onAck(std::string const& peer, BounceMsgHeader const& h);
-    void onDrainAck(std::string const& peer, BounceMsgHeader const& h);
+    void onAck(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope);
+    void onDrainAck(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope);
     /// The receiver reported it cannot complete a chunk/request: fail the request now (kPeerNack)
     /// instead of waiting out requestTimeoutMs. Unknown / wrong-peer NACKs are dropped like ACKs.
-    void onNack(std::string const& peer, BounceMsgHeader const& h);
-    /// Issue the RDMA write for any chunk whose gather kernel has now completed (poll ctx->event,
-    /// non-blocking). Decouples the IO thread from gather latency on a shared GPU. Returns true if it
-    /// posted a write (or failed a request) this pass — used to drive the IO loop's idle backoff.
-    bool drainGatherReady();
-    bool pollSenderHandles();
+    void onNack(std::string const& peer, BounceMsgHeader const& h, std::string const& envelope);
+    /// Post ready writes across all requests, then send DATA for their completed writes.
+    /// Poll each event and handle once without blocking the IO thread.
+    /// Returns true when a chunk advances or a request fails, for the IO loop's idle backoff.
+    bool progressPostedChunks();
     /// Free local regions whose failed request still had an RDMA write in flight, once that write
     /// reaches a terminal state (so the NIC is done reading the source). Returns true if any freed.
     bool drainOrphanLocal();
@@ -316,7 +312,7 @@ public:
     /// stream is idle (non-blocking cudaStreamQuery), and return the exec context. Returns true if
     /// any freed. Keeps failRequest off the GPU: the IO thread never blocks on a stream sync.
     bool drainOrphanGather();
-    /// Retry parked credits for every request (called on the IO loop after ACKs free regions).
+    /// Retry parked credits after local staging regions or gather contexts become available.
     void drainPendingPosts();
     /// Fail requests that have made no progress within requestTimeoutMs (e.g. peer never granted).
     void checkTimeouts();
@@ -347,17 +343,19 @@ private:
     enum class PostState
     {
         Gathering,    // gather kernel launched + event recorded; write deferred until the event signals
-        GatherFailed, // gather launch / event-record failed -> drainGatherReady fails the request
+        GatherFailed, // gather launch / event-record failed -> progressPostedChunks fails the request
                       // (an unrecorded event queries as "complete", so its event must NOT be trusted)
         Gathered,     // gather event signalled, exec ctx returned; waiting for the credit (eager gather)
         Writing,      // gather done; RDMA write issued (xfer valid); polling getXferStatus
-        Sent,         // getXferStatus==Done -> DATA emitted; xfer released; awaiting ACK
+        Sent,         // DATA emitted; local staging is returned or owned by an orphan; awaiting scatter ACK
     };
+
+    friend class BounceSenderStateTest;
 
     struct Posted
     {
         std::uint32_t chunkIdx{};
-        std::uint64_t localOffset{};          // shared-arena region held for gather/write until ACK (OUTGOING_HELD)
+        std::uint64_t localOffset{};          // shared-arena region owned by the chunk only before Sent
         ExecCtx* ctx{nullptr};                // gather exec context, borrowed while the gather runs (until Gathered)
         std::unique_ptr<TransferStatus> xfer; // in-flight RDMA write (set once state == Writing;
                                               // nullptr after release, or if the post itself failed)
@@ -365,7 +363,7 @@ private:
         // Remote write target (from the GRANT), kept so postWrite can be issued LATER — after the
         // gather kernel completes — instead of blocking the IO thread on cudaStreamSynchronize.
         // The gather may be delayed behind unrelated GPU work (shared device), so we never sync;
-        // drainGatherReady() polls ctx->event and posts the write only when the gather is done.
+        // progressPostedChunks() polls ctx->event and posts the write only when the gather is done.
         // With eager gather these fields are filled in later, by attachCredits() (hasCredit==true).
         std::uint64_t remoteAddr{};
         std::uint32_t remoteDevId{};
@@ -380,6 +378,28 @@ private:
 
     struct Request
     {
+        [[nodiscard]] bool acceptsCredit(std::uint64_t packedBytes, std::uint32_t creditBytes);
+        [[nodiscard]] bool canPost();
+        [[nodiscard]] BounceFailReason failureReason(BounceFailReason fallback) const;
+
+        template <class Release>
+        bool acknowledge(std::uint32_t chunk, std::uint64_t handle, Release release)
+        {
+            for (auto iter = posted.begin(); iter != posted.end(); ++iter)
+            {
+                if (iter->state == PostState::Sent && iter->chunkIdx == chunk && iter->remoteHandle == handle)
+                {
+                    release(*iter);
+                    posted.erase(iter);
+                    ++acked;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        std::string windowKey;
+        std::string windowId;
         std::string peer;
         std::uint32_t numChunks{};
         BounceTransferPlan plan;
@@ -395,7 +415,7 @@ private:
         // start (no gather region / exec context free — the shared arena is used across peers and can
         // be oversubscribed) or, with eager gather, the chunk posted before its GRANT arrived and the
         // credit is about to be attached. The IO thread NEVER blocks on acquire; it parks the credit
-        // here and retries each loop iteration as ACKs free regions. FIFO: paired with chunks in order.
+        // here and retries each loop iteration as regions become available. FIFO: paired with chunks in order.
         std::deque<BounceCreditEntry> pendingCredits;
         std::shared_ptr<std::promise<BounceResult>> promise;
         // Set by the abandon sites (GRANT mispair / plan overflow): the request then dies through
@@ -413,10 +433,8 @@ private:
         std::uint64_t nvtxArenaStarved{0};  // credits parked: no local region / exec ctx -> parked credits drain
     };
 
-    // Regions of a FAILED request whose RDMA write was still in flight (state == Writing).
-    // The NIC may still be reading the source region, so recycling is deferred until the write reaches
-    // a terminal state — drainOrphanLocal() polls and only then releases the xfer handle + returns the
-    // region. IO-thread-only (no lock). (xfer handle, arena offset).
+    // Local staging retained by an in-flight write of a failed request, or by a completed write
+    // whose backend refused to release its handle. The IO thread returns the region after release.
     struct OrphanLocal
     {
         std::unique_ptr<TransferStatus> xfer;
@@ -424,6 +442,7 @@ private:
         std::uint64_t rid{};
         std::chrono::steady_clock::time_point since{}; // when the write was orphaned (age for the stall warning)
         bool warned{false};                            // stall WARNING already emitted once
+        std::chrono::steady_clock::time_point retryReleaseAfter{};
     };
 
     // Staging regions of a FAILED request whose gather may still be running (state == Gathering, or
@@ -472,22 +491,26 @@ private:
 
     // request table (IO thread + submit() from app threads)
     std::mutex mReqMu;
-    std::unordered_map<std::uint64_t, Request> mRequests;
+    using RequestTable = std::unordered_map<std::uint64_t, Request>;
+    static RequestTable::iterator findReply(RequestTable& requests, std::string const& peer, std::uint64_t rid);
+    RequestTable::iterator findVerifiedReply(std::string const& peer, std::uint64_t rid, std::string const& envelope);
+    RequestTable mRequests;
     std::atomic<std::uint64_t> mNextRid{1};
 
-    std::vector<OrphanLocal> mOrphanLocal;
+    std::list<OrphanLocal> mOrphanLocal;
     std::vector<OrphanGather> mOrphanGather;
     // A failed request's cancel (empty WANT) must be DEFERRED while any of its RDMA writes are still
     // in flight: those writes are landing on the RECEIVER's regions, and an early cancel would let the
     // receiver reclaim + re-grant those regions under the in-flight write -> cross-node corruption.
     // drainOrphanLocal() sends the cancel once the flow's last in-flight write reaches terminal.
     // rid -> peer. IO-thread-only.
-    std::unordered_map<std::uint64_t, std::string> mPendingCancel;
+    std::unordered_map<std::uint64_t, std::pair<std::string, std::string>> mPendingCancel;
 
     struct PendingDrain
     {
         std::string peer;
         std::weak_ptr<BounceDrain> drain;
+        std::string windowKey;
     };
 
     std::unordered_map<std::uint64_t, PendingDrain> mAwaitingDrain;
@@ -542,10 +565,15 @@ public:
 
     /// Submit a WRITE of (src -> dst) descriptors to `peer`. Returns a future that resolves
     /// {kSUCCESS} once every chunk is scattered+ACKed, or {kFAILURE, reason} on error/shutdown.
-    [[nodiscard]] std::shared_future<BounceResult> submit(
-        TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
+    [[nodiscard]] std::shared_future<BounceResult> submit(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
+        std::string const& peer, std::string const& windowKey)
     {
-        return mSender.submit(srcDescs, dstDescs, peer);
+        return mSender.submit(srcDescs, dstDescs, peer, windowKey);
+    }
+
+    BounceWriteWindows& receiveWindows() noexcept
+    {
+        return mCtx.windows;
     }
 
     /// This side's EFFECTIVE per-chunk cap: cfg.maxChunkSizeBytes AFTER the constructor's clamp to

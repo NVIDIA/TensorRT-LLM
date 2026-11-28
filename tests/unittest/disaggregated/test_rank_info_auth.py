@@ -689,3 +689,13 @@ def test_sync_rank_info_admission_rejects_all_ranks_before_publication(rejected_
             assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
         assert not tc._recv_sessions
         assert not tc._recv_reqs
+
+
+def test_request_data_advertises_bounce_per_writer():
+    from tensorrt_llm._torch.disaggregation.native.transfer import _request_data_credentials
+
+    result_token = bytes(range(16))
+    window = bytes(range(16, 32))
+    legacy = [b"REQUEST_DATA", b"metadata", result_token]
+    assert _request_data_credentials(legacy) == (result_token, b"")
+    assert _request_data_credentials([*legacy, window]) == (result_token, window)

@@ -567,6 +567,160 @@ b::CreditScheduler makeTimedSched(
         kBase, static_cast<std::size_t>(nRegions) * kRegion, kRegion, maxInflight, [now] { return *now; });
 }
 
+TEST(CreditScheduler, DuplicateRequestPreservesGrantAndLease)
+{
+    auto now = std::make_shared<std::chrono::steady_clock::time_point>();
+    auto scheduler = makeTimedSched(2, 2, now);
+    auto first = scheduler.startFlow("a", want(1), kRegion);
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->size(), 1U);
+    *now += std::chrono::seconds(2);
+    auto repeat = scheduler.startFlow("a", want(1), kRegion);
+    ASSERT_TRUE(repeat);
+    EXPECT_TRUE(repeat->empty());
+    EXPECT_EQ(scheduler.heldCount("a"), 1U);
+    EXPECT_EQ(freeRegions(scheduler), 1U);
+    EXPECT_EQ(scheduler.staleFlows(std::chrono::seconds(1)), std::vector<std::string>{"a"});
+}
+
+TEST(CreditScheduler, OutOfRangeDemandLeavesAllRegionsAvailable)
+{
+    auto scheduler = makeSched(2, 2);
+    for (auto bytes : {0U, kRegion + 1})
+    {
+        EXPECT_FALSE(scheduler.startFlow("rejected", {bytes}, kRegion));
+        EXPECT_EQ(scheduler.trackedFlows(), 0U);
+        EXPECT_EQ(freeRegions(scheduler), 2U);
+        for (int i = 0; i < 12; ++i)
+        {
+            auto credits = scheduler.startFlow("next", want(2), kRegion);
+            ASSERT_TRUE(credits);
+            ASSERT_EQ(credits->size(), 2U);
+            for (auto const& grant : *credits)
+            {
+                EXPECT_TRUE(scheduler.onScatterDone("next", grant.offset).empty());
+            }
+        }
+    }
+}
+
+TEST(CreditScheduler, OneScatterReservationPerGrantedRegion)
+{
+    auto scheduler = makeSched(2, 2);
+    auto grants = scheduler.onWant("a", want(1));
+    ASSERT_EQ(grants.size(), 1U);
+    auto const offset = grants.front().offset;
+    b::ScatterReservations scatters;
+    EXPECT_TRUE(scatters.begin(scheduler, "a", offset));
+    EXPECT_FALSE(scatters.begin(scheduler, "a", offset));
+    EXPECT_EQ(scatters.offsets().size(), 1U);
+    EXPECT_FALSE(scatters.finish(offset));
+    EXPECT_TRUE(scheduler.onScatterDone("a", offset).empty());
+    EXPECT_FALSE(scatters.begin(scheduler, "a", offset));
+    EXPECT_TRUE(scatters.empty());
+    EXPECT_EQ(freeRegions(scheduler), 2U);
+}
+
+TEST(CreditScheduler, DrainWaitsForEveryScatterInItsOwnFlow)
+{
+    auto scheduler = makeSched(4, 2);
+    std::string const first = "writer/1";
+    std::string const second = "writer/2";
+    auto firstGrants = scheduler.onWant(first, want(2));
+    auto secondGrants = scheduler.onWant(second, want(1));
+    ASSERT_EQ(firstGrants.size(), 2U);
+    ASSERT_EQ(secondGrants.size(), 1U);
+
+    b::ScatterReservations scatters;
+    ASSERT_TRUE(scatters.begin(scheduler, first, firstGrants[0].offset));
+    ASSERT_TRUE(scatters.begin(scheduler, first, firstGrants[1].offset));
+    ASSERT_TRUE(scatters.begin(scheduler, second, secondGrants[0].offset));
+
+    std::vector<std::uint64_t> deferred;
+    EXPECT_TRUE(scheduler.reclaimFlow(first, scatters.offsets(), deferred).empty());
+    ASSERT_EQ(deferred.size(), 2U);
+    scatters.markOrphaned(deferred);
+    EXPECT_TRUE(scatters.hasFlow(first));
+    EXPECT_TRUE(scatters.finish(firstGrants[0].offset));
+    EXPECT_TRUE(scheduler.freeOrphanRegion(firstGrants[0].offset).empty());
+    EXPECT_TRUE(scatters.hasFlow(first));
+    EXPECT_TRUE(scatters.hasFlow(second));
+
+    EXPECT_TRUE(scatters.finish(firstGrants[1].offset));
+    EXPECT_TRUE(scheduler.freeOrphanRegion(firstGrants[1].offset).empty());
+    EXPECT_FALSE(scatters.hasFlow(first));
+    EXPECT_TRUE(scatters.hasFlow(second));
+    EXPECT_FALSE(scatters.finish(secondGrants[0].offset));
+    EXPECT_TRUE(scheduler.onScatterDone(second, secondGrants[0].offset).empty());
+    EXPECT_FALSE(scatters.hasFlow(second));
+    EXPECT_EQ(freeRegions(scheduler), 4U);
+}
+
+TEST(CreditScheduler, ExpiredGrantCannotStartScatterAfterRegionReuse)
+{
+    using namespace std::chrono_literals;
+    auto now = std::make_shared<std::chrono::steady_clock::time_point>();
+    auto scheduler = makeTimedSched(1, 1, now);
+    auto original = scheduler.onWant("expired", want(1));
+    ASSERT_EQ(original.size(), 1U);
+    auto const offset = original.front().offset;
+    EXPECT_TRUE(scheduler.onWant("waiting", want(1)).empty());
+    *now += 100ms;
+    EXPECT_TRUE(scheduler.staleFlows(400ms).empty());
+    *now += 400ms;
+    ASSERT_EQ(scheduler.staleFlows(400ms), std::vector<std::string>{"expired"});
+    std::vector<std::uint64_t> deferred;
+    EXPECT_TRUE(scheduler.reclaimFlow("expired", {}, deferred, 200ms).empty());
+    *now += 199ms;
+    EXPECT_TRUE(scheduler.reapQuarantine().empty());
+    *now += 2ms;
+    auto reused = scheduler.reapQuarantine();
+    ASSERT_EQ(reused.size(), 1U);
+    EXPECT_EQ(reused.front().flow, "waiting");
+    EXPECT_EQ(reused.front().offset, offset);
+    b::ScatterReservations scatters;
+    EXPECT_FALSE(scatters.begin(scheduler, "expired", offset));
+    EXPECT_TRUE(scatters.begin(scheduler, "waiting", offset));
+    EXPECT_FALSE(scatters.finish(offset));
+    EXPECT_TRUE(scheduler.onScatterDone("waiting", offset).empty());
+    EXPECT_EQ(freeRegions(scheduler), 1U);
+}
+
+TEST(CreditScheduler, ForgetReleasesQueuedOrphansOnlyToSurvivingFlows)
+{
+    auto scheduler = makeSched(2, 2);
+    auto granted = scheduler.onWant("gone/active", want(2));
+    ASSERT_EQ(granted.size(), 2U);
+    auto const running = granted[0].offset;
+    auto const queued = granted[1].offset;
+    b::ScatterReservations scatters;
+    ASSERT_TRUE(scatters.begin(scheduler, "gone/active", running));
+    ASSERT_TRUE(scatters.begin(scheduler, "gone/active", queued));
+    std::vector<std::uint64_t> deferred;
+    EXPECT_TRUE(scheduler.reclaimFlow("gone/active", scatters.offsets(), deferred).empty());
+    ASSERT_EQ(deferred.size(), 2U);
+    scatters.markOrphaned(deferred);
+    EXPECT_TRUE(scheduler.onWant("gone/pending", want(1)).empty());
+    EXPECT_TRUE(scheduler.onWant("other/pending", want(2)).empty());
+
+    ASSERT_TRUE(scatters.finish(queued));
+    std::vector<std::vector<b::Grant>> batches;
+    scatters.forgetPeer(scheduler, "gone/", std::chrono::seconds(30), {queued},
+        [&](auto grants) { batches.push_back(std::move(grants)); });
+    ASSERT_EQ(batches.size(), 2U);
+    EXPECT_TRUE(batches[0].empty());
+    ASSERT_EQ(batches[1].size(), 1U);
+    EXPECT_EQ(batches[1].front().flow, "other/pending");
+    EXPECT_EQ(batches[1].front().offset, queued);
+    EXPECT_EQ(scheduler.heldCount("gone/pending"), 0U);
+    EXPECT_EQ(freeRegions(scheduler), 0U);
+    ASSERT_TRUE(scatters.finish(running));
+    auto completed = scheduler.freeOrphanRegion(running);
+    ASSERT_EQ(completed.size(), 1U);
+    EXPECT_EQ(completed.front().flow, "other/pending");
+    EXPECT_EQ(completed.front().offset, running);
+}
+
 TEST(CreditScheduler, ReceiverReclaimQuarantinesUnwrittenRegionsUntilReaped)
 {
     // Receiver-initiated reclaim (peer loss / lease expiry): granted-but-unwritten regions may STILL

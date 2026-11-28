@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -46,9 +47,11 @@ namespace
 // statuses it hands out.
 struct XferControls
 {
-    std::atomic<bool> failWrites{false};     // every posted write polls as FAILURE
-    std::atomic<bool> allowTerminal{true};   // false -> posted writes stay IN_PROGRESS
-    std::atomic<bool> releaseSucceeds{true}; // false -> release() fails (handle retained)
+    std::atomic<bool> useNixl{false};
+    std::atomic<bool> failWrites{false};      // every posted write polls as FAILURE
+    std::atomic<bool> allowTerminal{true};    // false -> posted writes stay IN_PROGRESS
+    std::atomic<bool> releaseSucceeds{true};  // false -> release() fails (handle retained)
+    std::atomic<std::uint64_t> failOnPost{0}; // one-based; zero keeps every post enabled
     std::atomic<std::uint64_t> postCount{0};
     std::atomic<std::uint64_t> releaseCount{0};
 };
@@ -98,6 +101,37 @@ private:
     bool mReleased{false};
 };
 
+// Retain a real NIXL write handle on demand while leaving its transfer and completion query intact.
+class ControlledReleaseStatus final : public kvc::TransferStatus
+{
+public:
+    ControlledReleaseStatus(std::unique_ptr<kvc::TransferStatus> status, std::shared_ptr<XferControls> controls)
+        : mStatus(std::move(status))
+        , mControls(std::move(controls))
+    {
+    }
+
+    bool isCompleted() const override
+    {
+        return mStatus->isCompleted();
+    }
+
+    kvc::TransferState wait(int64_t timeout) const override
+    {
+        return mStatus->wait(timeout);
+    }
+
+    bool release() override
+    {
+        ++mControls->releaseCount;
+        return mControls->releaseSucceeds && mStatus->release();
+    }
+
+private:
+    std::unique_ptr<kvc::TransferStatus> mStatus;
+    std::shared_ptr<XferControls> mControls;
+};
+
 // The fault-injection seam: a REAL NixlTransferAgent (control plane / metadata untouched) whose
 // low-level write primitive is overridden per XferControls — real NIXL cannot be coerced into a
 // deterministic write failure.
@@ -110,10 +144,24 @@ public:
     {
     }
 
-    [[nodiscard]] std::unique_ptr<kvc::TransferStatus> postXferRequest(kvc::TransferOp, kvc::TransferDescs const&,
-        kvc::TransferDescs const&, std::string const&, std::optional<kvc::SyncMessage> const&) override
+    [[nodiscard]] std::unique_ptr<kvc::TransferStatus> postXferRequest(kvc::TransferOp op,
+        kvc::TransferDescs const& local, kvc::TransferDescs const& remote, std::string const& peer,
+        std::optional<kvc::SyncMessage> const& notification) override
     {
-        mCtl->postCount.fetch_add(1, std::memory_order_relaxed);
+        auto const post = mCtl->postCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (post == mCtl->failOnPost)
+        {
+            return nullptr;
+        }
+        if (mCtl->useNixl.load(std::memory_order_acquire))
+        {
+            auto status = kvc::NixlTransferAgent::postXferRequest(op, local, remote, peer, notification);
+            if (status && !mCtl->releaseSucceeds)
+            {
+                return std::make_unique<ControlledReleaseStatus>(std::move(status), mCtl);
+            }
+            return status;
+        }
         return std::make_unique<FakeXferStatus>(mCtl);
     }
 
@@ -148,71 +196,12 @@ void capRegions(b::BounceConfig& c, std::uint32_t regionCap)
 
 // makeNode with a FakeXferAgent wired to `ctl`.
 std::unique_ptr<bounce_test::Node> makeFakeNode(
-    std::string const& name, b::BounceConfig const& c, std::shared_ptr<XferControls> ctl)
+    std::string const& name, b::BounceConfig const& c, std::shared_ptr<XferControls> ctl, std::size_t maxDescs = 1024)
 {
-    return bounce_test::makeNode(name, c, 1024,
+    return bounce_test::makeNode(name, c, maxDescs,
         [&ctl](kvc::BaseAgentConfig const& agentConfig) { return std::make_unique<FakeXferAgent>(agentConfig, ctl); });
 }
 
-// Poll `ch` until `budget` elapses, invoking `onMsg(header, blob)` for each decoded message;
-// stops early when onMsg returns true (returns whether it did).
-template <typename Fn>
-bool pumpChannel(b::ZmqControlChannel& ch, std::chrono::milliseconds budget, Fn&& onMsg)
-{
-    auto const deadline = std::chrono::steady_clock::now() + budget;
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        std::string peer;
-        std::string blob;
-        b::BounceMsgHeader h{};
-        if (ch.recv(peer, blob, 20) && b::decodeHeader(blob, h) && onMsg(h, blob))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Wait up to `budget` for a GRANT for `rid`, decoding its credits into `out`.
-bool waitGrant(b::ZmqControlChannel& ch, std::uint64_t rid, std::chrono::milliseconds budget,
-    std::vector<b::BounceCreditEntry>& out)
-{
-    return pumpChannel(ch, budget,
-        [&](b::BounceMsgHeader const& h, std::string const& blob)
-        {
-            if (static_cast<b::BounceMsgType>(h.msgType) != b::BounceMsgType::kGRANT || h.requestId != rid)
-            {
-                return false;
-            }
-            EXPECT_TRUE(b::decodeCredits(blob, h, out));
-            return !out.empty();
-        });
-}
-
-// Wait up to `budget` for a NACK for `rid`.
-bool waitNack(b::ZmqControlChannel& ch, std::uint64_t rid, std::chrono::milliseconds budget)
-{
-    return pumpChannel(ch, budget,
-        [&](b::BounceMsgHeader const& h, std::string const&)
-        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kNACK && h.requestId == rid; });
-}
-
-// Count ACKs for `rid` over the FULL `budget` window (a negative-assertion helper: always runs to
-// the deadline so extra/duplicate ACKs have time to show up).
-int countAcks(b::ZmqControlChannel& ch, std::chrono::milliseconds budget, std::uint64_t rid)
-{
-    int n = 0;
-    pumpChannel(ch, budget,
-        [&](b::BounceMsgHeader const& h, std::string const&)
-        {
-            if (static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kACK && h.requestId == rid)
-            {
-                ++n;
-            }
-            return false;
-        });
-    return n;
-}
 } // namespace
 
 // A peer that never GRANTs must fail the request on requestTimeoutMs, not hang. The WANT is
@@ -232,7 +221,7 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
     t->tx->addPeer("ghostPeer", ghost.localEndpoint());
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "ghostPeer");
+    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "ghostPeer", bounce_test::testWindowKey());
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "request hung with no grant";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kNoProgressTimeout);
@@ -241,8 +230,7 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
     bounce_test::freeXferBufs(bufs);
 }
 
-// The posted write reports failure -> the request must FAIL (not hang, not falsely succeed).
-// The sender is a FakeXferAgent whose writes always poll as FAILURE.
+// A backend write failure settles the request. The same sender and receiver can service the next transfer.
 TEST(BounceTransportFailure, WriteFailureFailsRequest)
 {
     if (!bounce_test::hasCuda())
@@ -255,39 +243,119 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     auto B = bounce_test::makeNode("feB", c, 1024);
     if (!A || !B)
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    A->tx->addPeer("feB", B->ch->localEndpoint());
-    B->tx->addPeer("feA", A->ch->localEndpoint());
+    bounce_test::wirePair(*A, *B);
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "feB");
+    auto fut = bounce_test::submitTransfer(*A, *B, bufs);
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "write failure hung";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kWriteFailed);
     EXPECT_GE(ctl->postCount.load(std::memory_order_acquire), 1u);
 
+    ctl->useNixl.store(true, std::memory_order_release);
+    auto followup = bounce_test::makeXferBufs(8, 256, /*seed=*/2);
+    auto recovered = bounce_test::submitTransfer(*A, *B, followup);
+    ASSERT_EQ(recovered.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_EQ(recovered.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(followup));
+
     A->tx->shutdown();
     B->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
+    bounce_test::freeXferBufs(followup);
 }
 
-TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
+namespace
+{
+// The reactor dispatches one received message before its next recv. Pause at that boundary
+// after the first DATA, so the test can seal an already queued scatter before cancel is handled.
+class PauseAfterData : public b::ZmqControlChannel
+{
+public:
+    PauseAfterData(std::string const& name, std::promise<void> reached, std::future<void> resume)
+        : b::ZmqControlChannel(name)
+        , mReached(std::move(reached))
+        , mResume(std::move(resume))
+    {
+    }
+
+    bool recv(std::string& peer, std::string& blob, int timeoutMs) override
+    {
+        if (mPauseNext)
+        {
+            mPauseNext = false;
+            mReached.set_value();
+            EXPECT_EQ(mResume.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        }
+        auto const received = b::ZmqControlChannel::recv(peer, blob, timeoutMs);
+        if (received && mArmed)
+        {
+            b::BounceMsgHeader header{};
+            if (b::decodeHeader(blob, header) && header.msgType == static_cast<std::uint16_t>(b::BounceMsgType::kDATA))
+            {
+                mPauseNext = true;
+                mArmed = false;
+            }
+        }
+        return received;
+    }
+
+private:
+    std::promise<void> mReached;
+    std::future<void> mResume;
+    bool mArmed{true};
+    bool mPauseNext{false};
+};
+
+void checkFailedWriteDrain(bool sealBeforeCancel)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/1500);
     auto sender = bounce_test::makeNode("drainA", c, 1024);
-    auto receiver = bounce_test::makeNode("drainB", c, 1024);
+    std::promise<void> reached;
+    auto queued = reached.get_future();
+    std::promise<void> resume;
+    std::unique_ptr<b::ZmqControlChannel> channel;
+    if (sealBeforeCancel)
+    {
+        channel = std::make_unique<PauseAfterData>("drainB", std::move(reached), resume.get_future());
+    }
+    auto receiver = bounce_test::makeNode("drainB", c, 1024, nullptr, std::move(channel));
     if (!sender || !receiver)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     bounce_test::wirePair(*sender, *receiver);
+    ASSERT_TRUE(sender->tx->registerPeerHandshake(receiver->name, receiver->tx->localHandshakeBlob()));
+    ASSERT_TRUE(receiver->tx->registerPeerHandshake(sender->name, sender->tx->localHandshakeBlob()));
 
+    auto const key = bounce_test::testWindowKey();
+    auto const id = b::bounceWindowId(key);
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/7);
+    std::vector<unsigned char> const untouched(bufs.total, 0xA5);
+    if (sealBeforeCancel)
+    {
+        ASSERT_EQ(cudaMemcpy(bufs.dst, untouched.data(), bufs.total, cudaMemcpyHostToDevice), cudaSuccess);
+    }
     std::vector<b::ExecCtx*> held;
     while (auto* ctx = receiver->exec->tryAcquire())
     {
         held.push_back(ctx);
     }
-    auto result = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "drainB");
+    EXPECT_EQ(held.size(), receiver->exec->size());
+    auto result = bounce_test::submitTransfer(*sender, *receiver, bufs, key);
+    if (sealBeforeCancel)
+    {
+        EXPECT_EQ(queued.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        receiver->tx->receiveWindows().seal(id);
+        auto window = receiver->tx->receiveWindows().find(id, sender->name);
+        EXPECT_TRUE(window && !window->acquire().owns_lock());
+        EXPECT_EQ(result.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+        resume.set_value();
+    }
     std::shared_future<bool> drain;
     if (result.wait_for(std::chrono::seconds(10)) == std::future_status::ready)
     {
@@ -316,437 +384,312 @@ TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
         if (ready == std::future_status::ready)
         {
             EXPECT_TRUE(drain.get());
-            EXPECT_TRUE(bounce_test::verifyXferBufs(bufs));
+            if (!sealBeforeCancel)
+            {
+                EXPECT_TRUE(bounce_test::verifyXferBufs(bufs));
+            }
         }
+    }
+    if (sealBeforeCancel)
+    {
+        auto next = bounce_test::makeXferBufs(8, 256, /*seed=*/8);
+        auto followup = bounce_test::submitTransfer(*sender, *receiver, next);
+        ASSERT_EQ(followup.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+        EXPECT_EQ(followup.get().state, kvc::TransferState::kSUCCESS);
+        EXPECT_TRUE(bounce_test::verifyXferBufs(next));
+        std::vector<unsigned char> actual(bufs.total);
+        EXPECT_EQ(cudaMemcpy(actual.data(), bufs.dst, actual.size(), cudaMemcpyDeviceToHost), cudaSuccess);
+        EXPECT_EQ(actual, untouched);
+        bounce_test::freeXferBufs(next);
     }
     sender->tx->shutdown();
     receiver->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
+} // namespace
 
-// A receiver that KNOWS a request cannot complete NACKs it, so the sender fails right away
-// (kPeerNack) instead of waiting out requestTimeoutMs (kNoProgressTimeout). Provoked via the WANT
-// chunk-size rejection — the request-level NACK source (a rejected WANT): the sender's chunk cap
-// exceeds the receiver's, so the single 8 KiB chunk is outside the receiver's (0, 4 KiB]. The
-// cap-equality handshake gate lives in
-// NixlTransferAgent::shouldUseBounce, which BounceTransport::submit never consults (wirePair only does
-// loadRemoteAgent + addPeer), so the mismatched WANT reaches onWant directly.
-TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
+TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
 {
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    constexpr int kTimeoutMs = 20000; // generous: the NACK bound below is timeout/2, the hang guard is 10 s
-    auto senderCfg = cfg(kTimeoutMs);
-    senderCfg.maxChunkSizeBytes = 8192;
-    auto receiverCfg = cfg(kTimeoutMs); // maxChunkSizeBytes = 4096
-    auto A = bounce_test::makeNode("nackA", senderCfg, 1024);
-    auto B = bounce_test::makeNode("nackB", receiverCfg, 1024);
-    if (!A || !B)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-    bounce_test::wirePair(*A, *B);
-
-    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/8192, /*seed=*/12);
-    auto const execBaseline = A->exec->freeCount(); // every gather ctx idle before submit
-    auto const start = std::chrono::steady_clock::now();
-    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "nackB");
-    // Hang guard = the full request timeout, so a slow NACK fails the timing bound below, not this.
-    ASSERT_EQ(fut.wait_for(std::chrono::milliseconds(kTimeoutMs)), std::future_status::ready) << "NACKed request hung";
-    auto const elapsed = std::chrono::steady_clock::now() - start;
-    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kPeerNack);
-    EXPECT_LT(elapsed, std::chrono::milliseconds(kTimeoutMs / 2)) << "NACK did not short-circuit the timeout";
-
-    // The eager gather of the failed chunk holds an ExecCtx + staging region until failRequest (or,
-    // for a still-running gather, the IO loop's drainOrphanGather()) releases both in one step. The
-    // ctx assertion is a leak guard, not parked-branch coverage: it cannot tell the parked
-    // (Gathering) branch from the immediate (Gathered) one — an 8 KiB eager gather finishes before
-    // the ZMQ round trip, and if the NACK wins the race nothing was posted at all — so the
-    // parked-gather branch is not deterministically exercised here (it would need a gather-stall
-    // hook).
-    auto const releaseDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (A->exec->freeCount() != execBaseline && std::chrono::steady_clock::now() < releaseDeadline)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    EXPECT_EQ(A->exec->freeCount(), execBaseline) << "orphaned gather ctx/staging not released after NACK";
-
-    A->tx->shutdown();
-    B->tx->shutdown();
-    bounce_test::freeXferBufs(bufs);
+    checkFailedWriteDrain(false);
 }
 
-// DATA has no retransmission path in this protocol. Receiving it twice for one granted region must
-// therefore produce one scatter and one ACK, rather than adding replay state for an impossible
-// normal-flow event.
-TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
+TEST(BounceTransportFailure, LaterWriteFailureWaitsForEarlierDataOnTheSameRequest)
 {
+    using namespace std::chrono_literals;
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/5000);
-    capRegions(c, c.maxInflightChunksPerRequest);
-    b::ZmqControlChannel sender("dupDataSender");
-    auto receiver = bounce_test::makeNode("dupDataReceiver", c, 1024); // receiver posts no writes
-    if (!receiver)
+    auto config = cfg(10000);
+    auto senderConfig = config;
+    capRegions(senderConfig, 1);
+    auto controls = std::make_shared<XferControls>();
+    controls->useNixl = true;
+    controls->failOnPost = 2;
+    auto sender = makeFakeNode("laterFailA", senderConfig, controls);
+    auto receiver = bounce_test::makeNode("laterFailB", config, 1024);
+    if (!sender || !receiver)
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender.addPeer("dupDataReceiver", receiver->ch->localEndpoint()));
+    bounce_test::wirePair(*sender, *receiver);
 
-    // Hold every context so both DATA messages reach the reactor before the first scatter can finish.
-    std::vector<b::ExecCtx*> heldExecContexts;
+    // The second post needs the first chunk's staging slot. Hold the receiving contexts
+    // so that the first DATA cannot be acknowledged before the second write fails.
+    std::vector<b::ExecCtx*> held;
     while (auto* ctx = receiver->exec->tryAcquire())
     {
-        heldExecContexts.push_back(ctx);
+        held.push_back(ctx);
     }
-    ASSERT_EQ(heldExecContexts.size(), receiver->exec->size());
-
-    constexpr std::uint64_t rid = 17;
-    sender.sendTo("dupDataReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
-
-    std::vector<b::BounceCreditEntry> credits;
-    ASSERT_TRUE(waitGrant(sender, rid, std::chrono::seconds(5), credits));
-    ASSERT_EQ(credits.size(), 1);
-
-    void* dst = nullptr;
-    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
-    b::BounceScatterRun run{0, reinterpret_cast<std::uintptr_t>(dst), 0, 0, 256, 1};
-    auto const data = b::encodeData(rid, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, {run});
-    sender.sendTo("dupDataReceiver", data);
-    sender.sendTo("dupDataReceiver", data);
-    // FIFO sentinel instead of a sleep: the reactor is a single FIFO consumer, so a GRANT for a
-    // fresh rid sent after both DATA messages proves it already consumed them (the second region is
-    // free under capRegions(2), so the sentinel WANT is grantable while rid=17 holds its region).
-    constexpr std::uint64_t sentinelRid = 18;
-    sender.sendTo("dupDataReceiver", b::encodeWant(sentinelRid, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> sentinelCredits;
-    ASSERT_TRUE(waitGrant(sender, sentinelRid, std::chrono::seconds(5), sentinelCredits))
-        << "sentinel WANT never granted; DATA messages may not have reached the reactor";
-    for (auto* ctx : heldExecContexts)
+    EXPECT_EQ(held.size(), receiver->exec->size());
+    auto const key = bounce_test::testWindowKey();
+    auto buffers = bounce_test::makeXferBufs(2, config.maxChunkSizeBytes, 7);
+    auto result = bounce_test::submitTransfer(*sender, *receiver, buffers, key);
+    std::shared_ptr<b::BounceDrain> drain;
+    if (result.wait_for(5s) == std::future_status::ready)
+    {
+        EXPECT_EQ(result.get().state, kvc::TransferState::kFAILURE);
+        EXPECT_EQ(result.get().reason, b::BounceFailReason::kWriteFailed);
+        EXPECT_FALSE(result.get().remoteDrained);
+        drain = result.get().remoteDrain;
+    }
+    EXPECT_EQ(controls->postCount.load(), 2U);
+    if (drain)
+    {
+        EXPECT_EQ(drain->result.wait_for(0s), std::future_status::timeout);
+    }
+    for (auto* ctx : held)
     {
         receiver->exec->release(ctx);
     }
+    ASSERT_NE(drain, nullptr);
+    ASSERT_EQ(drain->result.wait_for(5s), std::future_status::ready);
+    EXPECT_TRUE(drain->result.get());
+    EXPECT_EQ(result.get().state, kvc::TransferState::kFAILURE);
 
-    EXPECT_EQ(countAcks(sender, std::chrono::seconds(2), rid), 1);
+    auto const address = reinterpret_cast<std::uintptr_t>(buffers.dst);
+    bounce_test::freeXferBufs(buffers);
+    EXPECT_EQ(receiver->tx->receiveWindows().find(b::bounceWindowId(key), sender->name), nullptr);
+    EXPECT_EQ(receiver->agent->borrowScatterDestinations().second.count(address), 0U);
 
+    auto next = bounce_test::makeXferBufs(2, config.maxChunkSizeBytes, 8);
+    auto followup = bounce_test::submitTransfer(*sender, *receiver, next);
+    ASSERT_EQ(followup.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(followup.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(next));
+    sender->tx->shutdown();
     receiver->tx->shutdown();
-    EXPECT_EQ(cudaFree(dst), cudaSuccess);
+    bounce_test::freeXferBufs(next);
 }
 
-// A non-empty WANT has no retransmission path either (submit() sends it exactly once per fresh
-// rid), so a replayed one for a live flow must be dropped: re-queueing would grant fresh regions
-// over the still-held ones — the sender never writes the extras, so they leak — and the lease
-// refresh would keep the flow off staleFlows() forever, defeating the reclaim that exists for
-// exactly this state.
-TEST(BounceTransportFailure, DuplicateWantIsDroppedWithoutRegrant)
+TEST(BounceTransportFailure, SealedWindowAllowsTheOriginalWriterToDrain)
 {
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/5000);
-    capRegions(c, c.maxInflightChunksPerRequest);
-    b::ZmqControlChannel sender("dupWantSender");
-    auto receiver = bounce_test::makeNode("dupWantReceiver", c, 1024); // receiver posts no writes
-    if (!receiver)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender.addPeer("dupWantReceiver", receiver->ch->localEndpoint()));
-
-    constexpr std::uint64_t rid = 23;
-    sender.sendTo("dupWantReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> credits;
-    ASSERT_TRUE(waitGrant(sender, rid, std::chrono::seconds(5), credits));
-    ASSERT_EQ(credits.size(), 1u);
-
-    // Replay the same WANT. The arena and the per-request cap both have room for a second region,
-    // so a re-queue WOULD be granted — the negative assertion below therefore fails pre-fix.
-    sender.sendTo("dupWantReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> extra;
-    EXPECT_FALSE(waitGrant(sender, rid, std::chrono::milliseconds(500), extra)) << "duplicate WANT was re-granted";
-
-    receiver->tx->shutdown();
+    checkFailedWriteDrain(true);
 }
 
-// WANT chunk sizes are untrusted peer input, and each of the two out-of-contract shapes is its own
-// DoS pre-fix: a chunk of 0 can never be allocated, so the flow blocks forever, and once
-// maybeActivateDrain() latches it as the drain flow, schedule() short-circuits before sweeping any
-// other flow — every grant to every peer stops with no reclaim path (a pending-only flow holds no
-// regions, so the lease sweep skips it). A chunk above the handshake-pinned maxChunkSizeBytes
-// instead buddy-rounds up to the WHOLE usable arena (test config: 4097 -> 8192 = capacity), gets
-// granted, and squats on it, starving all peers until the lease sweep. The receiver must reject
-// both up front. The test drives each mode separately: park the zero-size flow, push the grant
-// sequence past the drain bypass threshold with legitimate traffic, require fresh demand to still
-// be granted; then send the oversized WANT and require the same.
-TEST(BounceTransportFailure, MalformedWantChunkSizeIsRejectedNotWedged)
+class BounceLocalStaging : public ::testing::TestWithParam<bool>
 {
+};
+
+TEST_P(BounceLocalStaging, ReusesTheOnlySlotAfterHandleRelease)
+{
+    using namespace std::chrono_literals;
     if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/5000);
-    capRegions(c, c.maxInflightChunksPerRequest);
-    b::ZmqControlChannel sender("badWantSender");
-    auto receiver = bounce_test::makeNode("badWantReceiver", c, 1024); // receiver posts no writes
-    if (!receiver)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender.addPeer("badWantReceiver", receiver->ch->localEndpoint()));
-
-    sender.sendTo("badWantReceiver", b::encodeWant(/*rid=*/1, {0}, sender.localEndpoint()));
-
-    // Drive enough legitimate grant/cancel cycles to push mGrantSequence past the drain bypass
-    // threshold (max(kMinimumBypassGrants, kBypassRounds * ringSize) = 8 here); pre-fix this
-    // latches rid=1 as the drain flow and the cycle after the eighth grant starves.
-    for (std::uint64_t rid = 100; rid < 112; ++rid)
     {
-        sender.sendTo("badWantReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
-        std::vector<b::BounceCreditEntry> credits;
-        ASSERT_TRUE(waitGrant(sender, rid, std::chrono::seconds(5), credits)) << "legit WANT starved, rid=" << rid;
-        // Cancel to release the granted region and drop the flow from the ring.
-        sender.sendTo("badWantReceiver", b::encodeWant(rid, {}, sender.localEndpoint()));
+        GTEST_SKIP() << "no CUDA device";
     }
-
-    // The receiver must still grant fresh legitimate demand — pre-fix the drain latch wedges this.
-    sender.sendTo("badWantReceiver", b::encodeWant(/*rid=*/200, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> credits;
-    EXPECT_TRUE(waitGrant(sender, 200, std::chrono::seconds(5), credits)) << "receiver wedged after zero-size WANT";
-    sender.sendTo("badWantReceiver", b::encodeWant(200, {}, sender.localEndpoint()));
-
-    // Oversized mode: pre-fix this grant monopolizes the whole arena, so the follow-up legitimate
-    // WANT starves.
-    sender.sendTo("badWantReceiver",
-        b::encodeWant(/*rid=*/2, {static_cast<std::uint32_t>(c.maxChunkSizeBytes) + 1}, sender.localEndpoint()));
-    sender.sendTo("badWantReceiver", b::encodeWant(/*rid=*/201, {256}, sender.localEndpoint()));
-    credits.clear();
-    EXPECT_TRUE(waitGrant(sender, 201, std::chrono::seconds(5), credits)) << "arena monopolized by oversized WANT";
-
-    // The malformed flows themselves must never have been granted. The reactor is a single FIFO
-    // consumer, so the completed rid=200/201 grants above prove both malformed WANTs were already
-    // processed — these are not timing-window assertions.
-    std::vector<b::BounceCreditEntry> badCredits;
-    EXPECT_FALSE(waitGrant(sender, 1, std::chrono::milliseconds(200), badCredits)) << "zero-size WANT was granted";
-    EXPECT_FALSE(waitGrant(sender, 2, std::chrono::milliseconds(200), badCredits)) << "oversized WANT was granted";
-
-    receiver->tx->shutdown();
-}
-
-// The scatter worker sizes its plan by iterating the DATA run list; a hostile/corrupt run whose
-// count is near 2^32 (bounceStride 0 keeps the span check happy) must be rejected up front, not
-// counted piece by piece — pre-fix the worker (and the flow's region) is pinned for the whole
-// count, which the rid=2 re-grant deadline below catches.
-TEST(BounceTransportFailure, OversizedScatterRunListIsRejectedNotCounted)
-{
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/30000);
-    capRegions(c, /*regionCap=*/1);                                   // arena holds exactly ONE region
-    b::ZmqControlChannel sender("bigRunSender");
-    auto receiver = bounce_test::makeNode("bigRunReceiver", c, 1024); // receiver posts no writes
-    if (!receiver)
+    auto config = cfg(15000);
+    auto senderConfig = config;
+    capRegions(senderConfig, 1);
+    auto controls = std::make_shared<XferControls>();
+    controls->useNixl = true;
+    bool const holdHandle = GetParam();
+    controls->releaseSucceeds = !holdHandle;
+    auto sender = makeFakeNode("stagingA", senderConfig, controls);
+    std::promise<void> reached;
+    auto queued = reached.get_future();
+    std::promise<void> resume;
+    auto delayed = bounce_test::makeNode("stagingB", config, 1024, nullptr,
+        std::make_unique<PauseAfterData>("stagingB", std::move(reached), resume.get_future()));
+    auto other = bounce_test::makeNode("stagingC", config, 1024);
+    if (!sender || !delayed || !other)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender.addPeer("bigRunReceiver", receiver->ch->localEndpoint()));
-
-    sender.sendTo("bigRunReceiver", b::encodeWant(/*rid=*/1, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> credits;
-    ASSERT_TRUE(waitGrant(sender, 1, std::chrono::seconds(5), credits));
-    ASSERT_EQ(credits.size(), 1u);
-
-    void* dst = nullptr;
-    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
-    // count=2^32-1 with bounceStride=0: every piece reads the same 256 in-bounds bytes, so the
-    // span check alone admits it; only the piece-count guard can reject it cheaply.
-    b::BounceScatterRun run{/*bounceOffset=*/0, reinterpret_cast<std::uintptr_t>(dst), /*dstStride=*/0,
-        /*bounceStride=*/0, /*pieceSize=*/256, /*count=*/0xFFFFFFFFu};
-    sender.sendTo("bigRunReceiver",
-        b::encodeData(/*rid=*/1, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, {run}));
-
-    // The rejected scatter must NACK the chunk (so a real sender fails at once) and never ACK it.
-    // One full-window pump covers both: the NACK must arrive, and no ACK may show up afterwards.
-    int acks = 0;
-    bool nacked = false;
-    pumpChannel(sender, std::chrono::seconds(2),
-        [&](b::BounceMsgHeader const& h, std::string const&)
+    }
+    bounce_test::wirePair(*sender, *delayed);
+    bounce_test::wirePair(*sender, *other);
+    std::vector<b::ExecCtx*> held;
+    while (auto* ctx = delayed->exec->tryAcquire())
+    {
+        held.push_back(ctx);
+    }
+    auto releaseScatter = [&]
+    {
+        for (auto* ctx : held)
         {
-            if (h.requestId != 1)
-            {
-                return false;
-            }
-            auto const type = static_cast<b::BounceMsgType>(h.msgType);
-            if (type == b::BounceMsgType::kACK)
-            {
-                ++acks;
-            }
-            if (type == b::BounceMsgType::kNACK)
-            {
-                nacked = true;
-                EXPECT_EQ(h.chunkIdx, 0u);
-                EXPECT_EQ(h.regionHandle, credits.front().regionHandle);
-            }
-            return false;
-        });
-    EXPECT_TRUE(nacked) << "plan overflow was not NACKed";
-    EXPECT_EQ(acks, 0);
-    // The rejection must also release the single region promptly: rid=2 can only be granted once rid=1's
-    // region is freed, which a worker stuck counting 2^32 pieces cannot do within the deadline.
-    sender.sendTo("bigRunReceiver", b::encodeWant(/*rid=*/2, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> credits2;
-    EXPECT_TRUE(waitGrant(sender, 2, std::chrono::seconds(5), credits2)) << "region pinned by oversized run list";
+            delayed->exec->release(ctx);
+        }
+        held.clear();
+    };
+    auto firstBuffers = bounce_test::makeXferBufs(8, 256, 17);
+    auto secondBuffers = bounce_test::makeXferBufs(8, 256, 23);
+    auto first = bounce_test::submitTransfer(*sender, *delayed, firstBuffers);
+    EXPECT_EQ(queued.wait_for(5s), std::future_status::ready);
+    resume.set_value();
+    EXPECT_EQ(first.wait_for(0s), std::future_status::timeout);
 
-    receiver->tx->shutdown();
-    EXPECT_EQ(cudaFree(dst), cudaSuccess);
+    auto second = bounce_test::submitTransfer(*sender, *other, secondBuffers);
+    if (holdHandle)
+    {
+        // Even a genuine scatter ACK cannot free a slot whose NIXL handle is still retained.
+        releaseScatter();
+        EXPECT_EQ(first.wait_for(5s), std::future_status::ready);
+        EXPECT_EQ(second.wait_for(200ms), std::future_status::timeout);
+        EXPECT_EQ(controls->postCount.load(), 1U);
+        EXPECT_GT(controls->releaseCount.load(), 0U);
+        controls->releaseSucceeds = true;
+    }
+    auto secondReady = second.wait_for(5s);
+    EXPECT_EQ(secondReady, std::future_status::ready);
+    if (secondReady == std::future_status::ready)
+    {
+        EXPECT_EQ(second.get().state, kvc::TransferState::kSUCCESS);
+        EXPECT_TRUE(bounce_test::verifyXferBufs(secondBuffers));
+    }
+    if (!holdHandle)
+    {
+        // The second write reused the first write's staging slot before its destination scattered.
+        EXPECT_EQ(first.wait_for(0s), std::future_status::timeout);
+    }
+    releaseScatter();
+    auto firstReady = first.wait_for(5s);
+    EXPECT_EQ(firstReady, std::future_status::ready);
+    if (firstReady == std::future_status::ready)
+    {
+        EXPECT_EQ(first.get().state, kvc::TransferState::kSUCCESS);
+        EXPECT_TRUE(bounce_test::verifyXferBufs(firstBuffers));
+    }
+    sender->tx->shutdown();
+    delayed->tx->shutdown();
+    other->tx->shutdown();
+    bounce_test::freeXferBufs(firstBuffers);
+    bounce_test::freeXferBufs(secondBuffers);
 }
 
-// A sender that takes a GRANT and then dies emits neither DATA nor a cancel, so nothing
-// event-driven can ever reclaim its region — the receiver's grant lease must. After
-// receiverFlowTimeoutMs of silence the flow is reclaimed and its region quarantined for
-// quarantineMs, after which it must serve the next waiting flow; a late DATA for the expired
-// grant must be dropped (no scatter, no ACK).
-TEST(BounceTransportFailure, GrantLeaseExpiryReclaimsSilentSendersRegion)
+INSTANTIATE_TEST_SUITE_P(ImmediateOrDeferredRelease, BounceLocalStaging, ::testing::Bool());
+
+class BounceCapacityFailure : public ::testing::TestWithParam<bool>
+{
+};
+
+TEST_P(BounceCapacityFailure, ResolvesAndReleasesTheRegionForTheNextRequest)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/30000); // sender-side request timeout: irrelevant here
-    c.receiverFlowTimeoutMs = 400;
-    c.quarantineMs = 200;
-    capRegions(c, /*regionCap=*/1);                               // arena holds exactly ONE region
-    b::ZmqControlChannel sender("glSender");
-    auto receiver = bounce_test::makeNode("glReceiver", c, 1024); // receiver posts no writes
-    if (!receiver)
+    }
+    bool const senderLimited = GetParam();
+    auto config = cfg(senderLimited ? 1000 : 20000);
+    capRegions(config, 1);
+    auto controls = std::make_shared<XferControls>();
+    controls->useNixl.store(true, std::memory_order_release);
+    auto sender = makeFakeNode("capacitySender", config, controls, senderLimited ? 1 : 8);
+    auto receiver = bounce_test::makeNode("capacityReceiver", config, senderLimited ? 8 : 1);
+    if (!sender || !receiver)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender.addPeer("glReceiver", receiver->ch->localEndpoint()));
+    }
+    bounce_test::wirePair(*sender, *receiver);
 
-    // rid=1 takes the single region... and goes silent (models a dead/unreachable sender).
-    sender.sendTo("glReceiver", b::encodeWant(/*rid=*/1, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> credit1;
-    ASSERT_TRUE(waitGrant(sender, 1, std::chrono::seconds(5), credit1));
-    ASSERT_EQ(credit1.size(), 1u);
+    // Two non-contiguous descriptors cannot share a single scratch entry.
+    auto twoPieces = bounce_test::makeXferBufs(2, 128, 1);
+    auto const freeContexts = sender->exec->freeCount();
+    auto const start = std::chrono::steady_clock::now();
+    auto refused = bounce_test::submitTransfer(*sender, *receiver, twoPieces);
+    ASSERT_EQ(refused.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(refused.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(
+        refused.get().reason, senderLimited ? b::BounceFailReason::kProtocolError : b::BounceFailReason::kPeerNack);
+    EXPECT_EQ(controls->postCount.load(), senderLimited ? 0U : 1U);
+    if (!senderLimited)
+    {
+        EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(config.requestTimeoutMs / 2));
+    }
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (sender->exec->freeCount() != freeContexts && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(sender->exec->freeCount(), freeContexts);
 
-    // rid=2 wants the region too. Before the lease (400ms) + quarantine (200ms) can possibly have
-    // elapsed, it must NOT be granted (premature reclaim would race rid=1's hypothetical write).
-    sender.sendTo("glReceiver", b::encodeWant(/*rid=*/2, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> credit2;
-    EXPECT_FALSE(waitGrant(sender, 2, std::chrono::milliseconds(200), credit2))
-        << "region re-granted before lease expiry";
-    // ...but once the silent flow's lease expires and the quarantine passes, it must be.
-    ASSERT_TRUE(waitGrant(sender, 2, std::chrono::seconds(10), credit2)) << "silent sender's region never reclaimed";
-    ASSERT_EQ(credit2.size(), 1u);
-    EXPECT_EQ(credit2.front().regionHandle, credit1.front().regionHandle); // the one region, recycled
-
-    // Late DATA for the EXPIRED grant must be dropped (flow reclaimed -> heldByFlow false): exactly
-    // one ACK total, and it belongs to rid=2's legitimate DATA.
-    void* dst = nullptr;
-    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
-    b::BounceScatterRun run{0, reinterpret_cast<std::uintptr_t>(dst), 0, 0, 256, 1};
-    sender.sendTo("glReceiver", b::encodeData(/*rid=*/1, 0, 1, credit1.front().regionHandle, {run}));
-    sender.sendTo("glReceiver", b::encodeData(/*rid=*/2, 0, 1, credit2.front().regionHandle, {run}));
-    int ackRid1 = 0;
-    int ackRid2 = 0;
-    pumpChannel(sender, std::chrono::seconds(2),
-        [&](b::BounceMsgHeader const& h, std::string const&)
-        {
-            if (static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kACK)
-            {
-                ackRid1 += h.requestId == 1 ? 1 : 0;
-                ackRid2 += h.requestId == 2 ? 1 : 0;
-            }
-            return false;
-        });
-    EXPECT_EQ(ackRid1, 0) << "late DATA for an expired grant was scattered/ACKed";
-    EXPECT_EQ(ackRid2, 1);
-
-    receiver->tx->shutdown();
-    EXPECT_EQ(cudaFree(dst), cudaSuccess);
-}
-
-// GRANT and ACK messages carry peer-owned capabilities. Only the intended peer may grant, and an
-// ACK is valid only for the matching region after that chunk has reached Sent.
-TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
-{
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/5000);
-    capRegions(c, c.maxInflightChunksPerRequest);
-    b::ZmqControlChannel legitimate("validateLegitimate");
-    b::ZmqControlChannel attacker("validateAttacker");
-    auto ctl = std::make_shared<XferControls>(); // defaults: writes complete instantly
-    auto sender = makeFakeNode("validateSender", c, ctl);
-    if (!sender)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender->tx->addPeer("validateLegitimate", legitimate.localEndpoint()));
-    ASSERT_TRUE(legitimate.addPeer("validateSender", sender->ch->localEndpoint()));
-    ASSERT_TRUE(attacker.addPeer("validateSender", sender->ch->localEndpoint()));
-
-    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/4);
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "validateLegitimate");
-    b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/77};
-
-    attacker.sendTo("validateSender", b::encodeGrant(/*requestId=*/1, {credit}));
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 0u);
-
-    // A wrong-peer NACK (and one for an unknown rid) must not kill the request: still in flight.
-    attacker.sendTo("validateSender", b::encodeNack(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
-    legitimate.sendTo("validateSender", b::encodeNack(/*requestId=*/999, /*chunkIdx=*/0, 0));
-    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
-
-    legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
-    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
-    legitimate.sendTo("validateSender", b::encodeGrant(/*requestId=*/1, {credit}));
-
-    // Seeing DATA guarantees the matching sender chunk has transitioned to Sent.
-    ASSERT_TRUE(pumpChannel(legitimate, std::chrono::seconds(5),
-        [](b::BounceMsgHeader const& h, std::string const&)
-        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kDATA; }));
-    EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 1u);
-
-    attacker.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
-    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
-    legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle + 1));
-    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
-    legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
-    legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
+    auto onePiece = bounce_test::makeXferBufs(1, 128, 2);
+    auto accepted = bounce_test::submitTransfer(*sender, *receiver, onePiece);
+    ASSERT_EQ(accepted.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(accepted.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(onePiece));
 
     sender->tx->shutdown();
-    bounce_test::freeXferBufs(bufs);
+    receiver->tx->shutdown();
+    bounce_test::freeXferBufs(twoPieces);
+    bounce_test::freeXferBufs(onePiece);
 }
 
-// A GRANT whose credit is smaller than its chunk (mispair/reorder) abandons the flow. Abandon must
-// be terminal: pumpRequest ignores the request from then on, so (a) a LATER well-formed GRANT must
-// not resurrect it — pre-fix it would attach, post the RDMA write, and refresh lastProgress, pushing
-// the failure out by one extra timeout period per revived chunk (up to numChunks periods on a
-// multi-chunk request with a peer that keeps granting) — and (b) checkTimeouts resolves the future
-// kFAILURE with the abandon reason (kProtocolError, not the generic timeout).
-TEST(BounceTransportFailure, CreditMispairAbandonIsTerminalAndIgnoresLaterGrants)
+INSTANTIATE_TEST_SUITE_P(SenderOrReceiver, BounceCapacityFailure, ::testing::Bool());
+
+namespace tensorrt_llm::executor::kv_cache::bounce
 {
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    // Generous timeout: the mispair GRANT must be DELIVERED and dispatched before checkTimeouts
-    // can fire kNoProgressTimeout, or the reason assertion below flakes on a loaded machine.
-    auto c = cfg(/*timeoutMs=*/2000);
-    capRegions(c, c.maxInflightChunksPerRequest);
-    b::ZmqControlChannel peer("mispairPeer");
-    auto ctl = std::make_shared<XferControls>(); // defaults: writes complete instantly
-    auto sender = makeFakeNode("mispairSender", c, ctl);
-    if (!sender)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender->tx->addPeer("mispairPeer", peer.localEndpoint()));
-    ASSERT_TRUE(peer.addPeer("mispairSender", sender->ch->localEndpoint()));
+class BounceSenderStateTest : public ::testing::Test
+{
+protected:
+    using Table = BounceSender::RequestTable;
+    using Request = BounceSender::Request;
+    using PostState = BounceSender::PostState;
 
-    // One 256-byte chunk (packedBytes = 256).
-    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/6);
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "mispairPeer");
+    static auto reply(Table& requests, std::string const& peer, std::uint64_t rid)
+    {
+        return BounceSender::findReply(requests, peer, rid);
+    }
+};
 
-    // Undersized credit (128 < 256) -> mispair -> abandon; then a well-formed one that pre-fix
-    // would attach and post. FIFO ordering to the single reactor consumer guarantees the mispair
-    // is processed first.
-    peer.sendTo(
-        "mispairSender", b::encodeGrant(/*requestId=*/1, {{/*addr=*/0, /*len=*/128, /*devId=*/0, /*regionHandle=*/7}}));
-    peer.sendTo(
-        "mispairSender", b::encodeGrant(/*requestId=*/1, {{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/8}}));
+TEST_F(BounceSenderStateTest, OnlyTheMatchingSentChunkAdvancesTheRequest)
+{
+    Table requests;
+    auto& request = requests[1];
+    request.peer = "receiver";
+    request.numChunks = 1;
+    auto& post = request.posted.emplace_back();
+    post.chunkIdx = 0;
+    post.remoteHandle = 42;
+    auto released = 0;
+    auto recycle = [&](auto const&) { ++released; };
+    EXPECT_EQ(reply(requests, "other", 1), requests.end());
+    EXPECT_EQ(reply(requests, "receiver", 2), requests.end());
+    ASSERT_NE(reply(requests, "receiver", 1), requests.end());
 
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "abandoned flow never resolved";
-    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kProtocolError);
-    // The later valid GRANT must not have resurrected the abandoned flow into posting a write.
-    EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 0u) << "abandoned flow posted an RDMA write";
-
-    sender->tx->shutdown();
-    bounce_test::freeXferBufs(bufs);
+    EXPECT_FALSE(request.acknowledge(0, 42, recycle));
+    post.state = PostState::Sent;
+    EXPECT_FALSE(request.acknowledge(0, 43, recycle));
+    EXPECT_FALSE(request.acknowledge(1, 42, recycle));
+    EXPECT_EQ(released, 0);
+    EXPECT_EQ(request.acked, 0U);
+    EXPECT_TRUE(request.acknowledge(0, 42, recycle));
+    EXPECT_FALSE(request.acknowledge(0, 42, recycle));
+    EXPECT_EQ(released, 1);
+    EXPECT_EQ(request.acked, request.numChunks);
+    EXPECT_TRUE(request.posted.empty());
 }
+
+TEST_F(BounceSenderStateTest, CreditSizeFailureRemainsTerminal)
+{
+    Request request;
+    EXPECT_TRUE(request.acceptsCredit(256, 256));
+    EXPECT_EQ(request.failureReason(BounceFailReason::kNoProgressTimeout), BounceFailReason::kNoProgressTimeout);
+    request.pendingCredits.emplace_back();
+    EXPECT_FALSE(request.acceptsCredit(256, 128));
+    EXPECT_TRUE(request.pendingCredits.empty());
+    request.pendingCredits.emplace_back();
+    EXPECT_FALSE(request.canPost());
+    EXPECT_FALSE(request.acceptsCredit(256, 256));
+    EXPECT_TRUE(request.pendingCredits.empty());
+    EXPECT_EQ(request.failureReason(BounceFailReason::kNoProgressTimeout), BounceFailReason::kProtocolError);
+}
+} // namespace tensorrt_llm::executor::kv_cache::bounce
 
 // shutdown() with an in-flight (stuck) request must resolve its future FAILURE, never leave wait() hanging.
 TEST(BounceTransportFailure, ShutdownFailsInflight)
@@ -759,7 +702,8 @@ TEST(BounceTransportFailure, ShutdownFailsInflight)
         GTEST_SKIP() << "NIXL agent/backend unavailable";
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "nobody"); // stuck (no grant, no timeout)
+    auto fut = t->tx->submit(
+        bufs.srcDescs, bufs.dstDescs, "nobody", bounce_test::testWindowKey()); // stuck (no grant, no timeout)
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
     t->tx->shutdown();
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "shutdown left request hanging";
@@ -778,20 +722,19 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
         GTEST_SKIP() << "no CUDA device";
     auto c = cfg(/*timeoutMs=*/0);
     capRegions(c, c.maxInflightChunksPerRequest);
-    b::ZmqControlChannel peer("shutdownReleasePeer");
     auto ctl = std::make_shared<XferControls>();
     ctl->allowTerminal.store(false, std::memory_order_release);
     ctl->releaseSucceeds.store(false, std::memory_order_release);
     auto sender = makeFakeNode("shutdownReleaseSender", c, ctl);
-    if (!sender)
+    auto receiver = bounce_test::makeNode("shutdownReleasePeer", c, 1024);
+    if (!sender || !receiver)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender->tx->addPeer("shutdownReleasePeer", peer.localEndpoint()));
-    ASSERT_TRUE(peer.addPeer("shutdownReleaseSender", sender->ch->localEndpoint()));
+    }
+    bounce_test::wirePair(*sender, *receiver);
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/5);
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "shutdownReleasePeer");
-    b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/91};
-    peer.sendTo("shutdownReleaseSender", b::encodeGrant(/*requestId=*/1, {credit}));
+    auto fut = bounce_test::submitTransfer(*sender, *receiver, bufs);
 
     auto const postDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < postDeadline && ctl->postCount.load(std::memory_order_acquire) == 0)
@@ -810,6 +753,7 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
     // failAll attempts the failed release exactly twice (initial + bounded retry), never spins.
     EXPECT_EQ(ctl->releaseCount.load(std::memory_order_acquire), 2u);
+    receiver->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
 
@@ -825,8 +769,9 @@ TEST(BounceTransportFailure, ForgetPeerFailsInflightRequest)
         GTEST_SKIP() << "NIXL agent/backend unavailable";
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "gonePeer");                   // stuck: never granted
-    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
+    auto fut
+        = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "gonePeer", bounce_test::testWindowKey()); // stuck: never granted
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);        // still pending
     t->tx->forgetPeer("gonePeer");
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "forgetPeer left request hanging";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
@@ -856,7 +801,7 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
     bounce_test::wirePair(*A, *B);
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/1);
-    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "fpB");
+    auto fut = bounce_test::submitTransfer(*A, *B, bufs);
     A->tx->forgetPeer("fpB"); // drop the peer (queued; applied on A's IO thread)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "request hung after forgetPeer";
     auto const res = fut.get();
@@ -879,7 +824,7 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
     {
         auto rb
             = bounce_test::makeXferBufs(/*nDescs=*/20, /*descBytes=*/600, /*seed=*/static_cast<std::uint32_t>(50 + k));
-        auto rf = A->tx->submit(rb.srcDescs, rb.dstDescs, "fpB");
+        auto rf = bounce_test::submitTransfer(*A, *B, rb);
         ASSERT_EQ(rf.wait_for(std::chrono::seconds(30)), std::future_status::ready)
             << "post-forget transfer hung k=" << k;
         EXPECT_EQ(rf.get().state, kvc::TransferState::kSUCCESS) << "post-forget transfer failed k=" << k;
@@ -889,86 +834,6 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
 
     A->tx->shutdown();
     B->tx->shutdown();
-}
-
-// forget() must drop the gone peer's flows BEFORE freeing the orphaned regions of its queued (not yet
-// started) scatter jobs: freeOrphanRegion() runs schedule(), so with free-first the region is
-// granted straight back to a pending flow of the very peer being forgotten, and the reclaim that
-// follows then quarantines it (quarantineMs) instead of returning it to the arena. Setup: the
-// receiver's ExecPool is drained from the test so the single scatter worker spins in tryAcquire on
-// job A while job B stays queued (mScattering set for both); a cancel flags both regions orphaned; a
-// second WANT from the same peer is left pending (arena full); then forgetPeer. Correct order: the
-// pending flow is gone before region B is freed, so a second peer's WANT gets it at once. Old order:
-// region B goes to the forgotten peer's pending flow and is quarantined for 30 s, so the second peer
-// starves (and the forgotten peer sees a GRANT after forgetPeer).
-TEST(BounceTransportFailure, ForgetPeerFreesOrphanedRegionsToOtherPeersOnly)
-{
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/30000);
-    c.scatterWorkerCount = 1;                     // exactly one job can be dequeued; the other must stay in mJobs
-    c.quarantineMs = 30000;                       // the old-order symptom: the mis-granted region is parked this long
-    capRegions(c, c.maxInflightChunksPerRequest); // arena holds exactly TWO regions
-    b::ZmqControlChannel gone("fgGone");
-    b::ZmqControlChannel other("fgOther");
-    auto receiver = bounce_test::makeNode("fgReceiver", c, 1024); // receiver posts no writes
-    if (!receiver)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(gone.addPeer("fgReceiver", receiver->ch->localEndpoint()));
-    ASSERT_TRUE(other.addPeer("fgReceiver", receiver->ch->localEndpoint()));
-    // A zero-size WANT is NACKed inline by dispatch(); on the same DEALER it proves every earlier
-    // message was processed, and the tick that dispatched it runs drainForgets() before recv()ing again.
-    auto syncReactor = [&](std::uint64_t rid)
-    {
-        gone.sendTo("fgReceiver", b::encodeWant(rid, {0}, gone.localEndpoint()));
-        return waitNack(gone, rid, std::chrono::seconds(5));
-    };
-
-    std::vector<b::ExecCtx*> heldExecContexts;
-    while (auto* ctx = receiver->exec->tryAcquire())
-    {
-        heldExecContexts.push_back(ctx);
-    }
-    ASSERT_EQ(heldExecContexts.size(), receiver->exec->size());
-
-    auto const chunk = static_cast<std::uint32_t>(c.maxChunkSizeBytes);
-    gone.sendTo("fgReceiver", b::encodeWant(/*rid=*/1, {chunk, chunk}, gone.localEndpoint()));
-    std::vector<b::BounceCreditEntry> credits;
-    while (credits.size() < 2)
-    {
-        std::vector<b::BounceCreditEntry> more;
-        ASSERT_TRUE(waitGrant(gone, 1, std::chrono::seconds(5), more));
-        credits.insert(credits.end(), more.begin(), more.end());
-    }
-    ASSERT_EQ(credits.size(), 2u);
-
-    void* dst = nullptr;
-    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
-    b::BounceScatterRun run{0, reinterpret_cast<std::uintptr_t>(dst), 0, 0, 256, 1};
-    for (std::uint32_t i = 0; i < 2; ++i)
-    {
-        gone.sendTo("fgReceiver", b::encodeData(/*rid=*/1, i, /*numChunks=*/2, credits[i].regionHandle, {run}));
-    }
-    gone.sendTo("fgReceiver", b::encodeWant(/*rid=*/1, {}, gone.localEndpoint()));             // cancel -> orphans
-    gone.sendTo("fgReceiver", b::encodeWant(/*rid=*/2, {chunk, chunk}, gone.localEndpoint())); // pending: arena full
-    ASSERT_TRUE(syncReactor(/*rid=*/3)) << "cancel / pending WANT not processed";
-
-    receiver->tx->forgetPeer("fgGone");
-    ASSERT_TRUE(syncReactor(/*rid=*/4)) << "forget not applied"; // also re-adds fgGone's DEALER: a mis-grant is visible
-
-    other.sendTo("fgReceiver", b::encodeWant(/*rid=*/10, {chunk}, other.localEndpoint()));
-    std::vector<b::BounceCreditEntry> otherCredits;
-    EXPECT_TRUE(waitGrant(other, 10, std::chrono::seconds(2), otherCredits))
-        << "orphaned region not returned to the arena by forgetPeer (granted back to the forgotten peer?)";
-    std::vector<b::BounceCreditEntry> stray;
-    EXPECT_FALSE(waitGrant(gone, 2, std::chrono::milliseconds(200), stray)) << "forgotten peer was granted a region";
-
-    for (auto* ctx : heldExecContexts)
-    {
-        receiver->exec->release(ctx);
-    }
-    receiver->tx->shutdown();
-    EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
 
 // One sender -> TWO receivers sharing ONE small outgoing arena, deliberately oversubscribed: B and C
@@ -1005,7 +870,7 @@ TEST(BounceTransportFailure, MultiPeerSharedOutgoingPoolNoDeadlock)
     threads.emplace_back(
         [&]
         {
-            auto fut = A->tx->submit(toB.srcDescs, toB.dstDescs, B->name);
+            auto fut = bounce_test::submitTransfer(*A, *B, toB);
             if (fut.wait_for(std::chrono::seconds(40)) == std::future_status::ready
                 && fut.get().state == kvc::TransferState::kSUCCESS)
                 ok.fetch_add(1);
@@ -1013,7 +878,7 @@ TEST(BounceTransportFailure, MultiPeerSharedOutgoingPoolNoDeadlock)
     threads.emplace_back(
         [&]
         {
-            auto fut = A->tx->submit(toC.srcDescs, toC.dstDescs, C->name);
+            auto fut = bounce_test::submitTransfer(*A, *C, toC);
             if (fut.wait_for(std::chrono::seconds(40)) == std::future_status::ready
                 && fut.get().state == kvc::TransferState::kSUCCESS)
                 ok.fetch_add(1);
@@ -1059,7 +924,7 @@ TEST(BounceTransportFailure, ConcurrentMultiThreadedSubmit)
         threads.emplace_back(
             [&, i]
             {
-                auto fut = A->tx->submit(bufs[i].srcDescs, bufs[i].dstDescs, B->name);
+                auto fut = bounce_test::submitTransfer(*A, *B, bufs[i]);
                 if (fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready
                     && fut.get().state == kvc::TransferState::kSUCCESS)
                 {
