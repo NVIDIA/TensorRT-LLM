@@ -38,16 +38,31 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 def _build(spec, seed):
     """Materialize one cell.
 
-    `transposed_out` is the part a spec cannot express as a plain `empty`: the
+    `broadcast_a`, `transposed_b` and `out_row` are the context KV expansion's
+    operands: the latent shared by every head, a transposed weight view, and an
+    out laid into the FMHA's packed rows. `transposed_out` is the part a spec cannot express as a plain `empty`: the
     targets hand the op a transposed view of a buffer the forward already
     holds, so the product lands in place. The parent buffer comes back too,
     because "did it land there" is the thing worth asserting.
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     b, m, k, n, dt = spec["batch"], spec["m"], spec["k"], spec["n"], spec["dtype"]
-    a = torch.randn(b, m, k, generator=g, device="cuda").to(dt)
-    w = torch.randn(b, k, n, generator=g, device="cuda").to(dt)
-    if spec["transposed_out"]:
+    if spec.get("broadcast_a"):
+        # One [m, k] operand shared by every batch index: batch stride 0.
+        a = torch.randn(m, k, generator=g, device="cuda").to(dt).unsqueeze(0).expand(b, m, k)
+    else:
+        a = torch.randn(b, m, k, generator=g, device="cuda").to(dt)
+    if spec.get("transposed_b"):
+        w = torch.transpose(torch.randn(b, n, k, generator=g, device="cuda").to(dt), 1, 2)
+    else:
+        w = torch.randn(b, k, n, generator=g, device="cuda").to(dt)
+    if "out_row" in spec:
+        # A view into rows of `row` elements: batch index i's [m, n] block starts at
+        # `offset + i * head_stride` of each row, as the context FMHA's K and V buffers do.
+        row, head_stride, offset = spec["out_row"]
+        parent = torch.zeros(m, row, dtype=dt, device="cuda")
+        out = torch.as_strided(parent, (b, m, n), (head_stride, row, 1), offset)
+    elif spec["transposed_out"]:
         parent = torch.zeros(m, b, n, dtype=dt, device="cuda")
         out = torch.transpose(parent, 0, 1)
         # Only a decode-shaped cell escapes this: transposing a dim of extent 1
@@ -76,6 +91,34 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             why="deepseek default at attention TP2, prefill-height absorb: 64 heads per rank",
             spec=dict(batch=64, m=2048, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
         ),
+        Cell(
+            why="deepseek default at attention TP4, context V expansion: 32 heads per rank",
+            spec=dict(
+                batch=32,
+                m=8192,
+                k=512,
+                n=128,
+                dtype=torch.bfloat16,
+                transposed_out=True,
+                broadcast_a=True,
+                transposed_b=True,
+                out_row=(32 * 256, 128, 32 * 128),
+            ),
+        ),
+        Cell(
+            why="deepseek default at attention TP4, context K expansion: 32 heads per rank",
+            spec=dict(
+                batch=32,
+                m=8192,
+                k=512,
+                n=128,
+                dtype=torch.bfloat16,
+                transposed_out=True,
+                broadcast_a=True,
+                transposed_b=True,
+                out_row=(32 * 192, 192, 0),
+            ),
+        ),
     ),
 }
 
@@ -94,6 +137,12 @@ def test_certified_cells(cell) -> None:
     # allocated: that is the whole reason this op exists over torch.bmm.
     assert parent.data_ptr() == parent_ptr
     _compare(out, op.reference(a, w, out))
+    if "out_row" in cell.spec:
+        # Only the view's columns are written: the rest of each packed row (K's rope half,
+        # the k_nope half of [k_nope | v]) belongs to other writers.
+        rest = torch.ones_like(parent, dtype=torch.bool)
+        torch.as_strided(rest, out.shape, out.stride(), out.storage_offset()).fill_(False)
+        assert not parent[rest].any(), "the op wrote outside its view"
 
 
 def _ok(dtype=torch.bfloat16):
