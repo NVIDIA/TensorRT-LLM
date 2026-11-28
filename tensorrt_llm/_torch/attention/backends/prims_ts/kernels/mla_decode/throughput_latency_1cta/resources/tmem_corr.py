@@ -657,19 +657,34 @@ class TmemCorrResource(MlaResource):
     def _cluster_wait_transaction_barrier(self, warp_grp_thread_idx):
         """Wait for peer cluster stores before the owner reads local DSMEM."""
 
-        # Give every correction lane one nonblocking acquire attempt. If the
+        # Give every correction lane one nonblocking wait attempt. If the
         # transaction is not already complete, only lane 0 keeps polling. The
         # correction store barrier is free after the final O-staging phase and
         # publishes lane 0's ready point to all 128 correction lanes before
         # any of them reads the distributed-SMEM partials below.
+        # The peers' st.async complete-tx releases at cluster scope, so the
+        # wait must observe it at cluster scope; the default CTA scope does
+        # not synchronize with a thread of another CTA. The wait itself is
+        # relaxed and the acquire is a fence restricted to shared::cluster,
+        # which orders the distributed-SMEM reads without the L1 invalidation
+        # an acquire.cluster wait would cost.
         cluster_transaction_ready = prims.mbarrier_try_wait_parity(
-            self._cluster_reduction_barrier, 0, time_limit=0
+            self._cluster_reduction_barrier,
+            0,
+            time_limit=0,
+            scope=prims.MBarrierScope.CLUSTER,
+            order=prims.MemOrder.RELAXED,
         )
         if warp_grp_thread_idx == Int32(0):
             while not cluster_transaction_ready:
                 cluster_transaction_ready = prims.mbarrier_try_wait_parity(
-                    self._cluster_reduction_barrier, 0, time_limit=10_000_000
+                    self._cluster_reduction_barrier,
+                    0,
+                    time_limit=10_000_000,
+                    scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
                 )
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
         prims.barrier_cta_sync(
             barrier_id=self.store_barrier_id,
             thread_count=WARPGROUP_THREADS,
