@@ -164,8 +164,20 @@ def check_prompt_capacity(num_prompt_tokens: int, max_prompt_len: int) -> None:
 
 
 _CONTEXT_LENGTH_EXCEEDED_RE = re.compile(
-    r"This model's maximum context length is \d+ tokens\. "
-    r"However, your messages resulted in \d+ tokens\.")
+    r"This model's maximum context length is (\d+) tokens\. "
+    r"However, your messages resulted in (\d+) tokens\.")
+
+
+def context_length_exceeded_counts(message: str) -> tuple[int, int] | None:
+    """``(max_context_length, num_prompt_tokens)`` of a ``context_length_exceeded_message``.
+
+    None if ``message`` contains none. Searched for like
+    ``is_context_length_exceeded_message`` does.
+    """
+    match = _CONTEXT_LENGTH_EXCEEDED_RE.search(message)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def is_context_length_exceeded_message(message: str) -> bool:
