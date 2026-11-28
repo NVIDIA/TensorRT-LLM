@@ -33,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
+from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     _NO_EXTRA_INPUTS,
     DecoderInputBuffers,
@@ -776,9 +777,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         self.assertEqual(kernel_path[0][:num_tokens].tolist(), expected_input_ids.tolist())
 
     def test_staged_speculative_overlap_inputs_match_per_buffer_copies(self) -> None:
-        """One slab upload and one staging launch write the same inputs as the
-        per-buffer copies: a context row, a request without a previous step,
-        requests verifying in-flight drafts in permuted slots, and a dummy."""
+        """Compare both staged and early-packed overlap inputs with direct copies."""
         model_engine, kv_cache_manager = self.enterContext(
             create_model_engine_and_kvcache(spec_config=SADecodingConfig(max_draft_len=3))
         )
@@ -815,9 +814,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             ),
         )
 
-        def batch() -> ScheduledRequests:
-            context = _create_request_with_tokens(list(range(100, 107)), 1)
-            context.py_seq_slot = 0
+        def batch(include_context: bool) -> ScheduledRequests:
             fresh = _create_request_with_tokens([50, 51, 52, 53, 54], 2)
             fresh.py_seq_slot = 1
             fresh.py_draft_tokens = [7, 8, 9]
@@ -832,8 +829,13 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             dummy.py_draft_tokens = [1, 1, 1]
             dummy.is_cuda_graph_dummy = True
             scheduled = ScheduledRequests()
-            scheduled.context_requests_last_chunk = [context]
-            scheduled.generation_requests = [fresh, *verifying, dummy]
+            if include_context:
+                context = _create_request_with_tokens(list(range(100, 107)), 1)
+                context.py_seq_slot = 0
+                scheduled.context_requests_last_chunk = [context]
+                scheduled.generation_requests = [fresh, *verifying, dummy]
+            else:
+                scheduled.generation_requests = [fresh, verifying[0], dummy]
             return scheduled
 
         # The gather ids take their cached upload on both paths.
@@ -847,8 +849,13 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         )
         # The staging runs for models that opt in (RuntimeHooks.stage_decode_inputs).
         preparer._host_uploader = HostUploader()
-        results = []
-        for staging in (True, False):
+
+        def prepare(
+            *,
+            staging: bool = False,
+            include_context: bool = True,
+            pack: step_inputs.StepInputPack | None = None,
+        ) -> dict[str, torch.Tensor]:
             preparer._spec_overlap_staging = staging
             preparer._staged_previous_batch_indices = None
             preparer._staged_previous_pos_indices = None
@@ -858,29 +865,36 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                 max_num_requests=8, max_num_tokens=64, kv_cache_manager=kv_cache_manager
             )
             attn_metadata.is_cuda_graph = False
-            inputs = preparer.prepare_inputs(
-                scheduled_requests=batch(),
-                kv_cache_manager=kv_cache_manager,
-                attn_metadata=attn_metadata,
-                new_tensors_device=previous,
-                resource_manager=resource_manager,
-                enable_spec_decode=True,
-                runtime_draft_len=tokens_per_step - 1,
-                is_dummy=False,
-            ).kwargs
+            with step_inputs.active(pack):
+                step_inputs.begin()
+                inputs = preparer.prepare_inputs(
+                    scheduled_requests=batch(include_context),
+                    kv_cache_manager=kv_cache_manager,
+                    attn_metadata=attn_metadata,
+                    new_tensors_device=previous,
+                    resource_manager=resource_manager,
+                    enable_spec_decode=True,
+                    runtime_draft_len=tokens_per_step - 1,
+                    is_dummy=False,
+                ).kwargs
+                if pack is not None:
+                    pending = {dst for dst, _, _ in pack.h2d}
+                    self.assertIn(buffers.input_ids_cuda.data_ptr(), pending)
+                    self.assertIn(buffers.draft_tokens_cuda.data_ptr(), pending)
+                step_inputs.flush()
             torch.cuda.synchronize()
-            results.append(
-                {
-                    "input_ids": inputs["input_ids"].cpu(),
-                    "position_ids": inputs["position_ids"].cpu(),
-                    "gather_ids": preparer._gather_ids_buffer.tensor.cpu(),
-                    "draft_tokens": buffers.draft_tokens_cuda[:9].cpu(),
-                    "previous_slots": buffers.previous_batch_indices_cuda[:2].cpu(),
-                    "position_offsets": buffers.previous_pos_id_offsets_cuda.cpu(),
-                    "kv_lens_offsets": buffers.previous_kv_lens_offsets_cuda.cpu(),
-                }
-            )
-        staged, plain = results
+            return {
+                "input_ids": inputs["input_ids"].cpu(),
+                "position_ids": inputs["position_ids"].cpu(),
+                "gather_ids": preparer._gather_ids_buffer.tensor.cpu(),
+                "draft_tokens": buffers.draft_tokens_cuda[:9].cpu(),
+                "previous_slots": buffers.previous_batch_indices_cuda[:2].cpu(),
+                "position_offsets": buffers.previous_pos_id_offsets_cuda.cpu(),
+                "kv_lens_offsets": buffers.previous_kv_lens_offsets_cuda.cpu(),
+            }
+
+        staged = prepare(staging=True)
+        plain = prepare()
         for name, expected in plain.items():
             self.assertTrue(torch.equal(staged[name], expected), name)
         # The verifying rows take the previous step's tokens and corrections.
@@ -890,6 +904,27 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         self.assertEqual(
             staged["kv_lens_offsets"][:4].tolist(),
             [0, lens[4].item() - tokens_per_step, lens[2].item() - tokens_per_step, 0],
+        )
+
+        class EarlyPack(step_inputs.StepInputPack):
+            issue_after_prepare = True
+
+        decode_plain = prepare(include_context=False)
+        decode_packed = prepare(
+            include_context=False, pack=EarlyPack(buffers.input_ids_cuda.device)
+        )
+        for name, expected in decode_plain.items():
+            self.assertTrue(torch.equal(decode_packed[name], expected), name)
+        # The first request is uploaded from the host, the second comes from
+        # the previous step, and the trailing graph padding is cleared.
+        self.assertEqual(decode_packed["input_ids"][:4].tolist(), [54, 7, 8, 9])
+        self.assertEqual(
+            decode_packed["input_ids"][4:8].tolist(), previous.new_tokens[:, 4, 0].tolist()
+        )
+        self.assertEqual(decode_packed["input_ids"][8:].tolist(), [0] * tokens_per_step)
+        self.assertEqual(decode_packed["draft_tokens"][:3].tolist(), [7, 8, 9])
+        self.assertEqual(
+            decode_packed["draft_tokens"][3:6].tolist(), previous.next_draft_tokens[4].tolist()
         )
 
     @skip_ray

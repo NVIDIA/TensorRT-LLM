@@ -16,6 +16,7 @@ import dataclasses
 import inspect
 import types
 from pathlib import Path
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -74,6 +75,24 @@ def test_every_field_defaults_to_off():
             )
         else:
             assert value in (False, None), field.name
+
+
+def test_pack_factory_preserves_the_positional_decode_prologue():
+    decode_prologue = Mock()
+    pack_factory = Mock()
+    hooks = RuntimeHooks(
+        False,
+        False,
+        False,
+        False,
+        False,
+        None,
+        decode_prologue,
+        step_input_pack_factory=pack_factory,
+    )
+
+    assert hooks.decode_prologue is decode_prologue
+    assert hooks.step_input_pack_factory is pack_factory
 
 
 def test_hooks_declared_as_none_mean_the_default():
@@ -750,6 +769,112 @@ def test_executor_loop_cleanup_calls_at_shutdown_after_a_completed_loop(complete
     executor._executor_loop_cleanup()
     assert executor.is_shutdown
     assert events.calls == (["at_shutdown"] if completed else [])
+
+
+@pytest.mark.parametrize("events", ["none", "without", "with"])
+def test_the_overlap_loop_calls_the_events_optional_per_iteration_call(
+    monkeypatch: pytest.MonkeyPatch, events: str
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import py_executor
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    log = []
+    callbacks = types.SimpleNamespace(
+        before_overlap_loop=lambda: log.append("before_overlap_loop"),
+        on_iteration=lambda iteration: log.append(f"on_iteration {iteration}"),
+    )
+    declared = {"none": None, "without": _Events(), "with": callbacks}[events]
+
+    monkeypatch.setattr(torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(py_executor, "CUASSERT", Mock())
+    monkeypatch.setattr(py_executor.cudart, "cudaSetDevice", Mock())
+    executor = Mock(
+        spec=PyExecutor,
+        device_id=0,
+        iter_counter=7,
+        is_benchmark_disagg=False,
+        previous_batch=None,
+        kv_connector_manager=None,
+        _executor_events=declared,
+        _defer_generation_only_release=False,
+        enable_iter_perf_stats=False,
+        _resource_governor_enabled=False,
+        _is_kv_manager_v2=False,
+        _packed_sync_enabled=False,
+        _mm_encoder_item_scheduling_enabled=False,
+        _kv_connector_moves_kv=False,
+        enable_early_first_token_response=False,
+        enable_kv_cache_events=False,
+        enable_attention_dp=False,
+    )
+    executor._overlap_loop_stream_scope.return_value = contextlib.nullcontext()
+    executor._profiler.return_value = contextlib.nullcontext(lambda: log.append("profile step"))
+    executor.hang_detector = MagicMock()
+    executor.hang_detector.checkpoint.side_effect = [None, None, StopIteration]
+    executor.disagg.handle_errors_synced.return_value = False
+    executor._check_benchmark_disagg_gate.return_value = (True, False)
+    executor._can_queue.return_value = (False, False)
+    batch = types.SimpleNamespace(paused_requests=[], encoder_requests=[])
+
+    def schedule(**_: object) -> tuple[types.SimpleNamespace, None]:
+        log.append(f"schedule {executor.iter_counter}")
+        return batch, None
+
+    executor._prepare_and_schedule_batch.side_effect = schedule
+    with pytest.raises(StopIteration):
+        PyExecutor._executor_loop_overlap(executor)
+
+    expected = ["before_overlap_loop"] if events == "with" else []
+    for iteration in (7, 8):
+        expected.append("profile step")
+        if events == "with":
+            expected.append(f"on_iteration {iteration}")
+        expected.append(f"schedule {iteration}")
+    assert log == expected
+    assert executor.iter_counter == 9
+
+
+# -- a model's own step-input pack --------------------------------------------------------------
+
+
+class _RecordingPack:
+    """An open step-input pack without device buffers that records what it is asked to stage."""
+
+    def __init__(self, issue_after_prepare: bool) -> None:
+        self.open = True
+        self.issue_after_prepare = issue_after_prepare
+        self.staged_copies = []
+
+    def stage(self, dst: torch.Tensor, src: torch.Tensor) -> bool:
+        self.staged_copies.append((dst, src))
+        return True
+
+
+@pytest.fixture
+def not_capturing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+
+@pytest.mark.parametrize(
+    ("issue_after_prepare", "allow_pack"),
+    [(None, True), (False, True), (True, True), (True, False)],
+    ids=["no_pack", "replay_pack", "early_pack", "packing_disabled_for_copy"],
+)
+def test_pool_shared_copy_without_skip_cache(
+    issue_after_prepare: bool | None, allow_pack: bool, not_capturing: None
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
+
+    dst, src = torch.zeros(3, dtype=torch.int32), torch.arange(1, 4, dtype=torch.int32)
+    pack = None if issue_after_prepare is None else _RecordingPack(issue_after_prepare)
+    with h2d_cache.active(None), step_inputs.active(pack):
+        assert h2d_cache.copy_h2d_pool_shared(dst, src, pack=allow_pack)
+    should_stage = bool(issue_after_prepare and allow_pack)
+    if pack is not None:
+        assert len(pack.staged_copies) == int(should_stage)
+        if should_stage:
+            assert pack.staged_copies[0][0] is dst
+    assert torch.equal(dst, torch.zeros_like(src) if should_stage else src)
 
 
 class _M3PlainModel(torch.nn.Module):

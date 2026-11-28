@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache, copy_h2d_if_changed
@@ -491,6 +492,67 @@ def test_after_a_discarded_step_identical_values_are_sent_again(pack):
     torch.cuda.synchronize()
 
     assert dst.tolist() == [4, 5, 6]
+
+
+def test_a_metadata_upload_does_not_join_the_stock_pack(pack: StepInputPack) -> None:
+    """The stock pack is issued at the replay, so ``copy_metadata_`` copies directly into an open one."""
+    dst = _zeros(3)
+
+    step_inputs.begin()
+    step_inputs.copy_metadata_(dst, _host([1, 2, 3]))
+    assert pack.open and pack.h2d == [] and pack.d2d == []
+    torch.cuda.synchronize()
+    assert dst.tolist() == [1, 2, 3]
+
+
+class _PackIssuedAfterPrepare(StepInputPack):
+    issue_after_prepare = True
+
+
+def test_a_metadata_upload_joins_a_pack_issued_after_prepare() -> None:
+    step_pack = _PackIssuedAfterPrepare(_device())
+    dst = _zeros(3)
+
+    with step_inputs.active(step_pack):
+        step_inputs.begin()
+        step_inputs.copy_metadata_(dst, _host([1, 2, 3]))
+        assert len(step_pack.h2d) == 1
+        torch.cuda.synchronize()
+        assert dst.tolist() == [0, 0, 0]
+        step_inputs.flush()
+    torch.cuda.synchronize()
+
+    assert dst.tolist() == [1, 2, 3]
+
+
+def test_helix_metadata_uploads_join_a_pack_issued_after_prepare() -> None:
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.helix_position_offsets = _zeros(4, dtype=torch.int)
+    metadata.helix_position_offsets_cpu = _host([0, 0, 0, 0], dtype=torch.int)
+    metadata.helix_is_inactive_rank = _zeros(4, dtype=torch.bool)
+    metadata.helix_is_inactive_rank_cpu = _host([False, False, False, False], dtype=torch.bool)
+    metadata.helix_global_kv_lens = _zeros(4, dtype=torch.int)
+    metadata.helix_global_kv_lens_cpu = _host([0, 0, 0, 0], dtype=torch.int)
+
+    step_pack = _PackIssuedAfterPrepare(_device())
+    with step_inputs.active(step_pack):
+        step_inputs.begin()
+        metadata.update_helix_param([9, 15], [False, True])
+        assert [dst_ptr for dst_ptr, _, _ in step_pack.h2d] == [
+            metadata.helix_position_offsets.data_ptr(),
+            metadata.helix_is_inactive_rank.data_ptr(),
+            metadata.helix_global_kv_lens.data_ptr(),
+        ]
+        torch.cuda.synchronize()
+        assert metadata.helix_position_offsets[:2].tolist() == [0, 0]
+        assert metadata.helix_is_inactive_rank[:2].tolist() == [False, False]
+        assert metadata.helix_global_kv_lens[:2].tolist() == [0, 0]
+        step_inputs.flush()
+    torch.cuda.synchronize()
+
+    assert metadata.helix_position_offsets[:2].tolist() == [9, 15]
+    assert metadata.helix_is_inactive_rank[:2].tolist() == [False, True]
+    assert metadata.helix_global_kv_lens[:2].tolist() == [10, 16]
 
 
 def test_skip_cache_copies_join_the_active_pack(pack):
