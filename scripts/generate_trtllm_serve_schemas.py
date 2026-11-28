@@ -271,6 +271,11 @@ def _cross_field_rules(definitions: dict) -> None:
                 )
                 for name in ("context_claim_ahead", "context_prefetch_blocks")
             ),
+            # validate_disk_cache_config(): a page_staging_depth above 1 refuses busy-stream skipping.
+            when(
+                _is_set_to("page_staging_depth", {"type": "integer", "minimum": 2}),
+                {"properties": {"copy_stream_busy_skip": {"maximum": 0}}},
+            ),
             when(
                 _is_set_to("remote_cache_config", _is_set_to("level", {"type": "object"})),
                 {
