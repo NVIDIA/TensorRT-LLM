@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import math
 from contextlib import contextmanager
@@ -208,8 +223,8 @@ def test_scaffolding_benchmark_strategies():
                 ("Synchronous", SynchronousStrategy(), 10),
                 ("Concurrent@3", ConcurrentStrategy(concurrency=3), 10),
                 ("Throughput", ThroughputStrategy(), 10),
-                ("ConstantRate@10", ConstantRateStrategy(rate=2.0), 100),
-                ("PoissonRate@10", PoissonRateStrategy(rate=2.0), 100),
+                ("ConstantRate@2", ConstantRateStrategy(rate=2.0), 100),
+                ("PoissonRate@2", PoissonRateStrategy(rate=2.0), 100),
             ]
             for name, strategy, num_requests in strategies:
                 print(
@@ -237,8 +252,49 @@ def test_scaffolding_benchmark_strategies():
         scaffolding_llm.shutdown()
 
 
+def test_benchmark_dispatch_concurrency() -> None:
+
+    async def check_concurrency() -> None:
+        requests = create_requests(num_requests=3)
+        expected_prompts = [request.prompt for request in requests]
+        all_dispatched = asyncio.Event()
+        dispatched_prompts: list[str] = []
+        completed_prompts: list[str] = []
+
+        async def finish_request(prompt: str) -> None:
+            await all_dispatched.wait()
+            completed_prompts.append(prompt)
+
+        def generate_async(prompt: str) -> SimpleNamespace:
+            dispatched_prompts.append(prompt)
+            if len(dispatched_prompts) == len(requests):
+                all_dispatched.set()
+            return SimpleNamespace(prompt=prompt,
+                                   aresult=lambda: finish_request(prompt))
+
+        input_queue = asyncio.Queue()
+        output_queue = asyncio.Queue()
+        await benchmark.enqueue_requests(input_queue, requests)
+        await benchmark.run_scaffolding_llm(
+            SimpleNamespace(generate_async=generate_async), input_queue,
+            output_queue, ConstantRateStrategy(rate=2.0))
+
+        result_prompts = []
+        while (entry := await output_queue.get()) is not None:
+            result_prompts.append(entry[0].prompt)
+
+        assert dispatched_prompts == expected_prompts
+        assert sorted(completed_prompts) == sorted(expected_prompts)
+        assert sorted(result_prompts) == sorted(expected_prompts)
+
+    with _mock_benchmark_clock():
+        assert benchmark.asyncio.sleep is not asyncio.sleep
+        asyncio.run(asyncio.wait_for(check_concurrency(), timeout=10))
+
+
 @pytest.mark.parametrize("cancel_parent", [False, True])
 def test_benchmark_clock_cancellation(cancel_parent: bool) -> None:
+    """Self-test the clock with a live peer or with every sleeper cancelled."""
 
     async def check_cancellation() -> None:
         loop = asyncio.get_running_loop()
