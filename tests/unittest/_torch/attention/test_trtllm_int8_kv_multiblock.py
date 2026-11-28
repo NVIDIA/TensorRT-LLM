@@ -12,13 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TRTLLM generation attention over a long INT8 KV cache with XQA multi-block mode.
+"""TRTLLM generation attention over quantized KV caches with XQA multi-block mode.
 
 The generation step runs on a paged INT8 cache and, as a control, on a BF16 cache that holds the
 same dequantized values (the KV scale is a power of two, so ``int8 * scale`` is exact in BF16).
 Each case checks that the XQA kernel splits every sequence into more than one sub-sequence, that
 the INT8 output matches the BF16-cache output and a float64 reference, that the appended tokens
 are stored exactly, and that repeated steps are bitwise identical.
+The SM89 FP8 cases check the same on an FP8 (E4M3) cache, with K/V values rounded to E4M3 so that
+the BF16 control holds the same values. They include short histories and small batches, where the
+BF16 control does not run on the XQA kernel and each output is only compared with the reference.
 """
 
 import json
@@ -79,6 +82,11 @@ def _inputs(num_heads, num_kv_heads, head_dim, cached, q_len, seed):
     return q.to(torch.bfloat16), cached_k, cached_v, new_k, new_v
 
 
+def _e4m3(x):
+    """Round to the nearest E4M3 number."""
+    return x.to(torch.float8_e4m3fn).to(x.dtype)
+
+
 def _pool(manager, int8):
     """The layer's pool as ``[pages, 2, kv_heads, page, head_dim]``.
 
@@ -89,14 +97,15 @@ def _pool(manager, int8):
     return buf.view(torch.int8) if int8 else buf
 
 
-def _fill(manager, cached_k, cached_v, int8):
+def _fill(manager, cached_k, cached_v, kv_dtype):
     """Write the cached prefix of every sequence; the rest of the pool is zero."""
+    int8 = kv_dtype == DataType.INT8
     buf = _pool(manager, int8)
     buf.zero_()
     blocks = manager.get_batch_cache_indices(list(range(len(cached_k))), 0)
     for i, (k, v) in enumerate(zip(cached_k, cached_v, strict=True)):
-        if int8:
-            k, v = k.to(torch.int8), v.to(torch.int8)
+        if kv_dtype in (DataType.INT8, DataType.FP8):
+            k, v = k.to(buf.dtype), v.to(buf.dtype)
         else:
             k, v = (k * KV_SCALE).to(buf.dtype), (v * KV_SCALE).to(buf.dtype)
         for n, block in enumerate(blocks[i][: math.ceil(k.shape[0] / PAGE)]):
@@ -106,10 +115,11 @@ def _fill(manager, cached_k, cached_v, int8):
             buf[block, 1, :, :num].copy_(v[tokens].transpose(0, 1))
 
 
-def _cached_kv(manager, total, int8):
+def _cached_kv(manager, total, kv_dtype):
     """Dequantized cache contents per sequence, ``[2, total_len, num_kv_heads, head_dim]``."""
+    int8 = kv_dtype == DataType.INT8
     buf = _pool(manager, int8)
-    kv_scale = KV_SCALE if int8 else 1.0
+    kv_scale = KV_SCALE if kv_dtype in (DataType.INT8, DataType.FP8) else 1.0
     blocks = manager.get_batch_cache_indices(list(range(len(total))), 0)
     result = []
     for i, length in enumerate(total):
@@ -143,6 +153,7 @@ def _generation_step(kv_dtype, num_heads, num_kv_heads, head_dim, cached, q_len,
     """One generation step; returns (output, cache after the step, XQA grids, repeat outputs)."""
     q, cached_k, cached_v, new_k, new_v = inputs
     int8 = kv_dtype == DataType.INT8
+    quantized = kv_dtype in (DataType.INT8, DataType.FP8)
     pool_dtype = DataType.FP8 if int8 else kv_dtype
     num_seqs = len(cached)
     request_ids = list(range(num_seqs))
@@ -155,9 +166,13 @@ def _generation_step(kv_dtype, num_heads, num_kv_heads, head_dim, cached, q_len,
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.INT8) if int8 else None,
+        quant_config=(
+            QuantConfig(kv_cache_quant_algo=QuantAlgo.INT8 if int8 else QuantAlgo.FP8)
+            if quantized
+            else None
+        ),
     )
-    if int8:
+    if quantized:
         attn.kv_cache_scaling_factor.fill_(KV_SCALE)
         attn.kv_scale_quant_orig = attn.kv_cache_scaling_factor
         attn.kv_scale_orig_quant = 1.0 / attn.kv_cache_scaling_factor
@@ -176,7 +191,7 @@ def _generation_step(kv_dtype, num_heads, num_kv_heads, head_dim, cached, q_len,
     )
     try:
         manager.add_dummy_requests(request_ids, total)
-        _fill(manager, cached_k, cached_v, int8)
+        _fill(manager, cached_k, cached_v, kv_dtype)
 
         metadata = TrtllmAttentionMetadata(
             num_contexts=0,
@@ -217,7 +232,7 @@ def _generation_step(kv_dtype, num_heads, num_kv_heads, head_dim, cached, q_len,
 
         output = step().clone()
         torch.cuda.synchronize()
-        cache = _cached_kv(manager, total, int8)
+        cache = _cached_kv(manager, total, kv_dtype)
 
         # The step rewrites the same new tokens into the same slots, so it can be repeated.
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
@@ -293,3 +308,76 @@ def test_int8_kv_generation_uses_multi_block(
     torch.testing.assert_close(out_int8.double(), reference, atol=2e-2, rtol=2e-2)
     # Both kernels read the same values; they differ only in rounding of the partial results.
     torch.testing.assert_close(out_int8, out_bf16, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 89,
+    reason="FP8 KV multi-block regression targets SM89",
+)
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_dim,cached,q_len",
+    [
+        (32, 8, 128, [4096], 1),
+        (32, 8, 128, [2048, 4096], 1),
+        (32, 8, 128, [384], 1),
+        (32, 8, 128, [128, 1000, 4097, 2048], 1),
+        (24, 4, 256, [8192], 1),
+        (24, 4, 256, [8192], 4),
+        (32, 8, 128, [3000, 20000], 4),
+    ],
+    ids=[
+        "batch1",
+        "batch2-mixed",
+        "batch1-384",
+        "batch4-mixed",
+        "h24kv4d256-8k",
+        "h24kv4d256-8k-specdec4",
+        "batch2-mixed-specdec4",
+    ],
+)
+def test_fp8_kv_generation_uses_multi_block(
+    tmp_path, num_heads, num_kv_heads, head_dim, cached, q_len
+):
+    q, *kv_inputs = _inputs(num_heads, num_kv_heads, head_dim, cached, q_len, seed=0)
+    # Round the K/V values to E4M3, so that the FP8 cache and the BF16 control hold the same
+    # values (``fp8 * scale`` is exact in BF16).
+    cached_k, cached_v = ([_e4m3(x) for x in xs] for xs in kv_inputs[:2])
+    new_k, new_v = (_e4m3(x) for x in kv_inputs[2:])
+    inputs = (q, cached_k, cached_v, new_k, new_v)
+    args = (num_heads, num_kv_heads, head_dim, cached, q_len, inputs, tmp_path)
+    out_fp8, cache_fp8, grids_fp8, repeats_fp8 = _generation_step(DataType.FP8, *args)
+    out_bf16, cache_bf16, grids_bf16, _ = _generation_step(DataType.BF16, *args)
+
+    # Both caches hold exactly the input values, including the FP8-quantized new tokens.
+    for i, (kv_fp8, kv_bf16) in enumerate(zip(cache_fp8, cache_bf16, strict=True)):
+        tokens = slice(i * q_len, (i + 1) * q_len)
+        expected = (
+            torch.stack(
+                [
+                    torch.cat([cached_k[i], new_k[tokens]]),
+                    torch.cat([cached_v[i], new_v[tokens]]),
+                ]
+            ).double()
+            * KV_SCALE
+        )
+        torch.testing.assert_close(kv_fp8, expected, atol=0, rtol=0)
+        torch.testing.assert_close(kv_bf16, expected, atol=0, rtol=0)
+
+    # The XQA kernel serves the FP8 step and splits each sequence into sub-sequences. The BF16
+    # control runs on the non-XQA kernel when the batch is small and the history is short.
+    assert grids_fp8 and all(grid[0] > 1 for grid in grids_fp8), grids_fp8
+    assert all(grid[0] > 1 for grid in grids_bf16), grids_bf16
+
+    assert all(torch.equal(r, out_fp8) for r in repeats_fp8)
+    assert not out_fp8.isnan().any()
+
+    reference = _reference(q, cache_fp8, cached, q_len)
+    rel_err = ((out_fp8.double() - reference).norm() / reference.norm()).item()
+    rel_err_bf16 = ((out_bf16.double() - reference).norm() / reference.norm()).item()
+    assert rel_err < 1e-2, rel_err
+    assert rel_err_bf16 < 1e-2, rel_err_bf16
+    torch.testing.assert_close(out_fp8.double(), reference, atol=2e-2, rtol=2e-2)
+    if grids_bf16:
+        # Both XQA kernels read the same values; they differ only in rounding of the partial
+        # results.
+        torch.testing.assert_close(out_fp8, out_bf16, atol=1e-3, rtol=1e-2)
