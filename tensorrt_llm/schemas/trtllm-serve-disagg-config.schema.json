@@ -6004,6 +6004,26 @@
         {
           "if": {
             "properties": {
+              "page_staging_depth": {
+                "minimum": 2,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "page_staging_depth"
+            ]
+          },
+          "then": {
+            "properties": {
+              "copy_stream_busy_skip": {
+                "maximum": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
               "remote_cache_config": {
                 "properties": {
                   "level": {

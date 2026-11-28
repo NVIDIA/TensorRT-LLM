@@ -1349,6 +1349,11 @@ class KvCacheCreator:
         used_fields = {
             "remote_cache_config": kv_cache_config.remote_cache_config
             is not None,
+            # Copy-path settings that KvCacheConfig accepts with
+            # use_kv_cache_manager_v2="auto": only V2 reads them.
+            "host_copy_threads": kv_cache_config.host_copy_threads > 1,
+            "copy_stream_busy_skip": kv_cache_config.copy_stream_busy_skip > 0,
+            "page_staging_mib": kv_cache_config.page_staging_mib != 64,
         }
         for field in _KV_CACHE_HOST_HELPER_FIELDS:
             used_fields[field] = getattr(kv_cache_config, field)

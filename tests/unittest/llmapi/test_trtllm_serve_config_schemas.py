@@ -2321,3 +2321,41 @@ def test_host_helper_rules_match_runtime(
     for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
         validator = Draft202012Validator(schemas[filename])
         assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            # The worker sections carry the same rules as the root.
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section
+
+
+@pytest.mark.parametrize(
+    ("depth", "busy_skip", "valid"),
+    [(4, 64, False), (4, 0, True), (1, 64, True)],
+)
+def test_page_staging_depth_and_busy_skip_rule_matches_runtime(
+    schemas: dict[str, dict], tmp_path, depth: int, busy_skip: int, valid: bool
+) -> None:
+    """Both schemas refuse page_staging_depth > 1 with copy_stream_busy_skip > 0, as KvCacheConfig does."""
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    kv_cache_config = {
+        "use_kv_cache_manager_v2": True,
+        "disk_cache_size": 2048,
+        "disk_cache_path": str(tmp_path),
+        "page_staging_depth": depth,
+        "copy_stream_busy_skip": busy_skip,
+    }
+    try:
+        KvCacheConfig(**kv_cache_config)
+        runtime_accepts = True
+    except ValidationError:
+        runtime_accepts = False
+    assert runtime_accepts == valid
+    config = {"kv_cache_config": kv_cache_config}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section

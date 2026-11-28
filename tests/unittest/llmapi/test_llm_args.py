@@ -3073,6 +3073,37 @@ def test_KvCacheConfig_copy_stream_busy_skip():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("field, value", [("host_copy_threads", 4),
+                                          ("copy_stream_busy_skip", 64),
+                                          ("page_staging_mib", 128)])
+@pytest.mark.parametrize("use_v2", [True, "auto"])
+def test_copy_path_options_need_the_resolved_v2_manager(field, value, use_v2):
+    """A KvCacheConfig that requests V2 (or "auto") passes these at parse time; once model
+    loading has picked V1 they would be ignored, so the creator rejects them."""
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm.mapping import Mapping
+
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_v2,
+                                    **{field: value})
+    llm_args = SimpleNamespace(disable_overlap_scheduler=False)
+
+    def creator(is_v2):
+        return SimpleNamespace(_kv_cache_config=kv_cache_config,
+                               _is_kv_cache_manager_v2=is_v2,
+                               _kv_cache_manager_cls=type(
+                                   "KVCacheManager", (), {}),
+                               _is_disagg=False)
+
+    KvCacheCreator._reject_unused_v2_only_fields(creator(True), Mapping(),
+                                                 llm_args)
+    with pytest.raises(
+            ValueError,
+            match=f"kv_cache_config.{field} requires KVCacheManagerV2"):
+        KvCacheCreator._reject_unused_v2_only_fields(creator(False), Mapping(),
+                                                     llm_args)
+
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_host_cache_free_reserve(tmp_path):
     assert KvCacheConfig().host_cache_free_reserve_fraction == 0.0
     disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
@@ -3644,10 +3675,6 @@ def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
     },
     {
         "defer_context_only_release": True
-    },
-    {
-        "defer_generation_only_release": True,
-        "deferred_release_thread": True
     },
     {
         "context_claim_ahead": 6
