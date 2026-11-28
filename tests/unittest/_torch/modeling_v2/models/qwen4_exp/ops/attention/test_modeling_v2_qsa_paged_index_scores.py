@@ -569,12 +569,15 @@ def _late_store(index_cache, pages, slots, keys, delay_ns: int) -> None:
 
 
 def test_request_group_prefetch_rereads_what_a_late_producer_stores() -> None:
-    """`prefetch` behind a producer that releases it at entry and stores the run's own index
-    slots ~500 us later: the keys at or past the run's smallest position minus one compressed
-    block are read again after the wait, so the scores are the plain request-group kernel's
-    bits over the stored keys. Positive control: a key below that bound, stored the same way,
-    is read stale -- the op does start before the producer stores, so the first check would
-    see a missing or short re-read."""
+    """`prefetch` behind a producer that releases it at entry and stores, ~500 us later, the
+    run's own index slots and block 5's anchor (position 23, below the re-read bound): the keys
+    at or past the run's smallest position minus one compressed block are read again after the
+    wait, so those scores are the plain request-group kernel's bits over the stored keys.
+
+    Block 5 is the overlap signal of the same invocation: the op reads it before the wait and
+    never again, so its score is the old key's exactly when the op's loads ran before the
+    producer's store. Where they did not overlap (CUDA may serialize the pair) the re-read check
+    could not fail, and the attempt is retried, then reported inconclusive (skipped)."""
     rows, p0 = 4, 4096  # one request's verify run at 4096..4099: row 3 ends a group
     spec = _case(rows, 8, pages=_WIDTH_PAGES, only_visible_blocks=True)
     spec.update(q_layout="scratch_slice", use_pdl=True)
@@ -591,15 +594,22 @@ def test_request_group_prefetch_rereads_what_a_late_producer_stores() -> None:
     # Keys whose score is positive (a row's own index head 0): the ReLU cannot hide them.
     key_of = {r: q[r, 0].reshape(1, -1) for r in range(rows)}
 
-    def run(pages, slots, keys):
-        """`(before, early, plain)`: the plain scores before the store, the prefetching op's
-        behind the late store, the plain scores after it."""
-        old = cache[pages, slots].clone()
-        # Compile both launches outside the timed pair (a compile would let the store finish).
-        _late_store(cache, pages, slots, old, delay_ns=0)
-        op(**{**group, "prefetch": True})
-        before = op(**group)
-        torch.cuda.synchronize()
+    # The run's own slots (slot 4099 is the anchor row 3 reads at column 1024), then block 5's.
+    stale = torch.tensor([5 * cr + cr - 1], device=DEV)
+    positions = torch.cat([pos, stale])
+    pages = args["block_table"][req[0], positions // tpb].long()
+    slots = positions % tpb
+    keys = torch.cat([key_of[3]] * rows + [key_of[0]])
+    anchor = (p0 + rows) // cr - 1
+    old = cache[pages, slots].clone()
+    # Compile both launches outside the timed pair (a compile would let the store finish).
+    _late_store(cache, pages, slots, old, delay_ns=0)
+    op(**{**group, "prefetch": True})
+    before = op(**group)
+    torch.cuda.synchronize()
+    fresh = visible.clone()
+    fresh[:, 5] = False
+    for attempt in range(5):
         _late_store(cache, pages, slots, keys, delay_ns=500_000)
         with _watch_launches() as watcher:
             early = op(**{**group, "prefetch": True})
@@ -608,24 +618,76 @@ def test_request_group_prefetch_rereads_what_a_late_producer_stores() -> None:
         plain = op(**group)  # over the stored keys, the wait first
         cache[pages, slots] = old
         torch.cuda.synchronize()
-        return before, early, plain
+        assert float(plain[3, anchor]) > 0.0 and float(before[3, anchor]) != float(plain[3, anchor])
+        assert float(plain[0, 5]) > 0.0 and float(before[0, 5]) != float(plain[0, 5])
+        # Every column but block 5 is the post-store bits, overlapped or not (the run's own
+        # slots are read again after the wait).
+        assert torch.equal(early[fresh].view(torch.int32), plain[fresh].view(torch.int32))
+        # Block 5 is read once, before the wait: the old key's score or the new one's.
+        if torch.equal(early[:, 5], before[:, 5]):
+            return  # overlapped: the check above ran on a schedule where it can fail
+        assert torch.equal(early[:, 5], plain[:, 5])
+    pytest.skip("the op and the late producer never overlapped here: the re-read is unobserved")
 
-    # The run's own slots (the store; slot 4099 is the anchor row 3 reads at column 1024).
-    pages = args["block_table"][req, pos // tpb].long()
-    anchor = (p0 + rows) // cr - 1
-    before, early, plain = run(pages, pos % tpb, torch.cat([key_of[3]] * rows))
-    assert float(plain[3, anchor]) > 0.0 and float(before[3, anchor]) != float(plain[3, anchor])
-    assert torch.equal(early[visible].view(torch.int32), plain[visible].view(torch.int32))
 
-    # Below the re-read bound: block 5's anchor (position 23), visible to every row.
-    stale = torch.tensor([5 * cr + cr - 1], device=DEV)
-    pages = args["block_table"][req[:1], stale // tpb].long()
-    before, early, plain = run(pages, stale % tpb, key_of[0])
-    assert float(plain[0, 5]) > 0.0 and float(before[0, 5]) != float(plain[0, 5])
-    assert torch.equal(early[:, 5], before[:, 5]), (
-        "the op did not read the key before the producer stored it: this GPU or launch path "
-        "did not overlap them, so the re-read check above cannot fail"
-    )
+#: A page index far past any pool: a load through it faults.
+_FAR_PAGE = 1 << 28
+
+
+def _far_page_mixed_run(seed: int, **spec_overrides):
+    """Two requests in one two-row run at positions 3 and 35 (ratio 4, 32-token pages): the
+    first sees one block, the second nine. The first request's table entries past its one page
+    name a page far past the pool, so a load through them faults."""
+    spec = _case(
+        2, 2, layout="decode", gen_positions=[3, 35], rows_per_request=1, only_visible_blocks=True,
+        q_layout="scratch_slice", call_rows_per_request=2,
+    )  # fmt: skip
+    spec.update(spec_overrides)
+    args = _build(spec, seed=seed)
+    short = int(args["request_indices"][0])
+    args["block_table"][short, 1:] = _FAR_PAGE
+    return args
+
+
+@pytest.mark.parametrize("prefetch", [True, False], ids=["prefetch", "request_group"])
+def test_a_short_request_in_a_mixed_run_reads_only_its_own_pages(prefetch) -> None:
+    """A run whose rows name two requests of different lengths: each row's pages and keys are
+    read only up to its own visible blocks, on the prefetching request-group kernel (with PDL)
+    and on the plain one. Both rows' visible scores match the reference."""
+    args = _far_page_mixed_run(97, use_pdl=prefetch, prefetch=prefetch)
+    with _watch_launches() as watcher:
+        got = op(**args)
+        torch.cuda.synchronize()
+    assert watcher.branch == ("request_group_prefetch" if prefetch else "request_group")
+    # The reference gathers every column of every row (then masks): it reads the table past
+    # the short sequence as the engine's (-1), not the far page the kernels must not touch.
+    table = args["block_table"]
+    table = torch.where(table == _FAR_PAGE, torch.full_like(table, -1), table)
+    _compare(got, op.reference(**{**args, "block_table": table}))
+
+
+def test_split_shape_is_a_launch_option_of_call_and_reference() -> None:
+    """`split_shape` is accepted by `__call__` and `reference` alike (catalog validation hands
+    both the same keywords). Rows that come 4 a request, consecutive and tile-aligned, at the
+    target's `(programs a SM, tile // 4)`: bitwise the default launch."""
+    spec = _case(
+        16, 4, layout="decode", gen_positions=[700, 3000, 64, 9000], rows_per_request=4,
+        only_visible_blocks=True, q_layout="scratch_slice", pages=300,
+    )  # fmt: skip
+    args = _build(spec, seed=131)
+    tile = min(16, SPLIT_DOT_WIDTH // args["q"].shape[1])
+    shape = (_entry._SPLIT_PROGRAMS_PER_SM, tile // 4)
+    with _watch_launches() as watcher:
+        default = op(**args)
+        torch.cuda.synchronize()
+    assert watcher.branch == "visible_split"
+    with _watch_launches() as watcher:
+        shaped = op(**args, split_shape=shape)
+        torch.cuda.synchronize()
+    assert watcher.branch == "visible_split" and watcher.grid[1] == tile // 4
+    visible = _visible(args)
+    assert torch.equal(shaped[visible].view(torch.int32), default[visible].view(torch.int32))
+    _compare(shaped, op.reference(**args, split_shape=shape))
 
 
 @pytest.mark.parametrize(

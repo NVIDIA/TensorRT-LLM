@@ -416,11 +416,16 @@ def _qsa_index_scores_group_kernel(
             per_head_scores = tl.zeros((BLOCK_N, BLOCK_H), dtype=tl.float32)
             for slot in tl.static_range(GROUP_ROWS):
                 request = tl.sum(tl.where(slots == slot, requests, 0), axis=0)
+                # This row's own visible blocks: a shorter request's table ends before the
+                # run's longest row. The columns past it are not stored for this row.
+                row_blocks = valid_blocks & (
+                    block_columns < tl.sum(tl.where(slots == slot, visible, 0), axis=0)
+                )
                 physical_pages = tl.load(
                     block_table
                     + request * block_table_stride_request
                     + logical_pages * block_table_stride_page,
-                    mask=valid_blocks,
+                    mask=row_blocks,
                     other=0,
                 ).to(tl.int64)
                 keys = tl.load(
@@ -428,7 +433,7 @@ def _qsa_index_scores_group_kernel(
                     + physical_pages[:, None] * cache_stride_page
                     + token_in_page[:, None] * cache_stride_token
                     + dim_offsets[None, :] * cache_stride_dim,
-                    mask=valid_blocks[:, None] & dim_ok,
+                    mask=row_blocks[:, None] & dim_ok,
                     other=0.0,
                 )
                 per_head_scores = tl.where(
@@ -567,11 +572,16 @@ def _qsa_index_scores_group_prefetch_kernel(
         per_head_scores = tl.zeros((BLOCK_N, BLOCK_H), dtype=tl.float32)
         for slot in tl.static_range(GROUP_ROWS):
             request = tl.sum(tl.where(slots == slot, requests, 0), axis=0)
+            # This row's own visible blocks: a shorter request's table ends before the run's
+            # longest row. The columns past it are not stored for this row.
+            row_blocks = valid_blocks & (
+                block_columns < tl.sum(tl.where(slots == slot, visible, 0), axis=0)
+            )
             row_pages = tl.load(
                 block_table
                 + request * block_table_stride_request
                 + logical_pages * block_table_stride_page,
-                mask=valid_blocks,
+                mask=row_blocks,
                 other=0,
             ).to(tl.int64)
             row_keys = tl.load(
@@ -579,7 +589,7 @@ def _qsa_index_scores_group_prefetch_kernel(
                 + row_pages[:, None] * cache_stride_page
                 + token_in_page[:, None] * cache_stride_token
                 + dim_offsets[None, :] * cache_stride_dim,
-                mask=key_mask,
+                mask=row_blocks[:, None] & dim_ok,
                 other=0.0,
             )
             per_head_scores = tl.where(
@@ -1520,7 +1530,10 @@ class QsaPagedIndexScores(OpWrapper):
     ) -> torch.Tensor:
         """`split_shape` = `(programs a SM, request slots a row tile)` overrides the
         visible-split launch's shape (`_qsa_index_scores_visible_split`'s `programs_per_sm` and
-        `group_slots`); the scores do not depend on it. Other kernels ignore it."""
+        `group_slots`). Precondition: the slots are at least the distinct requests any row tile
+        holds (the target passes `tile // p` for rows that come `p` a request, consecutive and
+        tile-aligned); a tile's requests past its slots are not scored. Within that, the scores
+        do not depend on it. Other kernels ignore it."""
         if rows_per_request < 1:
             raise ValueError("QSA index scoring requires rows_per_request >= 1")
         if _takes_request_groups_prefetch(
@@ -1604,11 +1617,12 @@ class QsaPagedIndexScores(OpWrapper):
         rows_per_request: int = 1,
         prefill_query_tile: bool = False,
         wide_split: bool = False,
+        split_shape: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """fp32 scores, `-inf` past each row's bound -- or NaN there, meaning
         "unspecified", when `only_visible_blocks` is True. `context_rows`,
-        `rows_per_request`, `prefill_query_tile` and `wide_split` are ignored: they pick a
-        kernel or a launch, not a result.
+        `rows_per_request`, `prefill_query_tile`, `wide_split` and `split_shape` are ignored:
+        they pick a kernel or a launch, not a result.
 
         Walked in row chunks only to bound the gathered keys, which reach
         8.7 GiB in fp32 at 8191 rows x 2080 columns.
