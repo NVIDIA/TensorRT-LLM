@@ -12,7 +12,7 @@ apt-get update
 
 # https://kvcache-ai.github.io/Mooncake/getting_started/build.html
 # libboost-all-dev is removed because it will install a duplicated MPI library
-# triton also installed boost so the requirement is already met
+# Boost headers are already provided by install_base.sh (install_boost).
 apt-get install -y --no-install-recommends \
     build-essential \
     libibverbs-dev \
@@ -45,7 +45,7 @@ tar -czf /third-party-source/Mooncake-${MOONCAKE_VERSION}.tar.gz Mooncake
 cd Mooncake
 git submodule update --init --recursive --depth 1
 mkdir build && cd build
-cmake .. -DUSE_CUDA=ON -DBUILD_SHARED_LIBS=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+cmake .. -DUSE_CUDA=ON -DBUILD_SHARED_LIBS=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DWITH_STORE=OFF \
     -DCMAKE_INSTALL_PREFIX=${MOONCAKE_INSTALL_PATH}
 make -j
 make install

@@ -106,7 +106,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
-# Install UCX, NIXL, etcd
+# Install UCX, NIXL, etcd and Mooncake
 # TODO: Combine these into the main install.sh script
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
@@ -119,6 +119,11 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     bash /opt/docker/common/install_gdrcopy.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_etcd.sh && \
+    if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping mooncake installation"; \
+    else \
+        bash /opt/docker/common/install_mooncake.sh; \
+    fi && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
@@ -152,16 +157,11 @@ COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
 COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
 COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 
-# Install Triton deps, Mooncake, and CI tooling packages
+# Install Triton deps and CI tooling packages
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=secret,id=github_clone_token \
     . /opt/docker/common/github_auth.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_triton.sh && \
-    if [ -f /etc/redhat-release ]; then \
-        echo "Rocky8 detected, skipping mooncake installation"; \
-    else \
-        bash /opt/docker/common/install_mooncake.sh; \
-    fi && \
     bash /opt/docker/common/install_ci.sh
 
 FROM ${DEVEL_IMAGE} AS wheel
