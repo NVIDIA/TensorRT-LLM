@@ -1272,6 +1272,34 @@ def _check_sparse_gqa_grouped(cell, monkeypatch) -> None:
         _replay_in_a_graph(_sgg_op, args, refill, out)
 
 
+def test_sparse_gqa_grouped_plans_from_the_callers_floor(monkeypatch) -> None:
+    """A caller that routes from 2 groups (`min_groups=2`, the dep8 verify floor) and first
+    calls at 5 groups plans every launch from 2 groups up: a later 2-group call of the same
+    geometry compiles nothing, and both stay within the reference band."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
+        qsa_sparse_gqa_grouped_cute__decode as grouped,
+    )
+
+    cell = next(c for c in _sgg_op.CELLS if c.why.startswith("dep8 MTP-3 verify at 5 requests"))
+    spec, seed = cell.spec, sum(map(ord, cell.why))
+    args = _sgc_build({k: v for k, v in spec.items() if k != "holes"}, seed)
+    args["selected_tokens"].copy_(_sgg_selection(spec, seed + 5))
+    args["rows_per_request"] = rpr = spec["rows_per_request"]
+    monkeypatch.setattr(grouped, "_COMPILED", {})
+    monkeypatch.setattr(grouped, "_PLANNED", set())
+    out = _sgg_op(**args, min_groups=2)
+    torch.cuda.synchronize()
+    _gqa_compare(out, _sgg_op.reference(**args))
+    compiled = set(grouped._COMPILED)
+    sliced = ("q", "selected_tokens", "request_indices", "output_gate")
+    two = {n: (v[: 2 * rpr] if n in sliced else v) for n, v in args.items()}
+    assert _sgg_op.serves(two["q"], two["k_cache"], two["selected_tokens"], rpr, min_groups=2)
+    out = _sgg_op(**two, min_groups=2)
+    torch.cuda.synchronize()
+    assert set(grouped._COMPILED) == compiled, "the 2-group call compiled a plan"
+    _gqa_compare(out, _sgg_op.reference(**two))
+
+
 TKC_K, TKC_CR, TKC_TOKEN_TOPK = 512, 4, 2048
 
 
