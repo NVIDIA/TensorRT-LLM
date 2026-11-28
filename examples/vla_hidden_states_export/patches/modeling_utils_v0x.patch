@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hou Song <hous.ailab@gmail.com>
+Date: Thu, 7 Aug 2026 22:00:00 +0800
+Subject: [PATCH] Export full 3D hidden_states via mark_output
+
+Insert mark_output('full_hidden_states') before gather_last_token_logits
+in DecoderModelForCausalLM.forward(), so the complete tensor is exported.
+
+Related issue: https://github.com/NVIDIA/TensorRT-LLM/issues/4414
+
+NOTE: Line numbers below are from v0.13.0. For other v0.x versions, search
+for "gather_last_token_logits" in DecoderModelForCausalLM.forward() and
+insert the mark_output line above it. The surrounding code is identical
+across v0.7.0 through v0.21.0.
+
+diff --git a/tensorrt_llm/models/modeling_utils.py b/tensorrt_llm/models/modeling_utils.py
+--- a/tensorrt_llm/models/modeling_utils.py
++++ b/tensorrt_llm/models/modeling_utils.py
+@@ -776,6 +776,10 @@
+         if self.config.mapping.is_last_pp_rank():
++            # [VLA] Export full hidden_states before gather_last_token_logits compresses it.
++            # See: https://github.com/NVIDIA/TensorRT-LLM/issues/4414
++            hidden_states.mark_output('full_hidden_states', self.config.dtype)
++
+             hidden_states = gather_last_token_logits(
+                 hidden_states, last_token_ids,
