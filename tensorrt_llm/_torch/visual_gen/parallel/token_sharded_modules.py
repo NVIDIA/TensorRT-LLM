@@ -20,7 +20,9 @@ input first (:class:`TokenShardedColumn`), a row-parallel projection that writes
 reduce-scatters instead of all-reducing (:class:`TokenShardedRow`), and an MLP whose
 ``down_proj`` writes it does both around the whole MLP (:class:`TokenShardedMLP`). The modules
 to convert follow from their TP metadata (rules R1-R3 in :func:`classify`); the converter's
-``exceptions`` override the rules.
+``exceptions`` override the rules. The adapters hand their projections to the TP helper at
+``prepare()`` (``note_consumer`` / ``note_row_consumer``) so its copy-engine modes can size
+their pools and validate the FP8 operands once.
 
 Each adapter is a subclass of the module's own class, swapped in through ``module.__class__``
 (as FSDP2's ``fully_shard`` does) and cached per base class: parameters, state-dict names, quant
@@ -43,6 +45,8 @@ from ...modules.linear import Linear, TensorParallelMode
 from ...modules.mlp import MLP
 from ..attention.attention import Attention, QKVMode
 from ..modules.rms_norm import RMSNormTPAware
+from .token_sharded_shared_input import SharedTokenShardedInput
+from .token_sharded_tp import fp8_block_scale_prequant_ok
 
 if TYPE_CHECKING:
     from .token_sharded_tp import TokenShardedTP
@@ -97,7 +101,9 @@ class TokenShardedColumn(TokenShardedAdapter):
     from its output, not from the block input (``Attention._attn_impl`` re-derives them from
     ``q`` / ``k``). A bf16 input is quantized before the all-gather when the Linear takes a
     pre-quantized input it would produce itself (static NVFP4, or FP8 block scales on the
-    DeepGEMM path).
+    DeepGEMM path). In the TP's copy-engine gather mode an FP8 block-scale input takes the
+    fused gather + GEMM instead (``TokenShardedTP.ce_gather_gemm``), whose output is the
+    GEMM's on the gathered rows.
     """
 
     @classmethod
@@ -108,13 +114,23 @@ class TokenShardedColumn(TokenShardedAdapter):
                 f"token-sharded TP: {name} must be a column-parallel Linear without "
                 "gather_output to all-gather its input."
             )
+        tp.note_consumer(module)
 
     def forward(self, input, *args, **kwargs):
         tp = self._token_sharded_tp
         # Linear.forward(input, *, lora_params=None) applies its adapters to the dense input
         # when lora_params is truthy; the argument is keyword-only.
-        gathered = tp.gather_input(self, input, prequantize=not kwargs.get("lora_params"))
-        out = super().forward(gathered, *args, **kwargs)
+        lora_params = kwargs.get("lora_params")
+        if isinstance(input, SharedTokenShardedInput):
+            if args:
+                raise TypeError("shared column inputs require keyword-only options")
+            value = input.for_consumer(self, tp, lora_params)
+            out = value if input.outputs else super().forward(value, *args, **kwargs)
+        elif tp.uses_ce_gather(self, input, lora_params):
+            out = tp.ce_gather_gemm(self, input)
+        else:
+            gathered = tp.gather_input(self, input, prequantize=not lora_params)
+            out = super().forward(gathered, *args, **kwargs)
         p = tp.plan
         return out.view(p.batch_size, p.seq_len, -1)
 
@@ -125,17 +141,27 @@ class TokenShardedRow(TokenShardedAdapter):
     Takes all tokens (``[B, S, K_local]`` or ``[B * S, K_local]``) and returns this rank's
     reduced rows as ``[n, g, N]``. A padded plan zero-pads the GEMM input per sample (cheaper
     than padding the output partial; zero rows leave a dynamic amax unchanged), so the output's
-    pad rows hold only rank 0's bias and are dropped at the next gather.
+    pad rows hold only rank 0's bias and are dropped at the next gather. In the TP's
+    copy-engine reduce-scatter mode an FP8 block-scale Linear on a bf16 input takes the fused
+    GEMM + reduce-scatter instead (``TokenShardedTP.ce_gemm_reduce_scatter``), with the same
+    padding and bias placement.
     """
 
     @classmethod
     def prepare(cls, module: nn.Module, tp: "TokenShardedTP", name: str) -> None:
         _check_linear(module, name, TensorParallelMode.ROW, tp)
         _stop_all_reduce(module, name)
+        tp.note_row_consumer(module)
 
     def forward(self, input, *args, **kwargs):
         tp = self._token_sharded_tp
-        partial = super().forward(tp.pad_row_input(input), *args, **kwargs)
+        # Decided on the padded input, the tensor the module's own GEMM takes (its row count
+        # and strides are what the stock prologue sees; a free reshape in an unpadded plan).
+        # An active LoRA (Linear.forward's lora_params) needs the module's own forward.
+        padded = tp.pad_row_input(input)
+        if tp.uses_ce_reduce_scatter(self, padded, kwargs.get("lora_params")):
+            return tp.local_view(tp.ce_gemm_reduce_scatter(self, input))
+        partial = super().forward(padded, *args, **kwargs)
         return tp.local_view(tp.reduce_scatter(partial))
 
 
@@ -147,6 +173,24 @@ class TokenShardedMLP(TokenShardedAdapter):
     rows are non-zero after a norm and would perturb a dynamic amax); its output partial is
     padded per sample before the reduce-scatter. The input is quantized before the all-gather
     by the up-projection's rule, as for :class:`TokenShardedColumn`.
+
+    The two copy-engine modes are independent here as everywhere. In the TP's copy-engine
+    gather mode an ``MLP`` whose ``up_proj`` takes an FP8 block-scale input runs the fused
+    gather + GEMM for ``up_proj``; in the TP's copy-engine reduce-scatter mode an ``MLP``
+    whose ``up_proj`` and ``down_proj`` are both FP8 block-scale runs ``up_proj`` on the
+    NCCL-gathered input itself. On either path the adapter then runs ``MLP._act_from_up``
+    (the activation step ``MLP.forward`` runs between its two projections -- for an FP8
+    block-scale ``up_proj`` ``MLP.forward`` is exactly ``down_proj(_act_from_up(up_proj(x)))``,
+    its fused-GELU paths needing an NVFP4 or unquantized ``up_proj``) and owns the
+    ``down_proj`` call: the fused GEMM + reduce-scatter (``TokenShardedTP.ce_gemm_reduce_scatter``)
+    when the TP takes it, else ``down_proj`` and the NCCL reduce-scatter. Every other case
+    (the NCCL modes, an active LoRA, other quantizations, a ``GatedMLP`` with its fused
+    gate-up paths) is ``MLP.forward`` / ``GatedMLP.forward`` on the gathered input and the NCCL
+    reduce-scatter, byte for byte the NCCL-mode code.
+
+    An explicit shared input bypasses the adapter's gather. A plain MLP retains the same
+    down-projection dispatch on the shared up-projection result or gathered activation;
+    a GatedMLP runs its activation/down-projection tail and the NCCL reduce-scatter.
     """
 
     @classmethod
@@ -157,15 +201,43 @@ class TokenShardedMLP(TokenShardedAdapter):
         _check_linear(getattr(module, up, None), f"{name}.{up}", TensorParallelMode.COLUMN, tp)
         _check_linear(module.down_proj, f"{name}.down_proj", TensorParallelMode.ROW, tp)
         _stop_all_reduce(module.down_proj, f"{name}.down_proj")
+        tp.note_consumer(getattr(module, up))
+        if isinstance(module, MLP):
+            tp.note_row_consumer(module.down_proj)
 
     def forward(self, x, *args, **kwargs):
         tp = self._token_sharded_tp
         consumer = getattr(self, "up_proj", None) or getattr(self, "gate_up_proj", None)
-        # An active LoRA takes the dense input, so the FP8 pre-quantize is skipped for exactly
-        # the calls the wrapped forward routes to its LoRA path.
-        gathered = tp.gather_input(consumer, x, prequantize=not self._lora_active(args, kwargs))
-        partial = super().forward(gathered, *args, **kwargs)
-        return tp.local_view(tp.reduce_scatter(partial))
+        # An active LoRA takes the dense input, so the FP8 pre-quantize (and the fused
+        # copy-engine ops) is skipped for exactly the calls the wrapped forward routes to
+        # its LoRA path.
+        lora_active = self._lora_active(args, kwargs)
+        if isinstance(x, SharedTokenShardedInput):
+            value = x.for_consumer(self, tp, lora_active)
+            if isinstance(self, MLP) and x.outputs:
+                x_act = self._act_from_up(value)
+            elif isinstance(self, MLP) and self._owns_down_proj_for_ce_reduce_scatter(lora_active):
+                x_act = self._act_from_up(self.up_proj(value))
+            else:
+                if x.outputs:
+                    final_params = (
+                        args[1] if len(args) >= 2 else kwargs.get("final_all_reduce_params")
+                    )
+                    partial = self._down_from_gate_up(value, final_params)
+                else:
+                    partial = super().forward(value, *args, **kwargs)
+                return tp.local_view(tp.reduce_scatter(partial))
+        elif isinstance(self, MLP) and tp.uses_ce_gather(consumer, x, lora_active):
+            x_act = self._ce_up_and_activation(x)
+        elif isinstance(self, MLP) and self._owns_down_proj_for_ce_reduce_scatter(lora_active):
+            x_act = self._act_from_up(self.up_proj(tp.gather_input(consumer, x)))
+        else:
+            gathered = tp.gather_input(consumer, x, prequantize=not lora_active)
+            partial = super().forward(gathered, *args, **kwargs)
+            return tp.local_view(tp.reduce_scatter(partial))
+        if tp.uses_ce_reduce_scatter(self.down_proj, x_act, lora_active):
+            return tp.local_view(tp.ce_gemm_reduce_scatter(self.down_proj, x_act))
+        return tp.local_view(tp.reduce_scatter(self.down_proj(x_act)))
 
     def _lora_active(self, args: tuple, kwargs: dict) -> bool:
         """Whether the wrapped ``forward`` takes its LoRA path for this call.
@@ -177,6 +249,36 @@ class TokenShardedMLP(TokenShardedAdapter):
         if isinstance(self, GatedMLP):
             return bool(kwargs.get("lora_params", args[2] if len(args) > 2 else None))
         return kwargs.get("lora_params", args[0] if args else None) is not None
+
+    def _owns_down_proj_for_ce_reduce_scatter(self, lora_params) -> bool:
+        """Whether, on the NCCL-gather path, the adapter runs ``up_proj`` and the activation
+        itself so that ``down_proj`` can take the fused copy-engine GEMM + reduce-scatter.
+
+        True iff the TP's reduce-scatter mode is effectively ``"copy_engine"``, no LoRA is
+        active and both projections are FP8 block-scale on the DeepGEMM path (then
+        ``MLP.forward`` is exactly ``down_proj(_act_from_up(up_proj(x)))``, and ``down_proj``
+        is a candidate for the fused op; the final call-time decision is
+        ``TokenShardedTP.uses_ce_reduce_scatter`` on the activation output). False keeps
+        ``MLP.forward`` whole, so the NCCL-mode path is byte for byte the NCCL-mode code.
+        """
+        tp = self._token_sharded_tp
+        return (
+            tp.effective_reduce_scatter_mode == "copy_engine"
+            and not lora_params
+            and fp8_block_scale_prequant_ok(self.up_proj)
+            and fp8_block_scale_prequant_ok(self.down_proj)
+        )
+
+    def _ce_up_and_activation(self, x):
+        """``down_proj``'s input with the up-projection as the fused copy-engine gather + GEMM.
+
+        The fused GEMM's output goes through ``MLP._act_from_up`` (the activation, or the
+        fused ReLU2 + NVFP4 quantize), the same step ``MLP.forward`` runs between its
+        ``up_proj`` and ``down_proj`` calls. The fused up-projection + GELU paths of
+        ``MLP.forward`` need an NVFP4 or unquantized ``up_proj`` and never apply to an FP8
+        block-scale one, the only kind the fused gather takes.
+        """
+        return self._act_from_up(self._token_sharded_tp.ce_gather_gemm(self.up_proj, x))
 
 
 _KIND_ADAPTERS = {COLUMN: TokenShardedColumn, ROW: TokenShardedRow, MLP_KIND: TokenShardedMLP}

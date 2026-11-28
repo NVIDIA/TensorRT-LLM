@@ -646,7 +646,31 @@ def generate_visual_gen_schema() -> dict:
     """Describe the separate VisualGen engine-args YAML file."""
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-    return _schema_for(VisualGenArgs)
+    schema = _schema_for(VisualGenArgs)
+    # Mirror ParallelConfig._validate_tp_layout: model validators are not emitted by Pydantic.
+    schema["$defs"]["ParallelConfig"]["allOf"] = [
+        {
+            "if": _is_set_to("tp_layout", {"const": "token_sharded"}),
+            "then": {
+                "properties": {
+                    "tp_size": {"minimum": 2},
+                    "ulysses_size": {"const": 1},
+                    "ring_size": {"const": 1},
+                    "attn2d_size": {"const": [1, 1]},
+                    "async_ulysses": {"const": False},
+                },
+                "required": ["tp_size"],
+            },
+            "else": {
+                "properties": {
+                    "gather_mode": {"const": "nccl"},
+                    "reduce_scatter_mode": {"const": "nccl"},
+                    "row_align": {"const": 1},
+                },
+            },
+        }
+    ]
+    return schema
 
 
 def _source_version() -> str:

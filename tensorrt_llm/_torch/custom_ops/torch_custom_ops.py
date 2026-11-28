@@ -2462,6 +2462,182 @@ def _(
                                 dtype=output_dtype)
 
 
+@torch.library.custom_op("trtllm::token_sharded_fp8_ce_gather_gemms",
+                         mutates_args=())
+def token_sharded_fp8_ce_gather_gemms(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    weights: List[torch.Tensor],
+    weight_scales: List[torch.Tensor],
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> List[torch.Tensor]:
+    """Gather FP8 rows and packed UE8M0 scales once for several column GEMMs.
+
+    Each source chunk feeds every weight before its pool slot is released.
+    Returns one bf16 [batch_size * seq_len, N_local] tensor per weight;
+    biases are applied by the caller. The rank-symmetric call ordering and
+    hidden transport effects are those of token_sharded_fp8_ce_gather_gemm.
+    """
+    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_ce_gather import \
+        ce_gather_gemms_impl
+    return ce_gather_gemms_impl(x_fp8, x_sf, weights, weight_scales, group_name,
+                                tp_rank, tp_size, batch_size, seq_len,
+                                padded_seq_len)
+
+
+@token_sharded_fp8_ce_gather_gemms.register_fake
+def _(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    weights: List[torch.Tensor],
+    weight_scales: List[torch.Tensor],
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> List[torch.Tensor]:
+    del x_sf, group_name, tp_rank, tp_size, padded_seq_len
+    if not weights or len(weights) != len(weight_scales):
+        raise ValueError(
+            "shared gather needs a nonempty weight list and one scale per weight"
+        )
+    return [
+        x_fp8.new_empty((batch_size * seq_len, w.shape[0]),
+                        dtype=torch.bfloat16) for w in weights
+    ]
+
+
+@torch.library.custom_op("trtllm::token_sharded_fp8_ce_gather_gemm",
+                         mutates_args=())
+def token_sharded_fp8_ce_gather_gemm(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_sf: torch.Tensor,
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> torch.Tensor:
+    """Token-sharded TP: copy-engine all-gather of this rank's FP8 block-scale
+    rows fused with the consumer's DeepGEMM, one GEMM per source rank.
+
+    ``x_fp8`` ``[m, K]`` float8_e4m3fn and ``x_sf`` ``[m, P]`` int32 packed
+    UE8M0 scales are this rank's quantized rows (``m = batch_size *
+    padded_seq_len / tp_size``), ``w_fp8`` / ``w_sf`` the consumer Linear's
+    weight and packed weight scale. Returns ``[batch_size * seq_len, N]``
+    bf16: the GEMM output of every rank's real rows (pad rows dropped), the
+    same bytes ``trtllm::fp8_prequantized_swap_ab_gemm`` produces on the
+    NCCL-gathered input; the bias is added by the caller.
+
+    Hidden side effects (the op is registered without mutated args so a
+    compiled block stays one graph): it pushes the rows into every peer's
+    region of the TP group's symmetric-memory pool and runs signal kernels;
+    the slot protocol relies on every rank calling it in the same order.
+    The data dependency through the block orders consecutive boundaries and
+    the output is always consumed, so Inductor neither reorders nor drops
+    a call. ``group_name`` is the TP group's c10d name, identical for every
+    block, and the plan ints are the ones the graph already specializes on.
+    """
+    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_ce_gather import \
+        ce_gather_gemm_impl
+    return ce_gather_gemm_impl(x_fp8, x_sf, w_fp8, w_sf, group_name, tp_rank,
+                               tp_size, batch_size, seq_len, padded_seq_len)
+
+
+@token_sharded_fp8_ce_gather_gemm.register_fake
+def _(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_sf: torch.Tensor,
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> torch.Tensor:
+    del x_sf, w_sf, group_name, tp_rank, tp_size, padded_seq_len
+    return x_fp8.new_empty((batch_size * seq_len, w_fp8.shape[0]),
+                           dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("trtllm::token_sharded_fp8_ce_gemm_reduce_scatter",
+                         mutates_args=())
+def token_sharded_fp8_ce_gemm_reduce_scatter(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_sf: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> torch.Tensor:
+    """Token-sharded TP: the row Linear's FP8 block-scale DeepGEMM per
+    destination block fused with a copy-engine reduce-scatter.
+
+    ``x_fp8`` ``[B * S_pad, K_local]`` float8_e4m3fn and ``x_sf``
+    ``[B * S_pad, P]`` int32 packed UE8M0 scales are the quantized padded
+    row-path input of all tokens, ``w_fp8`` / ``w_sf`` the row Linear's weight
+    and packed weight scale, ``bias`` its ``[N]`` bf16 bias, passed on every
+    rank (None when the Linear has none). Returns this rank's reduced
+    rows ``[B * S_pad / tp_size, N]`` bf16 (pad rows kept, as the NCCL
+    reduce-scatter's output): the fp32 fixed-source-order sum of the same bf16
+    K-partials, rounded once, with the bias added in bf16 to source 0's partial
+    where the NCCL path's rank-0 Linear adds it.
+
+    Hidden side effects (the op is registered without mutated args so a
+    compiled block stays one graph): it pushes the remote blocks into every
+    peer's region of the TP group's reduce-scatter symmetric-memory pool and
+    runs signal kernels; the slot protocol relies on every rank calling it in
+    the same order. The data dependency through the block orders consecutive
+    boundaries and the output is always consumed, so Inductor neither reorders
+    nor drops a call. ``group_name`` is the TP group's c10d name, identical for
+    every block, and the plan ints are the ones the graph already specializes
+    on; ``bias`` is a graph input (a block without a bias traces a second graph
+    shared by every block of that pattern).
+    """
+    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_ce_reduce_scatter import \
+        ce_gemm_reduce_scatter_impl
+    return ce_gemm_reduce_scatter_impl(x_fp8, x_sf, w_fp8, w_sf, bias,
+                                       group_name, tp_rank, tp_size, batch_size,
+                                       seq_len, padded_seq_len)
+
+
+@token_sharded_fp8_ce_gemm_reduce_scatter.register_fake
+def _(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_sf: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> torch.Tensor:
+    del x_sf, w_sf, bias, group_name, tp_rank, seq_len
+    return x_fp8.new_empty(
+        (batch_size * padded_seq_len // tp_size, w_fp8.shape[0]),
+        dtype=torch.bfloat16)
+
+
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
 def fp8_swap_ab_gemm(
     input: torch.Tensor,
