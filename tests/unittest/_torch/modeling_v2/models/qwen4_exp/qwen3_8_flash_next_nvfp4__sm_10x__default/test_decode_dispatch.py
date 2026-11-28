@@ -89,10 +89,11 @@ def test_index_scores_tep4_rows(monkeypatch, tep_fast, rows, p, expected):
     core = SimpleNamespace(**{**vars(CORE), "tep_fast": tep_fast})
     q = torch.zeros(rows, 4, 128, dtype=torch.bfloat16)
     logical = torch.zeros(rows, dtype=torch.int64)
-    M._decode_index_scores(
+    result = M._decode_index_scores(
         core, q, None, None, logical, torch.zeros(rows, dtype=torch.int32), 32, p
     )
     assert calls == [expected]
+    assert result == expected[0]
 
 
 @pytest.mark.parametrize(
@@ -125,8 +126,11 @@ def test_index_scores_tep4_prefetch(monkeypatch, switch, behind, capturing, rows
     q = torch.zeros(rows, 4, 128, dtype=torch.bfloat16)
     logical = torch.zeros(rows, dtype=torch.int64)
     req = torch.zeros(rows, dtype=torch.int32)
-    M._decode_index_scores(core, q, None, None, logical, req, 32, p, behind_prologue=behind)
+    result = M._decode_index_scores(
+        core, q, None, None, logical, req, 32, p, behind_prologue=behind
+    )
     assert calls == [expected]
+    assert result == expected[0]
 
 
 @pytest.mark.parametrize(
@@ -520,11 +524,11 @@ def test_index_key_fp8_decode_scores(monkeypatch, fp8, rows, p):
     calls = _fp8_recorders(monkeypatch)
     core = SimpleNamespace(**{**vars(CORE), "index_key_fp8": fp8})
     t = torch.zeros(rows, dtype=torch.int64)
-    M._decode_index_scores(core, torch.zeros(rows, 4, 128), None, None, t, t.int(), 32, p)
+    result = M._decode_index_scores(core, torch.zeros(rows, 4, 128), None, None, t, t.int(), 32, p)
     if fp8:
-        assert calls == [("fp8", True, False, p)]
+        assert calls == [("fp8", True, False, p)] and result == "fp8"
     else:
-        assert calls and calls[0][0] in ("bf16", "cute")
+        assert calls and calls[0][0] in ("bf16", "cute") and result == calls[0][0]
 
 
 def test_index_key_fp8_keeps_the_tep4_prefetch_off(monkeypatch):
@@ -537,8 +541,8 @@ def test_index_key_fp8_keeps_the_tep4_prefetch_off(monkeypatch):
     )
     t = torch.zeros(8, dtype=torch.int64)
     q = torch.zeros(8, 4, 128)
-    M._decode_index_scores(core, q, None, None, t, t.int(), 32, 4, behind_prologue=True)
-    assert calls == [("fp8", True, False, 4)]
+    result = M._decode_index_scores(core, q, None, None, t, t.int(), 32, 4, behind_prologue=True)
+    assert calls == [("fp8", True, False, 4)] and result == "fp8"
 
 
 @pytest.mark.parametrize("fp8", [False, True])
@@ -612,6 +616,54 @@ def test_index_key_fp8_every_anchor_writer_converts():
             f"{calls.count('_index_anchors_fp8')} conversions"
         )
     assert writers >= 6, "the writers were renamed: update _ANCHOR_WRITERS"
+
+
+def _called(node, direct: bool) -> list:
+    """Names called in `node`; with `direct`, not those inside a statement nested in it."""
+    out, todo = [], [node]
+    while todo:
+        n = todo.pop()
+        if isinstance(n, ast.Call):
+            f = n.func
+            out.append(f.id if isinstance(f, ast.Name) else getattr(f, "attr", None))
+        for child in ast.iter_child_nodes(n):
+            if not (direct and isinstance(child, ast.stmt)):
+                todo.append(child)
+    return out
+
+
+def test_index_key_fp8_every_anchor_writer_converts_after_it_in_its_branch():
+    """Order, not only counts: each statement that launches an anchor writer is followed, in the
+    same statement list (the same branch) and before the next writer there, by a statement that
+    converts (`_index_anchors_fp8`). A conversion moved before its writer, or into another
+    branch, fails here though the counts above still match."""
+    tree = ast.parse(inspect.getsource(M))
+    unconverted, writers = [], 0
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if fn.name in _SCRATCH_ANCHOR_WRITERS:
+            continue
+        for node in ast.walk(fn):
+            for field in ("body", "orelse", "finalbody"):
+                stmts = getattr(node, field, None)
+                if not isinstance(stmts, list):
+                    continue
+                for i, st in enumerate(stmts):
+                    if not any(c in _ANCHOR_WRITERS for c in _called(st, direct=True)):
+                        continue
+                    writers += 1
+                    for later in stmts[i + 1 :]:
+                        names = _called(later, direct=False)
+                        if "_index_anchors_fp8" in names:
+                            break
+                        if any(c in _ANCHOR_WRITERS for c in names):
+                            unconverted.append((fn.name, st.lineno))
+                            break
+                    else:
+                        unconverted.append((fn.name, st.lineno))
+    assert writers >= 6, "the writers were renamed: update _ANCHOR_WRITERS"
+    assert not unconverted, f"anchor writers with no conversion after them: {unconverted}"
 
 
 def test_index_key_fp8_every_score_call_is_routed():
