@@ -23,7 +23,8 @@ pooled is marked in the plane itself:
       clears the marker of slot `L + 3` (it holds no data of this owner yet: a stale marker of a
       previous owner must not survive). When the anchor row is in the call the slot holds the
       raw key of token `L + 3` until the compress has pooled it, which is why the clear runs
-      after the compress;
+      after the compress. Group 0 takes the same clear from its second row (`L == 1`, anchor row
+      `3`): a padded row carries `L = 0` and must not clear a real request's page-0 marker;
     - an anchor row whose next group starts on the same page and whose next row `L + 1` is not
       in the call clears the marker of slot `L + 4`, so the lowest unmarked group of a partial
       page is exactly the first group this owner has not completed.
@@ -116,14 +117,17 @@ def _cold_index_mark_kernel(
     valid = valid & (page >= 0)
     is_anchor = valid & ((L + 1) % CR == 0)
     # L == 0 is skipped: a graph-padded row carries L = 0 (an exact no-op of the compress) and must not
-    # clear a real request's page-0 marker; a real request's group 0 is set by its anchor row anyway.
-    is_first = valid & (L % CR == 0) & (L > 0)
-    # the anchor row of a first-token row's group: in this call?
-    r3 = r + (CR - 1)
+    # clear a real request's page-0 marker. Group 0 of a request's first page is cleared by its
+    # second row (L == 1) instead, which no padded row carries: a request of 2 or 3 tokens leaves
+    # group 0 unanchored, and a stale marker there would hide its raw keys from the encoder.
+    is_first = valid & (((L % CR == 0) & (L > 0)) | (L == 1))
+    # the anchor row of the row's group (`ahead` rows on): in this call?
+    ahead = (CR - 1) - L % CR
+    r3 = r + ahead
     ok3 = is_first & (r3 < rows)
     L3 = tl.load(logical_positions + r3, mask=ok3, other=-1).to(tl.int64)
     q3 = tl.load(request_indices + r3, mask=ok3, other=-1).to(tl.int64)
-    anchor_here = ok3 & (L3 == L + (CR - 1)) & (q3 == req)
+    anchor_here = ok3 & (L3 == L + ahead) & (q3 == req)
     clear_own = is_first & (~anchor_here)
 
     slot = L % TPB
@@ -134,8 +138,8 @@ def _cold_index_mark_kernel(
     # set: slot L of anchor rows
     p_set = cache32 + (row_base + slot * stride_token)[:, None] + 32 + w[None, :]
     tl.store(p_set, tl.broadcast_to(magic[None, :], [BLOCK_R, 4]), mask=is_anchor[:, None])
-    # clear own: slot L + CR - 1 of first-token rows
-    p_own = cache32 + (row_base + (slot + CR - 1) * stride_token)[:, None] + 32 + w[None, :]
+    # clear own: the anchor slot of a first-token row's (or group 0's second row's) group
+    p_own = cache32 + (row_base + (slot + ahead) * stride_token)[:, None] + 32 + w[None, :]
     tl.store(p_own, zero, mask=clear_own[:, None])
     if NEXT_CLEAR:
         # clear next (mode 2): slot L + CR of anchor rows whose next group starts on the same page
@@ -203,6 +207,24 @@ def _plane_marks(plane, M0: tl.constexpr, M1: tl.constexpr, M2: tl.constexpr, M3
 
 
 @triton.jit
+def _copy_verbatim(src_addr, dst_addr, nbytes, VB_CHUNK: tl.constexpr, WORD: tl.constexpr):
+    """`nbytes` from `src_addr` to `dst_addr` (integer addresses) in WORD-byte words: 8 where every
+    verbatim buffer's base, slot stride and size are multiples of 8, else 1 (the plain fallback
+    of a layout the codec declines, whose sizes need not be)."""
+    if WORD == 8:
+        sp = src_addr.to(tl.pointer_type(tl.int64))
+        dp = dst_addr.to(tl.pointer_type(tl.int64))
+    else:
+        sp = src_addr.to(tl.pointer_type(tl.uint8))
+        dp = dst_addr.to(tl.pointer_type(tl.uint8))
+    n = (nbytes // WORD).to(tl.int32)
+    for kk in range(0, n, VB_CHUNK):
+        offs = kk + tl.arange(0, VB_CHUNK)
+        m = offs < n
+        tl.store(dp + offs, tl.load(sp + offs, mask=m), mask=m)
+
+
+@triton.jit
 def _cold_index_encode_kernel(
     pairs,
     vb_base,
@@ -222,6 +244,7 @@ def _cold_index_encode_kernel(
     ESC_OFF: tl.constexpr,
     NESC: tl.constexpr,
     VB_CHUNK: tl.constexpr,
+    WORD: tl.constexpr,
     M0: tl.constexpr,
     M1: tl.constexpr,
     M2: tl.constexpr,
@@ -235,14 +258,8 @@ def _cold_index_encode_kernel(
     if j < NVB:
         base = tl.load(vb_base + j)
         stride = tl.load(vb_stride + j)
-        n8 = (tl.load(vb_bytes + j) // 8).to(tl.int32)
         coff = tl.load(vb_cold + j)
-        sp = (base + src * stride).to(tl.pointer_type(tl.int64))
-        dp = (cold + coff).to(tl.pointer_type(tl.int64))
-        for kk in range(0, n8, VB_CHUNK):
-            offs = kk + tl.arange(0, VB_CHUNK)
-            m = offs < n8
-            tl.store(dp + offs, tl.load(sp + offs, mask=m), mask=m)
+        _copy_verbatim(base + src * stride, cold + coff, tl.load(vb_bytes + j), VB_CHUNK, WORD)
     else:
         pl = j - NVB
         page_addr = side_base + src * side_stride
@@ -303,6 +320,7 @@ def _cold_index_decode_kernel(
     NESC: tl.constexpr,
     NO_ESCAPE: tl.constexpr,
     VB_CHUNK: tl.constexpr,
+    WORD: tl.constexpr,
     M0: tl.constexpr,
     M1: tl.constexpr,
     M2: tl.constexpr,
@@ -316,14 +334,8 @@ def _cold_index_decode_kernel(
     if j < NVB:
         base = tl.load(vb_base + j)
         stride = tl.load(vb_stride + j)
-        n8 = (tl.load(vb_bytes + j) // 8).to(tl.int32)
         coff = tl.load(vb_cold + j)
-        dp = (base + dst * stride).to(tl.pointer_type(tl.int64))
-        sp = (cold + coff).to(tl.pointer_type(tl.int64))
-        for kk in range(0, n8, VB_CHUNK):
-            offs = kk + tl.arange(0, VB_CHUNK)
-            m = offs < n8
-            tl.store(dp + offs, tl.load(sp + offs, mask=m), mask=m)
+        _copy_verbatim(cold + coff, base + dst * stride, tl.load(vb_bytes + j), VB_CHUNK, WORD)
     else:
         pl = j - NVB
         page_addr = side_base + dst * side_stride
@@ -382,6 +394,11 @@ class ColdIndexTables:
         self.vb_stride = torch.tensor([s for _, s, _ in verbatim], dtype=torch.int64, device=device)
         self.vb_bytes = torch.tensor([b for _, _, b in verbatim], dtype=torch.int64, device=device)
         self.vb_cold = torch.tensor(offs, dtype=torch.int64, device=device)
+        # 8-byte words where every verbatim copy is 8-byte aligned, else bytes (the plain
+        # fallback's buffers need not be): either way every byte of a buffer is copied.
+        self.word = (
+            8 if all(a % 8 == 0 and s % 8 == 0 and b % 8 == 0 for a, s, b in verbatim) else 1
+        )
         self.side_base = int(side[0]) if side is not None else 0
         self.side_stride = int(side[1]) if side is not None else 0
         self.counters = torch.zeros(4, dtype=torch.int64, device=device)
@@ -402,6 +419,7 @@ class ColdIndexTables:
             ESC_OFF=L["ESC_OFF"],
             NESC=max(L["NESC"], 1),
             VB_CHUNK=1024,
+            WORD=self.word,
             M0=MARKER[0],
             M1=MARKER[1],
             M2=MARKER[2],

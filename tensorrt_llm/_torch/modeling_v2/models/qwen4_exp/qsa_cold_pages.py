@@ -17,7 +17,12 @@ manager calls `configure` once with the provider-owned lifecycles (the attention
 layout is not the one checked here is stored as the plain concatenation (one warning).
 
 Which groups of a page are pooled is marked in the plane by the forward (`qsa_cold_index_mark`
-behind every anchor writer, `core.cold_index_marks`). Every byte a kernel reads comes back bitwise;
+behind every anchor writer, `core.cold_index_marks`). A step that resumes a restored request --
+a context turn at the `L - 2` snapshot, or a decode step at the request's own position -- reads
+of the side planes only the anchors, the first-token coordinates and the raw keys of the partial
+group and the one before it, which the cold page holds; so the codec does not depend on the
+worker's role (none is known when the KV cache manager builds it). Every byte a kernel reads
+comes back bitwise;
 measured on the overlay this ports: ops micros on engine-size pools, a real KVCacheManagerV2 disk
 round trip, context-engine resumes (48 / 48) and 192 / 192 probe records against the switch off.
 """
