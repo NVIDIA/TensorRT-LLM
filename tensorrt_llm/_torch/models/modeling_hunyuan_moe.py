@@ -354,6 +354,8 @@ class HunYuanModel(DecoderModel):
 class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                                                       PretrainedConfig]):
 
+    supports_prompt_embeds = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(HunYuanModel(model_config),
                          config=model_config,

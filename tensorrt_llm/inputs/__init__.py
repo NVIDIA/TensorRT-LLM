@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .content_format import ContentFormat, detect_content_format
-from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
+from .data import (EmbedsPrompt, GenerationInputs, PromptInputs, TextPrompt,
+                   TokensPrompt, prompt_inputs)
 from .evs import (compute_retained_tokens_count,
                   compute_retained_tokens_from_tubelet_budget,
                   compute_retention_mask)
@@ -41,9 +42,11 @@ __all__ = [
     "BaseModalityData",
     "VideoData",
     "PromptInputs",
+    "GenerationInputs",
     "prompt_inputs",
     "TextPrompt",
     "TokensPrompt",
+    "EmbedsPrompt",
     "InputProcessor",
     "create_input_processor",
     "create_input_processor_with_hash",

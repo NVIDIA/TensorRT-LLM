@@ -485,6 +485,8 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
     routes text and MTP tensors and excludes the vision namespace.
     """
 
+    supports_prompt_embeds = True
+
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
         # Avoid AUTO autotuning on TP decode; honor explicit user overrides.

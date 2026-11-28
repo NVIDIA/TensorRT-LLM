@@ -115,6 +115,9 @@ class CopySite(CopySiteEnum):
     GRAPH_POSITION_IDS = ("graph.position_ids", Direction.D2D)
     # Decoder inputs: host position ids.
     INPUT_POSITION_IDS = ("inputs.position_ids", Direction.H2D)
+    # Decoder inputs: a context pass's prompt-embedding rows and the input rows they overwrite.
+    PROMPT_EMBEDS_DST_ROWS = ("inputs.prompt_embeds_dst_rows", Direction.H2D)
+    PROMPT_EMBEDS_ROWS = ("inputs.prompt_embeds_rows", Direction.H2D)
     # TrtllmAttentionMetadata.
     ATTN_KV_LENS = ("attn.kv_lens", Direction.H2D)
     ATTN_PROMPT_LENS = ("attn.prompt_lens", Direction.H2D)

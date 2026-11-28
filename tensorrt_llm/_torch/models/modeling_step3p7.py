@@ -1568,6 +1568,8 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
     the wrapper.
     """
 
+    supports_prompt_embeds = True
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,

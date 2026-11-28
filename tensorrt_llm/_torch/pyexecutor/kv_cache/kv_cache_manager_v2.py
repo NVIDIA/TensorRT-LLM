@@ -69,6 +69,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_per_layer_block_offsets_to_device,
     gather_base_page_rows,
 )
+from tensorrt_llm.inputs.prompt_embeds import prompt_embeds_block_key
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     KVEventsConfig,
@@ -176,6 +177,7 @@ from .sparse_offload_memory import (
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .remote_donor import RemoteMemDonor
@@ -1678,6 +1680,91 @@ def _augment_tokens_with_mm_run_metadata(
     return result
 
 
+def _augment_multimodal_tokens(
+    vocab_size: Optional[int], tokens: Sequence[int], req: LlmRequest, start: int, end: int
+) -> Sequence[TokenIdExt]:
+    """Return ``tokens[start:end]`` with multimodal regions keyed by content."""
+    chunk_start = start
+    chunk_end = end
+    is_sliced = chunk_start != 0 or chunk_end != len(tokens)
+
+    if (
+        req.multimodal_hashes is None
+        or req.multimodal_positions is None
+        or req.multimodal_lengths is None
+    ):
+        return tokens[chunk_start:chunk_end] if is_sliced else tokens
+
+    # Reached only with block reuse on, since every caller gates on it, and
+    # only for a multimodal request. Both augment helpers below mint synthetic
+    # ids above vocab_size, so a None here becomes a TypeError inside the key
+    # generator; name the fix instead.
+    if vocab_size is None:
+        raise ValueError(
+            "Block reuse needs vocab_size to build multimodal cache keys, but "
+            "it could not be resolved from the model config. Add this model's "
+            "text-config attribute name to resolve_vocab_size() in "
+            "tensorrt_llm/_torch/pyexecutor/config_utils.py, or disable block "
+            "reuse."
+        )
+
+    # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
+    # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
+    # int32 view (get_tokens_view) — use tolist() so elements are Python ints, not np.int32.
+    chunk = tokens[chunk_start:chunk_end]
+    result: list[TokenIdExt] = chunk.tolist() if hasattr(chunk, "tolist") else list(chunk)
+    run_metadata = _resolve_multimodal_run_metadata(req)
+    if run_metadata is not None:
+        return _augment_tokens_with_mm_run_metadata(
+            vocab_size,
+            result,
+            req.multimodal_hashes,
+            req.multimodal_uuids,
+            run_metadata,
+            chunk_start,
+            chunk_end,
+        )
+
+    return _augment_tokens_with_contiguous_mm_metadata(
+        vocab_size,
+        result,
+        req.multimodal_hashes,
+        req.multimodal_uuids,
+        req.multimodal_positions,
+        req.multimodal_lengths,
+        chunk_start,
+        chunk_end,
+    )
+
+
+def _augment_tokens_with_prompt_embeds(
+    result: list[TokenIdExt],
+    prompt_embeds: "PromptEmbeds",
+    chunk_start: int,
+    rows: tuple[int, int],
+    memo: Optional[tuple[list[int], list[Optional[bytes]]]] = None,
+) -> list[TokenIdExt]:
+    """Key the embedding positions of ``result`` (the prompt slice from ``chunk_start``).
+
+    ``rows``: the ``[lo, hi)`` supplied rows inside that slice (``PromptEmbeds.chunk_rows``).
+    The placeholder id stays in the key because some models still read it.
+    ``memo``: the request's row positions and the keys computed so far, filled in place.
+    """
+    if memo is None:
+        memo = (prompt_embeds.positions.tolist(), [None] * prompt_embeds.num_rows)
+    positions, keys = memo
+    lo, hi = rows
+    for row in range(lo, hi):
+        offset = positions[row] - chunk_start
+        key = keys[row]
+        if key is None:
+            key = keys[row] = prompt_embeds_block_key(
+                prompt_embeds.row_digest(row), int(result[offset])
+            )
+        result[offset] = key
+    return result
+
+
 def _augment_tokens_with_contiguous_mm_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
@@ -2389,6 +2476,9 @@ def resolve_fork_join_attn(
 
 class KVCacheManagerV2(BaseResourceManager):
     gen_preemption_headroom: int = 0
+    # Block keys carry prompt_embeds rows (_augment_tokens_for_block_reuse); managers
+    # without this flag get the embedding identity through the cache salt instead.
+    keys_prompt_embeds_rows: bool = True
     # Host memory this rank donates to remote cache levels (remote_cache_config.donor); closed by shutdown().
     _remote_donor: Optional["RemoteMemDonor"] = None
     # The remote config of a donation this manager owns, started or not; a failure leaves its marker.
@@ -8534,61 +8624,27 @@ class KVCacheManagerV2(BaseResourceManager):
         `tokens[start:end]` is materialized and returned. This avoids
         re-augmenting the full prompt on every chunk during chunked prefill.
 
+        Prompt-embedding positions are keyed by their row and placeholder id.
+
         For text-only requests this is a no-op.
         """
         if end is None:
             end = len(tokens)
-        chunk_start = start
-        chunk_end = end
-        is_sliced = chunk_start != 0 or chunk_end != len(tokens)
-
-        if (
-            req.multimodal_hashes is None
-            or req.multimodal_positions is None
-            or req.multimodal_lengths is None
-        ):
-            return tokens[chunk_start:chunk_end] if is_sliced else tokens
-
-        # Reached only with block reuse on, since every caller gates on it, and
-        # only for a multimodal request. Both augment helpers below mint synthetic
-        # ids above vocab_size, so a None here becomes a TypeError inside the key
-        # generator; name the fix instead.
-        if self.vocab_size is None:
-            raise ValueError(
-                "Block reuse needs vocab_size to build multimodal cache keys, but "
-                "it could not be resolved from the model config. Add this model's "
-                "text-config attribute name to resolve_vocab_size() in "
-                "tensorrt_llm/_torch/pyexecutor/config_utils.py, or disable block "
-                "reuse."
-            )
-
-        # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
-        # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
-        # int32 view (get_tokens_view) — use tolist() so elements are Python ints, not np.int32.
-        chunk = tokens[chunk_start:chunk_end]
-        result: list[TokenIdExt] = chunk.tolist() if hasattr(chunk, "tolist") else list(chunk)
-        run_metadata = _resolve_multimodal_run_metadata(req)
-        if run_metadata is not None:
-            return _augment_tokens_with_mm_run_metadata(
-                self.vocab_size,
-                result,
-                req.multimodal_hashes,
-                req.multimodal_uuids,
-                run_metadata,
-                chunk_start,
-                chunk_end,
-            )
-
-        return _augment_tokens_with_contiguous_mm_metadata(
-            self.vocab_size,
-            result,
-            req.multimodal_hashes,
-            req.multimodal_uuids,
-            req.multimodal_positions,
-            req.multimodal_lengths,
-            chunk_start,
-            chunk_end,
-        )
+        prompt_embeds = getattr(req, "py_prompt_embeds", None)
+        tokens = _augment_multimodal_tokens(self.vocab_size, tokens, req, start, end)
+        if prompt_embeds is None:
+            return tokens
+        lo, hi = prompt_embeds.chunk_rows(start, end)
+        if lo == hi:
+            # No supplied row in this slice.
+            return tokens
+        result = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+        # A request's keys never change, and the scheduler probes the full prompt every pass.
+        memo = getattr(req, "py_prompt_embeds_key_memo", None)
+        if memo is None:
+            memo = (prompt_embeds.positions.tolist(), [None] * prompt_embeds.num_rows)
+            req.py_prompt_embeds_key_memo = memo
+        return _augment_tokens_with_prompt_embeds(result, prompt_embeds, start, (lo, hi), memo)
 
     def _stats_window_size(self, window_size: Optional[int]) -> int:
         return self.max_seq_len if window_size is None else int(window_size)

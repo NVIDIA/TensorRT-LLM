@@ -279,6 +279,8 @@ class QwenMoeModel(DecoderModel):
 class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
                                                   Qwen2MoeConfig]):
 
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen2MoeConfig],

@@ -254,6 +254,7 @@ class Qwen2ForCausalLM(SpecDecOneEngineForCausalLM[QwenModel, Qwen2Config]):
     ``mrope_config`` (Qwen2-VL) reaches QwenModel through ``**kwargs`` of
     SpecDecOneEngineForCausalLM.forward.
     """
+    supports_prompt_embeds = True
 
     def __init__(
         self,

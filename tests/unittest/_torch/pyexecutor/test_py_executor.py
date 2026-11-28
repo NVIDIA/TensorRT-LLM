@@ -665,6 +665,7 @@ def test_context_model_without_decoder_requires_replay_configuration(
         ("py_beam_width", 2, "requires beam_width == 1"),
         ("py_return_context_logits", True, "does not support context logits"),
         ("py_multimodal_data", {"image": object()}, "supports text prompts only"),
+        ("py_prompt_embeds", object(), "does not support prompt_embeds"),
     ],
 )
 def test_remote_tail_short_prompt_rejects_unsupported_requests(
@@ -674,6 +675,19 @@ def test_remote_tail_short_prompt_rejects_unsupported_requests(
     setattr(request, field, value)
 
     with pytest.raises(ValueError, match=message):
+        PyExecutor._configure_csa2_remote_tail(executor, request)
+
+
+def test_remote_tail_destination_rejects_prompt_embeds_identity() -> None:
+    # A generation-only request carries the rows' identity but no rows to replay.
+    from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
+
+    executor, request = _make_remote_tail_executor_and_request(64, context_only=False)
+    request.py_llm_request_type = LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    request.py_disaggregated_params.remote_tail_start = 0
+    request.py_prompt_embeds = build_prompt_embeds([0] * 64, torch.ones(64, 4))[1].identity_only()
+
+    with pytest.raises(ValueError, match="does not support prompt_embeds"):
         PyExecutor._configure_csa2_remote_tail(executor, request)
 
 

@@ -1,0 +1,279 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""prompt_embeds on Qwen-VL models, batched with and inside multimodal requests."""
+
+import json
+import os
+import uuid
+from typing import Iterator, List
+
+import numpy as np
+import pytest
+import torch
+from PIL import Image
+from safetensors import safe_open
+
+from tensorrt_llm import LLM
+from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.inputs.multimodal_data import VideoData
+from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.sampling_params import SamplingParams
+
+# isort: off
+from .model_paths import get_model_path
+# isort: on
+
+pytestmark = pytest.mark.threadleak(enabled=False)
+
+PROMPTS = ["The capital of France is", "Write a haiku about the ocean. The waves"]
+QWEN3_VL = "Qwen3/Qwen3-VL-2B-Instruct"
+QWEN2_5_VL = "Qwen2.5-VL-3B-Instruct"
+
+
+def _greedy() -> SamplingParams:
+    return SamplingParams(max_tokens=16, temperature=0.0)
+
+
+def _run(llm: LLM, requests: list) -> List[List[int]]:
+    outputs = llm.generate(requests, _greedy(), cache_salt=uuid.uuid4().hex)
+    return [list(o.outputs[0].token_ids) for o in outputs]
+
+
+def _text_embedding_table(model_dir: str) -> torch.Tensor:
+    """Read the language model's input embedding table from the checkpoint."""
+    for name in sorted(os.listdir(model_dir)):
+        if not name.endswith(".safetensors"):
+            continue
+        with safe_open(os.path.join(model_dir, name), "pt") as f:
+            for key in f.keys():
+                if key.endswith("embed_tokens.weight") and "visual" not in key:
+                    return f.get_tensor(key)
+    raise FileNotFoundError(f"no embed_tokens.weight under {model_dir}")
+
+
+def _model_path(name: str) -> str:
+    path = get_model_path(name)
+    if not os.path.isdir(path):
+        pytest.skip(f"{path} not found")
+    return path
+
+
+def _engine(model_dir: str) -> LLM:
+    return LLM(
+        model=model_dir,
+        # Token caps keep this engine and the chunked case's second one within an A10.
+        kv_cache_config=KvCacheConfig(
+            free_gpu_memory_fraction=0.4, max_tokens=8192, enable_block_reuse=True
+        ),
+        max_batch_size=4,
+    )
+
+
+@pytest.fixture(scope="module")
+def model_dir() -> str:
+    # The engine-side cases are model independent; test_qwen2_5_vl_image_swap covers
+    # Qwen2-VL's own fusion path.
+    return _model_path(QWEN3_VL)
+
+
+@pytest.fixture(scope="module")
+def llm(model_dir: str) -> Iterator[LLM]:
+    with _engine(model_dir) as instance:
+        yield instance
+
+
+def _image_request(llm: LLM, model_dir: str) -> dict:
+    with open(os.path.join(model_dir, "config.json")) as f:
+        model_type = json.load(f)["model_type"]
+    image = Image.new("RGB", (224, 224), (200, 40, 40))
+    (request,) = default_multimodal_input_loader(
+        tokenizer=llm.tokenizer,
+        model_dir=model_dir,
+        model_type=model_type,
+        modality="image",
+        prompts=["Describe the color of this image."],
+        media=[[image]],
+        image_data_format="pt",
+    )
+    return request
+
+
+def test_text_prompt_embeds_batched_with_image(llm: LLM, model_dir: str) -> None:
+    table = _text_embedding_table(model_dir)
+    image = _image_request(llm, model_dir)
+    ids = [llm.tokenizer.encode(p) for p in PROMPTS]
+    expected = _run(llm, [image, *ids])
+    mask = [p % 2 == 0 for p in range(len(ids[1]))]
+    requests = [
+        image,
+        {"prompt_embeds": table[torch.tensor(ids[0])]},
+        {
+            "prompt_token_ids": [0 if m else t for t, m in zip(ids[1], mask)],
+            "prompt_embeds": table[torch.tensor([t for t, m in zip(ids[1], mask) if m])],
+            "prompt_embeds_mask": mask,
+        },
+    ]
+    assert _run(llm, requests) == expected
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["one_chunk", "chunked"])
+def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str, chunked: bool) -> None:
+    # The mask indexes the ids before the image placeholder expands. Swap two
+    # words around the image through embeddings only; the reference swaps the ids.
+    # Chunked: the image splits the two rows into different 32-token chunks.
+    if chunked:
+        with LLM(
+            model=model_dir,
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=0.3,
+                max_tokens=2048,
+                enable_block_reuse=True,
+                tokens_per_block=32,
+            ),
+            enable_chunked_prefill=True,
+            max_num_tokens=32,
+            max_batch_size=1,
+        ) as chunked_llm:
+            _check_image_swap(chunked_llm, model_dir, reuse=True)
+        return
+    _check_image_swap(llm, model_dir, reuse=False)
+    table = _text_embedding_table(model_dir)
+    image = _image_request(llm, model_dir)
+    ids = llm.tokenizer.encode(image["prompt"], add_special_tokens=False)
+    plain = {"prompt_token_ids": ids, "multi_modal_data": image["multi_modal_data"]}
+    image_pos = ids.index(llm.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
+    on_image = [p == image_pos for p in range(len(ids))]
+    with pytest.raises(ValueError, match="multimodal placeholder"):
+        llm.generate(
+            {**plain, "prompt_embeds": table[:1], "prompt_embeds_mask": on_image}, _greedy()
+        )
+
+
+def test_qwen2_5_vl_image_swap() -> None:
+    model_dir = _model_path(QWEN2_5_VL)
+    with _engine(model_dir) as llm:
+        _check_image_swap(llm, model_dir, reuse=False)
+
+
+def _check_image_swap(llm: LLM, model_dir: str, reuse: bool) -> None:
+    table = _text_embedding_table(model_dir)
+    image = _image_request(llm, model_dir)
+    ids = llm.tokenizer.encode(image["prompt"], add_special_tokens=False)
+    plain = {"prompt_token_ids": ids, "multi_modal_data": image["multi_modal_data"]}
+    vision_ids = set(
+        llm.tokenizer.convert_tokens_to_ids(["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"])
+    )
+    before, after = _swappable_positions(llm, ids, vision_ids)
+    swapped_ids = list(ids)
+    swapped_ids[before], swapped_ids[after] = ids[after], ids[before]
+    request = {
+        **plain,
+        "prompt_embeds": table[torch.tensor([ids[after], ids[before]])],
+        "prompt_embeds_mask": [p in (before, after) for p in range(len(ids))],
+    }
+    expected = _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
+    # Otherwise an ignored overlay would also match.
+    assert expected != _run(llm, [plain])
+    salt = uuid.uuid4().hex
+    for repeat in (False, True) if reuse else (False,):
+        out = llm.generate([request], _greedy(), cache_salt=salt)[0]
+        assert [list(out.outputs[0].token_ids)] == expected
+        assert (out.cached_tokens > 0) == repeat
+    if reuse:
+        # The repeat reuses as far as a plain repeat does, past the image and both rows.
+        plain_salt = uuid.uuid4().hex
+        llm.generate([plain], _greedy(), cache_salt=plain_salt)
+        plain_hit = llm.generate([plain], _greedy(), cache_salt=plain_salt)[0].cached_tokens
+        assert out.cached_tokens == plain_hit
+
+
+def _video_request(llm: LLM, text_first: bool = False) -> dict:
+    """Chat prompt with one video placeholder and a short red-then-blue clip."""
+    indices = [0, 80, 160, 239]
+    frames = []
+    for index in indices:
+        frame = np.zeros((224, 224, 3), dtype=np.uint8)
+        frame[:, :, 0 if index < 120 else 2] = 255
+        frames.append(frame)
+    video = VideoData(
+        frames=np.stack(frames),
+        metadata={
+            "fps": 24.0,
+            "total_num_frames": 240,
+            "duration": 10.0,
+            "frames_indices": indices,
+        },
+    )
+    prompt = llm.tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "video"}, {"type": "text", "text": "What happens?"}][
+                    :: -1 if text_first else 1
+                ],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return {
+        "prompt_token_ids": llm.tokenizer.encode(prompt, add_special_tokens=False),
+        "multi_modal_data": {"video": [video]},
+        "mm_processor_kwargs": {"do_sample_frames": False},
+    }
+
+
+@pytest.mark.parametrize("text_first", [False, True], ids=["video_first", "text_first"])
+def test_prompt_embeds_with_video_in_one_request(
+    llm: LLM, model_dir: str, text_first: bool
+) -> None:
+    # Qwen3-VL frames each video frame with timestamp text the mask never indexes.
+    # Text first: "?" before the video merges with the first timestamp's "<".
+    table = _text_embedding_table(model_dir)
+    plain = _video_request(llm, text_first)
+    ids = plain["prompt_token_ids"]
+    expected = _run(llm, [plain])
+    vision_ids = set(
+        llm.tokenizer.convert_tokens_to_ids(["<|vision_start|>", "<|video_pad|>", "<|vision_end|>"])
+    )
+    merged = min(p for p, t in enumerate(ids) if t in vision_ids) - 1
+    mask = [t not in vision_ids and p % 2 == 1 and p != merged for p, t in enumerate(ids)]
+    request = {
+        **plain,
+        "prompt_embeds": table[torch.tensor([t for t, m in zip(ids, mask) if m])],
+        "prompt_embeds_mask": mask,
+    }
+    assert _run(llm, [request]) == expected
+
+    # Rows that differ from the scheduled ids: swap two words around the video
+    # through embeddings only; the reference swaps the ids themselves.
+    before, after = _swappable_positions(llm, ids, vision_ids)
+    swapped_ids = list(ids)
+    swapped_ids[before], swapped_ids[after] = ids[after], ids[before]
+    swapped = {
+        **plain,
+        "prompt_embeds": table[torch.tensor([ids[after], ids[before]])],
+        "prompt_embeds_mask": [p in (before, after) for p in range(len(ids))],
+    }
+    expected_swap = _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
+    assert expected_swap != expected
+    assert _run(llm, [swapped]) == expected_swap
+
+
+def _swappable_positions(llm: LLM, ids: List[int], vision_ids: set) -> tuple[int, int]:
+    """Pick a word before and one after the vision tokens whose swap re-tokenizes stably."""
+    first_vision = min(p for p, t in enumerate(ids) if t in vision_ids)
+    last_vision = max(p for p, t in enumerate(ids) if t in vision_ids)
+    words = [
+        p
+        for p, t in enumerate(ids)
+        if t not in vision_ids and llm.tokenizer.decode([t]).strip().isalpha()
+    ]
+    for before in (p for p in words if p < first_vision):
+        for after in (p for p in words if p > last_vision):
+            swapped = list(ids)
+            swapped[before], swapped[after] = ids[after], ids[before]
+            text = llm.tokenizer.decode(swapped)
+            if llm.tokenizer.encode(text, add_special_tokens=False) == swapped:
+                return before, after
+    pytest.skip("no stably re-tokenizing word swap in the prompt")

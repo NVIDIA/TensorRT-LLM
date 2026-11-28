@@ -458,9 +458,27 @@ def _without_prompt(item):
     )
 
 
+def _without_prompt_embeds_rows(item: "RequestQueueItem") -> "RequestQueueItem":
+    """A copy of a queued request whose prompt_embeds rows are left on rank 0.
+
+    TP ranks of the first pipeline stage receive each context chunk's rows from
+    TP rank 0 when it runs (``DecoderInputPreparer._ship_prompt_embeds``); later
+    stages never read them.
+    """
+    request = item.request
+    if not isinstance(request, ExecutorRequest):
+        return item
+    prompt_embeds = request.inputs.prompt_embeds
+    if prompt_embeds is None or prompt_embeds.embeds is None:
+        return item
+    inputs = dataclasses.replace(request.inputs, prompt_embeds=prompt_embeds.for_peer_ranks())
+    return dataclasses.replace(item, request=ExecutorRequest(request.request, inputs))
+
+
 class RequestBroadcaster:
     """Broadcasts requests across distributed ranks (TP, PP, CP).
 
+    Requests go out without their prompt_embeds rows (``_without_prompt_embeds_rows``).
     With ``prompts_to_owners`` the broadcast carries requests without their prompts, and
     ``deliver_prompts`` sends each prompt only to the rank the request is admitted on.
     """
@@ -569,7 +587,7 @@ class RequestBroadcaster:
         payloads = None
         is_root = self.dist.rank == 0
         if is_root and new_requests:
-            payloads = new_requests
+            payloads = self._root_payloads(new_requests)
         if self.sync_clock:
             # Same microsecond encoding as the probe (_broadcast_request_count), so the clock never steps back
             # when consecutive iterations take different routes.
@@ -637,12 +655,9 @@ class RequestBroadcaster:
         self, new_requests: list["RequestQueueItem"]
     ) -> list["RequestQueueItem"]:
         """Broadcast request envelopes across pipeline stages."""
-        if self.prompts_to_owners and self.dist.rank == 0:
-            new_requests = [_without_prompt(item) for item in new_requests]
-        payloads = new_requests
-
         if self.dist.world_size == 1:
-            return payloads
+            return new_requests
+        payloads = self._root_payloads(new_requests) if self.dist.rank == 0 else new_requests
 
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)
@@ -679,6 +694,13 @@ class RequestBroadcaster:
             with nvtx_range("send_requests_to_next_pp"):
                 self.send_requests_handler = pp_send_func(payloads, self.dist.next_pp_rank, tag)
 
+        return payloads
+
+    def _root_payloads(self, new_requests: list["RequestQueueItem"]) -> list["RequestQueueItem"]:
+        """Rank 0's copies of ``new_requests`` as broadcast; rank 0 keeps the originals."""
+        payloads = [_without_prompt_embeds_rows(item) for item in new_requests]
+        if self.prompts_to_owners:
+            payloads = [_without_prompt(item) for item in payloads]
         return payloads
 
     @nvtx_range("deliver_prompts")

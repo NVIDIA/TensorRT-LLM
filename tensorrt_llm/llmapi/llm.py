@@ -54,9 +54,12 @@ from ..executor.postprocessor_hook import (PostProcessorHook,
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
-from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
-                      create_input_processor_with_hash,
+from ..inputs import (GenerationInputs, PromptInputs, TokensPrompt,
+                      create_input_processor, create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
+from ..inputs.prompt_embeds import (PrebuiltPromptEmbeds, PromptEmbeds,
+                                    build_prompt_embeds, multimodal_item_spans,
+                                    multimodal_run_spans, remap_prompt_embeds)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -714,7 +717,7 @@ class BaseLLM:
 
     def generate(
         self,
-        inputs: Union[PromptInputs, Sequence[PromptInputs]],
+        inputs: Union[GenerationInputs, Sequence[GenerationInputs]],
         sampling_params: Optional[Union[SamplingParams,
                                         List[SamplingParams]]] = None,
         use_tqdm: bool = True,
@@ -739,7 +742,7 @@ class BaseLLM:
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
-            inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
+            inputs (tensorrt_llm.inputs.data.GenerationInputs, Sequence[tensorrt_llm.inputs.data.GenerationInputs]): The prompt text, token ids, or prompt embeddings.
                 It can be single prompt or batched prompts.
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams], optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
@@ -828,7 +831,7 @@ class BaseLLM:
     @nvtx_range_debug("LLM.generate_async", color="green", category="LLM")
     def generate_async(
         self,
-        inputs: Union[PromptInputs, PreprocessedInputs],
+        inputs: Union[GenerationInputs, PreprocessedInputs],
         sampling_params: Optional[SamplingParams] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
@@ -847,7 +850,7 @@ class BaseLLM:
         Asynchronous generation accepts single prompt only.
 
         Args:
-            inputs (Union[tensorrt_llm.inputs.data.PromptInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text or token ids, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
+            inputs (Union[tensorrt_llm.inputs.data.GenerationInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text, token ids or prompt embeddings, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
@@ -885,6 +888,12 @@ class BaseLLM:
             sampling_params.max_tokens = 1
             self._configure_bart_decoder_prefix(sampling_params)
 
+        prompt_embeds = None
+        if isinstance(inputs,
+                      dict) and (inputs.get("prompt_embeds") is not None or
+                                 inputs.get("prompt_embeds_mask") is not None):
+            inputs, prompt_embeds = self._split_prompt_embeds(inputs)
+
         if isinstance(inputs, PreprocessedInputs):
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
@@ -906,6 +915,31 @@ class BaseLLM:
                  sampling_params,
                  disaggregated_params,
              )
+
+        if prompt_embeds is not None:
+            if multimodal_params is not None:
+                multimodal_input = multimodal_params.multimodal_input
+                spans = ((multimodal_item_spans(multimodal_input),
+                          multimodal_run_spans(multimodal_input))
+                         if multimodal_input is not None else ([], []))
+                prompt_embeds = remap_prompt_embeds(prompt_embeds,
+                                                    inputs["prompt_token_ids"],
+                                                    prompt_token_ids, *spans)
+        if is_gen_only and disaggregated_params.prompt_embeds is not None:
+            # The context result carries the identity; rows are optional here.
+            identity = disaggregated_params.prompt_embeds
+            if prompt_embeds is None:
+                prompt_embeds = identity
+            elif prompt_embeds.digest != identity.digest:
+                raise ValueError(
+                    "prompt_embeds of a generation-only request must match "
+                    "the context request's.")
+        elif (is_gen_only and prompt_embeds is not None
+              and disaggregated_params.first_gen_tokens is not None):
+            # The context result came from a plain-token prompt.
+            raise ValueError(
+                "prompt_embeds of a generation-only request must match "
+                "the context request's.")
 
         if (not self.args.mm_encoder_only and disaggregated_params is not None
                 and disaggregated_params.multimodal_input_layout is not None):
@@ -950,6 +984,7 @@ class BaseLLM:
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
             kv_hints=kv_hints,
+            prompt_embeds=prompt_embeds,
         )
 
         if sampling_params.return_perf_metrics:
@@ -961,6 +996,71 @@ class BaseLLM:
             prompt,
             self.tokenizer,
             post_processor_hook=self._post_processor_hook)
+
+    _PROMPT_EMBEDS_ALLOWED_KEYS = frozenset(
+        ("prompt_token_ids", "prompt_embeds", "prompt_embeds_mask"))
+    _PROMPT_EMBEDS_MULTIMODAL_KEYS = frozenset(
+        ("multi_modal_data", "multi_modal_uuids", "mm_processor_kwargs"))
+
+    def _split_prompt_embeds(
+            self, inputs: Dict[str, Any]) -> Tuple[TokensPrompt, PromptEmbeds]:
+        """Validate a prompt-embedding request and split off its rows.
+
+        Execution-mode restrictions are enforced by the worker at admission.
+        """
+        if inputs.get("prompt_embeds") is None:
+            raise ValueError("prompt_embeds_mask requires prompt_embeds.")
+        multimodal = {
+            key: inputs[key]
+            for key in self._PROMPT_EMBEDS_MULTIMODAL_KEYS
+            if inputs.get(key) is not None
+        }
+        if multimodal and ("prompt_token_ids" not in inputs
+                           or inputs.get("prompt_embeds_mask") is None):
+            raise ValueError(
+                "prompt_embeds with multi_modal_data needs prompt_token_ids and "
+                "prompt_embeds_mask.")
+        extra_keys = sorted(
+            set(inputs) - self._PROMPT_EMBEDS_ALLOWED_KEYS -
+            self._PROMPT_EMBEDS_MULTIMODAL_KEYS)
+        if extra_keys:
+            raise ValueError(
+                f"prompt_embeds cannot be combined with {extra_keys}; pass "
+                "finalized prompt_token_ids (with prompt_embeds_mask) instead.")
+        if self.args.backend != "pytorch":
+            raise ValueError(
+                f"prompt_embeds is not supported with the {self.args.backend} "
+                "backend.")
+        if (self._is_encoder_decoder_model() or self.args.mm_encoder_only
+                or self._encode_only):
+            raise ValueError(
+                "prompt_embeds requires a decoder-only generation model.")
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if prompt_token_ids is not None:
+            prompt_token_ids = self._normalize_token_ids(
+                prompt_token_ids, "prompt_token_ids")
+        if isinstance(inputs["prompt_embeds"], PrebuiltPromptEmbeds):
+            # trtllm-serve built it off its event loop and keeps no reference;
+            # hashing it again would block there. Only its shape is checked.
+            snapshot = inputs["prompt_embeds"]
+            positions = snapshot.positions
+            if (prompt_token_ids is None or snapshot.embeds is None
+                    or inputs.get("prompt_embeds_mask") is not None
+                    or positions.dim() != 1 or positions.numel() == 0
+                    or tuple(snapshot.embeds.shape) != (positions.numel(),
+                                                        snapshot.hidden_size)
+                    or int(positions[0]) < 0
+                    or int(positions[-1]) >= len(prompt_token_ids) or bool(
+                        (positions[1:] <= positions[:-1]).any())):
+                raise ValueError(
+                    "A PrebuiltPromptEmbeds needs the prompt_token_ids it "
+                    "was built for and no prompt_embeds_mask.")
+            return TokensPrompt(prompt_token_ids=prompt_token_ids), snapshot
+        prompt_token_ids, prompt_embeds = build_prompt_embeds(
+            prompt_token_ids, inputs["prompt_embeds"],
+            inputs.get("prompt_embeds_mask"))
+        return TokensPrompt(prompt_token_ids=prompt_token_ids,
+                            **multimodal), prompt_embeds
 
     def _preprocess(
         self,
@@ -991,6 +1091,13 @@ class BaseLLM:
                 raise ValueError(
                     "decoder_input_token_ids is not supported. Pass decoder "
                     "token IDs as inputs.")
+
+        if isinstance(inputs,
+                      dict) and (inputs.get("prompt_embeds") is not None or
+                                 inputs.get("prompt_embeds_mask") is not None):
+            raise ValueError(
+                "prompt_embeds is only accepted by generate() and "
+                "generate_async(); it cannot be preprocessed separately.")
 
         if inputs is None or (isinstance(inputs, dict)
                               and "prompt" not in inputs
@@ -1295,6 +1402,9 @@ class BaseLLM:
         batch_multi_item_part_lens = []
         for inp in inputs:
             inp = prompt_inputs(inp)
+            if (inp.get("prompt_embeds") is not None
+                    or inp.get("prompt_embeds_mask") is not None):
+                raise ValueError("prompt_embeds is not supported by encode().")
             if "prompt_token_ids" in inp:
                 inp_tok = cast(TokensPrompt, inp)
                 multi_item_part_lens = inp_tok.get("multi_item_part_lens")

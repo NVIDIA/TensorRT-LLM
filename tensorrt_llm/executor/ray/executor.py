@@ -310,7 +310,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
         try:
             with nvtx_range_debug("rpc_submit"):
-                self.rpc_client.submit(request).remote(need_response=False)
+                self.rpc_client.submit_from_proxy(request).remote(
+                    need_response=False)
         except Exception:
             self._results.pop(request.id, None)
             raise

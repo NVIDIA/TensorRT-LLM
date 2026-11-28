@@ -196,7 +196,12 @@ def test_pre_shutdown_flushes_batched_requests_before_the_sentinel():
     assert not shutdown.is_alive()
     proxy.workers_started = False
     # The sender thread wrote everything, the sentinel included.
-    assert request_queue.messages == [_payloads("first"), _payloads("queued"), None]
+    first, queued, sentinel = request_queue.messages
+    assert [[pickle.loads(m) for m in batch] for batch in (first, queued)] == [
+        ["first"],
+        ["queued"],
+    ]
+    assert sentinel is None
     assert request_queue.writer != shutdown.ident
 
 

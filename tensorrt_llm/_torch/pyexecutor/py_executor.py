@@ -9122,6 +9122,11 @@ class PyExecutor:
             raise ValueError(
                 "CSA2 disaggregated remote-tail replay currently supports text prompts only"
             )
+        if getattr(request, "py_prompt_embeds", None) is not None:
+            # A generation-only request holds only the rows' identity, not the rows to replay.
+            raise ValueError(
+                "CSA2 disaggregated remote-tail replay does not support prompt_embeds"
+            )
         request.py_csa2_remote_tail_mode = mode
         request.py_csa2_remote_tail_start = remote_tail_start
         request.py_csa2_remote_tail_split = split

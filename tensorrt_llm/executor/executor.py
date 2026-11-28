@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.logger import logger, set_level
 
@@ -135,12 +136,16 @@ class GenerationExecutor(ABC):
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
         kv_hints: Optional[KvHintsInput] = None,
+        prompt_embeds: Optional[PromptEmbeds] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
 
         ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
         omit this argument or pass None.
+
+        ``prompt_embeds`` is internal: only ``LLM`` builds it (``build_prompt_embeds``),
+        and its digest is trusted as the KV cache identity.
         """
         assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
             prompt_token_ids[0], int)
@@ -168,11 +173,15 @@ class GenerationExecutor(ABC):
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
-            kv_hints=kv_hints)
+            kv_hints=kv_hints,
+            prompt_embeds=prompt_embeds)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
             del request.multimodal_params
+        if prompt_embeds is not None:
+            # The worker holds the submitted rows; the client keeps the identity.
+            request.prompt_embeds = prompt_embeds.identity_only()
         return result
 
     def generate(

@@ -2074,6 +2074,8 @@ class DeepseekV3Model(DecoderModel):
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
+    supports_prompt_embeds = True
+
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,
                                                pretrained_config: Any = None

@@ -703,8 +703,10 @@ attention lifecycle with the largest window. Conversion to `BlockStored`, `Block
 `AllBlocksCleared` is centralized at iteration and reset publication boundaries, keeping
 internal lifecycle details contained and avoiding Python callbacks from native cache operations.
 
-**Multimodal payloads.** `token_ids` can contain integers and hexadecimal digest strings;
-integer-only consumers are incompatible. Each `mm_keys[i]` describes the multimodal segments
+**Multimodal and prompt-embedding payloads.** `token_ids` can contain integers and hexadecimal
+digest strings; integer-only consumers are incompatible. A digest string stands for a multimodal
+item position or, with the V2 manager, a [prompt embedding](prompt-embeds.md) position, keyed
+by that row and its placeholder id. Each `mm_keys[i]` describes the multimodal segments
 in `block_hashes[i]`, using the `hash`, `start_offset`, and optional `uuid` fields defined
 above. As in buffered V2 events, `hash` remains the item digest; `uuid` preserves the
 externally supplied identity without changing block hashes. An absent UUID is omitted

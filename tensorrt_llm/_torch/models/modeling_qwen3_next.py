@@ -2311,6 +2311,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                                                        Qwen3NextConfig]):
     # load_weights below only pre-processes the dict and delegates to the
     # generic loader, which tolerates a torch.compile wrapper in the tree.
+    supports_prompt_embeds = True
+
     load_weights_strips_compile_wrapper = True
     model_specific_llm_args = frozenset(
         {"replicate_embedding", "mnnvl_allreduce_fp8_payload"})

@@ -465,6 +465,8 @@ class AfmoeModel(DecoderModel):
 
 @register_auto_model("AfmoeForCausalLM")
 class AfmoeForCausalLM(DecoderModelForCausalLM[AfmoeModel, PretrainedConfig]):
+    supports_prompt_embeds = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(
             AfmoeModel(model_config),

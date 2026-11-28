@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -245,6 +245,8 @@ class Starcoder2Model(DecoderModel):
 
 @register_auto_model("Starcoder2ForCausalLM")
 class Starcoder2ForCausalLM(DecoderModelForCausalLM[Starcoder2Model, Starcoder2Config]):
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[Starcoder2Config],

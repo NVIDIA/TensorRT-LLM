@@ -43,7 +43,7 @@ class _RacingRpcClient:
         self._proxy = proxy
         self.sent = []
 
-    def submit(self, request):
+    def submit_from_proxy(self, request):
         client = self
 
         class _Call:
@@ -55,7 +55,7 @@ class _RacingRpcClient:
 
 
 class _FailingRpcClient:
-    def submit(self, request):
+    def submit_from_proxy(self, request):
         class _Call:
             def remote(self, need_response=False):
                 raise RuntimeError("send failed")

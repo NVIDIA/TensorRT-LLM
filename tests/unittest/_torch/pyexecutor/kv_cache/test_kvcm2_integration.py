@@ -3593,6 +3593,7 @@ def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     """A manager wired just far enough to run the publish/history bookkeeping."""
     manager = object.__new__(KVCacheManagerV2)
+    manager.vocab_size = None
     manager.kv_cache_type = CacheType.SELFKONLY
     manager.enable_block_reuse = True
     manager.is_draft = False
@@ -3682,6 +3683,7 @@ def test_draft_pool_commits_every_chunk_it_computes() -> None:
     )
     kv_cache = _FakeKVCache(num_committed_tokens=0)
     manager = object.__new__(KVCacheManagerV2)
+    manager.vocab_size = None
     manager.enable_block_reuse = True
     manager.is_draft = True
     manager._can_publish_block_reuse = True
@@ -7952,6 +7954,7 @@ def test_generation_token_slice_shares_token_view() -> None:
         multimodal_lengths=None,
     )
     manager = object.__new__(KVCacheManagerV2)
+    manager.vocab_size = None
 
     source = manager._reuse_token_source(request)
     result = manager._augment_tokens_for_block_reuse(source, request, start=7, end=10)

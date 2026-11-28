@@ -259,6 +259,8 @@ class Cohere2Model(DecoderModel):
 
 @register_auto_model("Cohere2ForCausalLM")
 class Cohere2ForCausalLM(DecoderModelForCausalLM[Cohere2Model, Cohere2Config]):
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[Cohere2Config],

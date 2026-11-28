@@ -250,6 +250,8 @@ class MistralModel(DecoderModel):
 @register_auto_model("MistralForCausalLM")
 class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
 
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[MistralConfig],

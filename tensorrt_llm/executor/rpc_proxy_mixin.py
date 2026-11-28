@@ -120,7 +120,7 @@ class RpcExecutorMixin:
         # submit is a fire-and-forget operation, don't need to wait for response
         try:
             with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-                self.rpc_client.submit(request).remote(need_response=False)
+                self.rpc_client.submit_from_proxy(request).remote(need_response=False)
         except Exception:
             # The request never reached the worker: drop the registration so
             # the id does not linger in _results.

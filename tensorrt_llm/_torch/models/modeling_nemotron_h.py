@@ -796,6 +796,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                            ):
     # The Mamba2 layers' metadata, with the replay slots and work items their
     # replay kernel reads, whichever cache manager serves the model.
+    supports_prompt_embeds = True
+
     mamba_metadata_cls = ReplayMamba2Metadata
 
     def __init__(

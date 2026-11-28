@@ -1153,6 +1153,7 @@ class LlamaModel(DecoderModel):
 
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
+    supports_prompt_embeds = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(
@@ -1540,6 +1541,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     ))
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
+    supports_prompt_embeds = True
 
     # The vision encoder uses the Hugging Face implementation.
     supported_encoder_attention_backends = {"vision": frozenset()}
@@ -1614,14 +1616,29 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                     for multimodal_param in multimodal_params
                 ]
 
-        input_ids, inputs_embeds = fuse_input_embeds(
-            self.model.embed_tokens,
-            input_ids,
-            mm_embeds,
-            mm_token_ids=self.mm_token_ids,
-            mm_token_indices=kwargs.get("mm_token_indices"),
-            text_token_indices=kwargs.get("text_token_indices"),
-        )
+        if inputs_embeds is None:
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.model.embed_tokens,
+                input_ids,
+                mm_embeds,
+                mm_token_ids=self.mm_token_ids,
+                mm_token_indices=kwargs.get("mm_token_indices"),
+                text_token_indices=kwargs.get("text_token_indices"),
+            )
+        elif mm_embeds:
+            # Supplied embeddings (prompt_embeds) already cover text rows.
+            mm_token_indices = kwargs.get("mm_token_indices")
+            if mm_token_indices is None:
+                raise ValueError(
+                    "Image features with inputs_embeds need mm_token_indices.")
+            mm_embed = torch.cat(mm_embeds)
+            if mm_token_indices.shape[0] != mm_embed.shape[0]:
+                raise ValueError(
+                    f"Multimodal token count mismatch: found {len(mm_token_indices)} image "
+                    f"tokens in input_ids but received {mm_embed.shape[0]} image embeddings."
+                )
+            inputs_embeds = inputs_embeds.index_copy(
+                0, mm_token_indices, mm_embed.to(inputs_embeds.dtype))
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

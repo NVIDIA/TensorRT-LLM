@@ -14,12 +14,17 @@
 # limitations under the License.
 
 from queue import Queue
+from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper
+from tensorrt_llm.executor.executor import GenerationExecutor
+from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
 from tensorrt_llm.executor.rpc_worker_mixin import RpcWorkerMixin
-from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError
+from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -77,3 +82,46 @@ def test_fetch_responses_dispatches_engine_responses_and_submission_errors(
     assert responses[-1] is submission_error
     assert engine_responses == original_responses
     assert worker._await_response_helper.temp_error_responses.empty()
+
+
+class _ProxyStub:
+    """An RPC proxy whose fire-and-forget submit calls the worker directly."""
+
+    def __init__(self, worker: _RpcWorkerStub) -> None:
+        self._results = {}
+        self.rpc_client = SimpleNamespace(
+            submit_from_proxy=lambda request: SimpleNamespace(
+                remote=lambda need_response: worker.submit_from_proxy(request)
+            )
+        )
+
+    def _get_next_client_id(self) -> int:
+        return 7
+
+    def _get_logprob_params(self, request: GenerationRequest) -> None:
+        return None
+
+    def _handle_background_error(self, error: object = None) -> None:
+        GenerationExecutor._handle_background_error(self, error)
+
+
+def test_submit_from_proxy_returns_rejection_to_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A request the worker rejects at admission fails the caller's result
+    # instead of leaving it waiting on a send that expects no reply.
+    def reject(self: _WorkerBaseStub, request: GenerationRequest) -> None:
+        raise RequestError("prompt_embeds is not supported by this model.")
+
+    monkeypatch.setattr(_WorkerBaseStub, "submit", reject, raising=False)
+    worker = _RpcWorkerStub([])
+    proxy = _ProxyStub(worker)
+    request = GenerationRequest([1, 2], SamplingParams(max_tokens=1))
+
+    result = RpcExecutorMixin.submit(proxy, request)
+    responses = worker.fetch_responses(timeout=0)
+    # The error crosses the RPC boundary as text.
+    assert [type(response.error_msg) for response in responses] == [str]
+    RpcExecutorMixin.handle_responses(proxy, responses)
+
+    with pytest.raises(RequestError, match="prompt_embeds is not supported"):
+        result.result(timeout=1)
+    assert proxy._results == {}

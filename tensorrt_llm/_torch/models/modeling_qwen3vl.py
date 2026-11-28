@@ -81,6 +81,7 @@ from .modeling_utils import (
     QuantConfig,
     _load_weights_impl,
     filter_weights,
+    prompt_embeds_unsupported_reason,
     register_auto_model,
     register_vision_encoder,
 )
@@ -1589,6 +1590,13 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
+    # mRoPE positions of prompt-embedding rows are text positions.
+    supports_prompt_embeds = True
+
+    def prompt_embeds_config_unsupported_reason(self) -> Optional[str]:
+        """Refuse what the language model refuses."""
+        return prompt_embeds_unsupported_reason(self.llm)
+
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
     }

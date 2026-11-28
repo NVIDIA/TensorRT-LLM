@@ -536,7 +536,8 @@ class Transformer(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        hidden_states = inputs_embeds or self.embedding(input_ids)
+        hidden_states = (inputs_embeds if inputs_embeds is not None else
+                         self.embedding(input_ids))
 
         residual = None
         for block in self.block:
@@ -554,6 +555,7 @@ class Transformer(DecoderModel):
 
 @register_auto_model("GptOssForCausalLM")
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
+    supports_prompt_embeds = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,

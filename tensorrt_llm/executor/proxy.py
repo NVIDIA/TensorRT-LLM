@@ -1232,7 +1232,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._request_sender is None:
             self.request_queue.put(request)
         else:
-            self._request_sender.send(pickle.dumps(request))
+            self._request_sender.send(
+                pickle.dumps(request, pickle.HIGHEST_PROTOCOL))
 
     def _close_request_sender(self, send_sentinel: bool = False) -> None:
         """Stop the request sender, if any, then send the shutdown sentinel if asked.

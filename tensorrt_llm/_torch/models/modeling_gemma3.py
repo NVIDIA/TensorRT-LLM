@@ -461,6 +461,8 @@ class Gemma3TextModel(DecoderModel):
 class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                                 Gemma3TextConfig]):
 
+    supports_prompt_embeds = True
+
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
         """Default to prefill scratch reuse where TRTLLM attention supports it

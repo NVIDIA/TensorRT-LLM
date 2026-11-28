@@ -412,6 +412,8 @@ class MiniMaxM2Model(DecoderModel):
 
 @register_auto_model("MiniMaxM2ForCausalLM")
 class MiniMaxM2ForCausalLM(DecoderModelForCausalLM[MiniMaxM2Model, PretrainedConfig]):
+    supports_prompt_embeds = True
+
     @classmethod
     def get_preferred_kv_cache_manager_version(
         cls, pretrained_config: object | None = None

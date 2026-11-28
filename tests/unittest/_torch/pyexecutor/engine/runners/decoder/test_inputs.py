@@ -374,7 +374,10 @@ def test_breakable_prefill_replays_multimodal_batches_only_with_staged_inputs(
         total_num_tokens=5,
         num_ctx_requests=1,
         remote_tail_modes=set(),
-        lists=SimpleNamespace(multimodal_params_list=[object()] if multimodal else []),
+        lists=SimpleNamespace(
+            multimodal_params_list=[object()] if multimodal else [],
+            prompt_embeds_src_rows=[],
+        ),
     )
     attn_metadata = SimpleNamespace(padded_num_tokens=None)
     incoming_flag = get_per_request_prefill_cuda_graph_flag()

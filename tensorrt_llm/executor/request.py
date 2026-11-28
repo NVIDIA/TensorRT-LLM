@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.kv_hints.protocol import snapshot_kv_hints
 
@@ -132,6 +133,7 @@ class GenerationRequest:
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
         kv_hints: Optional[KvHintsInput] = None,
+        prompt_embeds: Optional[PromptEmbeds] = None,
     ):
         if prompt_adapter_request is not None:
             warnings.warn(
@@ -177,6 +179,7 @@ class GenerationRequest:
         self.scheduling_params = scheduling_params
         self.conversation_params = conversation_params
         self.kv_hints = snapshot_kv_hints(kv_hints)
+        self.prompt_embeds = prompt_embeds
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
                 raise TypeError(
@@ -321,6 +324,7 @@ class GenerationRequest:
 
     def __setstate__(self, state):
         state.setdefault("kv_hints", None)
+        state.setdefault("prompt_embeds", None)
         buf = None
         pt = state.get("_prompt_token_ids")
         if type(pt) is tuple and len(

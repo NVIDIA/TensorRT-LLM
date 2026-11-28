@@ -179,6 +179,8 @@ class NemotronModel(DecoderModel):
 class NemotronForCausalLM(DecoderModelForCausalLM[NemotronModel,
                                                   NemotronConfig]):
 
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[NemotronConfig],

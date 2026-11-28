@@ -322,6 +322,8 @@ def _unfuse_mixtral_moe_weights(weights: Dict) -> Dict:
 class MixtralForCausalLM(DecoderModelForCausalLM[MixtralModel,
                                                  PretrainedConfig]):
 
+    supports_prompt_embeds = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(MixtralModel(model_config),
                          config=model_config,

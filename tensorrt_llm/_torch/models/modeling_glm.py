@@ -1066,6 +1066,8 @@ class Glm4Model(DecoderModel):
 
 @register_auto_model("Glm4MoeForCausalLM")
 class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig]):
+    supports_prompt_embeds = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model=Glm4Model(model_config), model_config=model_config)
 

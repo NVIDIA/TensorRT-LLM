@@ -180,6 +180,8 @@ class Phi3Model(DecoderModel):
 @register_auto_model("Phi3ForCausalLM")
 class Phi3ForCausalLM(DecoderModelForCausalLM[Phi3Model, Phi3Config]):
 
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[Phi3Config],
