@@ -19,6 +19,7 @@ from typing import TypeAlias
 
 from .beam_shared_prefix import BeamSharedPrefixFmha
 from .cute_dsl_mla import CuteDslMlaFmha
+from .deterministic import DeterministicFmha
 from .fallback import FallbackFmha
 from .flash_attn4_generation import FlashAttn4GenerationFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
@@ -90,6 +91,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "gqa_split_kv": GqaSplitKvFmha,
         "gqa_segmented": GqaSegmentedFmha,
         "gqa_decode": GqaDecodeFmha,
+        "deterministic": DeterministicFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         # Opt-in wide-beam generation path (TLLM_FMHA_LIBS=+beam_shared_prefix);
         # takes generation-only beam-search batches ahead of the fallback.
