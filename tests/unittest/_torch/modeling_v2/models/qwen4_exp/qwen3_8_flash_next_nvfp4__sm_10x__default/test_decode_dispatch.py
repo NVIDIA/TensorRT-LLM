@@ -66,8 +66,9 @@ def test_index_scores_dispatch(monkeypatch, rows, p, serves, expected):
     q = torch.zeros(rows, 4, 128, dtype=torch.bfloat16)
     logical = torch.zeros(rows, dtype=torch.int64)
     req = torch.zeros(rows, dtype=torch.int32)
-    M._decode_index_scores(CORE, q, None, None, logical, req, 32, p)
+    result = M._decode_index_scores(CORE, q, None, None, logical, req, 32, p)
     assert calls == [expected]
+    assert result == expected[0]  # the router hands back the scores of the op it called
 
 
 def test_index_scores_cute_needs_its_index_dtypes(monkeypatch):
@@ -75,11 +76,11 @@ def test_index_scores_cute_needs_its_index_dtypes(monkeypatch):
     Triton kernel."""
     calls = _scores_calls(monkeypatch, True)
     q = torch.zeros(24, 4, 128, dtype=torch.bfloat16)
-    M._decode_index_scores(
+    result = M._decode_index_scores(
         CORE, q, None, None, torch.zeros(24, dtype=torch.int32), torch.zeros(24, dtype=torch.int32),
         32, 3,
     )  # fmt: skip
-    assert calls == [("triton", 3)]
+    assert calls == [("triton", 3)] and result == "triton"
 
 
 class _GqaOp:
