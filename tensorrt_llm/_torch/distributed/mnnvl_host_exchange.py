@@ -34,7 +34,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
-from tensorrt_llm.bindings.internal.runtime import wait_for_slots
+from tensorrt_llm.bindings.internal.runtime import set_wake_word, wait_for_slots
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
@@ -342,11 +342,12 @@ class MnnvlHostExchangeGroup:
         ):
             return self._recv
         # Clear the word before the caller checks why, so that a later cancel ends the next wait.
-        self._wake[0] = 0
+        set_wake_word(self._wake, 0)
         return None
 
     def cancel(self) -> None:
-        self._wake[0] = 1
+        # The native wait reads the word atomically while it runs without the GIL.
+        set_wake_word(self._wake, 1)
 
     @property
     def waiting_for(self) -> int:

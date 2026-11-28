@@ -258,6 +258,12 @@ bool waitForSlots(uintptr_t streamPtr, std::vector<SlotCopy> const& sends, std::
     }
 }
 
+//! Set ``wake`` to ``value`` as the atomic store that a ``waitForSlots`` running on another thread reads.
+void setWakeWord(WakeWord const& wake, int32_t value)
+{
+    std::atomic_ref<int32_t>(*wake.data()).store(value, std::memory_order_relaxed);
+}
+
 //! Return the payload size of ``rank`` in ``received``: its entry in ``lengths``, cut to the packets that
 //! ``received`` holds.
 size_t payloadSize(ReceivedPackets const& received, PayloadLengths const& lengths, size_t rank)
@@ -325,6 +331,8 @@ void initHostExchangeBindings(nb::module_& m)
         "Enqueue the sends of one host exchange round and poll until the packets this rank reads arrive. Runs without "
         "the GIL. Returns false if the wake word is set first.",
         nb::call_guard<nb::gil_scoped_release>());
+    m.def("set_wake_word", &setWakeWord, nb::arg("wake").noconvert(), nb::arg("value"),
+        "Set the wake word of wait_for_slots atomically, so that a wait running on another thread sees the new value.");
     m.def("unpack_payloads", &unpackPayloads, nb::arg("received"), nb::arg("lengths"), nb::arg("ranks"),
         "Return the payload bytes of each rank in ranks from the packets of one host exchange round.");
     m.def("unpack_payloads_into", &unpackPayloadsInto, nb::arg("received"), nb::arg("lengths"), nb::arg("ranks"),
