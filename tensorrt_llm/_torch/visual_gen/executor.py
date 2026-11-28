@@ -3,6 +3,7 @@
 
 import asyncio
 import atexit
+import contextlib
 import os
 import queue
 import socket
@@ -10,7 +11,8 @@ import threading
 import time
 import traceback
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
@@ -31,12 +33,29 @@ from tensorrt_llm._torch.visual_gen.batching import (
 from tensorrt_llm._torch.visual_gen.memory_monitor import WorkerMemoryMonitor
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.session_channel import SessionChannel
+from tensorrt_llm._torch.visual_gen.session_protocol import (
+    AdmissionFailure,
+    ControlType,
+    SessionAdmitted,
+    SessionClosed,
+    SessionCommand,
+    SessionControl,
+    SessionOpen,
+    SessionOpened,
+    SessionReply,
+    SessionResultMessage,
+    SessionSubmit,
+)
+from tensorrt_llm._torch.visual_gen.session_worker import SessionExit, SessionWorker
+from tensorrt_llm._torch.visual_gen.slot_pool import map_slots, open_return_events
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.session_errors import SessionEnded
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen.params import VisualGenParams
@@ -470,6 +489,8 @@ class DiffusionExecutor:
         req_hmac_key: Optional[bytes] = None,
         resp_hmac_key: Optional[bytes] = None,
         in_client_process: bool = False,
+        control_queue_addr: Optional[str] = None,
+        ctl_hmac_key: Optional[bytes] = None,
     ):
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
@@ -480,10 +501,15 @@ class DiffusionExecutor:
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
+        # Session control (slot returns, close, keep-alive) arrives on its own
+        # socket, so it is serviced whatever the state of the request socket.
+        self.controls_ipc = None
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         self.response_queue = queue.Queue()
         self.sender_thread = None
+        self.session_config = getattr(visual_gen_args, "session_config", None)
+        self.session_worker = SessionWorker(self)
         self.memory_monitor = WorkerMemoryMonitor(device_id, self.rank, self.world_size)
 
         # Only rank 0 handles IPC
@@ -495,6 +521,13 @@ class DiffusionExecutor:
                 socket_type=zmq.PULL,
                 use_hmac_encryption=True,
             )
+            if control_queue_addr is not None:
+                self.controls_ipc = ZeroMqQueue(
+                    (control_queue_addr, ctl_hmac_key),
+                    is_server=False,
+                    socket_type=zmq.PULL,
+                    use_hmac_encryption=True,
+                )
             self.sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
             self.sender_thread.start()
 
@@ -573,26 +606,28 @@ class DiffusionExecutor:
         object into a tensor first and that copy dominates the collective.
         """
         payloads = []
-        if self.rank == 0 and req is not None:
+        request = req.request if isinstance(req, SessionOpen) else req
+        if self.rank == 0 and request is not None:
             # Take the payloads out before the object is pickled, and leave their
             # sizes behind so the peers can size their receive buffers.
             for slot in ("image_reference", "video_reference", "audio_reference"):
-                for ref in getattr(req.params, slot, None) or []:
+                for ref in getattr(request.params, slot, None) or []:
                     payloads.append(ref.content)
                     ref.content = b""
-            req.ref_sizes = [len(p) for p in payloads]
+            request.ref_sizes = [len(p) for p in payloads]
 
         obj_list = [req]
         dist.broadcast_object_list(obj_list, src=0)
         req = obj_list[0]
         if req is None:
             return None
+        request = req.request if isinstance(req, SessionOpen) else req
 
         if self.rank == 0:
             # Read-only views: the src rank only reads its buffer.
             buffers = [torch.frombuffer(p, dtype=torch.uint8) for p in payloads]
         else:
-            buffers = [torch.empty(n, dtype=torch.uint8) for n in req.ref_sizes or []]
+            buffers = [torch.empty(n, dtype=torch.uint8) for n in request.ref_sizes or []]
         for buffer in buffers:
             dist.broadcast(buffer, src=0)
 
@@ -602,7 +637,7 @@ class DiffusionExecutor:
         refs = [
             ref
             for slot in ("image_reference", "video_reference", "audio_reference")
-            for ref in getattr(req.params, slot, None) or []
+            for ref in getattr(request.params, slot, None) or []
         ]
         if len(refs) != len(payloads):
             # zip() would silently leave the tail of either side behind, and
@@ -610,11 +645,12 @@ class DiffusionExecutor:
             raise ValueError(f"expected {len(refs)} reference payloads, got {len(payloads)}.")
         for ref, payload in zip(refs, payloads):
             ref.content = payload
-        req.ref_sizes = None
+        request.ref_sizes = None
         return req
 
     def serve_forever(self):
-        """Main execution loop."""
+        """Main execution loop: one request, one merged batch of requests, or one
+        session at a time."""
         config = self.visual_gen_args.batching_config
         scheduler = DynamicBatchScheduler(
             max_batch_size=config.max_batch_size,
@@ -632,12 +668,17 @@ class DiffusionExecutor:
             req = None
             if self.rank == 0:
                 req = scheduler.next_request(
-                    self.requests_ipc.get,
+                    self._next_message,
                     self.requests_ipc.poll,
                     enabled=batching_enabled,
                 )
-                if req is not None:
+                if isinstance(req, DiffusionRequest):
                     req.refs_from_shm()
+                elif isinstance(req, SessionOpen):
+                    req.request.refs_from_shm()
+                elif req is not None:
+                    self._answer_stray_command(req)
+                    continue
                 logger.info(f"Worker {self.device_id}: Request available")
 
             # Skipped at world_size 1: with no peer, the object broadcast would
@@ -646,11 +687,19 @@ class DiffusionExecutor:
                 req = self._broadcast_request(req)
 
             if req is None:
-                logger.info(f"Worker {self.device_id}: Shutdown signal received")
-                if self.rank == 0 and self.sender_thread:
-                    self.response_queue.put(None)
-                    self.sender_thread.join()
+                self._stop_serving()
                 break
+
+            if isinstance(req, SessionOpen):
+                logger.info(f"Worker {self.device_id}: Opening session {req.request.request_id}")
+                if self.session_worker.serve(req.request) is SessionExit.SHUTDOWN:
+                    # Rank 0 read the signal inside the session; the peers are back
+                    # at the broadcast and get it now.
+                    if self.world_size > 1:
+                        self._broadcast_request(None)
+                    self._stop_serving()
+                    break
+                continue
 
             logger.info(f"Worker {self.device_id}: Processing request {req.request_id}")
             if req.batch_info is not None:
@@ -659,6 +708,43 @@ class DiffusionExecutor:
                     f"images={sum(req.batch_info.sample_counts)}"
                 )
             self.process_request(req)
+
+    def _stop_serving(self) -> None:
+        logger.info(f"Worker {self.device_id}: Shutdown signal received")
+        if self.rank == 0 and self.sender_thread:
+            self.response_queue.put(None)
+            self.sender_thread.join()
+
+    def _next_message(self) -> Any:
+        """Rank 0: the next message from the request socket. Controls that arrive
+        with no session open are strays (a close that crossed its SessionClosed):
+        answered, never queued."""
+        while True:
+            for command in self._drain_controls():
+                self._answer_stray_command(command)
+            try:
+                return self.requests_ipc.get(timeout=POLL_TIMEOUT)
+            except queue.Empty:
+                continue
+
+    def _drain_controls(self) -> List[Any]:
+        if self.controls_ipc is None:
+            return []
+        return self.controls_ipc.drain()
+
+    def _answer_stray_command(self, command: Any) -> None:
+        """A session command with no open session: a submit is refused so the
+        client does not wait forever; the rest are stale and dropped."""
+        if isinstance(command, SessionSubmit):
+            self.response_queue.put(
+                SessionAdmitted(
+                    command.session_id,
+                    error=f"session {command.session_id} is not open",
+                    failure=AdmissionFailure.ENDED,
+                )
+            )
+        elif isinstance(command, SessionControl) and command.type is ControlType.CLOSE:
+            self.response_queue.put(SessionClosed(command.session_id))
 
     def _merge_defaults(self, req: DiffusionRequest):
         """Fill ``None`` fields in *req.params* with pipeline-specific defaults.
@@ -796,6 +882,41 @@ class DiffusionExecutor:
                 f"Unable to log CUDA peak memory for request {request_id}: {e}"
             )
 
+    def _waiting_commands(self) -> List[Any]:
+        """Every command already waiting on either socket, controls first, without
+        waiting for more."""
+        return self._drain_controls() + self.requests_ipc.drain()
+
+    def _wait_for_commands(self, deadline: Optional[float]) -> List[Any]:
+        """Wait until ``deadline`` on the monotonic clock (``None``: no limit) for
+        a command on either socket. Returns it with everything behind it, or an
+        empty list when nothing arrived in time. Both sockets are watched in
+        slices of ``POLL_TIMEOUT``, so a slot return or a close is seen whatever
+        sits unread on the request socket."""
+        while True:
+            commands = self._waiting_commands()
+            if commands:
+                return commands
+            if deadline is not None and time.monotonic() >= deadline:
+                return []
+            try:
+                message = self.requests_ipc.get(timeout=POLL_TIMEOUT)
+            except queue.Empty:
+                continue
+            return [message] + self._waiting_commands()
+
+    def _refuse_request(self, message: Any, error: str) -> bool:
+        """Rank 0: answer a generation request with a capacity refusal that says
+        ``error``. The payload is taken so its shared memory is released. Returns
+        ``False``, with nothing done, when ``message`` is not a generation request."""
+        if not isinstance(message, DiffusionRequest):
+            return False
+        message.refs_from_shm()
+        self.response_queue.put(
+            DiffusionResponse(request_id=message.request_id, error_msg=error, error_type="capacity")
+        )
+        return True
+
 
 def run_diffusion_worker(
     rank: int,
@@ -811,6 +932,8 @@ def run_diffusion_worker(
     local_rank: Optional[int] = None,
     in_client_process: bool = False,
     parent_pid: Optional[int] = None,
+    control_queue_addr: Optional[str] = None,
+    ctl_hmac_key: Optional[bytes] = None,
     use_client_store: bool = False,
 ):
     """Entry point for worker process.
@@ -892,6 +1015,8 @@ def run_diffusion_worker(
             req_hmac_key=req_hmac_key,
             resp_hmac_key=resp_hmac_key,
             in_client_process=in_client_process,
+            control_queue_addr=control_queue_addr,
+            ctl_hmac_key=ctl_hmac_key,
         )
         try:
             executor.serve_forever()
@@ -905,6 +1030,11 @@ def run_diffusion_worker(
         logger.error(f"Worker failed: {e}")
         traceback.print_exc()
         raise
+
+
+def _consume_exception(fut: "asyncio.Future") -> None:
+    if not fut.cancelled():
+        fut.exception()
 
 
 class DiffusionRemoteClient:
@@ -972,34 +1102,50 @@ class DiffusionRemoteClient:
 
                 # Setup IPC addresses
                 self.host_ip = get_ip_address()
-                req_port, resp_port = find_free_port(), find_free_port()
+                req_port, resp_port, ctl_port = find_free_port(), find_free_port(), find_free_port()
 
                 self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
                 self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+                self.control_queue_addr = f"tcp://0.0.0.0:{ctl_port}"
                 self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
                 self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
+                self.ctl_addr_connect = f"tcp://{self.host_ip}:{ctl_port}"
 
             else:
                 # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
                 rank, local_rank, world_size, master_addr, master_port = ext
                 req_port = find_free_port()
                 resp_port = find_free_port()
+                ctl_port = find_free_port()
                 self.master_addr = master_addr
                 self.master_port = master_port
                 self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
                 self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+                self.control_queue_addr = f"tcp://0.0.0.0:{ctl_port}"
                 self.req_addr_connect = f"tcp://{master_addr}:{req_port}"
                 self.resp_addr_connect = f"tcp://{master_addr}:{resp_port}"
+                self.ctl_addr_connect = f"tcp://{master_addr}:{ctl_port}"
 
             # Generate shared HMAC keys for IPC authentication
             self.req_hmac_key = os.urandom(32)
             self.resp_hmac_key = os.urandom(32)
+            self.ctl_hmac_key = os.urandom(32)
 
             # IPC setup
             self.requests_ipc = None
             self.responses_ipc = None
+            self.controls_ipc = None
             self.pending_requests = queue.Queue()
+            # Session control commands (slot returns, close, keep-alive): their own
+            # outbox and socket, so a request parked on a non-writable request socket
+            # never holds them up. Keyed by (session_id, type, slot_id), so repeats
+            # coalesce; an entry stays until its send succeeded, so it also stands
+            # for a command being retried.
+            self._controls: "OrderedDict[Tuple[int, ControlType, Optional[int]], SessionControl]" = OrderedDict()
+            self._controls_lock = threading.Lock()
             self.completed_responses: Dict[int, DiffusionResponse] = {}
+            self._sessions: Dict[int, SessionChannel] = {}
+            self._sessions_lock = threading.Lock()
             # Request ids the caller has given up on (e.g., aresult timed out).
             # _store_response drops late-arriving responses for these ids so a
             # full PipelineOutput tensor does not pin in completed_responses for
@@ -1068,6 +1214,8 @@ class DiffusionRemoteClient:
                             "visual_gen_args": self.args,
                             "req_hmac_key": self.req_hmac_key,
                             "resp_hmac_key": self.resp_hmac_key,
+                            "control_queue_addr": self.ctl_addr_connect,
+                            "ctl_hmac_key": self.ctl_hmac_key,
                             "log_level": logger.level,
                             "local_rank": rank,
                             "parent_pid": parent_pid,
@@ -1101,6 +1249,8 @@ class DiffusionRemoteClient:
                         "visual_gen_args": self.args,
                         "req_hmac_key": self.req_hmac_key,
                         "resp_hmac_key": self.resp_hmac_key,
+                        "control_queue_addr": self.ctl_addr_connect,
+                        "ctl_hmac_key": self.ctl_hmac_key,
                         "log_level": logger.level,
                         "local_rank": local_rank,
                         "in_client_process": True,
@@ -1135,9 +1285,12 @@ class DiffusionRemoteClient:
             raise RuntimeError(self._worker_failure)
 
         req_ids = []
-        for req in requests:
-            self.pending_requests.put(req)
-            req_ids.append(req.request_id)
+        # Under the lock a session's retirement filters the queue under, so a
+        # request never lands in the middle of that and jumps the ones before it.
+        with self._sessions_lock:
+            for req in requests:
+                self.pending_requests.put(req)
+                req_ids.append(req.request_id)
         # Record one snapshot per enqueue so a /metrics consumer sees the
         # queued-request transitions even if the dispatcher drains the queue
         # before the next poll.
@@ -1242,6 +1395,12 @@ class DiffusionRemoteClient:
                 socket_type=zmq.PULL,
                 use_hmac_encryption=True,
             )
+            self.controls_ipc = ZeroMqQueue(
+                (self.control_queue_addr, self.ctl_hmac_key),
+                is_server=True,
+                socket_type=zmq.PUSH,
+                use_hmac_encryption=True,
+            )
             logger.info("DiffusionClient: IPC ready")
             return True
         except Exception as e:
@@ -1260,9 +1419,11 @@ class DiffusionRemoteClient:
                 self._close_socket(self.requests_ipc)
 
     @staticmethod
-    def _discard_unsent_request(request: Optional[DiffusionRequest]) -> None:
-        if request is None:
-            return
+    def _discard_unsent_request(request: Optional[Any]) -> None:
+        if isinstance(request, SessionOpen):
+            request = request.request
+        if request is None or not hasattr(request, "refs_from_shm"):
+            return  # session commands carry no shared-memory payload
         try:
             # Rebuilding an unsent shared-memory handle releases its producer
             # reference. The restored request is discarded immediately.
@@ -1286,13 +1447,15 @@ class DiffusionRemoteClient:
                     self._request_to_send = req
 
                 req = self._request_to_send
-                logger.info(f"DiffusionClient: Sending request {req.request_id}")
+                if isinstance(req, DiffusionRequest):
+                    logger.info(f"DiffusionClient: Sending request {req.request_id}")
                 self.requests_ipc.put_nowait(req)
                 self._request_to_send = None
                 # The client tracks requests handed to workers as in flight.
-                self._iter_stats.record_request_started(
-                    req.request_id, self.pending_requests.qsize()
-                )
+                if isinstance(req, DiffusionRequest):
+                    self._iter_stats.record_request_started(
+                        req.request_id, self.pending_requests.qsize()
+                    )
         except queue.Empty:
             pass
         except zmq.Again:
@@ -1306,6 +1469,104 @@ class DiffusionRemoteClient:
             self._request_to_send = None
             logger.error(f"DiffusionClient: Error sending request: {e}")
             logger.error(traceback.format_exc())
+            self._session_send_failed(req, e)
+
+    def _retire_unsent(self, session_id: int) -> None:
+        """The session is closed on the worker: a submit of it still unsent (parked
+        on the request socket, or queued behind other requests) is dropped, so it
+        neither holds its payload nor reaches a session that no longer exists;
+        its control commands still in the outbox go too. Runs on the background
+        thread, which owns the send slot."""
+        parked = self._request_to_send
+        if isinstance(parked, SessionSubmit) and parked.session_id == session_id:
+            self._request_to_send = None
+        # Every producer of the queue publishes under this lock, so nothing is
+        # enqueued between the drain and the refill and the order is kept.
+        with self._sessions_lock:
+            kept = []
+            while True:
+                try:
+                    item = self.pending_requests.get_nowait()
+                except queue.Empty:
+                    break
+                if not (isinstance(item, SessionSubmit) and item.session_id == session_id):
+                    kept.append(item)
+            for item in kept:
+                self.pending_requests.put(item)
+        with self._controls_lock:
+            for key in [k for k in self._controls if k[0] == session_id]:
+                del self._controls[key]
+
+    def _enqueue_control(self, command: SessionControl) -> None:
+        key = (command.session_id, command.type, command.slot_id)
+        with self._controls_lock:
+            if key not in self._controls:
+                self._controls[key] = command
+
+    def _process_controls(self):
+        """Send the first pending session control command, if any: the control
+        socket's counterpart of ``_process_requests``, with the same ``Again``
+        retry and the same containment on any other failure. The entry is
+        removed by its key after the send, never by position: a close or a
+        failure may have retired it meanwhile."""
+        with self._controls_lock:
+            if not self._controls:
+                return
+            key, command = next(iter(self._controls.items()))
+        try:
+            self.controls_ipc.put_nowait(command)
+        except zmq.Again:
+            worker_failure = self._check_worker_liveness()
+            if worker_failure is not None:
+                self._abort_worker_group(worker_failure)
+            return
+        except Exception as e:
+            logger.error(f"DiffusionClient: Error sending session control: {e}")
+            logger.error(traceback.format_exc())
+            with self._controls_lock:
+                if self._controls.get(key) is command:
+                    del self._controls[key]
+            self._session_send_failed(command, e)
+            return
+        with self._controls_lock:
+            if self._controls.get(key) is command:
+                del self._controls[key]
+
+    def _session_send_failed(self, req: Any, exc: Exception) -> None:
+        """A session command did not leave the process. The socket serializes a
+        command before it sends it, so anything other than a socket or OS error
+        is a payload that cannot be serialized (nothing was sent, the transport
+        is intact) and fails just the call that made it: the pending submit gets
+        ``ValueError`` and consumes no index; an open gets ``ValueError``, its
+        reservation and its request references are released. Any other failure
+        means control messages may be lost on a transport we can no longer trust,
+        so the worker group is aborted and every session call raises that failure."""
+        if not isinstance(req, SessionCommand):
+            return
+        payload_error = not isinstance(exc, (zmq.ZMQError, OSError))
+        with self._sessions_lock:
+            channel = self._sessions.get(req.session_id)
+        if not payload_error or isinstance(req, SessionControl):
+            # A failing data request goes back into the send slot so the abort
+            # releases its references with everything else, once; a control
+            # command owns nothing and must not displace a parked request.
+            if isinstance(req, (SessionOpen, SessionSubmit)) and self._request_to_send is None:
+                self._request_to_send = req
+            self._abort_worker_group(f"DiffusionClient: could not send {type(req).__name__}: {exc}")
+            return
+        if isinstance(req, SessionSubmit):
+            if channel is not None:
+                channel.admitted(
+                    None, ValueError(f"input {req.name!r} cannot be serialized: {exc}")
+                )
+            return
+        with self._sessions_lock:
+            self._sessions.pop(req.session_id, None)
+        self._discard_unsent_request(req)
+        if channel is not None:
+            channel.open_failed(
+                ValueError(f"Session open failed: request cannot be serialized: {exc}")
+            )
 
     def _process_responses(self, max_responses: int = 1):
         """Poll once, then drain a bounded burst of already-ready responses."""
@@ -1314,7 +1575,9 @@ class DiffusionRemoteClient:
                 if not self.responses_ipc.poll(timeout=POLL_TIMEOUT if index == 0 else 0):
                     break
                 response = self.responses_ipc.get()
-                if isinstance(response, DiffusionResponse):
+                if isinstance(response, SessionReply):
+                    self._dispatch_session_reply(response)
+                elif isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
                         logger.info("DiffusionClient: Received READY signal")
 
@@ -1355,6 +1618,171 @@ class DiffusionRemoteClient:
             )
         self.response_event.set()
 
+    # ------------------------------------------------------------------ sessions
+
+    def open_session(self, request: DiffusionRequest) -> SessionChannel:
+        """Send ``SessionOpen``; the caller waits through ``channel.wait_open`` (or
+        its async form) until the worker has opened it.
+
+        One session per model instance: while another session is opening or open
+        (its entry stays in ``_sessions`` until its close is confirmed or its open
+        failed), this raises ``MemoryError`` at once, without a round trip to a
+        worker that may be busy, and releases the request's shared-memory
+        payload."""
+        channel = SessionChannel(request.request_id)
+        # Failure check, reservation and enqueue under the one lock the abort path
+        # takes to record the failure and snapshot the channels: an open either
+        # lands in that snapshot with its message already queued (both are then
+        # failed and released by the abort) or sees the failure and refuses.
+        with self._sessions_lock:
+            if self._worker_failure is not None:
+                self._discard_unsent_request(request)
+                raise RuntimeError(self._worker_failure)
+            if self._sessions:
+                open_id = next(iter(self._sessions))
+                self._discard_unsent_request(request)
+                raise MemoryError(
+                    f"session {open_id} is open on this model instance; close it before "
+                    "opening another"
+                )
+            self._sessions[request.request_id] = channel
+            self.pending_requests.put(SessionOpen(request))
+        return channel
+
+    async def open_session_async(self, request: DiffusionRequest) -> SessionChannel:
+        """``open_session`` plus the wait, safe against the caller's cancellation.
+
+        The opening future is shielded: cancelling the caller never cancels it,
+        so the worker's reply always completes it. On cancellation the session is
+        closed (the one close operation: sent once the open is acknowledged,
+        settled if the open fails) and the ``CancelledError`` propagates."""
+        channel = self.open_session(request)
+        opening = channel.wait_open_async()
+        try:
+            await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            # Nobody awaits the wrapper any more; its eventual exception is the
+            # channel's business (recorded there), not an unretrieved one.
+            opening.add_done_callback(_consume_exception)
+            self.session_close(channel)
+            raise
+        return channel
+
+    def session_submit(
+        self, channel: SessionChannel, name: str, value: Any, for_advance: bool = False
+    ) -> Future:
+        """Send one value; the future resolves to the advance index or raises
+        ``ValueError`` / ``SessionQueueFull`` / ``SessionEnded``. The caller must
+        hand the future to ``channel.release_submit`` when done with it. A value
+        that cannot be pickled raises ``ValueError`` here and reserves nothing."""
+        if self._worker_failure is not None:
+            raise RuntimeError(self._worker_failure)
+        inputs = (channel.capabilities or {}).get("inputs", [])
+        if not any(s["name"] == name for s in inputs):
+            raise ValueError(f"unknown input {name!r}; declared: {[s['name'] for s in inputs]}")
+        if for_advance:
+            # The stream decides first: a terminal at the head means nothing is
+            # submitted, so the unused value is not even looked at.
+            fut = channel.plan_advance(name)
+            if fut is None:
+                return None
+        else:
+            fut = channel.reserve_submit(name)
+        # Reserved, not yet sent: until the command is in the queue any exit,
+        # an interrupt included, withdraws the reservation.
+        try:
+            # Publication is conditional on the session still being live and
+            # happens under the lock that retirement (close, abort) takes, so a
+            # command is either seen by the retirement that follows or never
+            # queued behind a close that came first.
+            try:
+                command = SessionSubmit.pack(channel.session_id, name, value)
+            except Exception as exc:
+                raise ValueError(f"input {name!r} cannot be serialized: {exc}") from exc
+            with self._sessions_lock:
+                if self._worker_failure is not None:
+                    raise RuntimeError(self._worker_failure)
+                if channel.closing() is not None:
+                    raise SessionEnded(f"session {channel.session_id} is closed")
+                self.pending_requests.put(command)
+        except BaseException:
+            channel.withdraw_submit(fut)
+            raise
+        return fut
+
+    def session_return_slot(self, channel: SessionChannel, slot_id: int) -> None:
+        if self._worker_failure is None:
+            self._enqueue_control(
+                SessionControl(channel.session_id, ControlType.SLOT_RETURN, slot_id)
+            )
+
+    def session_keep_alive(self, channel: SessionChannel) -> None:
+        """Tell the worker the client is still there (restarts its idle clock);
+        repeats coalesce in the outbox while one is pending."""
+        if self._worker_failure is None and channel.lease_lost is None:
+            self._enqueue_control(SessionControl(channel.session_id, ControlType.KEEP_ALIVE))
+
+    def session_close(self, channel: SessionChannel) -> Future:
+        """Close the session; the future completes on the worker's confirmation.
+        The first call begins the one close operation and arranges the one close
+        command: sent once the open is acknowledged (so the worker has the
+        session before its close can reach it on the other socket), or nothing
+        if the open fails. Later calls return the same operation."""
+        close, first = channel.request_close()
+        if first:
+
+            def after_open(error: Optional[BaseException]) -> None:
+                if error is not None:
+                    channel.open_failed(error)
+                    return
+                if self._worker_failure is None:
+                    self._enqueue_control(SessionControl(channel.session_id, ControlType.CLOSE))
+
+            channel.on_open(after_open)
+        return close
+
+    def _dispatch_session_reply(self, reply: Any) -> None:
+        """Hand one worker reply to its session's channel (background thread). A
+        session that is over leaves the registry before its channel wakes anyone,
+        so a caller woken by the reply can open the next session at once."""
+        with self._sessions_lock:
+            channel = self._sessions.get(reply.session_id)
+        if channel is None:
+            # Normal after a close: a reply to a command that crossed it in flight.
+            logger.debug(f"DiffusionClient: reply for closed session {reply.session_id}")
+        elif isinstance(reply, SessionOpened):
+            self._session_opened(channel, reply)
+        elif isinstance(reply, SessionAdmitted):
+            channel.admitted(reply.advance_index, reply.exception())
+        elif isinstance(reply, SessionResultMessage):
+            channel.deliver(reply)
+        elif isinstance(reply, SessionClosed):
+            self._forget_session(reply.session_id)
+            channel.worker_closed(reply.reason)
+            self._retire_unsent(reply.session_id)
+
+    def _session_opened(self, channel: SessionChannel, reply: SessionOpened) -> None:
+        error, slots, return_events = reply.exception(), None, None
+        if error is None:
+            try:
+                slots = map_slots(reply.slots or [])
+                return_events = open_return_events(reply.return_events, slots)
+            except Exception as e:
+                # The worker holds the session open; without its slots the client
+                # cannot use it, so the open fails and the worker is told to close.
+                logger.error(f"DiffusionClient: session {reply.session_id} slots: {e}")
+                error = RuntimeError(f"Session open failed: cannot map the delivery slots: {e}")
+                self._enqueue_control(SessionControl(reply.session_id, ControlType.CLOSE))
+        if error is not None:
+            self._forget_session(reply.session_id)
+            channel.open_failed(error)
+        else:
+            channel.open_succeeded(reply.capabilities or {}, slots, return_events)
+
+    def _forget_session(self, session_id: int) -> None:
+        with self._sessions_lock:
+            self._sessions.pop(session_id, None)
+
     def get_iteration_stats(self) -> List[Dict]:
         """Return all buffered iteration-stats snapshots and clear the buffer.
 
@@ -1392,6 +1820,7 @@ class DiffusionRemoteClient:
         logger.info("DiffusionClient: Cleaning up IPC")
         self._close_socket(self.requests_ipc)
         self._close_socket(self.responses_ipc)
+        self._close_socket(self.controls_ipc)
 
     def _serve_forever_thread(self):
         """Background thread wrapper that creates and runs an event loop."""
@@ -1425,10 +1854,15 @@ class DiffusionRemoteClient:
             if worker_failure is not None:
                 self._abort_worker_group(worker_failure)
             if self._worker_failure is None:
+                # Controls first: they never wait behind a request. The burst of
+                # at most ``max_batch_size`` requests serialized per pass bounds
+                # how long they wait.
+                self._process_controls()
                 self._process_requests(max_requests=self.args.batching_config.max_batch_size)
                 self._process_responses(max_responses=self.args.batching_config.max_batch_size)
             await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
 
+        self._fail_open_sessions(SessionEnded("the engine shut down"))
         self._cleanup_ipc()
 
         # Keep the event loop available long enough for outstanding result
@@ -1437,6 +1871,21 @@ class DiffusionRemoteClient:
         # within one polling interval and remains bounded.
         while self._worker_failure is not None and not self._shutdown_started:
             await asyncio.sleep(POLL_TIMEOUT)
+
+    def _fail_open_sessions(self, error: Exception) -> None:
+        """No reply will be read any more (the engine shut down, or the worker
+        group is gone): every session still registered ends with ``error``, which
+        wakes its pending open, read, submit and close and expires its results.
+        The registry is emptied under its lock and the sessions are failed outside
+        it, so a caller woken here can call back into the client."""
+        with self._sessions_lock:
+            channels = list(self._sessions.values())
+            self._sessions.clear()
+        for channel in channels:
+            try:
+                channel.fail(error)
+            except Exception as e:
+                logger.error(f"DiffusionClient: failing session {channel.session_id}: {e}")
 
     def _check_worker_liveness(self) -> Optional[str]:
         if (
@@ -1470,31 +1919,56 @@ class DiffusionRemoteClient:
         if self._worker_failure is not None or self._shutdown_started:
             return
 
-        self._worker_failure = worker_failure
+        # Lifecycle tests build partial clients without session state; nothing to fail then.
+        has_sessions = getattr(self, "_sessions", None) is not None
+        sessions_lock = getattr(self, "_sessions_lock", None) or contextlib.nullcontext()
+        with sessions_lock:
+            # open_session checks _worker_failure under this lock before it
+            # registers a session, so once the failure is set no new session
+            # can be added to the registry.
+            self._worker_failure = worker_failure
         request_to_discard = self._request_to_send
         self._request_to_send = None
         logger.error(self._worker_failure)
         self.shutdown_event.set()
         self.response_event.set()
-
         try:
-            # A surviving rank may be blocked in a collective that can never
-            # complete after another rank exits, so containment is immediate.
-            for process in self.worker_processes:
-                if process.is_alive():
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-
-            worker_spawner = getattr(self, "_worker_spawner", None)
-            if worker_spawner is not None:
-                worker_spawner.reap_started_processes()
-            else:
-                for process in self.worker_processes:
-                    _reap_worker_process(process)
+            # Nothing queued behind the failure will be sent; release the
+            # shared-memory payloads parked there (an unsent open, a generate).
+            pending = getattr(self, "pending_requests", None)
+            if pending is not None:
+                with sessions_lock:  # serialized against a submit being published
+                    while True:
+                        try:
+                            self._discard_unsent_request(pending.get_nowait())
+                        except queue.Empty:
+                            break
+            controls_lock = getattr(self, "_controls_lock", None)
+            if controls_lock is not None:
+                with controls_lock:
+                    self._controls.clear()
+            if has_sessions:
+                self._fail_open_sessions(RuntimeError(worker_failure))
         finally:
-            self._discard_unsent_request(request_to_discard)
+            # Whatever happened above, the survivors are killed: a surviving rank
+            # may be blocked in a collective that can never complete after
+            # another rank exits, so containment is immediate.
+            try:
+                for process in self.worker_processes:
+                    if process.is_alive():
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+
+                worker_spawner = getattr(self, "_worker_spawner", None)
+                if worker_spawner is not None:
+                    worker_spawner.reap_started_processes()
+                else:
+                    for process in self.worker_processes:
+                        _reap_worker_process(process)
+            finally:
+                self._discard_unsent_request(request_to_discard)
 
     def shutdown(self):
         """Shutdown client and workers."""

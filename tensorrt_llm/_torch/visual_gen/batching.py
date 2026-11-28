@@ -75,8 +75,13 @@ def request_batch_key(req: DiffusionRequest) -> str | None:
 
     Reference-conditioned requests and prepared tensors require pipeline-specific
     collation and are kept as singleton calls. Unsupported extra-parameter types
-    also opt out instead of being dropped from the compatibility key.
+    also opt out instead of being dropped from the compatibility key. So does
+    any other message on the request socket (a session open or command).
     """
+    from .executor import DiffusionRequest
+
+    if not isinstance(req, DiffusionRequest):
+        return None
     params = req.params
     if (
         params is None

@@ -50,6 +50,7 @@ if TYPE_CHECKING:
         QuantAttentionConfig,
         RuntimeLoRAConfig,
         SeaCacheConfig,
+        SessionConfig,
         SkipSoftmaxAttentionConfig,
         SolAttentionConfig,
         SparseAttentionConfig,
@@ -61,6 +62,8 @@ if TYPE_CHECKING:
     )
     from .output import VisualGenMetrics, VisualGenOutput
     from .params import MediaRef, VisualGenParams
+    from .session import SessionResult, SessionResultsIterator, VisualGenSession
+    from .session_errors import SessionEnded, SessionError, SessionLeaseExpired, SessionQueueFull
     from .visual_gen import ExtraParamSchema, VisualGen, VisualGenResult
 
 # Public name -> providing module.
@@ -87,6 +90,14 @@ _LAZY_ATTRS = {
     "TorchCompileConfig": "tensorrt_llm.visual_gen.args",
     "VideoSparseAttentionConfig": "tensorrt_llm.visual_gen.args",
     "VAEConfig": "tensorrt_llm.visual_gen.args",
+    "SessionConfig": "tensorrt_llm.visual_gen.args",
+    "VisualGenSession": "tensorrt_llm.visual_gen.session",
+    "SessionResultsIterator": "tensorrt_llm.visual_gen.session",
+    "SessionResult": "tensorrt_llm.visual_gen.session",
+    "SessionError": "tensorrt_llm.visual_gen.session_errors",
+    "SessionQueueFull": "tensorrt_llm.visual_gen.session_errors",
+    "SessionEnded": "tensorrt_llm.visual_gen.session_errors",
+    "SessionLeaseExpired": "tensorrt_llm.visual_gen.session_errors",
     "VisualGenMetrics": "tensorrt_llm.visual_gen.output",
     "VisualGenOutput": "tensorrt_llm.visual_gen.output",
     "VisualGenParams": "tensorrt_llm.visual_gen.params",
@@ -145,6 +156,14 @@ __all__ = [
     "VisualGenOutput",
     "VisualGenMetrics",
     "ExtraParamSchema",
+    # Streaming sessions
+    "VisualGenSession",
+    "SessionResultsIterator",
+    "SessionResult",
+    "SessionError",
+    "SessionQueueFull",
+    "SessionEnded",
+    "SessionLeaseExpired",
     # Cross-cutting sub-configs
     "BatchingConfig",
     "CompilationConfig",
@@ -160,6 +179,7 @@ __all__ = [
     "VideoSparseAttentionConfig",
     "SolAttentionConfig",
     "VAEConfig",
+    "SessionConfig",
     "CacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",
