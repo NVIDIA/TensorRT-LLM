@@ -32,6 +32,7 @@ never transposed into a real HND copy.
 """
 
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Optional, Tuple
@@ -314,7 +315,17 @@ class CuDNNAttention(AttentionBackend):
     def check_hardware_compatibility(
         cls, device: torch.device, quant_dtype: str | None = None
     ) -> None:
-        if get_sm_version() not in (100, 103, 107) and quant_dtype is not None:
+        if quant_dtype is None:
+            return
+        sm = get_sm_version()
+        if sm == 120:
+            # Only per-tensor FP8 has an SM120 cuDNN engine (the FROST FP8 SDPA kernel).
+            if quant_dtype != "fp8":
+                raise RuntimeError("cuDNN quantized attention on SM120 only supports fp8.")
+            # cuDNN Frontend gates that engine behind an opt-in env var, read live
+            # at graph build time. Respect an explicit user setting.
+            os.environ.setdefault("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+        elif sm not in (100, 103, 107):
             raise RuntimeError("cuDNN quantized attention requires NVIDIA Blackwell-class GPU.")
 
     @classmethod
@@ -457,8 +468,12 @@ class CuDNNAttention(AttentionBackend):
             ).set_data_type(f32)
             outputs["stats"] = stats_t
         # The quantized nodes emit amax(S) / amax(O) for calibration; inference binds
-        # scratch buffers for them.
+        # scratch buffers for them. The SM120 FROST FP8 engine does not produce
+        # amax(S) and the frontend rejects graphs that request it, so leave it
+        # undeclared there.
         for name, tensor in (("amax_s", amax_s_t), ("amax_o", amax_o_t)):
+            if name == "amax_s" and get_sm_version() == 120:
+                continue
             if tensor is not None:
                 tensor.set_output(True).set_dim([1, 1, 1, 1]).set_stride(
                     [1, 1, 1, 1]

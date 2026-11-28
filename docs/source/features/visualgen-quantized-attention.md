@@ -224,7 +224,7 @@ Omit `quant_attention_config` to use the same backend for unquantized FP16 or BF
 
 **Requirements and behavior.**
 
-- Quantized cuDNN attention requires an SM100 or SM103 Blackwell GPU.
+- Quantized cuDNN attention requires an SM100, SM103, or SM107 Blackwell GPU. On SM120 (for example RTX PRO 6000 Blackwell), only per-tensor `fp8` is supported; it runs on the cuDNN Frontend FROST SM120 FP8 engine, which the backend opts into automatically by setting `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` unless you have already set it. MXFP8 is not available on SM120.
 - The cuDNN backend requires cuDNN 9.1 or later. MXFP8 additionally requires cuDNN 9.21 or later.
 - Quantized attention supports head dimensions of 32, 64, 96, and 128.
 - Self-attention, cross-attention, MHA, GQA, MQA, full attention, and causal attention are supported. Key padding masks are not supported.
