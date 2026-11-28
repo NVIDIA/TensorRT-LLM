@@ -131,13 +131,19 @@ class Evaluator(ABC):
         outputs, references, auxiliaries = [], [], []
         for prompt, sampling_args, reference, *aux in tqdm(
                 self.generate_samples(), desc="Submitting requests"):
+            request_sampling_params = self._get_sampline_params(
+                sampling_params, sampling_args)
             if self.apply_chat_template:
                 prompt = self.do_apply_chat_template(llm, prompt)
-            sampling_params = self._get_sampline_params(sampling_params,
-                                                        sampling_args)
+                if isinstance(prompt, str):
+                    # The chat template already writes the special tokens the
+                    # model expects (such as BOS), so tokenize the rendered
+                    # text without adding them again, as trtllm-serve does for
+                    # chat requests.
+                    request_sampling_params.add_special_tokens = False
             output = llm.generate_async(
                 prompt,
-                sampling_params,
+                request_sampling_params,
                 streaming=streaming,
             )
             outputs.append(output)
@@ -183,7 +189,11 @@ def dump_inference_results(output_dir: str, results: List[dict],
             input_text = tokenizer.decode(input_ids).strip()
         else:
             input_text = result.prompt.strip()
-            input_ids = tokenizer.encode(input_text)
+            # The ids the engine ran. Re-encoding the prompt text can give other
+            # ids, e.g. an extra BOS when the request set add_special_tokens=False.
+            input_ids = result.prompt_token_ids
+            if input_ids is None:
+                input_ids = tokenizer.encode(input_text)
         results_list.append({
             "task_id": task_id,
             "input_ids": input_ids,
