@@ -191,11 +191,12 @@ def _create_v1_manager(
 def _create_llm_request(
     request_id: int,
     tokens: list[int],
+    max_new_tokens: int = 1,
 ) -> LlmRequest:
     sampling_params = SamplingParams()
     return LlmRequest(
         request_id=request_id,
-        max_new_tokens=1,
+        max_new_tokens=max_new_tokens,
         input_tokens=tokens,
         sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
         is_streaming=False,
@@ -1012,3 +1013,50 @@ def test_refused_resume_is_not_counted_as_a_recovery(resource_guard) -> None:
     assert stats_report is not None
     assert stats_report.suspended_requests == 1
     assert stats_report.resumed_requests == 0
+
+
+def _decode_step_v2(manager: KVCacheManagerV2, request: LlmRequest, token: int) -> None:
+    """One executor step: allocate, then the sampled token, then the post-forward update."""
+    assert manager.try_allocate_generation(request)
+    request.add_new_token(token, 0)
+    manager.update_resources(_generation_batch(request))
+
+
+def _decode_into_partial_block(manager: KVCacheManagerV2, request: LlmRequest) -> None:
+    """Decode a 5-token prompt to 7 tokens of KV, all of the tail in its second block."""
+    _run_v2_context(manager, request)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_token(5, 0)
+    for token in (6, 7):
+        _decode_step_v2(manager, request, token)
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    # Neither step filled the block, so native has only the prompt; the rest is deferred.
+    assert kv_cache.num_committed_tokens == 5
+    assert manager.get_num_committed_tokens(request.py_request_id) == 7
+
+
+def test_free_mid_generation_publishes_deferred_generation_tokens(resource_guard) -> None:
+    request = _create_llm_request(1, list(range(5)), max_new_tokens=8)
+    manager = resource_guard(_create_manager(gpu_bytes=16 << 20), request)
+    _decode_into_partial_block(manager, request)
+
+    manager.free_resources(request)
+
+    # Token 7 has no KV, so a follower reuses positions 0-6; without the flush only the prompt's 5.
+    follower = _StatsRequest(2, list(range(8)) + [100], context_remaining_length=9)
+    resource_guard(manager, follower)
+    assert manager.prepare_context(follower)
+    assert follower.prepopulated_prompt_len == 7
+
+
+def test_suspend_mid_generation_commits_deferred_generation_tokens(resource_guard) -> None:
+    request = _create_llm_request(1, list(range(5)), max_new_tokens=8)
+    manager = resource_guard(_create_manager(gpu_bytes=16 << 20), request)
+    _decode_into_partial_block(manager, request)
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+
+    manager.suspend_request(request)
+
+    assert not kv_cache.is_active
+    assert kv_cache.num_committed_tokens == 7
+    assert manager.get_num_committed_tokens(request.py_request_id) == 7
