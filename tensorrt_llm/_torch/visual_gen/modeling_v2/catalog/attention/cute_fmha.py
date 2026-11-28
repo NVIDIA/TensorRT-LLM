@@ -15,6 +15,7 @@ from ._cute_fmha_launcher import (
     cutlass,
     is_cute_fmha_supported,
 )
+from ._key_padding import KeyPadding
 
 __all__ = ["cute_fmha", "is_cute_fmha_supported"]
 
@@ -47,6 +48,9 @@ class CuteFMHA(OpWrapper):
         Cell("MXFP8 Q/K and E4M3 V", dict(qk_dtype="mxfp8")),
         Cell("NVFP4 Q/K with per-channel E4M3 V scales", dict(qk_dtype="nvfp4", v_block_size=1)),
     )
+
+    def key_padding(self) -> KeyPadding:
+        return KeyPadding.NONE
 
     def __call__(
         self,

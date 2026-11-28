@@ -13,7 +13,7 @@ Keep changes for one deployment local to its pipeline so developers can merge wo
 | --- | --- |
 | `visual_gen/modeling_v2/models/<family>/<target>/` | The pipeline and the parts of loading or execution specific to that target. |
 | `visual_gen/modeling_v2/models/<family>/` | The checkpoint router and components, ops or kernels that sibling targets import from the family. |
-| `visual_gen/modeling_v2/catalog/` | **Model-agnostic operations only.** Another family can pass its own tensors to the same op unchanged. Each entry defines its inputs and results, provides a reference and tests its implementations. |
+| `visual_gen/modeling_v2/catalog/` | **Model-agnostic operations only.** Another family can pass its own tensors to the same op unchanged. Each entry defines its inputs and results, provides a reference and tests its implementations. A dense attention entry that a family selects by backend declares in `key_padding()` which padded keys it excludes under a given configuration; the family reads its padding support from there. |
 
 #### When to split or merge a target
 

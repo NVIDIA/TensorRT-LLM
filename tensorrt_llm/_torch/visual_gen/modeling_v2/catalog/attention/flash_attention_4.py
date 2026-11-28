@@ -8,6 +8,8 @@ import torch
 from tensorrt_llm._torch.cute_dsl_utils import load_flash_attn_cute_forward
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ._key_padding import KeyPadding
+
 
 def _install_flash_attn_tile_scheduler_compatibility() -> None:
     """Preserve FA4's four-axis tile coordinates when CUTLASS replaces the base scheduler's three-axis accessor."""
@@ -117,6 +119,9 @@ class FlashAttention4(OpWrapper):
             ),
         ),
     )
+
+    def key_padding(self) -> KeyPadding:
+        return KeyPadding.PREFIX
 
     def __call__(
         self,

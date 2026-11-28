@@ -55,6 +55,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -1035,10 +1036,24 @@ def test_transformer_block_is_fullgraph_compile_safe(
 
 
 def _attention_config(backend: str) -> AttentionConfig:
-    """DECO is CUTEDSL under the DeCo-Attention recipe."""
+    """DECO is CUTEDSL under the DeCo-Attention recipe; a suffix adds a recipe or a sparse
+    algorithm. Those configs skip the validator, which binds a recipe to the GPU generation."""
     if backend == "DECO":
         recipe = QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True)
         return AttentionConfig(backend="CUTEDSL", quant_attention_config=recipe)
+    backend, _, variant = backend.partition("+")
+    if variant == "FP8":
+        recipe = QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8")
+        return AttentionConfig.model_construct(backend=backend, quant_attention_config=recipe)
+    if variant == "NVFP4":
+        recipe = QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8")
+        return AttentionConfig.model_construct(backend=backend, quant_attention_config=recipe)
+    if variant == "SKIP":
+        sparse = SkipSoftmaxAttentionConfig(threshold_scale_factor=8.0)
+        return AttentionConfig.model_construct(backend=backend, sparse_attention_config=sparse)
+    if variant == "SOL":
+        sparse = SolAttentionConfig(tau=0.5, thresh_type="exact")
+        return AttentionConfig.model_construct(backend=backend, sparse_attention_config=sparse)
     return AttentionConfig(backend=backend)
 
 
@@ -1052,6 +1067,11 @@ def _attention_config(backend: str) -> AttentionConfig:
         ("CUTEDSL", False, False),
         ("CUDNN", False, False),
         ("DECO", True, True),
+        ("FLASHINFER+NVFP4", False, False),
+        ("TRTLLM+FP8", False, False),
+        ("TRTLLM+SKIP", False, False),
+        ("TRTLLM+SOL", True, True),
+        ("CUTEDSL+SOL", False, False),
     ],
 )
 def test_padding_support_tracks_attention_backend(backend: str, mask: bool, trailing: bool) -> None:

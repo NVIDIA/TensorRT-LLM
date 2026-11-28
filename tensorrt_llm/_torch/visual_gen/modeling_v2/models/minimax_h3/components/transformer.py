@@ -30,6 +30,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from ....catalog.attention import KeyPadding
 from ..kernels.fused_adaln import h3_adaln_supported
 from ..ops.adaln import gate_res_norm_mod as h3_gate_res_norm_mod
 from ..ops.adaln import norm_mod as h3_norm_mod
@@ -41,7 +42,7 @@ from .attention import (
     MiniMaxH3VSAAttention,
     _dense_attention_model_config,
 )
-from .dense_attention import uses_deco_attention
+from .dense_attention import key_padding, uses_deco_attention
 from .linear import Linear
 from .mlp import GatedMLP
 from .norm import RMSNorm
@@ -51,12 +52,7 @@ MINIMAX_H3_MODALITY_NUM = 3
 
 
 def takes_key_padding_mask(attention) -> bool:
-    return attention.backend in (
-        "VANILLA",
-        "FA4",
-        "TRTLLM",
-        "FLASHINFER",
-    ) or uses_deco_attention(attention)
+    return key_padding(attention) is not KeyPadding.NONE
 
 
 @dataclass
@@ -457,10 +453,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     ) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
-        self._supports_key_padding_mask = takes_key_padding_mask(model_config.attention)
+        padding = key_padding(model_config.attention)
+        self._supports_key_padding_mask = padding is not KeyPadding.NONE
+        self._requires_trailing_padding = padding is KeyPadding.PREFIX
         self._uses_deco = uses_deco_attention(model_config.attention)
-        # FA4 seqused_k, TRTLLM prefix trimming and DeCo token counts read a valid prefix.
-        self._requires_trailing_padding = self._attn_backend in ("FA4", "TRTLLM") or self._uses_deco
         quant_algo = model_config.quant_config.quant_algo
         if quant_algo is not None and not (
             quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4)

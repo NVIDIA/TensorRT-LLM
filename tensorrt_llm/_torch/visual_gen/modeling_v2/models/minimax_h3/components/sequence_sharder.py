@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from .dense_attention import PADDED_ATTENTION
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
@@ -114,7 +116,7 @@ def shard_refiner_inputs(
         if not supports_key_padding_mask:
             raise NotImplementedError(
                 "Padded token-refiner sequences require key_padding_mask support; "
-                "use VANILLA, FA4, TRTLLM, FLASHINFER or CUTEDSL with deco_attention."
+                f"use {PADDED_ATTENTION}."
             )
         if backend != "TRTLLM":
             # Attention caches use the mask version to detect changes.
@@ -169,15 +171,16 @@ def shard_dit_inputs(
             raise NotImplementedError(
                 "Padded packed sequences (negative token_tags) need an attention "
                 "backend that honours key_padding_mask; the "
-                f"{backend} backend cannot express it. Use "
-                "VANILLA, FA4, TRTLLM, FLASHINFER or CUTEDSL with deco_attention."
+                f"{backend} backend cannot express it under this configuration. Use "
+                f"{PADDED_ATTENTION}."
             )
         # Ulysses appends padding in this layout.
         if requires_trailing_padding and bool(
             ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
         ):
             raise NotImplementedError(
-                f"{backend} requires trailing packed-row padding; use VANILLA for interior padding."
+                f"{backend} requires trailing packed-row padding; use VANILLA or unquantized "
+                "FLASHINFER for interior padding."
             )
         if backend != "TRTLLM":
             # Attention caches use the mask version to detect changes.

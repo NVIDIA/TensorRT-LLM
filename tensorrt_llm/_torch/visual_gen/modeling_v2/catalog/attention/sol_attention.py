@@ -7,6 +7,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ._key_padding import KeyPadding
 from .prims_routed_attention import prims_routed_attention
 from .sol_predictor import SOL_BLOCK_SIZE, sol_predictor
 
@@ -39,6 +40,9 @@ class SolAttention(OpWrapper):
         Cell("diagonal threshold and partial final tile", dict(tokens=321, thresh_type="diag")),
         Cell("exact score variance", dict(tokens=384, thresh_type="exact")),
     )
+
+    def key_padding(self) -> KeyPadding:
+        return KeyPadding.NONE
 
     @torch.compiler.disable
     def __call__(self, q, k, v, *, tau: float, thresh_type: str, sm_scale: float):

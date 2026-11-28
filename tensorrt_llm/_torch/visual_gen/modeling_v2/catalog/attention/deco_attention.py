@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm.logger import logger
 
+from ._key_padding import KeyPadding
+
 # Self-attention over fewer rows runs unquantized.
 DECO_MIN_SEQ_LEN = 8192
 DECO_HEAD_DIM = 128
@@ -94,6 +96,9 @@ class DeCoAttention(OpWrapper):
             dict(v_dtype="fp8", tokens=320, padding=(64, 0)),
         ),
     )
+
+    def key_padding(self) -> KeyPadding:
+        return KeyPadding.PREFIX
 
     def __call__(self, q, k, v, *, v_dtype: str, key_padding_mask=None, token_tags=None):
         if key_padding_mask is not None:

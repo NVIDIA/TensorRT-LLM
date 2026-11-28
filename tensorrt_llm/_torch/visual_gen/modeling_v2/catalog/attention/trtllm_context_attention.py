@@ -8,6 +8,7 @@ from torch.nn import functional as F
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ._key_padding import KeyPadding
 from ._trtllm_context_params import (
     _ContextForwardArgs,
     _ContextParams,
@@ -160,6 +161,9 @@ class TrtllmContextAttention(OpWrapper):
             dict(batch=1, length=256, heads=4, kv_heads=4, sage=True, sage_qk_int8=True),
         ),
     )
+
+    def key_padding(self) -> KeyPadding:
+        return KeyPadding.NONE
 
     @torch.compiler.disable
     def __call__(
