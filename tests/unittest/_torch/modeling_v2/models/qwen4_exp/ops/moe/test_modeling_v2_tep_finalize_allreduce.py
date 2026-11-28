@@ -21,6 +21,9 @@ row has no local slot), with -0.0 lanes and values over 2^-12..2^8. For each cel
 * with one rank's window empty (`[0, 2560]` FC2 rows, every slot -1) and the others' not, and
   with routing weights at a 2-byte offset: eagerly on slots 0, 1, 2 and replayed from one graph,
   every rank's output equals the reference (the empty rank adds 0) and every rank finishes.
+  Before each replay fresh operands are copied into the graph's buffers, the shifted weights in
+  place at their 2-byte offset, so each replay reads its own weights there, and its outputs
+  differ from the previous replay's.
 
 Both release points (`early` False / True) run. The `shared` cells add each rank's fp32
 shared-expert quarter with its gate logit (0, 60 or -200 by row: a sigmoid of 0.5, 1 or 0, exact
@@ -148,10 +151,20 @@ def _empty_window(gen, rank: int, rows: int, finar, device, tag: str) -> None:
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
         outs = [op.tep_finalize_allreduce(*static[s], rows, s, finar) for s in range(op.SLOTS)]
     torch.cuda.current_stream().wait_stream(stream)
+    previous = None
     for i in range(max(REPLAYS // 10, 10)):
+        fresh = [operands() for _ in range(op.SLOTS)]
+        for dst, src in zip(static, fresh):
+            for d, s_ in zip(dst, src):
+                d.copy_(s_)  # the shifted weights stay at their 2-byte offset
+        want = [_reference(ops) for ops in static]
         graph.replay()
         for s in range(op.SLOTS):
             _check(f"empty window replay {i} {tag}, slot {s}", outs[s], want[s])
+        if previous is not None:
+            for s in range(op.SLOTS):
+                assert not torch.equal(outs[s], previous[s]), f"replay {i} {tag}, slot {s}"
+        previous = [o.clone() for o in outs]
 
 
 def _back_to_back(gen, rank: int, rows: int, shared: bool, finar, device, tag: str) -> None:
