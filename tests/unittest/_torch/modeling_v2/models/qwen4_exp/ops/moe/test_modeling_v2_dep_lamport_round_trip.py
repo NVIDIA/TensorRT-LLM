@@ -13,8 +13,9 @@ and then replayed from one CUDA graph (the three slots rotating across replays):
   same sanitized partials. `NCCL_ALGO` picks the ring but not the order its ranks are visited in,
   which NCCL derives from the topology: a probe at the start compares NCCL with the reference,
   and where NCCL's ring visits the ranks in rank order (the one-node trays the op is certified
-  on) the NCCL comparison is bitwise; elsewhere it allows the rounding of a reordered bf16 sum and
-  the run says so.
+  on) the NCCL comparison is bitwise; elsewhere each lane may differ by what adding the same
+  `world` terms in another order can change (`_reorder_bound`), and the run says so. The
+  reference comparison is bitwise everywhere.
 
 Every other eager gather is the one that releases its PDL dependents at its start. The
 host-index cells run each round inside a region with a varying number of launches (one to
@@ -106,13 +107,34 @@ def _ring_in_rank_order(gen, rank: int, world: int, device) -> bool:
     return ring
 
 
-def _check_rs(name: str, got: torch.Tensor, nccl: torch.Tensor, ring: bool) -> None:
-    """The reduce-scatter against NCCL: bitwise where NCCL sums in rank order, else within the
-    rounding of a reordered four-term bf16 sum of the test's inputs."""
+def _reorder_bound(ys, rank: int) -> torch.Tensor:
+    """Per lane of `rank`'s slice of the partials `ys` (every rank's, in rank order), how far two
+    bf16 sums of the same terms in different orders can lie apart, each rounded to bf16 after
+    every add. Each of a sum's `world - 1` roundings moves it by at most half a bf16 ulp of the
+    partial sum it rounds, and every partial sum lies within 1.04 times the sum of the terms'
+    magnitudes (up to eight terms, a relative rounding of 2^-8 each): two orders lie within
+    `world - 1` ulps of 1.04 times that sum."""
+    world = len(ys)
+    rows = ys[0].shape[0] // world
+    mags = sum(
+        op._sanitized(y[rank * rows : (rank + 1) * rows]).float().abs() for y in ys
+    )  # fmt: skip
+    _, exponent = torch.frexp(mags * 1.04)  # mags * 1.04 in [2^(e-1), 2^e): its bf16 ulp 2^(e-8)
+    return (world - 1) * torch.ldexp(torch.ones_like(mags), exponent - 8)
+
+
+def _check_rs(name: str, got: torch.Tensor, nccl: torch.Tensor, ring: bool, ys, rank: int) -> None:
+    """The reduce-scatter against NCCL: bitwise where NCCL sums in rank order, else within
+    `_reorder_bound` of every rank's partials `ys` (NCCL's order is another ring's)."""
     if ring:
         _check(name, got, nccl)
-    else:
-        torch.testing.assert_close(got.float(), nccl.float(), rtol=0, atol=0.0625, msg=name)
+        return
+    diff = (got.float() - nccl.float()).abs()
+    over = diff > _reorder_bound(ys, rank)
+    assert not bool(over.any()), (
+        f"{name}: {int(over.sum())} lanes past the reorder bound, largest difference "
+        f"{float(diff.max())}"
+    )
 
 
 def _nccl(x, y, world: int):
@@ -184,12 +206,14 @@ def _rank_main(rank: int, port: int, world: int, step: bool, via_pointers: bool)
                 for k, (x, y, gathered, reduced) in enumerate(rounds):
                     nccl_gathered, nccl_reduced = _nccl(x, y, world)
                     tag = f"{world} ranks, {rows} rows, {trips} trips, trip {k}"
-                    _check(f"gather vs NCCL ({tag})", gathered, nccl_gathered)
-                    _check_rs(f"reduce-scatter vs NCCL ({tag})", reduced, nccl_reduced, ring)
                     xs = [torch.empty_like(x) for _ in range(world)]
                     ys = [torch.empty_like(y) for _ in range(world)]
                     dist.all_gather(xs, x)
                     dist.all_gather(ys, y)
+                    _check(f"gather vs NCCL ({tag})", gathered, nccl_gathered)
+                    _check_rs(
+                        f"reduce-scatter vs NCCL ({tag})", reduced, nccl_reduced, ring, ys, rank
+                    )
                     ref = op.dep_lamport_round_trip.reference
                     _check(f"gather vs reference ({tag})", gathered, ref(xs, rank, False))
                     _check(f"reduce-scatter vs reference ({tag})", reduced, ref(ys, rank, True))
@@ -199,9 +223,16 @@ def _rank_main(rank: int, port: int, world: int, step: bool, via_pointers: bool)
                 gathered = op.dep_lamport_round_trip(x, trip, False)
                 reduced = op.dep_lamport_round_trip(y, trip, True)
                 nccl_gathered, nccl_reduced = _nccl(x, y, world)
+                ys = [torch.empty_like(y) for _ in range(world)]
+                dist.all_gather(ys, y)
                 _check(f"gather outside a region ({rows} rows)", gathered, nccl_gathered)
                 _check_rs(
-                    f"reduce-scatter outside a region ({rows} rows)", reduced, nccl_reduced, ring
+                    f"reduce-scatter outside a region ({rows} rows)",
+                    reduced,
+                    nccl_reduced,
+                    ring,
+                    ys,
+                    rank,
                 )
 
             # Replayed from one graph: fresh inputs copied into its static buffers.
@@ -222,10 +253,12 @@ def _rank_main(rank: int, port: int, world: int, step: bool, via_pointers: bool)
                 sy.copy_(y)
                 graph.replay()
                 nccl_gathered, nccl_reduced = _nccl(x, y, world)
-                _check(f"replay {i}: gather {rows} rows", g_out, nccl_gathered)
-                _check_rs(f"replay {i}: reduce-scatter {rows} rows", r_out, nccl_reduced, ring)
                 ys = [torch.empty_like(y) for _ in range(world)]
                 dist.all_gather(ys, y)
+                _check(f"replay {i}: gather {rows} rows", g_out, nccl_gathered)
+                _check_rs(
+                    f"replay {i}: reduce-scatter {rows} rows", r_out, nccl_reduced, ring, ys, rank
+                )
                 _check(
                     f"replay {i}: reduce-scatter {rows} rows vs reference",
                     r_out,
@@ -422,6 +455,46 @@ def _spawn_bounded(fn, args, nprocs: int, timeout: float) -> None:
 )
 def test_round_trip_rows_shrink_and_grow(step):
     _spawn_bounded(_shrink_main, (_free_port(), 4, step), 4, TIMEOUT)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("world", [4, 8])
+def test_reorder_bound_holds_for_every_sum_order(world):
+    """`_reorder_bound` holds between the reference's sum order and the other orders a ring can
+    add a rank's slice in (any order that ends at the owner: all 6 at four ranks, 64 of the
+    5,040 at eight, and the one that adds the small terms first), over the test's inputs and
+    over partials where the order matters (three 3s, the rest 1/32: 9.0 in rank order, 9.125
+    with the small terms first, past the fixed 0.0625 this comparison used to allow)."""
+    import itertools
+    import random as _random
+
+    gen = torch.Generator().manual_seed(20261127 + world)
+    rows = 4
+    rng = _random.Random(world)
+    ref = op.dep_lamport_round_trip.reference
+    cases = [[_inputs(gen, world * rows, "cpu") for _ in range(world)]]
+    adversarial = torch.tensor([3.0] * 3 + [1.0 / 32] * (world - 3), dtype=torch.bfloat16)
+    cases.append(
+        [torch.full([world * rows, HIDDEN], float(adversarial[r])).to(torch.bfloat16)
+         for r in range(world)]
+    )  # fmt: skip
+    for case, ys in enumerate(cases):
+        for rank in range(world):
+            want = ref(ys, rank, True).float()
+            bound = _reorder_bound(ys, rank)
+            others = [p for p in itertools.permutations(range(world)) if p[-1] == rank]
+            orders = rng.sample(others, min(len(others), 64))
+            small_first = [r for r in range(3, world) if r != rank] + [
+                r for r in range(3) if r != rank
+            ]
+            orders.append(tuple(small_first + [rank]))
+            worst = 0.0
+            for order in orders:
+                diff = (ref(ys, rank, True, sum_order=order).float() - want).abs()
+                assert bool((diff <= bound).all()), (world, case, rank, order)
+                worst = max(worst, float(diff.max()))
+            if case == 1 and rank == world - 1 and world == 8:
+                assert worst > 0.0625, worst  # the order matters past the old fixed tolerance
 
 
 # ---- the slot protocol on the host: every interleaving of two ranks ----
