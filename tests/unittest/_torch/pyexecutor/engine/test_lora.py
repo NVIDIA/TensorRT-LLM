@@ -656,6 +656,11 @@ def test_encoder_decoder_runner_inherits_lora_model_fallback(
         ("step3p7vl", "Step3p7VLForConditionalGeneration"),
         ("nemotron_h_multimodal", "NemotronHMultimodalModel"),
         ("mistral", "Mistral3VLM"),
+        ("qwen2vl", "Qwen2VLModel"),
+        ("qwen3vl", "Qwen3VLModel"),
+        ("gemma4mm", "Gemma4ForConditionalGeneration"),
+        ("deepseekv41_multimodal", "DeepseekV41ForConditionalGeneration"),
+        ("glm5_next_vision", "Glm5NextVLM"),
     ],
 )
 def test_multimodal_language_model_property_returns_llm(module_name: str, class_name: str) -> None:
@@ -671,6 +676,21 @@ def test_multimodal_language_model_property_returns_llm(module_name: str, class_
 
 class _UndeclaredMultimodalModel(MultimodalModelMixin, torch.nn.Module):
     pass
+
+
+def test_multimodal_mixin_accessors_default_to_llm() -> None:
+    model = _UndeclaredMultimodalModel()
+    with pytest.raises(NotImplementedError):
+        model.language_model
+    with pytest.raises(NotImplementedError):
+        model.text_embedding_layer
+
+    model.llm = torch.nn.Module()
+    model.llm.model = torch.nn.Module()
+    model.llm.model.embed_tokens = torch.nn.Embedding(4, 2)
+
+    assert model.language_model is model.llm
+    assert model.text_embedding_layer is model.llm.model.embed_tokens
 
 
 def test_multimodal_lora_owner_declaration_is_required() -> None:

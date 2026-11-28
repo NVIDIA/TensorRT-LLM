@@ -14,15 +14,18 @@
 # limitations under the License.
 """CPU checks for the locality-domain partition helpers of the TRTLLM backend."""
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
@@ -421,6 +424,60 @@ def test_mrope_overrides_follow_kernel_indexing():
 
     with pytest.raises(RuntimeError, match="cannot slice"):
         trtllm_backend._locality_domain_mrope_overrides(forward_args, ld_slice, num_ctx, 5)
+
+
+@pytest.mark.parametrize(
+    "num_live, ld_slice",
+    [
+        # Domain 1 holds context tokens [64, 127) of 127 live tokens.
+        (127, _slice(ctx_req=(1, 2), ctx_tok=(64, 127))),
+        # Domain 1 holds context tokens [32, 64) of 64 live tokens.
+        (64, _slice(ctx_req=(1, 2), ctx_tok=(32, 64))),
+    ],
+)
+def test_padded_mrope_table_slices_on_live_rows(num_live, ld_slice):
+    """A padded prefill graph packs a cos/sin row for every bucket row; attention trims it with q."""
+    bucket, row_width = 128, 128
+    cos_sin = torch.arange(bucket * row_width, dtype=torch.float).view(1, -1)
+    recorded = {}
+
+    def backend_forward(q, k, v, metadata, forward_args):
+        recorded["forward_args"] = forward_args
+        return forward_args.output
+
+    module = SimpleNamespace(
+        attn=SimpleNamespace(forward=backend_forward, layer_idx=0),
+        mapping=SimpleNamespace(has_cp_helix=lambda: False),
+        offers_gated_fp8_out=False,
+        _get_output_quant_flags=lambda: (False, False),
+    )
+    metadata = SimpleNamespace(
+        num_tokens=num_live,
+        mixed_precision_kv_staging=lambda layer_idx: contextlib.nullcontext(),
+    )
+    Attention._attn_impl(
+        module,
+        torch.zeros(bucket, 8),
+        None,
+        None,
+        metadata,
+        PredefinedAttentionMask.CAUSAL,
+        cos_sin,
+        None,
+        None,
+        None,
+        output=torch.zeros(bucket, 8),
+    )
+    forward_args = recorded["forward_args"]
+    # A view of the packed table, so a graph keeps reading it in place.
+    assert forward_args.mrope_rotary_cos_sin.data_ptr() == cos_sin.data_ptr()
+    assert forward_args.mrope_rotary_cos_sin.numel() == num_live * row_width
+
+    overrides = trtllm_backend._locality_domain_mrope_overrides(forward_args, ld_slice, 2, num_live)
+    start, end = ld_slice["ctx_token_start"], ld_slice["ctx_token_end"]
+    torch.testing.assert_close(
+        overrides["mrope_rotary_cos_sin"], cos_sin[:, start * row_width : end * row_width]
+    )
 
 
 def test_draft_context_without_manager_disables_partitioning():
