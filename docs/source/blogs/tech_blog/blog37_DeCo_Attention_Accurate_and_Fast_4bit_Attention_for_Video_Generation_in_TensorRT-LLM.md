@@ -21,18 +21,15 @@ By NVIDIA TensorRT-LLM team
 - [Error Analysis of 4-Bit Attention](#error-analysis-of-4-bit-attention)
   - [Rounding Error of NVFP4](#rounding-error-of-nvfp4)
   - [Softmax Amplification](#softmax-amplification)
-- [QK: Principal Residual Compensation](#qk-principal-residual-compensation)
-  - [First-Order Error Along the Principal Directions](#first-order-error-along-the-principal-directions)
-  - [Hadamard Rotation](#hadamard-rotation)
-  - [Compensation Along r Directions](#compensation-along-r-directions)
-  - [Compensated and Remaining Error](#compensated-and-remaining-error)
+- [Algorithm Design](#algorithm-design)
+  - [Principal Residual Compensation](#principal-residual-compensation)
   - [Preparation Cost](#preparation-cost)
-- [PV: V Smoothing](#pv-v-smoothing)
+  - [Hadamard Rotation and V Smoothing](#hadamard-rotation-and-v-smoothing)
 - [Kernel Design](#kernel-design)
   - [I-ExpCast](#i-expcast)
   - [Row Sum in the PV MMA](#row-sum-in-the-pv-mma)
   - [Lazy Rescale](#lazy-rescale)
-- [Co-Design Ablation](#co-design-ablation)
+- [Why it needs Co-Design](#why-it-needs-co-design)
 - [Results](#results)
   - [Speedup](#speedup)
   - [Accuracy](#accuracy)
@@ -170,73 +167,49 @@ The approximation breaks as a centered error approaches 1.0, where exp(*e*<sub>j
 
 The PV product is not followed by an exponential. The rounding errors of P and V therefore add up in the output without amplification, which is why attention tolerates a low-precision PV much better.
 
-An accurate 4-bit QK therefore cannot come from better scales alone, and the rounding error itself has to be treated.
+## Algorithm Design
 
-## QK: Principal Residual Compensation
+Earlier low-precision attention, such as SageAttention and VC-Attention, reduces the quantization error by smoothing Q and K or by finer scales. A floating-point element keeps its relative rounding error at any scale, however, so the rounding error of Q and K stays in the scores. An accurate 4-bit QK therefore cannot come from better scales alone, and the rounding error itself has to be treated. DeCo-Attention treats this error numerically. It splits the error of the 4-bit score into its terms and adds the main part back inside the QK product.
 
-DeCo-Attention treats the rounding error of the 4-bit QK numerically. Rounding a tensor *x* gives a low-precision tensor *x̂* and leaves a residual δ*x* = *x* − *x̂*, which is known exactly after the rounding. For a query *q* and a key *k*, the exact score therefore has four terms.
+### Principal Residual Compensation
+
+Rounding a tensor *x* gives a low-precision tensor *x̂* and leaves a residual δ*x* = *x* − *x̂*, which is known exactly after the rounding. For a query *q* and a key *k*, the exact score therefore has four terms.
 
 $$q \cdot k = \hat q \cdot \hat k + \delta q \cdot \hat k + \hat q \cdot \delta k + \delta q \cdot \delta k$$
 
 A 4-bit kernel computes only the first of the four terms. The two first-order terms, δ*q* · *k̂* and *q̂* · δ*k*, hold most of the error of the 4-bit score, and the second-order term δ*q* · δ*k* is small enough to leave out. Adding the two first-order terms back exactly would take two more full-width matrix products, which costs more than running QK in FP8. A cheaper compensation has to know where the first-order error lies.
 
-### First-Order Error Along the Principal Directions
+Take the Q-side term of one query and add up its square over all keys. The total splits along the eigenvectors *u*<sub>m</sub> of the Gram matrix of the quantized keys.
 
-Take the Q-side term and add up its square over all queries *i* and keys *j* of a head. The total splits along the eigenvectors *u*<sub>m</sub> of the Gram matrix of the quantized keys, which are the same for every query of the head.
+$$\sum_j (\delta q \cdot \hat k_j)^2 = \sum_{m=1}^{d} \lambda_m \, (\delta q \, u_m)^2$$
 
-$$\sum_i \sum_j (\delta q_i \cdot \hat k_j)^2 = \sum_{m=1}^{d} \lambda_m \sum_i (\delta q_i \, u_m)^2$$
+Each direction contributes its eigenvalue λ<sub>m</sub>, the energy of the keys along the direction, times the squared component of the residual along the direction. The eigenvalues are strongly concentrated (Figure 5(b)). On Wan2.2, the 32 leading eigenvectors hold a median of 74.3% of the energy of K over the heads, while the 32 largest channels hold 46.9%. The error is therefore weighted toward a few leading directions, and these are the directions to compensate.
 
-Because the eigenvectors *u*<sub>m</sub> are orthonormal, the error energy is a sum over the directions with no cross terms, and two quantities set the contribution of each direction.
-
-- The eigenvalue λ<sub>m</sub> is the energy of the keys along the direction. This factor is strongly concentrated (Figure 5(b)). On Wan2.2, the 32 leading eigenvectors hold a median of 74.3% of the energy of K over the heads, while the 32 largest channels hold 46.9%.
-- The squared component of the residual δ*q* along the direction, summed over the queries, is the energy of the residuals along the direction. This factor depends on the input and cannot be modeled accurately.
-
-### Hadamard Rotation
-
-To remove this dependence on the input, DeCo-Attention rotates Q and K before rounding by a normalized Hadamard matrix with random row signs. The rotation leaves the scores unchanged and has two benefits.
-
-- The rotation ties the error to the eigenvalues. Without the rotation, the residual of the queries is largest in the outlier channels, where the keys also hold most of their energy, so the second factor grows with the eigenvalue (Figure 8(a)). The rotation spreads the residual δ*q* evenly over all directions, so that the residual of a query has no preferred direction. Summed over the queries of a head, the second factor is then the same for every direction *m*. The error along a direction is then proportional to the eigenvalue, and the eigenvalues are concentrated. Compensating the *r* leading directions is therefore both effective and stable.
-- The rotation lowers the rounding error itself. NVFP4 rounds a block with one shared scale. The rotation makes the values of a block similar in size, and Figure 8(b) shows the effect on the error that remains after the compensation of the next subsection, where the second-order term, the rounding of the compensation channels, and the total all fall. The rotation also spreads the first-order error over more directions, which leaves the leading directions a smaller share of a smaller error, and the part outside the leading directions rises only slightly.
-
-<p align="center">
-  <img src="../media/tech_blog37_rotation.png" alt="The Hadamard rotation on the hard layers of Wan2.2: residual energy along each eigenvector against its eigenvalue, and the parts of the error left after the compensation" width="1000">
-</p>
-
-<p align="center"><sub><em>Figure 8. The Hadamard rotation on the hard layers of Wan2.2. Panel (a) plots the residual energy along each direction, summed over the queries of the head and divided by the mean over the directions, against the eigenvalue of the direction, with one point per direction and head. Panel (b) gives the three parts of the QK error that remain after the compensation, and the error of the compensated QK, without and with the rotation.</em></sub></p>
-
-A compensation along the largest channels behaves the opposite way, because after the rotation no channel stands out. Such a compensation therefore gets worse where the compensation along eigenvectors gets better.
-
-The rotation has one side effect. The block scale of NVFP4 stores a single dominant value of a block almost exactly, and the rotation spreads such a value over channels that are each rounded to 4 bits. Some heads of the hard layers of MiniMax-H3 hold values of this kind, and for these heads the rotation makes the error slightly worse.
-
-### Compensation Along r Directions
-
-DeCo-Attention keeps each first-order term along the *r* leading eigenvectors and computes the kept part inside the QK product. Figure 9 states the method.
+DeCo-Attention keeps each first-order term along the *r* leading eigenvectors and computes the kept part inside the QK product. Figure 8 states the method.
 
 <p align="center">
   <img src="../media/tech_blog37_compensation_equations.png" alt="The exact score as four terms, the first-order term kept along r leading directions, and the extended operands" width="650">
 </p>
 
-<p align="center"><sub><em>Figure 9. Principal residual compensation.</em></sub></p>
+<p align="center"><sub><em>Figure 8. Principal residual compensation.</em></sub></p>
 
-The first line repeats the decomposition of the exact score. The second line approximates a first-order term in an orthonormal basis of the head, where most of the sum over the *d* directions lies along the leading eigenvectors of the keys. With *B*<sub>K</sub> holding the *r* leading eigenvectors, the term becomes a dot product of *r* numbers, and the K-side term is treated the same way along the *r* leading eigenvectors *B*<sub>Q</sub> of the queries. The third line appends the two dot products as extra channels of the same product (Figure 10), and *q*′ · *k*′ then gives the quantized score plus both corrections in one block-scaled NVFP4 MMA. With *r* = 32, a head of 128 channels grows to 192 without a second matrix product.
+The first line repeats the decomposition of the exact score. The second line approximates a first-order term in an orthonormal basis of the head, where most of the sum over the *d* directions lies along the leading eigenvectors of the keys. With *B*<sub>K</sub> holding the *r* leading eigenvectors, the term becomes a dot product of *r* numbers, and the K-side term is treated the same way along the *r* leading eigenvectors *B*<sub>Q</sub> of the queries. The third line appends the two dot products as extra channels of the same product (Figure 9), and *q*′ · *k*′ then gives the quantized score plus both corrections in one block-scaled NVFP4 MMA. With *r* = 32, a head of 128 channels grows to 192 without a second matrix product.
 
 <p align="center">
   <img src="../media/tech_blog37_extended_operands.png" alt="The extended operands and the three terms of the product q prime times k prime" width="500">
 </p>
 
-<p align="center"><sub><em>Figure 10. The extended operands and the three terms of the product q′ · k′.</em></sub></p>
+<p align="center"><sub><em>Figure 9. The extended operands and the three terms of the product q′ · k′.</em></sub></p>
 
-### Compensated and Remaining Error
-
-More directions remove more error but widen the product. Figure 11(a) shows the trade-off on Wan2.2 and MiniMax-H3. The first 16 directions remove most of the error, and the step to 32 still helps on the hard layers. DeCo-Attention therefore uses *r* = 32 on every model and GPU. Figure 11(b) splits the QK error that remains after the compensation into parts. The largest part is the first-order error in the dropped directions, which a larger *r* would reduce, and the second-order term is the smallest, which justifies leaving the term out.
+More directions remove more error but widen the product. Figure 10(a) shows the trade-off on Wan2.2 and MiniMax-H3. The first 16 directions remove most of the error, and the step to 32 still helps on the hard layers. DeCo-Attention therefore uses *r* = 32 on every model and GPU. Figure 10(b) splits the QK error that remains after the compensation into parts. The largest part is the first-order error in the dropped directions, which a larger *r* would reduce, and the second-order term is the smallest, which justifies leaving the term out.
 
 <p align="center">
   <img src="../media/tech_blog37_compensated_error.png" alt="Kernel error against the number of directions, the parts of the remaining QK error, and the error per compensation term" width="1000">
 </p>
 
-<p align="center"><sub><em>Figure 11. Panel (a) gives the kernel error with FP8 PV against the number of compensated directions r. Panel (b) gives the three parts of the QK error that remain after the compensation with r = 32 on Wan2.2, each measured as the relative L2 error that part alone causes. Panel (c) gives the kernel error on Wan2.2 with FP8 PV when the compensation adds neither term, one term, or both terms. All four cases of (c) use the Hadamard rotation and V smoothing.</em></sub></p>
+<p align="center"><sub><em>Figure 10. Panel (a) gives the kernel error with FP8 PV against the number of compensated directions r. Panel (b) gives the three parts of the QK error that remain after the compensation with r = 32 on Wan2.2, each measured as the relative L2 error that part alone causes. Panel (c) gives the kernel error on Wan2.2 with FP8 PV when the compensation adds neither term, one term, or both terms. All four cases of (c) use the Hadamard rotation and V smoothing.</em></sub></p>
 
-The two first-order terms are also not equally important, because the softmax passes on only the differences of the score errors between the keys of a query. In the K-side term, the residuals of different keys are multiplied by the whole query and do not cancel. In the Q-side term, the same residual δ*q* meets every key, and only the differences between keys remain. Figure 11(c) confirms the ordering of the two terms, since the K-side term alone removes most of the error and the Q-side term adds the rest.
+The two first-order terms are also not equally important, because the softmax passes on only the differences of the score errors between the keys of a query. In the K-side term, the residuals of different keys are multiplied by the whole query and do not cancel. In the Q-side term, the same residual δ*q* meets every key, and only the differences between keys remain. Figure 10(c) confirms the ordering of the two terms, since the K-side term alone removes most of the error and the Q-side term adds the rest.
 
 ### Preparation Cost
 
@@ -246,30 +219,15 @@ Because the principal directions depend on the data, DeCo-Attention estimates th
 - The Gram matrices come from a random sample of 1/256 of the tokens, at least 64, which costs almost no kernel accuracy on Wan2.2.
 - The preparation is a short chain of fused kernels, linear in the sequence length where attention is quadratic. On Wan2.2 the chain takes 1.55 ms on GB300 and 1.05 ms on VR200 and adds 2.7% to 3.6% to the attention time.
 
-## PV: V Smoothing
+### Hadamard Rotation and V Smoothing
 
-The PV product is less sensitive than QK, but the PV error has a direction. Rounding P sends the smallest probabilities to zero and loses the corresponding values of V. When the values of a block share a common offset, the losses all point the same way (Figure 12, left), and the bias accumulates over the layers and the denoising steps. DeCo-Attention therefore applies V smoothing, introduced by VC-Attention. The mean of each block of consecutive keys is subtracted from V before rounding, and one high-precision MMA adds the block means back after the low-precision PV product, which centers the row errors near zero (Figure 12, right).
-
-<p align="center">
-  <img src="../media/tech_blog37_v_smoothing.png" alt="Why rounding P biases the output, and the row errors without and with V smoothing" width="1000">
-</p>
-
-<p align="center"><sub><em>Figure 12. The left panels show, for one channel, the values of the keys whose probabilities round to zero, with V as it is and with the block mean subtracted. The right panel shows the error of the output rows along the shared direction, without and with V smoothing.</em></sub></p>
-
-The block is 128 keys with FP8 PV and 16 keys with NVFP4 PV. On the hard layers of Wan2.2, the kernel error goes from 2.95% to 2.80% with FP8 PV and from 7.50% to 5.68% with NVFP4 PV.
+Two supporting techniques complete the algorithm, and the paper gives the details of both. Before rounding, DeCo-Attention rotates Q and K by a normalized Hadamard matrix with random row signs, which leaves the scores unchanged. The rotation makes the values of a block similar in size, which lowers the rounding error. It also spreads the residuals evenly over all directions, so that the error along a direction is proportional to its eigenvalue and no longer depends on the input. For the PV product, DeCo-Attention applies V smoothing, introduced by VC-Attention. The mean of each block of keys is subtracted from V before rounding and added back by one high-precision MMA, which keeps the attention output unbiased.
 
 ## Kernel Design
 
-An accurate 4-bit QK is half of the work, because with both matrix products in low precision the kernel no longer waits on the tensor cores but on the softmax between the products. The expensive part of the softmax is the exponential, which runs on the special-function unit (SFU) through MUFU instructions, and the SFU handles far fewer scores per cycle than the tensor cores. As the MMAs get faster, the exponential takes a growing share of the kernel time. Earlier kernels reduce the cost of the exponential in two ways.
+An accurate 4-bit QK is half of the work. With both matrix products in low precision, the kernel no longer waits on the tensor cores but on the softmax between the products, and mostly on the exponential. The exponential runs on the special-function unit (SFU) through MUFU instructions, at far fewer scores per cycle than the tensor cores. Earlier kernels lower this cost at a price. FlashAttention-4 emulates part of the exponentials on the fused multiply-add (FMA) units, which takes many more instructions. ExpCast, from VC-Attention, and Direct-P build the code of each probability from a linear function of the score, which is fast, but neither rounds to the nearest code nor covers the subnormal codes.
 
-- FlashAttention-4 emulates part of the exponentials on the fused multiply-add (FMA) units, which frees the SFU at the cost of many more instructions.
-- ExpCast, from VC-Attention, and Direct-P skip the exponential and build the code of each probability from a linear function of the score. Both are fast, but neither rounds to the nearest code or covers the subnormal codes, which costs accuracy on small probabilities.
-
-We implement the kernels of DeCo-Attention in CuTe DSL for GB300, VR200, and RTX PRO 6000. The format of the PV product depends on the GPU, FP8 on GB300 and VR200 where a 4-bit PV would gain little speed, and NVFP4 on RTX PRO 6000. The kernels shorten the softmax in three ways.
-
-- I-ExpCast forms the probabilities without the special-function unit.
-- The PV MMA returns the row sum of the probabilities together with the output.
-- The lazy rescale skips most rescales of the accumulated output.
+We implement the kernels of DeCo-Attention in CuTe DSL for GB300, VR200, and RTX PRO 6000. The format of the PV product depends on the GPU, FP8 on GB300 and VR200 where a 4-bit PV would gain little speed, and NVFP4 on RTX PRO 6000. The kernels shorten the softmax with I-ExpCast, the row sum in the PV MMA, and the lazy rescale.
 
 ### I-ExpCast
 
@@ -283,39 +241,39 @@ I-ExpCast evaluates this linear function in the subnormal range of FP32, where t
 
 $$\hat p_j = \mathcal{Q}\Big(\mathrm{sat}_{16}\big(\mathrm{bits}_{\mathrm{FP32}}(a\,s_j + c)\big)\Big)$$
 
-The same routine serves FP8 and FP4 probabilities, and Figure 13 compares the decoded probabilities with the exact ones. I-ExpCast matches the exact exponential with rounding over the whole range including the subnormal codes, where ExpCast drops to zero. Direct-P departs from the exact value over much of the range. With exact scores and only P rounded to FP4, the Direct-P codes give an error of 5.06% over all layers of Wan2.2 against 1.90% for I-ExpCast.
+The same routine serves FP8 and FP4 probabilities, and Figure 11 compares the decoded probabilities with the exact ones. I-ExpCast matches the exact exponential with rounding over the whole range including the subnormal codes, where ExpCast drops to zero. Direct-P departs from the exact value over much of the range. With exact scores and only P rounded to FP4, the Direct-P codes give an error of 5.06% over all layers of Wan2.2 against 1.90% for I-ExpCast.
 
 <p align="center">
   <img src="../media/tech_blog37_p_codes.png" alt="Decoded value of P over the exact value, for each way of forming the codes" width="480">
 </p>
 
-<p align="center"><sub><em>Figure 13. Ratio of the decoded probability to the exact probability for each way of forming the codes, for (a) FP8 and (b) FP4 probabilities.</em></sub></p>
+<p align="center"><sub><em>Figure 11. Ratio of the decoded probability to the exact probability for each way of forming the codes, for (a) FP8 and (b) FP4 probabilities.</em></sub></p>
 
-Inside the kernel, the way of forming P shows directly in the time (Figure 14). Computing the exponential on the SFU takes 21.5% longer with FP8 PV and 34.3% longer with NVFP4 PV. The polynomial of FlashAttention-4 does not close this gap. A score pair takes 13 instructions on the polynomial against 4 on the SFU, and with the polynomial on one eighth of the score pairs the FP8-PV kernel takes 25.7% longer than with I-ExpCast, more than with the SFU alone. ExpCast is close in time, 3.6% longer than I-ExpCast. Direct-P needs the fewest instructions for this step. The Direct-P bar (†) times the released Direct-P kernel as a whole, which is a different implementation from the other bars and takes 40.2% longer than the NVFP4-PV kernel of DeCo-Attention.
+Inside the kernel, the way of forming P shows directly in the time (Figure 12). Computing the exponential on the SFU takes 21.5% longer with FP8 PV and 34.3% longer with NVFP4 PV. The polynomial of FlashAttention-4 does not close this gap. A score pair takes 13 instructions on the polynomial against 4 on the SFU, and with the polynomial on one eighth of the score pairs the FP8-PV kernel takes 25.7% longer than with I-ExpCast, more than with the SFU alone. ExpCast is close in time, 3.6% longer than I-ExpCast. Direct-P needs the fewest instructions for this step. The Direct-P bar (†) times the released Direct-P kernel as a whole, which is a different implementation from the other bars and takes 40.2% longer than the NVFP4-PV kernel of DeCo-Attention.
 
 <p align="center">
   <img src="../media/tech_blog37_forming_p.png" alt="Kernel time per way of forming the probabilities" width="760">
 </p>
 
-<p align="center"><sub><em>Figure 14. Kernel time of one Wan2.2 call on GB300 for each way of forming the probabilities.</em></sub></p>
+<p align="center"><sub><em>Figure 12. Kernel time of one Wan2.2 call on GB300 for each way of forming the probabilities.</em></sub></p>
 
 ### Row Sum in the PV MMA
 
 The softmax needs the sum of each row of probabilities, and computing the sum next to the exponentials adds work where the kernel is already limited. Since the tensor cores have spare capacity, a column of ones appended to V lets the PV MMA return the row sum of P with the output, which moves the work to the tensor cores.
 
-Figure 15 compares this row sum with a sum on the ALU. An ALU sum of the same E4M3 values gives the same error and takes 7.2% longer, so the row sum in the PV MMA costs no accuracy. A sum of the probabilities before the rounding to E4M3 is also slower and slightly less accurate. The output is the PV product divided by the row sum, so when the row sum uses the unrounded P while the product uses the rounded P, the attention weights no longer sum to one and the output is biased.
+Figure 13 compares this row sum with a sum on the ALU. An ALU sum of the same E4M3 values gives the same error and takes 7.2% longer, so the row sum in the PV MMA costs no accuracy. A sum of the probabilities before the rounding to E4M3 is also slower and slightly less accurate. The output is the PV product divided by the row sum, so when the row sum uses the unrounded P while the product uses the rounded P, the attention weights no longer sum to one and the output is biased.
 
 <p align="center">
   <img src="../media/tech_blog37_row_sum.png" alt="Row sum of P in the PV MMA and on the ALU" width="520">
 </p>
 
-<p align="center"><sub><em>Figure 15. Attention time of a Wan2.2 call and relative L2 error (%) of the kernel with FP8 PV on GB300 without V smoothing, with the row sum of P in the PV MMA and on the ALU.</em></sub></p>
+<p align="center"><sub><em>Figure 13. Attention time of a Wan2.2 call and relative L2 error (%) of the kernel with FP8 PV on GB300 without V smoothing, with the row sum of P in the PV MMA and on the ALU.</em></sub></p>
 
 ### Lazy Rescale
 
 The online softmax rescales the accumulated output whenever a new tile raises the running row maximum. The lazy rescale moves the base only when the maximum grows by more than a factor of 2<sup>*T*</sup>, which skips most rescales. A larger *T* skips more of them but costs accuracy, and how much depends on the format of P.
 
-An FP8 P is the more sensitive of the two. FP8 has a fixed range, and a larger *T* keeps more of it free at the top for probabilities that grow above the base. That leaves less room at the bottom for the small probabilities. With *T* = 8, the setting of FlashAttention-4, probabilities below 2<sup>−9</sup> of the base underflow to zero, and the error over all layers of Wan2.2 is 4.50% (Figure 16). With *T* = 4, probabilities survive down to 2<sup>−13</sup> and the error is 3.73%, against 3.70% with a rescale at every tile, while the kernel runs within 0.5% of the time of *T* = 8.
+An FP8 P is the more sensitive of the two. FP8 has a fixed range, and a larger *T* keeps more of it free at the top for probabilities that grow above the base. That leaves less room at the bottom for the small probabilities. With *T* = 8, the setting of FlashAttention-4, probabilities below 2<sup>−9</sup> of the base underflow to zero, and the error over all layers of Wan2.2 is 4.50% (Figure 14). With *T* = 4, probabilities survive down to 2<sup>−13</sup> and the error is 3.73%, against 3.70% with a rescale at every tile, while the kernel runs within 0.5% of the time of *T* = 8.
 
 An NVFP4 P hardly reacts to *T*. NVFP4 has two levels of scale, a global scale and one scale per block of 16 keys, and the room for *T* is taken from these scales. Inside a block, the largest probability still maps to the largest 4-bit value, so the 4-bit values use their full range at every *T*. FP8 has no block scale, and the room for *T* is taken from the values themselves. The error with NVFP4 PV therefore changes only in the second decimal from *T* = 0 to *T* = 8.
 
@@ -325,17 +283,17 @@ DeCo-Attention therefore uses *T* = 4 for both formats, as the balance of accura
   <img src="../media/tech_blog37_lazy_rescale_threshold.png" alt="Kernel time and error at three thresholds of the lazy rescale" width="520">
 </p>
 
-<p align="center"><sub><em>Figure 16. Attention time of a Wan2.2 call and relative L2 error (%) of the kernels with FP8 PV and NVFP4 PV on GB300 at three thresholds T of the lazy rescale.</em></sub></p>
+<p align="center"><sub><em>Figure 14. Attention time of a Wan2.2 call and relative L2 error (%) of the kernels with FP8 PV and NVFP4 PV on GB300 at three thresholds T of the lazy rescale.</em></sub></p>
 
-## Co-Design Ablation
+## Why it needs Co-Design
 
-Figure 17 shows why the compensation and the kernel optimizations were designed together.
+Figure 15 shows why the compensation and the kernel optimizations were designed together.
 
 <p align="center">
   <img src="../media/tech_blog37_codesign_ablation.png" alt="Time, speedup, SM clock and error as the pieces are added" width="1000">
 </p>
 
-<p align="center"><sub><em>Figure 17. The pieces of DeCo-Attention added one at a time to the kernel with FP8 PV on GB300, with the time of one Wan2.2 call, the speedup over BF16 attention, the SM clock under the power limit, and the error on the hard layers. The FP8-QK reference is the same kernel with an uncompensated FP8 QK and one scale per tensor.</em></sub></p>
+<p align="center"><sub><em>Figure 15. The pieces of DeCo-Attention added one at a time to the kernel with FP8 PV on GB300, with the time of one Wan2.2 call, the speedup over BF16 attention, the SM clock under the power limit, and the error on the hard layers. The FP8-QK reference is the same kernel with an uncompensated FP8 QK and one scale per tensor.</em></sub></p>
 
 The ablation gives three conclusions:
 
@@ -343,7 +301,9 @@ The ablation gives three conclusions:
 - **The softmax bottleneck has to be removed to turn the 4-bit QK into real speedup.** With compensation only, the softmax bounds the kernel and hides the gain of the 4-bit QK, 79.0 ms against 82.1 ms for the same kernel with an FP8 QK. I-ExpCast, the row sum in the PV MMA, and the lazy rescale bring the kernel to 55.8 ms. The optimized kernel also does more work per cycle and draws more power, which lowers the SM clock under the power limit from 2017 to 1582 MHz and gives back part of the gain.
 - **The kernel optimizations must not cost accuracy.** I-ExpCast and the lazy rescale change the numerics of the softmax, yet the error stays between 2.92% and 2.95% through all three additions, because I-ExpCast rounds to the nearest code, subnormal codes included, and therefore combines with the lazy rescale. V smoothing, the last piece, costs 2.2 ms and lowers the error to 2.80%.
 
-This is why DeCo-Attention is a co-design, since neither half is enough alone. The compensation alone gives an accurate 4-bit QK that is hardly faster than an FP8 QK. The kernel optimizations alone gain less, because with an FP8 QK the slower FP8 MMAs bound the kernel earlier. The same four changes speed up the FP8-QK reference by 1.20x against 1.36x with the NVFP4 QK, or 1.67x at a fixed clock. Together, the two halves bring out both the accuracy and the speed of 4-bit attention. The complete kernel is 1.17x faster than the optimized FP8-QK reference and more accurate on the hard layers, and the MMAs nearly bound its time. Both halves are also general. The compensation needs no training, calibration, or model-specific code, and the softmax optimizations work for FP8 and FP4 probabilities alike, so both carry over to other models and attention kernels.
+This is why DeCo-Attention is a co-design, since neither half is enough alone. The compensation alone gives an accurate 4-bit QK that is hardly faster than an FP8 QK. The kernel optimizations alone gain less, because with an FP8 QK the slower FP8 MMAs bound the kernel earlier. The same four changes speed up the FP8-QK reference by 1.20x against 1.36x with the NVFP4 QK, or 1.67x at a fixed clock. **Together, the two halves bring out both the accuracy and the speed of 4-bit attention.** The complete kernel is 1.17x faster than the optimized FP8-QK reference and more accurate on the hard layers, and the MMAs nearly bound its time.
+
+Both halves are also general. The compensation needs no training, calibration, or model-specific code, and the softmax optimizations work for FP8 and FP4 probabilities alike, so both carry over to other models and attention kernels.
 
 ## Results
 
@@ -351,33 +311,33 @@ We evaluate DeCo-Attention at the kernel level and end to end. At the kernel lev
 
 ### Speedup
 
-Figure 18 gives the speed of the kernels and of the whole generation, with DeCo-Attention running FP8 PV on GB300 and VR200 and NVFP4 PV on RTX PRO 6000. On Wan2.2, the DeCo kernel runs 2.13x, 2.49x, and 2.82x faster than the fastest BF16 kernel on the three GPUs, and the whole generation runs 1.55x, 1.68x, and 1.80x faster, while on MiniMax-H3 the speedups are similar.
+Figure 16 gives the speed of the kernels and of the whole generation, with DeCo-Attention running FP8 PV on GB300 and VR200 and NVFP4 PV on RTX PRO 6000. On Wan2.2, the DeCo kernel runs 2.13x, 2.49x, and 2.82x faster than the fastest BF16 kernel on the three GPUs, and the whole generation runs 1.55x, 1.68x, and 1.80x faster, while on MiniMax-H3 the speedups are similar.
 
 <p align="center">
   <img src="../media/tech_blog37_speedup.png" alt="Kernel-level and end-to-end speedup on GB300, VR200 and RTX PRO 6000" width="1000">
 </p>
 
-<p align="center"><sub><em>Figure 18. Speedup of the attention kernel over the fastest BF16 kernel in (a) and of the whole generation in TensorRT-LLM VisualGen over BF16 attention in (b). The SageAttention and VC-Attention bars show the FP8-QK kernels of both methods on GB300 and VR200 and the 4-bit kernels on RTX PRO 6000.</em></sub></p>
+<p align="center"><sub><em>Figure 16. Speedup of the attention kernel over the fastest BF16 kernel in (a) and of the whole generation in TensorRT-LLM VisualGen over BF16 attention in (b). The SageAttention and VC-Attention bars show the FP8-QK kernels of both methods on GB300 and VR200 and the 4-bit kernels on RTX PRO 6000.</em></sub></p>
 
 DeCo-Attention is the fastest of the compared attention kernels on every GPU. On GB300 and VR200 the DeCo kernel is 1.44x and 1.65x faster than the fastest prior method, VC-Attention, with the generation 1.22x and 1.32x faster, and on RTX PRO 6000, where SageAttention3 is the fastest prior method, the DeCo kernel is 1.08x faster at the kernel level and 1.09x end to end.
 
 ### Accuracy
 
-Figure 19 gives the kernel error on the hard layers and over all layers of Wan2.2 and MiniMax-H3. With FP8 PV, DeCo-Attention has the lowest error of all kernels with an FP8 or a 4-bit QK on the hard layers of both models, and over all layers the DeCo error lies between the errors of VC-Attention and SageAttention2 with an FP8 QK. With NVFP4 PV, DeCo-Attention has the lowest error of the fully 4-bit kernels. On the hard layers of Wan2.2, the DeCo error is about a quarter of the error of SageAttention3 and of the 4-bit VC-Attention, and below that of SageAttention2 with an FP8 QK.
+Figure 17 gives the kernel error on the hard layers and over all layers of Wan2.2 and MiniMax-H3. With FP8 PV, DeCo-Attention has the lowest error of all kernels with an FP8 or a 4-bit QK on the hard layers of both models, and over all layers the DeCo error lies between the errors of VC-Attention and SageAttention2 with an FP8 QK. With NVFP4 PV, DeCo-Attention has the lowest error of the fully 4-bit kernels. On the hard layers of Wan2.2, the DeCo error is about a quarter of the error of SageAttention3 and of the 4-bit VC-Attention, and below that of SageAttention2 with an FP8 QK.
 
 <p align="center">
   <img src="../media/tech_blog37_kernel_accuracy.png" alt="Kernel-level error on Wan2.2 and MiniMax-H3 with FP8 PV and with NVFP4 PV" width="1000">
 </p>
 
-<p align="center"><sub><em>Figure 19. Kernel-level accuracy as the relative L2 error of the attention output against FP32 attention, where lower is better, for the kernels with FP8 PV in (a) and with NVFP4 PV in (b). The SageAttention and VC-Attention bars show the FP8-QK kernels of both methods in (a) and the 4-bit kernels in (b). BF16 attention has an error of 0.15% to 0.17%.</em></sub></p>
+<p align="center"><sub><em>Figure 17. Kernel-level accuracy as the relative L2 error of the attention output against FP32 attention, where lower is better, for the kernels with FP8 PV in (a) and with NVFP4 PV in (b). The SageAttention and VC-Attention bars show the FP8-QK kernels of both methods in (a) and the 4-bit kernels in (b). BF16 attention has an error of 0.15% to 0.17%.</em></sub></p>
 
-For the end-to-end quality we generate videos for the 100 prompts of MovieGen Bench and compare each video with the BF16-attention video for the same prompt and seed (Figure 20). PSNR and SSIM are higher when two videos agree more, while LPIPS tracks what a viewer notices and is lower. A diffusion model amplifies any numeric difference along the sampling trajectory, which is why even two BF16 kernels do not produce identical videos. The BF16 row scores the BF16 attention of cuDNN against the reference and shows the scale.
+For the end-to-end quality we generate videos for the 100 prompts of MovieGen Bench and compare each video with the BF16-attention video for the same prompt and seed (Figure 18). PSNR and SSIM are higher when two videos agree more, while LPIPS tracks what a viewer notices and is lower. A diffusion model amplifies any numeric difference along the sampling trajectory, which is why even two BF16 kernels do not produce identical videos. The BF16 row scores the BF16 attention of cuDNN against the reference and shows the scale.
 
 <p align="center">
   <img src="../media/tech_blog37_e2e_quality.png" alt="End-to-end quality on four video models against BF16 attention" width="1000">
 </p>
 
-<p align="center"><sub><em>Figure 20. End-to-end quality on four video models against BF16 attention, as the mean over 100 prompts. QK/PV gives the bit widths of the two products, and DeCo-Attention is in bold. Blue cells mark the best PSNR, SSIM, and LPIPS within each group with a 4-bit QK. SageAttention2 and VC-Attention use the default INT8 QK on B200, and the rows with an FP8 QK run on GB300. The means marked † are reported by VC-Attention.</em></sub></p>
+<p align="center"><sub><em>Figure 18. End-to-end quality on four video models against BF16 attention, as the mean over 100 prompts. QK/PV gives the bit widths of the two products, and DeCo-Attention is in bold. Blue cells mark the best PSNR, SSIM, and LPIPS within each group with a 4-bit QK. SageAttention2 and VC-Attention use the default INT8 QK on B200, and the rows with an FP8 QK run on GB300. The means marked † are reported by VC-Attention.</em></sub></p>
 
 With FP8 PV, DeCo-Attention reaches the quality of the FP8-QK methods. DeCo-Attention is more accurate than MXFP8 and than SageAttention2 with an FP8 QK on every model. Against VC-Attention with an FP8 QK, DeCo-Attention is more accurate on Wan2.2 and LongCat-Video and less on the other two models. Compared with the existing NVFP4 QK, FP8 PV attention, the compensation gains about 3 to 5 dB of PSNR on every model. DeCo-Attention also narrows the gap of a 4-bit QK to INT8-QK attention, from 5 to 6 dB of PSNR behind VC-Attention with an INT8 QK to 1 to 3 dB. The INT8-QK methods need the INT8 tensor cores of B200, whereas DeCo-Attention runs on the FP4 tensor cores of GB300, VR200, and RTX PRO 6000. With NVFP4 PV, DeCo-Attention has better PSNR and LPIPS than SageAttention3 and the 4-bit VC-Attention on every model, and the fully NVFP4 DeCo kernel also matches SageAttention2 with an FP8 QK on every model, with both products in 4 bits.
 
