@@ -36,6 +36,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
     KVCacheManager,
+    SpeculativeAcceptance,
+    SpeculativeAcceptancePhase,
     get_pp_layers,
 )
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
@@ -294,6 +296,34 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
                     if point > 0:
                         snapshot_points.add(point)
             request.expect_snapshot_points = sorted(snapshot_points)
+
+    @override
+    def on_speculative_acceptance(
+        self, acceptance: SpeculativeAcceptance, phase: SpeculativeAcceptancePhase
+    ) -> None:
+        if phase is SpeculativeAcceptancePhase.BASE_STATE:
+            attn_metadata = acceptance.attn_metadata
+            state_indices = attn_metadata.mamba_metadata.state_indices
+            if acceptance.leaf_positions is None:
+                # Overrides of update_mamba_states that take no leaf positions
+                # still serve linear acceptance.
+                self.update_mamba_states(
+                    attn_metadata=attn_metadata,
+                    num_accepted_tokens=acceptance.num_accepted_tokens,
+                    state_indices=state_indices,
+                )
+            else:
+                self.update_mamba_states(
+                    attn_metadata=attn_metadata,
+                    num_accepted_tokens=acceptance.num_accepted_tokens,
+                    state_indices=state_indices,
+                    accepted_leaf_positions=acceptance.leaf_positions(),
+                )
+        else:
+            self._commit_auxiliary_speculative_state(acceptance)
+
+    def _commit_auxiliary_speculative_state(self, acceptance: SpeculativeAcceptance) -> None:
+        """Commit state this manager keeps beside the declared recurrent state."""
 
     @override
     def is_speculative(self) -> bool:

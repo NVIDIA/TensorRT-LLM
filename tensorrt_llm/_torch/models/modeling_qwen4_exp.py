@@ -14,7 +14,6 @@
 # limitations under the License.
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import torch
@@ -23,7 +22,6 @@ from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
     from ...models.modeling_utils import QuantConfig
-    from ..speculative.interface import SpecWorkerBase
 
 from ...inputs import (
     ContentFormat,
@@ -52,7 +50,7 @@ from ..modules.qwen4_exp.cache_manager import (
     get_qwen4_exp_ple_layer_mask,
 )
 from ..modules.qwen4_exp.hyper_connection import HCResidual, Qwen4ExpHyperConnection
-from ..modules.qwen4_exp.ple import PLEMetadata, Qwen4ExpPLE
+from ..modules.qwen4_exp.ple import PLEMetadata, PLESpeculativeRecord, Qwen4ExpPLE
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
 from ..recurrent_state_spec import (
@@ -351,9 +349,9 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
 
             # PLE n-gram short-conv side path, injected into the bundle before mix.
             if self.ple is not None and ple_state is not None:
-                ple_meta, conv_state, ngram_context = ple_state
+                ple_meta, conv_state, ngram_context, speculative_record = ple_state
                 hidden_states = hidden_states + self.ple(
-                    hidden_states, ple_meta, conv_state, ngram_context
+                    hidden_states, ple_meta, conv_state, ngram_context, speculative_record
                 )
 
             # Attention block: mix -> mixer -> attn_tp_all_reduce -> combine.
@@ -511,6 +509,8 @@ class Qwen4ExpModel(DecoderModel):
         # (conv_state_shape / ngram_context_len).
         self._ple_conv_state: Optional[torch.Tensor] = None
         self._ple_ngram_context: Optional[torch.Tensor] = None
+        # Verification candidates of pools the model does not get from a cache manager.
+        self._ple_speculative_record = PLESpeculativeRecord()
 
         # The final Hyper-Connection mixer IS the last norm (use_combine=False);
         # there is no separate final RMSNorm.
@@ -683,7 +683,7 @@ class Qwen4ExpModel(DecoderModel):
             is_cuda_graph=attn_metadata.is_cuda_graph,
         )
 
-        conv_state, ngram_context = self._resolve_ple_pools(
+        conv_state, ngram_context, speculative_record = self._resolve_ple_pools(
             attn_metadata, ple_module, ple_layer_idx, num_seq, device
         )
 
@@ -720,7 +720,7 @@ class Qwen4ExpModel(DecoderModel):
         # The cache-manager branch below is checked first each forward, so this
         # write never shadows the authoritative KVCacheManagerV2-owned pools.
         attn_metadata.qwen4_exp_ple_state = {ple_layer_idx: (conv_state, ngram_context)}
-        return ple_meta, conv_state, ngram_context
+        return ple_meta, conv_state, ngram_context, speculative_record
 
     def _resolve_ple_pools(
         self,
@@ -731,6 +731,13 @@ class Qwen4ExpModel(DecoderModel):
         device: torch.device,
     ) -> tuple:
         """Resolve the PLE (short-conv-state, n-gram-context) pools for a forward.
+
+        The third value is the record verification candidates go to: the cache
+        manager's for its pools, the model's own for the other two. Only the
+        cache manager's is committed on acceptance, and it is None when that
+        manager's acceptance commits no PLE state. Nothing in the runtime
+        commits the model's own: a harness that owns the other pools commits
+        the record ``_prepare_ple_state`` returns.
 
         Priority (all host-sync-free):
           1. **KVCacheManagerV2-owned pools** (serving runtime) —
@@ -750,17 +757,19 @@ class Qwen4ExpModel(DecoderModel):
                 raise RuntimeError(f"PLE cache pools are unavailable for layer {ple_layer_idx}")
             conv_state, ngram_context = pools
             self._assert_ple_pool_shape(conv_state, ngram_context, ple_module)
-            return conv_state, ngram_context
+            record = kv_cache_manager.ple_speculative_record(ple_layer_idx)
+            return conv_state, ngram_context, record
 
         provided = getattr(attn_metadata, "qwen4_exp_ple_state", None)
         if isinstance(provided, dict) and ple_layer_idx in provided:
             conv_state, ngram_context = provided[ple_layer_idx]
             self._assert_ple_pool_shape(conv_state, ngram_context, ple_module)
-            return conv_state, ngram_context
+            return conv_state, ngram_context, self._ple_speculative_record
 
         max_slots = int(attn_metadata.max_num_requests or 0)
         needed = max(max_slots, num_seq, 1)
-        return self._ensure_ple_pools(ple_module, needed, device)
+        conv_state, ngram_context = self._ensure_ple_pools(ple_module, needed, device)
+        return conv_state, ngram_context, self._ple_speculative_record
 
     @staticmethod
     def _assert_ple_pool_shape(
@@ -831,7 +840,7 @@ class Qwen4ExpModel(DecoderModel):
             ple_layer_idx = self.ple_layer_index
             if ple_layer_idx is None:
                 raise RuntimeError("PLE state was prepared on a rank without a PLE layer")
-            ple_meta, _, ngram_context = ple_state
+            ple_meta, _, ngram_context, _ = ple_state
             ple_module = self.layers[ple_layer_idx].ple
             if ple_module is None:
                 raise RuntimeError("PLE layer mask resolved to a layer without a PLE module")
@@ -1169,25 +1178,6 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
         self.preload_weight_modules = self.model.preload_weight_modules
         if spec_config is not None and spec_config.spec_dec_mode.is_mtp_one_model():
             self.model.layers.extend(self.draft_model.mtp_layers)
-            self._register_auxiliary_speculative_state_handlers(
-                self.spec_worker,
-                self.model.layers[: self.model.num_hidden_layers],
-            )
-
-    @staticmethod
-    def _register_auxiliary_speculative_state_handlers(
-        spec_worker: "SpecWorkerBase", layers: Sequence[DecoderLayer]
-    ) -> None:
-        """Register target recurrent side state that follows MTP acceptance."""
-        for layer in layers:
-            if layer.ple is not None:
-                spec_worker.register_auxiliary_state_handler(layer.ple)
-            attention = getattr(layer, "self_attn", None)
-            indexer = getattr(attention, "indexer", None)
-            if indexer is not None:
-                if not hasattr(indexer, "commit_speculative_states"):
-                    raise TypeError("QSA indexers must implement speculative commit")
-                spec_worker.register_auxiliary_state_handler(indexer)
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:

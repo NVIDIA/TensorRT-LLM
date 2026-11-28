@@ -38,6 +38,7 @@ from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
 from tensorrt_llm._torch.modules.qwen4_exp import ple as ple_module
 from tensorrt_llm._torch.modules.qwen4_exp.ple import (
     PLEMetadata,
+    PLESpeculativeRecord,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLE,
     _splitmix64,
@@ -472,7 +473,7 @@ def _run_parity(dtype: torch.dtype, tol_max: float):
         input_ids, seq_lens, state_idx, is_decode=False, eos_token_id=EOS_TOKEN_ID
     )
     with torch.no_grad():
-        out = module.forward(hs, meta, conv_state, ngram_context)
+        out = module.forward(hs, meta, conv_state, ngram_context, PLESpeculativeRecord())
     ref_out = ref.forward(hs, seqs, offsets)
     ma, _, _ = _metrics(out, ref_out)
     assert ma <= tol_max, f"prefill max_abs {ma} > {tol_max}"
@@ -490,7 +491,7 @@ def _run_parity(dtype: torch.dtype, tol_max: float):
         eos_token_id=EOS_TOKEN_ID,
     )
     with torch.no_grad():
-        out1 = module.forward(hs1, meta1, conv_state, ngram_context)
+        out1 = module.forward(hs1, meta1, conv_state, ngram_context, PLESpeculativeRecord())
     ref_out1 = ref.forward(hs1, dec1, off1)
     ma1, _, _ = _metrics(out1, ref_out1)
     assert ma1 <= tol_max, f"decode max_abs {ma1} > {tol_max}"
@@ -508,7 +509,7 @@ def _run_parity(dtype: torch.dtype, tol_max: float):
         eos_token_id=EOS_TOKEN_ID,
     )
     with torch.no_grad():
-        out2 = module.forward(hs2, meta2, conv_state, ngram_context)
+        out2 = module.forward(hs2, meta2, conv_state, ngram_context, PLESpeculativeRecord())
     ref_out2 = ref.forward(hs2, dec2, off2)
     ma2, _, _ = _metrics(out2, ref_out2)
     assert ma2 <= tol_max, f"decode2 max_abs {ma2} > {tol_max}"
@@ -589,7 +590,7 @@ def test_ple_state_carryover_matters():
         eos_token_id=EOS_TOKEN_ID,
     )
     with torch.no_grad():
-        module.forward(hs, meta, conv_state, ngram_context)
+        module.forward(hs, meta, conv_state, ngram_context, PLESpeculativeRecord())
 
     # Same decode token, primed vs fresh state.
     dtok = torch.tensor([99], device=device, dtype=torch.long)
@@ -606,8 +607,8 @@ def test_ple_state_carryover_matters():
     fresh_conv = torch.zeros_like(conv_state)
     fresh_ctx = torch.full_like(ngram_context, EOS_TOKEN_ID)
     with torch.no_grad():
-        out_primed = module.forward(dhs, dmeta, primed_conv, primed_ctx)
-        out_fresh = module.forward(dhs, dmeta, fresh_conv, fresh_ctx)
+        out_primed = module.forward(dhs, dmeta, primed_conv, primed_ctx, PLESpeculativeRecord())
+        out_fresh = module.forward(dhs, dmeta, fresh_conv, fresh_ctx, PLESpeculativeRecord())
     diff = (out_primed - out_fresh).abs().max().item()
     assert diff > 1e-2, (
         "carried conv/ngram state had no effect — prefill->decode carry-over is broken"
@@ -615,33 +616,70 @@ def test_ple_state_carryover_matters():
 
 
 def test_ple_speculative_commit_selects_accepted_prefix_state() -> None:
-    module = object.__new__(Qwen4ExpPLE)
-    torch.nn.Module.__init__(module)
     conv_pool = torch.zeros(3, 1)
     context_pool = torch.zeros(3, 1, dtype=torch.long)
     slots = torch.tensor([1, 2])
     conv_candidates = torch.tensor([[[10.0], [11.0], [12.0]], [[20.0], [21.0], [22.0]]])
     context_candidates = torch.tensor([[[100], [101], [102]], [[200], [201], [202]]])
-    module._pending_conv_states = (conv_pool, slots, conv_pool[slots].clone(), conv_candidates)
-    module._pending_ngram_contexts = (
-        context_pool,
-        slots,
-        context_pool[slots].clone(),
-        context_candidates,
-    )
+    record = PLESpeculativeRecord()
+    record.conv_states = (conv_pool, slots, conv_candidates)
+    record.ngram_contexts = (context_pool, slots, context_candidates)
 
     # Context count occupies the first entry. Generation request 0 accepts only
     # its golden token (candidate 0); request 1 accepts golden + two drafts.
-    module.commit_speculative_states(
-        num_accepted_tokens=torch.tensor([1, 1, 3]),
-        state_indices=torch.tensor([0, 1, 2]),
-        num_contexts=1,
-    )
+    record.commit(num_accepted_tokens=torch.tensor([1, 1, 3]), num_contexts=1)
 
     torch.testing.assert_close(conv_pool[slots], torch.tensor([[10.0], [22.0]]))
     torch.testing.assert_close(context_pool[slots], torch.tensor([[100], [202]]))
-    assert module._pending_conv_states is None
-    assert module._pending_ngram_contexts is None
+    assert record.conv_states is None
+    assert record.ngram_contexts is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("next_lengths", "next_accepted", "next_contexts"),
+    [([4], [4], 1), ([], [1, 1], 0)],
+    ids=["context_only_step", "empty_step"],
+)
+def test_ple_forward_drops_the_candidates_of_an_uncommitted_verification(
+    next_lengths: list[int], next_accepted: list[int], next_contexts: int
+) -> None:
+    """A step that fails after its verification leaves the candidates uncommitted. The next
+    forward drops them, so its acceptance writes nothing to the slots of the failed step."""
+    device = torch.device("cuda")
+    dtype = torch.float32
+    gen = torch.Generator(device=device).manual_seed(20261125)
+    module = Qwen4ExpPLE(_make_config(), dtype=dtype, ple_layer_index=0, layer_id=1).to(device)
+    module.eval()
+    _init_module_weights(module, gen, device, dtype)
+    conv_state = torch.zeros(4, CONV_CHANNELS, SHORT_CONV_STATE_LEN, device=device, dtype=dtype)
+    ngram_context = torch.full(
+        (4, NGRAM_CONTEXT_LEN), EOS_TOKEN_ID, device=device, dtype=torch.long
+    )
+    record = PLESpeculativeRecord()
+
+    def forward(lengths: list[int], slots: list[int], **layout: object) -> None:
+        tokens = torch.randint(0, VOCAB_SIZE, (sum(lengths),), generator=gen, device=device)
+        hidden = torch.randn(sum(lengths), CONV_CHANNELS, generator=gen, device=device).to(dtype)
+        metadata = PLEMetadata.build(
+            tokens,
+            torch.tensor(lengths, dtype=torch.long, device=device),
+            torch.tensor(slots, dtype=torch.long, device=device),
+            is_decode=False,
+            eos_token_id=EOS_TOKEN_ID,
+            **layout,
+        )
+        with torch.no_grad():
+            module.forward(hidden, metadata, conv_state, ngram_context, record)
+
+    forward([3, 3], [2, 3], use_spec_decoding=True, host_seq_lens=[3, 3])
+    assert record.conv_states is not None and record.ngram_contexts is not None
+
+    failed_step_conv, failed_step_context = conv_state[2:].clone(), ngram_context[2:].clone()
+    forward(next_lengths, [0] * len(next_lengths), num_contexts=next_contexts)
+    record.commit(torch.tensor(next_accepted, device=device), next_contexts)
+    assert torch.equal(conv_state[2:], failed_step_conv)
+    assert torch.equal(ngram_context[2:], failed_step_context)
 
 
 def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
@@ -661,7 +699,6 @@ def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
         dilation=module.short_conv_dilation,
         bias=False,
     )
-    module._pending_conv_states = None
 
     # One five-token context followed by two one-token generation requests.
     lengths = torch.tensor([5, 1, 1], dtype=torch.long)
@@ -686,6 +723,7 @@ def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
         values,
         dataclasses.replace(metadata, num_contexts=0, context_tokens=0),
         expected_state,
+        PLESpeculativeRecord(),
     )
 
     input_shapes = []
@@ -697,7 +735,7 @@ def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
 
     monkeypatch.setattr(F, "conv1d", record_conv1d)
     actual_state = initial_state.clone()
-    actual = module._short_conv(values, metadata, actual_state)
+    actual = module._short_conv(values, metadata, actual_state, PLESpeculativeRecord())
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual_state, expected_state)
@@ -736,9 +774,10 @@ def test_ple_uniform_layout_with_contexts_matches_joint_short_conv() -> None:
         values,
         dataclasses.replace(metadata, num_contexts=0, context_tokens=0),
         expected_state,
+        PLESpeculativeRecord(),
     )
     actual_state = initial_state.clone()
-    actual = module._short_conv(values, metadata, actual_state)
+    actual = module._short_conv(values, metadata, actual_state, PLESpeculativeRecord())
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual_state, expected_state)
@@ -762,8 +801,7 @@ def test_ple_mixed_speculative_workspace_and_rollback(
     module.conv1d = torch.nn.Conv1d(
         channels, channels, 4, groups=channels, dilation=3, bias=False, device=device
     )
-    module._pending_conv_states = None
-    module._pending_ngram_contexts = None
+    record = PLESpeculativeRecord()
     lengths = context_lengths + generation_lengths
     slots = torch.tensor([5, 1, 4, 0, 3], device=device)
     tokens = torch.arange(sum(lengths), device=device)
@@ -792,26 +830,26 @@ def test_ple_mixed_speculative_workspace_and_rollback(
         return original_conv1d(input_tensor, *args, **kwargs)
 
     monkeypatch.setattr(F, "conv1d", record_conv1d)
-    actual = module._short_conv(values, metadata, state)
+    actual = module._short_conv(values, metadata, state, record)
     combined = torch.cat((context[slots], metadata.padded_tokens), dim=1)
-    module._commit_ngram_context(combined, metadata, context)
+    module._commit_ngram_context(combined, metadata, context, record)
     width = max(generation_lengths)
     assert shapes == [
         (2, channels, state_len + max(context_lengths)),
         (3, channels, state_len + width),
     ]
     for entry, shape in [
-        (module._pending_conv_states, (3, width, channels, state_len)),
-        (module._pending_ngram_contexts, (3, width, 2)),
+        (record.conv_states, (3, width, channels, state_len)),
+        (record.ngram_contexts, (3, width, 2)),
     ]:
-        candidates = entry[3]
+        candidates = entry[2]
         assert tuple(candidates.shape) == shape
         assert (
             candidates.untyped_storage().nbytes() == candidates.numel() * candidates.element_size()
         )
 
     accepted = context_lengths + [1, 2, 4]
-    module.commit_speculative_states(torch.tensor(accepted, device=device), slots, 2)
+    record.commit(torch.tensor(accepted, device=device), 2)
     expected_state = initial_state.clone()
     expected_context = initial_context.clone()
     outputs = []
@@ -835,8 +873,8 @@ def test_ple_mixed_speculative_workspace_and_rollback(
     torch.testing.assert_close(actual, torch.cat(outputs))
     torch.testing.assert_close(state, expected_state)
     torch.testing.assert_close(context, expected_context)
-    assert module._pending_conv_states is None
-    assert module._pending_ngram_contexts is None
+    assert record.conv_states is None
+    assert record.ngram_contexts is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -854,6 +892,7 @@ def test_model_mixed_mtp_step_matches_per_sequence_execution(monkeypatch, dtype,
     model.ple_layer_index = 0
     model.layers = [SimpleNamespace(ple=module)]
     model.eos_token_id = EOS_TOKEN_ID
+    model._ple_speculative_record = PLESpeculativeRecord()
 
     # A fresh 6-token context, a 2-token continuation chunk, and three
     # verification rows (golden token + three drafts) that accept 1, 2, 4.
@@ -898,7 +937,7 @@ def test_model_mixed_mtp_step_matches_per_sequence_execution(monkeypatch, dtype,
     )
     spec_metadata = SimpleNamespace(runtime_draft_len=3)
 
-    metadata, conv_pool, context_pool = model._prepare_ple_state(
+    metadata, conv_pool, context_pool, speculative_record = model._prepare_ple_state(
         attn_metadata, tokens, mamba_metadata, spec_metadata
     )
     assert conv_pool is conv_state and context_pool is ngram_context
@@ -916,13 +955,11 @@ def test_model_mixed_mtp_step_matches_per_sequence_execution(monkeypatch, dtype,
 
     monkeypatch.setattr(ple_module, "ple_packed_short_conv", record_packed_short_conv)
     with torch.no_grad():
-        actual = module.forward(hidden, metadata, conv_state, ngram_context)
+        actual = module.forward(hidden, metadata, conv_state, ngram_context, speculative_record)
     # Only BF16 context rows qualify for the packed kernel; verification rows
     # keep the eager path that records rollback candidates.
     assert packed_calls == ([metadata.context_tokens] if dtype == torch.bfloat16 else [])
-    module.commit_speculative_states(
-        torch.tensor(accepted, device=device), slots, num_contexts=num_contexts
-    )
+    speculative_record.commit(torch.tensor(accepted, device=device), num_contexts)
 
     # Independent reference: each request alone through the eager path.
     monkeypatch.setattr(ple_module, "can_use_ple_packed_short_conv", lambda *args: False)
@@ -944,7 +981,9 @@ def test_model_mixed_mtp_step_matches_per_sequence_execution(monkeypatch, dtype,
                 eos_token_id=EOS_TOKEN_ID,
             )
             with torch.no_grad():
-                output = module.forward(hidden[start : start + count], single, conv, context)
+                output = module.forward(
+                    hidden[start : start + count], single, conv, context, PLESpeculativeRecord()
+                )
             if record:
                 expected[rows] = output
             else:
@@ -955,8 +994,8 @@ def test_model_mixed_mtp_step_matches_per_sequence_execution(monkeypatch, dtype,
     assert _metrics(actual, expected)[0] <= tol
     assert _metrics(conv_state, expected_conv)[0] <= tol
     assert torch.equal(ngram_context, expected_context)
-    assert module._pending_conv_states is None
-    assert module._pending_ngram_contexts is None
+    assert speculative_record.conv_states is None
+    assert speculative_record.ngram_contexts is None
 
 
 def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> None:

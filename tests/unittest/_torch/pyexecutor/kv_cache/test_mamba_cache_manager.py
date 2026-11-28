@@ -5,9 +5,10 @@
 import contextlib
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -26,6 +27,11 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import has_fp4_mla_ca
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
+from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
+    QSAIndexer,
+    QSASpeculativeRecord,
+)
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_CONV_ROLE,
@@ -83,6 +89,7 @@ from tensorrt_llm._torch.modules.mamba.cache_manager import (
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.mamba.replay_region import Mamba2ReplayRegion
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -138,12 +145,23 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     SamplingConfig,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager,
     CacheTypeCpp,
     DataType,
     KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+    SpeculativeAcceptance,
+    SpeculativeAcceptancePhase,
     get_pp_layers,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker, MTPEagleWorker
+from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm._torch.speculative.mtp import MTPWorker
+from tensorrt_llm._torch.speculative.mtp_dynamic_tree import MTPEagleDynamicTreeWorker
+from tensorrt_llm._torch.speculative.sa_worker import SAWorker
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
@@ -152,9 +170,12 @@ from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     CacheTransceiverConfig,
+    DFlashDecodingConfig,
+    Eagle3DecodingConfig,
     KvCacheConfig,
     MambaStateConfig,
     MTPDecodingConfig,
+    SADecodingConfig,
     SkipSoftmaxAttentionConfig,
     TorchLlmArgs,
 )
@@ -10647,5 +10668,944 @@ def test_v2_hybrid_mixed_precision_beside_private_mamba2_replay():
         for group, layer_ids in enumerate(mgr._layer_ids_by_group):
             ids.update(zip(layer_ids, _compute_global_layer_ids(mgr, group)))
         assert ids == {0: 0, 1: 2, 2: 4, 3: 5}
+    finally:
+        mgr.shutdown()
+
+
+class _DraftStarted(Exception):
+    """Raised in place of the first step of a worker's draft pass."""
+
+
+class _AttentionOnlyCache(BaseResourceManager):
+    def get_max_resource_count(self) -> int:
+        return 1
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        return 0
+
+
+class _RecordingCache(_AttentionOnlyCache):
+    """Logs every acceptance it is told about, beside what the test logs itself."""
+
+    def __init__(self, log: list) -> None:
+        self.log = log
+
+    def on_speculative_acceptance(
+        self, acceptance: SpeculativeAcceptance, phase: SpeculativeAcceptancePhase
+    ) -> None:
+        self.log.append((phase, acceptance))
+
+
+def _mtp_eagle_tree_worker() -> MTPEagleDynamicTreeWorker:
+    spec_config = MTPDecodingConfig(
+        max_draft_len=2, use_dynamic_tree=True, dynamic_tree_max_topK=2, max_total_draft_tokens=4
+    )
+    spec_config._max_batch_size = 4
+    worker = MTPEagleDynamicTreeWorker(spec_config)
+    worker._relocate_kv_eagerly = lambda *args: None
+    return worker
+
+
+def _dflash_worker() -> DFlashWorker:
+    worker = DFlashWorker(DFlashDecodingConfig(max_draft_len=2), Mapping())
+    worker._lazy_init_ctx_buffers = lambda *args: None
+    worker._ctx_len = worker._ctx_base_pages = torch.zeros(4, dtype=torch.long, device="cuda")
+    worker._ctx_len_host = worker._ctx_base_host = [0] * 4
+    return worker
+
+
+# How to build each worker, its verification step and the first step of its draft pass.
+_ACCEPTANCE_WORKERS = {
+    "mtp": (
+        lambda: MTPWorker(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True)),
+        "sample_and_accept_draft_tokens",
+        "update_mtp_hidden_states",
+    ),
+    "mtp_eagle": (
+        lambda: MTPEagleWorker(MTPDecodingConfig(max_draft_len=2)),
+        "sample_and_accept_draft_tokens",
+        "_prepare_attn_metadata_for_spec_dec",
+    ),
+    "eagle3": (
+        lambda: Eagle3OneModelWorker(
+            Eagle3DecodingConfig(max_draft_len=2, speculative_model="draft")
+        ),
+        "sample_and_accept_draft_tokens",
+        "_prepare_attn_metadata_for_spec_dec",
+    ),
+    "mtp_eagle_tree": (
+        _mtp_eagle_tree_worker,
+        "sample_and_accept_draft_tokens",
+        "_prepare_attn_metadata_for_spec_dec",
+    ),
+    "dflash": (
+        _dflash_worker,
+        "sample_and_accept_draft_tokens",
+        "_prepare_attn_metadata_for_dflash",
+    ),
+    "sa": (
+        lambda: SAWorker(SADecodingConfig(max_draft_len=2)),
+        "_sample_and_accept_draft_tokens",
+        "_generate_draft_tokens",
+    ),
+}
+_LINEAR_ACCEPTANCE_WORKERS = [kind for kind in _ACCEPTANCE_WORKERS if kind != "mtp_eagle_tree"]
+
+
+def _acceptance_worker(
+    kind: str,
+    num_accepted_tokens: torch.Tensor,
+    at_draft_start: Callable[[], None] | None = None,
+) -> SpecWorkerBase:
+    """A real worker whose verification accepts the given token counts and whose draft pass stops at its first step,
+    after at_draft_start has looked at what the worker did before it."""
+    build, verification, draft_start = _ACCEPTANCE_WORKERS[kind]
+    worker = build()
+    accepted_tokens = torch.zeros(len(num_accepted_tokens), 3, dtype=torch.int32, device="cuda")
+    setattr(worker, verification, lambda *args: (accepted_tokens, num_accepted_tokens))
+
+    def start_draft(*args: object, **kwargs: object) -> None:
+        if at_draft_start is not None:
+            at_draft_start()
+        raise _DraftStarted
+
+    setattr(worker, draft_start, start_draft)
+    return worker
+
+
+def _run_acceptance(
+    worker: SpecWorkerBase,
+    manager: BaseResourceManager | None,
+    num_seqs: int,
+    num_contexts: int,
+    state_slots: list[int] | None = None,
+    runtime_draft_len: int = 2,
+) -> dict[str, torch.Tensor]:
+    """Run the worker's forward on a batch of num_seqs requests, context requests first."""
+    mamba_metadata = None
+    if state_slots is not None:
+        mamba_metadata = SimpleNamespace(
+            state_indices=torch.tensor(state_slots, dtype=torch.int32, device="cuda")
+        )
+    attn_metadata = SimpleNamespace(
+        num_seqs=num_seqs,
+        num_contexts=num_contexts,
+        kv_cache_manager=manager,
+        mamba_metadata=mamba_metadata,
+        _seq_lens_cuda=None,
+        all_rank_num_tokens=None,
+        force_prepare_spec_dec_tree_mask=False,
+    )
+    spec_metadata = SimpleNamespace(
+        runtime_draft_len=runtime_draft_len,
+        spec_resource_manager=None,
+        is_cuda_graph=False,
+        request_ids=None,
+        batch_indices_cuda=None,
+    )
+    logits = torch.zeros(num_seqs, 8, device="cuda")
+    return worker._forward_impl(None, None, None, logits, attn_metadata, spec_metadata, None)
+
+
+_ACCEPTANCE_MANAGERS = pytest.mark.parametrize(
+    "manager_cls",
+    [NemotronHybridCacheManager, Qwen35HybridCacheManager, Qwen4ExpHybridCacheManager],
+)
+
+
+def _build_acceptance_manager(
+    manager_cls: type[MambaHybridCacheManagerV2], num_seqs: int
+) -> MambaHybridCacheManagerV2:
+    """A real V2 hybrid manager with empty state slots and a distinct verification state per request and step."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=4),
+        conv_state_layout="x_b_c" if manager_cls is NemotronHybridCacheManager else "q_k_v",
+        model_manager_cls=manager_cls,
+    )
+    state = mgr._speculative_state
+    for written in (state.intermediate_ssm, state.intermediate_conv):
+        written.copy_(torch.randn(written.shape, device="cuda").to(written.dtype))
+    for pool in (*mgr.all_ssm_states, *mgr.all_conv_states):
+        pool.zero_()
+    mgr._refresh_dummy_request_mask([False] * num_seqs)
+    return mgr
+
+
+def _assert_state_slots(
+    mgr: MambaHybridCacheManagerV2, kept: dict[int, tuple[int, int]], empty: Iterable[int]
+) -> None:
+    """kept maps a state slot to the (generation request, step) whose verification state it holds."""
+    state = mgr._speculative_state
+    for pools, written in (
+        (mgr.all_ssm_states, state.intermediate_ssm),
+        (mgr.all_conv_states, state.intermediate_conv),
+    ):
+        for layer, pool in enumerate(pools):
+            for slot, (request, step) in kept.items():
+                assert torch.equal(pool[slot], written[layer, request, step])
+            for slot in empty:
+                assert not pool[slot].any()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kind", _LINEAR_ACCEPTANCE_WORKERS)
+@_ACCEPTANCE_MANAGERS
+def test_worker_acceptance_keeps_the_accepted_state_before_drafting(
+    kind: str, manager_cls: type[MambaHybridCacheManagerV2]
+) -> None:
+    """When a worker starts drafting, each generation request's state slot holds the state written for its last accepted
+    token and the context request's slot is as it was."""
+    mgr = _build_acceptance_manager(manager_cls, num_seqs=3)
+    try:
+        # A context request, then generation requests accepting one and two draft tokens.
+        accepted = torch.tensor([1, 2, 3], dtype=torch.int32, device="cuda")
+        worker = _acceptance_worker(
+            kind,
+            accepted,
+            at_draft_start=lambda: _assert_state_slots(
+                mgr, kept={1: (0, 1), 2: (1, 2)}, empty=[0, 3]
+            ),
+        )
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=3, num_contexts=1, state_slots=[3, 1, 2])
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@_ACCEPTANCE_MANAGERS
+def test_dynamic_tree_acceptance_keeps_the_accepted_leaf_state(
+    manager_cls: type[MambaHybridCacheManagerV2],
+) -> None:
+    """A dynamic-tree step keeps the state at the deepest accepted tree node, not at the count."""
+    mgr = _build_acceptance_manager(manager_cls, num_seqs=3)
+    try:
+        # The first generation request accepts tree nodes 1 and 3, the second only the golden token.
+        accepted = torch.tensor([1, 3, 1], dtype=torch.int32, device="cuda")
+        worker = _acceptance_worker(
+            "mtp_eagle_tree",
+            accepted,
+            at_draft_start=lambda: _assert_state_slots(
+                mgr, kept={1: (0, 4), 2: (1, 0)}, empty=[0, 3]
+            ),
+        )
+        worker._accepted_draft_indices_tensor[1] = torch.tensor([1, 3], dtype=torch.int32)
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=3, num_contexts=1, state_slots=[3, 1, 2])
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kind", list(_ACCEPTANCE_WORKERS))
+def test_context_only_acceptance_keeps_the_state_slots(kind: str) -> None:
+    """A batch of context requests has no state to keep. Before drafting only MTPWorker raises anything, its auxiliary
+    phase, and the state slots stay empty."""
+    mgr = _build_acceptance_manager(NemotronHybridCacheManager, num_seqs=2)
+    try:
+        mgr.on_speculative_acceptance = raised = MagicMock(wraps=mgr.on_speculative_acceptance)
+        before_drafting = []
+        worker = _acceptance_worker(
+            kind,
+            torch.ones(2, dtype=torch.int32, device="cuda"),
+            at_draft_start=lambda: before_drafting.extend(
+                call.args[1] for call in raised.call_args_list
+            ),
+        )
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=2, state_slots=[3, 1])
+        assert before_drafting == (
+            [SpeculativeAcceptancePhase.AUXILIARY_STATE] if kind == "mtp" else []
+        )
+        _assert_state_slots(mgr, kept={}, empty=range(4))
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kind", _LINEAR_ACCEPTANCE_WORKERS)
+def test_step_without_drafting_keeps_the_state_slots(kind: str) -> None:
+    """A step whose draft length is zero samples one target token per request, drafts nothing, raises no acceptance
+    and leaves the state slots as they were."""
+    mgr = _build_acceptance_manager(NemotronHybridCacheManager, num_seqs=2)
+    try:
+        mgr.on_speculative_acceptance = raised = MagicMock(wraps=mgr.on_speculative_acceptance)
+        worker = _acceptance_worker(kind, torch.tensor([2, 3], dtype=torch.int32, device="cuda"))
+        target_tokens = torch.tensor([5, 7], dtype=torch.int32, device="cuda")
+        worker._sample_tokens_for_batch = lambda *args: target_tokens
+        result = _run_acceptance(
+            worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1], runtime_draft_len=0
+        )
+        assert result["new_tokens"].tolist() == [[5], [7]]
+        assert result["next_draft_tokens"].shape == (2, 0)
+        raised.assert_not_called()
+        _assert_state_slots(mgr, kept={}, empty=range(4))
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kind", list(_ACCEPTANCE_WORKERS))
+@pytest.mark.parametrize("manager", [None, _AttentionOnlyCache()], ids=["no_cache", "attention"])
+def test_acceptance_without_recurrent_state_goes_on_to_draft(
+    kind: str, manager: BaseResourceManager | None
+) -> None:
+    worker = _acceptance_worker(kind, torch.tensor([1, 2, 3], dtype=torch.int32, device="cuda"))
+    # Only the dynamic-tree worker resolves leaf positions, and only for a cache that keeps recurrent state.
+    worker._accepted_leaf_intermediate_positions = resolve_leaf = MagicMock()
+    with pytest.raises(_DraftStarted):
+        _run_acceptance(worker, manager, num_seqs=3, num_contexts=1)
+    resolve_leaf.assert_not_called()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "kind, phases",
+    [
+        (
+            "mtp",
+            [SpeculativeAcceptancePhase.BASE_STATE, SpeculativeAcceptancePhase.AUXILIARY_STATE],
+        ),
+        ("mtp_eagle", [SpeculativeAcceptancePhase.BASE_STATE]),
+        ("eagle3", [SpeculativeAcceptancePhase.BASE_STATE]),
+        ("mtp_eagle_tree", [SpeculativeAcceptancePhase.BASE_STATE]),
+        ("dflash", [SpeculativeAcceptancePhase.BASE_STATE]),
+        ("sa", [SpeculativeAcceptancePhase.BASE_STATE]),
+    ],
+)
+def test_worker_reports_the_acceptance_to_the_cache_before_drafting(
+    kind: str, phases: list[SpeculativeAcceptancePhase]
+) -> None:
+    """Before it drafts, a worker tells the cache the accepted counts of the whole batch and how the batch splits into
+    context and generation requests. Only MTPWorker has the auxiliary state committed that early."""
+    log, reported = [], []
+    accepted = torch.tensor([1, 2, 3], dtype=torch.int32, device="cuda")
+    worker = _acceptance_worker(kind, accepted, at_draft_start=lambda: reported.extend(log))
+    with pytest.raises(_DraftStarted):
+        _run_acceptance(worker, _RecordingCache(log), num_seqs=3, num_contexts=1)
+    assert [phase for phase, _ in reported] == phases
+    for _, acceptance in reported:
+        assert acceptance.num_accepted_tokens is accepted
+        assert (acceptance.num_contexts, acceptance.num_gens) == (1, 2)
+
+
+class _LoggedEvent(torch.cuda.Event):
+    """A CUDA event that logs when it is recorded and when a stream is made to wait for it."""
+
+    log: list
+
+    def record(self, stream: torch.cuda.Stream | None = None) -> None:
+        self.log.append("recorded")
+        super().record(stream)
+
+    def wait(self, stream: torch.cuda.Stream | None = None) -> None:
+        self.log.append("joined")
+        super().wait(stream)
+
+
+@skip_no_cuda
+def test_mtp_eagle_commits_the_base_state_on_its_stream_and_joins_it_before_the_auxiliary_state() -> (
+    None
+):
+    """In a multi-stream step, a worker with a commit stream has the base state committed on that stream, beside its
+    draft pass. The step waits for that commit before the auxiliary state and ends with the accepted state kept."""
+    mgr = _build_acceptance_manager(Qwen35HybridCacheManager, num_seqs=2)
+    try:
+        log = []
+        worker = _acceptance_worker(
+            "mtp_eagle", torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+        )
+        worker._promotion_stream = torch.cuda.Stream()
+        worker._promotion_done = _LoggedEvent()
+        worker._promotion_done.log = log
+        commit = mgr.on_speculative_acceptance
+
+        def logged_commit(
+            acceptance: SpeculativeAcceptance, phase: SpeculativeAcceptancePhase
+        ) -> None:
+            log.append((phase, torch.cuda.current_stream() == worker._promotion_stream))
+            commit(acceptance, phase)
+
+        mgr.on_speculative_acceptance = logged_commit
+        # The draft pass over the target's own KV cache is one call, so the step runs to its end.
+        worker._uses_external_shared_target_kv = True
+        worker._forward_external_shared_target_kv_draft_loop = lambda **kwargs: log.append("draft")
+        worker._prepare_next_new_tokens = lambda *args: None
+        with with_multi_stream(True):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1])
+
+        assert log == [
+            (SpeculativeAcceptancePhase.BASE_STATE, True),
+            "recorded",
+            "draft",
+            "joined",
+            (SpeculativeAcceptancePhase.AUXILIARY_STATE, False),
+        ]
+        _assert_state_slots(mgr, kept={3: (0, 1), 1: (1, 2)}, empty=[0, 2])
+    finally:
+        mgr.shutdown()
+
+
+def _log_handler_commit(log: list) -> SimpleNamespace:
+    """A handler as models register on a worker, logging the commit it is asked for."""
+    return SimpleNamespace(commit_speculative_states=lambda *args: log.append(("handler", args)))
+
+
+@skip_no_cuda
+def test_mtp_commits_registered_handlers_then_the_cache_before_drafting() -> None:
+    log, committed = [], []
+    accepted = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+    worker = _acceptance_worker("mtp", accepted, at_draft_start=lambda: committed.extend(log))
+    worker.register_auxiliary_state_handler(_log_handler_commit(log))
+    with pytest.raises(_DraftStarted):
+        _run_acceptance(
+            worker, _RecordingCache(log), num_seqs=2, num_contexts=0, state_slots=[3, 1]
+        )
+    assert [entry[0] for entry in committed] == [
+        SpeculativeAcceptancePhase.BASE_STATE,
+        "handler",
+        SpeculativeAcceptancePhase.AUXILIARY_STATE,
+    ]
+    handler_accepted, handler_slots, handler_num_contexts = committed[1][1]
+    assert handler_accepted is accepted
+    assert handler_slots.tolist() == [3, 1] and handler_num_contexts == 0
+
+
+@skip_no_cuda
+def test_mtp_eagle_commits_registered_handlers_then_the_cache_after_drafting() -> None:
+    log = []
+    accepted = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+    worker = _acceptance_worker("mtp_eagle", accepted)
+    worker.register_auxiliary_state_handler(_log_handler_commit(log))
+    # The draft pass over the target's own KV cache is one call, so the step runs to its end.
+    worker._uses_external_shared_target_kv = True
+    worker._forward_external_shared_target_kv_draft_loop = lambda **kwargs: log.append(("draft",))
+    worker._prepare_next_new_tokens = lambda *args: None
+    _run_acceptance(worker, _RecordingCache(log), num_seqs=2, num_contexts=0, state_slots=[3, 1])
+    assert [entry[0] for entry in log] == [
+        SpeculativeAcceptancePhase.BASE_STATE,
+        "draft",
+        "handler",
+        SpeculativeAcceptancePhase.AUXILIARY_STATE,
+    ]
+
+
+def _separate_draft_cache_metadata(
+    target: BaseResourceManager, num_seqs: int, num_contexts: int
+) -> Mock:
+    """A TRTLLM metadata stand-in over the target manager that keeps the real bookkeeping of the draft-manager swap."""
+    metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata.kv_cache_manager = target
+    metadata.num_seqs, metadata.num_contexts = num_seqs, num_contexts
+    metadata._seq_lens_cuda = metadata.all_rank_num_tokens = None
+    metadata.enable_flash_mla = metadata.locality_domain_enabled = False
+    metadata.spec_decoding_packed_mask = metadata.spec_decoding_position_offsets = None
+    metadata.spec_decoding_generation_lengths = None
+    metadata.draft_kv_cache_block_offsets = torch.zeros(1, dtype=torch.int32)
+    metadata.prepare_for_draft_forward.return_value = None
+    metadata.draft_replay_swapped_attrs = {}
+    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+        setattr(metadata, helper, partial(getattr(TrtllmAttentionMetadata, helper), metadata))
+    return metadata
+
+
+@skip_no_cuda
+def test_mtp_eagle_raises_both_phases_on_the_target_beside_a_separate_draft_cache() -> None:
+    """With a separate draft KV cache the draft pass runs with the draft manager swapped into the metadata. Both phases
+    reach the target manager, with the batch split of the target forward; the draft manager is told nothing."""
+    target_log, draft_log = [], []
+    target, draft = _RecordingCache(target_log), _RecordingCache(draft_log)
+    draft.host_kv_cache_block_offsets = torch.zeros(1, dtype=torch.int32)
+    accepted = torch.tensor([4, 2, 3], dtype=torch.int32, device="cuda")
+    accepted_tokens = torch.zeros(3, 3, dtype=torch.int32, device="cuda")
+    worker = MTPEagleWorker(MTPDecodingConfig(max_draft_len=2), use_separate_draft_kv_cache=True)
+    worker.sample_and_accept_draft_tokens = lambda *args: (accepted_tokens, accepted)
+    worker.prepare_1st_drafter_inputs = lambda **kwargs: {}
+    worker._prepare_next_new_tokens = lambda *args: None
+    during_draft = []
+
+    def draft_loop(
+        inputs: object,
+        attn_metadata: Mock,
+        spec_metadata: SimpleNamespace,
+        draft_model: object,
+        draft_kv_cache_manager: BaseResourceManager,
+        *args: object,
+    ) -> tuple[None, None]:
+        # The worker's draft loop without its draft forwards: the cache swap, and the rewritten batch split.
+        with worker.draft_kv_cache_context(
+            attn_metadata, draft_kv_cache_manager, enable_draft_locality_domain_forkjoin=True
+        ) as draft_metadata:
+            during_draft.append(draft_metadata.kv_cache_manager)
+            draft_metadata.num_contexts = 0
+        return None, None
+
+    worker._forward_draft_loop = draft_loop
+    attn_metadata = _separate_draft_cache_metadata(target, num_seqs=3, num_contexts=1)
+    spec_metadata = SimpleNamespace(
+        runtime_draft_len=2,
+        spec_resource_manager=None,
+        is_cuda_graph=False,
+        request_ids=None,
+        batch_indices_cuda=None,
+    )
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_MANAGER: target,
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft,
+        }
+    )
+    worker._forward_impl(
+        None,
+        torch.zeros(1, 3, dtype=torch.int32, device="cuda"),
+        None,
+        torch.zeros(3, 8, device="cuda"),
+        attn_metadata,
+        spec_metadata,
+        None,
+        resource_manager=resource_manager,
+    )
+
+    assert during_draft == [draft] and attn_metadata.kv_cache_manager is target
+    assert not draft_log
+    assert [
+        (phase, acceptance.num_contexts, acceptance.num_gens) for phase, acceptance in target_log
+    ] == [
+        (SpeculativeAcceptancePhase.BASE_STATE, 1, 2),
+        (SpeculativeAcceptancePhase.AUXILIARY_STATE, 1, 2),
+    ]
+
+
+def _build_ple_acceptance_manager(
+    spec_config: MTPDecodingConfig | Eagle3DecodingConfig,
+) -> Qwen4ExpHybridCacheManager:
+    """A real Qwen4-Exp manager of a one-model layout whose first layer keeps PLE state."""
+    return _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2,
+        num_draft_layers=1,
+        spec_config=spec_config,
+        conv_state_layout="q_k_v",
+        model_manager_cls=Qwen4ExpHybridCacheManager,
+        pretrained_config=SimpleNamespace(
+            ple_layer_ids=[1],
+            num_hidden_layers=3,
+            hc_count=1,
+            hidden_size=4,
+            ple_conv_kernel_size=2,
+            ngram_size=3,
+            torch_dtype=torch.float32,
+        ),
+    )
+
+
+def _stage_ple_candidates(mgr: Qwen4ExpHybridCacheManager, slots: list[int]) -> list[torch.Tensor]:
+    """Leave on the manager what the PLE layer's verification leaves: per generation request, the state after each of
+    three proposed tokens, a value of its own for each. Returns the candidates of the two PLE pools."""
+    slots = torch.tensor(slots, device="cuda")
+    record = mgr.ple_speculative_record(0)
+    staged = []
+    for pool, field in zip(mgr.ple_layer_cache(0), ("conv_states", "ngram_contexts")):
+        pool.zero_()
+        values = torch.arange(1, len(slots) * 3 + 1, device="cuda").to(pool.dtype)
+        candidates = values.view(len(slots), 3, *[1] * (pool.dim() - 1))
+        candidates = candidates.expand(-1, -1, *pool.shape[1:]).contiguous()
+        setattr(record, field, (pool, slots, candidates))
+        staged.append(candidates)
+    return staged
+
+
+def _assert_ple_slots(
+    mgr: Qwen4ExpHybridCacheManager,
+    staged: list[torch.Tensor],
+    kept: dict[int, tuple[int, int]],
+    empty: Iterable[int],
+) -> None:
+    """kept maps a state slot to the (generation request, proposed token) whose PLE state it holds."""
+    for pool, candidates in zip(mgr.ple_layer_cache(0), staged):
+        for slot, (request, token) in kept.items():
+            assert torch.equal(pool[slot], candidates[request, token])
+        for slot in empty:
+            assert not pool[slot].any()
+
+
+_PLE_SLOTS = [3, 1]
+
+
+def _ple_layer_verification(
+    mgr: Qwen4ExpHybridCacheManager,
+) -> tuple[Callable[[Qwen4ExpHybridCacheManager], None], torch.Tensor, torch.Tensor]:
+    """A model's PLE layer and the tokens and values it verifies: three tokens for each of two requests.
+
+    Returns the verification forward, which takes the pools and the record from the manager it is given, and the
+    tokens and values.
+    """
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
+    from tensorrt_llm._torch.modules.qwen4_exp.ple import PLEMetadata, Qwen4ExpPLE
+
+    conv_pool, context_pool = mgr.ple_layer_cache(0)
+    channels, state_len = conv_pool.shape[1:]
+    ple = object.__new__(Qwen4ExpPLE)
+    torch.nn.Module.__init__(ple)
+    ple.conv_channels, ple.short_conv_state_len = channels, state_len
+    ple.conv_state_shape, ple.ngram_context_len = (channels, state_len), context_pool.shape[1]
+    # A kernel of two taps: the state is one dilation long.
+    ple.short_conv_dilation = state_len
+    ple.conv1d = torch.nn.Conv1d(
+        channels, channels, 2, groups=channels, dilation=state_len, bias=False, device="cuda"
+    )
+    model = object.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+
+    tokens = torch.arange(100, 106, device="cuda")
+    values = torch.randn(6, channels, device="cuda")
+    metadata = PLEMetadata.build(
+        tokens,
+        torch.tensor([3, 3], device="cuda"),
+        torch.tensor(_PLE_SLOTS, device="cuda"),
+        is_decode=False,
+        eos_token_id=0,
+        use_spec_decoding=True,
+        host_seq_lens=[3, 3],
+    )
+
+    def verify(manager: Qwen4ExpHybridCacheManager) -> None:
+        conv_state, ngram_context, record = model._resolve_ple_pools(
+            SimpleNamespace(kv_cache_manager=manager), ple, 0, 2, torch.device("cuda")
+        )
+        with torch.no_grad():
+            ple._short_conv(values, metadata, conv_state, record)
+        combined = torch.cat((ngram_context[metadata.state_indices], metadata.padded_tokens), dim=1)
+        ple._commit_ngram_context(combined, metadata, ngram_context, record)
+
+    return verify, tokens, values
+
+
+def _fill_ple_pools(mgr: Qwen4ExpHybridCacheManager) -> tuple[torch.Tensor, torch.Tensor]:
+    """Give every slot of the two PLE pools a state of its own. Returns a copy of the pools."""
+    conv_pool, context_pool = mgr.ple_layer_cache(0)
+    conv_pool.copy_(torch.randn(conv_pool.shape, device="cuda"))
+    context_pool.copy_(torch.randint(1, 100, context_pool.shape, device="cuda"))
+    return conv_pool.clone(), context_pool.clone()
+
+
+def _assert_ple_prefix_state(
+    mgr: Qwen4ExpHybridCacheManager,
+    initial: tuple[torch.Tensor, torch.Tensor],
+    tokens: torch.Tensor,
+    values: torch.Tensor,
+    accepted: list[int],
+) -> None:
+    """Each request's slot holds the PLE state after the tokens it accepted; the other slots are as they were."""
+    conv_pool, context_pool = mgr.ple_layer_cache(0)
+    initial_conv, initial_context = initial
+    state_len, context_len = conv_pool.shape[2], context_pool.shape[1]
+    for row, (slot, keep) in enumerate(zip(_PLE_SLOTS, accepted)):
+        row_tokens = slice(3 * row, 3 * row + 3)
+        conv_history = torch.cat((initial_conv[slot], values[row_tokens].T), dim=1)
+        torch.testing.assert_close(conv_pool[slot], conv_history[:, keep : keep + state_len])
+        token_history = torch.cat((initial_context[slot], tokens[row_tokens]))
+        assert torch.equal(context_pool[slot], token_history[keep : keep + context_len])
+    for slot in (0, 2):
+        assert torch.equal(conv_pool[slot], initial_conv[slot])
+        assert torch.equal(context_pool[slot], initial_context[slot])
+
+
+@skip_no_cuda
+def test_ple_layer_verification_then_mtp_acceptance_keeps_the_accepted_prefix_state() -> None:
+    """The PLE layer verifies three tokens per request on the pools the model resolves from the manager. When MTPWorker
+    starts drafting, each request's slot holds the PLE state after the tokens it accepted."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(mgr)
+        verify, tokens, values = _ple_layer_verification(mgr)
+        verify(mgr)
+
+        accepted = [2, 3]
+        worker = _acceptance_worker(
+            "mtp",
+            torch.tensor(accepted, dtype=torch.int32).cuda(),
+            at_draft_start=lambda: _assert_ple_prefix_state(mgr, initial, tokens, values, accepted),
+        )
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=_PLE_SLOTS)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_acceptance_keeps_the_ple_state_on_a_rebuilt_manager() -> None:
+    """A model outlives a cache manager: one is built to size the memory and dropped. A verification after the rebuild
+    leaves its candidates with the new manager, whose acceptance keeps the accepted prefix state in its pools."""
+    spec_config = MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True)
+    first = _build_ple_acceptance_manager(spec_config)
+    try:
+        first._refresh_dummy_request_mask([False] * 2)
+        verify, tokens, values = _ple_layer_verification(first)
+        verify(first)
+    finally:
+        first.shutdown()
+
+    second = _build_ple_acceptance_manager(spec_config)
+    try:
+        second._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(second)
+        verify(second)
+
+        accepted = [3, 1]
+        worker = _acceptance_worker(
+            "mtp",
+            torch.tensor(accepted, dtype=torch.int32).cuda(),
+            at_draft_start=lambda: _assert_ple_prefix_state(
+                second, initial, tokens, values, accepted
+            ),
+        )
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, second, num_seqs=2, num_contexts=0, state_slots=_PLE_SLOTS)
+    finally:
+        second.shutdown()
+
+
+@skip_no_cuda
+def test_verification_and_acceptance_replay_in_a_cuda_graph() -> None:
+    """One CUDA graph captures a verification forward, a target layer's QSA snapshot and the acceptance after them.
+    Replayed with other accepted counts and other side-cache pages, it keeps the PLE state of the tokens accepted then
+    and restores the QSA entries of those rejected, on the pages of that replay."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(mgr)
+        verify, tokens, values = _ple_layer_verification(mgr)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+        attn_metadata = SimpleNamespace(kv_cache_manager=mgr)
+        accepted = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+        # A target layer's indexer sees the same three tokens per request. Each request has one side-cache page.
+        indexer = object.__new__(QSAIndexer)
+        torch.nn.Module.__init__(indexer)
+        qsa_metadata = SimpleNamespace(
+            num_contexts=0,
+            num_seqs=2,
+            num_tokens=6,
+            is_cuda_graph=True,
+            seq_lens_cuda=torch.tensor([3, 3], dtype=torch.int32, device="cuda"),
+            kv_cache_manager=mgr,
+        )
+        requests = torch.arange(2, device="cuda").repeat_interleave(3)
+        within = torch.arange(3, device="cuda").repeat(2)
+        request_pages = torch.zeros(2, dtype=torch.long, device="cuda")
+        before = torch.arange(1, 25, dtype=torch.float32, device="cuda").reshape(4, 3, 1, 2)
+        index_cache = before.clone()
+        written = torch.full((6, 1, 2), -1.0, device="cuda")
+        # The layer does not own the request-wide positions.
+        no_positions = torch.empty(0, device="cuda")
+
+        def step() -> None:
+            verify(mgr)
+            pages = request_pages[requests]
+            indexer._capture_speculative_cache_state(
+                layer_idx=2,
+                request_indices=requests,
+                pages=pages,
+                within=within,
+                index_cache=index_cache,
+                position_cache=no_positions,
+                metadata=qsa_metadata,
+            )
+            index_cache[pages, within] = written
+            worker._commit_accepted_auxiliary_state(
+                SpeculativeAcceptance(attn_metadata, accepted, num_contexts=0, num_gens=2)
+            )
+
+        def start(counts: list[int], pages: list[int]) -> None:
+            for pool, state in zip(mgr.ple_layer_cache(0), initial):
+                pool.copy_(state)
+            index_cache.copy_(before)
+            accepted.copy_(torch.tensor(counts, dtype=torch.int32))
+            request_pages.copy_(torch.tensor(pages))
+
+        def assert_kept(counts: list[int], pages: list[int]) -> None:
+            _assert_ple_prefix_state(mgr, initial, tokens, values, counts)
+            expected = before.clone()
+            for count, page in zip(counts, pages):
+                expected[page, :count] = -1
+            assert torch.equal(index_cache, expected)
+
+        start([2, 3], [0, 1])
+        step()
+        assert_kept([2, 3], [0, 1])
+
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            step()
+        for counts, pages in (([3, 1], [2, 3]), ([1, 2], [3, 0])):
+            start(counts, pages)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert_kept(counts, pages)
+    finally:
+        mgr.shutdown()
+
+
+def _run_whole_step(
+    worker: SpecWorkerBase, mgr: Qwen4ExpHybridCacheManager, draft_loop: Callable[..., object]
+) -> None:
+    """Run a step of two generation requests to its end, the draft pass being one call over the target's KV cache."""
+    worker._uses_external_shared_target_kv = True
+    worker._forward_external_shared_target_kv_draft_loop = draft_loop
+    worker._prepare_next_new_tokens = lambda *args: None
+    _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1])
+
+
+@skip_no_cuda
+def test_mtp_eagle_acceptance_keeps_the_accepted_ple_state_after_drafting() -> None:
+    """MTPEagleWorker has the PLE state committed once its draft pass is over, not before."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        staged = _stage_ple_candidates(mgr, slots=[3, 1])
+        worker = _acceptance_worker("mtp_eagle", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        during_draft = []
+        _run_whole_step(
+            worker,
+            mgr,
+            lambda **kwargs: during_draft.extend(pool.clone() for pool in mgr.ple_layer_cache(0)),
+        )
+        assert len(during_draft) == 2 and not any(pool.any() for pool in during_draft)
+        _assert_ple_slots(mgr, staged, kept={3: (0, 1), 1: (1, 2)}, empty=[0, 2])
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_eagle3_acceptance_leaves_the_ple_state_as_verification_wrote_it() -> None:
+    """Qwen4-Exp keeps the accepted PLE state under one-model MTP only. Under Eagle3 the PLE layer has no record to
+    leave candidates on, and a step that accepts fewer tokens leaves the state after all three verified tokens."""
+    mgr = _build_ple_acceptance_manager(
+        Eagle3DecodingConfig(max_draft_len=2, speculative_model="draft")
+    )
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(mgr)
+        verify, tokens, values = _ple_layer_verification(mgr)
+        verify(mgr)
+        assert mgr.ple_speculative_record(0) is None
+        worker = _acceptance_worker("eagle3", torch.tensor([2, 1], dtype=torch.int32).cuda())
+        _run_whole_step(worker, mgr, lambda **kwargs: None)
+        _assert_ple_prefix_state(mgr, initial, tokens, values, accepted=[3, 3])
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_mtp_eagle_tree_step_stages_no_ple_or_qsa_state() -> None:
+    """MTPEagleDynamicTreeWorker raises no auxiliary phase, so the manager hands the PLE layer no record and lets no
+    QSA layer take a snapshot. A step that accepts only the golden token leaves the state after all three verified
+    tokens."""
+    mgr = _build_ple_acceptance_manager(
+        MTPDecodingConfig(
+            max_draft_len=2,
+            use_dynamic_tree=True,
+            dynamic_tree_max_topK=2,
+            max_total_draft_tokens=4,
+        )
+    )
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(mgr)
+        verify, tokens, values = _ple_layer_verification(mgr)
+        verify(mgr)
+        assert mgr.ple_speculative_record(0) is None
+        assert not mgr.commits_qsa_speculative_record(2)
+        worker = _acceptance_worker("mtp_eagle_tree", torch.ones(2, dtype=torch.int32).cuda())
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=_PLE_SLOTS)
+        _assert_ple_prefix_state(mgr, initial, tokens, values, accepted=[3, 3])
+    finally:
+        mgr.shutdown()
+
+
+def _hold_qsa_record(mgr: Qwen4ExpHybridCacheManager, layer_idx: int) -> torch.Tensor:
+    """Leave on the manager what a layer's QSA indexer leaves: the index entries of the first request's four
+    verification tokens as they were before the forward wrote them. Returns a view of the entries, now written."""
+    index_cache = torch.zeros(1, 4, 1, 2, device="cuda")
+    pages = torch.zeros(4, dtype=torch.long, device="cuda")
+    within = torch.arange(4, device="cuda")
+    mgr.hold_qsa_speculative_record(
+        layer_idx,
+        QSASpeculativeRecord(
+            request_indices=torch.zeros(4, dtype=torch.long, device="cuda"),
+            token_ordinals=within,
+            pages=pages,
+            within=within,
+            index_values=index_cache[pages, within].clone(),
+            index_cache=index_cache,
+        ),
+    )
+    index_cache.fill_(1)
+    return index_cache[0, :, 0, 0]
+
+
+@skip_no_cuda
+def test_mtp_acceptance_restores_the_qsa_entries_of_rejected_tokens_in_target_layers() -> None:
+    """The first request accepts two of its four verification tokens: a target layer gets the entries of the other two
+    back. The manager has only the target's layers hold a record."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        _stage_ple_candidates(mgr, slots=[3, 1])
+        # The model has three layers; the layer after them is the draft's.
+        assert mgr.commits_qsa_speculative_record(2) and not mgr.commits_qsa_speculative_record(3)
+        target_entries = _hold_qsa_record(mgr, layer_idx=2)
+
+        def assert_committed() -> None:
+            assert target_entries.tolist() == [1, 1, 0, 0]
+            assert not mgr._qsa_speculative_records
+
+        worker = _acceptance_worker(
+            "mtp", torch.tensor([2, 3], dtype=torch.int32).cuda(), at_draft_start=assert_committed
+        )
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1])
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_eagle3_acceptance_leaves_the_qsa_entries_as_verification_wrote_them() -> None:
+    mgr = _build_ple_acceptance_manager(
+        Eagle3DecodingConfig(max_draft_len=2, speculative_model="draft")
+    )
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        assert not mgr.commits_qsa_speculative_record(2)
+        target_entries = _hold_qsa_record(mgr, layer_idx=2)
+        worker = _acceptance_worker("eagle3", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        _run_whole_step(worker, mgr, lambda **kwargs: None)
+        assert target_entries.tolist() == [1, 1, 1, 1]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_acceptance_that_fails_leaves_no_qsa_record_on_the_manager() -> None:
+    """A target layer's restore raises after another layer's has finished: that layer keeps its restored entries and
+    the manager holds neither record."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        _stage_ple_candidates(mgr, slots=[3, 1])
+        restored_entries = _hold_qsa_record(mgr, layer_idx=1)
+        _hold_qsa_record(mgr, layer_idx=2)
+        # One entry short of the layer's four tokens.
+        failing = mgr._qsa_speculative_records[2]
+        failing.index_values = failing.index_values[:3]
+        worker = _acceptance_worker("mtp", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        with pytest.raises(RuntimeError, match="must match"):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1])
+        assert restored_entries.tolist() == [1, 1, 0, 0]
+        assert not mgr._qsa_speculative_records
     finally:
         mgr.shutdown()

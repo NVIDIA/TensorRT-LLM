@@ -552,30 +552,30 @@ def test_external_shared_target_kv_step_prepares_next_new_tokens() -> None:
     accepted = torch.tensor([[11, 12, 13]], dtype=torch.int32)
     num_accepted = torch.tensor([2], dtype=torch.int32)
     drafts = torch.tensor([[21, 22]], dtype=torch.int32)
-    worker = SimpleNamespace(
-        _execute_guided_decoder_if_present=lambda logits: None,
-        sample_and_accept_draft_tokens=lambda *args: (accepted, num_accepted),
-        _is_mamba_hybrid_cache=False,
-        sa_enhancer=None,
-        _uses_external_shared_target_kv=True,
-        _forward_external_shared_target_kv_draft_loop=lambda **kwargs: drafts,
-        _prepare_next_new_tokens=lambda *args: "next new tokens",
-        _auxiliary_state_handlers=[],
-    )
+    worker = object.__new__(MTPEagleWorker)
+    worker._execute_guided_decoder_if_present = lambda logits: None
+    worker.sample_and_accept_draft_tokens = lambda *args: (accepted,
+                                                           num_accepted)
+    worker.sa_enhancer = None
+    worker._uses_external_shared_target_kv = True
+    worker._forward_external_shared_target_kv_draft_loop = lambda **kwargs: drafts
+    worker._prepare_next_new_tokens = lambda *args: "next new tokens"
+    worker._auxiliary_state_handlers = []
     spec_metadata = SimpleNamespace(runtime_draft_len=2,
                                     spec_resource_manager=None,
                                     batch_indices_cuda=torch.tensor([0]),
                                     sharded_target_logits=False)
-    attn_metadata = SimpleNamespace(num_seqs=1, num_contexts=0)
+    attn_metadata = SimpleNamespace(num_seqs=1,
+                                    num_contexts=0,
+                                    kv_cache_manager=None)
 
-    out = MTPEagleWorker._forward_impl(worker,
-                                       torch.tensor([1, 2, 3]),
-                                       torch.arange(3),
-                                       torch.zeros(3, 8),
-                                       torch.zeros(3, 16),
-                                       attn_metadata,
-                                       spec_metadata,
-                                       draft_model=None)
+    out = worker._forward_impl(torch.tensor([1, 2, 3]),
+                               torch.arange(3),
+                               torch.zeros(3, 8),
+                               torch.zeros(3, 16),
+                               attn_metadata,
+                               spec_metadata,
+                               draft_model=None)
 
     assert out["next_draft_tokens"] is drafts
     assert out["next_new_tokens"] == "next new tokens"

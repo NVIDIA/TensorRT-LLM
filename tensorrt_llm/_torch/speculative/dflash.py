@@ -32,9 +32,8 @@ from tensorrt_llm.mapping import Mapping
 from ..attention.backends import AttentionMetadata
 from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.resource_manager import BaseResourceManager, SpeculativeAcceptance
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import (
     DFLASH_FOLDED_DECODE_LOWERING,
@@ -2424,12 +2423,14 @@ class DFlashWorker(SpecWorkerBase):
             )
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
-        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
-            attn_metadata.kv_cache_manager.update_mamba_states(
+        self._commit_accepted_base_state(
+            SpeculativeAcceptance(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
+                num_contexts=num_contexts,
+                num_gens=num_gens,
             )
+        )
 
         self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
         self._prepare_kv_for_draft_forward(

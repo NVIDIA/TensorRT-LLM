@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
     QSAIndexer,
+    QSASpeculativeRecord,
     _position_coordinates,
     average_pool_qsa_keys,
 )
@@ -58,6 +59,7 @@ from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
+from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 
@@ -1931,39 +1933,48 @@ def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
     assert calls[0][2] is PageIndexMode.SHARED
 
 
+def _qsa_record_manager(
+    records: dict[int, object] | None = None,
+    spec_config: MTPDecodingConfig | Eagle3DecodingConfig | None = None,
+) -> Qwen4ExpHybridCacheManager:
+    """A V2 QSA manager reduced to the speculative records it holds for the indexers of a
+    one-layer target, under one-model MTP unless `spec_config` says otherwise."""
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+    manager._qsa_speculative_records = dict(records or {})
+    manager.qsa_position_layer_id = 0
+    manager.spec_config = spec_config or MTPDecodingConfig(max_draft_len=3)
+    manager._pretrained_config = SimpleNamespace(num_hidden_layers=1)
+    return manager
+
+
 def test_qsa_speculative_commit_restores_rejected_side_cache_entries() -> None:
-    indexer = object.__new__(QSAIndexer)
-    torch.nn.Module.__init__(indexer)
     index_cache = torch.arange(24, dtype=torch.float32).reshape(3, 2, 1, 4)
     position_cache = torch.arange(18, dtype=torch.int32).reshape(3, 2, 3)
     pages = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     within = torch.tensor([0, 1, 0, 1], dtype=torch.long)
-    indexer._pending_speculative_cache = {
-        "request_indices": torch.zeros(4, dtype=torch.long),
-        "token_ordinals": torch.arange(4),
-        "pages": pages,
-        "within": within,
-        "index_values": index_cache[pages, within].clone(),
-        "index_cache": index_cache,
-        "position_values": position_cache[pages, within].clone(),
-        "position_cache": position_cache,
-    }
+    record = QSASpeculativeRecord(
+        request_indices=torch.zeros(4, dtype=torch.long),
+        token_ordinals=torch.arange(4),
+        pages=pages,
+        within=within,
+        index_values=index_cache[pages, within].clone(),
+        index_cache=index_cache,
+        position_values=position_cache[pages, within].clone(),
+        position_cache=position_cache,
+    )
+    rejected_index = index_cache[pages[2:], within[2:]].clone()
+    rejected_positions = position_cache[pages[2:], within[2:]].clone()
     index_cache[pages, within] = -1
     position_cache[pages, within] = -1
 
-    indexer.commit_speculative_states(
-        num_accepted_tokens=torch.tensor([2]),
-        state_indices=torch.tensor([0]),
-        num_contexts=0,
-    )
+    record.commit(num_accepted_tokens=torch.tensor([2]))
 
     # Two accepted verification tokens retain their new values; later proposal
     # entries are restored to the snapshot.
-    assert torch.all(index_cache[pages[:2], within[:2], 0] == -1)
+    assert torch.all(index_cache[pages[:2], within[:2]] == -1)
     assert torch.all(position_cache[pages[:2], within[:2]] == -1)
-    assert torch.all(index_cache[pages[2:], within[2:], 0] != -1)
-    assert torch.all(position_cache[pages[2:], within[2:]] != -1)
-    assert indexer._pending_speculative_cache is None
+    assert torch.equal(index_cache[pages[2:], within[2:]], rejected_index)
+    assert torch.equal(position_cache[pages[2:], within[2:]], rejected_positions)
 
 
 @pytest.mark.parametrize(
@@ -1992,13 +2003,14 @@ def test_qsa_speculative_snapshot_state_uses_host_lengths(
 def test_qsa_ordinary_mixed_batch_skips_speculative_cache_snapshot() -> None:
     indexer = object.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
-    indexer._pending_speculative_cache = object()
+    manager = _qsa_record_manager({0: object()})
     metadata = SimpleNamespace(
         num_contexts=1,
         num_seqs=2,
         num_tokens=2,
         is_cuda_graph=False,
         qsa_needs_speculative_snapshot=False,
+        kv_cache_manager=manager,
     )
     empty = torch.empty(0, dtype=torch.long)
 
@@ -2012,13 +2024,16 @@ def test_qsa_ordinary_mixed_batch_skips_speculative_cache_snapshot() -> None:
         metadata=metadata,
     )
 
-    assert indexer._pending_speculative_cache is None
+    assert manager._qsa_speculative_records == {}
 
 
-def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> None:
+def _capture_four_token_verification(
+    manager: Qwen4ExpHybridCacheManager, layer_idx: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Have a layer's indexer see one request verify four tokens. Returns the side caches and
+    the entries of the four tokens in them."""
     indexer = object.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
-    indexer._pending_speculative_cache = None
     metadata = SimpleNamespace(
         num_contexts=0,
         num_seqs=1,
@@ -2026,29 +2041,119 @@ def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> Non
         is_cuda_graph=False,
         qsa_needs_speculative_snapshot=True,
         seq_lens_cuda=torch.tensor([4], dtype=torch.int32),
-        kv_cache_manager=SimpleNamespace(qsa_position_layer_id=0),
+        kv_cache_manager=manager,
     )
-    request_indices = torch.zeros(4, dtype=torch.long)
     pages = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     within = torch.tensor([0, 1, 0, 1], dtype=torch.long)
     index_cache = torch.arange(24, dtype=torch.float32).reshape(3, 2, 1, 4)
     position_cache = torch.arange(18, dtype=torch.int32).reshape(3, 2, 3)
 
     indexer._capture_speculative_cache_state(
-        layer_idx=0,
-        request_indices=request_indices,
+        layer_idx=layer_idx,
+        request_indices=torch.zeros(4, dtype=torch.long),
         pages=pages,
         within=within,
         index_cache=index_cache,
         position_cache=position_cache,
         metadata=metadata,
     )
+    return index_cache, position_cache, pages, within
 
-    pending = indexer._pending_speculative_cache
-    assert pending is not None
-    assert pending["token_ordinals"].tolist() == [0, 1, 2, 3]
-    torch.testing.assert_close(pending["index_values"], index_cache[pages, within])
-    torch.testing.assert_close(pending["position_values"], position_cache[pages, within])
+
+_MTP_EAGLE_TREE = dict(
+    max_draft_len=3, use_dynamic_tree=True, dynamic_tree_max_topK=2, max_total_draft_tokens=6
+)
+
+
+@pytest.mark.parametrize(
+    "spec_config",
+    [None, MTPDecodingConfig(use_mtp_vanilla=True, **_MTP_EAGLE_TREE)],
+    ids=["mtp_eagle", "mtp_vanilla_with_the_tree_option"],
+)
+def test_qsa_multi_token_generation_captures_speculative_cache_snapshot(
+    spec_config: MTPDecodingConfig | None,
+) -> None:
+    """MTPWorker serves vanilla MTP whatever the tree option says, and has the entries restored."""
+    manager = _qsa_record_manager(spec_config=spec_config)
+
+    index_cache, position_cache, pages, within = _capture_four_token_verification(manager, 0)
+
+    record = manager._qsa_speculative_records[0]
+    assert record.token_ordinals.tolist() == [0, 1, 2, 3]
+    torch.testing.assert_close(record.index_values, index_cache[pages, within])
+    torch.testing.assert_close(record.position_values, position_cache[pages, within])
+
+
+def test_qsa_mixed_batch_restores_each_target_layers_rejected_entries() -> None:
+    """A context request and two generation requests have three tokens each in two target
+    layers. Each layer gets back the entries of its own rejected tokens, the positions come
+    back from the layer that owns them, and the context request's entries stay as written."""
+    manager = _qsa_record_manager()
+    manager._pretrained_config = SimpleNamespace(num_hidden_layers=2)
+    indexer = object.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        num_seqs=3,
+        num_tokens=9,
+        is_cuda_graph=False,
+        qsa_needs_speculative_snapshot=True,
+        seq_lens_cuda=torch.tensor([3, 3, 3], dtype=torch.int32),
+        kv_cache_manager=manager,
+    )
+    # Each request has a page of its own: token t of request r is entry [r, t].
+    requests = torch.arange(3).repeat_interleave(3)
+    ordinals = torch.arange(3).repeat(3)
+    position_cache = torch.arange(27, dtype=torch.int32).reshape(3, 3, 3)
+    index_caches = [
+        torch.arange(36, dtype=torch.float32).reshape(3, 3, 1, 4) + 100 * layer_idx
+        for layer_idx in range(2)
+    ]
+    caches = (*index_caches, position_cache)
+    before = [cache.clone() for cache in caches]
+
+    for layer_idx, index_cache in enumerate(index_caches):
+        indexer._capture_speculative_cache_state(
+            layer_idx=layer_idx,
+            request_indices=requests,
+            pages=requests,
+            within=ordinals,
+            index_cache=index_cache,
+            position_cache=position_cache,
+            metadata=metadata,
+        )
+        # The layer's forward then writes its entries; the first layer's also writes the positions.
+        index_cache.fill_(-1)
+        position_cache.fill_(-1)
+    for record in manager._qsa_speculative_records.values():
+        record.commit(num_accepted_tokens=torch.tensor([1, 1, 2]))
+
+    # The first generation request accepts one token, the second two.
+    restored = torch.tensor([[False, False, False], [False, True, True], [False, False, True]])
+    for cache, was in zip(caches, before):
+        assert torch.equal(cache[restored], was[restored])
+        assert torch.all(cache[~restored] == -1)
+
+
+@pytest.mark.parametrize(
+    ("spec_config", "layer_idx"),
+    [
+        (None, 1),
+        (Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"), 0),
+        (MTPDecodingConfig(**_MTP_EAGLE_TREE), 0),
+    ],
+    ids=["mtp_draft_layer", "eagle3_target_layer", "mtp_eagle_tree_target_layer"],
+)
+def test_qsa_layer_whose_entries_no_acceptance_restores_takes_no_snapshot(
+    spec_config: MTPDecodingConfig | Eagle3DecodingConfig | None, layer_idx: int
+) -> None:
+    """Acceptance restores rejected entries in the target's layers, under MTPWorker and
+    MTPEagleWorker. A verification anywhere else drops the layer's earlier record and holds none."""
+    manager = _qsa_record_manager({layer_idx: object()}, spec_config)
+
+    _capture_four_token_verification(manager, layer_idx)
+
+    assert manager._qsa_speculative_records == {}
 
 
 class _QsaPageConverter:

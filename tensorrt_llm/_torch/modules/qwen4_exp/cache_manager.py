@@ -42,6 +42,7 @@ from tensorrt_llm._torch.modules.fla.inforward_snapshot import (
     InforwardSnapshots,
 )
 from tensorrt_llm._torch.modules.fla.replay_region import REPLAY_STATE_REGION, GDNReplayRegion
+from tensorrt_llm._torch.modules.qwen4_exp.ple import PLESpeculativeRecord
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
@@ -52,7 +53,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
-from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
+from tensorrt_llm._torch.pyexecutor.resource_manager import SpeculativeAcceptance, get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -62,6 +63,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, Pag
 if TYPE_CHECKING:
     import transformers
 
+    from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import QSASpeculativeRecord
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # Storage-layout constants; model geometry comes from QSASparseParams.
@@ -277,6 +279,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         self.qsa_sparse_layer_ids = []
         self.qsa_position_layer_id = None
         self.qsa_side_planes_size: int | None = None
+        self._qsa_speculative_records: dict[int, QSASpeculativeRecord] = {}
         self._qsa_enabled = (
             sparse_attention_config is not None and sparse_attention_config.algorithm == "qsa"
         )
@@ -520,6 +523,41 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
             page_shape=page_shape,
         )
 
+    def commits_qsa_speculative_record(self, layer_idx: int) -> bool:
+        """Whether acceptance restores the side-cache entries of the layer's rejected tokens.
+
+        Only the steps of a worker that has this state committed do, and only in the target's
+        layers; no other layer needs a record.
+
+        Args:
+            layer_idx: The layer's index among all layers of the engine. The target's layers
+                come first, so an index from ``num_hidden_layers`` on is a draft layer's.
+        """
+        return (
+            self._commits_speculative_records
+            and layer_idx < self._pretrained_config.num_hidden_layers
+        )
+
+    def hold_qsa_speculative_record(self, layer_idx: int, record: QSASpeculativeRecord) -> None:
+        """Keep the side-cache entries a layer's verification forward overwrote.
+
+        Every record held is committed at the next acceptance, so only a layer for which
+        :meth:`commits_qsa_speculative_record` is true holds one.
+
+        Args:
+            layer_idx: The layer's index among all layers of the engine.
+            record: The entries as they were before the forward.
+        """
+        self._qsa_speculative_records[layer_idx] = record
+
+    def drop_qsa_speculative_record(self, layer_idx: int) -> None:
+        """Forget what an earlier forward of the layer overwrote.
+
+        Args:
+            layer_idx: The layer's index among all layers of the engine.
+        """
+        self._qsa_speculative_records.pop(layer_idx, None)
+
     @torch.compiler.disable
     def get_qsa_position_buffer(self) -> Optional[torch.Tensor]:
         """Return per-token three-axis RoPE/mRoPE position coordinates."""
@@ -664,6 +702,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         self._ple_conv_state_dtype = default_state_dtype
         self._ple_conv_states: dict[int, torch.Tensor] = {}
         self._ple_ngram_contexts: dict[int, torch.Tensor] = {}
+        self._ple_speculative_records: dict[int, PLESpeculativeRecord] = {}
         if params is None:
             return
         if len(params.ple_layer_mask) != total_layers:
@@ -723,6 +762,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
                 )
             self._ple_conv_states[layer_id] = conv_state
             self._ple_ngram_contexts[layer_id] = ngram_context
+            self._ple_speculative_records[layer_id] = PLESpeculativeRecord()
         logger.info(
             "PLE state views bound to V2 lifecycle buffers for local layers "
             f"{sorted(self._ple_conv_states)}: conv "
@@ -789,6 +829,48 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         if conv is None or ngram is None:
             return None
         return conv, ngram
+
+    def ple_speculative_record(self, layer_idx: int) -> Optional[PLESpeculativeRecord]:
+        """Return the record a layer's verification forward leaves its state candidates on.
+
+        None when acceptance commits no PLE state, so that the layer stages none.
+
+        Args:
+            layer_idx: The PLE layer, by the index :meth:`ple_layer_cache` takes.
+        """
+        if not self._commits_speculative_records:
+            return None
+        return self._ple_speculative_records[layer_idx]
+
+    @cached_property
+    def _commits_speculative_records(self) -> bool:
+        """Whether the worker of this configuration has the PLE and QSA state committed.
+
+        The one-model MTP workers do, except the MTP-Eagle dynamic tree, which raises no
+        auxiliary phase.
+        """
+        spec_config = self.spec_config
+        if spec_config is None:
+            return False
+        mode = spec_config.spec_dec_mode
+        return mode.is_mtp_vanilla() or (
+            mode.is_mtp_eagle_one_model() and not spec_config.use_dynamic_tree
+        )
+
+    @override
+    def _commit_auxiliary_speculative_state(self, acceptance: SpeculativeAcceptance) -> None:
+        """Keep the PLE state and the QSA side-cache entries of the accepted tokens.
+
+        Only the steps of a worker that has them committed do. The QSA records leave the manager
+        before any commit, so a commit that raises leaves none behind.
+        """
+        if not self._commits_speculative_records:
+            return
+        qsa_records, self._qsa_speculative_records = self._qsa_speculative_records, {}
+        for record in self._ple_speculative_records.values():
+            record.commit(acceptance.num_accepted_tokens, acceptance.num_contexts)
+        for record in qsa_records.values():
+            record.commit(acceptance.num_accepted_tokens)
 
     def _ple_buffer_configs(self) -> list[BufferConfig]:
         if not self._ple_layer_ids:
@@ -1007,6 +1089,8 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
             self._replay_region.shutdown()
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
+        self._ple_speculative_records.clear()
+        self._qsa_speculative_records.clear()
         self._inforward_snapshots.shutdown()
         self._inforward_stage_ple = {}
         super().shutdown()

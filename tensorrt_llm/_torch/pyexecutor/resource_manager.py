@@ -20,8 +20,8 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Optional,
-                    Sequence, Set, Tuple, Union, overload)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Literal,
+                    NamedTuple, Optional, Sequence, Set, Tuple, Union, overload)
 
 import torch
 
@@ -211,6 +211,40 @@ def _merge_kv_cache_pool_pointers(
                        dim=-1)
 
 
+class SpeculativeAcceptancePhase(enum.Enum):
+    """Which state one speculative acceptance commits.
+
+    ``BASE_STATE`` is the state the model declares, committed before the draft
+    loop or beside it. ``AUXILIARY_STATE`` is the state a manager keeps beside
+    the declared one.
+    """
+
+    BASE_STATE = enum.auto()
+    AUXILIARY_STATE = enum.auto()
+
+
+class SpeculativeAcceptance(NamedTuple):
+    """What a speculative step knows once its acceptance is decided.
+
+    Attributes:
+        attn_metadata: The metadata of the step. The draft loop rewrites its
+            request counts, so after the loop they are not the verification's.
+        num_accepted_tokens: ``[batch]`` integer tensor on the device: the
+            accepted token count of every request, context requests first.
+        num_contexts: Context requests in the verification batch.
+        num_gens: Generation requests in the verification batch.
+        leaf_positions: Dynamic tree only. Returns a ``[num_gens]`` integer
+            tensor on the device: each generation request's accepted position
+            in the state buffer. A manager that needs the positions calls it.
+    """
+
+    attn_metadata: "AttentionMetadata"
+    num_accepted_tokens: torch.Tensor
+    num_contexts: int
+    num_gens: int
+    leaf_positions: Optional[Callable[[], torch.Tensor]] = None
+
+
 class BaseResourceManager(ABC):
     # A cache that omits generation-only state overrides this; see
     # is_context_only_kv_cache.
@@ -263,6 +297,21 @@ class BaseResourceManager(ABC):
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
+
+    def on_speculative_acceptance(self, acceptance: SpeculativeAcceptance,
+                                  phase: SpeculativeAcceptancePhase) -> None:
+        """Commit the state this manager keeps for the accepted tokens.
+
+        A speculative worker calls it from its forward, which a CUDA graph may
+        capture: an override must not read device values on the host. The base
+        phase is raised before the draft loop rewrites the request counts of
+        ``acceptance.attn_metadata``; the auxiliary phase can come after it, so
+        its answer takes the counts from ``acceptance``.
+
+        Args:
+            acceptance: The step's acceptance.
+            phase: Which of the manager's state to commit.
+        """
 
     def free_resources(self, request: LlmRequest):
         pass
