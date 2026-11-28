@@ -603,9 +603,11 @@ class TepFinar:
 
     def takes_shared(self, shared, gate, rows: int) -> bool:
         """Whether the shared-addend launch takes `shared` `[rows, 2560]` fp32 (dense) and its
-        gate logit `gate` `[rows, 1]` bf16 at any row pitch."""
+        gate logit `gate` `[rows, 1]` bf16 at any row pitch (both given)."""
         return (
             self.fn_shared is not None
+            and shared is not None
+            and gate is not None
             and shared.dtype == torch.float32
             and tuple(shared.shape) == (rows, HIDDEN)
             and shared.is_contiguous()

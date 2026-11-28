@@ -269,6 +269,7 @@ def test_shared_quarter_build(monkeypatch, served, inter, built, warns):
         q = inter // 4
         assert got.inter_q == q and len(got.quarters) == 2
         assert tuple(got.zero_shared.shape) == (max(built), core.hidden)
+        assert not got.zero_shared.any()
         assert tuple(got.zero_gate.shape) == (max(built), 1) and not got.zero_gate.any()
 
 
@@ -300,16 +301,20 @@ def test_moe_block_runs_the_quarter_and_hands_zeros(monkeypatch):
     seen = []
     monkeypatch.setattr(M, "_tep_finar_routed", lambda *a: seen.append(a[-1]) or "summed")
     zero = torch.zeros(16, 4)
-    shared = M._TepFinarShared((12, 16), {}, 8, zero, zero[:, 1:2])
+    zero_gate = torch.zeros(16, 3)[:, 1:2]
+    shared = M._TepFinarShared((12, 16), {}, 8, zero, zero_gate)
     fin = M._TepFinar("op", (4, 8, 12, 16), 6, shared)
     core = SimpleNamespace(_side_stream=side, _tep_finar=fin, expert_sum=None)
     for rows, quarter in ((12, True), (8, False)):
         seen.clear()
-        routed, gate, sh = M._moe_block(core, torch.zeros(rows, 4), None, 0)
+        # A nonzero input: what the next site gets is the build's zeros, not the input.
+        routed, gate, sh = M._moe_block(core, torch.ones(rows, 4), None, 0)
         assert routed == "summed"
         if quarter:
             assert seen == [("quarter", "quarter gate")]
             assert tuple(sh.shape) == (rows, 4) and tuple(gate.shape) == (rows, 1)
+            assert sh.data_ptr() == zero.data_ptr() and gate.data_ptr() == zero_gate.data_ptr()
+            assert not sh.any() and not gate.any()
         else:
             assert seen == [None] and (sh, gate) == ("whole", "whole gate")
 
