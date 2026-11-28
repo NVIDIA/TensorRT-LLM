@@ -130,6 +130,65 @@ def test_apply_profile_start_config_no_num_steps_leaves_stop_open(tmp_path):
     assert 3 not in controller.profile_stop_iters
 
 
+@pytest.mark.parametrize("start,stop", [(4, 6), (4, 7), (3, 6)])
+def test_cancel_pending_runtime_preserves_shared_environment_boundaries(
+    monkeypatch, tmp_path, start, stop
+):
+    monkeypatch.setenv(profiling.PROFILE_START_STOP_ENV_VAR_NAME, "4-6")
+    monkeypatch.setattr(
+        profiling, "load_iteration_indexes", profiling.load_iteration_indexes.__wrapped__
+    )
+    controller, _ = _controller()
+    controller.apply_start_config(
+        {"output_dir": str(tmp_path), "start_iter": start, "stop_iter": stop}
+    )
+    assert controller.apply_stop_config()
+    assert controller.profile_start_iters == {4}
+    assert controller.profile_stop_iters == {6}
+
+
+def test_replayed_relative_start_does_not_reschedule_cancelled_window(tmp_path):
+    controller, loop = _controller()
+    initial_starts = controller.profile_start_iters.copy()
+    initial_stops = controller.profile_stop_iters.copy()
+    config = {}
+    loop.executor_request_queue = SimpleNamespace(enqueue_profile_start_request=config.update)
+    controller.start_profile(output_dir=str(tmp_path), num_steps=2)
+    controller.apply_start_config(config)
+    assert controller.apply_stop_config()
+    loop.iter_counter = 3
+    controller.apply_start_config(config)
+    assert controller.profile_start_iters == initial_starts
+    assert controller.profile_stop_iters == initial_stops
+
+
+def test_reset_iterations_drops_runtime_ownership_before_environment_iteration_zero(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(profiling.PROFILE_START_STOP_ENV_VAR_NAME, "0-2")
+    monkeypatch.delenv(profiling.PROFILE_TRACE_ENV_VAR_NAME, raising=False)
+    monkeypatch.setattr(
+        profiling, "load_iteration_indexes", profiling.load_iteration_indexes.__wrapped__
+    )
+    monkeypatch.setattr(profiling, "get_calibrator", Mock())
+    monkeypatch.setattr(profiling.torch.cuda, "cudart", Mock())
+    profiler = Mock()
+    monkeypatch.setattr(profiling.torch.profiler, "profile", profiler)
+    controller, loop = _controller()
+    loop.iter_counter = 10
+    controller.apply_start_config({"output_dir": str(tmp_path), "activities": ["CPU"]})
+
+    # Rebinding resets the counter and schedule. A new start may be claimed
+    # on the caller thread before its broadcast reaches the executor.
+    loop.iter_counter = 0
+    controller.reset_iterations()
+    controller.start_profile(output_dir=str(tmp_path), activities=["CPU"])
+    with controller.iterations():
+        controller.begin_iteration()
+        assert controller.enabled
+    profiler.assert_not_called()
+
+
 def test_stop_profile_cancels_pending_start_before_firing(tmp_path):
     """If ``start_profile()`` was scheduled but the engine has not yet
     reached ``start_iter`` (idle server), ``stop_profile()`` must remove
