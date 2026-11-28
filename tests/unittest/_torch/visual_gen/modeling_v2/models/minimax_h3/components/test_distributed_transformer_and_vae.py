@@ -267,19 +267,15 @@ def _logic_h3_ulysses_and_parallel_vae(
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
 @pytest.mark.parametrize("async_ulysses", [False, True], ids=["nccl", "async"])
 @pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "FLASHINFER", "DECO"])
-def test_h3_ulysses_and_parallel_vae(backend: str, async_ulysses: bool, run_h3_ranks) -> None:
+def test_h3_ulysses_and_parallel_vae(
+    backend: str, async_ulysses: bool, run_h3_ranks, require_deco_kernels
+) -> None:
     if backend == "TRTLLM" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("TRTLLM H3 requires SM100 or SM103")
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
     if backend == "DECO":
-        from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention.deco_attention import (
-            deco_unavailable_reason,
-        )
-
-        reason = deco_unavailable_reason("nvfp4", "fp8")
-        if reason is not None:
-            pytest.skip(reason)
+        require_deco_kernels()
         if torch.cuda.get_device_capability(1) != torch.cuda.get_device_capability(0):
             pytest.skip("DeCo-Attention on two GPUs needs two GPUs of one model")
     if torch.cuda.device_count() < 2:

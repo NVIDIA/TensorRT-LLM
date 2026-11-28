@@ -172,8 +172,6 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
-Base H3 and FastH3 use V1 by default during rollout. Set `TLLM_VISUALGEN_MODELING2_H3=1` before starting VisualGen to use V2.
-
 MiniMax-H3 parallel VAE uses independent spatial tiles via
 `parallel_config.parallel_vae_size`, with size from 1 through the world size (`tp_size * ulysses_size`).
 Tile geometry and blending follow the loaded Diffusers VAE.
@@ -514,7 +512,7 @@ for tiny Wan/FLUX checkpoints, and checkpoint-backed H3 restoration of video,
 audio, and parameter addresses. Full-model sleep coverage is FP8 text-to-video/audio
 with pinned backing; keyframe-conditioned, Ref2VA, and non-FP8 sleep configurations remain
 unvalidated. The checkpoint-backed regression is
-`tests/integration/defs/visual_gen/test_minimax_h3_sleep.py`.
+`tests/integration/defs/visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_sleep.py`.
 
 ## Developer Guide
 

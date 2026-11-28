@@ -11,6 +11,9 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.lin
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.transformer import (
     MiniMaxH3Transformer3DModel,
 )
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.weights import (
+    map_runtime_lora_names,
+)
 from tensorrt_llm._torch.visual_gen.runtime_lora import apply_runtime_lora
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig
@@ -84,6 +87,74 @@ def test_turbo_lora_matches_premerged_h3(tmp_path: Path) -> None:
         merged = getattr(expected, stream)
         assert not torch.equal(baseline, merged), stream
         torch.testing.assert_close(getattr(output, stream), merged)
+
+
+@torch.inference_mode()
+def test_turbo_lora_names_reach_every_h3_projection(tmp_path: Path) -> None:
+    """Turbo names reach the trunk and refiner projections; to_q/to_k/to_v fold into qkv_proj."""
+    model = MiniMaxH3Transformer3DModel(_make_model_config(num_layers=1, num_refiner_layers=1))
+    for parameter in model.parameters():
+        parameter.zero_()
+
+    targets = {
+        "blocks.0.attn.out_proj": "transformer_blocks.0.attn.to_out.0",
+        "blocks.0.mlp.fc1": "transformer_blocks.0.ff.gate_up_proj",
+        "blocks.0.mlp.fc2": "transformer_blocks.0.ff.down_proj",
+        "blocks.0.adaln_proj.linear": "transformer_blocks.0.adaln_proj.linear",
+        "token_refiner.blocks.0.attn.out_proj": "token_refiner.refiner_blocks.0.attn.to_out.0",
+        "token_refiner.blocks.0.mlp.fc1": "token_refiner.refiner_blocks.0.ff.gate_up_proj",
+        "token_refiner.blocks.0.mlp.fc2": "token_refiner.refiner_blocks.0.ff.down_proj",
+        "final_layer.adaln_proj.linear": "norm_out.linear",
+    }
+    qkv_targets = {
+        "blocks.0.attn": "transformer_blocks.0.attn.qkv_proj",
+        "token_refiner.blocks.0.attn": "token_refiner.refiner_blocks.0.attn.qkv_proj",
+    }
+    pairs = {}
+    expected = {}
+
+    def add(adapter_name: str, in_features: int, column: torch.Tensor) -> None:
+        a = torch.zeros(1, in_features)
+        a[0, 0] = 1
+        pairs[f"{adapter_name}.lora_A.weight"] = a
+        pairs[f"{adapter_name}.lora_B.weight"] = column[:, None]
+
+    for value, (adapter_name, module_name) in enumerate(targets.items(), start=1):
+        projection = model.get_submodule(module_name)
+        expected[module_name] = torch.full((projection.out_features,), float(value))
+        add(adapter_name, projection.in_features, expected[module_name])
+    for adapter_name, module_name in qkv_targets.items():
+        projection = model.get_submodule(module_name)
+        rows = projection.out_features // 3
+        columns = [torch.full((rows,), value) for value in (9.0, 10.0, 11.0)]
+        for suffix, column in zip(("to_q", "to_k", "to_v"), columns):
+            add(f"{adapter_name}.{suffix}", projection.in_features, column)
+        expected[module_name] = torch.cat(columns)
+
+    path = tmp_path / "adapter.safetensors"
+    save_file(pairs, str(path))
+    application = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(path)))
+
+    assert set(application.applied_modules) == set(expected)
+    assert application.skipped_non_targets == application.skipped_incomplete == 0
+    for module_name, column in expected.items():
+        weight = model.get_submodule(module_name).weight
+        torch.testing.assert_close(weight[:, 0], column.to(weight.dtype), rtol=0, atol=0)
+        assert weight[:, 1:].count_nonzero().item() == 0, module_name
+
+
+_TURBO_LAYOUT = (
+    "blocks.0.mlp.fc1",
+    "token_refiner.blocks.0.mlp.fc1",
+    "final_layer.adaln_proj.linear",
+)
+
+
+@pytest.mark.parametrize("missing", _TURBO_LAYOUT)
+def test_turbo_lora_names_map_only_with_the_full_turbo_layout(missing: str) -> None:
+    """Without any one part of the Turbo layout, adapter names stay unmapped."""
+    names = {name: name for name in _TURBO_LAYOUT if name != missing}
+    assert map_runtime_lora_names(names) == {}
 
 
 @torch.inference_mode()

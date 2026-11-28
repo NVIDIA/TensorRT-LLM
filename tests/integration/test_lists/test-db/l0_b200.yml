@@ -159,7 +159,6 @@ l0_b200:
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_mega_mhc_pipeline.py::test_mega_mhc_pipeline_changed_input_graph[bf16-shifted-many-task-waves]
   - unittest/_torch/modules/test_engram.py
-  - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   - unittest/_torch/modules/test_megamoe_shared_mlp_scales.py
   - unittest/_torch/modules/test_logits_cast.py
@@ -491,6 +490,7 @@ l0_b200:
   - unittest/_torch/visual_gen/modeling_v2/catalog/activation/test_swiglu_block_fp8.py
   - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_cudnn_sdpa.py
   - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sol_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_deco_attention.py
   - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_block_weight_layout.py
   - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_quantize.py
   - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_static_quantize.py
@@ -592,15 +592,6 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_edge.py
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
-  - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
-  - unittest/_torch/visual_gen/test_minimax_h3_vsa.py
-  - unittest/_torch/visual_gen/test_minimax_h3_fused_rope.py
-  - unittest/_torch/visual_gen/test_minimax_h3_fused_adaln.py
-  - unittest/_torch/visual_gen/test_minimax_h3_vae_decode.py
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (60)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (60)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_minimax_h3_transformer.py
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_dense_attention.py
   - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_projection.py
@@ -750,12 +741,6 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
   # Real-checkpoint cases; the weights come from the shared CI model store.
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_loads_and_runs TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
   - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_public_visual_gen_api_smoke
   - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va]
   - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
@@ -783,7 +768,6 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_offload_matches_baseline
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_fp8_offload_matches_baseline
   - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
-  - visual_gen/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
   - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark

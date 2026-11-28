@@ -3517,9 +3517,7 @@ def omni_generator(request):
     from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
 
     if request.param == "minimax-h3-ref2va":
-        from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
-            MiniMaxH3Pipeline,
-        )
+        from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3 import MiniMaxH3Pipeline
 
         pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
         pipeline.workflow = "ref2va"

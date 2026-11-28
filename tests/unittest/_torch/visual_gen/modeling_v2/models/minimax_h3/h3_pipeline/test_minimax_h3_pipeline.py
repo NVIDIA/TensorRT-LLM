@@ -650,8 +650,12 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
             calls.append(("weights", checkpoint_dir, mapping, kwargs))
             return {"weight": torch.ones(1)}
 
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline import (
+        text_encoder_tp,
+    )
+
     monkeypatch.setattr(
-        h3_pipeline.MiniMaxH3TensorParallelTextEncoder,
+        text_encoder_tp.MiniMaxH3TensorParallelTextEncoder,
         "from_pretrained_config",
         from_pretrained_config,
     )

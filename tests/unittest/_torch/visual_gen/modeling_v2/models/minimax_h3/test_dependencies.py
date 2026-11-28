@@ -31,6 +31,7 @@ _VISUAL_GEN_SERVICES = {
     "pipeline.RefSlotSpec",
     "pipeline.RoleSpec",
     "pipeline_registry.PipelineComponent",
+    "pipeline_registry.register_pipeline",
     "sleep.PipelineSleepManager",
     "sleep.SleepRestoreMode",
 }

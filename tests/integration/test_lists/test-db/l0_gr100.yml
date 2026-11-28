@@ -258,9 +258,9 @@ l0_gr100:
   # VisualGen accuracy checks.
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_lpips_against_golden
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va]
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va]
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va]
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va]
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
   # FLUX.2 conditioning, FP8 and CUDA graph coverage.
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-fp8-blockwise]
@@ -270,8 +270,8 @@ l0_gr100:
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_lpips_against_golden TIMEOUT (15)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_t2i_lpips_against_golden TIMEOUT (15)
   # MiniMax-H3 executor API and dynamic-quantization coverage.
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_public_visual_gen_api_smoke
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)

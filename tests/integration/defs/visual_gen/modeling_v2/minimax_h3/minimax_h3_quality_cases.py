@@ -26,7 +26,7 @@ import torch
 from diffusers import ModularPipeline
 from PIL import Image
 from test_common.llm_data import get_checkpoint
-from test_common.visual_gen.h3_rollout import load_default_h3_visual_gen
+from test_common.visual_gen.h3_loading import load_default_h3_visual_gen
 
 from defs.examples.visual_gen.visual_gen_test_utils import (
     _cleanup_cuda,

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-# Self-attention over fewer rows runs unquantized, as in the shared DeCo-Attention recipe.
+# Self-attention over fewer rows runs unquantized.
 DECO_MIN_SEQ_LEN = 8192
 DECO_HEAD_DIM = 128
 

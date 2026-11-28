@@ -20,7 +20,7 @@ Follows: VisualGenArgs → PipelineLoader → DiffusionPipelineConfig → AutoPi
 All pipelines (Wan, Flux, Flux2, LTX2, QwenImage) register via @register_pipeline decorator.
 
 The registry value is a private ``_PipelineEntry`` dataclass that carries
-the pipeline class plus four pieces of per-family metadata:
+the pipeline class plus per-family metadata:
 
   * ``hf_ids``  — canonical HuggingFace model IDs that dispatch to this
                   pipeline. Powers ``VisualGen.supported_models()`` and
@@ -33,6 +33,9 @@ the pipeline class plus four pieces of per-family metadata:
                             that contain multiple checkpoint formats/variants.
   * ``doc``     — short human-readable description for discovery tooling.
   * ``supports_nvfp4_vae`` — whether this family can execute an NVFP4 VAE.
+  * ``router``  — optional family router that picks the target pipeline
+                  class from the config and the resolved checkpoint
+                  directory before construction.
 
 The dataclass and the registry itself are deliberately private — users go
 through ``VisualGenArgs(model=...)``, ``VisualGen.supported_models()``,
@@ -94,11 +97,7 @@ class _PipelineEntry:
     download_patterns: List[str] = field(default_factory=list)
     doc: str = ""
     supports_nvfp4_vae: bool = False
-    opt_in: Optional[tuple[str, _PipelineResolver]] = None
-
-    @property
-    def opt_in_enabled(self) -> bool:
-        return self.opt_in is not None and os.environ.get(self.opt_in[0]) == "1"
+    router: Optional[_PipelineResolver] = None
 
 
 # Keyed by Diffusers ``_class_name`` (from either manifest format). ~3-5 entries
@@ -115,6 +114,7 @@ def register_pipeline(
     download_patterns: Optional[List[str]] = None,
     doc: str = "",
     supports_nvfp4_vae: bool = False,
+    router: Optional[_PipelineResolver] = None,
 ) -> Callable[[Type["BasePipeline"]], Type["BasePipeline"]]:
     """Register a pipeline class with optional per-family metadata.
 
@@ -149,19 +149,12 @@ def register_pipeline(
             download_patterns=list(download_patterns or []),
             doc=doc,
             supports_nvfp4_vae=supports_nvfp4_vae,
+            router=router,
         )
         logger.debug(f"Registered pipeline: {name} -> {cls.__name__}")
         return cls
 
     return decorator
-
-
-def register_pipeline_opt_in(name: str, env_var: str, resolver: _PipelineResolver) -> None:
-    """Attach an opt-in resolver to an existing checkpoint family."""
-    entry = PIPELINE_REGISTRY[name]
-    if entry.opt_in is not None:
-        raise ValueError(f"Pipeline opt-in already registered: {name}")
-    entry.opt_in = (env_var, resolver)
 
 
 class AutoPipeline:
@@ -187,15 +180,12 @@ class AutoPipeline:
                 f"Checkpoint: {checkpoint_dir}"
             )
         entry = PIPELINE_REGISTRY[class_name]
-        if entry.opt_in is not None:
-            from ._pipeline_opt_in import resolve_opt_in
-
-            target = resolve_opt_in(config, checkpoint_dir, class_name, entry, entry.opt_in)
-            if target is not None:
-                return target
-
         AutoPipeline._validate_vae_quantization(config, class_name, entry)
-        pipeline_class = entry.pipeline_cls.resolve_variant(config)
+        pipeline_class = (
+            entry.router(config, checkpoint_dir)
+            if entry.router is not None
+            else entry.pipeline_cls.resolve_variant(config)
+        )
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
         return pipeline_class
 

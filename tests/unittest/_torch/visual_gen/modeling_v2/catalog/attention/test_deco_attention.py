@@ -8,7 +8,6 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention.deco_attention import (
     deco_attention,
-    deco_unavailable_reason,
 )
 
 
@@ -17,12 +16,11 @@ def _relative_error(out: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 @pytest.mark.parametrize("cell", deco_attention.CELLS, ids=lambda cell: cell.why)
-def test_deco_attention(cell):
+def test_deco_attention(cell, require_deco_kernels):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("DeCo-Attention cells are certified on SM100")
     v_dtype, tokens, padding = cell.spec["v_dtype"], cell.spec["tokens"], cell.spec["padding"]
-    reason = deco_unavailable_reason("nvfp4", v_dtype)
-    assert reason is None, reason
+    require_deco_kernels(v_dtype)
     shape = (1, tokens, 2, 128)
     generator = torch.Generator(device="cuda").manual_seed(7)
     # Scores with standard deviation 4 let a few keys dominate each row.

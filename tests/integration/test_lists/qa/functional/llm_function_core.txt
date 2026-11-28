@@ -910,8 +910,6 @@ unittest/_torch/modeling/test_modeling_apertus.py::TestApertus1p5_8B
 
 # Single-GPU H3: >= 140 GiB GPU memory, 320 GiB host RAM budget, MiniMax-H3 checkpoint.
 # Smaller GPUs are skipped by the test. Run both policies sequentially.
-visual_gen/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio[False] TIMEOUT (30)
-visual_gen/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio[True] TIMEOUT (30)
 visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio[False] TIMEOUT (30)
 visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio[True] TIMEOUT (30)
 

@@ -493,7 +493,7 @@ def test_loader_rejects_backup_release_without_sleep(allocation_backend: SimpleN
 def h3_loader(monkeypatch: pytest.MonkeyPatch) -> tuple:
     from tensorrt_llm._torch.visual_gen import pipeline_loader as loader_module
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
         MiniMaxH3Pipeline,
     )
     from tensorrt_llm.visual_gen.args import VisualGenArgs
@@ -795,7 +795,7 @@ def test_loader_failure_exits_capture_without_enabling_sleep(
 
 
 def test_sleeping_h3_rejects_forward_before_cuda_work() -> None:
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
         MiniMaxH3Pipeline,
     )
 
@@ -821,7 +821,7 @@ def test_sleeping_h3_rejects_forward_before_cuda_work() -> None:
 def test_h3_forward_holds_generation_scope(
     allocation_backend: SimpleNamespace, enabled: bool, raises: bool, references: list | None
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
         MiniMaxH3Pipeline,
     )
 
@@ -862,10 +862,8 @@ def test_h3_forward_holds_generation_scope(
 
 
 def test_sleep_api_belongs_only_to_h3() -> None:
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.pipeline import H3PipelineBase
     from tensorrt_llm._torch.visual_gen.models.flux import FluxPipeline
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
-        MiniMaxH3Pipeline,
-    )
     from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
     from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
@@ -873,7 +871,7 @@ def test_sleep_api_belongs_only_to_h3() -> None:
         for pipeline_cls in (BasePipeline, WanPipeline, FluxPipeline):
             assert not hasattr(pipeline_cls, name)
     for name in ("sleep", "wake_up", "is_sleeping"):
-        assert name in MiniMaxH3Pipeline.__dict__
+        assert name in H3PipelineBase.__dict__
 
 
 @pytest.mark.parametrize("operation", ["sleep", "wake_up"])
@@ -882,7 +880,7 @@ def test_sleep_api_belongs_only_to_h3() -> None:
 def test_h3_sleep_controls_require_single_rank(
     operation: str, world_size: int, mapping_kind: str
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
         MiniMaxH3Pipeline,
     )
 
@@ -907,8 +905,8 @@ def test_h3_sleep_controls_require_single_rank(
 
 
 @pytest.mark.parametrize("operation", ["sleep", "wake_up"])
-def test_h3_without_opt_in_rejects_sleep_controls(operation: str) -> None:
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+def test_h3_rejects_sleep_controls_without_sleep_loading(operation: str) -> None:
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline.pipeline import (
         MiniMaxH3Pipeline,
     )
 

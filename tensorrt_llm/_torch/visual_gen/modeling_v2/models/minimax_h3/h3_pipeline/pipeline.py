@@ -17,6 +17,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -38,7 +39,9 @@ from ..components.transformer import (
 from ..packing import resolve_canvas_size
 from ..pipeline import H3PipelineBase
 from .ref2va import load_references, prepare_references, validate_reference_order
-from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
+
+if TYPE_CHECKING:
+    from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
 
 
 class MiniMaxH3Pipeline(H3PipelineBase):
@@ -147,7 +150,10 @@ class MiniMaxH3Pipeline(H3PipelineBase):
         self,
         checkpoint_dir: str,
         device: torch.device,
-    ) -> MiniMaxH3TensorParallelTextEncoder:
+    ) -> "MiniMaxH3TensorParallelTextEncoder":
+        # Its Triton Gluon kernel is imported only when a TP text encoder is built.
+        from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
+
         if not self._loads_text_encoder_on_this_rank:
             raise RuntimeError(
                 "MiniMax-H3 tensor-parallel text encoder is loaded only on "

@@ -29,6 +29,9 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
+from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention import (
+    deco_attention as deco_catalog,
+)
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components import (
     attention as attention_module,
 )
@@ -40,6 +43,9 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components imp
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.attention import (
     QKVMode,
+)
+from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.components.dense_attention import (
+    H3DenseAttention,
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.weights import (
     remap_feed_forward_weights,
@@ -1028,23 +1034,107 @@ def test_transformer_block_is_fullgraph_compile_safe(
         torch._dynamo.reset()
 
 
+def _attention_config(backend: str) -> AttentionConfig:
+    """DECO is CUTEDSL under the DeCo-Attention recipe."""
+    if backend == "DECO":
+        recipe = QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True)
+        return AttentionConfig(backend="CUTEDSL", quant_attention_config=recipe)
+    return AttentionConfig(backend=backend)
+
+
 @pytest.mark.parametrize(
-    ("backend", "supported"),
-    [("VANILLA", True), ("FA4", True), ("TRTLLM", True), ("FLASHINFER", True), ("CUTEDSL", False)],
+    ("backend", "mask", "trailing"),
+    [
+        ("VANILLA", True, False),
+        ("FA4", True, True),
+        ("TRTLLM", True, True),
+        ("FLASHINFER", True, False),
+        ("CUTEDSL", False, False),
+        ("CUDNN", False, False),
+        ("DECO", True, True),
+    ],
 )
-def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
+def test_padding_support_tracks_attention_backend(backend: str, mask: bool, trailing: bool) -> None:
     config = _make_model_config()
-    config.attention = AttentionConfig(backend=backend)
+    config.attention = _attention_config(backend)
     model = h3.MiniMaxH3Transformer3DModel(config)
 
-    assert model._supports_key_padding_mask is supported
+    assert model._supports_key_padding_mask is mask
+    assert model.token_refiner._supports_key_padding_mask is mask
+    assert model._requires_trailing_padding is trailing
+    assert model._uses_deco is (backend == "DECO")
 
 
-def test_deco_attention_takes_the_key_padding_mask() -> None:
-    recipe = QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True)
-    attention = AttentionConfig(backend="CUTEDSL", quant_attention_config=recipe)
+@requires_cuda
+def test_vanilla_interior_padding_matches_the_unpadded_sequence() -> None:
+    """A padded row between the tokens leaves the output of every valid row unchanged."""
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(num_layers=1, num_refiner_layers=1)
+    ).to("cuda")
+    _initialize_weights(model, scale=0.1)
+    inputs = _model_inputs("cuda")
+    # The unpadded rows are text, video, audio, video; row 1 is inserted as padding.
+    padded = inputs | {
+        "token_tags": torch.tensor([1, -1, 0, 2, 0], device="cuda"),
+        "timestep_indices": torch.tensor([0, 0, 1, 1, 0], device="cuda"),
+        "position_ids": torch.tensor(
+            [[0, 0, 0], [0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 1]], device="cuda"
+        ),
+        "video_indices": torch.tensor([2, 4], device="cuda"),
+        "audio_indices": torch.tensor([3], device="cuda"),
+    }
 
-    assert h3.takes_key_padding_mask(attention)
+    with torch.inference_mode():
+        expected = model(**inputs)
+        actual = model(**padded)
+
+    torch.testing.assert_close(actual.sample, expected.sample, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=2e-2, atol=2e-3)
+
+
+@requires_cuda
+def test_deco_recipe_selects_deco_in_every_attention_layer(require_deco_kernels) -> None:
+    require_deco_kernels()
+    config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
+    config.attention = _attention_config("DECO")
+    model = h3.MiniMaxH3Transformer3DModel(config)
+
+    blocks = [*model.transformer_blocks, *model.token_refiner.refiner_blocks]
+    assert len(blocks) == 2
+    for block in blocks:
+        assert isinstance(block.attn.attn, H3DenseAttention) and block.attn.attn.deco
+
+
+@requires_cuda
+def test_deco_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch) -> None:
+    """The kernels keep one basis draw while every block passes the same tags and mask."""
+    monkeypatch.setattr(deco_catalog, "deco_unavailable_reason", lambda *_: None)
+    config = _make_model_config(num_layers=2, num_refiner_layers=1)
+    config.attention = _attention_config("DECO")
+    model = h3.MiniMaxH3Transformer3DModel(config).to("cuda")
+    _initialize_weights(model)
+    calls = []
+
+    def record(self, q, k, v, key_padding_mask, token_tags):
+        calls.append((key_padding_mask, token_tags))
+        return q
+
+    monkeypatch.setattr(H3DenseAttention, "_deco_forward", record)
+    # A trailing padded row gives the joint blocks a key padding mask.
+    inputs = _model_inputs("cuda") | {
+        "timestep_indices": torch.tensor([0, 1, 1, 0, 0], device="cuda"),
+        "token_tags": torch.tensor([1, 0, 2, 0, -1], device="cuda"),
+        "position_ids": torch.tensor(
+            [[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 1], [0, 0, 0]], device="cuda"
+        ),
+    }
+    with torch.inference_mode():
+        model(**inputs)
+
+    masks, tags = zip(*(call for call in calls if call[1] is not None))
+    assert len(tags) == len(model.transformer_blocks)
+    assert masks[0] is not None and all(mask is masks[0] for mask in masks)
+    assert all(tag is tags[0] for tag in tags)
 
 
 @requires_cuda
@@ -1623,14 +1713,16 @@ def test_refiner_rejects_padding_without_mask_support() -> None:
 
 
 @requires_cuda
-@pytest.mark.parametrize("backend", ["FA4", "TRTLLM"])
-def test_prefix_backend_rejects_interior_padding(backend: str) -> None:
+@pytest.mark.parametrize("backend", ["FA4", "TRTLLM", "DECO"])
+def test_prefix_backend_rejects_interior_padding(backend: str, require_deco_kernels) -> None:
     if not _sm_at_least(10):
         pytest.skip("FA4 requires SM100 or newer")
     if backend == "FA4":
         assert FA4_AVAILABLE
+    if backend == "DECO":
+        require_deco_kernels()
     config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
-    config.attention = AttentionConfig(backend=backend)
+    config.attention = _attention_config(backend)
     if backend == "TRTLLM":
         config.attention_metadata_state = create_attention_metadata_state()
     model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
