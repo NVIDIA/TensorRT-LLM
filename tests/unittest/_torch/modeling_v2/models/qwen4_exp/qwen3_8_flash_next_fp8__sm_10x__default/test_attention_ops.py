@@ -1174,7 +1174,7 @@ def test_sparse_gqa_splitk_first_decode_call_compiles_every_plan(spec, monkeypat
     compile nothing at any plan (at tp2/tep2, 164..256 and 324..512 rows take three splits),
     nor do gated calls, and the results stay within the reference band."""
     monkeypatch.setattr(mod, "_COMPILED", {})
-    monkeypatch.setattr(mod, "_PLANNED", set())
+    monkeypatch.setattr(mod, "_PLANNED", {})
     args = _sgc_build(spec, seed=4242)
     q, k = args["q"], args["k_cache"]
     cap = mod.MAX_ROWS[(q.shape[1], k.shape[1], k.dtype)]
