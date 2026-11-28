@@ -2440,9 +2440,11 @@ def sparse_gqa_grouped(
     softmax_scale: float,
     rows_per_request: int,
     output_gate: Optional[torch.Tensor] = None,
+    min_groups: Optional[int] = None,
 ) -> torch.Tensor:
     """The grouped kernel (and the row merge with more than one split) over an e4m3 pool; see
-    `QsaSparseGqaGroupedCute` for the contract."""
+    `QsaSparseGqaGroupedCute` for the contract. `min_groups`: the fewest groups the caller routes
+    here (what it passes `takes_grouped`), from which the first call of a geometry plans."""
     rows, num_q_heads, head_dim = q.shape
     num_pages, num_kv_heads, tpb, dim = k_cache.shape
     rpr = int(rows_per_request)
@@ -2606,9 +2608,10 @@ def sparse_gqa_grouped(
         bal_ctas=n_sms,
     )
     # A launch plan depends on the call's row count: the first call of a geometry compiles every
-    # plan its row counts can reach, so no serving step compiles one; a first call below
-    # `MIN_GROUPS` groups (a caller's `min_groups`) also the plans from its own count up.
-    floor = min(MIN_GROUPS, n_groups)
+    # plan its row counts can reach, so no serving step compiles one. Below `MIN_GROUPS` groups
+    # the reach starts at the caller's `min_groups` (else at the call's own count), so a later
+    # call at fewer groups than the first, but not fewer than the caller routes, compiles none.
+    floor = min(MIN_GROUPS, n_groups if min_groups is None else int(min_groups))
     if key[:5] + key[7:] + (floor,) not in _PLANNED:
         _PLANNED.add(key[:5] + key[7:] + (floor,))
         max_groups = block_table.shape[0]
@@ -2796,7 +2799,9 @@ class QsaSparseGqaGroupedCute(OpWrapper):
         softmax_scale: float,
         rows_per_request: int,
         output_gate: Optional[torch.Tensor] = None,
+        min_groups: Optional[int] = None,
     ) -> torch.Tensor:
+        """`min_groups`: the floor the caller passes `serves` (planning reach only)."""
         return sparse_gqa_grouped(
             q,
             k_cache,
@@ -2808,6 +2813,7 @@ class QsaSparseGqaGroupedCute(OpWrapper):
             softmax_scale,
             rows_per_request,
             output_gate=output_gate,
+            min_groups=min_groups,
         )
 
     def reference(
@@ -2822,10 +2828,12 @@ class QsaSparseGqaGroupedCute(OpWrapper):
         softmax_scale: float,
         rows_per_request: int,
         output_gate: Optional[torch.Tensor] = None,
+        min_groups: Optional[int] = None,
     ) -> torch.Tensor:
         """The per-row entry's reference (fp32 sparse GQA over every resident selected token,
         rounded once; gated in fp32 over that rounding and rounded again). `rows_per_request`
-        is ignored: the grouping changes which loads serve a row, not what it attends."""
+        and `min_groups` are ignored: they change which loads serve a row and what is compiled
+        when, not what a row attends."""
         return qsa_sparse_gqa_splitk_cute.reference(
             q,
             k_cache,

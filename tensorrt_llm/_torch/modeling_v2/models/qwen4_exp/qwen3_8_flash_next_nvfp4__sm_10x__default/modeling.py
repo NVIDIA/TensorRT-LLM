@@ -5538,8 +5538,9 @@ def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p
         and qsa_sparse_gqa_grouped_cute.serves(q, kv.k, selected, p, min_groups=min_requests)
     ):
         return qsa_sparse_gqa_grouped_cute(
-            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, p, gate
-        )
+            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, p, gate,
+            min_groups=min_requests,
+        )  # fmt: skip
     if _splitk_serves(core, q, kv.k, selected):
         # A tep4 shard the op's table leaves out names its reach, so the first call compiles
         # every plan up to it (`_TEP_SPLITK_MAX_ROWS`) and no later row count compiles one.
