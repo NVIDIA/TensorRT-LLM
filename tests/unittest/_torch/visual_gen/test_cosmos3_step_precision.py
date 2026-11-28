@@ -209,11 +209,12 @@ class TestDispatch:
 
 
 class TestW8A16Apply:
-    def test_dequantized_weight_matches_scaled_reference(self):
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+    def test_dequantized_weight_matches_scaled_reference(self, backend):
         module = _StubLinear(out_features=3, in_features=4, scale=0.5)
         module.weight = torch.arange(12).reshape(3, 4).to(torch.float8_e4m3fn)
         x = torch.ones(2, 4, dtype=torch.bfloat16)
-        out = W8A16FP8LinearMethod().apply(module, x, bias=None)
+        out = W8A16FP8LinearMethod(backend=backend).apply(module, x, bias=None)
         expected = torch.nn.functional.linear(x, module.weight.to(x.dtype) * 0.5)
         assert torch.allclose(out, expected)
 

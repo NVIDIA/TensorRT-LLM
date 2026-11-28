@@ -151,13 +151,14 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
             return False
 
     def _prepare(self, inputs: list[torch.Tensor]):
-        from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE, _get_cache_buf
+        from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+        from flashinfer.utils import _get_stream_cache_buf
 
         act, act_scale, weight, weight_scale = inputs
         major, minor = torch.cuda.get_device_capability(act.device)
         runner = _flashinfer_runner(self.backend, major, minor, self.output_dtype)
         out = act.new_empty((act.shape[0], weight.shape[0]), dtype=self.output_dtype)
-        workspace = _get_cache_buf("mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, act.device)
+        workspace = _get_stream_cache_buf("mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, act.device)
         return runner, [act, weight.t(), act_scale, weight_scale, self.output_dtype, out, workspace]
 
     def get_valid_tactics(

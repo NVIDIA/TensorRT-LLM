@@ -75,6 +75,7 @@ l0_b300:
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_mxfp8_linear.py
+  - unittest/_torch/modules/test_w8a16_fp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/test_top_k.py

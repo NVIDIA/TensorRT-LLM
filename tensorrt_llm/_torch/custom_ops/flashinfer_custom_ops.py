@@ -130,6 +130,29 @@ if IS_FLASHINFER_AVAILABLE:
     ):
         return
 
+    @torch.library.custom_op("trtllm::flashinfer_w8a16_fp8_gemm",
+                             mutates_args=())
+    def flashinfer_w8a16_fp8_gemm(
+        act: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the FlashInfer GEMM with pointer validation outside tracing."""
+        from flashinfer.gemm import mm_bf16_fp8, mm_fp16_fp8
+
+        gemm = mm_bf16_fp8 if act.dtype == torch.bfloat16 else mm_fp16_fp8
+        return gemm(act, weight, weight_scale, bias=bias)
+
+    @flashinfer_w8a16_fp8_gemm.register_fake
+    def _(
+        act: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return act.new_empty((*act.shape[:-1], weight.shape[0]))
+
     # mm_mxfp8 is newer than the entry points above, so probe it separately
     # rather than breaking this module's import on an older flashinfer build.
     try:
