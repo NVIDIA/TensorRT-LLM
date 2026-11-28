@@ -56,11 +56,9 @@ class LoRARequest:
     lora_path: str = ""
     lora_ckpt_source: str = "hf"
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.lora_ckpt_source not in ["hf", "nemo"]:
-            raise ValueError(
-                f"lora_ckpt_source must be 'hf' or 'nemo', got '{self.lora_ckpt_source}'"
-            )
+            raise ValueError("lora_ckpt_source must be 'hf' or 'nemo'")
 
     @property
     def adapter_id(self):

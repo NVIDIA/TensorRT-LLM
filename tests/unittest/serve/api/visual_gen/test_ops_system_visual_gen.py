@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""/health, /version and /v1/models of the VisualGen serving role."""
+"""System endpoints and validation errors of the VisualGen serving role."""
 
 import pytest
+from fastapi.testclient import TestClient
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 import tensorrt_llm.version
@@ -30,6 +31,15 @@ def visual_gen_client(tmp_path):
             AggConfig(role=ServerRole.VISUAL_GEN, model_name="fake-visual-gen")
         )
         yield env.client(server.app)
+
+
+def test_visual_gen_role_uses_its_422_envelope(visual_gen_client: TestClient) -> None:
+    resp = visual_gen_client.post("/v1/images/generations", json={"prompt": "test", "messages": []})
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["type"] == "BadRequestError"
+    assert body["code"] == 422
+    assert "messages" in body["message"]
 
 
 def test_health_always_succeeds_today(visual_gen_client):

@@ -19,7 +19,8 @@ import base64
 import math
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import (Any, Dict, List, Literal, Mapping, Optional, Sequence,
+                    Tuple, Union)
 
 import torch
 import xgrammar
@@ -415,6 +416,263 @@ class ErrorResponse(OpenAIBaseModel):
     # HTTP status by default; a machine-readable string for conditions that
     # define one (e.g. "context_length_exceeded", matching OpenAI).
     code: Union[int, str]
+
+
+# A longer location segment, such as an unknown field name, is cut short so
+# the error cannot echo an arbitrarily long name back.
+_MAX_LOCATION_SEGMENT_CHARS = 64
+_MAX_DESCRIBED_ERRORS = 20
+_MAX_VALIDATION_ERROR_CHARS = 256
+_MAX_VALIDATION_MESSAGE_CHARS = 4096
+
+# Schema names pydantic tags a scalar union member with.
+_SCALAR_MEMBER_TAGS = frozenset({"str", "int", "float", "bool", "bytes"})
+
+# FastAPI request-part prefixes that identify where a validation error came
+# from rather than a parameter name in the client's request.
+_REQUEST_LOCATION_PREFIXES = frozenset(
+    {"body", "query", "path", "header", "cookie"})
+
+
+def _is_union_member_tag(segment: Any) -> bool:
+    """Whether a location segment names a union member rather than a field.
+
+    Pydantic tags each member's errors with the member: a model or TypedDict
+    by its class name, any other type by its schema name ('str',
+    'list[...]', 'function-after[...]'). Request field names are lowercase,
+    but a key the client sent need not be; _union_member_tag_positions keeps
+    such a key.
+    """
+    return isinstance(segment,
+                      str) and ("[" in segment or segment[:1].isupper()
+                                or segment in _SCALAR_MEMBER_TAGS)
+
+
+# Error types whose last location segment is a key the client sent or a field
+# the schema requires, never a union member.
+_KEY_NAMING_ERROR_TYPES = frozenset({"extra_forbidden", "missing"})
+
+
+def _union_member_tag_positions(error: Mapping[str, Any]) -> List[int]:
+    """Where an error's location names a union member rather than a field.
+
+    The last segment of an unknown or missing parameter is that parameter's
+    own name, whatever it looks like ('Temperature', 'list'), so it is never
+    taken for a member.
+    """
+    loc = tuple(error.get("loc", ()))
+    end = len(loc) - 1 if error.get("type") in _KEY_NAMING_ERROR_TYPES else len(
+        loc)
+    return [i for i in range(end) if _is_union_member_tag(loc[i])]
+
+
+def _matched_union_member_errors(
+        errors: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    """The errors left once each union keeps only the members its value chose.
+
+    A union reports every member's errors. Only a rejected role/type tag or
+    a wrong member type rules out a member, not other literal fields such as
+    tool-choice "mode". Bare literal alternatives can reject the value too;
+    keep every diagnostic when all members reject it. When several members
+    still survive, rank the one whose errors reach deepest (then with fewest
+    errors) first so ``param`` and the leading sentence point at the closest
+    match.
+    """
+    members_by_union: Dict[tuple, Dict[str, List[int]]] = {}
+    field_depths: List[int] = []
+    for index, error in enumerate(errors):
+        loc = tuple(error.get("loc", ()))
+        tag_positions = _union_member_tag_positions(error)
+        field_depths.append(len(loc) - len(tag_positions))
+        for depth in tag_positions:
+            members = members_by_union.setdefault(loc[:depth], {})
+            members.setdefault(loc[depth], []).append(index)
+    dropped = set()
+    surviving_by_union: Dict[tuple, Dict[str, List[int]]] = {}
+    for prefix, members in members_by_union.items():
+        rejected = {
+            tag
+            for tag, indices in members.items()
+            if any((len(errors[i].get("loc", ())) == len(prefix) +
+                    1 and errors[i].get("type") in {
+                        "literal_error", "model_type", "model_attributes_type",
+                        "dict_type", "list_type", "string_type"
+                    }) or (errors[i].get("type") == "literal_error"
+                           and len(errors[i].get("loc", ())) == len(prefix) +
+                           2 and errors[i]["loc"][-1] in ("role", "type"))
+                   for i in indices)
+        }
+        if len(rejected) < len(members):
+            if rejected:
+                for tag in rejected:
+                    dropped.update(members[tag])
+                surviving = {
+                    tag: indices
+                    for tag, indices in members.items() if tag not in rejected
+                }
+            else:
+                surviving = members
+            if len(surviving) > 1:
+                surviving_by_union[prefix] = surviving
+
+    order = [i for i in range(len(errors)) if i not in dropped]
+    pos_of = {idx: pos for pos, idx in enumerate(order)}
+    for prefix in sorted(surviving_by_union, key=len):
+        members = surviving_by_union[prefix]
+        live_members = {
+            tag: [i for i in indices if i in pos_of]
+            for tag, indices in members.items()
+        }
+        live_members = {tag: idxs for tag, idxs in live_members.items() if idxs}
+        if len(live_members) <= 1:
+            continue
+        ranked_tags = sorted(
+            live_members,
+            key=lambda tag: (
+                -max(field_depths[i] for i in live_members[tag]),
+                len(live_members[tag]),
+                min(pos_of[i] for i in live_members[tag]),
+            ),
+        )
+        slots = sorted(pos_of[i] for idxs in live_members.values()
+                       for i in idxs)
+        reordered = [
+            i for tag in ranked_tags
+            for i in sorted(live_members[tag], key=pos_of.__getitem__)
+        ]
+        for slot, idx in zip(slots, reordered):
+            order[slot] = idx
+            pos_of[idx] = slot
+
+    return [errors[i] for i in order]
+
+
+def _error_location(error: Mapping[str, Any]) -> str:
+    """The dotted place of a validation error within the request."""
+    loc = tuple(error.get("loc", ()))
+    member_tags = set(_union_member_tag_positions(error))
+    segments = []
+    for index, segment in enumerate(loc):
+        # FastAPI prefixes request locations with the request part (body, query,
+        # path, header, cookie); any later segment with that name is a field.
+        if (index == 0 and segment
+                in _REQUEST_LOCATION_PREFIXES) or index in member_tags:
+            continue
+        text = str(segment)
+        if len(text) > _MAX_LOCATION_SEGMENT_CHARS:
+            text = text[:_MAX_LOCATION_SEGMENT_CHARS] + "..."
+        segments.append(text)
+    return ".".join(segments)
+
+
+def _with_period(text: str) -> str:
+    return text if text.endswith(".") else f"{text}."
+
+
+def _validation_error_text(error: Mapping[str, Any]) -> str:
+    if error.get("type") == "value_error":
+        ctx_err = (error.get("ctx") or {}).get("error")
+        if ctx_err is not None:
+            return str(ctx_err)
+        msg = str(error.get("msg", ""))
+        return msg.removeprefix("Value error, ")
+    return str(error.get("msg", ""))
+
+
+def summarize_validation_errors(
+        errors: Sequence[Mapping[str, Any]],
+        limit: int = _MAX_DESCRIBED_ERRORS) -> Tuple[str, Optional[str]]:
+    """Describe HTTP-boundary validation errors with bounded messages.
+
+    Each error is named by its dotted path in the request: "Unknown parameter:
+    'store'.", "Missing required parameter: 'messages'.", "Invalid value for
+    'messages.0.content': ...". Input dumps and rejected discriminator tags are
+    omitted. Custom validator messages must not contain rejected values either.
+
+    Args:
+        errors: ``RequestValidationError.errors()`` of the rejected request.
+        limit: How many errors to describe; the rest are only counted.
+
+    Returns:
+        The message, and the dotted location of the first error, or None when
+        that error has no location in the request (the body is not valid JSON).
+    """
+    parts: List[str] = []
+    param: Optional[str] = None
+    errors = _matched_union_member_errors(errors)
+    # A field that failed in several union members is described once.
+    seen_locations = set()
+    described = []
+    for error in errors:
+        location = _error_location(error)
+        if error.get("type") != "json_invalid":
+            if location in seen_locations:
+                continue
+            seen_locations.add(location)
+        described.append((error, location))
+    for index, (error, location) in enumerate(described):
+        error_type = error.get("type", "")
+        if error_type == "json_invalid":
+            # The location is a character offset, not a parameter.
+            reason = (error.get("ctx") or {}).get("error") or error.get(
+                "msg", "")
+            description = _with_period(
+                f"The request body is not valid JSON: {reason}")
+            location = ""
+        elif error_type == "union_tag_invalid":
+            # Pydantic's msg includes the rejected tag; these are schema text.
+            context = error.get("ctx") or {}
+            expected = context.get("expected_tags", "a valid tag")
+            discriminator = context.get("discriminator", "the discriminator")
+            description = (
+                f"Invalid value for '{location}': expected {expected} "
+                f"for {discriminator}.")
+        elif error_type == "extra_forbidden":
+            description = f"Unknown parameter: '{location}'."
+        elif error_type == "missing":
+            description = (f"Missing required parameter: '{location}'."
+                           if location else "The request body is missing.")
+        elif location:
+            # A validator's own message is passed through as written, so a
+            # validator in this module must not put a request value into it.
+            description = _with_period(
+                f"Invalid value for '{location}': {_validation_error_text(error)}"
+            )
+        else:
+            description = _with_period(_validation_error_text(error))
+        if index == 0:
+            param = location or None
+        if index < limit:
+            parts.append(description[:_MAX_VALIDATION_ERROR_CHARS])
+    if len(described) > limit:
+        parts.append(f"({len(described) - limit} more errors not shown.)")
+    message = " ".join(parts) or "The request body is invalid."
+    return message[:_MAX_VALIDATION_MESSAGE_CHARS], param
+
+
+def validation_error_envelope(message: str,
+                              param: Optional[str]) -> Dict[str, Any]:
+    """Build the OpenAI validation-error JSON envelope from a summary."""
+    return {
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": param,
+            "code": None,
+        }
+    }
+
+
+def validation_error_body(
+        errors: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """The OpenAI error envelope for a request that failed validation.
+
+    Uses ``{"error": {"message", "type", "param", "code"}}`` with dotted
+    ``param`` paths and ``code: null`` so OpenAI SDKs surface the message and
+    clients checking for an ``error`` key still find one.
+    """
+    message, param = summarize_validation_errors(errors)
+    return validation_error_envelope(message, param)
 
 
 class CompletionLogProbs(OpenAIBaseModel):
@@ -1199,8 +1457,10 @@ class FunctionDefinition(OpenAIBaseModel):
         if self.parameters is not None:
             num_enum_values = _count_schema_enum_values(self.parameters)
             if num_enum_values > TOOL_PARAM_MAX_ENUM_VALUES:
+                # The name is left out: it is client text of any length, and
+                # the error's location already identifies the tool.
                 raise ValueError(
-                    f"tool function {self.name!r} declares {num_enum_values} "
+                    f"tool function declares {num_enum_values} "
                     f"enum values across its parameters schema; the maximum "
                     f"is {TOOL_PARAM_MAX_ENUM_VALUES}.")
         return self
