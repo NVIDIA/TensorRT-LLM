@@ -57,6 +57,7 @@ from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
+    MultimodalRuntimeData,
     strip_mm_data_for_generation,
 )
 from tensorrt_llm.llmapi import (
@@ -1868,7 +1869,47 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
     def test_item_scheduled_chunk_embedding_is_not_retained(self) -> None:
         """The per-forward item-scheduler payload must not replace the
         request's own multimodal data, or each chunked prefill would keep its
-        last chunk's joined embedding rows until prefill completes."""
+        last chunk's joined embedding rows until prefill completes. Attached
+        embeddings have no encoder state but are sliced the same way."""
+        for attached in (False, True):
+            with self.subTest(attached=attached):
+                self._check_chunk_embedding_is_not_retained(attached)
+
+    def test_attached_embedding_is_sliced_without_item_scheduling(self) -> None:
+        """Without the item scheduler (disable_mm_encoder, an unsupported model
+        or PP), a model with the chunk-aware gather still gets only the
+        forward's rows of an attachment, unless it opts out; other models get
+        it whole."""
+        for chunk_aware, opts_in in ((True, True), (True, False), (False, True)):
+            with self.subTest(chunk_aware=chunk_aware, opts_in=opts_in):
+                (preparer, _) = self.enterContext(input_preparer_and_kv_cache())
+                preparer._mm_item_scheduler = None
+                preparer._slices_attached_embeddings = chunk_aware
+                preparer.model.slices_attached_embeddings = opts_in
+                attachment = torch.arange(6, dtype=torch.float16).reshape(3, 2)
+                request = _create_request_with_tokens([11, 22, 33, 44], 1)
+                request.py_multimodal_data = {
+                    "multimodal_embedding": attachment,
+                    "multimodal_embed_mask_cumsum": torch.tensor([0, 1, 2, 3]),
+                }
+                runtime = MultimodalRuntimeData(
+                    embed_mask_cumsum=request.py_multimodal_data["multimodal_embed_mask_cumsum"],
+                    past_seen_token_num=2,
+                    chunk_end_pos=4,
+                )
+
+                multimodal_data = preparer._build_multimodal_data_for_llm(request, runtime)
+
+                if chunk_aware and opts_in:
+                    torch.testing.assert_close(
+                        multimodal_data["multimodal_embedding"], attachment[1:3]
+                    )
+                    self.assertTrue(multimodal_data["multimodal_embedding_is_chunk"])
+                    self.assertIs(request.py_multimodal_data["multimodal_embedding"], attachment)
+                else:
+                    self.assertIs(multimodal_data, request.py_multimodal_data)
+
+    def _check_chunk_embedding_is_not_retained(self, attached: bool) -> None:
         (preparer, kv_cache_manager) = self.enterContext(input_preparer_and_kv_cache())
         preparer.model.config.vocab_size = 100
         attn_metadata = AttentionMetadata(
@@ -1879,7 +1920,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         context = _create_request_with_tokens([11, 22, 33, 44], 1)
         context.context_chunk_size = 2
         context.py_seq_slot = 0
-        context.py_mm_encoder_state = object()
+        context.py_mm_encoder_state = None if attached else object()
         multimodal_data = {
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 [("image", 0)], output_embedding_lengths=[2]

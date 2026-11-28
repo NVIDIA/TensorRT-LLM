@@ -692,6 +692,15 @@ class MultimodalModelMixin:
         raise NotImplementedError
 
     @property
+    def slices_attached_embeddings(self) -> bool:
+        """Whether input preparation may attach only a forward's rows of an attachment.
+
+        A model whose gather recomputes the row layout of raw requests in the
+        same batch after the executor counted it opts out.
+        """
+        return True
+
+    @property
     def embedding_dtype(self) -> torch.dtype:
         """Return the dtype of each cached multimodal embedding row."""
         raise NotImplementedError

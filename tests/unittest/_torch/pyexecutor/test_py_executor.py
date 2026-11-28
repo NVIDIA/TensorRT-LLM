@@ -52,6 +52,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmResult,
     PyResult,
     SamplingConfig,
+    SequenceGroupState,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import (
@@ -732,6 +733,7 @@ def _make_admission_executor(model, requests):
 def _make_admission_request(request_id: int) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         request_id=request_id,
+        child_requests=[],
         py_disaggregated_params=None,
         sampling_config=None,
         kv_cache_retention_config=None,
@@ -801,7 +803,7 @@ def test_sparse_offload_admission_fails_only_prefill_request(
 def test_model_validation_fails_only_the_request_it_rejects() -> None:
     requests = [_make_admission_request(i) for i in range(3)]
 
-    def validate_request(request) -> None:
+    def validate_request(request: types.SimpleNamespace) -> None:
         if request.request_id == 1:
             raise ValueError("frame too large")
 
@@ -818,6 +820,67 @@ def test_model_validation_fails_only_the_request_it_rejects() -> None:
     assert [call.args[0] for call in model.validate_request.call_args_list] == requests
     # The checks after the model's still run for the requests it admitted.
     assert executor._validate_request_budget.call_count == 2
+
+
+def test_failed_parent_fails_its_child_sequences() -> None:
+    parent, child, other = (_make_admission_request(i) for i in (1, 10, 2))
+    parent.child_requests = [child]
+
+    def validate_request(request: types.SimpleNamespace) -> None:
+        if request.request_id == 1:
+            raise ValueError("over budget")
+
+    model = types.SimpleNamespace(validate_request=Mock(side_effect=validate_request))
+    executor = _make_admission_executor(model, [parent, child, other])
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == [other]
+    executor._handle_errors.assert_called_once_with(
+        "over budget", requests=[parent, child], charge_budget=False
+    )
+
+
+@pytest.mark.parametrize("child_first", [False, True])
+@pytest.mark.parametrize("separate_calls", [False, True])
+def test_failed_sequence_group_gets_one_error_response(
+    child_first: bool, separate_calls: bool
+) -> None:
+    group = SequenceGroupState()
+
+    def sequence(request_id: int, parent_id: int | None) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            py_request_id=request_id,
+            is_child=parent_id is not None,
+            parent_request_id=parent_id,
+            py_client_id=7,
+            context_remaining_length=0,
+            py_sequence_group=group,
+        )
+
+    parent, child = sequence(1, None), sequence(10, 1)
+    executor = MagicMock(
+        enable_attention_dp=False,
+        kv_connector_manager=None,
+        _fatal_error=None,
+        active_requests=[parent, child],
+        _pending_transfer_responses=[],
+        _pending_response_terminations=[],
+    )
+    executor._transfer_owns_request_blocks.return_value = False
+
+    failed = [child, parent] if child_first else [parent, child]
+    for requests in [failed[:1], failed[1:]] if separate_calls else [failed]:
+        PyExecutor._handle_errors(executor, "over budget", requests=requests, charge_budget=False)
+
+    responses = [
+        (req_id, response.request_id)
+        for call in executor._enqueue_responses.call_args_list
+        for req_id, response in call.args[0]
+    ]
+    assert responses == [(1, 1)]
+    assert executor.active_requests == []
+    assert [call.args[0] for call in executor._terminate_request.call_args_list] == failed
 
 
 def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:

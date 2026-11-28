@@ -10425,13 +10425,17 @@ class PyExecutor:
         return self.should_exclude_last_generation_logits
 
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
+        # Children of failed parents, by identity; they follow their parent.
+        failed_children = set()
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
             """Immediately fail invalid request.
 
             Return True if invalid request was encountered and
-            handled.
+            handled. A failed parent fails its child sequences with it.
             """
+            if id(request) in failed_children:
+                return True
             try:
                 self._validate_request(request)
                 if self._mm_encoder_item_scheduling_enabled:
@@ -10446,8 +10450,9 @@ class PyExecutor:
                             self.scheduler, "context_chunk_unit_size", None))
                 return False
             except Exception as e:
+                failed_children.update(map(id, request.child_requests))
                 self._handle_errors(str(e),
-                                    requests=[request],
+                                    requests=[request, *request.child_requests],
                                     charge_budget=False)
                 return True
 
@@ -12963,6 +12968,8 @@ class PyExecutor:
                 logger.warning(
                     f"Deferring failure of {len(held_requests)} request(s) "
                     "whose KV blocks a transfer still owns")
+        # The sequences of an n>1 request share one client result, which the
+        # first error response ends; a second one crashes the response path.
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -12979,8 +12986,16 @@ class PyExecutor:
             # A failure parked earlier is the outcome; a later error does not
             # replace it.
             held = self._held_transfer_failures().pop(id(request), None)
-            error_responses[req_id] = LlmResponse(
-                request_id=req_id,
+            group = getattr(request, "py_sequence_group", None)
+            if group is not None:
+                if group.error_sent:
+                    continue
+                group.error_sent = True
+            group_id = (request.parent_request_id if getattr(
+                request, "is_child", False) else req_id)
+            # The group answers under its parent's id, which callers await.
+            error_responses[group_id] = LlmResponse(
+                request_id=group_id,
                 error_msg=error_msg if held is None else held[1],
                 client_id=request.py_client_id)
         if requests is None:

@@ -941,6 +941,14 @@ class LlmResult:
 
 
 @dataclass
+class SequenceGroupState:
+    """State shared by the sequences of one request, parent and children."""
+
+    # The group's client result ends with its first error response.
+    error_sent: bool = False
+
+
+@dataclass
 class LlmResponse:
     request_id: int
     error_msg: Optional[str] = None
@@ -1202,6 +1210,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             chunk_size=self.py_logits_chunk_size,
             additional_outputs=additional_outputs)
         self.child_requests = []
+        self.py_sequence_group = SequenceGroupState()
 
         self._validation_error = _validation_error
 
@@ -1546,7 +1555,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             py_logits_post_processors=(self.py_logits_post_processors.copy()
                                        if self.py_logits_post_processors
                                        is not None else None),
-            py_multimodal_data=deepcopy(self.py_multimodal_data),
+            py_multimodal_data=deepcopy(
+                self.py_multimodal_data,
+                _shared_attachment_memo(self.py_multimodal_data)),
             encoder_input_features=self.py_encoder_input_features,
             locality_domain_id=self.py_locality_domain_id,
             _validation_error=self._validation_error,
@@ -1561,6 +1572,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy
         child.is_cuda_graph_dummy = self.is_cuda_graph_dummy
+        child.py_sequence_group = self.py_sequence_group
 
         # Register only after all input copies and Python initialization succeed.
         self._register_child_request(child)
@@ -1650,6 +1662,22 @@ def format_multimodal_encoder_output_budget_error(
         f"{chunking_hint}")
 
 
+def _shared_attachment_memo(
+        mm_data: Optional[Dict[str, Any]]) -> Dict[int, torch.Tensor]:
+    """Return a deepcopy memo that shares attached embedding tensors.
+
+    Prefill only reads the attachment, so the sequences of an n>1 request can
+    share it instead of each holding a copy.
+    """
+    embedding = (mm_data.get("multimodal_embedding") if isinstance(
+        mm_data, dict) else None)
+    tensors = embedding if isinstance(embedding, (list, tuple)) else [embedding]
+    return {
+        id(tensor): tensor
+        for tensor in tensors if isinstance(tensor, torch.Tensor)
+    }
+
+
 def get_mm_max_resident_embeddings(
         request: LlmRequest, embedding_lengths: List[int],
         context_chunk_unit_size: Optional[int]) -> int:
@@ -1703,7 +1731,9 @@ def initialize_multimodal_encoder_request(
     effective encoder token budget, the items' embedding rows do not match
     the prompt's embedding slots, or — when the encoder-output budget is
     supplied — the outputs that must be resident at once could never fit
-    (see `get_mm_max_resident_embeddings`).
+    (see `get_mm_max_resident_embeddings`), or attached precomputed
+    embeddings do not fill exactly the prompt's embedding slots, which
+    prefill slices them by.
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1728,6 +1758,20 @@ def initialize_multimodal_encoder_request(
             raise ValueError(
                 f"Multimodal item requires {largest} encoder tokens, exceeding "
                 f"the effective startup maximum {max_num_tokens}")
+
+    if has_full_embedding:
+        cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+        embedding = mm_data["multimodal_embedding"]
+        tensors = (embedding if isinstance(embedding,
+                                           (list, tuple)) else [embedding])
+        if cumsum is not None and all(
+                isinstance(tensor, torch.Tensor) for tensor in tensors):
+            rows = sum(tensor.shape[0] for tensor in tensors)
+            slots = int(cumsum[-1]) if len(cumsum) else 0
+            if rows != slots:
+                raise ValueError(
+                    f"Attached multimodal embeddings have {rows} rows but the "
+                    f"prompt has {slots} multimodal embedding slots")
 
     request.py_mm_encoder_state = None
     if token_lengths is not None:
