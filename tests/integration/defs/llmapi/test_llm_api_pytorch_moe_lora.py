@@ -354,7 +354,12 @@ def _run_paired_adapter_engine(
             original_replay = runner.replay
 
             def counted_replay(
-                key, current_inputs, *, position_id_offsets=None, static_inputs_staged=0
+                key,
+                current_inputs,
+                *,
+                position_id_offsets=None,
+                static_inputs_staged=0,
+                pre_replay_staged=False,
             ):
                 replay_count[0] += 1
                 return original_replay(
@@ -362,6 +367,7 @@ def _run_paired_adapter_engine(
                     current_inputs,
                     position_id_offsets=position_id_offsets,
                     static_inputs_staged=static_inputs_staged,
+                    pre_replay_staged=pre_replay_staged,
                 )
 
             runner.replay = counted_replay
