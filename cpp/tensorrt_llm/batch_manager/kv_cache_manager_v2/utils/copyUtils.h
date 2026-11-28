@@ -88,11 +88,12 @@ void delayBackgroundDiskWritesForTesting(double seconds) noexcept;
 //! write-through copies). All zero without the pool.
 struct DiskIoWriteCapStats
 {
-    size_t threads = 0;                 //!< workers of the pool
-    size_t maxWriters = 0;              //!< workers that may run write pieces at once (0: no cap)
-    size_t peakWriters = 0;             //!< most workers seen running write pieces at once
-    uint64_t readsPastCappedWrites = 0; //!< read pieces started while a write waited at the cap
-    uint64_t expiredWriteHolds = 0;     //!< write pieces holdDiskWritePiecesForTesting released at its deadline
+    size_t threads = 0;                   //!< workers of the pool
+    size_t maxWriters = 0;                //!< workers that may run write pieces at once (0: no cap)
+    size_t peakWriters = 0;               //!< most workers seen running write pieces at once
+    uint64_t readsPastCappedWrites = 0;   //!< read pieces started while a write waited at the cap
+    uint64_t expiredWriteHolds = 0;       //!< write pieces holdDiskWritePiecesForTesting released at its deadline
+    uint64_t readsQueuedBehindWrites = 0; //!< read transfers queued while every worker ran a write piece
 };
 
 //! Testing only: the pool's write cap and its counters; \p reset zeroes the counters after reading them.

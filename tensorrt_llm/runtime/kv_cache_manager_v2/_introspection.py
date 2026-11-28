@@ -139,7 +139,8 @@ def disk_io_write_cap_stats_for_testing(reset: bool = False) -> dict[str, int]:
 
     ``threads``, ``max_writers`` (workers that may run write pieces at once, 0: no cap), ``peak_writers`` (most
     workers seen in write pieces at once), ``reads_past_capped_writes`` (reads started while a write waited at the
-    cap) and ``expired_write_holds`` (write pieces ``hold_disk_write_pieces_for_testing`` released at its deadline).
+    cap), ``expired_write_holds`` (write pieces ``hold_disk_write_pieces_for_testing`` released at its deadline) and
+    ``reads_queued_behind_writes`` (read transfers queued while every worker ran a write piece).
     All 0 without the pool. ``reset`` zeroes the counters after reading them.
     """
     return {k: int(v) for k, v in _cpp().disk_io_write_cap_stats_for_testing(reset).items()}

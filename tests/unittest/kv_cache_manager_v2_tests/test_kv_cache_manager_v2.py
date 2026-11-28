@@ -12400,14 +12400,70 @@ class TestNoBatchingDiskIoWriteCap(TestNoBatchingDiskWriteBehind):
         # The backlog filled the writer share and no more: the other workers served the restore's reads.
         self.assertEqual(stats["peak_writers"], cap, stats)
         self.assertGreater(stats["reads_past_capped_writes"], 0, stats)
+        self.assertEqual(stats["reads_queued_behind_writes"], 0, stats)
 
     def test_without_a_cap_held_writes_take_every_worker(self) -> None:
         # The previous scheduling (no cap): the flushes take every worker, so the restore waits until the deadline
         # releases the writes, and is still correct afterwards (refcheck).
-        stats = self._restore_while_writes_are_held(half_cap=False, hold_s=3.0)
+        # The hold outlasts the fillers by far, so the restore's reads are queued while every worker is held, which
+        # the pool records; the deadline is only the release.
+        stats = self._restore_while_writes_are_held(half_cap=False, hold_s=20.0)
         self.assertGreater(stats["expired_write_holds"], 0, stats)
         self.assertEqual(stats["max_writers"], 0, stats)
         self.assertEqual(stats["peak_writers"], stats["expected_threads"], stats)
+        self.assertGreater(stats["reads_queued_behind_writes"], 0, stats)
+
+    @parameterized.expand(
+        [
+            ("unset", None, "half"),
+            ("zero_removes_the_cap", "0", 0),
+            ("explicit", "3", 3),
+            ("malformed", "abc", "half"),
+            ("negative_with_blank", " -1", "half"),
+            ("out_of_range", "99999999999999999999999", "half"),
+        ]
+    )
+    def test_the_write_thread_override_at_pool_start(self, _, value, expected) -> None:
+        # The pool is process-wide and reads the variable once, when it starts: a fresh process starts it here.
+        import subprocess
+        import tempfile
+        import textwrap
+
+        package = _introspection.__name__.rpartition(".")[0]
+        with tempfile.TemporaryDirectory() as disk_path:
+            code = textwrap.dedent(
+                f"""
+                import importlib
+                kv = importlib.import_module({package!r})
+                from {package} import _introspection
+                manager = kv.KVCacheManager(kv.KVCacheManagerConfig(
+                    tokens_per_block=32,
+                    cache_tiers=[
+                        kv.GpuCacheTierConfig(4 << 20),
+                        kv.HostCacheTierConfig(4 << 20),
+                        kv.DiskCacheTierConfig(quota=64 << 20, path={disk_path!r}, num_io_threads=4),
+                    ],
+                    layers=[kv.AttentionLayerConfig(0, [kv.BufferConfig("key", 4096)])],
+                ))
+                stats = _introspection.disk_io_write_cap_stats_for_testing()
+                print("STATS", stats["threads"], stats["max_writers"])
+                manager.shutdown()
+                """
+            )
+            env = dict(os.environ, TLLM_LOG_LEVEL="WARNING")
+            env.pop("TLLM_KV_DISK_IO_MAX_WRITE_THREADS", None)
+            if value is not None:
+                env["TLLM_KV_DISK_IO_MAX_WRITE_THREADS"] = value
+            result = subprocess.run(
+                [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=900
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output[-4000:])
+        threads, max_writers = (int(v) for v in output.split("STATS", 1)[1].split()[:2])
+        self.assertEqual(threads, 4)
+        self.assertEqual(max_writers, max(1, threads // 2) if expected == "half" else expected)
+        ignored = "ignoring TLLM_KV_DISK_IO_MAX_WRITE_THREADS" in output
+        self.assertEqual(ignored, value is not None and expected == "half", output[-4000:])
 
     def test_default_cap_is_half_the_workers(self) -> None:
         if os.environ.get("TLLM_KV_DISK_IO_MAX_WRITE_THREADS"):

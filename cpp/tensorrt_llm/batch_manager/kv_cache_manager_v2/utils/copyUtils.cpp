@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -37,6 +38,7 @@
 #include <pthread.h>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -1086,6 +1088,10 @@ public:
             TLLM_LOG_WARNING(
                 "[kvCacheManagerV2Utils] started %zu of %zu disk I/O threads: %s", started, numThreads, e.what());
         }
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mWorkers += started;
+        }
         return started;
     }
 
@@ -1112,11 +1118,13 @@ public:
         stats.peakWriters = mPeakWriters;
         stats.readsPastCappedWrites = mReadsPastCappedWrites;
         stats.expiredWriteHolds = mExpiredWriteHolds;
+        stats.readsQueuedBehindWrites = mReadsQueuedBehindWrites;
         if (reset)
         {
             mPeakWriters = mWritersRunning;
             mReadsPastCappedWrites = 0;
             mExpiredWriteHolds = 0;
+            mReadsQueuedBehindWrites = 0;
         }
         return stats;
     }
@@ -1199,6 +1207,10 @@ public:
             auto& queue = transfer->isRead
                 ? mReads
                 : (transfer->backgroundBytes != 0 && !transfer->promoted ? mBackground : mWrites);
+            if (transfer->isRead && mWorkers != 0 && mWritersRunning >= mWorkers)
+            {
+                ++mReadsQueuedBehindWrites; // testing only: every worker is in a write piece
+            }
             auto const queued = std::chrono::steady_clock::now();
             for (size_t task = 0; task < transfer->numTasks(); ++task)
             {
@@ -1262,6 +1274,7 @@ private:
         std::chrono::steady_clock::time_point queued;
         std::shared_ptr<StagedDiskPage> page = nullptr; // a flush: the staged page and where it goes
         DiskPageKey key{-1, 0};
+        bool direct = false; // a staged write's page that found no staging memory: written as a write piece
     };
 
     // Testing only: a flush may start once it has been queued for mFlushDelay.
@@ -1402,10 +1415,24 @@ private:
             return;
         }
         DiskTransfer& transfer = *piece.transfer;
+        if (piece.direct)
+        {
+            if (!writeStagedPageDirectly(transfer, piece.task))
+            {
+                transfer.ok.store(false);
+            }
+            if (transfer.remaining.fetch_sub(1) == 1)
+            {
+                transfer.finish();
+                transfer.remaining.notify_all();
+            }
+            pieceDone();
+            return;
+        }
         if (transfer.staged)
         {
-            stagePage(transfer, piece.task);
-            if (transfer.remaining.fetch_sub(1) == 1)
+            // A page handed to a direct write piece completes the transfer when that piece has run.
+            if (stagePage(transfer, piece.task) && transfer.remaining.fetch_sub(1) == 1)
             {
                 transfer.finish();
                 transfer.remaining.notify_all();
@@ -1446,7 +1473,8 @@ private:
 
     //! Copies page \p task of a staged write into staging, makes it the page's pending content and queues its flush.
     //! Without memory for it, the page is written here instead, as an unstaged write would be.
-    void stagePage(DiskTransfer& transfer, size_t task) noexcept
+    //! Returns false when the page was handed to a direct write piece, which then completes it.
+    bool stagePage(DiskTransfer& transfer, size_t task) noexcept
     {
         auto const& t = transfer.writes[task];
         size_t const bytes = static_cast<size_t>(transfer.numBytes);
@@ -1467,23 +1495,52 @@ private:
                 ++mInFlight;
             }
             mCv.notify_one();
-            return;
+            return true;
         }
         catch (std::exception const&)
         {
             // Out of memory: fall through to a direct write.
         }
-        // The direct write bypasses staging. Retire any staged copy of the page first: an older write's, whose flush
-        // must not land after this one, or this write's own when it was published but its flush could not be queued,
-        // which would otherwise keep its staging and stay the page's read source with no flush to release it.
-        wb.dropPage(key);
+        // The direct write is a write piece like any other: queued under the writer cap, so these fallbacks cannot
+        // take the workers restores need (a stage piece itself is a memory copy and stays uncapped). The transfer
+        // stays incomplete until it has run, so the source stays valid. Without memory to queue it, it runs here.
+        try
+        {
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                Piece direct{transfer.shared_from_this(), task, 0, transfer.numBytes, std::chrono::steady_clock::now()};
+                direct.direct = true;
+                mWrites.push_back(std::move(direct));
+                ++mInFlight;
+            }
+            mCv.notify_one();
+            return false;
+        }
+        catch (std::exception const&)
+        {
+        }
+        if (!writeStagedPageDirectly(transfer, task))
+        {
+            transfer.ok.store(false);
+        }
+        return true;
+    }
+
+    //! Writes page \p task of a staged write to its file, bypassing staging.
+    bool writeStagedPageDirectly(DiskTransfer& transfer, size_t task) noexcept
+    {
+        auto const& t = transfer.writes[task];
+        // Retire any staged copy of the page first: an older write's, whose flush must not land after this one, or
+        // this write's own when it was published but its flush could not be queued, which would otherwise keep its
+        // staging and stay the page's read source with no flush to release it.
+        diskWriteBehind().dropPage({t.dst.fd, t.dst.pos});
         bool const ok = !takeInjectedWriteFailure()
             && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), transfer.numBytes);
         if (!ok)
         {
             recordFailedDiskWrite(t.dst.fd, t.dst.pos);
-            transfer.ok.store(false);
         }
+        return ok;
     }
 
     void runFlush(Piece piece) noexcept
@@ -1532,7 +1589,9 @@ private:
     size_t mWritersRunning = 0;                              // workers running a write piece
     size_t mPeakWriters = 0;                                 // testing only: most of mWritersRunning seen
     uint64_t mReadsPastCappedWrites = 0;                     // testing only: reads started while a write was capped
-    uint64_t mExpiredWriteHolds = 0;                         // testing only: held write pieces released by the deadline
+    uint64_t mReadsQueuedBehindWrites = 0; // testing only: reads queued while every worker ran a write piece
+    size_t mWorkers = 0;                   // workers started
+    uint64_t mExpiredWriteHolds = 0;       // testing only: held write pieces released by the deadline
     std::chrono::steady_clock::time_point mHoldWritesUntil{}; // testing only: holdDiskWritePiecesForTesting
     std::chrono::steady_clock::duration mBackgroundDelay{0};  // testing only: delayBackgroundDiskWritesForTesting
     std::chrono::steady_clock::duration mFlushDelay{0};       // testing only: delayDiskWriteBehindFlushesForTesting
@@ -1892,11 +1951,13 @@ void configureAsyncDiskIo(size_t numThreads) noexcept
     size_t maxWriters = std::max<size_t>(1, started / 2);
     if (char const* env = std::getenv("TLLM_KV_DISK_IO_MAX_WRITE_THREADS"); env != nullptr && *env != '\0')
     {
-        char* end = nullptr;
-        unsigned long long const value = std::strtoull(env, &end, 10);
-        if (end != nullptr && *end == '\0' && *env != '-')
+        // Digits only, and in range: no sign, no leading or trailing blanks (strtoull would take " -1" and wrap it).
+        std::string_view const text(env);
+        size_t value = 0;
+        auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (error == std::errc{} && end == text.data() + text.size())
         {
-            maxWriters = static_cast<size_t>(value);
+            maxWriters = value;
         }
         else
         {

@@ -2513,6 +2513,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             stats["peak_writers"] = s.peakWriters;
             stats["reads_past_capped_writes"] = s.readsPastCappedWrites;
             stats["expired_write_holds"] = s.expiredWriteHolds;
+            stats["reads_queued_behind_writes"] = s.readsQueuedBehindWrites;
             return stats;
         },
         nb::arg("reset") = false,
