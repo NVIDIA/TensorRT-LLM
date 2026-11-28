@@ -4522,6 +4522,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
+    @staticmethod
+    def _create_gpqa_task(model_name: str) -> GPQADiamond:
+        task = GPQADiamond(model_name)
+        # Opt in so caller sampling parameters override GPQA's greedy default.
+        task.EVALUATE_KWARGS = dict(getattr(task, "EVALUATE_KWARGS", {}),
+                                    sampling_override=True)
+        return task
+
     def _fixed_date_evaluator_kwargs(self, llm: LLM) -> dict:
         chat_template = llm.tokenizer.get_chat_template()
         date_expression = 'strftime_now("%Y-%m-%d")'
@@ -5012,7 +5020,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(
                 **extra_evaluator_kwargs["chat_template_kwargs"],
@@ -5025,6 +5033,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
@@ -5151,7 +5160,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(reasoning_effort="medium")
             extra_evaluator_kwargs = {
@@ -5162,6 +5171,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
@@ -5226,7 +5236,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(
                 **extra_evaluator_kwargs["chat_template_kwargs"],
@@ -5239,6 +5249,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
@@ -5306,7 +5317,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(reasoning_effort="medium")
             extra_evaluator_kwargs = {
@@ -5317,6 +5328,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
@@ -5416,7 +5428,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
+            task = self._create_gpqa_task(model_name)
 
             chat_template_kwargs = dict(reasoning_effort="medium")
             extra_evaluator_kwargs = {
@@ -5427,6 +5439,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
