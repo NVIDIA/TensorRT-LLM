@@ -5015,6 +5015,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                                cuda_graph=True,
                                overlap_scheduler=True,
                                mocker=mocker)
+        gpqa_evaluator.return_value.evaluate.assert_called_once()
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
@@ -5045,9 +5046,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
-        if (not v2_kv_cache and ep_size == 1
-                and moe_kwargs.get("tactic") == "cutlass"
-                and kv_cache_dtype == "auto"):
+        if (not v2_kv_cache and kv_cache_reuse and kv_cache_dtype == "auto"
+                and moe_kwargs == dict(tactic="cutlass")
+                and (tp_size, pp_size, ep_size) == (4, 1, 1)
+                and not attention_dp and cuda_graph and overlap_scheduler):
             mocker.patch.object(GPQADiamond, "ALPHA", 0.01)
 
         pytorch_config = dict(
