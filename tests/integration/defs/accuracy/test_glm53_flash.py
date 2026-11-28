@@ -39,6 +39,11 @@ from .accuracy_core import (
 )
 
 
+def _sm107_timeout(seconds: int) -> list[pytest.MarkDecorator]:
+    """Scope longer cold-start deadlines to SM107."""
+    return [pytest.mark.timeout(seconds)] if get_sm_version() == 107 else []
+
+
 class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
     """GLM-5.3-Flash FP8 accuracy and runtime tests on Blackwell.
 
@@ -105,7 +110,10 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
-    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    @parametrize_with_ids(
+        "tp_size,ep_size",
+        [pytest.param(4, 4, marks=_sm107_timeout(10800))],
+    )
     def test_block_reuse(self, tp_size, ep_size):
         """KV block reuse with periodic Mamba state snapshots.
 
@@ -273,7 +281,10 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
-    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    @parametrize_with_ids(
+        "tp_size,ep_size",
+        [pytest.param(4, 4, marks=_sm107_timeout(10800))],
+    )
     def test_mtp(self, tp_size, ep_size):
         # The checkpoint's single MTP layer is chained for three drafts per
         # step; KDA verification runs on the fused replay kernel.
@@ -303,7 +314,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
                 3,
                 "fp8",
                 # SM107 cold runs of this combined ADP/MTP/FP8-KV case can exceed one hour.
-                marks=[pytest.mark.timeout(7200)] if get_sm_version() == 107 else [],
+                marks=_sm107_timeout(7200),
             ),
         ],
         ids=["adp-mtp3", "tp-fp8-kv", "adp-mtp3-fp8-kv"],
