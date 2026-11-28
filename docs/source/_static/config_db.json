@@ -241,6 +241,18 @@
       "scenario": "Max Throughput"
     },
     {
+      "command": "trtllm-serve moonshotai/Kimi-K3.1-Pro --config ${TRTLLM_DIR}/examples/configs/curated/kimi-k3.1-pro-dep16-dflash2.yaml",
+      "config_filename": "kimi-k3.1-pro-dep16-dflash2.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/kimi-k3.1-pro-dep16-dflash2.yaml",
+      "config_path": "examples/configs/curated/kimi-k3.1-pro-dep16-dflash2.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/kimi-k3.1-pro-dep16-dflash2.yaml",
+      "gpu_compatibility": "GB300",
+      "model": "moonshotai/Kimi-K3.1-Pro",
+      "model_display_name": "Kimi K3.1 Pro (MXFP4)",
+      "model_url": "https://huggingface.co/moonshotai/Kimi-K3.1-Pro",
+      "scenario": "General deployment"
+    },
+    {
       "command": "trtllm-serve MiniMaxAI/MiniMax-M3-MXFP8 --config ${TRTLLM_DIR}/examples/configs/curated/minimax-m3-throughput.yaml",
       "config_filename": "minimax-m3-throughput.yaml",
       "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/minimax-m3-throughput.yaml",
@@ -4341,6 +4353,10 @@
     "deepseek-ai/DeepSeek-V4-Pro": {
       "display_name": "deepseek-ai/DeepSeek-V4-Pro",
       "url": ""
+    },
+    "moonshotai/Kimi-K3.1-Pro": {
+      "display_name": "Kimi K3.1 Pro (MXFP4)",
+      "url": "https://huggingface.co/moonshotai/Kimi-K3.1-Pro"
     },
     "nvidia/DeepSeek-R1-0528-FP4-v2": {
       "display_name": "DeepSeek-R1 (NVFP4)",

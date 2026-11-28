@@ -368,6 +368,8 @@ class SamplingParams:
     truncate_prompt_tokens: Optional[int] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
+    # Some chat protocols need raw delimiters but omit a terminal tokenizer EOS from text.
+    _omit_chat_eos: bool = field(default=False, init=False, repr=False)
     # Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.
     # TODO: make this a per-request parameter.
     _stream_interval: Optional[int] = field(default=None, init=False, repr=False)

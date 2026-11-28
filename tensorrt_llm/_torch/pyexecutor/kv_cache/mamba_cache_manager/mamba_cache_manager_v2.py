@@ -1214,9 +1214,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
         if self._attention_cache_layout_policy is not None:
             return self.blocks_in_primary_pool
+        return self._get_num_free_blocks_for_layers(range(self.num_local_layers))
+
+    def _get_num_free_blocks_for_layers(self, local_layer_ids: Iterable[int]) -> int:
+        """Count warmup blocks from the attention and SSM pools of the selected local layers."""
         attention_pages = []
         ssm_pages = []
-        for local_layer_idx in range(self.num_local_layers):
+        for local_layer_idx in local_layer_ids:
             layer_id = LayerId(local_layer_idx)
             if self._is_local_mamba_layer(local_layer_idx):
                 ssm_pages.append(

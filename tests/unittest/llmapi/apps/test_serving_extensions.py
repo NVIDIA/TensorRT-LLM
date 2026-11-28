@@ -35,6 +35,7 @@ pytestmark = pytest.mark.cpu_only
     "model_type,expected",
     [
         ("kimi_k3", "template"),
+        ("kimi_k31", "prefer_grammar"),
         ("nemotron_h_omni", "grammar"),
         ("nemotron_h", "grammar"),
         ("qwen3", None),
@@ -576,6 +577,60 @@ class TestOpenAIChatIntegration:
         assert response.status_code == 200, response.text
         assert rendered["generation"]["sampling_params"].guided_decoding is not None
 
+    def test_prefer_grammar_uses_the_grammar_when_the_server_can_build_it(
+        self, chat_client, monkeypatch
+    ):
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        client, _, rendered = chat_client
+        server = client.app.state.server
+        model_type = "prefer-grammar-test-model"
+        type(server.model_config).model_type = model_type
+        server.tool_parser = "qwen3_coder"
+        server.generator.args.reasoning_parser = "nemotron-v3"
+
+        async def render_prompt(**kwargs):
+            return "<|im_start|>assistant\n<think>\n"
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render_prompt)
+
+        @register_serving_extension(model_types=(model_type,))
+        class PreferGrammarExtension(ServingExtension):
+            def required_tool_choice_mode(self):
+                return "prefer_grammar"
+
+        enforced = {}
+        try:
+            for backend in ("xgrammar", None):
+                server.generator.args.guided_decoding_backend = backend
+                response = client.post("/v1/chat/completions", json=self.required_body())
+                assert response.status_code == 200, response.text
+                postproc = server._create_chat_response.call_args.args[1].postproc_args
+                enforced[backend] = (
+                    rendered["generation"]["sampling_params"].guided_decoding is not None,
+                    postproc.tool_parser_grammar_constrained,
+                )
+
+            server.generator.args.guided_decoding_backend = "xgrammar"
+
+            async def custom_tail(**kwargs):
+                return "user: hello\nassistant:"
+
+            monkeypatch.setattr(render_chat_module, "async_apply_chat_template", custom_tail)
+            body = self.required_body()
+            response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == 200, response.text
+            assert rendered["generation"]["sampling_params"].guided_decoding is None
+            body["tools"][0]["function"]["strict"] = True
+            response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == 400, response.text
+        finally:
+            serving_extensions._BY_MODEL_TYPE.pop(model_type, None)
+
+        # With xgrammar a grammar enforces the call. Without it, where the "grammar" mode refuses
+        # the request (400), the chat template asks for the call.
+        assert enforced == {"xgrammar": (True, True), None: (False, False)}
+
     @pytest.mark.parametrize("thinking", [False, True])
     @pytest.mark.parametrize("workers", [0, 4])
     def test_required_attaches_mandatory_grammar(self, required_chat_client, thinking, workers):
@@ -606,6 +661,51 @@ class TestOpenAIChatIntegration:
         assert postproc.chat_template_kwargs["enable_thinking"] is thinking
         assert postproc.tool_parser_grammar_constrained is True
 
+    @pytest.mark.parametrize("required_chat_client", ["nemotron_h"], indirect=True)
+    @pytest.mark.parametrize(
+        ("thinking", "token_ids"),
+        [(False, {"prompt_token_ids": [1]}), (True, {"prompt_token_ids_b64": "AQAAAA=="})],
+    )
+    def test_strict_required_tool_grammar_matches_across_handoff(
+        self, required_chat_client, thinking, token_ids
+    ):
+        client, server, rendered = required_chat_client
+        rendered["thinking"] = thinking
+        body = self.required_body()
+        body["tools"][0]["function"]["strict"] = True
+        # The context renderer determines the mode even when the request kwargs disagree.
+        body["chat_template_kwargs"] = {"enable_thinking": not thinking}
+        response = client.post(
+            "/v1/chat/completions",
+            json={**body, "disaggregated_params": {"request_type": "context_only"}},
+        )
+        assert response.status_code == 200, response.text
+        context_grammar = rendered["generation"]["sampling_params"].guided_decoding.structural_tag
+        context_args = server._create_chat_response.call_args.args[1].postproc_args
+        assert context_args.tool_parser_grammar_constrained
+        resolved = context_args.chat_template_kwargs["thinking"]
+        assert resolved is thinking
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                **body,
+                **token_ids,
+                "disaggregated_params": {
+                    "request_type": "generation_only",
+                    "resolved_thinking": resolved,
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert (
+            rendered["generation"]["sampling_params"].guided_decoding.structural_tag
+            == context_grammar
+        )
+        assert server._create_chat_response.call_args.args[
+            1
+        ].postproc_args.tool_parser_grammar_constrained
+
     @pytest.mark.parametrize(
         "change",
         [
@@ -613,7 +713,11 @@ class TestOpenAIChatIntegration:
             {"prompt_token_ids": [1, 2]},
             {"prompt_token_ids_b64": "AQAAAA=="},
             {"add_generation_prompt": False},
-            {"disaggregated_params": {"request_type": "context_only"}},
+            {"prompt_token_ids": [1], "disaggregated_params": {"request_type": "generation_only"}},
+            {
+                "prompt_token_ids": [1],
+                "disaggregated_params": {"request_type": "context_only", "resolved_thinking": True},
+            },
             {"response_format": {"type": "json_object"}},
         ],
     )
@@ -934,3 +1038,56 @@ class TestExtensionHooks:
         tool = self._namespaced_tool(namespace=namespace, name=name)
 
         assert deepseek_v41.serialize_tool(tool) == tool.model_dump()
+
+
+@pytest.mark.parametrize(
+    "arguments,accepted",
+    [
+        ([("city", "string", "Paris"), ("days", "number", "2")], True),
+        (
+            [("city", "string", "Paris"), ("days", "number", "2"), ("hourly", "boolean", "true")],
+            True,
+        ),
+        ([("city", "string", "Paris")], False),
+        ([("city", "string", "Paris"), ("city", "string", "Lyon"), ("days", "number", "2")], False),
+        ([("city", "string", "Paris"), ("days", "string", "two")], False),
+        ([("city", "string", "LA"), ("days", "number", "2")], False),
+    ],
+)
+def test_k31_strict_required_arguments(arguments, accepted):
+    import xgrammar
+    from xgrammar import structural_tag as st
+
+    from tensorrt_llm.serve.extensions.kimi_k31 import _call_tag
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam
+
+    schema = {
+        "type": "object",
+        "$id": "#weather",
+        "$defs": {"duration": {"type": "integer"}},
+        "properties": {
+            "city": {"type": "string", "minLength": 3, "maxLength": 8},
+            "days": {"$ref": "#/$defs/duration"},
+            "hourly": {"type": "boolean"},
+        },
+        "required": ["city", "days"],
+        "additionalProperties": False,
+    }
+    tool = ChatCompletionToolsParam.model_validate(
+        {"type": "function", "function": {"name": "weather", "parameters": schema, "strict": True}}
+    )
+    grammar = st.StructuralTag(format=_call_tag(tool))
+    compiler = xgrammar.GrammarCompiler(
+        xgrammar.TokenizerInfo([bytes([i]) for i in range(256)] + [b"<eos>"], stop_token_ids=[256])
+    )
+    matcher = xgrammar.GrammarMatcher(compiler.compile_structural_tag(grammar))
+    body = "".join(
+        f'<|open|>argument key="{key}" type="{kind}"<|sep|>{value}<|close|>argument<|sep|>'
+        for key, kind, value in arguments
+    )
+    assert (
+        matcher.accept_string(
+            '<|open|>call tool="weather" index="1"<|sep|>' + body + "<|close|>call<|sep|>"
+        )
+        == accepted
+    )

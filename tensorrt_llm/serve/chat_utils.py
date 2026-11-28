@@ -29,6 +29,7 @@ from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import (NATIVE_MISTRAL_MODEL_TYPES,
                                        apply_mm_placeholders)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.serving_extensions import get_serving_extension
 
 
 class VideoURL(TypedDict):
@@ -548,18 +549,18 @@ def parse_chat_messages_coroutines(
     else:
         content_format = ContentFormat.STRING
 
+    # How messages are parsed for this model (tool-call arguments kept
+    # verbatim, message-level tool declarations) is stated by its serving
+    # extension; the default extension keeps the strict parsing.
+    serving_extension = get_serving_extension(model_type)
+    native_mistral = model_type in NATIVE_MISTRAL_MODEL_TYPES
     for msg in messages:
-        # kimi_k3's reference renderer keeps unparsable tool-call argument
-        # strings verbatim; other templates expect the strict dict contract.
-        # mistral-common (the Mistral-native renderer) encodes each text part
-        # of a content list on its own, and parses a history tool call's
-        # arguments itself.
-        native_mistral = model_type in NATIVE_MISTRAL_MODEL_TYPES
         parsed_msg = parse_chat_message_content(
             msg,
             mm_data_tracker,
-            lenient_tool_call_arguments=(model_type == "kimi_k3"),
-            keep_message_tools=(model_type == "kimi_k3"),
+            lenient_tool_call_arguments=serving_extension.
+            lenient_tool_call_arguments,
+            keep_message_tools=serving_extension.keeps_message_tools,
             keep_text_parts=native_mistral,
             raw_tool_call_arguments=native_mistral)
         conversation.append(parsed_msg)

@@ -26,8 +26,8 @@ any consumer that zips the two together fails -- e.g. the OpenAI server's
 This bites models whose ``generation_config.eos_token_id`` is a list: every
 entry other than the tokenizer's ``eos_token_id`` becomes a ``stop_token_ids``
 entry, so which EOS variant the model happens to emit decides whether the
-request finishes via END_ID (fine) or STOP_WORDS (trimmed).  CPU-only; no
-engine needed.
+request finishes via END_ID (fine) or STOP_WORDS (trimmed).  An END_ID finish
+keeps its end token for the tokenizer to decode.  CPU-only; no engine needed.
 """
 
 from types import SimpleNamespace

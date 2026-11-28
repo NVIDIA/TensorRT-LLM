@@ -98,6 +98,10 @@ MODEL_INFO = {
         "display_name": "Llama 4 Scout (FP8)",
         "url": "https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8",
     },
+    "moonshotai/Kimi-K3.1-Pro": {
+        "display_name": "Kimi K3.1 Pro (MXFP4)",
+        "url": "https://huggingface.co/moonshotai/Kimi-K3.1-Pro",
+    },
     "nvidia/Kimi-K2-Thinking-NVFP4": {
         "display_name": "Kimi-K2-Thinking (NVFP4)",
         "url": "https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4",

@@ -59,6 +59,14 @@ moonshotai/Kimi-K3:
   # allowing larger regressions. If repeated 32K runs cannot reliably clear 85.234, revisit the
   # token cap rather than weaken the provider's official quality reference.
   - accuracy: 93.5
+moonshotai/Kimi-K3.1-Pro:
+  # The official 93.97 result (MXFP4 model card) used a 65,536-token output budget; CI uses 32,768
+  # output tokens instead, as for Kimi K3. The below is the official quality reference, not the
+  # expected shortened-run score: the hypothesis harness lowers 93.97 to an 85.704 acceptance
+  # threshold, and test_gpqa_diamond[dep16] of the K3.1 modeling_v2 gates (DEP16, FP8 KV) measured
+  # 91.41 with the 32K budget on GB300.
+  - kv_cache_quant_algo: FP8
+    accuracy: 93.97
 Qwen/Qwen3.6-35B-A3B:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8

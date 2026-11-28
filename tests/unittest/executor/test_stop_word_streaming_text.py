@@ -270,3 +270,57 @@ def test_trimmed_candidate_is_decoded_once_when_siblings_stream_on(tokenizer, mo
     assert full_decodes == [THAI_GENERATED[:-3]]
     assert second.text == "ข้อ <answer>42"
     assert second.finish_reason == "length"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("special", [False, True])
+@pytest.mark.parametrize("skip", [False, True])
+def test_end_id_is_decoded_by_the_tokenizer(streaming, special, skip):
+    backend = Tokenizer(WordLevel(VOCAB, unk_token="<unk>"))
+    backend.decoder = Fuse()
+    hf = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<eos>")
+    end = hf.eos_token_id if special else VOCAB[">"]
+    params = SamplingParams(end_id=end, skip_special_tokens=skip)
+    params._stream_interval = 1
+    output, text = _run(
+        TransformersTokenizer(hf),
+        params,
+        [[8], [end]],
+        tllm.FinishReason.END_ID,
+        streaming=streaming,
+    )
+    assert output.token_ids == [8, end]
+    expected = hf.decode([8, end], skip_special_tokens=skip)
+    assert output.text == text == expected
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "end,finish,include_stop,expected_suffix",
+    [
+        ("[EOS]", tllm.FinishReason.END_ID, False, ""),
+        ("[EOS]", tllm.FinishReason.END_ID, True, "[EOS]"),
+        ("[EOS]", tllm.FinishReason.LENGTH, False, "[EOS]"),
+        (">", tllm.FinishReason.END_ID, False, ">"),
+    ],
+)
+def test_chat_eos_only_omits_the_terminal_token(
+    streaming, end, finish, include_stop, expected_suffix
+):
+    # The JSON value spells the same text with ordinary tokens.
+    body = '{"value":"[EOS]"}'
+    vocab = {token: i for i, token in enumerate(dict.fromkeys([*body, "[EOS]", ">"]))}
+    backend = Tokenizer(WordLevel(vocab))
+    backend.decoder = Fuse()
+    tokenizer = TransformersTokenizer(
+        PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="[EOS]")
+    )
+    params = SamplingParams(
+        end_id=vocab[end], skip_special_tokens=False, include_stop_str_in_output=include_stop
+    )
+    params._omit_chat_eos = True
+    params._stream_interval = 1
+    chunks = [[vocab[c] for c in body], [vocab[end]]]
+    output, text = _run(tokenizer, params, chunks, finish, streaming=streaming)
+    assert output.token_ids == chunks[0] + chunks[1]
+    assert output.text == text == body + expected_suffix

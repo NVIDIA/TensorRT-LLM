@@ -143,6 +143,11 @@ class KimiK3ServingExtension(ServingExtension):
 
     render_version = 3
 
+    # The reference renderer keeps unparsable tool-call argument strings verbatim and renders a
+    # system message's tools as an in-conversation tool declaration.
+    lenient_tool_call_arguments = True
+    keeps_message_tools = True
+
     # Trailing tokens of the native K3 generation prompt (the channel opener
     # ``<|open|>think|response<|sep|>``) that are not reported as prompt usage.
     _GENERATION_CHANNEL_OPENER_TOKENS = 3

@@ -517,6 +517,9 @@
 /tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl @vsabavat
 /tests/unittest/_torch/modeling_v2/models/kimi_k3_vl @vsabavat
 /tests/integration/defs/accuracy/modeling_v2/kimi_k3_vl @vsabavat
+/tensorrt_llm/_torch/modeling_v2/models/kimi_k31 @jasxu-nvidia
+/tests/unittest/_torch/modeling_v2/models/kimi_k31 @jasxu-nvidia
+/tests/integration/defs/accuracy/modeling_v2/kimi_k31 @jasxu-nvidia
 
 # MiniMax M3
 /tensorrt_llm/_torch/modeling_v2/models/minimax_m3 @peihu-nv

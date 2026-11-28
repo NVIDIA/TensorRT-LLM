@@ -1110,9 +1110,18 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                                    and not self.sampling_params.use_beam_search
                                    and not trimmed_streamed_ids and hasattr(
                                        self.tokenizer, 'decode_incrementally'))
+                token_ids = beam_output.token_ids_diff if use_incremental else beam_output.token_ids
+                if (self.sampling_params._omit_chat_eos
+                        and not self.sampling_params.skip_special_tokens
+                        and not self.sampling_params.include_stop_str_in_output
+                        and beam_output.finish_reason == 'stop'
+                        and beam_output.stop_reason is None and token_ids
+                        and token_ids[-1] == self.sampling_params.end_id
+                        and token_ids[-1] == self.tokenizer.eos_token_id):
+                    token_ids = token_ids[:-1]
                 if use_incremental:
                     beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
-                        beam_output.token_ids_diff,
+                        token_ids,
                         prev_text=beam_output.text,
                         states=beam_output._incremental_states,
                         flush=self._done,
@@ -1120,7 +1129,7 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                         **kwargs)
                 else:
                     beam_output.text = self.tokenizer.decode(
-                        beam_output.token_ids, **kwargs)
+                        token_ids, **kwargs)
                     if trimmed_streamed_ids:
                         # Drop the pending flush, and move the watermark to the
                         # kept ids so that later responses for sibling

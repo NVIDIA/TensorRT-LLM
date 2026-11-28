@@ -14,6 +14,7 @@
 
 import copy
 import dataclasses
+import functools
 import os
 from contextlib import ExitStack
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
@@ -317,7 +318,8 @@ def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
         is_disagg: bool = False,
-        cache_transceiver_config: Optional[CacheTransceiverConfig] = None):
+        cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
+        model_declares_manager: bool = False):
     """Resolve the concrete KV cache manager class for ``model_config``.
 
     For hybrid mamba models the choice between
@@ -397,11 +399,18 @@ def get_kv_cache_manager_cls(
             return _non_hybrid_kv_cache_manager_cls(model_config,
                                                     kv_cache_config)
 
-        if sparse_attn_algorithm == "qsa" and not use_v2:
+        # DSA takes the hybrid V2 manager below only when the model declares
+        # the subclass that keeps the DSA indexer K cache
+        # (RuntimeHooks.kv_cache_manager_cls).
+        hybrid_sparse_algorithms = (
+            "qsa", "dsa") if model_declares_manager else ("qsa", )
+        if sparse_attn_algorithm in hybrid_sparse_algorithms and not use_v2:
             raise ValueError(
-                "QSA with hybrid Mamba / linear-attention models requires "
-                "use_kv_cache_manager_v2=True.")
-        if uses_sparse_kv_cache_manager and sparse_attn_algorithm != "qsa":
+                f"{sparse_attn_algorithm.upper()} with hybrid Mamba / "
+                "linear-attention models requires use_kv_cache_manager_v2=True."
+            )
+        if (uses_sparse_kv_cache_manager
+                and sparse_attn_algorithm not in hybrid_sparse_algorithms):
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
@@ -1389,7 +1398,9 @@ class KvCacheCreator:
             model_config,
             kv_cache_config,
             is_disagg=self._is_disagg,
-            cache_transceiver_config=self._cache_transceiver_config)
+            cache_transceiver_config=self._cache_transceiver_config,
+            model_declares_manager=runtime_hooks_of(
+                self._model_engine.model).kv_cache_manager_cls is not None)
         cls = self._validate_or_fallback_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
         if is_hybrid_linear(model_config.pretrained_config):
@@ -2027,6 +2038,8 @@ class KvCacheCreator:
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
+            num_extra_tokens_per_seq += self._unified_draft_cache_kwargs.get(
+                "draft_scratch_tokens", 0)
 
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
@@ -2091,6 +2104,9 @@ class KvCacheCreator:
                     # A hybrid manager's appended draft layers.
                     num_pool_groups += _get_num_storage_pool_groups(
                         unified_layer_specs, self._tokens_per_block)
+                if self._unified_draft_cache_kwargs:
+                    # The unified draft layers form a pool group of their own.
+                    num_pool_groups += 1
         num_cache_blocks *= num_pool_groups
 
         # Dummy context requests use the configured maximum beam width. Scale
@@ -2730,6 +2746,7 @@ class KvCacheCreator:
             layer_specs=unified_layer_specs,
             shared_draft_block_width=shared_draft_block_width,
             remote_donor=remote_donor,
+            **self._unified_draft_cache_kwargs,
         )
 
         if not self._skip_est:
@@ -3314,6 +3331,27 @@ class KvCacheCreator:
                 sliding_window_size=window,
                 reuse_policy=ReusePolicy.REQUIRED,
             ) for layer_id, window in zip(draft_local_ids, draft_windows))
+
+    @functools.cached_property
+    def _unified_draft_cache_kwargs(self) -> dict:
+        """``draft_*`` constructor arguments of a unified draft cache; empty without one.
+
+        A manager class that stores a standalone drafter's context KV as extra
+        layers of the target manager declares them for this deployment with the
+        classmethod ``unified_draft_cache_kwargs``, which also rejects the
+        drafter settings it cannot serve.
+        """
+        declare = getattr(getattr(self, "_kv_cache_manager_cls", None),
+                          "unified_draft_cache_kwargs", None)
+        if declare is None:
+            return {}
+        return dict(
+            declare(model_engine=self._model_engine,
+                    draft_config=self._draft_config,
+                    spec_config=self._speculative_config,
+                    mapping=self._mapping,
+                    kv_cache_config=self._kv_cache_config,
+                    is_disagg=self._is_disagg))
 
     def _joint_reuse_supported(self) -> bool:
         """Span half of the pairing decision; ``build_managers`` ANDs it with
@@ -4769,8 +4807,14 @@ def _create_kv_cache_manager(
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
         remote_donor: Optional["RemoteMemDonor"] = None,
-        gen_preemption_headroom: int = 0) -> KVCacheManager:
+        gen_preemption_headroom: int = 0,
+        **draft_cache_kwargs) -> KVCacheManager:
     """
+    Args:
+        draft_cache_kwargs: ``draft_*`` keyword arguments a manager class
+            declares for a unified standalone draft cache
+            (``unified_draft_cache_kwargs``); empty otherwise.
+
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
@@ -4933,6 +4977,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "shared_draft_block_width"] = shared_draft_block_width
         manager_extra_kwargs["remote_donor"] = remote_donor
+        manager_extra_kwargs.update(draft_cache_kwargs)
         # Vocab size also enables multimodal event decoding and its per-block
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:
@@ -5016,6 +5061,12 @@ def _create_kv_cache_manager(
                 glm_kpool_index_state_dim
             kda_extra_kwargs["index_state_dim"] = glm_kpool_index_state_dim(
                 _model_config)
+        # Constructor arguments a manager class adds for its model (a
+        # modeling_v2 family's own hybrid manager).
+        extra_init_kwargs = getattr(kv_cache_manager_cls, "extra_init_kwargs",
+                                    None)
+        if extra_init_kwargs is not None:
+            kda_extra_kwargs.update(extra_init_kwargs(_model_config))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,

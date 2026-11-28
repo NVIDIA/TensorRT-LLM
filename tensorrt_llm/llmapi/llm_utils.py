@@ -427,8 +427,8 @@ class CachedModelLoader:
                 # The DFlash buffer-fit check reads the drafter geometry from
                 # the same config.json, so for a hub repo id the validation
                 # pass only covered the token budget. Re-run it now that the
-                # checkpoint is local; a local path was fully checked at
-                # validation time and is not re-run.
+                # checkpoint is local. For MLA, the model loader checks the
+                # pooled-buffer budget once the target's storage policy is known.
                 if (isinstance(self.llm_args, TorchLlmArgs)
                         and isinstance(self.llm_args.speculative_config,
                                        DFlashDecodingConfig)):

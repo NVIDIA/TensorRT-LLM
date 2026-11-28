@@ -267,9 +267,13 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
 
 
 def _validate_required_tool_grammar_request(
-        request: ChatCompletionRequest, sampling_params: SamplingParams, *,
-        guided_decoding_backend: Optional[str], tool_parser: Optional[str],
-        reasoning_parser: Optional[str]) -> None:
+        request: ChatCompletionRequest,
+        sampling_params: SamplingParams,
+        *,
+        guided_decoding_backend: Optional[str],
+        tool_parser: Optional[str],
+        reasoning_parser: Optional[str],
+        has_dynamic_tools: bool = False) -> None:
     """Validate inputs for mandatory tool-call grammar construction."""
     if guided_decoding_backend != "xgrammar":
         raise ValueError("Required tool grammars need the xgrammar backend.")
@@ -281,13 +285,18 @@ def _validate_required_tool_grammar_request(
             "Required tool grammars need a reasoning parser that resolves its "
             "mode from the rendered prompt. Configure the server with "
             "--reasoning_parser nemotron-v3 (or a compatible parser alias).")
-    if not request.tools:
-        raise ValueError("tool_choice='required' requires request-level tools.")
-    if (request.prompt_token_ids is not None or request.prompt_token_ids_b64
-            or not request.add_generation_prompt
-            or request.disaggregated_params is not None):
-        raise ValueError("Required tool grammars need chat messages with "
-                         "add_generation_prompt=True on a native server.")
+    if not request.tools and not has_dynamic_tools:
+        raise ValueError("tool_choice='required' requires tools.")
+    if not request.add_generation_prompt:
+        raise ValueError(
+            "Required tool grammars need add_generation_prompt=True.")
+    if request.prompt_token_ids is not None or request.prompt_token_ids_b64:
+        handoff = request.disaggregated_params
+        if (handoff is None or handoff.request_type != "generation_only"
+                or handoff.resolved_thinking is None):
+            raise ValueError(
+                "Required tool grammars with prompt token IDs need the context "
+                "worker's resolved thinking mode on a generation-only request.")
     if sampling_params.guided_decoding is not None:
         raise ValueError(
             "tool_choice='required' cannot be combined with response_format "
@@ -305,8 +314,8 @@ def _configure_parser_special_token_decoding(
         # request: reasoning delimiters are special tokens regardless of
         # whether tools are attached.
         sampling_params.skip_special_tokens = False
-        needs_compact_special_tokens = reasoning_parser_name.lower(
-        ) == "kimi_k3"
+        needs_compact_special_tokens = ReasoningParserFactory.compacts_special_tokens(
+            reasoning_parser_name)
 
     if tool_parser_name and has_tools:
         tool_parser_cls = ToolParserFactory.parsers.get(
@@ -2323,9 +2332,28 @@ class OpenAIServer(_VideoRoutesMixin):
             extension = render_resources.extension
             tool_dicts = prepare_chat_request(request,
                                               render_resources).tool_dicts
+            # Message-level (dynamic) tools are a model extension (Kimi API);
+            # only models whose extension declares them render them, so other
+            # models keep ignoring the key entirely.
+            dynamic_tools = extension.dynamic_tools(request.messages)
+            dynamic_tool_params: List[ChatCompletionToolsParam] = []
+            if dynamic_tools:
+                try:
+                    dynamic_tool_params = [
+                        ChatCompletionToolsParam.model_validate(tool)
+                        for tool in dynamic_tools
+                    ]
+                except ValidationError as e:
+                    raise ValueError(
+                        f"Invalid message-level tool declaration: {e}") from e
+            all_tools = (request.tools or []) + dynamic_tool_params
             required_mode = extension.required_tool_choice_mode()
             required_tool_grammar = (request.tool_choice == "required"
-                                     and required_mode == "grammar")
+                                     and required_mode
+                                     in ("grammar", "prefer_grammar"))
+            template_fallback = (required_mode == "prefer_grammar"
+                                 and not any(tool.function.strict
+                                             for tool in all_tools))
             conversation: List[ConversationMessage] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -2339,13 +2367,24 @@ class OpenAIServer(_VideoRoutesMixin):
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
             if required_tool_grammar:
-                _validate_required_tool_grammar_request(
-                    request,
-                    sampling_params,
-                    guided_decoding_backend=self.generator.args.
-                    guided_decoding_backend,
-                    tool_parser=self.tool_parser,
-                    reasoning_parser=self.generator.args.reasoning_parser)
+                try:
+                    _validate_required_tool_grammar_request(
+                        request,
+                        sampling_params,
+                        guided_decoding_backend=self.generator.args.
+                        guided_decoding_backend,
+                        tool_parser=self.tool_parser,
+                        reasoning_parser=self.generator.args.reasoning_parser,
+                        has_dynamic_tools=bool(dynamic_tools))
+                except ValueError as e:
+                    if not template_fallback:
+                        raise
+                    # The chat template still asks for the call.
+                    logger.warning_once(
+                        "tool_choice='required' is requested through the chat "
+                        f"template, not enforced by a grammar: {e}",
+                        key=f"required_tool_choice_without_grammar: {e}")
+                    required_tool_grammar = False
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
@@ -2438,26 +2477,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 forced_tool_name = request.tool_choice.function.name
 
             reasoning_parser_name = self.generator.args.reasoning_parser
-            # Message-level (dynamic) tools are a model extension (Kimi API);
-            # only models whose extension declares them render them, so other
-            # models keep ignoring the key entirely.
-            dynamic_tools = extension.dynamic_tools(request.messages)
-            dynamic_tool_params: List[ChatCompletionToolsParam] = []
-            if dynamic_tools:
-                try:
-                    dynamic_tool_params = [
-                        ChatCompletionToolsParam.model_validate(tool)
-                        for tool in dynamic_tools
-                    ]
-                except ValidationError as e:
-                    raise ValueError(
-                        f"Invalid message-level tool declaration: {e}") from e
+            sampling_params._omit_chat_eos = extension.omit_chat_eos
             _configure_parser_special_token_decoding(
                 sampling_params,
                 reasoning_parser_name=reasoning_parser_name,
                 tool_parser_name=self.tool_parser,
                 has_tools=bool(request.tools) or bool(dynamic_tools))
-            all_tools = (request.tools or []) + dynamic_tool_params
             if self.tool_parser and all_tools:
                 # When strict=True on any tool, apply constrained decoding
                 # via structural tags (only if response_format doesn't already
@@ -2660,25 +2685,30 @@ class OpenAIServer(_VideoRoutesMixin):
                         "enable_thinking": thinking,
                     }
             if required_tool_grammar:
-                if thinking is None:
-                    raise ValueError(
-                        "Cannot resolve required-tool reasoning state from the rendered prompt."
-                    )
-                parser = ToolParserFactory.create_tool_parser(self.tool_parser)
-                build_required = functools.partial(
-                    parser.build_required_structural_tag,
-                    request.tools,
-                    thinking=thinking)
-                required_format = await asyncio.get_running_loop(
-                ).run_in_executor(self._input_proc_executor, build_required)
-                if required_format is None:
+                required_format = None
+                if thinking is not None:
+                    parser = ToolParserFactory.create_tool_parser(
+                        self.tool_parser)
+                    build_required = functools.partial(
+                        extension.build_required_structural_tag,
+                        parser,
+                        all_tools,
+                        thinking=thinking)
+                    required_format = await asyncio.get_running_loop(
+                    ).run_in_executor(self._input_proc_executor, build_required)
+                if required_format is not None:
+                    sampling_params.guided_decoding = GuidedDecodingParams(
+                        structural_tag=required_format.model_dump_json(
+                            by_alias=True))
+                    postproc_args.tool_parser_grammar_constrained = True
+                elif not template_fallback:
+                    if thinking is None:
+                        raise ValueError(
+                            "Cannot resolve required-tool reasoning state from the rendered prompt."
+                        )
                     raise ValueError(
                         "The configured tool parser does not support required tools."
                     )
-                sampling_params.guided_decoding = GuidedDecodingParams(
-                    structural_tag=required_format.model_dump_json(
-                        by_alias=True))
-                postproc_args.tool_parser_grammar_constrained = True
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(
@@ -3814,6 +3844,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 # tags also need them without spaces in between. Without this,
                 # `<|open|>tools<|sep|>` arrives as `<|open|> tools <|sep|>` and
                 # every K3 tool call reaches the client as message text.
+                sampling_params._omit_chat_eos = RenderResources.from_server(
+                    self).extension.omit_chat_eos
                 _configure_parser_special_token_decoding(
                     sampling_params,
                     reasoning_parser_name=self.generator.args.reasoning_parser,

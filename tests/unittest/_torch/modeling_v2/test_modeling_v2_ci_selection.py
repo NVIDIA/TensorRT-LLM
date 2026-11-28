@@ -12,8 +12,8 @@ class from. The rule maps paths, not names, so it is safe only while:
 * no code reaches into a target except the target itself and the family's
   ``routing.py``;
 * test directories mirror source directories: every target has accuracy tests in
-  ``accuracy/modeling_v2/<family>/<D>/``, and every accuracy directory names a
-  target;
+  ``accuracy/modeling_v2/<family>/<D>/`` (except the targets in
+  ``_WAIVED_ACCURACY_TARGETS``), and every accuracy directory names a target;
 * some test-db entry runs every modeling_v2 unit test, and some test-db or QA list
   entry runs every target's accuracy tests;
 * every dynamic import names a module the rule's import analysis can read.
@@ -244,6 +244,15 @@ def test_accuracy_directories_are_targets(repo: Path = _REPO):
 # An exemption is invalid as soon as routing or registry imports are introduced.
 _COMPONENT_ONLY_FAMILIES: set[str] = {"beam", "inkling2"}
 
+# Routed targets waived from having accuracy tests, as ``<family>/<target>``, with why no accuracy
+# test can run them. An entry is invalid once its target gains accuracy tests or is no longer routed.
+_WAIVED_ACCURACY_TARGETS: dict[str, str] = {
+    "kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix8": (
+        "a disaggregated Helix CP8 generation server behind a DEP16 context server (24 Rubin GPUs "
+        "on six trays), which no CI stage or QA launcher can start"
+    ),
+}
+
 
 def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
     """Every class a family's ``route`` returns lives in a target with accuracy tests.
@@ -253,6 +262,7 @@ def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
     same way, and tests a family whole while one of its returns is unknown.
     """
     problems = []
+    waived = set()
     for family_dir in _families(repo):
         routing = family_dir / "routing.py"
         where = routing.relative_to(repo)
@@ -277,11 +287,23 @@ def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
                     f"{where}:{node.lineno}: returns something other than a name bound only by "
                     "`from .<D>.<module> import <Class>`, so its target is unknown"
                 )
+            elif f"{family_dir.name}/{target}" in _WAIVED_ACCURACY_TARGETS:
+                waived.add(f"{family_dir.name}/{target}")
             elif not (repo / _ACC / family_dir.name / target).is_dir():
                 problems.append(
                     f"{where}:{node.lineno}: {node.value.id} from {target}/ has no "
                     f"{_ACC}/{family_dir.name}/{target}/"
                 )
+    for key in sorted(_WAIVED_ACCURACY_TARGETS):
+        family = key.split("/")[0]
+        if not (repo / _PY / "models" / family).is_dir():
+            continue
+        if key not in waived:
+            problems.append(f"_WAIVED_ACCURACY_TARGETS: {key} is not a target its family routes to")
+        elif any((repo / _ACC / key).rglob("test_*.py")):
+            problems.append(
+                f"_WAIVED_ACCURACY_TARGETS: {key} has tests in {_ACC}/{key}/; remove the waiver"
+            )
     assert not problems, "\n".join(problems)
 
 

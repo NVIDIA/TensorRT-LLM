@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Kimi K3.1 MXFP4 sm_103 TEP8 GSM8K, DFlash2 w5 with block verification: measured - 0.10.
+ModelingV2KimiK31ProMxfp4Sm103Tep::dflash2_w5:
+  ref_al: 4.189952279957582
+  min_al: 4.089952279957582
+# Kimi K3.1 NVFP4 default DEP16 GSM8K, DFlash2 w5 with greedy acceptance: measured on GB300 - 0.10.
+ModelingV2KimiK31ProNvfp4Sm10xDefault::dflash2_w5[dep16]:
+  ref_al: 4.28053585500394
+  min_al: 4.18053585500394
+# Kimi K3.1 NVFP4 sm_107 TEP8 GSM8K, DFlash2 w8 with greedy acceptance: measured on VR200 - 0.10.
+ModelingV2KimiK31ProNvfp4Sm107Tep8::dflash2_w8:
+  ref_al: 5.338174
+  min_al: 5.238174
 TestQwen3_4B::test_eagle3:
   ref_al: 2.02809899228679
   min_al: 1.9266940426724504

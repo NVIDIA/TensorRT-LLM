@@ -918,6 +918,12 @@ class ModelEngine:
 
         if keeps_text_prefill_body(self.model, self.llm_args.disable_mm_encoder):
             return
+        decoder_model = getattr(self.model, "llm", None)
+        if (
+            isinstance(decoder_model, DecoderModelForCausalLM)
+            and getattr(self.model, "supports_prefill_cuda_graph", False) is True
+        ):
+            return
         if isinstance(self.model, MultimodalModelMixin):
             try:
                 language_model = self.model.language_model

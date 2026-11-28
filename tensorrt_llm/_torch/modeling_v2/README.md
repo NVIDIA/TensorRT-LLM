@@ -530,6 +530,8 @@ for these associations and shared-helper selection.
 A target is a directory under `models/<family>/` whose class the family's
 `route` returns. Give each target a mirrored unit test directory and an
 accuracy test directory, `tests/integration/defs/accuracy/modeling_v2/<family>/<target>/`.
+A target whose layout no CI stage or QA launcher can start has no accuracy test
+directory; list it with the reason in `_WAIVED_ACCURACY_TARGETS` instead.
 Make sure a test list under `tests/integration/test_lists/test-db/` reaches
 every new test, either by file or by directory. CI does not run unlisted tests.
 A target's accuracy tests may instead be listed under

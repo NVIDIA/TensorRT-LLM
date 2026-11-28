@@ -140,6 +140,12 @@ class ReasoningParserFactory:
         return cls._parsers.keys()
 
     @classmethod
+    def compacts_special_tokens(cls, reasoning_parser: str) -> bool:
+        """See ``BaseReasoningParser.compact_special_tokens``."""
+        entry = cls._parsers.get(reasoning_parser.lower())
+        return bool(entry) and entry[0].compact_special_tokens
+
+    @classmethod
     def needs_raw_special_tokens(cls, reasoning_parser: str) -> bool:
         """Whether the registered parser must see special tokens.
 
@@ -158,6 +164,9 @@ class BaseReasoningParser(ABC):
     # ``BaseToolParser.needs_raw_special_tokens``, which only takes effect
     # when the request carries tools).
     needs_raw_special_tokens: bool = False
+    # Special tokens detokenized without spaces between them, for markups that
+    # put ordinary-text tag names directly between special tokens.
+    compact_special_tokens: ClassVar[bool] = False
 
     # Opt in on parsers whose template prefills the reasoning marker into the
     # prompt and that select their mode from `enable_thinking`. Only those can
@@ -722,6 +731,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",
     "kimi_k3": "kimi_k3",
+    "kimi_k31": "kimi_k31",
     "minimax_m3": "minimax_m3",
     "minimax_m3_vl": "minimax_m3",
     "muse_spark": "musespark",
@@ -1253,6 +1263,7 @@ class KimiK3ReasoningParser(BaseReasoningParser):
     """
 
     needs_raw_special_tokens = True
+    compact_special_tokens = True
 
     OPEN = "<|open|>"
     CLOSE = "<|close|>"
@@ -1395,6 +1406,22 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                 return ReasoningParserResult(content=remaining)
         # Header fragments and structural-gap text are dropped.
         return ReasoningParserResult()
+
+
+@register_reasoning_parser("kimi_k31")
+class KimiK31ReasoningParser(KimiK3ReasoningParser):
+    """Kimi K3's parser; Kimi K3.1's chat template ends the generation prompt inside the think
+    channel when thinking is on and inside the response channel when it is off, so the mode is
+    read off the rendered prompt."""
+
+    resolves_thinking_from_prompt = True
+    reasoning_start = "<|open|>think<|sep|>"
+    reasoning_end = "<|close|>think<|sep|>"
+
+    @classmethod
+    def resolve_unmarked_prompt(cls, tail: str) -> Optional[bool]:
+        """A prompt that opens the response channel has thinking off."""
+        return False if tail.endswith(cls.OPEN + "response" + cls.SEP) else None
 
 
 # Model-specific parsers live in tensorrt_llm.llmapi.reasoning; importing a

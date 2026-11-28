@@ -1439,13 +1439,21 @@ class DFlashWorker(SpecWorkerBase):
         )
         return True
 
+    def _reads_shared_manager_offsets(self, draft_kv_cache_manager, attn_metadata) -> bool:
+        """Whether the drafter's context layers live in the target's KV cache manager and are
+        addressed through its block offsets (``kv_cache_block_offsets``): the draft KV cache manager
+        is the target's. A subclass whose drafter keeps its own block tables there says no.
+        """
+        return draft_kv_cache_manager is not None and draft_kv_cache_manager is getattr(
+            attn_metadata, "kv_cache_manager", None
+        )
+
     def _lazy_init_ctx_buffers(
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
     ):
         self._validate_draft_attention_backend(draft_model)
-        self._ctx_unified_cache = (
-            draft_kv_cache_manager is not None
-            and draft_kv_cache_manager is getattr(attn_metadata, "kv_cache_manager", None)
+        self._ctx_unified_cache = self._reads_shared_manager_offsets(
+            draft_kv_cache_manager, attn_metadata
         )
         offsets_name = (
             "kv_cache_block_offsets" if self._ctx_unified_cache else "draft_kv_cache_block_offsets"
@@ -2240,6 +2248,9 @@ class DFlashWorker(SpecWorkerBase):
                 ctx_base_updates[slot] = base
             cur = start
             if cur + slen > cap:
+                if self._drop_overflowing_chunk(req_id, slot, first_pos + slen, ctx_len_updates):
+                    offset += slen
+                    continue
                 # Request-level, like the no-free-slots path above: truncating
                 # would silently draft from a stale prefix, but killing the
                 # forward would take every other in-flight request with it.
@@ -2295,9 +2306,24 @@ class DFlashWorker(SpecWorkerBase):
                     self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
                     if chunk_v is not None:
                         self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
+            self._after_context_chunk(req_id, slot, end)
             offset += slen
 
         self._write_ctx_len(ctx_len_updates, ctx_base_updates)
+
+    def _drop_overflowing_chunk(
+        self, req_id: int, slot: int, chunk_end: int, ctx_len_updates: dict
+    ) -> bool:
+        """Whether a context chunk that does not fit its slot is dropped while the request keeps
+        the slot (``chunk_end`` is the absolute position after the chunk; such an override records
+        the slot's length in ``ctx_len_updates``). By default the slot is released and the
+        request drafts nothing.
+        """
+        return False
+
+    def _after_context_chunk(self, req_id: int, slot: int, end: int) -> None:
+        """Called once a context chunk is stored in ``slot``, whose stored length is then ``end``;
+        nothing by default."""
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         # Restore first (in warmup mode kv_lens_cuda was saved and comes back
