@@ -672,3 +672,135 @@ def test_minimax_fused_route_quant_declines_only_while_tuning(monkeypatch, tunin
         moe, tensor((16, 1024), torch.bfloat16), tensor((16, 256))
     )
     assert (reason == "autotuning") == tuning, reason
+
+
+@pytest.mark.parametrize(
+    "sm_version,capacity,tokens",
+    [
+        (107, 32, 16),
+        (107, 64, 48),
+        (107, 192, 160),
+        (107, 1024, 768),
+        (107, 4096, 2560),
+        (107, 8192, 6144),
+        (107, 8448, 6272),
+        (100, 256, 128),
+        (100, 1024, 640),
+        (103, 16384, 10240),
+    ],
+)
+def test_partial_fill_is_the_middle_of_the_bucket_live_window(sm_version, capacity, tokens) -> None:
+    """Launches at a bucket carry (previous bucket, capacity] tokens per rank."""
+    previous = max(
+        (r for r in op_module.megamoe_ladder_buckets(sm_version) if r < capacity), default=0
+    )
+    assert op_module.megamoe_partial_fill_tokens(sm_version, capacity) == tokens
+    assert previous < tokens <= capacity
+
+
+def _all_routes(**kwargs):
+    ranks = kwargs["world_size"]
+    return [
+        op_module.synthesize_profiling_workload_topk(
+            **kwargs, source_rank=rank, device=torch.device("cpu")
+        )
+        for rank in range(ranks)
+    ]
+
+
+@pytest.mark.parametrize(
+    "hotspot_share,per_destination,per_expert",
+    [
+        (0.0, [64, 64, 64, 64], [8] * 8),  # 4 sources x 16 tokens x top-4, even
+        (0.75, [208, 16, 16, 16], [26] * 8),  # 52 of each source's 64 routes to rank 0
+    ],
+)
+def test_workload_routes_follow_the_plan(hotspot_share, per_destination, per_expert) -> None:
+    """Every rank's routes are deterministic, padded with -1, distinct per token, and add up
+    over the ranks to the planned destination and expert counts."""
+    kwargs = dict(
+        num_tokens=16,
+        rows=20,
+        num_topk=4,
+        num_experts_per_rank=8,
+        world_size=4,
+        hotspot_share=hotspot_share,
+    )
+    routes = _all_routes(**kwargs)
+    assert all(torch.equal(a, b) for a, b in zip(routes, _all_routes(**kwargs)))
+    for rank_routes in routes:
+        assert rank_routes.shape == (20, 4)
+        assert bool((rank_routes[16:] == -1).all())
+        live = rank_routes[:16]
+        assert bool(((live >= 0) & (live < 32)).all())
+        assert all(len(set(row)) == 4 for row in live.tolist())
+        # Every source sends the same planned share to each destination.
+        sent = torch.bincount(live.reshape(-1) // 8, minlength=4)
+        assert sent.tolist() == [d // 4 for d in per_destination]
+    received = torch.bincount(torch.cat([r[:16].reshape(-1) for r in routes]), minlength=32)
+    assert received.view(4, 8).sum(dim=1).tolist() == per_destination
+    assert received[:8].tolist() == per_expert
+
+
+def test_infeasible_workload_plan_keeps_experts_distinct() -> None:
+    """With two experts a rank, a source cannot send one expert more routes than tokens: the
+    repeated slots move to other experts and every token still routes to distinct experts."""
+    for routes in _all_routes(
+        num_tokens=8,
+        rows=8,
+        num_topk=4,
+        num_experts_per_rank=2,
+        world_size=4,
+        hotspot_share=0.75,
+    ):
+        assert all(len(set(row)) == 4 for row in routes.tolist())
+        assert bool(((routes >= 0) & (routes < 8)).all())
+
+
+def _megamoe_runner(monkeypatch, capacity, helper_expert_count=0, local_rank=0):
+    monkeypatch.setattr(op_module, "get_sm_version", lambda: 107)
+    return op_module.Sm100MegaMoENvfp4Runner(
+        world_size=4,
+        local_rank=local_rank,
+        num_topk=6,
+        num_experts_per_rank=96,
+        hidden_size=_HIDDEN,
+        intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
+        max_tokens_per_rank=capacity,
+        output_dtype=torch.bfloat16,
+        tactic_autotune=True,
+        helper_expert_count=helper_expert_count,
+    )
+
+
+def test_runner_profiles_three_workloads_without_helper_experts(monkeypatch) -> None:
+    runner = _megamoe_runner(monkeypatch, 4096)
+    workloads = runner.get_tuning_config().profiling_workloads
+    assert [w.args for w in workloads] == [
+        (name,) for name in op_module.MEGAMOE_PROFILING_WORKLOADS
+    ]
+    assert _megamoe_runner(monkeypatch, 4096, helper_expert_count=4)._profiling_workloads() == ()
+
+
+@pytest.mark.parametrize("local_rank", [0, 3])
+def test_runner_workload_inputs(monkeypatch, local_rank) -> None:
+    """Each workload rewrites the routes, top-k weights and output rows of the profiling inputs
+    in place of the last one, within the bucket's capacity."""
+    capacity = 4096
+    runner = _megamoe_runner(monkeypatch, capacity, local_rank=local_rank)
+    inputs = _runner_inputs(capacity)
+    hits = {}
+    for workload in runner.get_tuning_config().profiling_workloads:
+        name = workload.args[0]
+        out = workload(inputs)
+        live = 2560 if name == "bal_partial" else capacity
+        topk_idx, weights, combine = out[2], out[3], out[11]
+        assert topk_idx is inputs[2] and topk_idx.shape == (capacity, 6)
+        assert bool((topk_idx[:live] >= 0).all()) and bool((topk_idx[live:] == -1).all())
+        assert bool((weights[:live] == 1).all()) and bool((weights[live:] == 0).all())
+        assert combine.shape[0] == live and combine.data_ptr() == inputs[11].data_ptr()
+        hits[name] = (topk_idx[:live] < 96).float().mean().item()
+    # A quarter of the routes go to each rank, except rank 0 under the receiver hotspot.
+    assert abs(hits["bal_full"] - 0.25) < 1e-3 and abs(hits["bal_partial"] - 0.25) < 1e-3
+    assert abs(hits["recv_hotspot"] - (0.75 + 0.25 / 4)) < 1e-3

@@ -196,6 +196,12 @@ class TuningConfig:
             spans. The op's tuning collectives (cache agreement, the barrier before each timed
             loop, the exchange of timings) run over it. None uses the tuning group (TP, times CP
             under Helix).
+        profiling_workloads (Tuple[Callable, ...]): COLLECTIVE only. Each maps the profiling
+            inputs (after ``inputs_pre_hook``) to the inputs of one workload; it may restage
+            shared input tensors in place, since it is called right before its own launch.
+            Every candidate is timed on each, and scores the mean over workloads of its
+            slowest-rank time relative to the fallback tactic's; that score, not a time, is what
+            the cache keeps. Empty times the profiling inputs as they are.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -210,6 +216,14 @@ class TuningConfig:
     cold_l2_flush_bytes: int = 0
     use_build_pool_in_warmup: bool = False
     process_group: Any = None
+    profiling_workloads: Tuple[Callable, ...] = ()
+
+    def __post_init__(self):
+        if (self.profiling_workloads and self.distributed_tuning_strategy
+                != DistributedTuningStrategy.COLLECTIVE):
+            raise ValueError(
+                "TuningConfig.profiling_workloads requires the COLLECTIVE strategy"
+            )
 
 
 @dataclass(frozen=True)
@@ -1279,7 +1293,7 @@ class AutoTuner:
     """
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     # COLLECTIVE tuning keeps the runner's fallback tactic unless another
-    # candidate's score is lower by more than this fraction.
+    # candidate's score is lower than the fallback's by more than this fraction.
     COLLECTIVE_TIE_RTOL = 0.005
     _instance = None
 
@@ -2261,12 +2275,30 @@ class AutoTuner:
                     )
 
                 for tac in valid_tactics:
+                    workloads = tuning_config.profiling_workloads
+                    workload_times = None
                     try:
                         with nvtx_range(f"r{runner_id}, tactic {tac}"):
                             if coordinated:
-                                time_measured = self._time_collectively(
+                                workload_times = self._time_collectively(
                                     runner, tac, input_tensors, tuning_config,
                                     **kwargs)
+                                time_measured = sum(workload_times)
+                                if not workloads:
+                                    workload_times = None
+                            elif workloads:
+                                workload_times = [
+                                    self._profile_single_kernel(
+                                        runner=runner,
+                                        inputs=workload(input_tensors),
+                                        tactic=tac,
+                                        tuning_config=tuning_config,
+                                        use_cuda_graph=tuning_config.
+                                        use_cuda_graph,
+                                        **kwargs,
+                                    ) for workload in workloads
+                                ]
+                                time_measured = sum(workload_times)
                             else:
                                 time_measured = self._profile_single_kernel(
                                     runner=runner,
@@ -2308,13 +2340,18 @@ class AutoTuner:
                         # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                         # or some runtime error occurs during profiling.
                         time_measured = float('inf')
+                        workload_times = [float('inf')] * len(workloads or ())
                         has_tuning_failure_occurred = True
                     self._debug_logger(
                         f"[Autotuner] Candidate: custom_op={custom_op}, "
                         f"runner={runner}, tactic={tac}, "
                         f"shapes={profile.get_opt_shapes()}, "
-                        f"time={time_measured:.3f}ms")
-                    timed.append((runner_id, tac, time_measured))
+                        f"time={time_measured:.3f}ms" +
+                        (f" (per workload {[round(t, 4) for t in workload_times]})"
+                         if workloads else ""))
+                    timed.append(
+                        (runner_id, tac,
+                         workload_times if workloads else time_measured))
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
@@ -3401,42 +3438,52 @@ class AutoTuner:
 
     def _time_collectively(self, runner: TunableRunner, tactic: Any,
                            input_tensors: List[torch.Tensor],
-                           tuning_config: TuningConfig, **kwargs) -> float:
-        """Time ``tactic`` on a multi-rank COLLECTIVE op.
+                           tuning_config: TuningConfig,
+                           **kwargs) -> List[float]:
+        """Per-workload times of ``tactic`` on a multi-rank COLLECTIVE op (one workload: the inputs).
 
         Each launch spans the ranks, so a rank must not launch while a peer
-        has stopped. The ranks first build the tactic
-        (``TunableRunner.prepare_tactic``) without launching and agree that
-        all succeeded; after its timing they agree again before the next
-        launch. A failure on any rank raises on every rank at the same point
-        (this rank's error, or ``_FailedOnAnotherRank``), so all of them drop
-        the tactic and move to the next one together. A failure inside a
-        launch that left peers waiting in the kernel cannot be recovered here.
+        has stopped. Before each workload's launch the ranks build its inputs
+        (and, before the first, the tactic: ``TunableRunner.prepare_tactic``)
+        without launching and agree that all succeeded; after each workload's
+        timing they agree again. A workload may restage shared input tensors
+        in place, so its inputs are built right before its own launch. A
+        failure on any rank raises on every rank at the same point (this
+        rank's error, or ``_FailedOnAnotherRank``), so all of them drop the
+        tactic and move to the next one together. A failure inside a launch
+        that left peers waiting in the kernel cannot be recovered here.
         """
-        error = None
-        try:
-            runner.prepare_tactic(input_tensors, tactic, **kwargs)
-        except Exception as e:  # noqa: BLE001 - any rank-local failure is agreed on before a launch
-            error = e
-        if not self._all_ranks_ok(error is None, tuning_config):
-            raise error or self._FailedOnAnotherRank(
-                f"tactic {tactic} failed to build on another rank")
-        time_measured = float('inf')
-        try:
-            time_measured = self._profile_single_kernel(
-                runner=runner,
-                inputs=input_tensors,
-                tactic=tactic,
-                tuning_config=tuning_config,
-                use_cuda_graph=tuning_config.use_cuda_graph,
-                **kwargs,
-            )
-        except Exception as e:  # noqa: BLE001 - agreed on before the next launch
-            error = e
-        if not self._all_ranks_ok(error is None, tuning_config):
-            raise error or self._FailedOnAnotherRank(
-                f"tactic {tactic} failed to run on another rank")
-        return time_measured
+        workloads = tuning_config.profiling_workloads or (None, )
+        times = []
+        for index, workload in enumerate(workloads):
+            error = None
+            batch = None
+            try:
+                batch = input_tensors if workload is None else workload(
+                    input_tensors)
+                if index == 0:
+                    runner.prepare_tactic(batch, tactic, **kwargs)
+            except Exception as e:  # noqa: BLE001 - any rank-local failure is agreed on before a launch
+                error = e
+            if not self._all_ranks_ok(error is None, tuning_config):
+                raise error or self._FailedOnAnotherRank(
+                    f"tactic {tactic} failed to build on another rank")
+            try:
+                times.append(
+                    self._profile_single_kernel(
+                        runner=runner,
+                        inputs=batch,
+                        tactic=tactic,
+                        tuning_config=tuning_config,
+                        use_cuda_graph=tuning_config.use_cuda_graph,
+                        **kwargs,
+                    ))
+            except Exception as e:  # noqa: BLE001 - agreed on before the next launch
+                error = e
+            if not self._all_ranks_ok(error is None, tuning_config):
+                raise error or self._FailedOnAnotherRank(
+                    f"tactic {tactic} failed to run on another rank")
+        return times
 
     def _collective_choice(self, custom_op: str, runners: List[TunableRunner],
                            input_tensors: List[torch.Tensor],
@@ -3448,11 +3495,15 @@ class AutoTuner:
 
         A candidate's score is its time on its slowest rank (one host
         all-gather of every rank's times), so a candidate that failed on any
-        rank scores inf and is never kept. The lowest score wins, the earliest
-        candidate on an exact tie; the fallback tactic of ``runners[0]`` is
-        kept instead unless the winner beats it by more than
-        ``COLLECTIVE_TIE_RTOL``. Every rank decides from the same gathered
-        times and group rank 0's fallback, so all keep the same entry.
+        rank scores inf and is never kept. With ``profiling_workloads`` the
+        score is the mean over workloads of that slowest-rank time divided by
+        the fallback tactic's (or, if the fallback is not a timed candidate
+        that ran everywhere, the first such candidate's). The lowest score wins,
+        the earliest candidate on an exact tie; the fallback tactic of
+        ``runners[0]`` is kept instead unless the winner scores below the
+        fallback by more than ``COLLECTIVE_TIE_RTOL``. Every rank decides from
+        the same gathered times and group rank 0's fallback, so all keep the
+        same entry.
         """
         fallback = runners[0].fallback_tactic(input_tensors, profile, **kwargs)
         fallback_index = next((i
@@ -3462,23 +3513,42 @@ class AutoTuner:
         per_rank = (self._group_allgather(mine, tuning_config)
                     if self._collective_group(tuning_config)[0] > 1 else [mine])
         fallback_index = per_rank[0][1]
-        scores = [max(times) for times in zip(*(t for t, _ in per_rank))]
+        workloads = bool(tuning_config.profiling_workloads)
+        # Per candidate, the slowest rank's time (per workload, with workloads).
+        slowest = [([max(column)
+                     for column in zip(*times)] if workloads else max(times))
+                   for times in zip(*(t for t, _ in per_rank))]
+        if workloads:
+            ran = [
+                i for i, times in enumerate(slowest) if all(
+                    math.isfinite(t) for t in times)
+            ]
+            if not ran:
+                return None, None, float('inf')
+            reference = slowest[fallback_index if fallback_index in
+                                ran else ran[0]]
+            scores = [
+                sum(t / r for t, r in zip(times, reference)) / len(reference)
+                for times in slowest
+            ]
+        else:
+            scores = slowest
         finite = [i for i, score in enumerate(scores) if math.isfinite(score)]
         if not finite:
             return None, None, float('inf')
         best = min(finite, key=scores.__getitem__)
-        if (fallback_index in finite
-                and scores[fallback_index] <= scores[best] *
-            (1 + self.COLLECTIVE_TIE_RTOL)):
+        if (fallback_index in finite and scores[best] > scores[fallback_index] *
+            (1 - self.COLLECTIVE_TIE_RTOL)):
             best = fallback_index
         runner_id, tactic, _ = timed[best]
         self._debug_logger(
             f"[Autotuner] Collective choice: custom_op={custom_op}, "
             f"shapes={profile.get_opt_shapes()}, kept candidate {best} "
             f"(runner={runners[runner_id]}, tactic={tactic}), "
-            f"slowest-rank ms={scores[best]:.4f}, fallback candidate "
-            f"{fallback_index}, slowest-rank ms per candidate="
-            f"{[round(score, 4) for score in scores]}")
+            f"score={scores[best]:.4f}, fallback candidate {fallback_index}, "
+            f"scores={[round(score, 4) for score in scores]}" +
+            (f", slowest-rank ms per candidate and workload={slowest}"
+             if workloads else ""))
         return runner_id, tactic, scores[best]
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,

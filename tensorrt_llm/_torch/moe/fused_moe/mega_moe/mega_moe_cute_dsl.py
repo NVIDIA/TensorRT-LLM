@@ -87,6 +87,7 @@ from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     _SM107_GENPHASE_MAX_TOKENS_PER_RANK,
     _megamoe_ugpu_die_smid_mask,
     megamoe_activation_sf_bytes_per_row,
+    megamoe_ladder_buckets,
 )
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
@@ -863,12 +864,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         full = int(max_num_tokens)
         if full <= 0:
             full = 4096
-        rungs = (
-            (32, 64, 128, 192, 256, 384, 512, 1024, 4096)
-            if get_sm_version() == 107
-            else (256, 1024, 4096)
-        )
-        cand = {b for b in rungs if b < full}
+        cand = {b for b in megamoe_ladder_buckets(get_sm_version()) if b < full}
         cand.add(full)
         return sorted(cand)
 

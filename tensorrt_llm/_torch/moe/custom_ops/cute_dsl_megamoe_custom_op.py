@@ -38,7 +38,7 @@ import dataclasses
 import functools
 import math
 import weakref
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -250,6 +250,132 @@ def synthesize_profiling_topk(
     return destination * experts + relabel[destination, local]
 
 
+# Capacity buckets of a MegaMoE launch ladder below its top, which is the per-rank token cap
+# (see ``MegaMoECuteDsl._resolve_maxt_buckets``).
+_MEGAMOE_SM107_LADDER_BUCKETS = (32, 64, 128, 192, 256, 384, 512, 1024, 4096)
+_MEGAMOE_LADDER_BUCKETS = (256, 1024, 4096)
+
+
+def megamoe_ladder_buckets(sm_version: int) -> Tuple[int, ...]:
+    """The fixed capacity buckets of the launch ladder; every bucket below the top is one of them."""
+    return _MEGAMOE_SM107_LADDER_BUCKETS if sm_version == 107 else _MEGAMOE_LADDER_BUCKETS
+
+
+def megamoe_partial_fill_tokens(sm_version: int, capacity: int) -> int:
+    """Per-rank tokens of the partial-fill profiling workload: the middle of the live window
+    (previous bucket, ``capacity``] of launches at this capacity."""
+    lowest = max((r for r in megamoe_ladder_buckets(sm_version) if r < capacity), default=0) + 1
+    return max(lowest, (lowest + int(capacity)) // 2)
+
+
+# The workloads each candidate tactic of a helper-free runner is timed on: every rank full, every
+# rank at the partial fill, and every rank full with this share of each rank's routes sent to
+# destination rank 0 on top of an even split.
+MEGAMOE_PROFILING_WORKLOADS = ("bal_full", "bal_partial", "recv_hotspot")
+_MEGAMOE_RECEIVER_HOTSPOT_SHARE = 0.75
+
+
+def _largest_remainder_split(total: int, weights: Sequence[float]) -> List[int]:
+    """Split ``total`` units over ``weights`` by largest remainder, ties to the lower index."""
+    n = len(weights)
+    if n == 0:
+        return []
+    total = int(total)
+    if total <= 0:
+        return [0] * n
+    weight_sum = sum(weights)
+    if weight_sum <= 0.0:
+        out = [total // n] * n
+        for i in range(total - (total // n) * n):
+            out[i] += 1
+        return out
+    raw = [total * (w / weight_sum) for w in weights]
+    floors = [int(x) for x in raw]
+    remainders = sorted(
+        ((raw[i] - floors[i], -i) for i in range(n)), key=lambda p: p[0], reverse=True
+    )
+    for k in range(total - sum(floors)):
+        floors[-remainders[k % n][1]] += 1
+    return floors
+
+
+def synthesize_profiling_workload_topk(
+    *,
+    num_tokens: int,
+    rows: int,
+    num_topk: int,
+    num_experts_per_rank: int,
+    world_size: int,
+    source_rank: int,
+    hotspot_share: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Routes of one source rank under a planned all-to-all: ``rows`` x top-k physical expert
+    ids, -1 past ``num_tokens``.
+
+    Every rank sends ``num_tokens`` x top-k routes. A rank's routes go to the destination ranks
+    evenly (``hotspot_share`` 0) or in proportion to ``(1 - h) / EP`` each plus ``h`` more to
+    rank 0, and every destination spreads what it receives evenly over its experts. Counts are
+    split by largest remainder (ties to the lower index), and each source takes its share of a
+    destination's experts after the lower source ranks, so all sources' routes add up to the
+    plan exactly. The plan depends only on the arguments other than ``source_rank``, so it is
+    the same on every rank. Routes are laid out column-major (slot j of token t is route
+    j * num_tokens + t), which keeps a token's experts distinct unless one source sends an
+    expert more than ``num_tokens`` routes; such an infeasible plan gives a repeated slot the
+    next expert of its destination rank the token does not use.
+    """
+    tokens, topk = int(num_tokens), int(num_topk)
+    experts, ranks = int(num_experts_per_rank), int(world_size)
+    if (
+        not 0 <= tokens <= int(rows)
+        or experts <= 0
+        or ranks <= 0
+        or not 0 < topk <= experts * ranks
+    ):
+        raise ValueError("Invalid MegaMoE profiling route dimensions")
+    if not 0 <= source_rank < ranks or not 0.0 <= hotspot_share <= 1.0:
+        raise ValueError("Invalid MegaMoE profiling source rank or hotspot share")
+    routes = torch.full((int(rows), topk), -1, dtype=torch.long)
+    if tokens == 0:
+        return routes.to(device)
+    if hotspot_share == 0.0:
+        weights = [1.0] * ranks
+    else:
+        weights = [(1.0 - hotspot_share) / ranks] * ranks
+        weights[0] += hotspot_share
+    # Every source sends the same row, so a destination receives EP times its cell.
+    row = _largest_remainder_split(tokens * topk, weights)
+    shares: Dict[Tuple[int, Tuple[int, ...]], List[int]] = {}
+    counts = []
+    for cell in row:
+        histogram = tuple(_largest_remainder_split(cell * ranks, [1.0] * experts))
+        share = shares.get((cell, histogram))
+        if share is None:
+            remaining = [float(v) for v in histogram]
+            for _ in range(source_rank):
+                taken = _largest_remainder_split(cell, remaining)
+                remaining = [r - t for r, t in zip(remaining, taken)]
+            share = shares[(cell, histogram)] = _largest_remainder_split(cell, remaining)
+        counts.extend(share)
+    flat = torch.repeat_interleave(torch.arange(ranks * experts), torch.tensor(counts))
+    live = flat.view(topk, tokens).t().contiguous()
+    ordered = live.sort(dim=1).values
+    if bool((ordered[:, 1:] == ordered[:, :-1]).any()):
+        for t in range(tokens):
+            used = set()
+            for j in range(topk):
+                expert = int(live[t, j])
+                if expert in used:
+                    first = expert - expert % experts
+                    same_rank = [first + (expert - first + i) % experts for i in range(1, experts)]
+                    any_rank = [(expert + i) % (ranks * experts) for i in range(1, ranks * experts)]
+                    expert = next(e for e in same_rank + any_rank if e not in used)
+                    live[t, j] = expert
+                used.add(expert)
+    routes[:tokens] = live
+    return routes.to(device)
+
+
 def _token_back_ready_granularity_choices(*, load_balance: bool = False) -> tuple[str, ...]:
     """Compare both readiness modes only for load-balanced tuning."""
     return _TOKEN_BACK_READY_GRANULARITIES if load_balance else ("expert",)
@@ -266,7 +392,8 @@ def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
     alpha = _autotune_pl_alpha(helper_expert_count)
     granularities = _token_back_ready_granularity_choices(load_balance=load_balance)
     if not load_balance and alpha == 0 and granularities == ("expert",):
-        return base
+        # Helper-free runners score tactics on several workloads, relative to the default.
+        return f"{base}:profile_v3:workloads={','.join(MEGAMOE_PROFILING_WORKLOADS)}"
     return (
         f"{base}:profile_v2:load_balance={int(load_balance)}:alpha={alpha!r}"
         f":ready={','.join(granularities)}"
@@ -3132,6 +3259,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Deferred scratch factory; the pre-hook materializes it on the
             # first REAL profiling launch (tuning-mode cache HITs never allocate).
             self._profiling_scratch_factory = None
+            # (workload, rows, device) -> (live tokens, routes) of the profiling workloads.
+            self._profiling_routes: Dict[Tuple, Tuple[int, torch.Tensor]] = {}
             self.in_kernel_fc2_reduce = bool(in_kernel_fc2_reduce)
             # combine wire format: bf16 / 32e4m3xe8m0 (fp8) / 16e2m1xbf16 (fp4);
             # quantized changes the shared_workspace size, so part of unique_id.
@@ -3398,8 +3527,64 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # rank is fastest. Its process group (the EP group) is set per
                 # tuning call, see ``_megamoe_tuning_group``.
                 distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+                profiling_workloads=self._profiling_workloads(),
             )
             return config
+
+        def _profiling_workloads(self) -> Tuple[Any, ...]:
+            """The workloads candidate tactics are timed on: ``MEGAMOE_PROFILING_WORKLOADS``
+            for a helper-free runner; a helper-bearing one keeps its load-balanced routes."""
+            if self.helper_expert_count > 0:
+                return ()
+            return tuple(
+                functools.partial(self._profiling_workload_inputs, workload)
+                for workload in MEGAMOE_PROFILING_WORKLOADS
+            )
+
+        def _profiling_workload_inputs(
+            self, workload: str, inputs: List[torch.Tensor]
+        ) -> List[torch.Tensor]:
+            """``inputs`` (after ``_autotuner_inputs_pre_hook``) with the routes, top-k weights
+            and output rows of ``workload``; the padded tail routes to no expert, as in serving."""
+            if workload not in MEGAMOE_PROFILING_WORKLOADS:
+                raise ValueError(f"Unknown MegaMoE profiling workload {workload!r}")
+            inputs = list(inputs)
+            rows = int(inputs[0].shape[0])
+            topk_idx = inputs[2]
+            key = (workload, rows, str(topk_idx.device))
+            cached = self._profiling_routes.get(key)
+            if cached is None:
+                tokens = rows
+                if workload == "bal_partial":
+                    tokens = min(
+                        rows, megamoe_partial_fill_tokens(self.sm_version, self.max_tokens_per_rank)
+                    )
+                routes = synthesize_profiling_workload_topk(
+                    num_tokens=tokens,
+                    rows=rows,
+                    num_topk=int(topk_idx.shape[1]),
+                    num_experts_per_rank=self.num_experts_per_rank,
+                    world_size=self.world_size,
+                    source_rank=self.local_rank,
+                    hotspot_share=(
+                        _MEGAMOE_RECEIVER_HOTSPOT_SHARE if workload == "recv_hotspot" else 0.0
+                    ),
+                    device=topk_idx.device,
+                ).to(topk_idx.dtype)
+                cached = self._profiling_routes[key] = (tokens, routes)
+            tokens, routes = cached
+            topk_idx.copy_(routes)
+            inputs[3][:tokens].fill_(1.0)
+            inputs[3][tokens:].zero_()
+            if tokens < rows:
+                # As the backend trims a launch's output to its live rows.
+                out_rows = (
+                    tokens
+                    if self.shared_intermediate_size is None
+                    else pad_up(tokens, math.gcd(rows, 128))
+                )
+                inputs[11] = inputs[11][:out_rows]
+            return inputs
 
         def fallback_tactic(
             self, inputs: List[torch.Tensor], profile: OptimizationProfile, **kwargs

@@ -1957,24 +1957,38 @@ def test_megamoe_tuning_config_is_built_once_per_runner():
     runner_cls = _extract_class(
         _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
         "Sm100MegaMoENvfp4Runner",
-        {"get_tuning_config", "_autotuner_inputs_pre_hook"},
+        {
+            "get_tuning_config",
+            "_autotuner_inputs_pre_hook",
+            "_profiling_workloads",
+            "_profiling_workload_inputs",
+        },
         {
             "TuningConfig": tuning_config,
             "DynamicTensorSpec": lambda *args: args,
             "ConstraintSpec": lambda *args: args,
             "DistributedTuningStrategy": SimpleNamespace(COLLECTIVE="collective"),
             "_megamoe_autotune_num_tokens": None,
+            "functools": functools,
+            "MEGAMOE_PROFILING_WORKLOADS": ("bal_full", "bal_partial", "recv_hotspot"),
         },
     )
     first, second = runner_cls(), runner_cls()
     for runner in (first, second):
         runner.max_tokens_per_rank = 8192
+        runner.helper_expert_count = 0
 
     config = first.get_tuning_config()
     assert first.get_tuning_config() is config
-    # One profile per capacity bucket, tuned collectively across the EP ranks.
+    # One profile per capacity bucket, tuned collectively across the EP ranks on three workloads.
     assert config.dynamic_tensor_specs == ((0, 0, (8192,)),)
     assert config.distributed_tuning_strategy == "collective"
+    assert [w.args for w in config.profiling_workloads] == [
+        ("bal_full",),
+        ("bal_partial",),
+        ("recv_hotspot",),
+    ]
+    assert all(w.func.__self__ is first for w in config.profiling_workloads)
     # The profiling pre-hook stays bound to the runner that built the config.
     assert config.inputs_pre_hook.__self__ is first
     assert second.get_tuning_config().inputs_pre_hook.__self__ is second
@@ -2033,6 +2047,7 @@ def _autotune_helpers(torch):
         "_EPI_FLAG_BATCH_SMALL",
         "_EPI_FLAG_BATCH_LARGE",
         "_EPI_FLAG_BATCH_TOKEN_THRESHOLD",
+        "MEGAMOE_PROFILING_WORKLOADS",
     }
     tree = ast.parse(source.read_text())
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
@@ -2149,7 +2164,10 @@ def test_on_autotune_uses_distinct_tactics():
 
     off_key = helpers["_megamoe_tuning_op_name"](0)
     on_key = helpers["_megamoe_tuning_op_name"](4)
-    assert off_key == "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
+    assert off_key == (
+        "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
+        ":profile_v3:workloads=bal_full,bal_partial,recv_hotspot"
+    )
     assert on_key != off_key and "alpha=0.8" in on_key
 
     off = helpers["enumerate_megamoe_candidate_tactics"](32, 107)

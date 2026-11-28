@@ -4433,20 +4433,147 @@ def test_collective_tunes_across_its_process_group(monkeypatch):
     assert process_group.barriers == [1, 1]
 
 
-def _raise_on(monkeypatch, failing: set) -> list:
-    """Profiling raises for the (rank, tactic) pairs in ``failing``, else returns 1 ms (0.5 ms
-    for tactic 1); returns the (rank, tactic) pairs profiled."""
+_WORKLOADS = ("bal_full", "bal_partial", "recv_hotspot")
+
+
+def _tagged_workloads():
+    """Profiling workloads that append their name to the inputs, for a fake timer to read."""
+    return tuple(lambda inputs, name=name: [*inputs, name]
+                 for name in _WORKLOADS)
+
+
+def _time_by_rank_and_workload(monkeypatch, times: dict) -> list:
+    """Make profiling return times[rank][tactic][workload]; returns the (rank, tactic, workload)
+    triples profiled, in order."""
     profiled = []
 
     def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
-        rank = _SIMULATED_RANK.rank
-        profiled.append((rank, tactic))
-        if (rank, tactic) in failing:
-            raise RuntimeError(f"rank {rank} failed tactic {tactic}")
+        rank, workload = _SIMULATED_RANK.rank, inputs[-1]
+        profiled.append((rank, tactic, workload))
+        return times[rank][tactic][workload]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    return profiled
+
+
+def _per_workload(full, partial, hotspot):
+    return dict(zip(_WORKLOADS, (full, partial, hotspot)))
+
+
+@pytest.mark.parametrize(
+    "tactic_2_times,expected",
+    [
+        # Tactic 1 wins bal_full alone but loses on the other workloads: the mean ratio to
+        # the fallback (tactic 0) keeps tactic 2.
+        ((0.97, 0.95, 0.96), 2),
+        # Within COLLECTIVE_TIE_RTOL of the fallback on average: the fallback stays.
+        ((0.996, 0.996, 0.996), 0),
+    ])
+def test_collective_scores_profiling_workloads_relative_to_the_fallback(
+        monkeypatch, tactic_2_times, expected):
+    times = {
+        rank: {
+            0:
+            _per_workload(1.0, 0.5, 2.0),
+            1:
+            _per_workload(0.90, 0.60, 2.30),
+            2:
+            _per_workload(*(t * f
+                            for t, f in zip(tactic_2_times, (1.0, 0.5, 2.0)))),
+        }
+        for rank in range(2)
+    }
+    # The slowest rank decides each workload: rank 1 is slower on tactic 1's hotspot run.
+    times[1][1]["recv_hotspot"] = 2.4
+    group = _ThreadGroup(2)
+    profiled = _time_by_rank_and_workload(monkeypatch, times)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1, 2], fallback=0) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        profiling_workloads=_tagged_workloads())
+    op = "autotuner_test::collective_workloads"
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(op, [runners[rank]], config,
+                                                    _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [expected, expected]
+    # Every candidate is timed on every workload, in the same order on every rank.
+    assert [(t, w) for r, t, w in profiled
+            if r == 0] == [(t, w) for t in (0, 1, 2) for w in _WORKLOADS]
+    assert [(t, w) for r, t, w in profiled
+            if r == 1] == [(t, w) for t in (0, 1, 2) for w in _WORKLOADS]
+    # One entry per shape on every rank, holding the winner's mean ratio to the fallback.
+    expected_score = 1.0 if expected == 0 else sum(tactic_2_times) / 3
+    for tuner in tuners:
+        (entry, ) = tuner.profiling_cache.cache.values()
+        assert entry[1] == expected and entry[2] == pytest.approx(
+            expected_score)
+
+
+def test_collective_workload_failure_on_one_rank_excludes_the_candidate(
+        monkeypatch):
+    times = {
+        rank: {
+            0: _per_workload(1.0, 1.0, 1.0),
+            1: _per_workload(0.5, 0.5, 0.5),
+        }
+        for rank in range(2)
+    }
+    times[1][1]["bal_partial"] = float("inf")  # e.g. the run failed there
+    group = _ThreadGroup(2)
+    _time_by_rank_and_workload(monkeypatch, times)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1], fallback=0) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        profiling_workloads=_tagged_workloads())
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(
+            "autotuner_test::collective_workload_failure", [runners[rank]],
+            config, _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [0, 0]
+
+
+def _raise_on(monkeypatch, failing: dict) -> list:
+    """Profiling raises at failing[(rank, tactic)] == workload, else returns 1 ms
+    (0.5 ms for tactic 1); returns the (rank, tactic, workload) triples profiled."""
+    profiled = []
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        rank, workload = _SIMULATED_RANK.rank, inputs[-1]
+        profiled.append((rank, tactic, workload))
+        if failing.get((rank, tactic)) == workload:
+            raise RuntimeError(f"rank {rank} failed {workload}")
         return 0.5 if tactic == 1 else 1.0
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
     return profiled
+
+
+def test_collective_failure_on_one_rank_mid_workloads_stops_every_rank(
+        monkeypatch):
+    """Rank 1 fails tactic 1 on its second workload: no rank times that tactic's
+    third workload (whose launch rank 1 would never join), all move on to tactic
+    2 together and keep the same tactic."""
+    profiled = _raise_on(monkeypatch, {(1, 1): "bal_partial"})
+    group = _ThreadGroup(2)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1, 2], fallback=0) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        profiling_workloads=_tagged_workloads())
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(
+            "autotuner_test::collective_mid_failure", [runners[rank]], config,
+            _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [0, 0]
+    for rank in range(2):
+        assert [(t, w) for r, t, w in profiled if r == rank] == [
+            (0, w) for w in _WORKLOADS
+        ] + [(1, "bal_full"), (1, "bal_partial")] + [(2, w) for w in _WORKLOADS]
 
 
 class _RefusingRunner(_CollectiveRunner):
@@ -4465,30 +4592,33 @@ def test_collective_build_failure_on_one_rank_skips_the_tactic_everywhere(
         monkeypatch):
     """A rank that cannot build a tactic says so before any rank launches it:
     no rank times it, and all keep the same tactic."""
-    profiled = _raise_on(monkeypatch, set())
+    profiled = _raise_on(monkeypatch, {})
     group = _ThreadGroup(2)
     tuners = [_collective_tuner(group, rank) for rank in range(2)]
     runners = [_RefusingRunner([0, 1, 2], rank=1, tactic=1) for _ in range(2)]
     config = TuningConfig(
-        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        profiling_workloads=_tagged_workloads())
     results, errors = _run_ranks(
         group, lambda rank: tuners[rank].choose_one(
             "autotuner_test::collective_build_failure", [runners[rank]], config,
             _COLLECTIVE_INPUTS)[1])
     assert errors == [None, None]
     assert results == [0, 0]
-    assert sorted(profiled) == [(0, 0), (0, 2), (1, 0), (1, 2)]
+    assert all(t != 1 for _, t, _ in profiled)
+    assert len(profiled) == 2 * 2 * len(_WORKLOADS)
 
 
 def test_collective_failure_of_every_candidate_serves_the_fallback(monkeypatch):
     """When no candidate runs on every rank, no entry is agreed and every rank
     serves the fallback."""
-    _raise_on(monkeypatch, {(0, 0), (1, 1)})
+    _raise_on(monkeypatch, {(0, 0): "bal_full", (1, 1): "recv_hotspot"})
     group = _ThreadGroup(2)
     tuners = [_collective_tuner(group, rank) for rank in range(2)]
     runners = [_CollectiveRunner([0, 1], fallback=0) for _ in range(2)]
     config = TuningConfig(
-        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE)
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        profiling_workloads=_tagged_workloads())
     op = "autotuner_test::collective_all_fail"
     results, errors = _run_ranks(
         group, lambda rank: tuners[rank].choose_one(op, [runners[rank]], config,
@@ -4497,3 +4627,120 @@ def test_collective_failure_of_every_candidate_serves_the_fallback(monkeypatch):
     assert results == [-1, -1]
     assert _serve(tuners, runners, op, [_COLLECTIVE_INPUTS] * 2,
                   config) == [-1, -1]
+
+
+def test_collective_times_each_in_place_workload_with_its_own_inputs(
+        monkeypatch):
+    """A workload may restage shared input tensors in place (the MegaMoE runner
+    writes its routes into the staging buffers), so every launch must see the
+    inputs of the workload it times, not those of the last workload built."""
+    staged = {
+    }  # rank -> the workload last staged into that rank's shared inputs
+    observed = []
+
+    def in_place(name):
+
+        def workload(inputs):
+            staged[_SIMULATED_RANK.rank] = name
+            return inputs
+
+        return workload
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        rank = _SIMULATED_RANK.rank
+        observed.append((rank, tactic, staged[rank]))
+        return 1.0 if tactic == 0 else 0.9
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    group = _ThreadGroup(2)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1], fallback=0) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        profiling_workloads=tuple(in_place(name) for name in _WORKLOADS))
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(
+            "autotuner_test::collective_in_place_workloads", [runners[rank]],
+            config, _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    assert results == [1, 1]
+    for rank in range(2):
+        assert [(t, w) for r, t, w in observed
+                if r == rank] == [(t, w) for t in (0, 1) for w in _WORKLOADS]
+
+
+def test_collective_workload_build_failure_on_one_rank_stops_before_its_launch(
+        monkeypatch):
+    """Rank 1 cannot build tactic 1's second workload: every rank times that
+    tactic's first workload, no rank launches its second (whose launch rank 1
+    would never join), and all move on to tactic 2 together."""
+    profiled = _raise_on(monkeypatch, {})
+    builds = {0: 0, 1: 0}
+
+    def staged(name):
+
+        def workload(inputs):
+            rank = _SIMULATED_RANK.rank
+            builds[rank] += 1
+            if rank == 1 and builds[rank] == 5:  # tactic 1, bal_partial
+                raise RuntimeError("cannot stage this workload here")
+            return [*inputs, name]
+
+        return workload
+
+    group = _ThreadGroup(2)
+    tuners = [_collective_tuner(group, rank) for rank in range(2)]
+    runners = [_CollectiveRunner([0, 1, 2], fallback=0) for _ in range(2)]
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.COLLECTIVE,
+        profiling_workloads=tuple(staged(name) for name in _WORKLOADS))
+    results, errors = _run_ranks(
+        group, lambda rank: tuners[rank].choose_one(
+            "autotuner_test::collective_workload_build_failure",
+            [runners[rank]], config, _COLLECTIVE_INPUTS)[1])
+    assert errors == [None, None]
+    # Tactic 1 (fastest) is dropped everywhere; tactic 2 ties with the fallback.
+    assert results == [0, 0]
+    for rank in range(2):
+        assert [
+            (t, w) for r, t, w in profiled if r == rank
+        ] == [(0, w)
+              for w in _WORKLOADS] + [(1, "bal_full")] + [(2, w)
+                                                          for w in _WORKLOADS]
+
+
+@pytest.mark.parametrize("strategy", [
+    DistributedTuningStrategy.INDEPENDENT,
+    DistributedTuningStrategy.MERGE,
+    DistributedTuningStrategy.PARALLEL,
+    DistributedTuningStrategy.BROADCAST,
+])
+def test_profiling_workloads_require_collective(strategy):
+    with pytest.raises(ValueError, match="COLLECTIVE"):
+        TuningConfig(distributed_tuning_strategy=strategy,
+                     profiling_workloads=_tagged_workloads())
+
+
+@pytest.mark.parametrize("strategy", [
+    DistributedTuningStrategy.INDEPENDENT,
+    DistributedTuningStrategy.COLLECTIVE,
+])
+def test_configs_without_workloads_time_each_candidate_once(
+        monkeypatch, strategy):
+    """Ops that name no profiling workloads keep one timing per candidate on the inputs
+    as given, and the fastest wins."""
+    seen = []
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        seen.append((len(inputs), tactic))
+        return {0: 1.0, 1: 0.5, 2: 0.8}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    tuner = autotuner.AutoTuner()
+    tuner.is_tuning_mode = True
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+    assert config.profiling_workloads == ()
+    runner = _CollectiveRunner([0, 1, 2])
+    assert tuner.choose_one(f"autotuner_test::no_workloads_{strategy.value}",
+                            [runner], config, _COLLECTIVE_INPUTS)[1] == 1
+    assert seen == [(1, 0), (1, 1), (1, 2)]
