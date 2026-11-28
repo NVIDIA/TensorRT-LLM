@@ -3249,6 +3249,7 @@ class TestComputeScheduledTokens:
     [
         (None, False),
         (None, True),
+        ("native_oom", False),
         ("peer_missing", False),
         ("cleanup_error", False),
         ("loop_teardown_error", False),
@@ -3351,6 +3352,9 @@ def test_periodic_tp_fatal_response_requires_peer_and_cleanup_agreement(
     executor._do_terminate_request(parent)
     assert executor._response_channel.result_wait_queues[1] is result_queue
     message = {
+        "native_oom": "[TensorRT-LLM][ERROR] CUDA runtime error in "
+        "cudaMalloc((void**) (ptr), sizeof(T) * size): out of memory "
+        "(memoryUtils.cu:93)\nframe 0: allocate",
         "device_fault": "CUDA error: device-side assert triggered",
         "collective_fault": "NCCL timeout",
         "math_library_fault": "CUBLAS_STATUS_EXECUTION_FAILED",
@@ -3383,7 +3387,7 @@ def test_periodic_tp_fatal_response_requires_peer_and_cleanup_agreement(
 
     executor.event_loop = loop
     executor._executor_loop_cleanup = cleanup
-    if failure is None:
+    if failure in {None, "native_oom"}:
         executor._event_loop_wrapper()
         group.close.assert_called_once_with()
         assert group.arrive.call_count == 2
@@ -3404,7 +3408,7 @@ def test_periodic_tp_fatal_response_requires_peer_and_cleanup_agreement(
     start_watchdog.assert_called_once()
     watchdog.cancel.assert_called_once_with()
 
-    if failure in {None, "cleanup_error", "loop_teardown_error"}:
+    if failure in {None, "native_oom", "cleanup_error", "loop_teardown_error"}:
         device_sync.assert_called_once_with(executor.device_id)
         assert not request_queue.can_enqueue_request()
         assert not executor.request_accumulated

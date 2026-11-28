@@ -373,6 +373,7 @@ def _make_executor(dist, batch, request, manager, wrapped, mm_active, mm_model=F
     ex._ctx_mla_kv_len_cap = None
     ex.ctx_decoder_batcher = None
     ex.drafter = None
+    ex._periodic_tp_failure_group = Mock()
     ex.model_engine = SimpleNamespace(
         is_spec_decode=False, model=MultimodalModelMixin() if mm_model else None
     )
@@ -1333,6 +1334,61 @@ def test_executor_backs_off_snapshot_budget_after_one_rank_refuses_resources():
     assert not any(thread.is_alive() for thread in threads)
     assert not errors
     assert results == [[(1, 256), (0, 0), (2, 256), (1, 1024)]] * 2
+
+
+@pytest.mark.cpu_only
+def test_executor_requires_failure_control_on_all_ranks(monkeypatch):
+    create = Mock()
+    monkeypatch.setattr(executor_module.PeriodicSnapshotFailureGroup, "create", create)
+    monkeypatch.setattr(
+        executor_module.PeriodicSnapshotFailureGroup,
+        "supported",
+        staticmethod(lambda dist: dist.supports_failure_control),
+    )
+    for support in ((False, True), (True, False), (False, False), (True, True)):
+        exchange = _Exchange()
+        enabled = all(support)
+        executors = []
+        for rank, supported in enumerate(support):
+            dist = exchange.for_rank(rank)
+            dist.tp_allgather_int64 = Mock(wraps=dist.tp_allgather_int64)
+            dist.supports_failure_control = supported
+            request = _Context()
+            batch = ScheduledRequests()
+            batch.append_context_request(request)
+            executor, scheduler, caps = _make_executor(
+                dist, batch, request, _Manager(), False, False
+            )
+            executor._periodic_tp_failure_group = None
+            executors.append((executor, scheduler, caps, request))
+
+        errors = []
+
+        def run(executor):
+            try:
+                executor._prepare_and_schedule_batch()
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=run, args=(executor,)) for executor, *_ in executors]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert not any(thread.is_alive() for thread in threads)
+        assert not errors, errors
+        for rank, (executor, scheduler, caps, request) in enumerate(executors):
+            assert caps == [enabled]
+            assert scheduler.periodic_snapshot_tp_enabled is enabled
+            assert getattr(executor, "_periodic_snapshot_tp_used", False) is enabled
+            expected_group = create.return_value if enabled else None
+            assert executor._periodic_tp_failure_group is expected_group
+            assert request.context_chunk_size == (1024 if enabled else 256)
+            votes = executor.dist.tp_allgather_int64
+            assert votes.call_args_list[0].args == ([1, 0, int(support[rank]), 1],)
+            if not enabled:
+                votes.assert_called_once()
+        assert create.call_count == (2 if enabled else 0)
 
 
 @pytest.mark.cpu_only

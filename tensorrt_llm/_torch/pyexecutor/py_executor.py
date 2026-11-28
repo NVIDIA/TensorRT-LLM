@@ -223,7 +223,13 @@ def _periodic_tp_can_drain_fatal_error(error_msg: str) -> bool:
                                    "cusparse", "cufft", "curand"))):
         return False
     if "cuda" in lowered:
-        return "cuda out of memory" in lowered
+        # Native CUDA checks append the source location and a stack trace.
+        native_message = lowered.split("\n", 1)[0]
+        if native_message.endswith(")"):
+            native_message = native_message.rsplit(" (", 1)[0]
+        return ("cuda out of memory" in lowered
+                or ("cuda runtime error in " in native_message
+                    and native_message.endswith(": out of memory")))
     return classify_error(error_msg) == "transient"
 
 
@@ -6505,25 +6511,28 @@ class PyExecutor:
                            and self.kv_cache_transceiver is None
                            and not self.is_encoder_decoder
                            and self.ctx_decoder_batcher is None)
+                failure_group = getattr(self, "_periodic_tp_failure_group",
+                                        None)
                 try:
                     rank_support = self.dist.tp_allgather_int64([
                         int(enabled),
                         int(mm_capable),
-                        int(enabled and PeriodicSnapshotFailureGroup.supported(
-                            self.dist)),
+                        int(enabled
+                            and (failure_group is not None
+                                 or PeriodicSnapshotFailureGroup.supported(
+                                     self.dist))),
                         int(enabled and
                             manager._periodic_snapshot_supports_mixed_decode),
                     ])
                 except Exception:
                     self._periodic_snapshot_tp_used = True
                     raise
-                self._periodic_tp_enabled = all(row[0] for row in rank_support)
+                self._periodic_tp_enabled = all(row[0] and row[2]
+                                                for row in rank_support)
                 self._periodic_tp_mixed_decode_supported = all(
                     row[3] for row in rank_support)
                 self._periodic_tp_backoff = False
-                if (self._periodic_tp_enabled
-                        and all(row[2] for row in rank_support) and getattr(
-                            self, "_periodic_tp_failure_group", None) is None):
+                if self._periodic_tp_enabled and failure_group is None:
                     self._periodic_snapshot_tp_used = True
                     self._periodic_tp_failure_group = PeriodicSnapshotFailureGroup.create(
                         self.dist)
