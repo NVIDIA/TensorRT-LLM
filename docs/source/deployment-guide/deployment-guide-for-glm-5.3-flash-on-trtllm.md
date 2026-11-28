@@ -307,7 +307,7 @@ Send images and videos to `/v1/chat/completions` using the OpenAI-compatible `im
 
 ### Tool Calling and Structured Output
 
-For tool calling, add `--tool_parser glm47 --reasoning_parser deepseek-r1` to the server command and use `tool_choice: "auto"` (streaming/non-streaming and MTP all supported). Limitations: `tool_choice: "required"` and named-function choice are not supported, and `parallel_tool_calls` should be omitted (the model can still return multiple tool calls under `auto`).
+For tool calling, add `--tool_parser glm47 --reasoning_parser deepseek-r1` to the server command and use `tool_choice: "auto"` (streaming/non-streaming and MTP all supported). Limitations: `tool_choice: "required"` and named-function choice are not supported. `parallel_tool_calls: false` ends generation after the model's first tool call; otherwise the model may return several tool calls in one turn.
 
 ### Long Context
 
