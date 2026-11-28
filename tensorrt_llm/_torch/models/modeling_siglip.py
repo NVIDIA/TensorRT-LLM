@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -121,9 +124,15 @@ class SiglipVisionModel(nn.Module, MultimodalEncoderMixin):
         )
 
     def load_weights(self, weights: Dict):
+        # Standalone vision state dicts omit the wrapper used by this model.
         pattern_mapping = {
-            r'(.*?)out_proj(.*)': r'\1o_proj\2',
-            r'(.*?)fc1(.*)': r'\1up_proj\2',
-            r'(.*?)fc2(.*)': r'\1down_proj\2',
+            r'^(?:vision_model\.)?(encoder\..*?)out_proj(.*)':
+            r'vision_model.\1o_proj\2',
+            r'^(?:vision_model\.)?(encoder\..*?)fc1(.*)':
+            r'vision_model.\1up_proj\2',
+            r'^(?:vision_model\.)?(encoder\..*?)fc2(.*)':
+            r'vision_model.\1down_proj\2',
+            r'^(embeddings|encoder|post_layernorm)\.(.*)':
+            r'vision_model.\1.\2',
         }
         _load_weights_impl(self, weights, params_map=pattern_mapping)

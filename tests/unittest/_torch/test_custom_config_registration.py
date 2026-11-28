@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import transformers
 from transformers import AutoConfig
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
@@ -35,6 +36,15 @@ from tensorrt_llm._torch.configs import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _expected_autoconfig_class(model_type: str, local_class: type) -> type:
+    native_names = {
+        "cosmos3_omni": "Cosmos3OmniConfig",
+        "deepseek_v32": "DeepseekV32Config",
+    }
+    native_name = native_names.get(model_type)
+    return getattr(transformers, native_name, local_class) if native_name else local_class
 
 
 _COSMOS3_EDGE_MIN_CONFIG = {
@@ -136,7 +146,7 @@ _DEEPSEEK_V41_MIN_CONFIG = {
 
 
 def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None:
-    assert isinstance(cfg, config_cls)
+    assert isinstance(cfg, _expected_autoconfig_class(model_type, config_cls))
     assert cfg.model_type == model_type
 
     if model_type == "cosmos3":
@@ -187,7 +197,7 @@ def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     assert model_type in CONFIG_MAPPING
-    assert CONFIG_MAPPING[model_type] is config_cls
+    assert CONFIG_MAPPING[model_type] is _expected_autoconfig_class(model_type, config_cls)
 
 
 @pytest.mark.parametrize(
@@ -200,7 +210,7 @@ def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
         ("deepseek_v41", DeepseekV41Config, _DEEPSEEK_V41_MIN_CONFIG),
     ],
 )
-def test_autoconfig_from_pretrained_resolves_to_local_config(
+def test_autoconfig_from_pretrained_resolves_to_registered_config(
     tmp_path, model_type, config_cls, config_dict
 ):
     # Mirrors what the benchmark_serving subprocess does under the hood:
@@ -280,9 +290,14 @@ def test_legacy_cosmos3_omni_model_type_still_resolves(tmp_path):
     (model_dir / "config.json").write_text(json.dumps(legacy_config))
 
     cfg = AutoConfig.from_pretrained(str(model_dir))
-    assert isinstance(cfg, Cosmos3Config)
+    assert isinstance(cfg, _expected_autoconfig_class("cosmos3_omni", Cosmos3Config))
     assert not isinstance(cfg.text_config, dict)
     assert cfg.text_config.hidden_size == 1024
+    assert cfg.text_config.max_position_embeddings == 8192
+    assert not isinstance(cfg.vision_config, dict)
+    assert cfg.vision_config.hidden_size == 256
+    assert cfg.vision_config.out_hidden_size == 1024
+    assert cfg._name_or_path == str(model_dir)
 
 
 @pytest.mark.parametrize("model_type", ["deepseek_v32", "kimi_k2"])
