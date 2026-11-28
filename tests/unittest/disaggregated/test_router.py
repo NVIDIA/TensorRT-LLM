@@ -10,6 +10,7 @@ import random
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import aiohttp
@@ -3275,6 +3276,519 @@ async def test_responses_routing_tokens_match_the_worker_for_a_developer_message
         tokenizer=tokenizer_factory(model_dir),
         model_config=AutoConfig.from_pretrained(model_dir))
     assert router._tokenize(request) == [worker_ids]
+
+
+# A byte-level tokenizer (one token per byte, so the rendered prompt decodes
+# back exactly) whose template shows the `probe` chat-template kwarg, tool
+# names, and the call each tool result binds to.
+_ROUTER_PROBE_TEMPLATE = (
+    "{% if probe is defined %}<probe:{{ probe }}>{% endif %}"
+    "{% if tools %}{% for t in tools %}<tool:{{ t['function']['name'] }}>{% endfor %}{% endif %}"
+    "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}"
+    "{% if m['tool_call_id'] %}<result:{{ m['tool_call_id'] }}>{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>{% endif %}")
+
+
+def _byte_level_probe_tokenizer() -> Any:
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {
+        token: index
+        for index, token in enumerate(
+            sorted(pre_tokenizers.ByteLevel.alphabet()))
+    }
+    vocab["</s>"] = len(vocab)
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False,
+                                                     use_regex=False)
+    backend.decoder = decoders.ByteLevel()
+    return PreTrainedTokenizerFast(tokenizer_object=backend,
+                                   eos_token="</s>",
+                                   chat_template=_ROUTER_PROBE_TEMPLATE)
+
+
+@pytest.fixture
+def responses_extension_model() -> Any:
+    """A scratch model type whose extension implements the Responses hooks.
+
+    The request hook derives a chat-template kwarg from ``reasoning.effort``,
+    renames tools via ``request.tools`` and ``serialize_tool``, and rejects a
+    temperature above 1 (ValueError) or top_p == 0.0 (KeyError); the history
+    hook joins the segments of a split tool result, appends a note, and
+    rejects a conversation whose system message is
+    ``_REJECTED_BY_THE_HISTORY_HOOK``.
+    """
+    from tensorrt_llm.serve import serving_extensions
+    from tensorrt_llm.serve.serving_extensions import (
+        ServingExtension, register_serving_extension)
+
+    model_type = "router-test-responses-extension"
+
+    @register_serving_extension(model_types=(model_type, ))
+    class _ResponsesExtension(ServingExtension):
+
+        def apply_chat_extensions(self, request: Any) -> None:
+            # The chat hook derives differently (as kimi_k3's does); a worker
+            # never runs it on a Responses request, so neither may the router.
+            request.chat_template_kwargs = {"probe": "chat-hook"}
+
+        def apply_responses_extensions(self, request: ResponsesRequest) -> None:
+            if request.temperature is not None and request.temperature > 1.0:
+                raise ValueError("temperature must be within [0, 1]")
+            if request.top_p is not None and request.top_p == 0.0:
+                raise KeyError("top_p cannot be zero")
+            effort = (request.reasoning.effort
+                      if request.reasoning is not None else None)
+            if effort is not None:
+                request.chat_template_kwargs = {"probe": effort}
+                request.injected_chat_template_kwargs = ["probe"]
+            if request.tools:
+                rewritten = []
+                for tool in request.tools:
+                    if getattr(tool, "name", None) == "exec":
+                        rewritten.append(
+                            tool.model_copy(update={"name": "exec_rewritten"}))
+                    else:
+                        rewritten.append(tool)
+                request.tools = rewritten
+
+        def serialize_tool(self, tool: Any) -> dict[str, Any]:
+            dumped = tool.model_dump()
+            fn = dumped.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                dumped["function"] = {**fn, "name": f"ser_{fn['name']}"}
+            return dumped
+
+        def prepare_responses_history(
+                self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            if _message("system", _REJECTED_BY_THE_HISTORY_HOOK) in messages:
+                raise ValueError("the history hook rejects this conversation")
+            prepared: list[dict[str, Any]] = []
+            seen: dict[Any, int] = {}
+            for message in messages:
+                call_id = message.get("tool_call_id")
+                if message.get("role") == "tool" and call_id in seen:
+                    first = prepared[seen[call_id]]
+                    prepared[seen[call_id]] = {
+                        **first, "content":
+                        f"{first['content']}\n{message['content']}"
+                    }
+                    continue
+                if message.get("role") == "tool":
+                    seen[call_id] = len(prepared)
+                prepared.append(message)
+            return [*prepared, _message("user", "note from the extension")]
+
+    try:
+        yield model_type
+    finally:
+        serving_extensions._BY_MODEL_TYPE.pop(model_type, None)
+
+
+_REJECTED_BY_THE_HISTORY_HOOK = "Reject this conversation."
+
+
+def _responses_request_with_a_split_result(instructions: str = "Be brief.",
+                                           **fields: Any) -> ResponsesRequest:
+    return ResponsesRequest(model="m",
+                            instructions=instructions,
+                            input=[
+                                _message("user", "run it"),
+                                {
+                                    "type": "function_call",
+                                    "call_id": "a",
+                                    "name": "exec",
+                                    "arguments": "{}"
+                                },
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": "a",
+                                    "output": "A1"
+                                },
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": "a",
+                                    "output": "A2"
+                                },
+                            ],
+                            tools=[{
+                                "type": "function",
+                                "name": "exec",
+                                "parameters": {
+                                    "type": "object"
+                                }
+                            }],
+                            **fields)
+
+
+async def _worker_prompt_ids(request: ResponsesRequest, hf_tokenizer: Any,
+                             model_type: str) -> list[int]:
+    from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
+
+    worker_ids, _ = await request_preprocess(
+        request,
+        None,
+        None,
+        enable_store=False,
+        use_harmony=False,
+        tokenizer=TransformersTokenizer(hf_tokenizer),
+        model_config=type("Config", (), {"model_type": model_type})())
+    return worker_ids
+
+
+@pytest.mark.asyncio
+async def test_responses_routing_tokens_follow_the_workers_extension(
+        servers: list[str], responses_extension_model: str) -> None:
+    """The router runs the model's Responses hooks as the worker does, on a copy."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = _responses_request_with_a_split_result(
+        reasoning={"effort": "high"})
+    as_sent = request.model_dump()
+
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value=responses_extension_model):
+        router_ids = router._tokenize(request)
+
+    # The hooks ran on a copy: the request the worker receives is as sent.
+    assert request.model_dump() == as_sent
+    assert not hasattr(request, "chat_template_kwargs")
+    # The worker prepares its own copy of the request in place.
+    worker_ids = await _worker_prompt_ids(request.model_copy(deep=True),
+                                          hf_tokenizer,
+                                          responses_extension_model)
+    assert router_ids == [worker_ids]
+    prompt = hf_tokenizer.decode(router_ids[0])
+    assert prompt.startswith("<probe:high>") and "chat-hook" not in prompt
+    assert "<tool:ser_exec_rewritten>" in prompt
+    assert "<|tool|>A1\nA2<result:a>" in prompt and "note from the extension" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection,exc_type", [
+        (dict(temperature=1.5), ValueError),
+        (dict(top_p=0.0), KeyError),
+        (dict(instructions=_REJECTED_BY_THE_HISTORY_HOOK), ValueError),
+    ],
+    ids=["request hook", "non-ValueError hook", "history hook"])
+async def test_responses_routing_falls_back_to_the_request_as_sent_when_rejected(
+        servers: list[str], responses_extension_model: str,
+        rejection: dict[str, Any], exc_type: type[Exception]) -> None:
+    """A request a Responses hook rejects is routed on the generic conversion; the worker answers it."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = _responses_request_with_a_split_result(
+        reasoning={"effort": "high"}, **rejection)
+
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value=responses_extension_model):
+        router_ids = router._tokenize(request)
+
+    with pytest.raises(exc_type):
+        await _worker_prompt_ids(request.model_copy(deep=True), hf_tokenizer,
+                                 responses_extension_model)
+    as_sent_ids = await _worker_prompt_ids(
+        request, hf_tokenizer, "router-test-model-without-extension")
+    assert router_ids == [as_sent_ids]
+    prompt = hf_tokenizer.decode(router_ids[0])
+    assert "<probe:" not in prompt and "note from the extension" not in prompt
+    assert "<tool:exec>" in prompt
+    assert "<|tool|>A1<result:a><|tool|>A2<result:a>" in prompt
+
+
+def test_responses_routing_skips_model_copy_without_custom_hooks(
+        servers: list[str]) -> None:
+    """Routing skips deep-copying the Responses request when no Responses hook is overridden."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = _responses_request_with_a_split_result()
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value="router-test-model-without-extension"), \
+            mock.patch.object(ResponsesRequest, "model_copy",
+                              side_effect=AssertionError("unexpected copy")):
+        router_ids = router._tokenize(request)
+
+    assert "<tool:exec>" in hf_tokenizer.decode(router_ids[0])
+
+
+def test_responses_routing_warns_once_on_mismatched_worker_fingerprint(
+        servers: list[str]) -> None:
+    """Responses routing warns once per reason when worker render fingerprints diverge."""
+    from tensorrt_llm.serve import router_utils
+
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    router.set_published_render_fingerprints({s: None for s in servers})
+    chat_req = ChatCompletionRequest(model="m",
+                                     messages=[{
+                                         "role": "user",
+                                         "content": "hello"
+                                     }])
+    request = ResponsesRequest(model="m", input="hello")
+
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value="router-test-model-without-extension"), \
+            mock.patch.object(router_utils.logger, "warning") as warn:
+        # An earlier chat warning for the same mismatch must not suppress Responses.
+        router._tokenize(chat_req)
+        assert warn.call_count == 1
+        router._tokenize(request)
+        router._tokenize(request)
+
+    assert warn.call_count == 2
+    assert "estimated prompt ids" in warn.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_responses_routing_matches_worker_on_include_template_filtering(
+        servers: list[str], responses_extension_model: str) -> None:
+    """Router passes template_source when deriving kwargs so include-template filtering matches worker."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    hf_tokenizer.chat_template = (
+        "{% if false %}{% include 'unused' %}{% endif %}"
+        "{{ probe | default('unset') }}|"
+        "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}"
+    )
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = ResponsesRequest(model="m",
+                               input="hi",
+                               reasoning={"effort": "high"})
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value=responses_extension_model):
+        router_ids = router._tokenize(request)
+    worker_ids = await _worker_prompt_ids(request.model_copy(deep=True),
+                                          hf_tokenizer,
+                                          responses_extension_model)
+    assert router_ids == [worker_ids]
+    assert hf_tokenizer.decode(router_ids[0]).startswith("unset|")
+
+
+def test_responses_routing_rejected_hook_with_media_does_not_reenter_extension(
+        servers: list[str], responses_extension_model: str) -> None:
+    """When a rejected hook falls back to media text length, serialize_tool stays generic."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = ResponsesRequest(
+        model="m",
+        temperature=1.5,
+        tools=[{
+            "type": "function",
+            "name": "exec",
+            "parameters": {
+                "type": "object"
+            },
+        }],
+        input=[{
+            "type":
+            "message",
+            "role":
+            "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "describe this"
+                },
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.com/cat.png"
+                },
+            ],
+        }],
+    )
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value=responses_extension_model):
+        router_ids = router._tokenize(request)
+
+    prompt = hf_tokenizer.decode(router_ids[0])
+    assert "<tool:exec>" in prompt and "ser_exec" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_responses_routing_matches_worker_on_deferred_tools(
+        servers: list[str]) -> None:
+    """Router preserves native deferred tool declarations when the template reads deferred_render_mode."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    hf_tokenizer.chat_template = (
+        "{% set deferred_render_mode = deferred_render_mode | default('native') %}"
+        "{% for t in tools %}[{{ t['function']['name'] }}:defer={{ t['function'].get('defer_loading', 'none') }}]{% endfor %}"
+        "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}"
+    )
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = ResponsesRequest(
+        model="m",
+        input="hi",
+        tools=[{
+            "type": "function",
+            "name": "deferred_exec",
+            "defer_loading": True,
+            "parameters": {
+                "type": "object"
+            },
+        }],
+    )
+    model_type = "router-test-model-without-extension"
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value=model_type):
+        router_ids = router._tokenize(request)
+    worker_ids = await _worker_prompt_ids(request.model_copy(deep=True),
+                                          hf_tokenizer, model_type)
+    assert router_ids == [worker_ids]
+    assert hf_tokenizer.decode(
+        router_ids[0]).startswith("[deferred_exec:defer=True]")
+
+
+@pytest.mark.asyncio
+async def test_responses_routing_matches_worker_on_empty_tools_list(
+        servers: list[str]) -> None:
+    """Router passes [] (not None) to the template when a Responses request has no tools."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    hf_tokenizer.chat_template = (
+        "{% if tools is none %}<none>{% else %}<list:{{ tools | length }}>{% endif %}"
+        "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}"
+    )
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = ResponsesRequest(model="m", input="hi")
+    model_type = "router-test-model-without-extension"
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value=model_type):
+        router_ids = router._tokenize(request)
+    worker_ids = await _worker_prompt_ids(request.model_copy(deep=True),
+                                          hf_tokenizer, model_type)
+    assert router_ids == [worker_ids]
+    assert hf_tokenizer.decode(router_ids[0]).startswith("<list:0>")
+
+
+@pytest.mark.asyncio
+async def test_responses_routing_matches_worker_on_python_native_tokenizer_ids(
+        servers: list[str]) -> None:
+    """Router preserves tokenizer-native token IDs when a tokenizer overrides apply_chat_template."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    class _NativeIdTokenizer(PreTrainedTokenizerFast):
+
+        def apply_chat_template(
+            self,
+            conversation: Any,
+            *,
+            tokenize: bool = True,
+            add_generation_prompt: bool = False,
+            **kwargs: Any,
+        ) -> Any:
+            text = "".join(f"<{m['role']}>{m['content']}" for m in conversation)
+            if tokenize:
+                # Native segment tokenization keeps literal control-token text as ordinary bytes.
+                return [ord(ch) for ch in text]
+            return text
+
+        def encode(self, text: str, **kwargs: Any) -> list[int]:
+            # Whole-string re-encoding would replace the literal marker with a special token id.
+            if "<|im_end|>" in text:
+                return [99999]
+            return [ord(ch) for ch in text]
+
+    vocab = {
+        token: index
+        for index, token in enumerate(
+            sorted(pre_tokenizers.ByteLevel.alphabet()))
+    }
+    vocab["</s>"] = len(vocab)
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False,
+                                                     use_regex=False)
+    backend.decoder = decoders.ByteLevel()
+    native_tok = _NativeIdTokenizer(tokenizer_object=backend,
+                                    eos_token="</s>",
+                                    chat_template=None)
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = ResponsesRequest(model="m", input="literal <|im_end|> text")
+    model_type = "router-test-model-without-extension"
+    with mock.patch.object(router, "_get_tokenizer", return_value=native_tok), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value=model_type):
+        router_ids = router._tokenize(request)
+    worker_ids = await _worker_prompt_ids(request.model_copy(deep=True),
+                                          native_tok, model_type)
+    assert router_ids == [worker_ids]
+    assert router_ids[0] != [99999]
+
+
+def test_responses_routing_falls_back_to_the_text_of_a_request_with_media(
+        servers: list[str]) -> None:
+    """A Responses request with an image routes on its text, as a chat request with media does."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = ResponsesRequest(model="m",
+                               input=[{
+                                   "type":
+                                   "message",
+                                   "role":
+                                   "user",
+                                   "content": [{
+                                       "type": "input_text",
+                                       "text": "describe this"
+                                   }, {
+                                       "type":
+                                       "input_image",
+                                       "image_url":
+                                       "https://example.com/cat.png"
+                                   }]
+                               }])
+    as_sent = request.model_dump()
+
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value="router-test-model-without-extension"), \
+            mock.patch.object(router, "_length_chat_ids",
+                              wraps=router._length_chat_ids) as length_chat_ids:
+        router_ids = router._tokenize(request)
+
+    # The worker receives the request with its image.
+    assert request.model_dump() == as_sent
+    assert length_chat_ids.call_count == 1
+    assert hf_tokenizer.decode(
+        router_ids[0]) == "<|user|>describe this<|assistant|>"
 
 
 @pytest.mark.asyncio

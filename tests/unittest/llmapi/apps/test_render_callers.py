@@ -29,6 +29,7 @@ from .render_helpers import (
     KIMI_K3,
     SERVER_TEMPLATE,
     WEATHER_TOOL,
+    byte_level_tokenizer,
     chat_request,
     fallback_processor,
     make_tokenizer,
@@ -980,12 +981,120 @@ class TestKimiK3MessagesAndCountTokens:
 
 class TestResponsesInputTokens:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("effort", "client_effort", "reads_effort"),
+        [
+            ("none", None, True),
+            ("minimal", None, True),
+            ("none", "HIGH", True),
+            pytest.param("none", None, False, id="template-without-effort"),
+        ],
+    )
+    async def test_router_matches_worker_for_musespark_reasoning_effort(
+        self, effort: str, client_effort: str | None, reads_effort: bool
+    ) -> None:
+        from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+        from tensorrt_llm.serve.responses_utils import request_preprocess
+
+        effort_template = "{{ reasoning_effort | default('unset') }}|" if reads_effort else ""
+        tokenizer = byte_level_tokenizer(
+            effort_template
+            + "{{ thinking }}|{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
+        )
+        request = ResponsesRequest(
+            model="m",
+            input="hello world",
+            store=False,
+            reasoning={"effort": effort},
+            chat_template_kwargs=(
+                {} if client_effort is None else {"reasoning_effort": client_effort}
+            ),
+        )
+        as_sent = request.model_dump(mode="json")
+        built = _Router.build(tokenizer, ["server1"])
+        try:
+            built._model_path = "/model"
+            built._model_types["/model"] = "muse_spark"
+
+            router_ids = built._tokenize(request)[0]
+
+            assert request.model_dump(mode="json") == as_sent
+            worker_ids, _ = await request_preprocess(
+                request=request.model_copy(deep=True),
+                prev_response=None,
+                conversation_store=None,
+                enable_store=False,
+                use_harmony=False,
+                tokenizer=tokenizer,
+                model_config=SimpleNamespace(model_type="muse_spark"),
+                processor=None,
+            )
+
+            effort_prefix = f"{client_effort or 'low'}|" if reads_effort else ""
+            assert tokenizer.decode(worker_ids) == effort_prefix + "True|<user>hello world"
+            assert router_ids == worker_ids
+            assert request.model_dump(mode="json") == as_sent
+        finally:
+            built._test_patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_router_matches_worker_for_kimi_k3_responses_without_chat_hook(
+        self,
+    ) -> None:
+        """The router must skip Kimi-K3's chat hook on Responses requests, matching the worker."""
+        from tensorrt_llm.serve import serving_extensions
+        from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+        from tensorrt_llm.serve.responses_utils import request_preprocess
+        from tensorrt_llm.serve.serving_extensions import (
+            get_serving_extension,
+            register_serving_extension,
+        )
+
+        scratch_type = "render-callers-kimi-k3-responses-parity"
+        register_serving_extension(model_types=(scratch_type,))(
+            type(get_serving_extension("kimi_k3"))
+        )
+        tokenizer = byte_level_tokenizer(
+            "{{ thinking_effort | default('unset') }}|"
+            "{{ reasoning_effort | default('unset') }}|"
+            "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
+        )
+        request = ResponsesRequest(
+            model="m",
+            input="hello world",
+            store=False,
+            reasoning={"effort": "high"},
+        )
+        built = _Router.build(tokenizer, ["server1"])
+        try:
+            built._model_path = "/model"
+            built._model_types["/model"] = scratch_type
+
+            router_ids = built._tokenize(request)[0]
+            worker_ids, _ = await request_preprocess(
+                request=request.model_copy(deep=True),
+                prev_response=None,
+                conversation_store=None,
+                enable_store=False,
+                use_harmony=False,
+                tokenizer=tokenizer,
+                model_config=SimpleNamespace(model_type=scratch_type),
+                processor=None,
+            )
+
+            assert tokenizer.decode(worker_ids) == "unset|high|<user>hello world"
+            assert router_ids == worker_ids
+        finally:
+            built._test_patcher.stop()
+            serving_extensions._BY_MODEL_TYPE.pop(scratch_type, None)
+
+    @pytest.mark.asyncio
     async def test_the_server_template_applies_to_responses_input(
         self, tokenizer, monkeypatch
     ) -> None:
         import tensorrt_llm.serve.responses_utils as responses_utils
 
-        async def fake_input_messages(request, prev_msgs):
+        async def fake_input_messages(request, prev_msgs, extension=None):
             return [{"role": "user", "content": "hello world"}]
 
         monkeypatch.setattr(responses_utils, "_create_input_messages", fake_input_messages)
@@ -993,10 +1102,9 @@ class TestResponsesInputTokens:
             responses_utils, "_get_chat_completion_function_tools", lambda tools: []
         )
         monkeypatch.setattr(
-            responses_utils, "reasoning_chat_template_kwargs", lambda request, **kwargs: {}
-        )
-        monkeypatch.setattr(
-            responses_utils, "reasoning_injected_chat_template_keys", lambda request: set()
+            responses_utils,
+            "reasoning_chat_template_kwargs_with_injected",
+            lambda request, **kwargs: ({}, frozenset()),
         )
         request = mock.Mock()
         request.tools = None

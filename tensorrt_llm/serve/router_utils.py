@@ -18,8 +18,11 @@ implementation of block hashing without importing the whole router module.
 """
 
 import base64
+import dataclasses
+import functools
 import os
 import sys
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,9 +62,30 @@ from tensorrt_llm.serve.render import (
     render_chat_for_length,
     worker_resolves_thinking,
 )
+from tensorrt_llm.serve.render.chat import _render_chat_without_request_hooks
+from tensorrt_llm.serve.serving_extensions import ServingExtension
 
 KV_CACHE_HASH_ALGO_DEFAULT = kv_cache_hash.KV_CACHE_HASH_ALGO_DEFAULT
 KV_CACHE_HASH_ALGO_V1 = kv_cache_hash.KV_CACHE_HASH_ALGO_V1
+_RESPONSES_WARN_LOCK = threading.Lock()
+
+
+@functools.lru_cache(maxsize=None)
+def _extension_cls_has_responses_hooks(extension_cls: type[ServingExtension]) -> bool:
+    return (
+        extension_cls.apply_responses_extensions is not ServingExtension.apply_responses_extensions
+        or extension_cls.prepare_responses_history is not ServingExtension.prepare_responses_history
+    )
+
+
+def _extension_has_responses_hooks(extension: ServingExtension) -> bool:
+    return (
+        "apply_responses_extensions" in extension.__dict__
+        or "prepare_responses_history" in extension.__dict__
+        or _extension_cls_has_responses_hooks(type(extension))
+    )
+
+
 KV_CACHE_HASH_ALGO_V2 = kv_cache_hash.KV_CACHE_HASH_ALGO_V2
 KV_CACHE_HASH_ALGO_V2_SHA256_64 = kv_cache_hash.KV_CACHE_HASH_ALGO_V2_SHA256_64
 KV_CACHE_HASH_ALGOS = frozenset(
@@ -340,7 +364,11 @@ class BlockHashMixin:
 
         return encode_rendered
 
-    def _length_chat_ids(self, request: ChatCompletionRequest) -> list[int]:
+    def _length_chat_ids(
+        self,
+        request: ChatCompletionRequest,
+        resources: Optional[RenderResources] = None,
+    ) -> list[int]:
         """Routing ids from :func:`render_chat_for_length`; never forwarded to a worker.
 
         A request the request model rejects, or Harmony cannot convert, gets no ids. One the chat
@@ -349,7 +377,8 @@ class BlockHashMixin:
         So do the chats of a Mistral-native directory read without the servers' checkpoint
         format, which this router cannot render.
         """
-        resources = self._render_resources(request.model)
+        if resources is None:
+            resources = self._render_resources(request.model)
         if request.model in self.__dict__.get("_mistral_native_dirs", ()):
             logger.debug(
                 "Router cannot render the chats of a Mistral-native directory without its "
@@ -611,10 +640,17 @@ class BlockHashMixin:
         return token_lists
 
     def _tokenize_responses_request(self, request: ResponsesRequest) -> list[int]:
-        """Return the token ids of the prompt a worker builds for a Responses request.
+        """Return routing-only prompt ids without changing the Responses request.
 
-        The ids only drive routing and are not stored on the request, so the
-        context worker still renders the prompt itself.
+        Relayed token ids are reused and native Harmony rendering bypasses the
+        Responses hooks here. For chat-template routing, the request hook and
+        the history-preparation hook run on a copy of the request. These ids
+        only select workers; each worker independently prepares and renders
+        the original request, including running its Responses hooks.
+
+        If a hook rejects the request, routing attempts the generic conversion
+        of the request as sent so the worker can report the preprocessing
+        error. If that conversion also fails, its error propagates.
         """
         token_ids = request.relayed_prompt_token_ids()
         if token_ids is not None:
@@ -629,25 +665,118 @@ class BlockHashMixin:
             return responses_utils._render_for_completion(
                 responses_utils._construct_harmony_messages(request, None)
             )
-        tools = responses_utils._get_chat_completion_function_tools(request.tools)
+        res = self._render_resources(request.model)
+        extension = res.extension
+        hooks_ran = False
+        if _extension_has_responses_hooks(extension):
+            prepared = request.model_copy(deep=True)
+            responses_utils._strip_client_injected_chat_template_kwargs(prepared)
+            try:
+                extension.apply_responses_extensions(prepared)
+                # Runs the history hook (prepare_responses_history) on the result.
+                conversation = responses_utils.chat_messages_from_responses_input(
+                    prepared, [], extension
+                )
+                hooks_ran = True
+            except Exception as error:
+                # Any exception from the hooks is the worker's 400 on this request;
+                # routing must not fail on it, so fall back to the generic conversion
+                # of the request as sent (whereas the chat path falls back to length-only
+                # text when its extension rejects). An error in the generic conversion
+                # itself is raised again by the call below.
+                logger.debug(
+                    f"Router could not preprocess the Responses request ({error}); "
+                    "routing on the request as sent."
+                )
+                prepared, extension = request, ServingExtension()
+                res = dataclasses.replace(res, extension=extension)
+                conversation = responses_utils.chat_messages_from_responses_input(
+                    prepared, [], extension
+                )
+        else:
+            prepared = request
+            conversation = responses_utils.chat_messages_from_responses_input(
+                prepared, [], extension
+            )
+        tools = responses_utils._get_chat_completion_function_tools(prepared.tools)
+        tool_dicts = [extension.serialize_tool(tool) for tool in tools]
+        tokenizer = self._get_tokenizer(request.model)
         # As on the worker, developer messages render as system for a chat
         # template that has no developer role.
         messages = responses_utils._render_developer_as_system(
-            responses_utils.chat_messages_from_responses_input(request, []),
-            self._get_tokenizer(request.model),
+            conversation,
+            tokenizer,
             None,
-            [tool.model_dump() for tool in tools],
+            tool_dicts,
+        )
+        template_source = responses_utils.rendered_hf_chat_template_source(
+            tokenizer=tokenizer,
+            processor=None,
+            chat_template=None,
+            tools=tool_dicts,
+            model_type=res.model_type,
+        )
+        tools_dict = responses_utils._tools_for_chat_template(
+            prepared.tools, tool_dicts, template_source
+        )
+        chat_template_kwargs, injected_kwargs = (
+            responses_utils.reasoning_chat_template_kwargs_with_injected(
+                prepared,
+                template_source=template_source,
+                model_type=res.model_type,
+                include_request_injected=hooks_ran,
+            )
         )
         chat_request = ChatCompletionRequest.model_construct(
             model=request.model,
             messages=messages,
             tools=tools,
-            chat_template_kwargs=responses_utils.reasoning_chat_template_kwargs(request),
-            injected_chat_template_kwargs=list(
-                responses_utils.reasoning_injected_chat_template_keys(request)
-            ),
+            chat_template_kwargs=chat_template_kwargs,
+            injected_chat_template_kwargs=list(injected_kwargs),
         )
-        return self._tokenize(chat_request)[0]
+        return self._tokenize_prepared_chat(chat_request, res, tools_dict=tools_dict)
+
+    def _tokenize_prepared_chat(
+        self,
+        request: ChatCompletionRequest,
+        resources: Optional[RenderResources] = None,
+        *,
+        tools_dict: Optional[list[dict]] = None,
+    ) -> list[int]:
+        """Routing ids of a synthetic chat request built from Responses; never forwarded.
+
+        Chat request hooks are skipped because Responses preprocessing already
+        ran (or fell back to generic conversion), and the ids are not written
+        back: a Responses worker renders its prompt itself.
+        """
+        res = resources if resources is not None else self._render_resources(request.model)
+        decision = self._write_back_decision(request.model)
+        if decision.mismatched:
+            reason = ", ".join(f"{server} ({why})" for server, why in decision.mismatched.items())
+            should_warn = False
+            with _RESPONSES_WARN_LOCK:
+                if reason != getattr(self, "_last_responses_fallback_reason", None):
+                    self._last_responses_fallback_reason = reason
+                    should_warn = True
+            if should_warn:
+                logger.warning(
+                    f"Responses routing uses estimated prompt ids for workers with mismatched "
+                    f"render fingerprints: {reason}."
+                )
+        try:
+            return _render_chat_without_request_hooks(
+                request,
+                res,
+                tools=tools_dict,
+                encode_rendered=self._make_encode_rendered(request),
+            ).token_ids
+        except UnrenderableMessagesError as error:
+            logger.debug(f"Router could not render the messages ({error}); routing on no ids.")
+            return []
+        except (UnsupportedRenderError, ValueError) as error:
+            # Media or an unsupported model: route on its text.
+            logger.debug(f"Router could not render the request exactly ({error}).")
+            return self._length_chat_ids(request, res)
 
     def _compute_block_hashes(
         self,

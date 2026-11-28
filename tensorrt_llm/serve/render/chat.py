@@ -517,14 +517,95 @@ def render_chat(
     return result
 
 
-class _LengthExtension(ServingExtension):
-    """No extension hooks, but the model's tool serialization (kimi_k3 drops null defaults)."""
+class _ModelToolsExtension(ServingExtension):
+    """No request hooks, but the model's tool serialization (kimi_k3 drops null defaults)."""
 
     def __init__(self, model_extension: ServingExtension):
         self._model_extension = model_extension
 
     def serialize_tool(self, tool: Any) -> Dict[str, Any]:
         return self._model_extension.serialize_tool(tool)
+
+
+def _render_chat_without_request_hooks(
+    request: "ChatCompletionRequest",
+    res: RenderResources,
+    *,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
+) -> RenderedPrompt:
+    """Render a synthetic chat request without running chat request hooks.
+
+    Used by the router when turning a preprocessed Responses request into
+    routing-only token ids: ``apply_chat_extensions`` is skipped while the
+    model's ``serialize_tool`` hook stays active (or pre-selected ``tools``
+    dicts, such as native deferred/namespace declarations, are handed directly
+    to ``apply_chat_template``). The result serves routing only and is never
+    forwarded to a worker.
+
+    Args:
+        request: Synthetic chat request whose messages, tools, and kwargs were
+            prepared on the Responses path.
+        res: Render resources for the target model. Harmony resources are
+            rejected because native Harmony rendering bypasses chat templates.
+        tools: Pre-selected tool dicts from the Responses path (for example
+            native deferred or namespace tool structures). When ``None``,
+            ``request.tools`` is serialized through ``res.extension.serialize_tool``.
+        encode_rendered: Optional encoder callback forwarded to
+            :func:`render_chat` for prefix-cache tokenization.
+    """
+    if res.use_harmony:
+        raise UnsupportedRenderError(
+            "_render_chat_without_request_hooks does not support Harmony rendering."
+        )
+    if tools is None:
+        return render_chat(
+            request,
+            dataclasses.replace(res, extension=_ModelToolsExtension(res.extension)),
+            tokenize=True,
+            encode_rendered=encode_rendered,
+        )
+    if _has_media(request.messages):
+        raise UnsupportedRenderError("Multimodal input is not supported by prompt rendering.")
+    if _is_passthrough_model(res):
+        raise UnsupportedRenderError(
+            f"Model type {res.model_type!r} builds its prompt in its own input processor; "
+            "rendering its prompts is not supported."
+        )
+    conversation, mm_coroutine, mm_placeholder_counts, _mm_item_order = _parse_text_conversation(
+        request, res, None
+    )
+    mm_coroutine.close()
+    native_ids = _prompt_is_native_ids(
+        res,
+        chat_template=request.chat_template,
+        forced_prefix=None,
+        add_special_tokens=request.add_special_tokens,
+        truncate_prompt_tokens=request.truncate_prompt_tokens,
+    )
+    rendered = apply_chat_template(
+        **_template_kwargs(
+            res,
+            conversation=conversation,
+            mm_placeholder_counts=mm_placeholder_counts,
+            add_generation_prompt=request.add_generation_prompt,
+            tools=tools,
+            documents=request.documents,
+            chat_template=request.chat_template,
+            chat_template_kwargs=request.chat_template_kwargs,
+            injected_chat_template_kwargs=request.injected_chat_template_kwargs,
+            enable_tokenize=native_ids,
+        )
+    )
+    return _finish(
+        res,
+        rendered,
+        forced_prefix=None,
+        tokenize=True,
+        add_special_tokens=request.add_special_tokens,
+        truncate_prompt_tokens=request.truncate_prompt_tokens,
+        encode_rendered=encode_rendered,
+    )
 
 
 def render_chat_for_length(
@@ -570,7 +651,7 @@ def render_chat_for_length(
         model_type="" if _is_passthrough_model(res) else res.model_type,
         hf_config=None,
         input_processor=None,
-        extension=_LengthExtension(res.extension),
+        extension=_ModelToolsExtension(res.extension),
         use_harmony=False,
     )
     return render_chat(text_only, plain, encode_rendered=encode_rendered)
