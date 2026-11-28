@@ -29,6 +29,11 @@ _MARKUP_TAG = re.compile(r"</?[A-Za-z_][A-Za-z0-9_-]*>")
 # a parser that reaches it never converges, and ``finish`` warns about it.
 _MAX_FINISH_PASSES = 1024
 
+# ``finish_reason`` values of a generation that was cut off rather than
+# ended by the model: max_tokens ("length"), the request deadline ("timeout")
+# or an abort ("cancelled").
+TRUNCATED_FINISH_REASONS = frozenset({"length", "timeout", "cancelled"})
+
 
 def warn_if_tool_call_unparsed(parser_name: str, tool_parser: "BaseToolParser",
                                text: str, calls: List[ToolCallItem]) -> None:
@@ -214,6 +219,17 @@ class BaseToolParser(ABC):
     def parse_partial(self, text: str,
                       tools: List[Tool]) -> StreamingParseResult:
         """Inspect unfinished output without updating the streaming state."""
+        return self.detect_and_parse(text, tools)
+
+    def parse_finished(self, text: str, tools: List[Tool], *,
+                       truncated: bool) -> StreamingParseResult:
+        """Parse the whole text of a generation that has finished.
+
+        ``truncated`` is set when generation was cut off (``finish_reason``
+        in ``TRUNCATED_FINISH_REASONS``). Parsers whose ``finish`` recovers a call the stream ended
+        inside override this so the whole-text parse recovers the same call.
+        The default is ``detect_and_parse``.
+        """
         return self.detect_and_parse(text, tools)
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:

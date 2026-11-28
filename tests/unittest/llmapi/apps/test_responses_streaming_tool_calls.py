@@ -354,6 +354,25 @@ def test_whole_text_parser_calls_are_streamed_once_and_repeated_in_the_snapshot(
         assert [i for i in items if i.type == "function_call"] == calls
 
 
+@pytest.mark.parametrize(
+    "finish_reason, recovered",
+    [("stop", True), ("length", False), ("timeout", False), ("cancelled", False)],
+)
+def test_qwen_coder_snapshot_recovers_an_unterminated_call_only_if_not_cut_off(
+    finish_reason, recovered
+):
+    """A call the output ended inside is recovered unless generation was cut off."""
+    text = "Checking.\n<tool_call>\n<function=get_time>\n<parameter=city>\nParis\n</parameter>\n"
+    text += "</function>\n"
+    items, _messages, _reasoning = _create_output_content(
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text=text, finish_reason=finish_reason)]),
+        tool_parser="qwen3_coder",
+        tools=[_function_tool()],
+    )
+    calls = [(i.name, json.loads(i.arguments)) for i in items if i.type == "function_call"]
+    assert calls == ([("get_time", {"city": "Paris"})] if recovered else [])
+
+
 def _codex_tools():
     """Tools as the Codex CLI declares them: every one under a namespace."""
     exec_tool = SimpleNamespace(name="exec", type="custom", description="run code")
