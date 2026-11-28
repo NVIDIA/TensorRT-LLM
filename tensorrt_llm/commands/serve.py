@@ -32,7 +32,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, Literal, NoReturn,
-                    Optional, Sequence, Set, Tuple)
+                    Optional, Sequence, Set)
 
 import click
 import pydantic
@@ -487,8 +487,11 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield llm_args
 
 
-def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
-    """Bind the Unix socket attached frontends forward launcher-owned routes to.
+def _listen_on_launcher_uds(llm: PyTorchLLM) -> tuple[socket.socket, str]:
+    """Bind and listen on the Unix socket for launcher-owned forwarded routes.
+
+    Queued startup probes are answered as soon as uvicorn accepts, instead of
+    waiting for the next connection-refusal retry in an attached frontend.
 
     It lives in the multi-frontend ipc dir, which is private to the user and
     removed, socket file included, when the executor proxy shuts down.
@@ -503,6 +506,7 @@ def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.bind(path)
+        sock.listen(socket.SOMAXCONN)
     except OSError:
         sock.close()
         raise
@@ -826,7 +830,7 @@ def launch_server(
             launcher_uds_sock = None
             try:
                 if multi_frontend.is_launcher:
-                    launcher_uds_sock, launcher_uds_path = _bind_launcher_uds(
+                    launcher_uds_sock, launcher_uds_path = _listen_on_launcher_uds(
                         llm)
                     _share_prometheus_multiproc_dir(
                         llm, os.path.dirname(launcher_uds_path))
@@ -877,7 +881,7 @@ def launch_server(
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)
                 if launcher_uds_sock is not None:
-                    # Its file goes with the ipc dir (see _bind_launcher_uds).
+                    # Its file goes with the ipc dir (see _listen_on_launcher_uds).
                     launcher_uds_sock.close()
 
 

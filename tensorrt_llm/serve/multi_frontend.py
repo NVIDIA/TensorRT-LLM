@@ -154,16 +154,28 @@ class LauncherForwarder:
                     status_code=resp.status,
                     media_type=resp.headers.get("Content-Type"),
                 )
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
             logger.warning(
-                f"Forwarding {request.method} {target} to the launcher frontend failed: {e!r}"
+                f"Forwarding {request.method} {target} to the launcher frontend failed: {error!r}"
             )
+            if isinstance(error, asyncio.TimeoutError):
+                status_code = 504
+                response_headers = {"x-should-retry": "false"}
+                message = (
+                    f"The launcher frontend did not respond to {request.url.path} in time; "
+                    "the request may still be processed. Check its result before retrying."
+                )
+            else:
+                status_code = 503
+                response_headers = None
+                message = (
+                    f"The launcher frontend that serves {request.url.path} "
+                    f"is unavailable: {error!r}"
+                )
             return JSONResponse(
-                status_code=503,
-                content={
-                    "error": f"The launcher frontend that serves {request.url.path} "
-                    f"is unavailable: {e!r}"
-                },
+                status_code=status_code,
+                content={"error": message},
+                headers=response_headers,
             )
 
     async def get_status(self, path: str, timeout_s: float = 5.0) -> Optional[int]:
@@ -255,13 +267,30 @@ class AttachedFrontendWatchdog:
         self._ppid_interval = ppid_interval_s
         self._health_interval = health_interval_s
         self._health_failures = health_failures
+        self._launcher_was_healthy = False
+
+    async def wait_until_ready(self) -> None:
+        """Wait for launcher HTTP serving, independently of health authorization.
+
+        Group-startup deadlines and cancellation belong to the launcher.
+
+        Raises:
+            RuntimeError: The launcher exits before answering an HTTP probe.
+        """
+        while True:
+            if os.getppid() != self._launcher_pid:
+                raise RuntimeError(
+                    f"Launcher frontend (pid {self._launcher_pid}) exited during startup"
+                )
+            status = await self._forwarder.get_status("/health")
+            if status is not None:
+                self._launcher_was_healthy = status == 200
+                return
+            await asyncio.sleep(0.1)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         failures = 0
-        # The launcher starts listening only after its attached frontends are
-        # ready, so failures count once it has answered.
-        launcher_answered = False
         next_health = loop.time() + self._health_interval
         while True:
             await asyncio.sleep(self._ppid_interval)
@@ -273,10 +302,11 @@ class AttachedFrontendWatchdog:
             next_health = loop.time() + self._health_interval
             status = await self._forwarder.get_status("/health")
             if status == 200:
-                launcher_answered = True
+                self._launcher_was_healthy = True
                 failures = 0
                 continue
-            if not launcher_answered:
+            # Auth-protected health can stay 401; count failures only after a 200.
+            if not self._launcher_was_healthy:
                 continue
             failures += 1
             if failures >= self._health_failures:
