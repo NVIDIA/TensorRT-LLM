@@ -2969,6 +2969,90 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
+class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-5.3-Flash"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.3-Flash"
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(250000)
+    def test_tep2_dep2_mtp(self):
+        """GSM8K over one TEP2 context server and one DEP2 generation server.
+
+        The FP8 weights take about 154 GB per GPU at TP2, so both servers fit
+        on one 4-GPU GB300 node. MTP runs on both servers; the generation
+        server adds attention DP. The batch size bounds the recurrent (KDA)
+        state that the cache manager reserves per request slot.
+        """
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False,
+            "tokens_per_block": 128,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+        }
+        speculative_config = {
+            "decoding_type": "MTP",
+            "max_draft_len": 3,
+        }
+        common_server_config = {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 2,
+            "trust_remote_code": True,
+            "disable_mm_encoder": True,
+            "max_batch_size": 64,
+            "max_num_tokens": 8192,
+            "max_seq_len": 8192,
+            "enable_chunked_prefill": True,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+            "speculative_config": speculative_config,
+        }
+        ctx_server_config = {
+            **common_server_config,
+            "enable_attention_dp": False,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_server_config,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": False,
+            # Each attention-DP rank prefills its own batch and the MoE gathers
+            # every rank's tokens.
+            "max_num_tokens": 4096,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "max_batch_size": 64,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
+            # The disaggregated LLM carries bare LlmArgs; fill in the spec the
+            # accuracy reference is registered under (FP8 block scales + MTP).
+            llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+            llm.args.speculative_config = MTPDecodingConfig(
+                max_draft_len=speculative_config["max_draft_len"])
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
 class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"

@@ -156,11 +156,12 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-1017-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
+  # GLM-5.3-Flash 1P1D on one tray: TEP2 context and DEP2 generation workers, MTP3, NIXL.
+  - accuracy/test_disaggregated_serving.py::TestGLM53FlashFP8::test_tep2_dep2_mtp TIMEOUT (60)
   # Exact LongBench v2 offload parity: TP2/EP2 context and generation workers. Pre-merge
   # keeps GLM with an NVFP4 latent and V4 with block reuse; the FP8 variants run post-merge
   # (l0_gb300_multi_gpus).
   - unittest/_torch/attention/sparse/dsa/test_dsa_indexer.py::test_indexer_projection_is_batch_invariant
-  - accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_kv_cache_offload[kv_dtype=nvfp4] TIMEOUT (30)
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_kv_cache_offload_block_reuse TIMEOUT (30)
   # qwen4_exp target, pre-merge: tep4 with three drafts and IndexShare, gsm8k and then
   # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
@@ -178,6 +179,7 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/comm
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_long_context TIMEOUT (60)
+  - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv] TIMEOUT (60)
 
 # K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
 # NVLink domain.

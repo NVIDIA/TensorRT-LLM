@@ -96,6 +96,47 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@skip_pre_blackwell
+class TestGLM53FP8(LlmapiAccuracyTestHarness):
+    """GLM-5.3: the GLM-5.2 architecture with FP8 block-scale weights.
+
+    The architecture is MLA plus DSA with cross-layer indexer sharing.
+    """
+
+    MODEL_NAME = "zai-org/GLM-5.3"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.3"
+
+    @skip_ray
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_dep_mtp(self, tp_size, ep_size):
+        """Attention DP + expert parallelism with MTP, the deployment configuration."""
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
+            moe_config=fp8_block_scales_moe_config(),
+            speculative_config=MTPDecodingConfig(moe_tactic=fp8_block_scales_moe_tactic()),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            enable_attention_dp=True,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=8192,
+            **pytorch_config,
+        ) as llm:
+            assert llm.args.enable_attention_dp is True
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "zai-org/GLM-5.2"
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"

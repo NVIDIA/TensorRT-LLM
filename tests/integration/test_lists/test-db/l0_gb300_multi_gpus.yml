@@ -84,7 +84,6 @@ l0_gb300_multi_gpus:
   - accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_kv_cache_offload[kv_dtype=fp8] TIMEOUT (30)
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_kv_cache_offload TIMEOUT (30)
   # GLM-5.3-Flash: ADP/MTP/FP8-KV and non-speculative prefix reuse.
-  - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv] TIMEOUT (60)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_size=4] TIMEOUT (60)
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
@@ -180,3 +179,4 @@ l0_gb300_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_breakable_prefill_cuda_graph TIMEOUT (60)
   # NVFP4 DSpark attention-DP4 gate with FP8 Engram tables (pre-merge runs the MXFP4-table export).
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
+  - accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_kv_cache_offload[kv_dtype=nvfp4] TIMEOUT (30)
