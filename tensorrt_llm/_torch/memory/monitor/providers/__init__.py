@@ -84,6 +84,11 @@ class MonitorProvider(Protocol):
     def collect(self) -> list[Entry]: ...
 
 
+@runtime_checkable
+class _PoolRowsProvider(Protocol):
+    def collect_with_pool_rows(self) -> tuple[list[Entry], list[dict] | None]: ...
+
+
 #: Providers whose host object cannot be reached from here, with the
 #: executor that registered them. The KV cache manager lives in a
 #: ``ResourceManager`` owned by the executor and a
@@ -292,9 +297,8 @@ def collect_all(
         try:
             if not provider.available():
                 continue
-            read_pool_rows = getattr(provider, "collect_with_pool_rows", None)
-            if pool_rows is not None and read_pool_rows is not None:
-                collected, rows = read_pool_rows()
+            if pool_rows is not None and isinstance(provider, _PoolRowsProvider):
+                collected, rows = provider.collect_with_pool_rows()
                 if rows is not None:
                     pool_rows[provider.name] = rows
                 entries.extend(collected)

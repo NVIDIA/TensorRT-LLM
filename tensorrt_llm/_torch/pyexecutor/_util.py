@@ -56,8 +56,8 @@ from ..hostfunc import set_low_latency_dispatch
 from ..memory.monitor import names as monitor_names
 from ..memory.monitor import providers as monitor_providers
 from ..memory.monitor import startup as monitor_startup
-from ..memory.monitor.providers.kv_cache import \
-    KvCacheProvider as MonitorKvCacheProvider
+from ..memory.monitor.providers.kv_cache import (KvCacheProviderV1,
+                                                 KvCacheProviderV2)
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..modules.dwdp.dense.manager import DenseDwdpManager
@@ -208,8 +208,9 @@ def _register_kv_cache_monitor_providers(
         if manager is None or any(manager is other for other in seen):
             continue
         seen.append(manager)
-        monitor_providers.register_provider(
-            MonitorKvCacheProvider(manager, role))
+        provider_cls = KvCacheProviderV2 if isinstance(
+            manager, KVCacheManagerV2) else KvCacheProviderV1
+        monitor_providers.register_provider(provider_cls(manager, role))
 
 
 def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,

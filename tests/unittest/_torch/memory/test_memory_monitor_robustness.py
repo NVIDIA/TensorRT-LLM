@@ -98,10 +98,10 @@ class _V1Manager:
 
 @pytest.mark.cpu_only
 def test_released_kv_cache_is_listed_not_counted():
-    from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
+    from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProviderV1
 
     manager = _V1Manager()
-    provider = KvCacheProvider(manager)
+    provider = KvCacheProviderV1(manager)
     pools.clear_registered_pools()
     try:
         pools.register_pool((7, 5), "sleep: kv_cache", sleep_tag="kv_cache")

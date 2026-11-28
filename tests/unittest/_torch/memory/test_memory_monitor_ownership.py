@@ -18,6 +18,8 @@ KV pool readings, the registered KV caches and the startup plan.
 CPU only: the allocator and the managers are faked.
 """
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from memory_monitor_test_utils import GIB, MB, FakeKvManager, capability, kv_stats
@@ -25,7 +27,11 @@ from memory_monitor_test_utils import GIB, MB, FakeKvManager, capability, kv_sta
 from tensorrt_llm._torch.memory.monitor import pools, providers, startup, tagging, triggers
 from tensorrt_llm._torch.memory.monitor.capture import _run_checks
 from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
-from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
+from tensorrt_llm._torch.memory.monitor.providers.kv_cache import (
+    KvCacheProvider,
+    KvCacheProviderV1,
+    KvCacheProviderV2,
+)
 from tensorrt_llm._torch.memory.monitor.report import render
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Entry, Placement, Source
 
@@ -155,11 +161,14 @@ def test_stack_recording_follows_only_a_completed_startup(monkeypatch):
         tagging.forget_startup_of(tagging._startup_executor)
 
 
-def test_pool_check_runs_on_the_reading_it_came_from():
+def test_pool_check_runs_on_the_reading_it_came_from(monkeypatch):
     manager = FakeKvManager(kv_stats(100, 30, 20))
-    provider = KvCacheProvider(manager)
+    provider = KvCacheProviderV2(manager)
+    read = Mock(wraps=manager.get_storage_statistics)
+    monkeypatch.setattr(manager, "get_storage_statistics", read)
     rows = {}
     providers.collect_all([provider], pool_rows=rows)
+    read.assert_called_once()
     assert list(rows) == ["kv_cache.main"]
 
     # Another report reads the pool while it is inconsistent ...
@@ -188,8 +197,8 @@ def test_released_kv_cache_stops_being_reported(monkeypatch):
     try:
         sizing, other = _V1(), _V1()
         providers.begin_executor()
-        providers.register_provider(KvCacheProvider(sizing, "main"))
-        providers.register_provider(KvCacheProvider(other, "draft"))
+        providers.register_provider(KvCacheProviderV1(sizing, "main"))
+        providers.register_provider(KvCacheProviderV1(other, "draft"))
         resources = {
             ResourceManagerType.KV_CACHE_MANAGER: sizing,
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER: None,
@@ -210,7 +219,7 @@ def test_sleep_release_lasts_as_long_as_the_monitored_executor(monkeypatch):
     try:
         manager = FakeKvManager(kv_stats(10, 10, 0))
         monitored = providers.begin_executor()
-        providers.register_provider(KvCacheProvider(manager))
+        providers.register_provider(KvCacheProviderV2(manager))
         pools.register_pool((7, 1), "sleep: kv_cache", sleep_tag="kv_cache")
         other = providers.begin_executor()
 
@@ -235,7 +244,7 @@ def test_another_executors_sleep_does_not_release_the_monitored_kv_cache():
     try:
         manager = FakeKvManager(kv_stats(10, 10, 0))  # the provider holds it weakly
         monitored = providers.begin_executor()
-        providers.register_provider(KvCacheProvider(manager))
+        providers.register_provider(KvCacheProviderV2(manager))
         other = providers.begin_executor()
         # Only the other executor runs with sleep_config.
         pools.register_pool((7, 2), "sleep: kv_cache", sleep_tag="kv_cache")
