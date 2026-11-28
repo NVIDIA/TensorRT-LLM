@@ -350,6 +350,15 @@ struct SM120BlockScaledKernel
             sf_full_mbar[0].wait(sf_phase);
             cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
             cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
+            asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                "fence.proxy.async.shared::cta;"
+#endif
+                ::
+                    : "memory");
             sf_empty_mbar[0].arrive();
 
             cute::for_each(cute::make_int_sequence<KT::kNumStagePerSF>{},
@@ -361,6 +370,15 @@ struct SM120BlockScaledKernel
                             ab_full_mbar[read_stage].wait(ab_phase);
                             cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
                             cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
+                            asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                                "fence.proxy.async.shared::cta;"
+#endif
+                                ::
+                                    : "memory");
                             ab_empty_mbar[read_stage].arrive();
 
                             auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
@@ -376,6 +394,15 @@ struct SM120BlockScaledKernel
         sf_full_mbar[0].wait(sf_phase);
         cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
         cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         sf_empty_mbar[0].arrive();
 
         cute::for_each(cute::make_int_sequence<KT::kNumStagePerSF>{},
@@ -387,6 +414,15 @@ struct SM120BlockScaledKernel
                         ab_full_mbar[read_stage].wait(ab_phase);
                         cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
                         cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
+                        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                            "fence.proxy.async.shared::cta;"
+#endif
+                            ::
+                                : "memory");
                         ab_empty_mbar[read_stage].arrive();
                         if constexpr (iter == KT::kNumStagePerSF - 1 && read_stage == KT::AB_Stages - 1)
                         {
