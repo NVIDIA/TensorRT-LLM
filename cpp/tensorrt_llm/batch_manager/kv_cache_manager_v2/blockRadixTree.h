@@ -336,6 +336,9 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
 
     // Clear stale tree nodes after a lifecycle page has been unlinked.
     // Returns detached blocks that must stay alive until cleanup completes.
+    //! Whether unlinking a page of life cycle `lc` from `block` removes the block's subtree in
+    //! clearStaleBlocksAfterPageUnlink(): the page covers a prefix its descendants need.
+    static bool unlinkRemovesSubtree(Block const& block, LifeCycle const& lc);
     static std::vector<SharedPtr<Block>> clearStaleBlocksAfterPageUnlink(
         Block& block, LifeCycleId lcIdx, LifeCycle const& lc);
 

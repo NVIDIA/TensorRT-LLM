@@ -26,9 +26,12 @@
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/storage/remoteMem.h"
 #include "kv_cache_manager_v2/utils/copyUtils.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
+#include "kv_cache_manager_v2/utils/staticHostMem.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -37,12 +40,14 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <set>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
@@ -851,6 +856,12 @@ void StorageManager::dropPagesOfFailedRemoteLevels()
 StorageManager::~StorageManager()
 {
     KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
+    if (Poison::poisoned())
+    {
+        // destroy() was skipped or abandoned: a consumer may still read drained ring slots and ring copies may still
+        // be queued, so the ring and what they use are leaked with the rest of the teardown.
+        _leakHostDropResources();
+    }
 }
 
 void StorageManager::destroy()
@@ -886,6 +897,7 @@ void StorageManager::destroy()
     }
     mRemoteClients.clear();
     releaseAllRetainedCopies(/*level=*/std::nullopt);
+    _releaseHostDropResources();
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -1103,6 +1115,786 @@ std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGro
     }
     TLLM_CHECK_DEBUG(numSlots <= allocatableSlots(level, poolGroup(level, pgIdx), domain));
     return allocatePreferring(level, poolGroup(level, pgIdx), numSlots, domain);
+}
+
+namespace
+{
+
+//! A failed host-drop hand-off is logged for the first kHostDropErrorLogFirst failures, then every
+//! kHostDropErrorLogEvery-th.
+constexpr int64_t kHostDropErrorLogFirst = 20;
+constexpr int64_t kHostDropErrorLogEvery = 10000;
+//! The ring has at least this many slots, whatever size is requested.
+constexpr size_t kHostDropMinRingSlots = 16;
+//! Ring slots are aligned to host pages.
+constexpr size_t kHostDropSlotAlignment = 4096;
+//! Page-index pairs one launch of the copy kernel takes.
+constexpr size_t kHostDropMaxPairsPerLaunch = 16384;
+
+void logHostDropError(char const* where, int64_t count, char const* what)
+{
+    if (count <= kHostDropErrorLogFirst || count % kHostDropErrorLogEvery == 0)
+    {
+        TLLM_LOG_WARNING(
+            "KV cache host-drop hand-off failed in %s (#%lld): %s", where, static_cast<long long>(count), what);
+    }
+}
+
+int64_t steadyNowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+//! `page` as a committed page, or null.
+CommittedPage const* asCommitted(Page const& page) noexcept
+{
+    return page.isCommitted() ? static_cast<CommittedPage const*>(&page) : nullptr;
+}
+
+std::string blockKey(CommittedPage const& page)
+{
+    auto const& key = page.block->key;
+    return std::string(reinterpret_cast<char const*>(key.data()), key.size());
+}
+
+bool sameLosslessConfig(HostDropLosslessConfig const& a, HostDropLosslessConfig const& b) noexcept
+{
+    return a.enabled == b.enabled && a.maxWaitS == b.maxWaitS && a.minChunk == b.minChunk;
+}
+
+} // namespace
+
+void StorageManager::_handOffDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level)
+{
+    try
+    {
+        std::vector<HostDropRecord> records;
+        records.reserve(pages.size());
+        for (auto const& page : pages)
+        {
+            auto const* committed = asCommitted(*page);
+            if (committed == nullptr || committed->block == nullptr || !page->hasValidSlot())
+            {
+                continue;
+            }
+            // The copy that brought the page here may still be in flight.
+            page->readyEvent.synchronize();
+            PoolGroupIndex const pgIdx = getPoolGroupIndex(level, page->lifeCycle);
+            auto const memAddress = std::get<MemAddress>(slotAddress(level, pgIdx, page->slotId(), PoolIndex{0}));
+            records.push_back(HostDropRecord{.key = blockKey(*committed),
+                .lifeCycle = static_cast<int32_t>(page->lifeCycle.value()),
+                .numTokens = static_cast<int32_t>(committed->numTokensInBlock),
+                .address = static_cast<uint64_t>(memAddress),
+                .bytes = static_cast<uint64_t>(slotSize(level, pgIdx).at(PoolIndex{0}))});
+        }
+        if (!records.empty())
+        {
+            mHostDropHook(records);
+            mHostDropStats.handed += static_cast<int64_t>(records.size());
+        }
+    }
+    catch (std::exception const& error)
+    {
+        // A failed hand-off only costs a later pool miss; eviction must go on.
+        logHostDropError("eviction", ++mHostDropStats.errors, error.what());
+    }
+}
+
+void StorageManager::_handOffEvictedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level, bool mayWait)
+{
+    _handOffPages(pages, level, mayWait);
+    if (!hostDropAsync() && !mHostDropHook)
+    {
+        return;
+    }
+    // The pages the drop prunes with it leave the cache too; hand them off in the same eviction, by level.
+    std::map<CacheLevel, std::vector<SharedPtr<Page>>> prunedByLevel;
+    try
+    {
+        for (auto& page : _pagesPrunedWith(pages))
+        {
+            CacheLevel const pageLevel = page->cacheLevel;
+            prunedByLevel[pageLevel].push_back(std::move(page));
+        }
+    }
+    catch (std::exception const& error)
+    {
+        logHostDropError("eviction", ++mHostDropStats.errors, error.what());
+        return;
+    }
+    for (auto const& [prunedLevel, pruned] : prunedByLevel)
+    {
+        _handOffPages(pruned, prunedLevel, mayWait);
+    }
+}
+
+void StorageManager::_handOffPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level, bool mayWait)
+{
+    if (cacheTier(level) == CacheTier::HOST_MEM)
+    {
+        if (hostDropAsync())
+        {
+            try
+            {
+                std::vector<Page*> rawPages;
+                rawPages.reserve(pages.size());
+                for (auto const& page : pages)
+                {
+                    rawPages.push_back(page.get());
+                }
+                _queueHostDrops(rawPages, level, mayWait);
+            }
+            catch (std::exception const& error)
+            {
+                logHostDropError("eviction", ++mHostDropStats.errors, error.what());
+            }
+        }
+        else if (mHostDropHook)
+        {
+            _handOffDroppedPages(pages, level);
+        }
+    }
+    for (auto const& page : pages)
+    {
+        page->hostDropHandled = true;
+    }
+}
+
+std::vector<SharedPtr<Page>> StorageManager::_pagesPrunedWith(std::vector<SharedPtr<Page>> const& pages) const
+{
+    // Mirrors what destroying `pages` does: ~CommittedPage unlinks the page and, if Block::unlinkRemovesSubtree(),
+    // detaches its block's subtree, whose blocks then free their droppable pages unlinked (Block::releasePages()).
+    std::vector<SharedPtr<Page>> pruned;
+    std::vector<Block const*> pending;
+    for (auto const& page : pages)
+    {
+        auto const* committed = asCommitted(*page);
+        if (committed == nullptr || committed->block == nullptr || committed->block->isOrphan()
+            || !Block::unlinkRemovesSubtree(*committed->block, mLifeCycles.getLifeCycle(page->lifeCycle)))
+        {
+            continue;
+        }
+        pending.push_back(committed->block);
+    }
+    std::unordered_set<Block const*> visited;
+    while (!pending.empty())
+    {
+        Block const* block = pending.back();
+        pending.pop_back();
+        if (!visited.insert(block).second)
+        {
+            continue;
+        }
+        for (Page* const page : block->storage)
+        {
+            if (page != nullptr && page->isCommitted() && !page->hostDropHandled && page->cacheLevel != kHotLevel
+                && page->hasValidSlot() && page->status() == PageStatus::DROPPABLE && page->scheduledForEviction()
+                && cacheTier(page->cacheLevel) == CacheTier::HOST_MEM)
+            {
+                pruned.push_back(page->sharedFromThis());
+            }
+        }
+        for (auto const& [key, child] : block->next)
+        {
+            pending.push_back(child.get());
+        }
+    }
+    return pruned;
+}
+
+HostDropRingInfo StorageManager::setUpHostDropRing(
+    size_t ringBytes, bool preferKernel, HostDropLosslessConfig const& lossless)
+{
+    TLLM_CHECK_WITH_INFO(
+        std::isfinite(lossless.maxWaitS) && lossless.maxWaitS > 0 && lossless.maxWaitS <= kHostDropMaxWaitS,
+        "setUpHostDropRing: lossless maxWaitS must be finite and in (0, %g] s, got %g", kHostDropMaxWaitS,
+        lossless.maxWaitS);
+    std::lock_guard<std::mutex> lock(mHostDropMutex);
+    if (mHostDropRing)
+    {
+        TLLM_CHECK_WITH_INFO(ringBytes == mHostDropRequest.ringBytes && preferKernel == mHostDropRequest.preferKernel
+                && sameLosslessConfig(lossless, mHostDropRequest.config),
+            "setUpHostDropRing: the ring is already set up with other arguments");
+    }
+    else
+    {
+        size_t slotBytes = 0;
+        for (CacheLevel level{0}; level < mLevels.size(); ++level)
+        {
+            if (cacheTier(level) != CacheTier::HOST_MEM)
+            {
+                continue;
+            }
+            for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(level); ++pgIdx)
+            {
+                slotBytes = std::max(slotBytes, slotSize(level, pgIdx).at(PoolIndex{0}));
+            }
+        }
+        TLLM_CHECK_WITH_INFO(slotBytes > 0, "setUpHostDropRing: no host-memory cache level");
+        slotBytes = (slotBytes + kHostDropSlotAlignment - 1) / kHostDropSlotAlignment * kHostDropSlotAlignment;
+        size_t const numSlots = std::max(ringBytes / slotBytes, kHostDropMinRingSlots);
+        // Built in locals and published only after the last allocation succeeded: a failed call leaves nothing
+        // behind, and a retry starts afresh.
+        CUcontext context = nullptr;
+        cuCheck(cuCtxGetCurrent(&context));
+        auto stream = std::make_unique<CachedCudaStream>();
+        auto copier = std::make_unique<BatchedPageCopier>();
+        bool const kernel
+            = preferKernel && copier->kernelEnabled() && copier->pageIndexLocation() == PageIndexLocation::kDevice;
+        auto pairs
+            = kernel ? allocateDeviceMemory<PageIndexPair>(kHostDropMaxPairsPerLaunch) : CudaUniqPtr<PageIndexPair>{};
+        // The ring first: it is the allocation a request too large fails, and the slot tables scale with it.
+        auto ring = std::make_unique<StaticHostMem>(numSlots * slotBytes);
+        std::vector<int32_t> freeSlots;
+        freeSlots.reserve(numSlots);
+        for (size_t i = numSlots; i > 0; --i)
+        {
+            freeSlots.push_back(static_cast<int32_t>(i - 1));
+        }
+        std::vector<HostDropSlotState> slotState(numSlots, HostDropSlotState::kFree);
+
+        mHostDropCtx = context;
+        mHostDropStream = std::move(stream);
+        mHostDropCopier = std::move(copier);
+        mHostDropKernel = kernel;
+        mHostDropPairsDev = std::move(pairs);
+        mHostDropPairsCap = kernel ? kHostDropMaxPairsPerLaunch : 0;
+        mHostDropRing = std::move(ring);
+        mHostDropSlotBytes = slotBytes;
+        mHostDropFree = std::move(freeSlots);
+        mHostDropSlotState = std::move(slotState);
+        mHostDropRequest
+            = HostDropRingRequest{.ringBytes = ringBytes, .preferKernel = preferKernel, .config = lossless};
+        mHostDropLossless = lossless.enabled;
+        mHostDropMaxWaitNs
+            = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(lossless.maxWaitS))
+                  .count();
+        mHostDropMinChunk = std::clamp<size_t>(lossless.minChunk, 1, std::max<size_t>(1, numSlots / 2));
+        mHostDropWaitSpans.clear();
+        mHostDropClosing = false;
+        mHostDropAsync.store(true, std::memory_order_release);
+        TLLM_LOG_INFO("KV cache host-drop ring: %zu slots x %zu B, copy=%s, lossless=%s", numSlots, slotBytes,
+            mHostDropKernel ? "kernel" : "hostfn", mHostDropLossless ? "on" : "off");
+    }
+    return HostDropRingInfo{.address = static_cast<uint64_t>(mHostDropRing->address()),
+        .slotBytes = static_cast<uint64_t>(mHostDropSlotBytes),
+        .numSlots = static_cast<int64_t>(mHostDropSlotState.size()),
+        .kernelCopy = mHostDropKernel};
+}
+
+std::vector<HostDropRingRecord> StorageManager::drainHostDrops(size_t maxRecords)
+{
+    std::vector<HostDropRingRecord> out;
+    std::lock_guard<std::mutex> lock(mHostDropMutex);
+    // A poisoned copy recorded no completion event, so its batch would read as complete while the copy may still run.
+    if (mHostDropCtx == nullptr || mHostDropClosing || Poison::poisoned())
+    {
+        return out;
+    }
+    // Event queries need the ring's context, and the consumer's thread may have none or another one current. The
+    // scope restores the caller's context on every return path.
+    CudaContextScope const context(mHostDropCtx);
+    if (!context.usable())
+    {
+        return out;
+    }
+    // The batches are picked and `out` sized first, so nothing below can throw once a batch leaves the queue: a
+    // drained record always reaches the caller.
+    size_t ready = 0;
+    size_t total = 0;
+    for (auto const& batch : mHostDropQueue)
+    {
+        if (total > 0 && total + batch.records.size() > maxRecords)
+        {
+            break;
+        }
+        if (!batch.consumerDone.queryComplete())
+        {
+            break;
+        }
+        total += batch.records.size();
+        ++ready;
+    }
+    out.reserve(total);
+    for (size_t i = 0; i < ready; ++i)
+    {
+        for (auto& r : mHostDropQueue.front().records)
+        {
+            mHostDropSlotState[static_cast<size_t>(r.slot)] = HostDropSlotState::kDrained;
+            out.push_back(std::move(r));
+        }
+        mHostDropQueue.pop_front();
+    }
+    return out;
+}
+
+void StorageManager::returnUndeliveredHostDrops(std::vector<HostDropRingRecord> const& records)
+{
+    int64_t returned = 0;
+    {
+        std::lock_guard<std::mutex> lock(mHostDropMutex);
+        for (auto const& record : records)
+        {
+            auto const index = static_cast<size_t>(record.slot);
+            if (index < mHostDropSlotState.size() && mHostDropSlotState[index] == HostDropSlotState::kDrained)
+            {
+                mHostDropSlotState[index] = HostDropSlotState::kFree;
+                mHostDropFree.push_back(record.slot);
+                ++returned;
+            }
+        }
+    }
+    mHostDropStats.handed -= returned;
+    mHostDropStats.ringFull += returned;
+    mHostDropSlotsFreed.notify_all();
+}
+
+void StorageManager::releaseHostDropSlots(std::vector<int32_t> const& slots)
+{
+    {
+        std::lock_guard<std::mutex> lock(mHostDropMutex);
+        if (mHostDropClosing)
+        {
+            // The ring is going away or gone: a consumer that finishes after teardown started may still return the
+            // slots it drained, and anything else is ignored rather than raised on its thread.
+            for (int32_t const slot : slots)
+            {
+                auto const index = static_cast<size_t>(slot);
+                if (slot >= 0 && index < mHostDropSlotState.size()
+                    && mHostDropSlotState[index] == HostDropSlotState::kDrained)
+                {
+                    mHostDropSlotState[index] = HostDropSlotState::kFree;
+                }
+            }
+        }
+        else
+        {
+            // Every slot is checked before any is released. A slot released twice, or before it was drained, would
+            // give two dropped pages one slot, and the consumer would store one page's KV under the other's key.
+            std::vector<bool> releasing(mHostDropSlotState.size(), false);
+            for (int32_t const slot : slots)
+            {
+                TLLM_CHECK_WITH_INFO(slot >= 0 && static_cast<size_t>(slot) < mHostDropSlotState.size(),
+                    "releaseHostDropSlots: %d is not a ring slot", slot);
+                auto const index = static_cast<size_t>(slot);
+                TLLM_CHECK_WITH_INFO(mHostDropSlotState[index] == HostDropSlotState::kDrained && !releasing[index],
+                    "releaseHostDropSlots: slot %d was not drained, or is released twice", slot);
+                releasing[index] = true;
+            }
+            for (int32_t const slot : slots)
+            {
+                mHostDropSlotState[static_cast<size_t>(slot)] = HostDropSlotState::kFree;
+                mHostDropFree.push_back(slot);
+            }
+        }
+    }
+    mHostDropSlotsFreed.notify_all();
+}
+
+void StorageManager::_releaseHostDropResources()
+{
+    mHostDropAsync.store(false, std::memory_order_release);
+    {
+        // Close the ring first: a consumer still at work would otherwise keep draining, and holding, slots for as
+        // long as this waits. Records it has not drained are dropped.
+        std::lock_guard<std::mutex> lock(mHostDropMutex);
+        mHostDropClosing = true;
+        int64_t undrained = 0;
+        for (auto const& batch : mHostDropQueue)
+        {
+            undrained += static_cast<int64_t>(batch.records.size());
+        }
+        mHostDropStats.handed -= undrained;
+        mHostDropStats.ringFull += undrained;
+    }
+    // A lossless hand-off waiting for slots sees the ring going away and stops staging.
+    mHostDropSlotsFreed.notify_all();
+    // The consumer that releases slots may be a Python thread, so the GIL is not held while waiting for it.
+    OptionalGilRelease const gilRelease;
+    std::unique_lock<std::mutex> lock(mHostDropMutex);
+    if (mHostDropRing)
+    {
+        // Slots the consumer drained and has not released may still be read. Wait for them, bounded; if a consumer
+        // still holds some, leak the ring (as destroy() leaks unquiesced remote transfers) rather than free memory it
+        // may read. The slot table stays, so a late release of those slots is a no-op.
+        auto const heldByConsumer = [&]
+        { return std::count(mHostDropSlotState.begin(), mHostDropSlotState.end(), HostDropSlotState::kDrained); };
+        auto const maxWait = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(kHostDropTeardownMaxWaitS));
+        if (!mHostDropSlotsFreed.wait_for(lock, maxWait, [&] { return heldByConsumer() == 0; }))
+        {
+            TLLM_LOG_WARNING(
+                "KV cache host-drop ring: %lld slots still held by the consumer at shutdown; leaking the ring",
+                static_cast<long long>(heldByConsumer()));
+            static_cast<void>(mHostDropRing.release());
+        }
+    }
+    if (mHostDropStream)
+    {
+        mHostDropStream->synchronize();
+        mHostDropStream.reset();
+    }
+    mHostDropQueue.clear();
+    mHostDropPairsDev.reset();
+    mHostDropCopier.reset();
+    mHostDropRing.reset();
+    mHostDropFree.clear();
+    mHostDropCtx = nullptr;
+}
+
+void StorageManager::_leakHostDropResources() noexcept
+{
+    mHostDropAsync.store(false, std::memory_order_release);
+    static_cast<void>(mHostDropRing.release());
+    static_cast<void>(mHostDropStream.release());
+    static_cast<void>(mHostDropPairsDev.release());
+    static_cast<void>(mHostDropCopier.release());
+}
+
+int64_t StorageManager::_hostDropWaitBudgetNs(int64_t atNs)
+{
+    int64_t const intervalStart = atNs - 2 * mHostDropMaxWaitNs;
+    while (!mHostDropWaitSpans.empty() && mHostDropWaitSpans.front().second <= intervalStart)
+    {
+        mHostDropWaitSpans.pop_front();
+    }
+    int64_t used = 0;
+    for (auto const& [start, end] : mHostDropWaitSpans)
+    {
+        used += end - std::max(start, intervalStart);
+    }
+    return std::max<int64_t>(0, mHostDropMaxWaitNs - used);
+}
+
+void StorageManager::_waitForHostDropSlots(std::unique_lock<std::mutex>& lock, size_t want)
+{
+    // Every wait is charged to one budget over a sliding interval of 2 x maxWait. A wait may take only what is left
+    // of it at its start; the interval ending with this wait then holds this wait and earlier waits that fell inside
+    // the interval ending at its start, so no interval of 2 x maxWait ever holds more than maxWait of waiting.
+    int64_t const start = steadyNowNs();
+    int64_t const budget = _hostDropWaitBudgetNs(start);
+    if (budget <= 0)
+    {
+        return;
+    }
+    mHostDropStats.waits += 1;
+    bool const ready = mHostDropSlotsFreed.wait_for(lock, std::chrono::nanoseconds(budget),
+        [&] { return mHostDropFree.size() >= want || !mHostDropAsync.load(std::memory_order_acquire); });
+    int64_t const end = steadyNowNs();
+    mHostDropWaitSpans.emplace_back(start, end);
+    mHostDropStats.waitNs += end - start;
+    if (!ready)
+    {
+        mHostDropStats.timeouts += 1;
+    }
+}
+
+void StorageManager::_queueHostDrops(std::vector<Page*> const& pages, CacheLevel level, bool mayWait)
+{
+    // The pages are DROPPABLE (no live reader) and their slots are released right after this returns. Instead of
+    // waiting for anything here, the copy into the ring is queued on the ring's stream behind each page's ready event,
+    // and the page's ready event becomes the copy's completion: the slot travels to its next owner with that event,
+    // and every new user of a slot waits on it in-stream. The consumer only sees a batch once its copy has completed.
+    //
+    // A page that finds no free ring slot is dropped without a hand-off (counted in ringFull), unless the ring is
+    // lossless. Then the pages are staged in chunks: each chunk takes the free slots and is queued as its own batch,
+    // so the consumer can drain it and release its slots, and the call waits for released slots before the next
+    // chunk. The wait is the eviction's back-pressure; _waitForHostDropSlots bounds it.
+    struct Item
+    {
+        Page* page;
+        CommittedPage const* committed;
+        PoolGroupIndex pgIdx;
+        size_t bytes;
+        int32_t slot;
+    };
+
+    std::vector<Item> items;
+    bool launched = false;
+
+    // Takes the last free ring slot for a hand-off. The caller holds mHostDropMutex and has checked one is free.
+    auto const takeSlot = [&]()
+    {
+        int32_t const slot = mHostDropFree.back();
+        mHostDropFree.pop_back();
+        mHostDropSlotState.at(static_cast<size_t>(slot)) = HostDropSlotState::kStaged;
+        return slot;
+    };
+
+    // Copies `items` into their ring slots behind each page's ready event and queues them for the consumer as one
+    // batch. On return the slots belong to the batch and `items` is empty.
+    auto const stageItems = [&]()
+    {
+        if (items.empty())
+        {
+            return;
+        }
+        CUstream const stream = mHostDropStream->handle();
+        std::vector<CUevent> waits;
+        waits.reserve(items.size());
+        for (auto const& item : items)
+        {
+            waits.push_back(item.page->readyEvent.handle());
+        }
+        streamWaitEvents(reinterpret_cast<CudaStream>(stream), std::move(waits));
+        MemAddress const ringBase = mHostDropRing->address();
+        std::vector<PoolGroupIndex> groups;
+        for (auto const& item : items)
+        {
+            if (std::find(groups.begin(), groups.end(), item.pgIdx) == groups.end())
+            {
+                groups.push_back(item.pgIdx);
+            }
+        }
+        for (PoolGroupIndex const pgIdx : groups)
+        {
+            std::vector<size_t> idx;
+            for (size_t i = 0; i < items.size(); ++i)
+            {
+                if (items[i].pgIdx == pgIdx)
+                {
+                    idx.push_back(i);
+                }
+            }
+            size_t const bytes = items[idx.front()].bytes;
+            if (mHostDropKernel)
+            {
+                MemAddress const srcBase = std::get<MemAddress>(slotAddress(level, pgIdx, SlotId{0}, PoolIndex{0}));
+                auto const pairsDev = reinterpret_cast<CUdeviceptr>(mHostDropPairsDev.get());
+                size_t off = 0;
+                while (off < idx.size())
+                {
+                    size_t const n = std::min(idx.size() - off, mHostDropPairsCap);
+                    std::vector<PageIndexPair> pairs(n);
+                    for (size_t j = 0; j < n; ++j)
+                    {
+                        auto const& item = items[idx[off + j]];
+                        pairs[j] = PageIndexPair{
+                            .dst = item.slot, .src = static_cast<int32_t>(toSizeT(item.page->slotId()))};
+                    }
+                    copyToDeviceSyncSource(pairsDev, pairs.data(), n, stream);
+                    PoolCopyArgs args{};
+                    args.dstBase = static_cast<CUdeviceptr>(ringBase);
+                    args.srcBase = static_cast<CUdeviceptr>(srcBase);
+                    args.dstStride = mHostDropSlotBytes;
+                    args.srcStride = bytes;
+                    args.bytesPerPage = static_cast<uint32_t>(bytes);
+                    args.pairs = mHostDropPairsDev.get();
+                    args.numPairs = static_cast<uint32_t>(n);
+                    launched = true;
+                    mHostDropCopier->launch(args, CopyDirection::kH2D, stream);
+                    off += n;
+                }
+            }
+            else
+            {
+                std::vector<CopyTask> tasks;
+                tasks.reserve(idx.size());
+                for (size_t const i : idx)
+                {
+                    auto const& item = items[i];
+                    tasks.push_back(CopyTask{MemAddress(ringBase + static_cast<size_t>(item.slot) * mHostDropSlotBytes),
+                        slotAddress(level, pgIdx, item.page->slotId(), PoolIndex{0})});
+                }
+                launched = true;
+                mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::HOST_MEM, bytes, tasks, stream);
+            }
+        }
+        CachedCudaEvent const done(reinterpret_cast<CudaStream>(stream));
+        HostDropBatch batch{.consumerDone = CachedCudaEvent(reinterpret_cast<CudaStream>(stream)), .records = {}};
+        if (Poison::poisoned())
+        {
+            // A poisoned KVCM2 records no events: the batch would read as complete while its copy may still run. The
+            // handler below synchronizes the stream and takes the chunk's slots back.
+            throw LogicError("KVCM2 is poisoned: a host-drop ring copy has no completion event");
+        }
+        batch.records.reserve(items.size());
+        for (auto const& item : items)
+        {
+            item.page->readyEvent = done;
+            batch.records.push_back(HostDropRingRecord{.key = blockKey(*item.committed),
+                .lifeCycle = static_cast<int32_t>(item.page->lifeCycle.value()),
+                .numTokens = static_cast<int32_t>(item.committed->numTokensInBlock),
+                .slot = item.slot,
+                .bytes = static_cast<uint64_t>(item.bytes)});
+        }
+        {
+            std::lock_guard<std::mutex> lock(mHostDropMutex);
+            mHostDropQueue.push_back(std::move(batch));
+        }
+        mHostDropStats.handed += static_cast<int64_t>(items.size());
+        items.clear();
+        launched = false;
+    };
+
+    try
+    {
+        items.reserve(pages.size());
+        int64_t ringFull = 0;
+        if (!mHostDropLossless || !mayWait)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mHostDropMutex);
+                for (auto* page : pages)
+                {
+                    auto const* committed = asCommitted(*page);
+                    if (committed == nullptr || committed->block == nullptr || !page->hasValidSlot())
+                    {
+                        continue;
+                    }
+                    PoolGroupIndex const pgIdx = getPoolGroupIndex(level, page->lifeCycle);
+                    size_t const bytes = slotSize(level, pgIdx).at(PoolIndex{0});
+                    if (bytes > mHostDropSlotBytes || mHostDropFree.empty())
+                    {
+                        ++ringFull;
+                        continue;
+                    }
+                    items.push_back(
+                        Item{.page = page, .committed = committed, .pgIdx = pgIdx, .bytes = bytes, .slot = takeSlot()});
+                }
+            }
+            mHostDropStats.ringFull += ringFull;
+            stageItems();
+            return;
+        }
+
+        struct Pending
+        {
+            Page* page;
+            CommittedPage const* committed;
+            PoolGroupIndex pgIdx;
+            size_t bytes;
+        };
+
+        std::vector<Pending> todo;
+        todo.reserve(pages.size());
+        for (auto* page : pages)
+        {
+            auto const* committed = asCommitted(*page);
+            if (committed == nullptr || committed->block == nullptr || !page->hasValidSlot())
+            {
+                continue;
+            }
+            PoolGroupIndex const pgIdx = getPoolGroupIndex(level, page->lifeCycle);
+            size_t const bytes = slotSize(level, pgIdx).at(PoolIndex{0});
+            if (bytes > mHostDropSlotBytes)
+            {
+                ++ringFull; // no ring slot can ever hold it
+                continue;
+            }
+            todo.push_back(Pending{.page = page, .committed = committed, .pgIdx = pgIdx, .bytes = bytes});
+        }
+        size_t next = 0;
+        while (next < todo.size())
+        {
+            size_t const left = todo.size() - next;
+            size_t const want = std::min(left, mHostDropMinChunk);
+            bool mustWait = false;
+            {
+                std::lock_guard<std::mutex> lock(mHostDropMutex);
+                mustWait = mHostDropAsync.load(std::memory_order_acquire) && mHostDropFree.size() < want
+                    && _hostDropWaitBudgetNs(steadyNowNs()) > 0;
+            }
+            if (mustWait)
+            {
+                // The consumer that releases slots may be a Python thread, so the wait does not hold the GIL. The
+                // lock is declared after the release: it is dropped before the GIL is taken back.
+                OptionalGilRelease const gilRelease;
+                std::unique_lock<std::mutex> lock(mHostDropMutex);
+                _waitForHostDropSlots(lock, want);
+            }
+            {
+                // Free slots are taken even while paused, never once the ring is going away.
+                std::lock_guard<std::mutex> lock(mHostDropMutex);
+                if (mHostDropAsync.load(std::memory_order_acquire))
+                {
+                    size_t const n = std::min(left, mHostDropFree.size());
+                    for (size_t j = 0; j < n; ++j)
+                    {
+                        auto const& p = todo[next + j];
+                        items.push_back(Item{.page = p.page,
+                            .committed = p.committed,
+                            .pgIdx = p.pgIdx,
+                            .bytes = p.bytes,
+                            .slot = takeSlot()});
+                    }
+                }
+            }
+            if (items.empty())
+            {
+                // The waiting budget is spent, or the ring is going away: drop the rest without a hand-off.
+                ringFull += static_cast<int64_t>(left);
+                break;
+            }
+            next += items.size();
+            stageItems();
+        }
+        mHostDropStats.ringFull += ringFull;
+    }
+    catch (std::exception const& error)
+    {
+        // Never give a slot to its next owner while a copy may still write it: finish the stream first, then give back
+        // the slots of the chunk that was not queued (queued chunks belong to the consumer). If the stream cannot be
+        // shown idle, those slots stay out of circulation (staged, with no batch to drain them) until teardown.
+        CUresult const idle
+            = launched && mHostDropStream ? cuStreamSynchronize(mHostDropStream->handle()) : CUDA_SUCCESS;
+        if (idle == CUDA_SUCCESS)
+        {
+            std::lock_guard<std::mutex> lock(mHostDropMutex);
+            for (auto const& item : items)
+            {
+                mHostDropSlotState.at(static_cast<size_t>(item.slot)) = HostDropSlotState::kFree;
+                mHostDropFree.push_back(item.slot);
+            }
+        }
+        else
+        {
+            TLLM_LOG_ERROR("KV cache host-drop ring: synchronizing a failed copy returned %d; quarantining %zu slots",
+                static_cast<int>(idle), items.size());
+        }
+        logHostDropError("ring copy", ++mHostDropStats.errors, error.what());
+    }
+}
+
+void StorageManager::handOffDestroyedPage(Page& page)
+{
+    // Runs inside ~CommittedPage: no shared pointers to the page may be taken here.
+    try
+    {
+        auto const* committed = asCommitted(page);
+        CacheLevel const level = page.cacheLevel;
+        if (committed == nullptr || committed->block == nullptr || !page.hasValidSlot()
+            || cacheTier(level) != CacheTier::HOST_MEM)
+        {
+            return;
+        }
+        if (hostDropAsync())
+        {
+            // Staged behind the page's ready event, so nothing is awaited here; the destructor may run on any thread,
+            // so it never waits for ring slots (a full ring drops the page).
+            _queueHostDrops({&page}, level, /*mayWait=*/false);
+            return;
+        }
+        if (!mHostDropHook)
+        {
+            return;
+        }
+        page.readyEvent.synchronize();
+        PoolGroupIndex const pgIdx = getPoolGroupIndex(level, page.lifeCycle);
+        auto const memAddress = std::get<MemAddress>(slotAddress(level, pgIdx, page.slotId(), PoolIndex{0}));
+        std::vector<HostDropRecord> records{HostDropRecord{.key = blockKey(*committed),
+            .lifeCycle = static_cast<int32_t>(page.lifeCycle.value()),
+            .numTokens = static_cast<int32_t>(committed->numTokensInBlock),
+            .address = static_cast<uint64_t>(memAddress),
+            .bytes = static_cast<uint64_t>(slotSize(level, pgIdx).at(PoolIndex{0}))}};
+        mHostDropHook(records);
+        mHostDropStats.handed += 1;
+    }
+    catch (std::exception const& error)
+    {
+        logHostDropError("page destruction", ++mHostDropStats.errors, error.what());
+    }
 }
 
 Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const
@@ -2047,6 +2839,15 @@ void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotC
                 TLLM_CHECK_DEBUG_WITH_INFO(page->status() == PageStatus::DROPPABLE, "Corrupted eviction controller");
             }
         }
+        // Forced eviction (resize, defragmentation) hands its host drops off like the capacity eviction that follows
+        // it in shrinkPoolGroup, but never waits for ring slots: a full ring drops them and counts them in ringFull.
+        for (auto const& pages : evicted)
+        {
+            if (level != kHotLevel && !pages.empty())
+            {
+                _handOffEvictedPages(pages, level, /*mayWait=*/false);
+            }
+        }
         if (dropRecorder)
         {
             for (auto const& pages : evicted)
@@ -2377,6 +3178,23 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         }
     };
 
+    if (isLast && lvlId != kHotLevel)
+    {
+        // Pages the last host level drops go to the host-drop hook (or ring) before their slots are freed: every pool
+        // group's, and the pages they prune, before any group is cleared. Clearing a full-attention page prunes its
+        // block's subtree, which unlinks the pages this eviction popped into a later group (an SSM or windowed page of
+        // the same block or a descendant), and an unlinked page can no longer be handed off.
+        std::vector<SharedPtr<Page>> dropped;
+        for (auto const& ev : evicted)
+        {
+            dropped.insert(dropped.end(), ev.begin(), ev.end());
+        }
+        if (!dropped.empty())
+        {
+            _handOffEvictedPages(dropped, lvlId, /*mayWait=*/true);
+        }
+    }
+
     for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
     {
         auto& ev = evicted.at(pgIdx);
@@ -2422,6 +3240,20 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                     accepted.end(), std::make_move_iterator(held.begin()), std::make_move_iterator(held.end()));
                 held.clear();
                 auto& rejected = fallenPages.at(lifeCycle);
+                // Host pages the level below could not take are destroyed with `rejected`. Hand them off here, in the
+                // eviction, so a lossless ring waits for slots for them too.
+                std::map<CacheLevel, std::vector<SharedPtr<Page>>> rejectedHostPages;
+                for (auto const& page : rejected)
+                {
+                    if (page->cacheLevel != kHotLevel && cacheTier(page->cacheLevel) == CacheTier::HOST_MEM)
+                    {
+                        rejectedHostPages[page->cacheLevel].push_back(page);
+                    }
+                }
+                for (auto const& [fromLevel, pages] : rejectedHostPages)
+                {
+                    _handOffEvictedPages(pages, fromLevel, /*mayWait=*/true);
+                }
                 if (dropRecorder && !rejected.empty() && !isLastLevel(lvlId))
                 {
                     // Above failed trailing levels these droppable pages would have been migrated down: count them
