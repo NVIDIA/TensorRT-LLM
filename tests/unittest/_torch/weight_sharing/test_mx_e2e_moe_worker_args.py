@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for how the MX qualification harness passes MoE settings to its workers.
+"""Unit tests for MX qualification worker settings and MoE partition checks.
 
 Every role of one donor/receiver row must load the model with the same MoE
 partition and finalize setting, and rows without MoE settings pass no MoE
@@ -23,7 +23,9 @@ to check that every rank realized the partition the row names.
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,6 +34,7 @@ from tensorrt_llm._torch.weight_sharing.weight_manifest import WeightManifest, W
 from tensorrt_llm.llmapi import MoeConfig
 
 __extra_import_path__ = ["~/tests/integration"]
+from defs.model_express import mx_e2e_worker  # noqa: E402
 from defs.model_express.mx_e2e_worker import _llm_kwargs, _parse_args  # noqa: E402
 from defs.model_express.mx_harness import (  # noqa: E402
     ROLES,
@@ -41,6 +44,74 @@ from defs.model_express.mx_harness import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    "role, exact_token_comparison, inherited_deterministic, inherited_multi_block",
+    [
+        pytest.param("baseline", True, None, "ON", id="exact-token-comparison"),
+        pytest.param("donor", False, None, "ON", id="accuracy-donor"),
+        pytest.param("donor", False, "1", "OFF", id="accuracy-donor-inherited-determinism"),
+    ],
+)
+def test_worker_attention_settings_follow_comparison_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    role: str,
+    exact_token_comparison: bool,
+    inherited_deterministic: str | None,
+    inherited_multi_block: str,
+) -> None:
+    construction_kwargs: dict[str, object] = {}
+
+    def capture_llm_settings(**kwargs: object) -> None:
+        construction_kwargs.update(kwargs)
+        raise RuntimeError("LLM constructor boundary")
+
+    argv = [
+        "mx-worker",
+        "--role",
+        role,
+        "--model",
+        str(tmp_path / "checkpoint"),
+        "--tp-size",
+        "1",
+        "--output",
+        str(tmp_path / "output.json"),
+    ]
+    if exact_token_comparison:
+        argv.append("--exact-token-comparison")
+    if role != "baseline":
+        argv.extend(["--mx-url", "http://localhost:5000"])
+    if role == "donor":
+        argv.extend(
+            [
+                "--ready-file",
+                str(tmp_path / "ready"),
+                "--stop-file",
+                str(tmp_path / "stop"),
+            ]
+        )
+    monkeypatch.setenv("FORCE_MULTI_BLOCK_MODE", inherited_multi_block)
+    if inherited_deterministic is None:
+        monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
+    else:
+        monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", inherited_deterministic)
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(mx_e2e_worker, "LLM", capture_llm_settings)
+
+    with pytest.raises(RuntimeError, match="LLM constructor boundary"):
+        mx_e2e_worker.main()
+
+    overrides = construction_kwargs.get("env_overrides", {})
+    assert isinstance(overrides, dict)
+    deterministic = overrides.get(
+        "FORCE_ATTENTION_KERNEL_DETERMINISTIC",
+        os.environ.get("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "0"),
+    )
+    multi_block = overrides.get("FORCE_MULTI_BLOCK_MODE", os.environ["FORCE_MULTI_BLOCK_MODE"])
+    assert deterministic == ("1" if exact_token_comparison else (inherited_deterministic or "0"))
+    assert multi_block == ("OFF" if exact_token_comparison else inherited_multi_block)
 
 
 @pytest.mark.parametrize(
@@ -90,7 +161,10 @@ def test_moe_row_settings_reach_every_role(
         key: kwargs[key] for key in ("moe_expert_parallel_size", "moe_config") if key in kwargs
     }
     assert moe_kwargs == expected_moe_kwargs
-    assert kwargs == {**_llm_kwargs(_parse_args(argv)), **expected_moe_kwargs}
+    assert kwargs == {
+        **_llm_kwargs(_parse_args(argv)),
+        **expected_moe_kwargs,
+    }
 
 
 # A small MoE checkpoint: 8 experts of intermediate size 64 over hidden size 32.

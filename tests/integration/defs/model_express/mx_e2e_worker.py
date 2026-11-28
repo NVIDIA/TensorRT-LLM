@@ -43,9 +43,9 @@ _PROMPT_TOKEN_IDS = (
 # Greedy tokens generated per prompt; `end_id=-1` keeps every output exactly
 # this long so the orchestrator can compare fixed-length token-ID lists.
 _MAX_NEW_TOKENS = 32
-# Engine limits sized for the probe: the longest prompt plus the generated
-# tokens fits in `_MAX_SEQ_LEN`, and one context iteration schedules the
-# whole batch within `_MAX_NUM_TOKENS`.
+# Engine limits fit each prompt plus generated tokens in `_MAX_SEQ_LEN`
+# and bound each iteration's token budget with `_MAX_NUM_TOKENS`.
+# Request arrival can still split the probe across executor batches.
 _MAX_SEQ_LEN = 128
 _MAX_NUM_TOKENS = 256
 # The image probe asks each question about each `--image`, so vision-language
@@ -56,8 +56,8 @@ _IMAGE_PROBE_QUESTIONS = (
     "List the main objects in this image.",
     "Where could this picture have been taken?",
 )
-# Image prompts are a few hundred tokens each; one context iteration still
-# schedules the whole batch, and every role uses the same limits.
+# Image prompts are a few hundred tokens each. Every role uses these same
+# limits, but request arrival still determines the executor batches.
 _IMAGE_MAX_SEQ_LEN = 1024
 _IMAGE_MAX_NUM_TOKENS = 4096
 _PROBES = ("text", "image")
@@ -77,6 +77,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--stop-file", type=Path)
     parser.add_argument("--max-serve-seconds", type=float, default=1800.0)
+    parser.add_argument(
+        "--exact-token-comparison",
+        action="store_true",
+        help="Use deterministic attention for exact token comparisons",
+    )
     parser.add_argument(
         "--probe",
         choices=_PROBES,
@@ -205,8 +210,13 @@ def _rank_process_env_overrides(args: argparse.Namespace) -> dict[str, str]:
     `MX_TRANSFER_LOG_DIR` applies to MX roles only; the MX checkpoint loader
     raises the `modelexpress` logger to INFO when it is set, which is how the
     RDMA completion records reach this process's log.
+    `--exact-token-comparison` adds `FORCE_ATTENTION_KERNEL_DETERMINISTIC=1`
+    and `FORCE_MULTI_BLOCK_MODE=OFF` for every comparison role.
     """
     overrides: dict[str, str] = {}
+    if args.exact_token_comparison:
+        overrides["FORCE_ATTENTION_KERNEL_DETERMINISTIC"] = "1"
+        overrides["FORCE_MULTI_BLOCK_MODE"] = "OFF"
     manifest_dir = os.environ.get("MX_WEIGHT_MANIFEST_DIR")
     if manifest_dir:
         overrides["MX_WEIGHT_MANIFEST_DIR"] = manifest_dir
