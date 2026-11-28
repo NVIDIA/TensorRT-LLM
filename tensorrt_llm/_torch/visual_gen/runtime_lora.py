@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -133,7 +133,12 @@ def _prepare_runtime_lora(
     strip_prefixes = _dedupe_prefixes(
         tuple(config.strip_prefixes) + tuple(default_strip_prefixes) + _DEFAULT_STRIP_PREFIXES
     )
-    if _is_minimax_h3_turbo_lora(modules, pairs, strip_prefixes=strip_prefixes):
+    map_names = getattr(transformer, "map_runtime_lora_names", None)
+    if map_names is not None:
+        names = {pair.name: _strip_known_prefix(pair.name, strip_prefixes) for pair in pairs}
+        mapped = map_names(names)
+        pairs = [replace(pair, name=mapped.get(pair.name, pair.name)) for pair in pairs]
+    elif _is_minimax_h3_turbo_lora(modules, pairs, strip_prefixes=strip_prefixes):
         pairs = _normalize_minimax_h3_turbo_pairs(pairs)
 
     qkv_groups: Dict[str, Dict[str, _LoRAPair]] = {}

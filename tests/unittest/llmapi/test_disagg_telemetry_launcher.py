@@ -496,7 +496,7 @@ def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key,
     )
 
     launch.assert_called_once()
-    llm_args = launch.call_args.args[2]
+    llm_args = launch.call_args.kwargs["llm_args"]
     transceiver = llm_args.get("cache_transceiver_config")
     if not with_transceiver:
         assert transceiver is None

@@ -12,10 +12,12 @@ import pytest
 from click.testing import CliRunner
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Block, Stage, YAMLIndex
+from cbts.blocks import Block, Stage, YAMLIndex, parse_stages_from_groovy
 from cbts.command.main import Selector, _load_pr_inputs, main
+from cbts.coverage.tier import coverage_preflight
 from cbts.rules.base import PRInputs
 from cbts.rules.python_formatting import PythonFormattingRule, is_formatting_only_change
+from cbts.rules.tests_def import TestsDefRule as CbtsTestsDefRule
 from cbts.rules.visual_gen import VisualGenRule, _is_vg_claim
 
 pytestmark = pytest.mark.cpu_only
@@ -301,3 +303,373 @@ def test_public_api_accepts_validation_in_any_candidate_stage(name: str) -> None
     result = rule.apply(PRInputs(["tensorrt_llm/visual_gen/args.py"], {}))
     assert result is not None and result.scope == "visualgenonly"
     assert name in result.affected_stages
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        (
+            "tensorrt_llm/_torch/modeling_v2/catalog/_op.py",
+            {"h3_pipeline", "fasth3", "ops", "second_consumer", "second_other"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/models/wan/ops/attention.py",
+            {
+                "h3_pipeline",
+                "fasth3",
+                "ops",
+                "legacy",
+                "catalog",
+                "unused",
+                "second_consumer",
+                "second_other",
+            },
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/__init__.py",
+            {
+                "h3_pipeline",
+                "fasth3",
+                "ops",
+                "catalog",
+                "unused",
+                "second_consumer",
+                "second_other",
+            },
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/catalog/attention/_native.py",
+            {"fasth3", "ops", "catalog", "contracts", "second_consumer"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/catalog/attention/unused.py",
+            {"unused", "contracts"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/catalog/attention/csrc/attention.cu",
+            {"fasth3", "ops", "catalog", "unused", "contracts", "second_consumer"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/csrc/shared.cpp",
+            {"h3_pipeline", "fasth3", "ops"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/fasth3/csrc/fast.cu",
+            {"fasth3"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/models/second/consumer/pipeline.py",
+            {"second_consumer"},
+        ),
+        ("tensorrt_llm/_torch/modeling_v2/catalog/attention/core.py", {"fasth3", "ops"}),
+        (
+            "tensorrt_llm/_torch/modeling_v2/catalog/gemm/cublas_mm.py",
+            {"h3_pipeline", "fasth3"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/vsa.py",
+            {"fasth3", "ops", "contracts"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/pipeline.py",
+            {"h3_pipeline"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/pipeline_registry.py",
+            {"h3_pipeline", "fasth3", "ops"},
+        ),
+    ],
+)
+def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
+    family = "minimax_h3"
+    unit = f"unittest/_torch/visual_gen/modeling_v2/models/{family}"
+    quality = f"visual_gen/modeling_v2/{family}"
+    files = {
+        f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/pipeline_registry.py": (
+            "from .h3_pipeline.pipeline import Default\nfrom .fasth3.pipeline import Fast\n"
+            "def route(config):\n    if config.fast:\n        return Fast\n    return Default\n"
+        ),
+        f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/h3_pipeline/pipeline.py": (
+            "from ..components.linear import project\nclass Default: pass"
+        ),
+        f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/fasth3/pipeline.py": (
+            "from ..ops.vsa import sparse\nfrom ..components.linear import project\nclass Fast: pass\n"
+        ),
+        f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/components/linear.py": (
+            "from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as project"
+        ),
+        f"tensorrt_llm/_torch/visual_gen/modeling_v2/models/{family}/ops/vsa.py": (
+            "from tensorrt_llm._torch.modeling_v2.catalog.attention.adapter import sparse\n"
+            "from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention.sparse import launch"
+        ),
+        "tensorrt_llm/_torch/visual_gen/modeling_v2/models/second/pipeline_registry.py": (
+            "from .consumer.pipeline import Consumer\nfrom .other.pipeline import Other\n"
+            "def route(config):\n    if config.fast:\n        return Consumer\n    return Other\n"
+        ),
+        "tensorrt_llm/_torch/visual_gen/modeling_v2/models/second/consumer/pipeline.py": (
+            "from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention.sparse import launch\n"
+            "class Consumer: pass"
+        ),
+        "tensorrt_llm/_torch/visual_gen/modeling_v2/catalog/attention/sparse.py": "from ._native import launch",
+        "tests/unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sparse.py": (
+            "from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention.sparse import launch"
+        ),
+        "tensorrt_llm/_torch/modeling_v2/catalog/attention/adapter.py": "from .core import sparse",
+        f"tests/{unit}/ops/test_vsa.py": (
+            "from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.ops.vsa import sparse"
+        ),
+    }
+    for name, source in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    entries = {
+        "h3_pipeline": {
+            f"{unit}/h3_pipeline/test_model.py",
+            f"{quality}/h3_pipeline/test_quality.py",
+        },
+        "fasth3": {f"{unit}/fasth3/test_pipeline.py", f"{quality}/fasth3/test_quality.py"},
+        "ops": {f"{unit}/ops/test_vsa.py"},
+        "legacy": {
+            "visual_gen/test_unrelated.py",
+            "examples/visual_gen/test_minimax_h3_e2e.py",
+            "unittest/_torch/visual_gen/models/minimax_h3/test_minimax_h3_pipeline.py",
+        },
+        "catalog": {"unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sparse.py"},
+        "unused": {"unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_unused.py"},
+        "second_consumer": {"visual_gen/modeling_v2/second/consumer/test_quality.py"},
+        "second_other": {"visual_gen/modeling_v2/second/other/test_quality.py"},
+        "contracts": {"unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"},
+    }
+    index = YAMLIndex()
+    index.blocks = [
+        Block(
+            "l0_b200",
+            0,
+            {},
+            sorted(set.union(*(paths for key, paths in entries.items() if key != "contracts"))),
+        ),
+        Block("l0_cpu", 0, {}, sorted(entries["contracts"])),
+    ]
+    stages = {"CPU-Generic-x86-1": Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1)}
+    rule = VisualGenRule(index, stages, tmp_path)
+    result = rule.apply(PRInputs([changed], {}))
+    assert result is not None
+    selected = {
+        e for block in result.block_filters.values() for tests in block.values() for e in tests
+    }
+    assert selected == set.union(*(entries[key] for key in expected))
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        (
+            "minimax_h3_quality_cases.py",
+            {
+                "h3_pipeline/test_loading.py",
+                "h3_pipeline/test_parallel_quality.py",
+                "h3_pipeline/test_quality.py",
+            },
+        ),
+        ("fasth3/quality_case.py", {"fasth3/test_smoke.py"}),
+    ],
+)
+def test_h3_v2_quality_changes_select_only_importing_l0_tests(changed, expected):
+    index = YAMLIndex.load(REPO_ROOT / "tests/integration/test_lists/test-db")
+    rule = CbtsTestsDefRule(index, {}, REPO_ROOT)
+    family = "visual_gen/modeling_v2/minimax_h3"
+    result = rule.apply(PRInputs([f"tests/integration/defs/{family}/{changed}"], {}))
+    assert result is not None and result.scope == "testdefonly"
+    selected = {path for filters in result.block_filters.values() for path in filters}
+    assert selected == {f"{family}/{path}" for path in expected}
+
+
+def _visualgen_selection(changed):
+    index = YAMLIndex.load(REPO_ROOT / "tests/integration/test_lists/test-db")
+    stages = parse_stages_from_groovy(REPO_ROOT / "jenkins/L0_Test.groovy")
+    rule = VisualGenRule(index, stages, REPO_ROOT)
+    result = rule.apply(PRInputs([changed], {}))
+    assert result is not None and result.scope == "visualgenonly"
+    return {path for filters in result.block_filters.values() for path in filters}
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "catalog/attention/block_sparse_attention",
+        "catalog/attention/cute_fmha",
+        "catalog/attention/flash_attention_4",
+        "catalog/attention/flashinfer_prefill",
+        "catalog/attention/prims_dense_attention",
+        "catalog/attention/prims_routed_attention",
+        "catalog/attention/sol_predictor",
+        "catalog/attention/trtllm_context_attention",
+        "catalog/gemm/gate_up_swiglu_quack",
+        "catalog/quantization/fp8_weight_quantize",
+        "catalog/quantization/nvfp4_weight_quantize",
+        "models/minimax_h3/ops/ulysses_qkv",
+    ],
+)
+def test_visualgen_ops_select_only_importing_families(module):
+    scope, op = module.rsplit("/", 1)
+    selected = _visualgen_selection(f"tensorrt_llm/_torch/visual_gen/modeling_v2/{module}.py")
+    unit = "unittest/_torch/visual_gen/modeling_v2/models/minimax_h3"
+    mirror = f"unittest/_torch/visual_gen/modeling_v2/{scope}/test_{op}.py"
+    contracts = "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"
+    assert {
+        mirror,
+        contracts,
+        f"{unit}/test_dependencies.py",
+        f"{unit}/h3_pipeline/test_minimax_h3_pipeline.py",
+        f"{unit}/fasth3/test_fasth3_pipeline.py",
+    } <= selected
+    catalog_consumers = {mirror}
+    if op in {"prims_routed_attention", "sol_predictor"}:
+        catalog_consumers.add(
+            "unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sol_attention.py"
+        )
+    assert catalog_consumers <= selected
+    assert all(
+        path.startswith((unit + "/", "visual_gen/modeling_v2/minimax_h3/"))
+        for path in selected - catalog_consumers - {contracts}
+    )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "cpp/cmake/modules/modeling_v2.cmake",
+        "cpp/tensorrt_llm/modeling_v2/common/familyLibrary.version",
+    ],
+)
+def test_shared_native_build_selects_visual_gen_native_tests(changed):
+    selected = _visualgen_selection(changed)
+    unit = "unittest/_torch/visual_gen/modeling_v2/models/minimax_h3"
+    assert {
+        "unittest/_torch/visual_gen/test_native_cmake.py",
+        "unittest/_torch/visual_gen/modeling_v2/catalog/activation/test_swiglu_block_fp8.py",
+        f"{unit}/h3_pipeline/test_minimax_h3_pipeline.py",
+        f"{unit}/fasth3/test_fasth3_pipeline.py",
+    } <= selected
+
+
+def test_shared_native_build_runs_all_visual_gen_for_unrouted_native_code(tmp_path):
+    source = (
+        tmp_path / "tensorrt_llm/_torch/visual_gen/modeling_v2/models/plain/csrc/kernels/plain.cu"
+    )
+    source.parent.mkdir(parents=True)
+    source.touch()
+    entries = [
+        "unittest/_torch/visual_gen/modeling_v2/models/plain/test_plain.py",
+        "unittest/_torch/visual_gen/test_native_cmake.py",
+    ]
+    index = YAMLIndex()
+    index.blocks = [Block("l0_b200", 0, {}, entries)]
+    stages = {"B200-PyTorch-1": Stage("B200-PyTorch-1", "l0_b200", "x86_64", 1, 1)}
+    rule = VisualGenRule(index, stages, tmp_path)
+    result = rule.apply(PRInputs(["cpp/cmake/modules/modeling_v2.cmake"], {}))
+    assert result is not None and result.scope == "visualgenonly"
+    selected = {
+        e for block in result.block_filters.values() for tests in block.values() for e in tests
+    }
+    assert selected == set(entries)
+
+
+@pytest.mark.parametrize(
+    ("path", "consumer", "unrelated"),
+    [
+        (
+            "attention/backends/prims_ts/kernels/fmha_context/fmha_kernel.py",
+            "catalog/attention/test_prims_dense_attention.py",
+            "catalog/attention/test_cute_fmha.py",
+        ),
+        (
+            "attention/kernels/sage_quant.py",
+            "catalog/attention/test_prims_routed_attention.py",
+            "catalog/attention/test_prims_dense_attention.py",
+        ),
+        (
+            "kernels/blackwell/fp8_block_scale_low_m_gemm.py",
+            "models/minimax_h3/ops/test_projection.py",
+            "models/minimax_h3/ops/test_cute_bf16_gemm.py",
+        ),
+        (
+            "custom_ops/torch_custom_ops.py",
+            "models/minimax_h3/ops/test_projection.py",
+            "models/minimax_h3/ops/test_cute_bf16_gemm.py",
+        ),
+        (
+            "kernels/blackwell/low_m_mma_gemm.py",
+            "models/minimax_h3/ops/test_low_m_mma_gemm.py",
+            "models/minimax_h3/ops/test_cute_bf16_gemm.py",
+        ),
+        (
+            "kernels/blackwell/utils.py",
+            "models/minimax_h3/ops/test_low_m_mma_gemm.py",
+            "catalog/attention/test_cute_fmha.py",
+        ),
+    ]
+    + [
+        (
+            path,
+            "models/minimax_h3/ops/test_cute_bf16_gemm.py",
+            "catalog/attention/test_cute_fmha.py",
+        )
+        for path in (
+            "custom_ops/cute_dsl_custom_ops.py",
+            "custom_ops/cutedsl_matmul_heuristics.py",
+            "kernels/blackwell/custom_pipeline.py",
+            "kernels/blackwell/utils.py",
+            "kernels/utils/gemm/sm100.py",
+        )
+    ],
+)
+def test_shared_llm_provider_adds_vg_tests_and_remains_in_coverage_residual(
+    path, consumer, unrelated
+):
+    path = f"tensorrt_llm/_torch/{path}"
+    index = YAMLIndex.load(REPO_ROOT / "tests/integration/test_lists/test-db")
+    stages = parse_stages_from_groovy(REPO_ROOT / "jenkins/L0_Test.groovy")
+    selector = Selector(stages)
+    pr = PRInputs([path], {})
+    result = selector.run(pr, [VisualGenRule(index, stages, REPO_ROOT)])
+    assert result.scope is None
+    assert coverage_preflight(pr, selector.pairs, selector.handled) == ([path], "")
+    assert len(selector.pairs) == 1
+    rule_result = selector.pairs[0][1]
+    selected = {entry for block in rule_result.block_filters.values() for entry in block}
+    unit = "unittest/_torch/visual_gen/modeling_v2/"
+    assert {
+        unit + consumer,
+        unit + "models/minimax_h3/h3_pipeline/test_minimax_h3_pipeline.py",
+        unit + "models/minimax_h3/fasth3/test_fasth3_pipeline.py",
+        "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
+    } <= selected
+    assert unit + unrelated not in selected
+
+
+@pytest.mark.parametrize(
+    ("provider", "test_name"),
+    [
+        ("cute_dsl_kernels/blackwell/sol_attn/sm100/mainloop.py", "test_sol_attention.py"),
+        ("attention/backends/sparse/sol/kernels.py", "test_sol_predictor.py"),
+    ],
+)
+def test_shared_visualgen_kernel_selects_catalog_and_legacy_consumers(provider, test_name):
+    selected = _visualgen_selection(f"tensorrt_llm/_torch/visual_gen/{provider}")
+    assert {
+        f"unittest/_torch/visual_gen/sparse_attention/sol/{test_name}",
+        f"unittest/_torch/visual_gen/modeling_v2/catalog/attention/{test_name}",
+        "unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/test_minimax_h3_pipeline.py",
+        "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
+    } <= selected
+
+
+def test_visualgen_h3_target_change_selects_dependency_check():
+    selected = _visualgen_selection(
+        "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/fasth3/schedule.py"
+    )
+    assert (
+        "unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/test_dependencies.py" in selected
+    )

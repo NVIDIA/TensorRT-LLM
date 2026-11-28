@@ -172,6 +172,8 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
+Base H3 and FastH3 use V1 by default during rollout. Set `TLLM_VISUALGEN_MODELING2_H3=1` before starting VisualGen to use V2.
+
 MiniMax-H3 parallel VAE uses independent spatial tiles via
 `parallel_config.parallel_vae_size`, with size from 1 through the world size (`tp_size * ulysses_size`).
 Tile geometry and blending follow the loaded Diffusers VAE.
@@ -192,10 +194,11 @@ are not supported. See the
   for input limits, ordering, and media dependencies.
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
   model-specific restriction, not a general VisualGen backend requirement.
+- For H3 TRTLLM attention with sparse routes, choose a block-scaled Sage recipe to quantize Q/K/V. The block-sparse runner uses the input dtype on routed calls with a per-tensor FP8 recipe. See [VisualGen quantized attention](../features/visualgen-quantized-attention.md).
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 
-- FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
+- FastH3 uses the MiniMax-H3 transformer architecture with a
   distilled 8-step V2 checkpoint. Model-specific VSA is the supported inference path
   for this checkpoint and is selected by default with the TRTLLM backend and the
   checkpoint's sparsity (80% for V2). Explicit incompatible backends

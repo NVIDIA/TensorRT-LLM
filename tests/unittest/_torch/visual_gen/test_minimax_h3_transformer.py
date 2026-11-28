@@ -39,6 +39,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
+from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -263,6 +264,38 @@ def test_transformer_accepts_dynamic_nvfp4_configuration() -> None:
 
     assert model.model_config.quant_config.quant_algo == QuantAlgo.NVFP4
     assert model.model_config.dynamic_weight_quant
+
+
+@pytest.mark.parametrize("algo", [QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4])
+def test_vsa_gate_loads_checkpoint_weights_under_dynamic_quantization(algo: QuantAlgo) -> None:
+    config = _make_model_config(
+        quant_config=QuantConfig(quant_algo=algo),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+    )
+    config.skip_create_weights_in_init = True
+    config.attention = AttentionConfig(
+        backend="TRTLLM", sparse_attention_config=VideoSparseAttentionConfig()
+    )
+    config.attention_metadata_state = create_attention_metadata_state()
+    name = "transformer_blocks.0.attn"
+    attention = h3.MiniMaxH3Attention(
+        hidden_size=128,
+        num_attention_heads=1,
+        attention_head_dim=128,
+        qk_norm_eps=1e-5,
+        model_config=config,
+        layer_idx=0,
+        module_name=name,
+    )
+    gate = attention.to_gate_compress
+    assert gate is not None
+    gate.create_weights()
+    weight = torch.linspace(-0.25, 0.25, 128 * 128, dtype=torch.bfloat16).reshape(128, 128)
+    h3.DynamicLinearWeightLoader(config).load_linear_weights(
+        gate, f"{name}.to_gate_compress", [{"weight": weight}]
+    )
+    torch.testing.assert_close(gate.weight, weight, rtol=0, atol=0)
 
 
 def test_post_load_quantizes_nvfp4_projections_like_fp8() -> None:

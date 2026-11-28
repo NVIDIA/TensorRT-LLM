@@ -22,7 +22,7 @@ import socket
 import traceback
 import uuid
 from contextlib import aclosing, asynccontextmanager
-from typing import AsyncGenerator, AsyncIterator, Callable, Optional
+from typing import AsyncGenerator, AsyncIterator, Awaitable, Callable, Optional
 
 import aiohttp
 import anyio
@@ -45,6 +45,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
                                                   AnthropicResponseError,
+                                                  anthropic_chat_error_response,
                                                   anthropic_error_response,
                                                   convert_anthropic_request,
                                                   convert_chat_response,
@@ -76,9 +77,9 @@ from tensorrt_llm.serve.responses_utils import (
     STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED,
     STREAM_TERMINATION_UPSTREAM_ERROR, ClosingStreamingResponse,
     ResponsesStreamingProcessor, ServerArrivalTimeMiddleware,
-    get_steady_clock_now_in_seconds, guard_responses_stream,
-    iter_complete_sse_frames, keep_responses_stream_alive, relay_after_opening,
-    stream_error_event)
+    UCompletionResponseOrGenerator, get_steady_clock_now_in_seconds,
+    guard_responses_stream, iter_complete_sse_frames,
+    keep_responses_stream_alive, relay_after_opening, stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
@@ -236,9 +237,17 @@ class _ResponsesStreamingResponse(ClosingStreamingResponse):
     that stream to its end.
     """
 
-    def __init__(self, pipeline: asyncio.Future,
-                 content: AsyncIterator[str]) -> None:
-        super().__init__(content=content, media_type="text/event-stream")
+    def __init__(self,
+                 pipeline: asyncio.Future,
+                 content: AsyncIterator[str],
+                 *,
+                 status_code: int = 200,
+                 media_type: str = "text/event-stream",
+                 background=None) -> None:
+        super().__init__(content=content,
+                         status_code=status_code,
+                         media_type=media_type,
+                         background=background)
         self._pipeline = pipeline
 
     async def __call__(self, scope, receive, send) -> None:
@@ -255,15 +264,21 @@ def _guard_relayed_responses_stream(answer: Response,
     The stream is the generation worker's own, response.created included, so
     there is no response of this server's to report as failed. Wrapping it in
     _ResponsesStreamingResponse ensures disconnecting before the body iterates
-    still closes the pipeline's upstream stream.
+    still closes the pipeline's upstream stream while preserving status code,
+    headers, media type, and background task.
     """
     if not isinstance(answer, StreamingResponse):
         return answer
-    return _ResponsesStreamingResponse(
+    wrapped = _ResponsesStreamingResponse(
         pipeline=pipeline,
         content=guard_responses_stream(
             iter_complete_sse_frames(answer.body_iterator),
-            stream_error_event))
+            stream_error_event),
+        status_code=answer.status_code,
+        media_type=answer.media_type or "text/event-stream",
+        background=answer.background)
+    wrapped.raw_headers = list(answer.raw_headers)
+    return wrapped
 
 
 def _error_response_failure(response: Response) -> tuple[str, str]:
@@ -310,6 +325,16 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
 
 
 class OpenAIDisaggServer:
+    """OpenAI- and Anthropic-compatible frontend of disaggregated serving.
+
+    Extension surface used outside this repository (NeMo-RL subclasses this
+    class): the constructor (config, req_timeout_secs=...,
+    coordinator_url=None) with self.app built and every route registered when
+    it returns; __call__(host, port, sockets=None); _wrap_entry_point;
+    _handle_exception; and _perf_metrics_collector.http_exceptions. Agree a
+    change to any of them with the NeMo-RL owners first; the contract test is
+    tests/unittest/disaggregated/test_disagg_server_contract.py.
+    """
     # Per-request hooks class instantiated by the entry-point wrapper.
     # Subclasses may substitute a ResponseHooks implementation with the same
     # constructor signature to observe the request lifecycle (e.g. relay
@@ -459,7 +484,7 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
-        self.app.add_api_route("/v1/responses", self.openai_responses, methods=["POST"])
+        self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
@@ -536,40 +561,26 @@ class OpenAIDisaggServer:
         # annotation with request_type (as openai_server.py does).
         # hold_headers_until_first_chunk=False returns a stream at once, for a
         # caller that keeps it alive until the first chunk (/v1/messages pings).
-        @tracing.trace_span("disaggregated_request")
-        async def wrapper(req: request_type, raw_req: Request) -> Response:
+        service_responses = getattr(getattr(self, "_service", None),
+                                    "openai_responses", None)
+        use_early_open = (service_responses is not None
+                          and entry_point == service_responses)
+
+        async def run_once(req: request_type, raw_req: Request,
+                           hold_headers: bool,
+                           guard_responses: bool) -> Response:
+            hooks: Optional[RawRequestResponseHooks] = None
             try:
-                self._perf_metrics_collector.total_requests.inc()
-                if req.stream:
-                    self._perf_metrics_collector.stream_requests.inc()
-                else:
-                    self._perf_metrics_collector.nonstream_requests.inc()
-                try:
-                    ensure_request_chat_template_allowed(
-                        req, self._allow_request_chat_template)
-                except ValueError as e:
-                    raise HTTPException(status_code=400, detail=str(e)) from e
-                self._extract_conversation_id(
-                    req, raw_req,
-                    self._config.conversation_affinity_header_for_subagents)
-                hooks = self.response_hooks_cls(
-                    raw_req, self._perf_metrics_collector.queue_latency_seconds,
-                    self._collect_perf_metrics)
-                response_or_generator = await entry_point(req, hooks)
-                if req.stream:
-                    # openai_responses guards Responses streams itself; other
-                    # protocols hold headers until the first chunk unless opted out.
-                    stream = response_or_generator
-                    if hold_headers_until_first_chunk:
-                        stream = await self._start_stream(stream, raw_req)
-                    self._perf_metrics_collector.total_responses.inc()
-                    return StreamingResponse(
-                        content=stream,
-                        media_type="text/event-stream")
-                self._perf_metrics_collector.total_responses.inc()
-                # by_alias: e.g. text.format.schema goes out under its wire name.
-                return JSONResponse(
-                    content=response_or_generator.model_dump(by_alias=True))
+                hooks = self._prepare_request(req, raw_req)
+                response_or_generator = await self._run_entry_point(
+                    entry_point,
+                    req,
+                    hooks,
+                    raw_req,
+                    hold_headers,
+                    guard_responses=guard_responses)
+                self._finish_request(req, hooks)
+                return self._serialize_response(req, response_or_generator)
             except _ClientDisconnected:
                 # The upstream stream is already closed; end the request
                 # quietly instead of raising into the ASGI server.
@@ -577,8 +588,105 @@ class OpenAIDisaggServer:
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
-                return self._handle_exception(e)
+                return self._finish_failed_request(e, req, hooks)
+
+        @tracing.trace_span("disaggregated_request")
+        async def wrapper(req: request_type, raw_req: Request) -> Response:
+            if req.stream and use_early_open:
+                return await self._serve_early_open_responses_stream(
+                    req, lambda: run_once(req, raw_req, False, False))
+            return await run_once(req, raw_req, hold_headers_until_first_chunk,
+                                  True)
         return wrapper
+
+    def _prepare_request(self, req: UCompletionRequest,
+                         raw_req: Request) -> RawRequestResponseHooks:
+        """Account for a request and check it before any worker is involved.
+
+        Counts the request, applies the chat-template permission (HTTPException
+        400), resolves the conversation identity from the headers and builds
+        the per-request hooks.
+        """
+        self._perf_metrics_collector.total_requests.inc()
+        if req.stream:
+            self._perf_metrics_collector.stream_requests.inc()
+        else:
+            self._perf_metrics_collector.nonstream_requests.inc()
+        try:
+            ensure_request_chat_template_allowed(
+                req, self._allow_request_chat_template)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        self._extract_conversation_id(
+            req, raw_req,
+            self._config.conversation_affinity_header_for_subagents)
+        return self.response_hooks_cls(
+            raw_req, self._perf_metrics_collector.queue_latency_seconds,
+            self._collect_perf_metrics)
+
+    async def _run_entry_point(
+            self,
+            entry_point: Callable,
+            req: UCompletionRequest,
+            hooks: RawRequestResponseHooks,
+            raw_req: Request,
+            hold_headers_until_first_chunk: bool = True,
+            *,
+            guard_responses: bool = True
+    ) -> UCompletionResponseOrGenerator:
+        """Run the service and, when holding headers, start its stream first.
+
+        When ``guard_responses`` is true, a streamed ``ResponsesRequest`` is
+        guarded with ``guard_responses_stream`` so an early failure ends with an
+        SSE ``error`` event. When ``hold_headers_until_first_chunk`` is true,
+        the first chunk is pulled via ``_start_stream``. Returns a typed
+        response for non-streaming requests, or an async generator of the
+        worker's raw SSE bytes.
+        """
+        response_or_generator = await entry_point(req, hooks)
+        if req.stream:
+            stream = response_or_generator
+            if isinstance(req, ResponsesRequest) and guard_responses:
+                # A relayed Responses stream that fails ends with an `error`
+                # event, even before its first frame.
+                stream = guard_responses_stream(stream, stream_error_event)
+            if hold_headers_until_first_chunk:
+                # Hold the headers until the first chunk: a chat or completion
+                # stream that fails before it becomes an HTTP error, not a 200
+                # whose body is cut off. Anthropic and early-open Responses
+                # streams open and guard their streams themselves.
+                stream = await self._start_stream(stream, raw_req)
+            return stream
+        return response_or_generator
+
+    def _finish_request(self, req: UCompletionRequest,
+                        hooks: RawRequestResponseHooks) -> None:
+        """Account for a request the service answered."""
+        self._perf_metrics_collector.total_responses.inc()
+
+    def _finish_failed_request(
+            self, error: Exception, req: UCompletionRequest,
+            hooks: Optional[RawRequestResponseHooks]) -> Optional[Response]:
+        """Answer a failed request through _handle_exception.
+
+        Must be called while ``error`` is being handled: _handle_exception logs
+        with traceback.format_exc(). Raises HTTPException in most cases, returns
+        a JSONResponse for worker errors that carry a machine-readable code, and
+        returns None after an engine fatal error (SIGINT already sent).
+        """
+        return self._handle_exception(error)
+
+    def _serialize_response(
+            self, req: UCompletionRequest,
+            response_or_generator: UCompletionResponseOrGenerator) -> Response:
+        """The HTTP response of the OpenAI routes."""
+        if req.stream:
+            return StreamingResponse(
+                content=response_or_generator,
+                media_type="text/event-stream")
+        # by_alias: e.g. text.format.schema goes out under its wire name.
+        return JSONResponse(
+            content=response_or_generator.model_dump(by_alias=True))
 
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:
@@ -588,12 +696,15 @@ class OpenAIDisaggServer:
         _RESPONSES_STREAM_START_WAIT_S is answered from here at once; see
         _responses_stream_when_done.
         """
-        responses = self._wrap_entry_point(
-            self._service.openai_responses,
-            hold_headers_until_first_chunk=False)
-        if not request.stream:
-            return await responses(request, raw_request)
-        pipeline = asyncio.ensure_future(responses(request, raw_request))
+        responses = self._wrap_entry_point(self._service.openai_responses,
+                                           ResponsesRequest)
+        return await responses(request, raw_request)
+
+    async def _serve_early_open_responses_stream(
+            self, request: ResponsesRequest,
+            start_pipeline: Callable[[], Awaitable[Response]]) -> Response:
+        """Run a streamed Responses pipeline and open the stream if it waits."""
+        pipeline = asyncio.ensure_future(start_pipeline())
         try:
             await asyncio.wait((pipeline, ),
                                timeout=_RESPONSES_STREAM_START_WAIT_S)
@@ -769,10 +880,7 @@ class OpenAIDisaggServer:
                 hold_headers_until_first_chunk=False)(chat_request,
                                                       raw_request)
         except HTTPException as e:
-            error_type = ("invalid_request_error"
-                          if 400 <= e.status_code < 500 else "api_error")
-            return anthropic_error_response(str(e.detail), error_type,
-                                            e.status_code)
+            return anthropic_chat_error_response(str(e.detail), e.status_code)
 
         # The reply is named after the disaggregated request rather than the
         # worker's own id for it (see anthropic_message_id).
@@ -794,9 +902,10 @@ class OpenAIDisaggServer:
                            or payload.get("error") or json.dumps(payload))
             except (json.JSONDecodeError, AttributeError, TypeError):
                 message = "Internal server error"
-            error_type = ("invalid_request_error"
-                          if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(str(message), error_type, status)
+            # The context phase never streams, so a context worker's over-length
+            # rejection arrives here, before any stream, for a streamed request
+            # too.
+            return anthropic_chat_error_response(str(message), status)
 
         try:
             chat_response = ChatCompletionResponse(

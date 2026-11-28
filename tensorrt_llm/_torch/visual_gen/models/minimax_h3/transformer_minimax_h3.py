@@ -187,6 +187,7 @@ class MiniMaxH3Attention(Attention):
                 num_attention_heads * attention_head_dim,
                 bias=False,
                 dtype=model_config.torch_dtype,
+                quant_config=QuantConfig(),  # None inherits the model-wide recipe during loading.
                 mapping=model_config.mapping,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
