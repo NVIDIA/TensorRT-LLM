@@ -179,3 +179,19 @@ def test_non_request_records_excluded_from_denominator(tmp_path: Path) -> None:
     # lines would dilute it to ~1% if they were counted as requests.
     with pytest.raises(AssertionError, match="exceeds threshold"):
         enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=100)
+
+
+def test_warmup_records_excluded(tmp_path: Path) -> None:
+    """Warmup records in the aiperf export do not count, only profiling ones."""
+    records = []
+    for phase, error in (
+        [("warmup", None)] * 90 + [("profiling", None)] * 90 + [("profiling", _SERVER_500)] * 10
+    ):
+        rec = _record(error)
+        rec["metadata"]["benchmark_phase"] = phase
+        records.append(rec)
+    artifact_dir = _write_export(tmp_path, records)
+    # 10 errors over 100 profiling requests = 10%; with the 90 warmup records
+    # counted it would read 5.3%, under the 6% threshold.
+    with pytest.raises(AssertionError, match=r"exceeds threshold"):
+        enforce_aiperf_error_rate(artifact_dir, 0.06, expected_records=100)

@@ -185,24 +185,38 @@ def _env_float(name: str, default: float) -> float:
 def aiperf_is_usable() -> bool:
     """Return whether the ambient interpreter already has a working agentx stack.
 
-    Checks importability, that the ``aiperf`` found is the agentx-harness fork
-    (it alone ships the ``inferencex-agentx-mvp`` scenario), *and* the datasets
+    Checks importability, that the ``aiperf`` found is the agentx-harness fork,
+    that it ships the ``inferencex-agentx-mvp`` scenario, *and* the datasets
     major version, since a container with aiperf but datasets 3.x fails only
     later, when loading the corpus. The fork check matters because
-    requirements-dev.txt pins the upstream PyPI ``aiperf``, which imports fine
-    but rejects ``--scenario`` at the start of the run.
+    requirements-dev.txt installs the upstream PyPI ``aiperf``. Since 0.13.0
+    it ships the same scenario module, but not the fork's CLI (for example
+    ``--warmup-requests-per-lane``), so the scenario alone no longer tells them
+    apart. The fork is told apart by where pip installed it from: its PEP 610
+    ``direct_url.json`` names the agentx-harness repository (the repository of
+    ``AGENTX_AIPERF_REF`` when set). A PyPI install has no such record.
 
     The scenario is looked up through ``aiperf.common.scenario.registry``, the
     module path in the pinned ``DEFAULT_AIPERF_REF`` build. The reason for a
     failed probe is logged, so a fork that moves that module shows up as such
     instead of as a reinstall on every run.
     """
+    ref = os.environ.get("AGENTX_AIPERF_REF", DEFAULT_AIPERF_REF)
+    repo = ref.removeprefix("git+").rsplit("@", 1)[0]
     probe = (
         "import sys\n"
         "try:\n"
         "    import aiperf, cyclopts, datasets, transformers, pydantic, msgspec, orjson\n"
         "except ImportError as e:\n"
         "    sys.exit(f'missing module: {e}')\n"
+        "import importlib.metadata, json\n"
+        "try:\n"
+        "    source = importlib.metadata.distribution('aiperf').read_text('direct_url.json')\n"
+        "except importlib.metadata.PackageNotFoundError:\n"
+        "    source = None\n"
+        "url = json.loads(source).get('url', '') if source else ''\n"
+        f"if {repo!r} not in url:\n"
+        f"    sys.exit(f'aiperf is not installed from {repo} (installed from: {{url or \"PyPI\"}})')\n"
         "try:\n"
         "    from aiperf.common.scenario.registry import get_scenario\n"
         "except ImportError:\n"

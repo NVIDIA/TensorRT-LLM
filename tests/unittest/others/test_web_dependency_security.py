@@ -72,3 +72,13 @@ def test_starlette_constraint_floor() -> None:
 
     assert _minimum_version(starlette) >= Version("1.3.1")
     assert Version("0.50.0") not in starlette.specifier
+
+
+def test_aiohttp_constraint_floor() -> None:
+    # constraints.txt carries the aiohttp 3.14.4 advisory WAR
+    # (GHSA-jm3w-gw2p-xjfj); it applies on every Python version.
+    aiohttp = _requirement("aiohttp", "constraints.txt")
+
+    assert aiohttp.marker is None
+    assert _minimum_version(aiohttp) >= Version("3.14.4")
+    assert Version("3.13.3") not in aiohttp.specifier

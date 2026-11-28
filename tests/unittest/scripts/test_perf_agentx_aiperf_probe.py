@@ -45,22 +45,31 @@ def client() -> ModuleType:
 
 
 def _write_stub_site(root: Path, *, fork: bool, datasets_version: str = "4.7.0") -> None:
-    """Stand-in packages: an upstream-like aiperf, or the fork with its scenario."""
+    """Stand-in packages: PyPI aiperf 0.13+, or the fork installed from its repository.
+
+    Both ship the AgentX scenario registry (PyPI aiperf does since 0.13.0); only
+    the fork has the PEP 610 record of an install from the agentx-harness repo.
+    """
     for name in _STUB_MODULES:
         version = datasets_version if name == "datasets" else "1.0.0"
         (root / name).mkdir()
         (root / name / "__init__.py").write_text(f"__version__ = {version!r}\n")
-    (root / "aiperf").mkdir()
-    (root / "aiperf" / "__init__.py").write_text("")
+    registry = root / "aiperf" / "common" / "scenario"
+    registry.mkdir(parents=True)
+    for package in (root / "aiperf", root / "aiperf" / "common", registry):
+        (package / "__init__.py").write_text("")
+    (registry / "registry.py").write_text(
+        "SCENARIOS = {'inferencex-agentx-mvp': object()}\n"
+        "def get_scenario(name):\n"
+        "    return SCENARIOS[name]\n"
+    )
+    dist_info = root / "aiperf-0.13.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: aiperf\nVersion: 0.13.0\n")
     if fork:
-        registry = root / "aiperf" / "common" / "scenario"
-        registry.mkdir(parents=True)
-        (root / "aiperf" / "common" / "__init__.py").write_text("")
-        (registry / "__init__.py").write_text("")
-        (registry / "registry.py").write_text(
-            "SCENARIOS = {'inferencex-agentx-mvp': object()}\n"
-            "def get_scenario(name):\n"
-            "    return SCENARIOS[name]\n"
+        url = "https://github.com/SemiAnalysisAI/agentx-harness.git"
+        (dist_info / "direct_url.json").write_text(
+            f'{{"url": "{url}", "vcs_info": {{"vcs": "git", "commit_id": "754356e"}}}}'
         )
 
 
@@ -77,18 +86,20 @@ def _probe(client: ModuleType, monkeypatch, site: Path) -> tuple[bool, str]:
         )
 
     logged = []
+    monkeypatch.delenv("AGENTX_AIPERF_REF", raising=False)
     monkeypatch.setattr(client.subprocess, "run", run)
     monkeypatch.setattr(client, "_log", logged.append)
     return client.aiperf_is_usable(), "\n".join(logged)
 
 
 def test_upstream_aiperf_is_not_usable(client: ModuleType, monkeypatch, tmp_path: Path):
-    # requirements-dev.txt installs the PyPI aiperf, which has no AgentX scenario
-    # and rejects --scenario; it must trigger the fork install, not skip it.
+    # requirements-dev.txt installs the PyPI aiperf. Since 0.13.0 it ships the
+    # AgentX scenario too, but not the fork's CLI (--warmup-requests-per-lane);
+    # it must trigger the fork install, not skip it.
     _write_stub_site(tmp_path, fork=False)
     usable, log = _probe(client, monkeypatch, tmp_path)
     assert not usable
-    assert "aiperf.common.scenario.registry" in log
+    assert "not installed from https://github.com/SemiAnalysisAI/agentx-harness.git" in log
 
 
 def test_agentx_fork_is_usable(client: ModuleType, monkeypatch, tmp_path: Path):
