@@ -20,6 +20,7 @@ from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._utils import prefer_pinned
 
+from .exact_replay import advance_exact_replay_rows, prepare_exact_replay_rows
 from .mamba2_metadata import Mamba2Metadata
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
@@ -335,6 +336,17 @@ class ReplayMamba2Metadata(Mamba2Metadata):
             max_batch_size, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device="cuda"
         )
         self.replay_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
+        # Exact replay (deterministic Mamba2 kernels, see exact_replay.py): each
+        # row's position in its chunk, whether it has a boundary state and a
+        # convolution state, the context rows' host copies, and the offsets of
+        # one-token sequences. A full prepare() stages the three device buffers
+        # in host memory of its own.
+        self.replay_pos = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
+        self.replay_has_boundary = torch.zeros(max_batch_size, dtype=torch.bool, device="cuda")
+        self.replay_conv_has_initial = torch.ones(max_batch_size, dtype=torch.bool, device="cuda")
+        self.replay_prefill_n_pre: list[int] = []
+        self.replay_prefill_has_boundary: list[bool] = []
+        self.replay_arange = torch.arange(max_batch_size + 1, dtype=torch.int32, device="cuda")
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         super().prepare(attn_metadata)
@@ -352,6 +364,15 @@ class ReplayMamba2Metadata(Mamba2Metadata):
         else:
             self.replay_state_indices = self.state_indices
         self._prepare_replay_work_items(kv_cache_manager, batch_size, attn_metadata.num_contexts)
+        chunk_size = getattr(kv_cache_manager, "mamba_exact_replay_chunk_size", None)
+        if chunk_size and batch_size > 0:
+            prepare_exact_replay_rows(
+                self,
+                attn_metadata.kv_cache_params.num_cached_tokens_per_seq,
+                batch_size,
+                attn_metadata.num_contexts,
+                chunk_size,
+            )
 
     def prepare_steady_gen_step(self, attn_metadata: AttentionMetadata) -> None:
         # The replay slots stay in place with the state slots; the work items follow the
@@ -359,6 +380,10 @@ class ReplayMamba2Metadata(Mamba2Metadata):
         super().prepare_steady_gen_step(attn_metadata)
         batch_size = attn_metadata.seq_lens.shape[0]
         self._prepare_replay_work_items(attn_metadata.kv_cache_manager, batch_size, 0)
+        chunk_size = getattr(attn_metadata.kv_cache_manager, "mamba_exact_replay_chunk_size", None)
+        if chunk_size and batch_size > 0:
+            # Exact replay moves its rows on every step, steady or not.
+            advance_exact_replay_rows(self, batch_size, chunk_size)
 
     def _prepare_replay_work_items(
         self, kv_cache_manager, batch_size: int, num_contexts: int
