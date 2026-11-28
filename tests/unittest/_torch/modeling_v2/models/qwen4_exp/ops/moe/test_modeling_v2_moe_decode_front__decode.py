@@ -100,8 +100,14 @@ def test_certified_cells(cell):
         x, _, _, _ = _operands(spec, seed + 1 + k, device)
         s_x.copy_(x)
         graph.replay()
+        # Stream-ordered snapshots between the two replays (no host synchronization): what the
+        # first replay left, including its staging buffer, which the second must not be the one
+        # to clear.
+        first = [t.clone() for t in out]
+        first_stage, first_tables = stage.clone(), tables.clone()
         graph.replay()
         torch.cuda.synchronize()
+        _assert_matches(spec, s_x, router, global_scale, first_tables, first_stage, first)
         _assert_matches(spec, s_x, router, global_scale, tables, stage, out)
 
 
@@ -117,3 +123,42 @@ def test_certified_cells(cell):
 )
 def test_compile_declines_shapes_the_kernel_does_not_take(rows, hidden, stride, local):
     assert op.compile_front(rows, hidden, stride, local, 8) is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tile", [0, 4, 12, 512])
+def test_compile_declines_tiles_the_kernel_does_not_take(tile):
+    """A tile outside the kernel's powers of two in [8, 256] is declined, not raised."""
+    assert op.compile_front(4, 2560, 2560, 128, tile) is False
+
+
+@pytest.mark.cpu_only
+def test_the_reference_rounds_the_exact_sum_once():
+    """`1 + 2^-8 + 2^-25` lies just above the midpoint of 1 and `1 + 2^-7`: rounded once it is
+    `1 + 2^-7`; through fp32 it would come back as 1."""
+    exact = torch.tensor([1 + 2.0**-8 + 2.0**-25], dtype=torch.float64)
+    assert float(op.round_to_bf16(exact)) == 1 + 2.0**-7
+    x = torch.tensor([[1.0, 2.0**-8, 2.0**-25]], dtype=torch.bfloat16)
+    router = torch.ones(1, 3, dtype=torch.bfloat16)
+    assert float(op.reference_logits(x, router)) == 1 + 2.0**-7
+    # ties to even, negative values, zero and the largest finite bf16 round as torch does there
+    values = torch.tensor(
+        [1 + 2.0**-8, 1 + 3 * 2.0**-8, -(1 + 2.0**-8 + 2.0**-25), 0.0, 3.3895313892515355e38, -7.5],
+        dtype=torch.float64,
+    )
+    want = torch.tensor([1.0, 1 + 2.0**-6, -(1 + 2.0**-7), 0.0, 3.3895313892515355e38, -7.5])
+    assert torch.equal(op.round_to_bf16(values), want)
+
+
+@pytest.mark.cpu_only
+def test_a_nan_logit_is_off_the_bound():
+    """A NaN or infinite logit where the exact one is finite is off the bound."""
+    gen = torch.Generator().manual_seed(3)
+    x = torch.randn(2, 64, generator=gen).to(torch.bfloat16)
+    router = (torch.randn(8, 64, generator=gen) * 0.02).to(torch.bfloat16)
+    logits = op.reference_logits(x, router).to(torch.bfloat16)
+    assert not bool(op.logits_off_bound(logits, x, router).any())
+    logits[1, 3] = float("nan")
+    logits[0, 5] = float("inf")
+    off = op.logits_off_bound(logits, x, router)
+    assert off.nonzero().tolist() == [[0, 5], [1, 3]]
