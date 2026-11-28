@@ -487,6 +487,25 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_attention_deco.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/activation/test_swiglu.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/activation/test_swiglu_block_fp8.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_cudnn_sdpa.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sol_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_block_weight_layout.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_quantize.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_static_quantize.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_cute_bf16_gemm.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_block_sparse_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_cute_fmha.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_flash_attention_4.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_flashinfer_prefill.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_prims_dense_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_prims_routed_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sol_predictor.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_trtllm_context_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/gemm/test_gate_up_swiglu_quack.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_weight_quantize.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_nvfp4_weight_quantize.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_attention.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_kernels.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py
@@ -582,6 +601,20 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (60)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_minimax_h3_transformer.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_dense_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_projection.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_low_m_mma_gemm.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_trtllm_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_lora.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/ops/test_text_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/ops/test_text_qk_norm_rope.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_minimax_h3_vsa.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_rope.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/kernels/test_minimax_h3_fused_rope.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/kernels/test_minimax_h3_fused_adaln.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_minimax_h3_vae_decode.py
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va]
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -723,6 +756,16 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_public_visual_gen_api_smoke
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va]
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_loads_and_runs TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/fasth3/test_smoke.py::test_released_checkpoint_runs_vsa TIMEOUT (30)
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
@@ -741,6 +784,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_fp8_offload_matches_baseline
   - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
   - visual_gen/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1-cuda-graph] TIMEOUT (10)

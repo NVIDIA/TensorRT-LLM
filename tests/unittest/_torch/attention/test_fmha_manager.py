@@ -714,6 +714,31 @@ def test_block_sparse_requests_only_reach_libraries_that_declare_support() -> No
     assert [event[1] for event in events if event[0] == "support"] == ["block-sparse"]
 
 
+@pytest.mark.parametrize("thresholds", [(0.0, 8.0, 4.0, 0.0), (8.0, 0.0, 0.0, 4.0)])
+def test_skip_softmax_phase_selects_its_cached_library(thresholds) -> None:
+    attn, manager = _make_manager()
+    events = []
+    dense = FakeFmha(
+        attn,
+        "dense-sage",
+        events,
+        support_predicate=lambda fwd: fwd.sparse_runtime_params.threshold_scale_factor_prefill == 0,
+    )
+    fallback = FakeFmha(attn, "fallback", events)
+    manager.fmha_libs = [dense, fallback]
+    q = torch.empty((1, 4))
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    for threshold in thresholds:
+        fwd = AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            sparse_runtime_params=SparseRuntimeParams(threshold_scale_factor_prefill=threshold),
+        )
+        assert manager.select(attn, q, None, None, metadata, fwd) is (
+            fallback if threshold else dense
+        )
+    assert len(manager._cache) == 2
+
+
 @pytest.mark.parametrize("block_sparse_first", [False, True])
 def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> None:
     events: list[tuple] = []

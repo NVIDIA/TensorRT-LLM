@@ -304,6 +304,20 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_minimax_h3_vsa.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/test_minimax_h3_pipeline.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/fasth3/test_fasth3_pipeline.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/test_routing.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/test_dependencies.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_minimax_h3_vsa.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_skip_softmax_threshold.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_prims_selection.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/kernels/test_minimax_h3_fused_adaln.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_cute_fmha.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_flash_attention_4.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_flashinfer_prefill.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_trtllm_context_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_tiled_vae.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/test_minimax_h3_scheduler_packing.py
   - unittest/_torch/visual_gen/test_model_loader.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_step_precision.py
@@ -313,7 +327,9 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_batching.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py::test_forward_routes_each_cfg_request_layout
+  - unittest/_torch/visual_gen/test_native_cmake.py
   - unittest/_torch/visual_gen/test_runtime_lora.py
+  - unittest/_torch/visual_gen/test_native_loader.py
   - unittest/_torch/visual_gen/test_seacache.py
   - unittest/_torch/visual_gen/test_sleep.py
   - unittest/_torch/visual_gen/test_symm_mem_pool.py

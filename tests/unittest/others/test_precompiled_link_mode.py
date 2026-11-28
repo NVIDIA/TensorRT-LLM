@@ -6,14 +6,14 @@ The local-directory source normally copies the compiled artifacts into the
 checkout. ``TRTLLM_PRECOMPILED_LINK=1`` symlinks them instead so several
 checkouts can share one build tree.
 
-``setup.py`` cannot be imported (module scope runs ``setup()``), so the two
-functions under test are pulled out of its AST and executed on their own. They
-are self-contained: every import they need is inside the function body, apart
-from ``os``.
+The tests load the packaging helpers from the AST to avoid invoking setup().
 """
 
 import ast
+import json
 import os
+import re
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -21,7 +21,13 @@ import pytest
 pytestmark = pytest.mark.cpu_only
 
 _SETUP_PY = Path(__file__).resolve().parents[3] / "setup.py"
-_WANTED = ("should_skip_precompiled_package_data", "warn_on_build_skew", "extract_from_precompiled")
+_WANTED = (
+    "is_visual_gen_native_artifact",
+    "stage_visual_gen_native_libs",
+    "should_skip_precompiled_package_data",
+    "warn_on_build_skew",
+    "extract_from_precompiled",
+)
 
 
 def _load(name):
@@ -31,7 +37,7 @@ def _load(name):
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in _WANTED
     ]
     assert {node.name for node in wanted} == set(_WANTED)
-    namespace = {"os": os}
+    namespace = {"os": os, "re": re, "Path": Path}
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(_SETUP_PY), "exec"), namespace)
     return namespace[name]
 
@@ -141,11 +147,53 @@ def test_copy_mode_is_unchanged(extract_from_precompiled, build_tree, tmp_path):
 
 
 @pytest.mark.parametrize("source_kind", ["wheel", "copy", "link"])
+def test_precompiled_visual_gen_libs_follow_manifest(
+    extract_from_precompiled, build_tree, tmp_path, source_kind
+):
+    catalog = "libth_visual_gen_catalog.so"
+    model = "libth_visual_gen_example.so"
+    stale = "libth_visual_gen_obsolete.so"
+    manifest = "visual_gen_native.json"
+    data = {
+        catalog: b"catalog",
+        model: b"model",
+        manifest: json.dumps(
+            {
+                "catalog/activation": {"library": catalog, "namespace": "vg_catalog"},
+                "models/example": {"library": model, "namespace": "vg_example"},
+            }
+        ).encode(),
+    }
+    libs = Path("tensorrt_llm/libs")
+    libs.mkdir(parents=True)
+    (libs / stale).symlink_to(tmp_path / "missing")
+    source = build_tree
+    if source_kind == "wheel":
+        source = tmp_path / "precompiled.whl"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("fmha_sm100/__init__.py", "")
+            for name, content in {**data, stale: b"extra"}.items():
+                archive.writestr(str(libs / name), content)
+    else:
+        for name, content in {**data, stale: b"extra"}.items():
+            (source / libs / name).write_bytes(content)
+
+    _run(extract_from_precompiled, source, tmp_path, link=source_kind == "link")
+    for name, content in data.items():
+        assert (libs / name).read_bytes() == content
+        assert (libs / name).is_symlink() == (source_kind == "link")
+    assert not os.path.lexists(libs / stale)
+
+    # Installing an older precompiled build also removes this build's optional native code.
+    (build_tree / libs / manifest).unlink(missing_ok=True)
+    _run(extract_from_precompiled, build_tree, tmp_path, link=False)
+    assert not any(os.path.lexists(libs / name) for name in data)
+
+
+@pytest.mark.parametrize("source_kind", ["wheel", "copy", "link"])
 def test_precompiled_preserves_source_schemas(
     extract_from_precompiled, build_tree, tmp_path, monkeypatch, source_kind
 ):
-    import zipfile
-
     paths = (
         "tensorrt_llm/schemas/trtllm-serve-config.schema.json",
         "tensorrt_llm/usage/schemas/trtllm_usage_event_schema.json",
@@ -186,8 +234,6 @@ def test_link_mode_rejects_a_wheel(extract_from_precompiled, build_tree, tmp_pat
 
 def test_wheel_extracts_embedded_nccl_ep(extract_from_precompiled, tmp_path, monkeypatch):
     """Wheel inputs stage NCCL-EP below 3rdparty for repackaging."""
-    import zipfile
-
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     monkeypatch.chdir(checkout)
