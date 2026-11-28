@@ -3,15 +3,17 @@
 
 import asyncio
 import json
+from contextlib import contextmanager
 
 import pytest
+from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import GenerationResultBase
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, StreamOptions
-from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.openai_server import OpenAIServer, merge_generators
 from tensorrt_llm.serve.postprocess_handlers import ChatPostprocArgs, chat_stream_post_processor
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
@@ -177,6 +179,24 @@ class _FakeRawRequest:
         return True
 
 
+@contextmanager
+def _completion_server(tmp_path, generator):
+    # Build the server through the shared factory instead of
+    # object.__new__ (the ratchet in test_no_new_object_new_sites only
+    # lets the baseline sites shrink), then swap in the fake generator
+    # the test drives and pin the attributes the request path reads.
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig(model_name="test-model"))
+        server.generator = generator
+        server.model_config = _FakeModelConfig()
+        server.tokenizer = None
+        server.metrics_collector = None
+        server._collect_perf_metrics = False
+        server._input_proc_executor = None
+        server._adjusted_steady_clock = AdjustedSteadyClock()
+        yield server
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "checkpoint_io_policy",
@@ -279,3 +299,223 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
     assert choice_indexes == {0, 1}
     assert {args.stream_response_id for args in generator.postproc_args} == ids
     assert {args.stream_created for args in generator.postproc_args} == created
+
+
+def test_openai_completion_multi_prompt_stream_sums_usage(tmp_path) -> None:
+    # A streaming /v1/completions request with several prompts and
+    # include_usage must end with a single usage chunk for the whole
+    # request, not one per prompt (issue #22740). The fake generator gives
+    # each prompt one prompt token and one generated token.
+    async def run_request():
+        generator = _FakeCompletionGenerator()
+        with _completion_server(tmp_path, generator) as server:
+            request = CompletionRequest(
+                model="test-model",
+                prompt=["A", "B"],
+                stream=True,
+                stream_options=StreamOptions(include_usage=True),
+            )
+            response = await server.openai_completion(request, _FakeRawRequest())
+            chunks = [chunk async for chunk in response.body_iterator]
+            return _stream_payloads_from_chunks(chunks)
+
+    payloads = asyncio.run(run_request())
+
+    # Both prompts still emit their choice chunk, indexes 0 and 1 exactly
+    # once each, before the aggregate.
+    choice_indexes = [
+        payload["choices"][0]["index"]
+        for payload in payloads
+        if payload["choices"]
+    ]
+    assert sorted(choice_indexes) == [0, 1]
+
+    usage_chunks = [payload for payload in payloads if payload["choices"] == []]
+    assert len(usage_chunks) == 1
+    assert usage_chunks[0] is payloads[-1]
+    usage = usage_chunks[0]["usage"]
+    assert usage["prompt_tokens"] == 2
+    assert usage["completion_tokens"] == 2
+    assert usage["total_tokens"] == 4
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 0
+    assert {payload["id"] for payload in payloads} == {usage_chunks[0]["id"]}
+
+
+def test_openai_completion_multi_prompt_stream_continuous_usage(
+        tmp_path) -> None:
+    # With continuous_usage_stats, every choice chunk carries its own
+    # prompt's usage. Those chunks are not final usage chunks: the merger
+    # must pass them through untouched, and only the trailing usage-only
+    # chunk holds the request total.
+    async def run_request():
+        generator = _FakeCompletionGenerator()
+        with _completion_server(tmp_path, generator) as server:
+            request = CompletionRequest(
+                model="test-model",
+                prompt=["A", "B"],
+                stream=True,
+                stream_options=StreamOptions(
+                    include_usage=True, continuous_usage_stats=True),
+            )
+            response = await server.openai_completion(request, _FakeRawRequest())
+            chunks = [chunk async for chunk in response.body_iterator]
+            return _stream_payloads_from_chunks(chunks)
+
+    payloads = asyncio.run(run_request())
+
+    choice_payloads = [payload for payload in payloads if payload["choices"]]
+    assert sorted(
+        payload["choices"][0]["index"] for payload in choice_payloads) == [0, 1]
+    for payload in choice_payloads:
+        # Each prompt generated one token from one prompt token, and its
+        # choice chunk keeps exactly that per-prompt usage.
+        assert payload["usage"]["prompt_tokens"] == 1
+        assert payload["usage"]["completion_tokens"] == 1
+        assert payload["usage"]["total_tokens"] == 2
+
+    usage_chunks = [payload for payload in payloads if payload["choices"] == []]
+    assert len(usage_chunks) == 1
+    assert usage_chunks[0] is payloads[-1]
+    usage = usage_chunks[0]["usage"]
+    assert usage["prompt_tokens"] == 2
+    assert usage["completion_tokens"] == 2
+    assert usage["total_tokens"] == 4
+
+
+async def _fake_prompt_usage_stream(prompt_tokens: int,
+                                    completion_tokens: int,
+                                    cached_tokens: int = 0):
+    chunk = {
+        "id": "cmpl-1",
+        "object": "text_completion",
+        "created": 1,
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "text": "x",
+            "finish_reason": "stop",
+        }],
+        "usage": None,
+    }
+    yield f"data: {json.dumps(chunk)}\n\n"
+    chunk["choices"] = []
+    chunk["usage"] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": cached_tokens
+        },
+    }
+    yield f"data: {json.dumps(chunk)}\n\n"
+
+
+def test_merge_generators_sums_per_prompt_usage_chunks() -> None:
+    async def collect():
+        merged = merge_generators([
+            _fake_prompt_usage_stream(3, 2, cached_tokens=1),
+            _fake_prompt_usage_stream(5, 4, cached_tokens=2),
+        ])
+        return [chunk async for chunk in merged]
+
+    payloads = _stream_payloads_from_chunks(asyncio.run(collect()))
+
+    usage_chunks = [payload for payload in payloads if payload["choices"] == []]
+    assert len(usage_chunks) == 1
+    assert usage_chunks[0] is payloads[-1]
+    assert usage_chunks[0]["usage"] == {
+        "prompt_tokens": 8,
+        "completion_tokens": 6,
+        "total_tokens": 14,
+        "prompt_tokens_details": {
+            "cached_tokens": 3
+        },
+    }
+
+
+def test_merge_generators_forwards_malformed_usage_chunks() -> None:
+    # A usage chunk whose fields are malformed must be forwarded
+    # untouched: it must not abort the merged stream, and it must not
+    # change the summed total. One frame has prompt_tokens_details as a
+    # list instead of an object, the other a string token count.
+    def usage_frame(usage):
+        return "data: %s\n\n" % json.dumps({
+            "id": "cmpl-1",
+            "object": "text_completion",
+            "created": 1,
+            "model": "test-model",
+            "choices": [],
+            "usage": usage,
+        })
+
+    bad_details = usage_frame({
+        "prompt_tokens": 100,
+        "completion_tokens": 100,
+        "total_tokens": 200,
+        "prompt_tokens_details": [1],
+    })
+    bad_count = usage_frame({
+        "prompt_tokens": "3",
+        "completion_tokens": 2,
+        "total_tokens": 5,
+        "prompt_tokens_details": {
+            "cached_tokens": 0
+        },
+    })
+
+    async def malformed_stream():
+        yield bad_details
+        yield bad_count
+
+    async def collect():
+        merged = merge_generators([
+            malformed_stream(),
+            _fake_prompt_usage_stream(3, 2),
+            _fake_prompt_usage_stream(5, 4),
+        ])
+        return [chunk async for chunk in merged]
+
+    chunks = asyncio.run(collect())
+
+    assert bad_details in chunks
+    assert bad_count in chunks
+    payloads = _stream_payloads_from_chunks(chunks)
+    totals = sorted(
+        payload["usage"]["total_tokens"]
+        for payload in payloads
+        if payload["choices"] == [] and isinstance(
+            payload["usage"]["total_tokens"], int))
+    # The two malformed frames keep their own totals, and the only
+    # aggregate is the sum of the two valid frames.
+    assert totals == [5, 14, 200]
+
+
+def test_merge_generators_skips_aggregate_when_a_prompt_fails() -> None:
+    # One prompt completes with usage, the other fails: its generator
+    # yields an error chunk and [DONE], like completion_generator does.
+    # The error goes out unchanged and no aggregate follows it, since a
+    # summed total here would be partial and would land after [DONE].
+    error_chunk = ('data: {"error": {"message": "boom", "type": '
+                   '"server_error", "code": null, "param": null}}\n\n')
+
+    async def failing_stream():
+        yield error_chunk
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        merged = merge_generators([
+            _fake_prompt_usage_stream(3, 2),
+            failing_stream(),
+        ])
+        return [chunk async for chunk in merged]
+
+    chunks = asyncio.run(collect())
+
+    assert error_chunk in chunks
+    done_index = chunks.index("data: [DONE]\n\n")
+    assert _stream_payloads_from_chunks(chunks[done_index + 1:]) == []
+    usage_payloads = [
+        payload for payload in _stream_payloads_from_chunks(chunks)
+        if payload.get("choices") == [] and payload.get("usage")
+    ]
+    assert usage_payloads == []

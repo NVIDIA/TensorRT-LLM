@@ -118,7 +118,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionToolsParam, ChatMessage, CompletionRequest,
-    CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
+    CompletionResponse, CompletionResponseChoice, CompletionStreamResponse,
+    EmbeddingRequest,
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
     ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
@@ -607,6 +608,114 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
 
 
 _InputProcessingResult = TypeVar("_InputProcessingResult")
+
+
+def _is_stream_usage_chunk(payload: Any) -> bool:
+    """Whether a parsed SSE payload is a final per-prompt usage chunk.
+
+    The completion post-processor appends one of these (empty choices, usage
+    set) when a prompt finishes. Chunks that carry choices, such as the
+    continuous-usage-stats chunks, are not usage chunks.
+    """
+    return (isinstance(payload, dict) and payload.get("choices") == []
+            and isinstance(payload.get("usage"), dict))
+
+
+async def merge_generators(generators: List[AsyncIterator[Any]]):
+    """Merge per-prompt completion streams, emitting one summed usage chunk.
+
+    Each prompt's post-processor appends its own final usage chunk, so with
+    several prompts a client keeping the last chunk would see one prompt's
+    tokens instead of the request total. Hold those chunks back, sum them the
+    way the non-streaming path sums responses, and emit a single usage chunk
+    after the last choice chunk.
+
+    A usage chunk whose fields are malformed is forwarded untouched rather
+    than absorbed, so one bad chunk cannot abort the merged stream. If any
+    prompt fails, its error chunk is forwarded and no aggregate is emitted:
+    a partial total would be mistaken for the request total, and it would
+    land after the failed prompt's [DONE] where clients no longer read.
+    """
+    result_queue = asyncio.Queue()
+    finished = [False] * len(generators)
+
+    async def producer(generator: AsyncIterator[Any], idx: int):
+        async for output in generator:
+            await result_queue.put(output)
+        finished[idx] = True
+
+    tasks = [
+        asyncio.create_task(producer(generator, idx))
+        for idx, generator in enumerate(generators)
+    ]
+
+    usage_total = None
+    usage_model = usage_id = usage_created = None
+    usage_details: Dict[str, int] = {}
+
+    def _absorb_usage(payload: Dict[str, Any]) -> bool:
+        """Sum one final usage chunk into the request totals.
+
+        Returns False when the chunk's usage fields are malformed, for
+        example a non-integer token count or a prompt_tokens_details that
+        is not an object. The caller then forwards the chunk untouched
+        instead of letting it abort the merged stream.
+        """
+        nonlocal usage_total, usage_model, usage_id, usage_created
+        usage = payload["usage"]
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if value is not None and not isinstance(value, int):
+                return False
+        details = usage.get("prompt_tokens_details") or {}
+        if not isinstance(details, dict):
+            return False
+        if usage_total is None:
+            usage_total = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+            usage_model = payload.get("model")
+            usage_id = payload.get("id")
+            usage_created = payload.get("created")
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            usage_total[key] += usage.get(key) or 0
+        for key, value in details.items():
+            if isinstance(value, int):
+                usage_details[key] = usage_details.get(key, 0) + value
+        return True
+
+    saw_error = False
+    while not all(finished) or not result_queue.empty():
+        output = await result_queue.get()
+        if isinstance(output, str) and output.startswith("data: "):
+            try:
+                payload = json.loads(output[len("data: "):])
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and "error" in payload:
+                saw_error = True
+            elif payload is not None and _is_stream_usage_chunk(
+                    payload) and _absorb_usage(payload):
+                continue
+        yield output
+
+    await asyncio.gather(*tasks)
+
+    if not saw_error and usage_total is not None and usage_model is not None:
+        usage = UsageInfo(
+            prompt_tokens=usage_total["prompt_tokens"],
+            completion_tokens=usage_total["completion_tokens"],
+            total_tokens=usage_total["total_tokens"],
+            prompt_tokens_details=PromptTokensDetails(**usage_details),
+        )
+        chunk = CompletionStreamResponse(choices=[],
+                                         model=usage_model,
+                                         usage=usage,
+                                         id=usage_id,
+                                         created=usage_created)
+        yield f"data: {chunk.model_dump_json()}\n\n"
 
 
 class OpenAIServer(_VideoRoutesMixin):
@@ -3310,25 +3419,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 })
                 yield f"data: {error_data}\n\n"
                 yield "data: [DONE]\n\n"
-
-        async def merge_generators(generators: List[AsyncIterator[Any]]):
-            result_queue = asyncio.Queue()
-            finished = [False] * len(generators)
-
-            async def producer(generator: AsyncIterator[Any], idx: int):
-                async for output in generator:
-                    await result_queue.put(output)
-                finished[idx] = True
-
-            tasks = [
-                asyncio.create_task(producer(generator, idx))
-                for idx, generator in enumerate(generators)
-            ]
-
-            while not all(finished) or not result_queue.empty():
-                output = await result_queue.get()
-                yield output
-            await asyncio.gather(*tasks)
 
         async def generator_wrapper(generator: AsyncIterator[Any]):
             first_response = await anext(generator)
