@@ -245,6 +245,7 @@ def test_encoder_replay_with_context_logits(has_workspace: bool, has_processor: 
 
     if has_processor:
         scoring.py_orig_prompt_len = scoring.py_prompt_len
+        scoring.is_last_context_chunk = True
         scoring.get_tokens = lambda beam: [1, 2]
         scoring.py_logits_post_processors = [process_logits]
         decode.get_beam_width_by_iter = lambda **kwargs: 1
