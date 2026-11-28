@@ -150,7 +150,10 @@ def quantize_nvfp4(
     amax_weight = weight.float().abs().max()
 
     # Global scale for fp4_quantize kernel (multiplier form: (448*6) / amax)
-    global_sf = FP8_E4M3_MAX * E2M1_MAX / amax_weight
+    # Zero blocks have an exact FP4 representation. A finite multiplier avoids
+    # inf * 0 inside the quantizer; their global dequantization divisor stays zero.
+    denominator = torch.where(amax_weight == 0, torch.ones_like(amax_weight), amax_weight)
+    global_sf = FP8_E4M3_MAX * E2M1_MAX / denominator
 
     # Quantize using TRT-LLM kernel (isSfSwizzledLayout=False for LINEAR output)
     # LINEAR layout matches ModelOpt checkpoint format so that the downstream
