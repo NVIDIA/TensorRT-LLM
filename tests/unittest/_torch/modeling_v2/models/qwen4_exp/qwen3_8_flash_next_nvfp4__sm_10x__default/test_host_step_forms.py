@@ -111,10 +111,55 @@ def test_the_shell_passes_its_core():
     assert "_runtime_hooks(self.spec_config, self.model)" in src
 
 
+def _forms_core(dp_size: int, forms: dict):
+    """A core with every field `_decode_forms` reads, no decode form built, and `forms` as the
+    host step forms the shell recorded."""
+    return SimpleNamespace(
+        mapping=SimpleNamespace(tp_rank=1, tp_size=4),
+        dp_size=dp_size,
+        _route_front=None,
+        _router_front=None,
+        _inproj_release=None,
+        _out_proj=None,
+        _lamport_trip=None,
+        hc_tiles=None,
+        dp_gqa_min_requests=None,
+        dp_topk_cluster_rows=None,
+        tep_fast=True,
+        _tep_finar=None,
+        tep_draft_layer=False,
+        host_step_forms=forms,
+    )
+
+
 @pytest.mark.cpu_only
-def test_the_decode_forms_line_names_them():
-    src = inspect.getsource(M._decode_forms)
-    for key in ('"steady prepare"', '"qsa steady"', '"replay gap"'):
-        assert key in src
-    # the tep4 branch names the QSA steady step too
-    assert src.count('"qsa steady"') == 2
+@pytest.mark.parametrize(
+    "dp_size, forms, reported",
+    [
+        # dep: the steady step and its replay gap on
+        (
+            4,
+            dict(dp_steady=True, qsa_steady=True, qsa_replay_gap=True),
+            {"steady prepare": True, "qsa steady": True, "replay gap": True},
+        ),
+        # dep with the replay gap off
+        (
+            4,
+            dict(dp_steady=True, qsa_steady=True, qsa_replay_gap=False),
+            {"steady prepare": True, "qsa steady": True, "replay gap": False},
+        ),
+        # tep4: only the QSA steady step (the engine's steady prepare and the gap are dep's)
+        (1, dict(dp_steady=False, qsa_steady=True, qsa_replay_gap=False), {"qsa steady": True}),
+        (1, dict(dp_steady=False, qsa_steady=False, qsa_replay_gap=False), {"qsa steady": False}),
+    ],
+    ids=["dep", "dep_no_gap", "tep4", "tep4_off"],
+)
+def test_the_decode_forms_line_reports_them(dp_size, forms, reported):
+    """The decode-forms line reports each host form's value for the layout: what the row table
+    gave, read back from the line a rank logs."""
+    line = M._decode_forms(_forms_core(dp_size, forms))
+    assert line.startswith("decode forms: rank 1 of 4: ")
+    for key, value in reported.items():
+        assert f"{key} {value}," in line + ",", (key, line)
+    if dp_size == 1:
+        assert "steady prepare" not in line and "replay gap" not in line

@@ -135,8 +135,13 @@ class DecoderMetadata:
         )
         if isinstance(self.attn_metadata, TrtllmAttentionMetadata):
             self.attn_metadata.host_uploader = self._host_uploader
-        self._arm_msa_policy(kv_cache_manager)
-        self._arm_qsa_policy()
+        try:
+            self._arm_msa_policy(kv_cache_manager)
+            self._arm_qsa_policy()
+        except Exception:
+            # Not kept: a retry must not get the unarmed metadata back from the early return.
+            self.attn_metadata = None
+            raise
         if self.keep_steady_growth_blocks and isinstance(kv_cache_manager, KVCacheManagerV2):
             # The steady decode prepare re-reads a page table whenever its pages change.
             kv_cache_manager.keep_growth_blocks()
