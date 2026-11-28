@@ -26,7 +26,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import AllReduce, MiniMaxAllReduceRMS
+from ..distributed import AllReduce, MiniMaxAllReduceRMS, allreduce_workspace_ipc_failed
 from ..models.modeling_utils import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -150,6 +150,10 @@ class MiniMaxRMSNorm(nn.Module):
         self.all_reduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.NCCL)
 
         self.minimax_all_reduce_rms = MiniMaxAllReduceRMS(mapping=self.mapping)
+        # MiniMaxAllReduceRMS has no NCCL path: use the one below without CUDA IPC.
+        self.is_p2p_supported = self.is_p2p_supported and not allreduce_workspace_ipc_failed(
+            self.mapping
+        )
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
@@ -185,7 +189,7 @@ class MiniMaxRMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.contiguous()
         if not self.is_p2p_supported:
-            # Inter-node TP: IPC is unavailable, fall back to NCCL all-reduce of
+            # Inter-node TP or unusable CUDA IPC: fall back to NCCL all-reduce of
             # partial sum-of-squares followed by local RMS normalization.
             hidden_f32 = hidden_states.float()
             local_sum_sq = hidden_f32.pow(2).sum(-1, keepdim=True)
@@ -261,7 +265,8 @@ class MiniMaxM2Attention(Attention):
     def apply_qk_norm(self, q, k):
         if self.qkv_proj.mapping.tp_size > 1:
             if not self.q_norm.is_p2p_supported:
-                # Inter-node TP: fall back to separate per-tensor NCCL-based norm.
+                # Inter-node TP or unusable CUDA IPC: fall back to separate
+                # per-tensor NCCL-based norm.
                 return self.q_norm(q), self.k_norm(k)
             q = q.contiguous()
             k = k.contiguous()
