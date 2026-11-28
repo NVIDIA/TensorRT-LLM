@@ -31,15 +31,14 @@ REPLAYS = int(os.environ.get("QWEN4_EXP_TPSUM_REPLAYS", "200"))
 CYCLES = 4
 ROWS = (1, 4, 16, 20, op.TP_SUM_MAX_ROWS)
 
-pytestmark = [
-    pytest.mark.no_xdist,
-    pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or torch.cuda.device_count() < WORLD
-        or torch.cuda.get_device_capability() != (10, 3),
-        reason="the Lamport TP sum is certified on 4 SM103 GPUs of one NVLink domain",
-    ),
-]
+pytestmark = pytest.mark.no_xdist
+#: The distributed case only: `test_takes` and the operand checks run without a GPU.
+_GPUS = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < WORLD
+    or torch.cuda.get_device_capability() != (10, 3),
+    reason="the Lamport TP sum is certified on 4 SM103 GPUs of one NVLink domain",
+)
 
 
 def _partial(gen, rows: int, device):
@@ -130,6 +129,7 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+@_GPUS
 def test_plain_tp_sum_matches_its_reference():
     import torch.multiprocessing as mp
 
@@ -143,3 +143,24 @@ def test_takes():
     assert not op.TepTpSum.takes(torch.empty(33, op.HIDDEN, dtype=torch.bfloat16))
     assert not op.TepTpSum.takes(torch.empty(4, op.HIDDEN, dtype=torch.float32))
     assert not op.TepTpSum.takes(torch.empty(4, 2048, dtype=torch.bfloat16))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("given", ["shared", "gate"])
+def test_the_shared_launch_needs_both_operands(given):
+    """The fused finalize's shared addend comes with its gate: one without the other is refused
+    with the layout error (not an AttributeError on the missing operand's dtype)."""
+    finar = object.__new__(op.TepFinar)
+    finar.fn = finar.fn_shared = object()  # both launches "built"
+    rows = 4
+    fc2 = torch.zeros(8, op.HIDDEN, dtype=torch.bfloat16)
+    wts = torch.zeros(rows, op.TOP_K, dtype=torch.bfloat16)
+    perm = torch.zeros(rows, op.TOP_K, dtype=torch.int32)
+    shared = torch.zeros(rows, op.HIDDEN, dtype=torch.float32)
+    gate = torch.zeros(rows, 1, dtype=torch.bfloat16)
+    assert finar.takes_shared(shared, gate, rows)
+    assert not finar.takes_shared(shared if given == "shared" else None,
+                                  gate if given == "gate" else None, rows)  # fmt: skip
+    one = dict(shared=shared) if given == "shared" else dict(gate=gate)
+    with pytest.raises(RuntimeError, match="shared and gate must be given together"):
+        finar(fc2, wts, perm, rows, 0, **one)
