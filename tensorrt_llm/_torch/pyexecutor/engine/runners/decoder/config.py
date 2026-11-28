@@ -67,3 +67,5 @@ class DecoderRunnerConfig(RunnerConfig):
     watermark_config: "WatermarkConfig | None" = field(default=None, kw_only=True)
     # The executor serves disaggregated (a cache transceiver is configured).
     is_disagg: bool = field(kw_only=True)
+    # The model opts into loads-first MTP staging, CUDA graph padding and admissions.
+    steady_decode_prepare: bool = field(default=False, kw_only=True)

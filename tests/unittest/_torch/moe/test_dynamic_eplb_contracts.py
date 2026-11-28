@@ -2158,6 +2158,11 @@ def test_on_autotune_uses_distinct_tactics():
         "token_tile",
     }
     assert any(tactic[2] is not None for tactic in on)
+    for sm_version in (100, 103):
+        blackwell = helpers["enumerate_megamoe_candidate_tactics"](
+            32, sm_version, load_balance=True
+        )
+        assert {helpers["_unpack_tactic"](tactic)[10] for tactic in blackwell} == {"expert"}
 
 
 def test_on_autotune_builds_balanced_powerlaw_input(request):

@@ -74,25 +74,39 @@ void launchMinimaxM3Fp8QKNormRopeKVInsert(void const* qkv_input, void* q_output,
 
 // MiniMax-M3 sparse producer for the packed [Q|K|V|index-Q|index-K]
 // projection. It uses a precomputed FP32 RoPE table, emits compact FP8 Q and
-// index-Q, and inserts main K/V plus index-K into their paged FP8 HND caches.
+// index-Q, and inserts main K/V plus index-K into their FP8 HND caches.
+//
+// out_cache_loc names each token's main K/V slot (page * page_size + offset, -1 to
+// skip) among num_pages pages; index_out_cache_loc names its index-K slot among
+// num_index_pages pages. The caller passes the same map for both when the caches
+// share one page space. The main cache may instead be a sparse cache arena, where a
+// page is an arena cell and V sits at a fixed cell offset from K (kv_plane_stride);
+// its slots then differ from the paged index-K slots, so the maps are separate. The
+// strides alone describe either layout to the kernel.
 void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
-    void* kv_cache, void* index_k_cache, int const* out_cache_loc, int64_t kv_page_stride, int64_t kv_plane_stride,
-    int64_t kv_head_stride, int64_t kv_token_stride, int64_t index_page_stride, int64_t index_token_stride,
-    int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
-    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
-    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream);
+    void* kv_cache, void* index_k_cache, int const* out_cache_loc, int const* index_out_cache_loc,
+    int64_t kv_page_stride, int64_t kv_plane_stride, int64_t kv_head_stride, int64_t kv_token_stride,
+    int64_t index_page_stride, int64_t index_token_stride, int64_t num_pages, int64_t num_index_pages, int page_size,
+    int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps,
+    void const* q_weight, void const* k_weight, void const* index_q_weight, void const* index_k_weight,
+    float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream);
 
 // MiniMax-M3 sparse horizontal producer for an NVFP4 main KV cache.  Q,
 // index-Q, and index-K remain FP8.  Main K/V are quantized directly from the
 // normalized/RoPE registers into packed E2M1 data plus E4M3 SF16 scales.
+//
+// The slot maps, page counts, and strides mean what they do for the FP8
+// producer above, including a sparse cache arena as the main cache. The data
+// and scale caches share out_cache_loc: a slot names the same page, or the same
+// arena cell, in both.
 void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
     void* kv_data_cache, void* kv_scale_cache, void* index_k_cache, int const* out_cache_loc,
-    float const* kv_quant_scale, int64_t data_page_stride, int64_t data_plane_stride, int64_t data_head_stride,
-    int64_t data_token_stride, int64_t scale_page_stride, int64_t scale_plane_stride, int64_t scale_head_stride,
-    int64_t index_page_stride, int64_t index_token_stride, int64_t num_pages, int page_size, int num_tokens,
-    int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps,
-    void const* q_weight, void const* k_weight, void const* index_q_weight, void const* index_k_weight,
-    float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream);
+    int const* index_out_cache_loc, float const* kv_quant_scale, int64_t data_page_stride, int64_t data_plane_stride,
+    int64_t data_head_stride, int64_t data_token_stride, int64_t scale_page_stride, int64_t scale_plane_stride,
+    int64_t scale_head_stride, int64_t index_page_stride, int64_t index_token_stride, int64_t num_pages,
+    int64_t num_index_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
+    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
+    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream);
 
 } // namespace kernels
 

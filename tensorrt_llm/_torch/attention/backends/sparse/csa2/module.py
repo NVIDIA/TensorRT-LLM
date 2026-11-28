@@ -63,6 +63,13 @@ def _lowm_tiles(n: int, rows: int) -> int:
     return 1
 
 
+def _lowm_query_mma_options(weight: torch.Tensor, rows: int) -> tuple[bool, bool] | None:
+    """Use BF16 dequantization for the small SM107 QAKV and Q-B projections."""
+    if get_sm_version() == 107 and 0 < rows <= 8 and weight.shape in ((1792, 5120), (4096, 1280)):
+        return True, False
+    return None
+
+
 # Per (device, stream): the fused context kernel's O-A input buffers, grown to the largest forward.
 # Each layer's attention kernel writes them and its O-A reads them on that stream before the next
 # layer's kernel writes them again.
@@ -192,6 +199,8 @@ class DeepseekV41Attention(nn.Module):
         self._query_done = torch.cuda.Event() if aux_stream is not None else None
         self._touch_done = torch.cuda.Event() if aux_stream is not None else None
         self._touch_sink = None
+        # The caller's all-reduce parameters for O-B's TP reduction, set for one forward.
+        self.o_b_all_reduce_params = None
         self._overlap_query_kv = True
         self._fuse_index_q = sparse_params.fuse_index_q
         if sparse_params.fuse_packed_output_rope and pos_embd_params.is_neox:
@@ -542,6 +551,7 @@ class DeepseekV41Attention(nn.Module):
                 split_n=self.wq_a.weight.shape[0],
                 scale_swizzled=True,
                 n_tiles=_lowm_tiles(self._fused_qkv_weight.shape[0], hidden_states.shape[0]),
+                mma_options=_lowm_query_mma_options(self._fused_qkv_weight, hidden_states.shape[0]),
             )
             return self._project_decode_query(
                 latent, swa, query_stream, late_stream=late_stream, fp8_query=fp8_query
@@ -838,6 +848,7 @@ class DeepseekV41Attention(nn.Module):
                         (self.q_norm.weight, self.q_norm.variance_epsilon) if norm_in_q_b else None
                     ),
                     n_tiles=_lowm_tiles(self.wq_b.weight.shape[0], latent.shape[0]),
+                    mma_options=_lowm_query_mma_options(self.wq_b.weight, latent.shape[0]),
                 )
             elif fused:
                 q = mxfp8_query_gemm(
@@ -1169,6 +1180,17 @@ class DeepseekV41Attention(nn.Module):
             and (depth // default_k_warps(depth)) % self.qk_head_dim == 0
         )
 
+    def _o_b(self, x: torch.Tensor) -> torch.Tensor:
+        """O-B with its TP reduction under the caller's all-reduce parameters."""
+        return self.o_b_proj(x, all_reduce_params=self.o_b_all_reduce_params)
+
+    def _reduce_o_b(self, projected: torch.Tensor) -> torch.Tensor:
+        """The TP reduction of an O-B output computed outside the module, as ``_o_b`` runs it."""
+        linear = self.o_b_proj
+        if not linear.reduce_output:
+            return projected
+        return linear.all_reduce(projected, all_reduce_params=self.o_b_all_reduce_params)
+
     def _project_output_small_m(self, output, positions):
         """O-A with inverse RoPE fused, then O-B, for a small step; None when not applicable."""
         rows = output.shape[0]
@@ -1222,11 +1244,11 @@ class DeepseekV41Attention(nn.Module):
                 ),
             )
             if not (quantize and self._lowm_projects(linear, rows)):
-                return linear(latent)
+                return self._o_b(latent)
             projected = mxfp8_lowm_linear(
                 latent, linear.weight, linear.weight_scale, scale_swizzled=True
             )
-            return linear.all_reduce(projected) if linear.reduce_output else projected
+            return self._reduce_o_b(projected)
         o_lora = inverse_rope_block128_small_m(
             output.reshape(rows, -1),
             positions,
@@ -1237,15 +1259,13 @@ class DeepseekV41Attention(nn.Module):
             quantize_output=quantize,
         )
         if not quantize:
-            return linear(o_lora)
+            return self._o_b(o_lora)
         projected = mxfp8_linear_quantized(
             linear,
             *o_lora,
             allowed_backends=projection_backends(rows, linear.mxfp8_allowed_backends),
         )
-        if linear.reduce_output:
-            projected = linear.all_reduce(projected)
-        return projected
+        return self._reduce_o_b(projected)
 
     def _project_output_mxfp8(self, output, positions, prequantized=None):
         """O-A as MXFP8 GEMMs with inverse RoPE fused into quantization, then O-B; else None.
@@ -1290,7 +1310,7 @@ class DeepseekV41Attention(nn.Module):
         if o_lora is None:
             return None
         if not quantize:
-            return linear(o_lora)
+            return self._o_b(o_lora)
         from .projection import mxfp8_linear_quantized, projection_backends
 
         return mxfp8_linear_quantized(
@@ -1331,9 +1351,7 @@ class DeepseekV41Attention(nn.Module):
             data, scale, self.o_a_proj, self.o_a_proj_scale.contiguous()
         )
         projected = mxfp8_linear_quantized(linear, *o_lora, cute_min_rows=1024, out=out)
-        if linear.reduce_output:
-            projected = linear.all_reduce(projected)
-        return projected
+        return self._reduce_o_b(projected)
 
     def _project_output(
         self, output, positions, *, inverse_rope_applied: bool = False, prequantized=None, out=None
@@ -1343,19 +1361,21 @@ class DeepseekV41Attention(nn.Module):
             if projected is not None:
                 return projected
             return project_sparse_attn_output(
-                self, [output.flatten(1)], positions, prequantized=prequantized
+                self, [output.flatten(1)], positions, prequantized=prequantized, o_b=self._o_b
             )
         if self._o_a_fp8_block128 and inverse_rope_applied:
             raise ValueError("Grouped 128-block FP8 owns its fused inverse-RoPE/quantization")
         if self.projection_quantization == "bf16":
             if not inverse_rope_applied:
-                return project_sparse_attn_output(self, [output.flatten(1)], positions)
+                return project_sparse_attn_output(
+                    self, [output.flatten(1)], positions, o_b=self._o_b
+                )
             grouped = output.reshape(output.shape[0], self.n_local_groups, -1)
             latent = output.new_empty((output.shape[0], self.n_local_groups, self.o_lora_rank))
             torch.ops.trtllm.bmm_out(
                 grouped.transpose(0, 1), self.o_a_proj.transpose(1, 2), latent.transpose(0, 1)
             )
-            return self.o_b_proj(latent.flatten(1))
+            return self._o_b(latent.flatten(1))
         if self._o_a_fp8_block128:
             projected = self._project_output_small_m(output, positions)
             if projected is None:
@@ -1364,7 +1384,7 @@ class DeepseekV41Attention(nn.Module):
                 return projected
             # Preserve the existing inverse-RoPE/quantization/BMM path when
             # its 128-block contract fits; the packed reducer does not rotate.
-            return project_sparse_attn_output(self, [output.flatten(1)], positions)
+            return project_sparse_attn_output(self, [output.flatten(1)], positions, o_b=self._o_b)
         if self.o_a_proj_scale is None:
             raise RuntimeError("Load CSA2 native grouped projection scales before forward")
         if output.shape[0] == 0:
@@ -1398,7 +1418,7 @@ class DeepseekV41Attention(nn.Module):
                     self.dtype,
                 )
             projections.append(projection)
-        return self.o_b_proj(torch.cat(projections, dim=-1))
+        return self._o_b(torch.cat(projections, dim=-1))
 
     @property
     def supports_row_split(self) -> bool:

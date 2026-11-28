@@ -448,3 +448,99 @@ def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay() -> None:
     assert torch.equal(data_cache, reference_data)
     assert torch.equal(scale_cache, reference_scale)
     assert torch.equal(index_cache.view(torch.uint8), reference_index.view(torch.uint8))
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 4])
+def test_minimax_m3_nvfp4_horizontal_producer_independent_offload_slots(num_kv_heads: int) -> None:
+    """Graph replay writes data and scale arena cells independently of index history pages."""
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 quantization requires Blackwell")
+
+    torch.manual_seed(9321)
+    tokens, q_heads, main_pages, index_pages = 8, 8, 3, 7
+    width = (q_heads + 3 * num_kv_heads + 1) * 128
+    packed = torch.randn(tokens, width, dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(tokens, dtype=torch.int32, device="cuda")
+    inv_scales = torch.tensor([1.0, 1.25, 0.75], dtype=torch.float32, device="cuda")
+    weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
+    rope = _rope_cache(256)
+    main_slots = torch.tensor([0, 128, 257, -1, 9, 384, 127, 300], dtype=torch.int32, device="cuda")
+    index_slots = torch.tensor(
+        [521, 2, -1, 777, 345, 896, 127, 640], dtype=torch.int32, device="cuda"
+    )
+    # Each arena stores K cells followed by V cells, with one cell per page.
+    data_arena = torch.zeros(2, main_pages, num_kv_heads, 128, 64, dtype=torch.uint8, device="cuda")
+    scale_arena = torch.zeros(2, main_pages, num_kv_heads, 128, 8, dtype=torch.uint8, device="cuda")
+    data_cache = data_arena.permute(1, 0, 2, 3, 4)
+    scale_cache = scale_arena.permute(1, 0, 2, 3, 4)
+    index_cache = _nvfp4_caches(index_pages, num_kv_heads)[2]
+    operation = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert
+
+    def run(data, scales, index, main_map, index_map=None, arena=False):
+        return operation(
+            packed,
+            data,
+            scales,
+            index,
+            main_map,
+            inv_scales,
+            q_heads,
+            num_kv_heads,
+            num_kv_heads,
+            128,
+            64,
+            1e-5,
+            *weights,
+            rope,
+            positions,
+            index_out_cache_loc=index_map,
+            kv_cache_is_arena=arena,
+        )
+
+    run(data_cache, scale_cache, index_cache, main_slots, index_slots, arena=True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        q, index_q = run(data_cache, scale_cache, index_cache, main_slots, index_slots, arena=True)
+
+    for replay in range(2):
+        packed.copy_(torch.randn_like(packed))
+        positions.add_(11)
+        if replay:
+            main_slots.copy_(torch.roll(main_slots, 1))
+            index_slots.copy_(torch.roll(index_slots, 3))
+        data_cache.zero_()
+        scale_cache.zero_()
+        index_cache.zero_()
+        # Paged pools that share one slot map hold what the arenas and the index cache should.
+        reference_data, reference_scales, main_index = _nvfp4_caches(main_pages, num_kv_heads)
+        index_data, index_scales, reference_index = _nvfp4_caches(index_pages, num_kv_heads)
+        reference_q, _ = run(reference_data, reference_scales, main_index, main_slots)
+        _, reference_index_q = run(index_data, index_scales, reference_index, index_slots)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(q.view(torch.uint8), reference_q.view(torch.uint8))
+        assert torch.equal(index_q.view(torch.uint8), reference_index_q.view(torch.uint8))
+        assert torch.equal(data_cache, reference_data)
+        assert torch.equal(scale_cache, reference_scales)
+        assert torch.equal(index_cache.view(torch.uint8), reference_index.view(torch.uint8))
+
+    with pytest.raises(RuntimeError, match="index_out_cache_loc"):
+        run(data_cache, scale_cache, index_cache, main_slots, index_slots[:1], arena=True)
+    # Separate index slots do not admit overlapping K/V planes; only the arena flag does.
+    with pytest.raises(RuntimeError, match="data cache planes or pages overlap"):
+        run(data_cache, scale_cache, index_cache, main_slots, index_slots)
+    with pytest.raises(RuntimeError, match="kv_cache_is_arena requires index_out_cache_loc"):
+        run(
+            data_cache,
+            scale_cache,
+            _nvfp4_caches(main_pages, num_kv_heads)[2],
+            main_slots,
+            arena=True,
+        )
+    # Data and scales share each slot, so they must be arenas together.
+    scale_pool = _nvfp4_caches(main_pages, num_kv_heads)[1]
+    with pytest.raises(RuntimeError, match="both be paged pools or both be cell arenas"):
+        run(data_cache, scale_pool, index_cache, main_slots, index_slots, arena=True)

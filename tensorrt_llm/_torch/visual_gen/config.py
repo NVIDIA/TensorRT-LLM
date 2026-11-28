@@ -631,7 +631,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         runtime_lora_cfg = args.runtime_lora_config if args else None
         enable_layerwise_nvtx_marker = bool(args.enable_layerwise_nvtx_marker) if args else False
 
-        from .pipeline_registry import PipelineComponent
+        from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
@@ -652,9 +652,10 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             with open(model_index_path) as f:
                 model_index = json.load(f)
 
+        family = model_index.get("_class_name")
         h3_workflow = None
-        if model_index.get("_class_name") == "MiniMaxH3ModularPipeline" or (
-            model_index.get("_class_name") is None
+        if family == "MiniMaxH3ModularPipeline" or (
+            family is None
             and model_index.get("transformer") == ["diffusers", "MiniMaxH3Transformer3DModel"]
         ):
             h3_workflow = resolved_pipeline_config.get("workflow")
@@ -811,17 +812,18 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             vae_conv_dynamic_weight_quant = None
             vae_conv_dynamic_activation_quant = None
 
-        # Enable tunable FP4 quantize for visual gen: larger activation
-        # tensors (full image/video latents) amortize the AutoTuner overhead.
-        if QuantAlgo.NVFP4 in transformer_quant_algos:
-            from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
+        entry = PIPELINE_REGISTRY.get(family)
+        h3_v2 = family == "MiniMaxH3ModularPipeline" and entry is not None and entry.opt_in_enabled
+        if not h3_v2:
+            if QuantAlgo.NVFP4 in transformer_quant_algos:
+                from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 
-            NVFP4LinearMethod.use_tunable_quantize = True
+                NVFP4LinearMethod.use_tunable_quantize = True
 
-        if QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN in transformer_quant_algos:
-            from tensorrt_llm._torch.modules.linear import FP8RowwiseLinearMethod
+            if QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN in transformer_quant_algos:
+                from tensorrt_llm._torch.modules.linear import FP8RowwiseLinearMethod
 
-            FP8RowwiseLinearMethod.use_tunable_quantize = True
+                FP8RowwiseLinearMethod.use_tunable_quantize = True
 
         attention_metadata_state = (
             create_attention_metadata_state()

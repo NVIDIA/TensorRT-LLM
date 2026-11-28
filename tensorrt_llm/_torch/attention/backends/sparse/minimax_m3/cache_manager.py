@@ -24,14 +24,17 @@ Provides:
     their own virtual attention-op pools.
   * :class:`MiniMaxM3DraftKVCacheView` — FP8/P128 view of the shared Eagle3
     draft layer when the target KV cache is NVFP4.
+  * :class:`MiniMaxM3SparseOffloadMixin` — host-backed sparse K/V history
+    for KV cache offload, read through the sparse cache arena.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import os
+from collections.abc import Iterator
+from copy import copy
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -44,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _BasePageTableMaterializer,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -59,18 +63,27 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
+    AttentionLayerConfig,
     BufferConfig,
+    BufferId,
     DataRole,
+    KVCacheManagerConfig,
+    LayerId,
     PageIndexMode,
 )
 
+from ..offload import (
+    SPARSE_OFFLOAD_STATE_COPIES,
+    SparseOffloadCacheMixin,
+    SparseOffloadLayerDescriptor,
+)
 from .common import get_sparse_layer_ids
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, MiniMaxM3SparseAttentionConfig
 
 
 class MiniMaxM3SparseIndexCache:
@@ -308,7 +321,202 @@ def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:
         )
 
 
-class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
+# NVFP4 block-scale roles, which only sparse layers carry.
+_M3_SCALE_ROLES = frozenset({Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE})
+# A sparse layer's main K/V roles, the ones offload keeps in host memory.
+_M3_SPARSE_MAIN_ROLES = frozenset({Role.KEY, Role.VALUE}) | _M3_SCALE_ROLES
+
+# Token write slots are int32 ``cell * tokens_per_block + offset``, so a layer's K
+# arena may hold at most this many tokens.
+_MAX_SPARSE_ARENA_TOKEN_SLOTS = 2**31
+
+
+class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
+    """Keep dense layers and index keys resident while offloading sparse K/V blocks.
+
+    An offloaded layer's K/V history lives in host-backed pools, so the layer has
+    no page-indexed GPU view: ``get_buffers`` and ``get_block_scale_buffers``
+    return None for it, as page-indexed consumers expect of host-backed layers.
+    Attention reads the layer's selected history through
+    ``get_sparse_arena_buffers``, whose rows are sparse cache arena cells.
+    """
+
+    _m3_offloaded_layer_ids: frozenset[int] = frozenset()
+    # A head-major page holds one chunk per KV head, so the fetch moves only the heads that read a unit.
+    _sparse_offload_unit_masks: bool = True
+
+    def _init_m3_sparse_offload(self, config: MiniMaxM3SparseAttentionConfig | None) -> None:
+        sizing = None if config is None else config.get_kv_cache_offload_config()
+        self._init_sparse_offload(enabled=sizing is not None, topk=None)
+        self._m3_topk_blocks = 0 if config is None else config.sparse_topk_blocks
+        self._m3_offload_descriptors: dict[int, SparseOffloadLayerDescriptor] | None = None
+        self._m3_arena_views: dict[tuple[int, bool], torch.Tensor] = {}
+        # Each physical arena as {base address: bytes}. The layer views alias one another,
+        # since every one starts at its pool's base and spans the whole pool.
+        self._m3_arena_regions: dict[int, int] = {}
+
+    def _set_m3_offloaded_layers(self, sparse_layer_ids: Sequence[int]) -> None:
+        self._m3_offloaded_layer_ids = (
+            frozenset(sparse_layer_ids) if self._enable_kv_cache_offload else frozenset()
+        )
+
+    def offloads_layer(self, layer_idx: int) -> bool:
+        return layer_idx in self._m3_offloaded_layer_ids
+
+    def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
+        config = super()._build_cache_config(config)
+        if not self._enable_kv_cache_offload:
+            return config
+        if self.tokens_per_block != 128:
+            raise ValueError("MiniMax-M3 KV cache offload requires 128-token pages")
+        if self.dtype not in (DataType.FP8, DataType.NVFP4, DataType.BF16, DataType.HALF):
+            raise ValueError(f"Unsupported MiniMax-M3 offload KV dtype: {self.dtype}")
+        heads = {
+            self.num_kv_heads_per_layer[self.layer_offsets[layer]]
+            for layer in self.sparse_layer_ids
+            if layer in self.layer_offsets
+        }
+        if len(heads) != 1:
+            raise ValueError("MiniMax-M3 offload requires uniform sparse-layer KV head counts")
+        local_heads = heads.pop()
+        self._sparse_offload_topk = self._m3_topk_blocks * local_heads
+        layers = []
+        for layer in config.layers:
+            if not isinstance(layer, AttentionLayerConfig) or not self.offloads_layer(
+                self.pp_layers[int(layer.layer_id)]
+            ):
+                layers.append(layer)
+                continue
+            sparse_layer = copy(layer)
+            buffers = []
+            for buffer in layer.buffers:
+                sparse_buffer = copy(buffer)
+                if buffer.role in _M3_SPARSE_MAIN_ROLES:
+                    sparse_buffer.is_sparse = True
+                    sparse_buffer.sparse_unit_chunks = local_heads
+                    sparse_buffer.sparse_write_back_granularity = (
+                        4 if buffer.role == Role.VALUE_BLOCK_SCALE else 1
+                    )
+                buffers.append(sparse_buffer)
+            sparse_layer.buffers = buffers
+            sparse_layer.sparse_cache = sparse_cache_config(
+                num_selected_units=self._sparse_offload_topk,
+                unit_tokens=self.tokens_per_block,
+                tokens_per_block=self.tokens_per_block,
+                gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
+                include_partial_units=True,
+            )
+            layers.append(sparse_layer)
+        return replace(config, layers=layers)
+
+    def get_sparse_offload_descriptors(self) -> dict[int, SparseOffloadLayerDescriptor]:
+        if self._m3_offload_descriptors is None:
+            layout = self._sparse_arena_layout()
+            descriptors = {
+                layer: replace(
+                    self._build_sparse_offload_descriptor(
+                        layout,
+                        self.layer_offsets[layer],
+                        Role.KEY,
+                        unit_tokens=self.tokens_per_block,
+                        scale_role=Role.KEY_BLOCK_SCALE if self.is_nvfp4_layer(layer) else None,
+                        name=f"MiniMax-M3 layer {layer}",
+                    ),
+                    padding_regions=(),
+                )
+                for layer in self.pp_layers
+                if self.offloads_layer(layer)
+            }
+            for layer, descriptor in descriptors.items():
+                cells = descriptor.arena_row_counts[descriptor.data_buffer_index]
+                if cells * descriptor.unit_tokens > _MAX_SPARSE_ARENA_TOKEN_SLOTS:
+                    raise ValueError(
+                        f"MiniMax-M3 KV cache offload: layer {layer}'s sparse cache arena has "
+                        f"{cells} cells of {descriptor.unit_tokens} tokens, but token write "
+                        "slots are int32 and address at most "
+                        f"{_MAX_SPARSE_ARENA_TOKEN_SLOTS // descriptor.unit_tokens} cells. "
+                        "Lower max_batch_size or "
+                        "sparse_attention_config.kv_cache_offload_config.gpu_cache_factor."
+                    )
+            self._m3_offload_descriptors = descriptors
+        return self._m3_offload_descriptors
+
+    def get_sparse_arena_buffers(
+        self, layer_idx: int, kv_layout: Optional[str] = None, *, scales: bool = False
+    ) -> torch.Tensor:
+        """Return an offloaded layer's K/V arena view, or its NVFP4 scale arena view.
+
+        The view is ``[cells, 2, heads, tokens_per_block, dim]`` for HND and swaps
+        the head and token dimensions for NHD. It is indexed by arena cell: the
+        layer's write slots and sparse block table name cells, not KV pages.
+        """
+        if not self.offloads_layer(layer_idx):
+            raise ValueError(f"MiniMax-M3 layer {layer_idx} is resident and has no sparse arena")
+        view = self._m3_sparse_arena_view(layer_idx, scales=scales)
+        return view.transpose(2, 3) if kv_layout == "NHD" else view
+
+    def _m3_sparse_arena_view(self, layer_idx: int, *, scales: bool = False) -> torch.Tensor:
+        """A strided [arena pages, K/V, heads, 128, dim] view addressed by K's indices.
+
+        Each lease stores all K cells followed by all V cells. Their displacement
+        is constant across leases, so both planes can use K's returned page index.
+        NVFP4 scale arenas have the same buffer positions as their data arenas.
+        """
+        key = (layer_idx, scales)
+        if key in self._m3_arena_views:
+            return self._m3_arena_views[key]
+        descriptor = self.get_sparse_offload_descriptors()[layer_idx]
+        layout = self._sparse_arena_layout()
+        local = self.layer_offsets[layer_idx]
+        k_role, v_role = (
+            (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE) if scales else (Role.KEY, Role.VALUE)
+        )
+        k_id, v_id = BufferId(local, k_role), BufferId(local, v_role)
+        k_index, v_index = descriptor.buffer_ids.index(k_id), descriptor.buffer_ids.index(v_id)
+        if layout.pool_indices[k_id] != layout.pool_indices[v_id]:
+            raise ValueError("MiniMax-M3 sparse K/V must share one arena pool")
+        if scales and layout.positions[v_id] != layout.positions[BufferId(local, Role.VALUE)]:
+            raise ValueError("MiniMax-M3 value data and scales must have matching arena indices")
+        units = layout.max_units_by_group[descriptor.group_id]
+        offset = (layout.positions[v_id][1] - layout.positions[k_id][1]) * units
+        if (
+            offset <= 0
+            or descriptor.arena_base_addresses[k_index] != descriptor.arena_base_addresses[v_index]
+        ):
+            raise ValueError("MiniMax-M3 sparse value cells must follow key cells")
+        heads = self.num_kv_heads_per_layer[local]
+        dim = self.head_dim_per_layer[local]
+        if scales:
+            dim, dtype = dim // 16, torch.uint8
+        elif self.is_nvfp4_layer(layer_idx):
+            dim, dtype = dim // 2, torch.int8
+        else:
+            dtype = binding_to_torch_dtype(self.dtype)
+        page = self.tokens_per_block
+        elements = heads * page * dim
+        shape = (descriptor.arena_row_counts[k_index] - offset, 2, heads, page, dim)
+        strides = (elements, offset * elements, page * dim, dim, 1)
+        base = descriptor.arena_base_addresses[k_index]
+        view = convert_to_torch_tensor(TensorWrapper(base, dtype, shape, strides=strides))
+        self._m3_arena_views[key] = view
+        self._m3_arena_regions[base] = (
+            descriptor.arena_row_counts[k_index] * elements * view.element_size()
+        )
+        return view
+
+    def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfig) -> int:
+        shared = super().get_sparse_offload_scratch_bytes(config)
+        if not shared:
+            return 0
+        # Deduplicated per-head selections, write slots, request IDs, unit lengths,
+        # and the logical-block to arena-page table, for eager and graph metadata.
+        entries = self.max_batch_size * (
+            self._sparse_offload_topk + 3 + self._get_max_blocks_per_seq(self.max_seq_len)
+        )
+        return shared + SPARSE_OFFLOAD_STATE_COPIES * entries * torch.int32.itemsize
+
+
+class MiniMaxM3KVCacheManagerV2(MiniMaxM3SparseOffloadMixin, KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
 
@@ -379,6 +587,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # sparse_index_dim authoritative for the cache layout.
         # Peeked (not popped) so the base __init__ still receives them.
         sparse_attention_config = kwargs.get("sparse_attention_config")
+        self._init_m3_sparse_offload(sparse_attention_config)
+        if self._enable_kv_cache_offload:
+            kwargs["sparse_kv_offload_config"] = (
+                sparse_attention_config.get_kv_cache_offload_config()
+            )
         num_layers = kwargs.get("num_layers")
         implementation = getattr(sparse_attention_config, "implementation", "triton")
         self._main_kv_view_layout = "HND" if implementation == "msa" else "NHD"
@@ -429,6 +642,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # ``_build_base_config`` invokes ``_extra_buffers_per_layer``
         # which reads these attributes.
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
+        self._set_m3_offloaded_layers(self.sparse_layer_ids)
         if implementation == "triton" and native_dense_cache and num_target_layers is not None:
             self._dense_native_layer_ids = tuple(
                 i
@@ -463,7 +677,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if layer_specs is not None and kwargs.get("dtype") == DataType.NVFP4:
             # The hybrid layout of _build_cache_config as specs: FP8 on the dense target layers.
             kwargs["layer_specs"] = tuple(
-                dataclasses.replace(spec, dtype=DataType.FP8, buffer_roles=(Role.KEY, Role.VALUE))
+                replace(spec, dtype=DataType.FP8, buffer_roles=(Role.KEY, Role.VALUE))
                 if spec.owner is KVCacheLayerOwner.TARGET
                 and spec.dtype == DataType.NVFP4
                 and spec.global_layer_id not in self.sparse_layer_ids
@@ -543,8 +757,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 )
         # Resolve the K/V and NVFP4 scale views once too: the forward fetches them every step.
         for layer_idx in self.layer_offsets:
+            nvfp4 = self.is_nvfp4_layer(layer_idx)
+            if self.offloads_layer(layer_idx):
+                self.get_sparse_arena_buffers(layer_idx, kv_layout)
+                if nvfp4:
+                    self.get_sparse_arena_buffers(layer_idx, kv_layout, scales=True)
+                continue
             self._kv_buffers[layer_idx, kv_layout] = self.get_buffers(layer_idx, kv_layout)
-            if self.is_nvfp4_layer(layer_idx):
+            if nvfp4:
                 self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
                     layer_idx, kv_layout
                 )
@@ -552,8 +772,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
             # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
             # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
-            # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
-            # byte a kernel writes is unchanged.
+            # own manager), the NVFP4 block scales, the sparse cache arenas and the paged index keys once, before
+            # any request runs: every byte a kernel writes is unchanged.
             for view in (
                 *self._kv_buffers.values(),
                 *self._block_scale_buffers.values(),
@@ -561,6 +781,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             ):
                 if view is not None:
                     view.zero_()
+            # Every offloaded layer's arena view spans its whole pool, with overlapping K and V
+            # planes, so each physical arena is cleared once as one contiguous byte range.
+            for base, nbytes in self._m3_arena_regions.items():
+                convert_to_torch_tensor(TensorWrapper(base, torch.uint8, [nbytes])).zero_()
 
     @staticmethod
     def main_kv_is_head_major(sparse_attention_config: Any, dtype: Optional[DataType]) -> bool:
@@ -587,27 +811,30 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
 
     def _build_cache_config(self, config):
-        """Use NVFP4 only on MSA sparse layers and FP8 on dense/Eagle layers.
-
-        M3's 57 sparse target layers have a native MSA NVFP4 consumer.  The
-        three dense target layers and the appended one-model Eagle layer do
-        not have a matching TRTLLM-Gen NVFP4 cubin, so those buffers retain
-        the proven FP8 representation.
-        """
-        if self.dtype != DataType.NVFP4:
-            return super()._build_cache_config(config)
-
-        scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+        """Keep dense and Eagle layers in FP8 when sparse layers use NVFP4."""
+        layers = []
         for layer in config.layers:
-            if int(self.pp_layers[int(layer.layer_id)]) in self.sparse_layer_ids:
-                continue
-            layer.buffers[:] = [
-                buffer for buffer in layer.buffers if buffer.role not in scale_roles
-            ]
-        return super()._build_cache_config(config)
+            dense = int(self.pp_layers[int(layer.layer_id)]) not in self.sparse_layer_ids
+            if self.dtype == DataType.NVFP4 and dense:
+                layer = copy(layer)
+                layer.buffers = [
+                    buffer for buffer in layer.buffers if buffer.role not in _M3_SCALE_ROLES
+                ]
+            layers.append(layer)
+        return super()._build_cache_config(replace(config, layers=layers))
+
+    def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole) -> tuple:
+        """Match resident and offloaded transfer views without splitting resident pools."""
+        sparse_main = (
+            int(self.pp_layers[int(layer_id)]) in self.sparse_layer_ids
+            and role in _M3_SPARSE_MAIN_ROLES
+        )
+        return super().get_disagg_pool_view_partition(layer_id, role), sparse_main
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
+        if data_role == Role.ALL and self.offloads_layer(self.pp_layers[local_layer_idx]):
+            return self._index_k_bytes_per_token()
         global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
         has_index_k = global_layer_idx in self.sparse_layer_ids
         if data_role == Role.INDEX_KEY:
@@ -637,12 +864,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         return cache_bytes
 
     def get_cache_bytes_per_token(self) -> int:
-        """Bytes per token across the local layers, the sparse layers' index-K included.
-
-        The base sums the K/V roles only; the per-sparse-layer ``Role.INDEX_KEY``
-        buffers live in the same tiers, so the cache-created event's block count
-        divides each tier quota by this total. Layer specs carry no index-K either.
-        """
+        """GPU pool bytes per token, including index keys and excluding offloaded history."""
+        if self._enable_kv_cache_offload:
+            return sum(
+                self.get_layer_bytes_per_token(layer, Role.ALL)
+                for layer in range(self.num_local_layers)
+            )
         return super().get_cache_bytes_per_token() + sum(
             self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
             for local_layer_idx in range(self.num_local_layers)
@@ -1187,6 +1414,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
 
         Explicit draft layers keep the base view: their own lifecycle's pool holds only their K/V.
+        A layer whose history is offloaded to host memory has no paged GPU view and returns None;
+        :meth:`get_sparse_arena_buffers` gives the arena its attention reads.
         """
         if self.layer_specs is not None and self.get_layer_owner(layer_idx) is (
             KVCacheLayerOwner.DRAFT
@@ -1198,6 +1427,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kv_layout = self._main_kv_view_layout
         if kv_layout not in ("HND", "NHD"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+        if self.offloads_layer(layer_idx):
+            return None
         view = self._kv_buffers.get((layer_idx, kv_layout))
         if view is not None:
             return view
@@ -1333,8 +1564,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def get_block_scale_buffers(
         self, layer_idx: int, kv_layout: Optional[str] = None
-    ) -> torch.Tensor:
-        """Return paged NVFP4 K+V E4M3 scale-byte views for ``layer_idx``."""
+    ) -> Optional[torch.Tensor]:
+        """Return paged NVFP4 K+V E4M3 scale-byte views for ``layer_idx``.
+
+        None for an offloaded layer, like :meth:`get_buffers`.
+        """
+        if self.offloads_layer(layer_idx):
+            return None
         view = self._block_scale_buffers.get((layer_idx, kv_layout or self._main_kv_layout_name()))
         if view is not None:
             return view

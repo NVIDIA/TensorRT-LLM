@@ -940,8 +940,8 @@ class TestInflightPrefixWait:
         reqs = [owner, self.make_request(1)]
         for _ in range(2):
             sched.schedule_request(reqs, {owner.request_id})
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request(reqs, {owner.request_id})
+        out = sched.schedule_request(reqs, {owner.request_id})
+        assert ids(out.failed_requests) == [1]
 
     def test_pipeline_ranks_agree_on_each_wait_through_its_expiry(self):
         """Under attention DP with pipeline parallelism, the first PP rank of
@@ -2821,7 +2821,7 @@ class TestDeadlockDetection:
     burns a job's whole wall clock.
     """
 
-    def test_raises_after_repeated_stalls_with_context_candidates(self):
+    def test_fails_requests_after_repeated_stalls_with_context_candidates(self):
         """A prefill-only worker has no generation requests to count."""
         mgr = make_kv_cache_manager(
             resize_context_fn=lambda req, n: False,
@@ -2833,10 +2833,10 @@ class TestDeadlockDetection:
 
         for _ in range(2):
             sched.schedule_request(reqs, set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request(reqs, set())
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.failed_requests) == [req.py_request_id for req in reqs]
 
-    def test_raises_after_repeated_stalls_with_generation_candidates(self):
+    def test_fails_requests_after_repeated_stalls_with_generation_candidates(self):
         mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         sched._DEADLOCK_STALL_ITERS = 3
@@ -2846,8 +2846,51 @@ class TestDeadlockDetection:
 
         for _ in range(3):
             sched.schedule_request(reqs, set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request(reqs, set())
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.failed_requests) == [req.py_request_id for req in reqs]
+
+    def test_two_context_init_failures_do_not_poison_the_next_request(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: req.py_request_id == 2,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 2
+        blocked = [make_ctx_request(0, 100), make_ctx_request(1, 100)]
+        assert sched.schedule_request(blocked, set()).failed_requests == []
+        assert ids(sched.schedule_request(blocked, set()).failed_requests) == [1]
+        # One victim per window; the older context retains its opportunity.
+        assert sched.schedule_request(blocked[:1], set()).failed_requests == []
+        assert ids(sched.schedule_request(blocked[:1], set()).failed_requests) == [0]
+        healthy = make_ctx_request(2, 100)
+        out = sched.schedule_request([healthy], set())
+        assert ids(out.context_requests) == [2]
+        assert out.failed_requests == []
+
+    def test_starved_contexts_remain_candidates_and_only_newest_holder_fails(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False, has_cache_tier_below_gpu=False
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(None, 16),
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+            context_starvation_iterations=1,
+            enable_recompute_pause=False,
+        )
+        sched._DEADLOCK_STALL_ITERS = 4
+        older = make_ctx_request(0, 100, prompt_len=116, is_first_context_chunk=False)
+        newest = make_ctx_request(1, 100, prompt_len=116, is_first_context_chunk=False)
+        # These are partial prefills with KV already owned. A fresh arrival
+        # must not be sacrificed while these page holders remain stranded.
+        older.context_current_position = newest.context_current_position = 16
+        fresh = make_ctx_request(2, 100)
+        reqs = [older, newest, fresh]
+        for _ in range(3):
+            assert sched.schedule_request(reqs, set()).failed_requests == []
+        assert older.py_ctx_sched_since_iter is not None
+        assert ids(sched.schedule_request(reqs, set()).failed_requests) == [1]
 
     def test_transient_stall_does_not_raise(self):
         """One bad iteration is normal; the counter has to reset."""
@@ -2929,8 +2972,8 @@ class TestDeadlockDetection:
         # full, so the stall is now the scheduler's to report.
         for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
             sched.schedule_request([blocked], set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request([blocked], set())
+        out = sched.schedule_request([blocked], set())
+        assert ids(out.failed_requests) == [blocked.py_request_id]
 
     def test_inflight_send_that_left_active_list_is_not_a_deadlock(self):
         """A sender off the active list but still in flight is not a deadlock.
@@ -3000,8 +3043,24 @@ class TestDeadlockDetection:
 
         for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
             sched.schedule_request([blocked], set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request([blocked], set())
+        out = sched.schedule_request([blocked], set())
+        assert ids(out.failed_requests) == [blocked.py_request_id]
+
+    def test_filtered_held_receive_prevents_false_capacity_failures(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False, has_cache_tier_below_gpu=False
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        held = {7}
+        sched.set_retiring_gen_receives_probe(lambda: bool(held))
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+        for _ in range(6):
+            assert sched.schedule_request([blocked], set()).failed_requests == []
+        held.clear()
+        for _ in range(2):
+            assert sched.schedule_request([blocked], set()).failed_requests == []
+        assert ids(sched.schedule_request([blocked], set()).failed_requests) == [0]
 
     @pytest.mark.parametrize("pages_available_after_retirement", [False, True])
     def test_cancelled_receive_holds_pages_only_until_retirement(
@@ -3039,8 +3098,8 @@ class TestDeadlockDetection:
             with patch(
                 "tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger.warning"
             ) as warning:
-                with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-                    sched.schedule_request([blocked], set())
+                out = sched.schedule_request([blocked], set())
+                assert ids(out.failed_requests) == [blocked.py_request_id]
             warning.assert_called_once()
             assert "local_retiring_gen_receives=False" in warning.call_args.args[0]
 
@@ -3103,6 +3162,26 @@ class TestPEFT:
             engine.active_requests.remove(held)
         batch, _, _ = engine._schedule()
         assert ids(batch.context_requests) == [2, 1]
+
+    @pytest.mark.parametrize("resident", [False, True])
+    @pytest.mark.parametrize("transfer_held", [False, True])
+    def test_inflight_transfer_only_claims_device_resident_adapter(self, resident, transfer_held):
+        peft = make_peft_cache_manager(max_device_pages=1, pages_per_task=1)
+        peft.is_task_cached_device = lambda task_id: resident and task_id == 10
+        sched = make_scheduler(make_kv_cache_manager(), peft_cache_manager=peft)
+        held = (
+            make_ctx_request(0, 100, is_first_context_chunk=False, lora_task_id=10)
+            if resident
+            else make_disagg_request(0, lora_task_id=10)
+        )
+        other = make_ctx_request(1, 100, lora_task_id=20)
+        if transfer_held:
+            sched.set_transfer_held_requests([held])
+            out = sched.schedule_request([other], set())
+        else:
+            out = sched.schedule_request([held, other], {held.request_id})
+        assert ids(out.context_requests) == ([] if resident else [1])
+        assert out.fitting_disagg_gen_init_requests == []
 
     def test_no_peft_manager(self):
         mgr = make_kv_cache_manager()

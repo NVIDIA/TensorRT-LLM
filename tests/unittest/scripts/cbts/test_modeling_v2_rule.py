@@ -65,7 +65,16 @@ def rule(tmp_path) -> ModelingV2Rule:
             condition={},
             tests=[_COMM, _DEEPSEEK_ACCURACY],
         ),
-        Block(yaml_stem="l0_b200", block_index=0, condition={}, tests=[_NATIVE_UNIT]),
+        Block(
+            yaml_stem="l0_b200",
+            block_index=0,
+            condition={},
+            tests=[
+                _NATIVE_UNIT,
+                "unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_modeling_v2_op.py",
+                "visual_gen/modeling_v2/minimax_h3/fasth3/test_modeling_v2_target.py",
+            ],
+        ),
         Block(yaml_stem="l0_cpu", block_index=0, condition={}, tests=["unittest/tools", _TREE]),
     ]
     stages = {
@@ -124,6 +133,8 @@ def test_claims_and_families():
         f"{_CPP}/README.md",
         "cpp/tensorrt_llm/thop/attentionOp.cpp",
         "tensorrt_llm/_torch/pyexecutor/model_loader.py",
+        "tensorrt_llm/_torch/visual_gen/modeling_v2/catalog/attention/attention.py",
+        "tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/pipeline_registry.py",
     ):
         assert not _is_mv2_claim(path), path
 

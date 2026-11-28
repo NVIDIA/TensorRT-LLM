@@ -85,9 +85,9 @@ class TokenCommCtaMainloop:
         if (warp_idx >= Int32(self.dispatch_warp_start)) & (
             warp_idx < Int32(self.dispatch_warp_start + self.dispatch_warp_count)
         ):
-            TokenCommNonDeterministic.token_in(self.token_comm, smem_workspace, smem_base)
+            self.token_comm.token_in(smem_workspace, smem_base)
         elif cutlass.const_expr(not self.token_back_on_compute_ctas):
             if (warp_idx >= Int32(self.combine_warp_start)) & (
                 warp_idx < Int32(self.combine_warp_start + self.combine_warp_count)
             ):
-                TokenCommNonDeterministic.token_back(self.token_comm, smem_workspace, smem_base)
+                self.token_comm.token_back(smem_workspace, smem_base)

@@ -246,4 +246,8 @@ def _verify_pinned_hardware_encoding() -> None:
 _verify_pinned_hardware_encoding()
 
 
-__all__ = ["CombineFormat", "QuantKind"]
+# The fused shared expert runs mxfp8 x mxfp8 in either fp8 flavour; no other kind has a shared path.
+SHARED_QUANT_KINDS = frozenset({QuantKind.mxfp8_e4m3.value, QuantKind.mxfp8_e5m2.value})
+
+
+__all__ = ["CombineFormat", "QuantKind", "SHARED_QUANT_KINDS"]

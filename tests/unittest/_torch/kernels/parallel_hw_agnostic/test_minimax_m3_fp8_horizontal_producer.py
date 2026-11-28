@@ -355,3 +355,80 @@ def test_minimax_m3_horizontal_producer_rejects_non_vector_norm_weight(
             _rope_cache(1),
             positions,
         )
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 4])
+def test_horizontal_producer_independent_offload_slots(num_kv_heads: int) -> None:
+    """Graph replay addresses main arena cells independently of index history pages."""
+    torch.manual_seed(9321)
+    tokens, q_heads, main_pages, index_pages = 8, 8, 3, 7
+    width = (q_heads + 3 * num_kv_heads + 1) * 128
+    packed = torch.randn(tokens, width, dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(tokens, dtype=torch.int32, device="cuda")
+    weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
+    rope = _rope_cache(256)
+    main_slots = torch.tensor([0, 128, 257, -1, 9, 384, 127, 300], dtype=torch.int32, device="cuda")
+    index_slots = torch.tensor(
+        [521, 2, -1, 777, 345, 896, 127, 640], dtype=torch.int32, device="cuda"
+    )
+    # The arena stores K cells followed by V cells, with one cell per page.
+    arena = torch.zeros(
+        2, main_pages, num_kv_heads, 128, 128, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    main_cache = arena.permute(1, 0, 2, 3, 4)
+    index_cache = _index_cache(index_pages)
+    operation = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert
+
+    def run(main, index, main_map, index_map=None, arena=False):
+        return operation(
+            packed,
+            main,
+            index,
+            main_map,
+            q_heads,
+            num_kv_heads,
+            num_kv_heads,
+            128,
+            64,
+            1e-5,
+            *weights,
+            rope,
+            positions,
+            index_out_cache_loc=index_map,
+            kv_cache_is_arena=arena,
+        )
+
+    run(main_cache, index_cache, main_slots, index_slots, arena=True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        q, index_q = run(main_cache, index_cache, main_slots, index_slots, arena=True)
+
+    for replay in range(2):
+        packed.copy_(torch.randn_like(packed))
+        positions.add_(11)
+        if replay:
+            main_slots.copy_(torch.roll(main_slots, 1))
+            index_slots.copy_(torch.roll(index_slots, 3))
+        main_cache.zero_()
+        index_cache.zero_()
+        reference_main = _main_cache(main_pages, num_kv_heads)
+        reference_index = _index_cache(index_pages)
+        reference_q, _ = run(reference_main, _index_cache(main_pages), main_slots)
+        _, reference_index_q = run(
+            _main_cache(index_pages, num_kv_heads), reference_index, index_slots
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(q.view(torch.uint8), reference_q.view(torch.uint8))
+        assert torch.equal(index_q.view(torch.uint8), reference_index_q.view(torch.uint8))
+        assert torch.equal(main_cache.view(torch.uint8), reference_main.view(torch.uint8))
+        assert torch.equal(index_cache.view(torch.uint8), reference_index.view(torch.uint8))
+
+    with pytest.raises(RuntimeError, match="index_out_cache_loc"):
+        run(main_cache, index_cache, main_slots, index_slots[:1], arena=True)
+    # Separate index slots do not admit overlapping K/V planes; only the arena flag does.
+    with pytest.raises(RuntimeError, match="disjoint HND pages"):
+        run(main_cache, index_cache, main_slots, index_slots)
+    with pytest.raises(RuntimeError, match="kv_cache_is_arena requires index_out_cache_loc"):
+        run(main_cache, _index_cache(main_pages), main_slots, arena=True)

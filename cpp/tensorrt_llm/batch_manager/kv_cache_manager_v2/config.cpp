@@ -53,6 +53,8 @@ void BufferConfig::validate() const
         "BufferConfig: tokensPerBlockOverride is not supported on a sparse buffer; use the layer's "
         "sparse_cache.unit_tokens");
     TLLM_CHECK_WITH_INFO(sparseUnitChunks > 0, "BufferConfig: sparseUnitChunks must be positive");
+    TLLM_CHECK_WITH_INFO(sparseWriteBackGranularity >= 0 && (isSparse || sparseWriteBackGranularity == 0),
+        "BufferConfig: sparseWriteBackGranularity must be nonnegative and requires a sparse buffer");
 }
 
 void RegionConfig::validate() const
@@ -103,6 +105,8 @@ void RegionConfig::validate() const
 
 void SparseCacheConfig::validate(int tokensPerBlock) const
 {
+    TLLM_CHECK_WITH_INFO(!includePartialUnits || !selectionId.has_value(),
+        "SparseCacheConfig: partial units require an independent selection per layer");
     TLLM_CHECK_WITH_INFO(numSelectedBlocks > 0 && maxCachedUnits > 0,
         "SparseCacheConfig: numSelectedBlocks and maxCachedUnits must be positive; omit sparse_cache "
         "entirely for a layer with no fetch path");
@@ -236,11 +240,11 @@ void _validateSelectionIds(std::vector<LayerConfig> const& layers)
         }
         auto const& first = *it->second;
         if (first.numSelectedBlocks != cache->numSelectedBlocks || first.maxCachedUnits != cache->maxCachedUnits
-            || first.unitTokens != cache->unitTokens)
+            || first.unitTokens != cache->unitTokens || first.includePartialUnits != cache->includePartialUnits)
         {
             throw AssertionError(
                 "KVCacheManagerConfig: layers sharing a selection_id must agree on "
-                "num_selected_blocks, max_cached_units and unit_tokens");
+                "num_selected_blocks, max_cached_units, unit_tokens and include_partial_units");
         }
     }
 
@@ -403,6 +407,24 @@ void KVCacheManagerConfig::validate() const
                 }
                 if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>, AttentionLayerConfig>)
                 {
+                    // Token-group write-back serves only a growing unit; a whole unit is
+                    // written back whole, so a granularity anywhere else would be ignored.
+                    for (auto const& buf : cfg.buffers)
+                    {
+                        int const grain = buf.sparseWriteBackGranularity;
+                        if (grain == 0)
+                        {
+                            continue;
+                        }
+                        TLLM_CHECK_WITH_INFO(cfg.sparseCache.has_value() && cfg.sparseCache->includePartialUnits,
+                            "KVCacheManagerConfig: layer %d buffer '%s' sets sparse_write_back_granularity=%d, "
+                            "which requires a sparse_cache with include_partial_units",
+                            cfg.layerId, buf.role.c_str(), grain);
+                        TLLM_CHECK_WITH_INFO(cfg.sparseCache->unitTokens % grain == 0,
+                            "KVCacheManagerConfig: layer %d buffer '%s' sets sparse_write_back_granularity=%d, "
+                            "which must divide the sparse_cache's unit_tokens=%d",
+                            cfg.layerId, buf.role.c_str(), grain, cfg.sparseCache->unitTokens);
+                    }
                     if (cfg.sparseCache.has_value())
                     {
                         cfg.sparseCache->validate(tokensPerBlock);

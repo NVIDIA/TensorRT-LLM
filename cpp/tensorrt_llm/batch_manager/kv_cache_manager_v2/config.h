@@ -281,6 +281,10 @@ struct BufferConfig
     //! place buffers of one attention or SSM layer in different lifecycle groups.
     std::optional<ReusePolicy> reusePolicy;
 
+    //! Smallest contiguous token group within each sparse chunk. Zero keeps whole-unit
+    //! write-back. Token-major buffers use one; a four-token swizzle uses four.
+    int sparseWriteBackGranularity = 0;
+
     [[nodiscard]] ReusePolicy effectiveReusePolicy(ReusePolicy layerPolicy) const noexcept
     {
         return reusePolicy.value_or(layerPolicy);
@@ -348,6 +352,12 @@ struct SparseCacheConfig
     //! layer that says nothing never shares, and no explicit id may name a layer that said
     //! nothing. Layers that do share must agree on the rest of this config.
     std::optional<int> selectionId;
+
+    //! Cache a growing block before its last token is written. On first reservation,
+    //! restore its existing prefix from host memory; each flush writes back only the tokens
+    //! appended since the previous one, in the buffer's sparseWriteBackGranularity groups.
+    //! False for compressed representations whose unit is produced only when complete.
+    bool includePartialUnits = false;
 
     //! The id this layer's selection goes by, which is its own when it named none.
     [[nodiscard]] int effectiveSelectionId(LayerId layerId) const noexcept

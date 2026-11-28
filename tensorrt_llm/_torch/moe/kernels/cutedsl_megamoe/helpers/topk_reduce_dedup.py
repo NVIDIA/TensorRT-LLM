@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.  # ctm-lint: allow-internal-marker
 # SPDX-License-Identifier: BSD-3-Clause
 """Combine reduce for the dedup path: sums the ``rank_slots[token][rank]`` rows named by ``valid_rank_mask`` in
-ascending rank order into ``reduced_output[token]``; top-k weights are already folded in."""
+ascending rank order into ``reduced_output[token]``; top-k weights are already folded in. An optional ``shared_term``
+adds one more unweighted BF16 row after the rank fold."""
 
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -11,8 +12,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Float32, Int32
 
-from .....helpers.dsl_helpers import mark_alignment
-from .....quant_def import CombineFormat
+from .dsl_helpers import mark_alignment
+from .topk_reduce import add_shared_term, load_shared_term, shared_term_view
+from ..quant_def import CombineFormat
 
 
 class TopkReduceDedup:
@@ -39,6 +41,7 @@ class TopkReduceDedup:
         valid_rank_mask: cute.Tensor,  # (token,) i32 bitmask over ranks
         reduced_output: cute.Tensor,  # (token, hidden)
         stream: cuda.CUstream,
+        shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, added after the rank fold
     ):
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
@@ -52,10 +55,20 @@ class TopkReduceDedup:
             reduced_output.iterator,
             cute.make_layout((reduced_output.shape[0], self.hidden), stride=reduced_output.stride),
         )
-        self._reduce_bf16(rank_slots, valid_rank_mask, reduced_output).launch(grid=grid, block=block, stream=stream)
+        if cutlass.const_expr(shared_term is not None):
+            shared_term = shared_term_view(shared_term, self.hidden)
+        self._reduce_bf16(rank_slots, valid_rank_mask, reduced_output, shared_term).launch(
+            grid=grid, block=block, stream=stream
+        )
 
     @cute.kernel
-    def _reduce_bf16(self, rank_slots: cute.Tensor, valid_rank_mask: cute.Tensor, reduced_output: cute.Tensor):
+    def _reduce_bf16(
+        self,
+        rank_slots: cute.Tensor,
+        valid_rank_mask: cute.Tensor,
+        reduced_output: cute.Tensor,
+        shared_term: Optional[cute.Tensor],
+    ):
         threads = self._threads
         hidden_per_thread = self._hidden_per_thread
         hidden_tiles = self.hidden_tiles
@@ -85,6 +98,10 @@ class TopkReduceDedup:
             # Issue every rank slot's load first (predicated, one register buffer per rank) so all of them are in
             # flight together, then accumulate ranks ascending; fma by 1.0 is an exact fp32 add.
             terms = [cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16) for _ in range(world_size)]
+            # The unpredicated shared-term load goes out with the rank loads; it is still added after the rank fold.
+            shared_reg = None
+            if cutlass.const_expr(shared_term is not None):
+                shared_reg = load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread)
             for rank in cutlass.range_constexpr(world_size):
                 if ((rank_mask >> Int32(rank)) & Int32(1)) != Int32(0):
                     cute.copy(
@@ -97,6 +114,9 @@ class TopkReduceDedup:
                     for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
                         value_pair = (Float32(terms[rank][i]), Float32(terms[rank][i + 1]))
                         acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(value_pair, one_pair, (acc[i], acc[i + 1]))
+
+            if cutlass.const_expr(shared_term is not None):
+                add_shared_term(acc, shared_reg, hidden_per_thread)
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

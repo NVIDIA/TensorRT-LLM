@@ -31,7 +31,7 @@ from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
-from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
+from ..models.modeling_utils import DecoderModelForCausalLM, _is_builtin_model_class, timing_metric
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
@@ -55,7 +55,9 @@ from .engine.model_setup import (
 )
 from .engine.multimodal import (
     MultimodalItemScheduler,
+    check_layer_registries_in_language_model,
     is_multimodal,
+    keeps_text_prefill_body,
     mm_encoder_cache_enabled,
     setup_mm_encoder_attn_metadata,
     setup_mm_encoder_cuda_graphs,
@@ -71,6 +73,7 @@ from .guided_decoder import CapturableGuidedDecoder
 from .llm_request import LlmRequest
 from .model_loader import ModelLoader, release_localized_moe_weights
 from .resource_manager import ResourceManager, ResourceManagerType
+from .runtime_hooks import runtime_hooks_of
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -591,6 +594,7 @@ class ModelEngine:
             guided_decoding_enabled=self.llm_args.guided_decoding_backend is not None,
             watermark_config=self.llm_args.watermark_config,
             is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
+            steady_decode_prepare=runtime_hooks_of(self.model).steady_decode_prepare,
             **extra_fields,
         )
 
@@ -661,6 +665,11 @@ class ModelEngine:
     def cuda_graph_padding_enabled(self) -> bool:
         """Return whether decode graph batches are padded to capture sizes."""
         return self._cuda_graph_padding_enabled
+
+    @property
+    def steady_mtp_reads_output_rows(self) -> bool:
+        """Whether the steady MTP prepare reads the previous step's output rows (``steady_decode_prepare``)."""
+        return isinstance(self._runner, DecoderRunner) and self._runner.steady_mtp_reads_output_rows
 
     @property
     def _dspark_confidence_enabled(self) -> bool:
@@ -907,18 +916,42 @@ class ModelEngine:
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return
 
-        if isinstance(self.model, DecoderModelForCausalLM):
+        if keeps_text_prefill_body(self.model, self.llm_args.disable_mm_encoder):
             return
-        decoder_model = getattr(self.model, "llm", None)
-        if (
-            self.llm_args.disable_mm_encoder
-            and isinstance(decoder_model, DecoderModelForCausalLM)
-            and getattr(self.model, "mm_encoder", None) is None
-        ):
+        if isinstance(self.model, MultimodalModelMixin):
+            try:
+                language_model = self.model.language_model
+            except NotImplementedError:
+                language_model = None
+            if not isinstance(language_model, DecoderModelForCausalLM):
+                raise ValueError(
+                    "breakable prefill CUDA graph supports multimodal models only with a "
+                    "DecoderModelForCausalLM language_model"
+                )
+            if self.mapping.pp_size > 1:
+                raise ValueError(
+                    "breakable prefill CUDA graph supports multimodal models only with a "
+                    "single pipeline stage"
+                )
+            if not self.model.supports_multimodal_breakable_cuda_graph:
+                raise ValueError(
+                    f"breakable prefill CUDA graph does not support {type(self.model).__name__}. "
+                    "Use eager prefill"
+                )
+            decoder_cls = type(language_model)
+            if not _is_builtin_model_class(decoder_cls):
+                wrapper_cls = type(self.model)
+                if _is_builtin_model_class(wrapper_cls) or (
+                    "supports_multimodal_breakable_cuda_graph" not in vars(wrapper_cls)
+                ):
+                    raise ValueError(
+                        f"{decoder_cls.__name__} comes from a custom module. Set "
+                        "supports_multimodal_breakable_cuda_graph = True on your own wrapper "
+                        "class to use breakable prefill CUDA graph, or use eager prefill"
+                    )
+            check_layer_registries_in_language_model(self.model, language_model)
             return
-        if isinstance(self.model, MultimodalModelMixin) or isinstance(
-            self.input_processor, BaseMultimodalInputProcessor
-        ):
+        if isinstance(self.input_processor, BaseMultimodalInputProcessor):
             raise ValueError("breakable prefill CUDA graph does not support multimodal models")
 
     def forward_multimodal_encoder_items(

@@ -1016,6 +1016,7 @@ class Cosmos3EdgeModel(Qwen3VLModelBase):
     supported_encoder_attention_backends = {"vision": frozenset()}
 
     supports_encoder_cache = True
+    supports_multimodal_breakable_cuda_graph = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         omni_config = model_config.pretrained_config

@@ -603,6 +603,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash[VANILLA]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash[FA4]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8_piecewise_cuda_graph
+accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_gpqa_diamond[dflash7]
+accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_gpqa_diamond[mtp3]
 accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[cutedsl.grouped_gemm]
 accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[trtllm_gen]
 accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_dflash[TRTLLM]
@@ -910,6 +912,8 @@ unittest/_torch/modeling/test_modeling_apertus.py::TestApertus1p5_8B
 # Smaller GPUs are skipped by the test. Run both policies sequentially.
 visual_gen/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio[False] TIMEOUT (30)
 visual_gen/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio[True] TIMEOUT (30)
+visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio[False] TIMEOUT (30)
+visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio[True] TIMEOUT (30)
 
 # Tiny local Wan/FLUX checkpoints; one CUDA GPU, no pretrained model download.
 unittest/_torch/visual_gen/test_sleep_non_h3.py

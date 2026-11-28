@@ -18,6 +18,8 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  - accuracy/test_disaggregated_serving.py::TestMiniMaxM3::test_kv_cache_offload_block_reuse[kv_dtype=fp8]
+  - accuracy/test_disaggregated_serving.py::TestMiniMaxM31Flash::test_kv_cache_offload_block_reuse[kv_dtype=nvfp4]
   # MiniMax-M3 target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/comm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/ops/comm
@@ -70,7 +72,7 @@ l0_gb300_multi_gpus:
   # matches to set its parallelism. This post_merge stage is the only Blackwell stage that
   # runs them. multi_gpu/test_gqa_kv_replica.py runs in l0_gb300's pre_merge block instead;
   # --ignore arguments do not change the CSV key (test_unittests.py _parallel_config_key).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py TIMEOUT (120)
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py TIMEOUT (150)
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel

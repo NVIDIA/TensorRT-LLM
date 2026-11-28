@@ -564,8 +564,11 @@ with the native `AttentionOp` input requirements.
 ##### 3.2.2.1 Selection order (`TLLM_FMHA_LIBS`)
 
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
-it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
-defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
+it may add host overhead, except for MLA generation on SM107. On SM100 and
+SM103, MLA generation is opt-in too: its decode kernels compile at startup for
+each new configuration, which takes minutes on a cold cache. Use
+`TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
+`TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
 block-sparse PrimTS remains enabled by default because a dense fallback cannot
 preserve its routing semantics. The PrimTS sparse MLA library
 (`prims_ts_sparse_mla`) is also enabled by default: it serves only DeepSeek-V4
@@ -920,7 +923,8 @@ for details.
 #### 3.2.5 Sparse KV cache offload
 
 With `enable_kv_cache_offload`, DSA layers and DeepSeek-V4 compress-ratio-4
-layers keep their sparse latent history in host-backed KVCacheManagerV2 pools.
+layers keep their sparse latent history, and MiniMax-M3 sparse layers their main
+K/V and NVFP4 block scales, in host-backed KVCacheManagerV2 pools.
 Each request reads it through a fixed-size GPU cache in the sparse cell arena,
 whose layout is described in
 [`SPARSE_ATTENTION_DESIGN.md`](../../../cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/SPARSE_ATTENTION_DESIGN.md).
@@ -951,6 +955,27 @@ Each offloaded layer runs three steps in a generation step:
    so the scratch ends in `NVFP4_SCRATCH_TAIL_ROWS` zeroed rows and every
    arena pool ends in a matching zeroed tail.
 
+MiniMax-M3 selects blocks per KV head and caches whole 128-token blocks,
+including the growing one, so its MSA backend runs the same three steps on
+blocks:
+
+1. **Write.** `prepare_write_slots` turns the layer's write indices into token
+   slots in the arena, and the cache writers or the fused FP8 producer store
+   the new K/V there. Index keys stay paged, so the producer takes separate
+   slot maps for the two caches. The growing block's host prefix is restored
+   into its cell before the first write.
+2. **Fetch.** `merge_head_selections` deduplicates the heads' selections into
+   one selection per request, and `build_sparse_block_table` publishes each
+   selected block's arena cell at the block's ordinal, so each head still reads
+   its own selection through an ordinary block table.
+3. **Attend.** The Triton sparse decode reads the arena view that
+   `MiniMaxM3KVCacheManagerV2.get_sparse_arena_buffers` returns, through that
+   table. `get_buffers` and `get_block_scale_buffers` return None for an
+   offloaded layer, as page-indexed consumers expect of host-backed layers.
+   The table gives CUDA-graph padding queries cell 0 for the blocks their
+   selection names, so the decode, which does not mask -1 entries, stays in
+   the arena.
+
 For an offloaded layer, the KV-cache manager's block tables and pool pointers
 do not describe where the history is. The arena-row indices are relative to
 the base of the layer's data arena, and a library must read through that base.
@@ -968,8 +993,8 @@ def _reads_sparse_arena(self, metadata) -> bool:
     )
 ```
 
-Read the attribute with `getattr`: only the DSA and DeepSeek-V4 metadata
-define it. Scope the check to the layers that actually offload. For
+Read the attribute with `getattr`: only the DSA, DeepSeek-V4 and MiniMax-M3
+MSA metadata define it. Scope the check to the layers that actually offload. For
 DeepSeek-V4, that is compress ratio 4 only; its other layers keep their
 compress pool. A library that reads offloaded layers must also mask -1 holes
 inside the live prefix, which offload produces, and over-read by no more than

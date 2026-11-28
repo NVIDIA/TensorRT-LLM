@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 hostname: localhost
 model: Qwen3/Qwen3-0.6B
 backend: pytorch
@@ -24,7 +27,7 @@ generation_servers:
   kv_cache_config:
     enable_block_reuse: true
     enable_partial_reuse: true
-    event_buffer_max_size: 1024
+    event_buffer_max_size: 8192
     free_gpu_memory_fraction: 0.05
   cache_transceiver_config:
     backend: DEFAULT

@@ -1826,11 +1826,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);
 
     nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
-        .def(nb::init<int, int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
-            nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none())
+        .def(nb::init<int, int, int, std::optional<int>, bool>(), nb::arg("num_selected_blocks"),
+            nb::arg("max_cached_units"), nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none(),
+            nb::arg("include_partial_units") = false)
         .def_rw("num_selected_blocks", &kv::SparseCacheConfig::numSelectedBlocks)
         .def_rw("max_cached_units", &kv::SparseCacheConfig::maxCachedUnits)
         .def_rw("unit_tokens", &kv::SparseCacheConfig::unitTokens)
+        .def_rw("include_partial_units", &kv::SparseCacheConfig::includePartialUnits)
         .def_prop_ro(
             "max_unit_ordinal", [](kv::SparseCacheConfig const&) { return kv::SparseCacheConfig::kMaxUnitOrdinal; },
             "Largest zero-based unit ordinal supported by the sparse probe index.")
@@ -1841,16 +1843,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "may name a layer that named nothing.") DEF_COPY(kv::SparseCacheConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(),
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>, int>(),
             nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
             nb::arg("is_sparse") = false, nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1,
-            nb::arg("reuse_policy") = std::nullopt)
+            nb::arg("reuse_policy") = std::nullopt, nb::arg("sparse_write_back_granularity") = 0)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
         .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup)
         .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks)
+        .def_rw("sparse_write_back_granularity", &kv::BufferConfig::sparseWriteBackGranularity)
         .def_rw("reuse_policy", &kv::BufferConfig::reusePolicy) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
@@ -2662,6 +2665,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("allow_remote_numa_fallback"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("sparse_cache_resident_ordinals", &kv::KvCacheIntrospection::sparseCacheResidentOrdinals,
         nb::arg("kv_cache"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("sparse_cache_valid_chunks", &kv::KvCacheIntrospection::sparseCacheValidChunks,
+        nb::arg("kv_cache"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("sparse_cache_base_cell", &kv::KvCacheIntrospection::sparseCacheBaseCell, nb::arg("kv_cache"),
         nb::arg("lc_id"), nb::arg("pool") = 0, nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("sparse_flush_counts", &kv::KvCacheIntrospection::sparseFlushCounts, nb::arg("kv_cache"),
@@ -2739,13 +2744,36 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("resident_ordinal"), nb::arg("entry_age"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
         nb::arg("max_in_flight_units"), nb::arg("inactive_rows"));
+    mIntrospection.def(
+        "sparse_resolve_chunks",
+        [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& entryAge, int numLayers,
+            int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
+            std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
+            std::vector<int32_t> const& inactiveRows, int unitChunks, std::vector<int32_t> const& residentValid,
+            std::vector<int32_t> const& unitMask)
+        {
+            auto r = kv::KvCacheIntrospection::sparseResolve(residentOrdinal, entryAge, numLayers, entriesPerLayer,
+                selected, selectionWidth, historyUnits, capacityUnits, maxInFlightUnits, inactiveRows, unitChunks,
+                residentValid, unitMask);
+            return std::make_tuple(std::move(r.residentOrdinal), std::move(r.validChunks), std::move(r.outSlot),
+                std::move(r.missRow), std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missMask),
+                std::move(r.missTotal), r.copiedSlices);
+        },
+        nb::arg("resident_ordinal"), nb::arg("entry_age"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
+        nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
+        nb::arg("max_in_flight_units"), nb::arg("inactive_rows"), nb::arg("unit_chunks"), nb::arg("resident_valid"),
+        nb::arg("unit_mask"),
+        "The sparse resolve with per-chunk residency: returns (resident ordinals, valid chunks per entry, "
+        "out slots, miss rows, miss ordinals, miss slots, miss chunk masks, miss totals, chunk copies). "
+        "resident_valid is one chunk mask per entry (empty: every chunk) and unit_mask one per selected unit "
+        "(empty: every chunk).");
     mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),
         nb::arg("host_page_stride"), nb::arg("page_table"), nb::arg("device_arena"), nb::arg("base_cell"),
         nb::arg("num_blocks"), nb::arg("cells_per_buffer"), nb::arg("buffer_bytes"), nb::arg("num_chunks"),
         nb::arg("chunk_bytes"), nb::arg("chunk_stride"), nb::arg("unit_stride"), nb::arg("expansion"),
         nb::arg("miss_ordinal"), nb::arg("miss_slot"), nb::arg("miss_count"), nb::arg("selection_width"),
         nb::arg("buffer_layer"), nb::arg("write_back") = false, nb::arg("grid_ctas") = 1,
-        nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("miss_mask") = std::vector<int32_t>{}, nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "sparse_flush_list",
         [](std::vector<int32_t> const& residentOrdinal, int numLayers, int entriesPerLayer, int fromUnits, int toUnits,
@@ -3278,9 +3306,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("buffers"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
             "Give each request's in-flight unit a cell, and report where to write it.\n\n"
-            "The unit between the two watermarks is the one the model is about to produce. It has no "
-            "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
-            "it -- so nothing is fetched: the call assigns a cell and leaves its bytes to the model.\n\n"
+            "The unit between the watermarks is the one the model is about to produce. With "
+            "include_partial_units, a newly reserved cell restores its host prefix before exposing "
+            "the write index; resident cells remain intact. Otherwise only a cell is reserved.\n\n"
             "Separate from fetch_sparse_pages because the orders differ. A fetch needs the selection, "
             "which the indexer produces from the previous layer; a write needs only the watermarks, so "
             "it can run first, which is the order the model requires.\n\n"
@@ -3296,11 +3324,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "fetch_sparse_pages",
             [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray2D const& selected,
-                DeviceArray3D const& out, nb::object stream)
+                DeviceArray3D const& out, nb::object stream, std::optional<DeviceArray2D> const& unitMasks)
             {
                 if (selected.shape(0) != out.shape(0))
                 {
                     throw std::invalid_argument("fetch_sparse_pages: selected and out must agree on the batch size");
+                }
+                if (unitMasks.has_value()
+                    && (unitMasks->shape(0) != selected.shape(0) || unitMasks->shape(1) != selected.shape(1)))
+                {
+                    throw std::invalid_argument("fetch_sparse_pages: unit_masks must have the shape of selected");
                 }
                 if (static_cast<int>(selected.shape(0)) != self.maxBatchSize())
                 {
@@ -3324,11 +3357,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     : std::optional<CUstream>{reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream))};
                 auto* selectedPtr = selected.data();
                 auto* outPtr = out.data();
+                auto const* maskPtr = unitMasks.has_value() ? unitMasks->data() : nullptr;
                 auto const width = static_cast<int>(selected.shape(1));
                 nb::gil_scoped_release rel;
-                self.fetchSparsePages(buffers, selectedPtr, width, outPtr, handle);
+                self.fetchSparsePages(buffers, selectedPtr, width, outPtr, handle, maskPtr);
             },
             nb::arg("buffers"), nb::arg("selected"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
+            nb::arg("unit_masks") = nb::none(),
             "Resolve a batch's selections against each buffer's per-request history cache.\n\n"
             "buffers must be exactly one layer's sparse buffers, in the cache's order. One layer, "
             "not one layer group, because a layer's selection is normally computed from the "
@@ -3353,12 +3388,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "stream defaults to the batch's own, which is the only correct choice while layers are "
             "fetched in order, since a layer's selection comes from the one before it. Name a stream "
             "only to run ahead of that, and then order it against the batch's stream yourself: the "
-            "resolve's scratch and counters are batch state the step clears on that stream.")
+            "resolve's scratch and counters are batch state the step clears on that stream.\n\n"
+            "unit_masks is int32[batch, topk], the chunks (for M3, the KV heads) that read each selected "
+            "unit, one bit per chunk; None reads every chunk. A resident cell lacking a chunk named here is "
+            "filled for that chunk alone, and a miss copies only the chunks named, so every reader of a "
+            "unit must be named or its attention reads a cell the cache never filled.")
         .def(
             "resolve_sparse_selection",
             [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray2D const& selected,
-                nb::object stream)
+                nb::object stream, std::optional<DeviceArray2D> const& unitMasks)
             {
+                if (unitMasks.has_value()
+                    && (unitMasks->shape(0) != selected.shape(0) || unitMasks->shape(1) != selected.shape(1)))
+                {
+                    throw std::invalid_argument("resolve_sparse_selection: unit_masks must have the shape of selected");
+                }
                 if (static_cast<int>(selected.shape(0)) != self.maxBatchSize())
                 {
                     throw std::invalid_argument(
@@ -3369,11 +3413,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     ? std::optional<CUstream>{}
                     : std::optional<CUstream>{reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream))};
                 auto* selectedPtr = selected.data();
+                auto const* maskPtr = unitMasks.has_value() ? unitMasks->data() : nullptr;
                 auto const width = static_cast<int>(selected.shape(1));
                 nb::gil_scoped_release rel;
-                self.resolveSparseSelection(buffers, selectedPtr, width, handle);
+                self.resolveSparseSelection(buffers, selectedPtr, width, handle, maskPtr);
             },
-            nb::arg("buffers"), nb::arg("selected"), nb::arg("stream") = nb::none(),
+            nb::arg("buffers"), nb::arg("selected"), nb::arg("stream") = nb::none(), nb::arg("unit_masks") = nb::none(),
             "Resolve one selection, admitting what it names and listing what has to be copied.\n\n"
             "The first half of fetch_sparse_pages, split out for the layers that share a "
             "selection_id: they resolve once between them and then fetch a layer at a time. "
@@ -3520,6 +3565,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "are in neither figure.\n\n"
             "Reads on a temporary stream and syncs only that, so the pair may be a few launches "
             "stale -- which does not move a ratio. Synchronise the device first for an exact one.")
+        .def(
+            "peek_copied_slices",
+            [](kv::Batch const& self)
+            {
+                nb::gil_scoped_release rel;
+                return self.peekHitMissCounter().slices;
+            },
+            "Cumulative chunk copies the fetches asked for since the counters were reset: per missed unit, "
+            "one for each chunk (KV head) it needed. Equals the miss count for a layout with one chunk per "
+            "unit. Read the way peek_hit_miss_counter is.")
         .def("reset_hit_miss_counter", &kv::Batch::resetHitMissCounter,
             "Zero the cumulative pair, on the Batch's stream.")
         .def_prop_ro("sparse_arena_bytes", &kv::Batch::sparseArenaBytes,

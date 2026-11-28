@@ -213,13 +213,13 @@ def test_sparse_max_seq_len_ignores_layers_without_a_fetch_path() -> None:
 @pytest.mark.parametrize(
     ("cells", "lease_bytes"),
     [
-        # 21 layers x cells x (9216 B data + 1152 B scale), plus one int32 word per
-        # cached entry. A lease holds the reservation and nothing of the step: the
-        # work lists belong to the Batch, sized by the batch rather than by whoever
-        # is seated.
-        (17, 3_747_200),
-        (32, 7_053_312),
-        (33, 7_273_856),
+        # 21 layers x cells x (9216 B data + 1152 B scale), plus one int32 word and
+        # one validity byte per cached entry. A lease holds the reservation and
+        # nothing of the step: the work lists belong to the Batch, sized by the batch
+        # rather than by whoever is seated.
+        (17, 3_758_720),
+        (32, 7_074_816),
+        (33, 7_296_128),
     ],
 )
 def test_lease_matches_native_layout(cells: int, lease_bytes: int) -> None:
@@ -258,7 +258,8 @@ def test_arena_reserves_one_tile_per_pool(
     # total. Zero leases measures the fixed overhead used by the capacity solver.
     usable_rows = max_leases * 2 * 3 * units_per_cell
     pool_bytes = sum(aligned((usable_rows + 128) * size) for size in row_bytes)
-    metadata_bytes = aligned(2 * 3 * units_per_cell * 4)
+    # An int32 word and a validity byte per entry, each array aligned on its own.
+    metadata_bytes = aligned(2 * 3 * units_per_cell * 4) + aligned(2 * 3 * units_per_cell)
     assert shape.arena_bytes(max_leases) == pool_bytes + 3 * 256 + max_leases * metadata_bytes
     assert shape.entries == 2 * 3 * units_per_cell
     assert shape.lease_bytes == 2 * 3 * units_per_cell * sum(row_bytes) + metadata_bytes
@@ -279,7 +280,7 @@ def test_arena_follows_the_batch_rows() -> None:
     (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=TOKENS_PER_BLOCK)
 
     assert shape == V4_FLASH_ARENA
-    assert shape.lease_bytes == 7_273_856
+    assert shape.lease_bytes == 7_296_128
     assert sparse_arena_bytes(config, 513) == shape.arena_bytes(513)
 
 
@@ -431,19 +432,52 @@ def test_batch_matches_native_layout() -> None:
     # The staging copy is mapped in whole 4 KiB pages.
     assert V4_FLASH_BATCH.staging_bytes == 25_182_208
     # Per row: a slot per selected unit, a miss count and the unit in flight. Then the
-    # two compacted work lists -- a row, an ordinal and a slot per entry, plus a total
-    # per list -- one for the fetch, sized for every row missing its whole selection,
-    # and one per layer for the write-back, sized by the step's token budget.
+    # two compacted work lists -- a row, an ordinal, a slot and a chunk mask per entry,
+    # plus a total per list -- one for the fetch, sized for every row missing its whole
+    # selection, and one per layer for the write-back, sized by the step's token budget.
     assert V4_FLASH_BATCH.fetch_scratch_bytes == 4 * (
-        256 * (512 + 2) + (3 * 256 * 512 + 1) + 2 * (3 * 256 + 1) + 256 * 2
+        256 * (512 + 2) + (4 * 256 * 512 + 1) + 2 * (4 * 256 + 1) + 256 * 2
     )
-    assert V4_FLASH_BATCH.fetch_scratch_bytes == 2_107_404
+    assert V4_FLASH_BATCH.fetch_scratch_bytes == 2_633_740
     # The fetch and the write-back read converted indices: a table per sparse buffer,
     # shared by the life cycle's layers since nothing substitutes a scratch slot there.
     assert V4_FLASH_BATCH.index_table_bytes == 4 * 2 * 256 * 8196 == 16_785_408
     # The device holds the staged block a publish fills ahead of the step, the mirror of
     # its tail that a captured kernel reads, the converted tables and the work arrays.
-    assert V4_FLASH_BATCH.device_bytes == 25_181_184 + 3_072 + 16_785_408 + 2_107_404 == 44_077_068
+    assert V4_FLASH_BATCH.device_bytes == 25_181_184 + 3_072 + 16_785_408 + 2_633_740 == 44_603_404
+
+
+@pytest.mark.cpu_only
+def test_partial_blocks_reserve_a_prefix_fetch_per_batch_row() -> None:
+    def shape(partial):
+        return sparse_batch_shape(
+            [
+                _layer(
+                    0,
+                    ("key", 16384, True),
+                    ("value", 16384, True),
+                    ("indexer", 16384, False),
+                    sparse_cache=sparse_cache_config(
+                        num_selected_units=32,
+                        unit_tokens=128,
+                        tokens_per_block=128,
+                        gpu_cache_factor=1.0,
+                        include_partial_units=partial,
+                    ),
+                )
+            ],
+            tokens_per_block=128,
+            max_batch_size=4,
+            max_blocks_per_seq=1024,
+        )
+
+    partial, complete = shape(True), shape(False)
+    assert partial.partial_unit_groups == 1
+    # Only the write-preparation list holds a missing partial block; the fetch copies history.
+    # Four rows of a row, an ordinal, a slot and a (never read) chunk mask.
+    assert partial.fetch_scratch_bytes - complete.fetch_scratch_bytes == 4 * 4 * 4
+    assert partial.device_bytes - complete.device_bytes == 4 * 4 * 4
+    assert partial.flush_capacities == complete.flush_capacities == (4,)
 
 
 @pytest.mark.cpu_only
@@ -830,7 +864,7 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert capacity.by_limit == {"max_batch_size": 256, "host": 4, "gpu": 794}
     assert capacity.limited_by == "host"
     assert capacity.fits == 4
-    assert capacity.lease_bytes == 7_273_856
+    assert capacity.lease_bytes == 7_296_128
     assert capacity.arena_bytes == V4_FLASH_ARENA.arena_bytes(256)
     # The 50 GiB host budget holds 240 requests of 128K tokens; the GPU budget
     # would hold more.
@@ -839,7 +873,7 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert "4 by host" in report
     assert "limited by host" in report
     assert "256 leases" in report
-    assert "offload buffers 173.0MiB for 256 rows" in report
+    assert "offload buffers 173.5MiB for 256 rows" in report
     assert "A max_batch_size of 240 fits" in report
 
 

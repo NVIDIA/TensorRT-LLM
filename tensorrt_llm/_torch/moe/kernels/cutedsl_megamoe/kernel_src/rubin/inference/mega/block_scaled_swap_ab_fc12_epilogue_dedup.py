@@ -173,6 +173,7 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
         fc2_output_sf: Optional[cute.Tensor],
         peer_rank_ptr_mapper,
         optional_epi_args: GatedActEpilogueArgs,
+        shared_target: Optional[SwapABFc2Epilogue] = None,
     ):
         # Not super().__init__(): the base picks its store pipeline and freezes; dedup installs its own.
         self.base = base
@@ -187,6 +188,8 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
         self.fc2_output_sf = None
         self.peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self.optional_epi_args = optional_epi_args
+        # Shared FC2 tiles go to the shared expert's local TMA store, not through the dedup router.
+        self.shared_target = shared_target
         if smem_tensor is None:
             raise ValueError("The dedup FC2 epilogue needs the FC2 staging SMEM (fc2_use_bulk).")
         self.smem_tensor = smem_tensor
@@ -238,9 +241,10 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
         )
 
     @cute.jit
-    def __call__(
+    def _run_tile(
         self, work_tile_info: SwapAbFc12WorkTileInfo, tmem_acc_tensor: cute.Tensor, acc_pipeline, acc_consumer_state
     ):
+        """Store one routed accumulator tile through the dedup bulk router (the base ``__call__`` releases it)."""
         if cutlass.const_expr(self.optional_epi_args.fc2_alpha is not None):
             alpha_val = self.optional_epi_args.fc2_alpha[work_tile_info.expert_idx]
         else:
@@ -267,8 +271,6 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
                     fc2_output_router=router,
                     alpha_val=alpha_val,
                 )
-        cute.arch.fence_view_async_tmem_load()
-        acc_pipeline.consumer_release(acc_consumer_state)
 
 
 class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
@@ -289,8 +291,8 @@ class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
             "dedup_chunks_per_row": int,
         }
 
-    def _make_fc2_epilogue(self, *args) -> SwapABFc2EpilogueDedup:
-        return SwapABFc2EpilogueDedup(self, *args)
+    def _make_fc2_epilogue(self, *args, **kwargs) -> SwapABFc2EpilogueDedup:
+        return SwapABFc2EpilogueDedup(self, *args, **kwargs)
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         super().__init__(problem_desc, impl_desc)
