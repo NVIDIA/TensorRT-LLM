@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Harness profile: Claude Code against an ANTHROPIC_BASE_URL endpoint served by trtllm-serve.
+# Derived from contracts/claude-code.md. Fields marked TODO are S0 measurements.
+# Anthropic does not support non-Claude models behind a gateway, and capabilities change with
+# every release: pin the version and re-run S0 on every upgrade.
+schema: trtllm-serve-model-harness-validation/harness-profile@1
+id: claude-code
+harness: claude-code
+version: "2.1.289"
+configuration: ANTHROPIC_BASE_URL (Anthropic Messages format)
+contract: contracts/claude-code.md
+status: partial             # timeouts measured; server_tools, parallel_tool_calls, the over-length
+                            # wording and the model-config mechanism still TODO (below)
+protocol: anthropic-messages
+routes:                     # measured: HEAD /api/hello, then POST /v1/messages?beta=true
+  - {method: POST, path: /v1/messages, query: "beta=true", stream: always}
+  - {method: POST, path: /v1/messages/count_tokens, optional: true}   # not called in the wiring runs
+  - {method: HEAD, path: /api/hello, optional: true}                  # warm-up probe, sent first
+  - {method: GET, path: /v1/models, optional: true}                   # only with CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+
+identity:
+  session: {header: x-claude-code-session-id}
+  agent: {header: x-claude-code-agent-id}            # sub-agents only
+  parent_agent: {header: x-claude-code-parent-agent-id}
+  request_class: {header: x-claude-code-request-class}   # needs CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
+  compaction: {header: x-claude-code-compaction}         # auto | manual | reactive
+  prompt: {header: x-claude-code-prompt-id}
+
+request:
+  model_field: from ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL
+  unknown_model_capabilities: full   # thinking adaptive, output_config, context_management,
+                                     # mid-conversation role:system, cache_control, beta tool fields
+  must_accept:
+    - anthropic-beta header (open list)
+    - thinking
+    - output_config
+    - context_management
+    - cache_control
+    - metadata
+    - system as an array
+    - "messages[].role: system"
+    - "tools[].strict"
+    - "tools[].defer_loading"
+    - tool_reference blocks
+  system_attribution_block: first system block; stable per conversation since v2.1.181;
+                            CLAUDE_CODE_ATTRIBUTION_HEADER=0 removes it
+
+tools:
+  declared_in: [tools]
+  namespaces: false
+  custom_tools: false
+  server_tools: TODO        # e.g. web search; record what reaches the endpoint
+parallel_tool_calls: TODO   # does it ever send disable_parallel_tool_use? main rejects it with a 400
+
+outcomes:                   # tool_result blocks by tool_use_id; measured (2.1.289, fake server):
+                            # all four carry is_error: true, so order matters, and a result
+                            # without it is the tool's output, whatever its text
+  aborted:                  # a call Claude Code did not run: rejected by the user or a permission
+    prefix:                 # rule, or interrupted; read from the 2.1.289, 2.1.299 and 2.1.309
+      - "The user doesn't want to proceed with this tool use."   # binaries
+      - "Permission for this tool use was denied."
+      - "Permission to use "
+      - "[Request interrupted by user for tool use]"
+      - "[Tool call did not complete:"
+    is_error: true
+  unsupported: {contains: "No such tool available", is_error: true}    # <tool_use_error>Error: No such tool available: NAME</tool_use_error>
+  arguments_rejected: {contains: "InputValidationError", is_error: true}  # <tool_use_error>InputValidationError: ...</tool_use_error>
+  tool_error: {is_error: true}                         # the tool ran and failed, e.g. "File does not exist."
+
+errors:
+  overlength: {shape: http_400, error_type: invalid_request_error, wording: "prompt is too long",
+               status: TODO}    # reactive compaction depends on the wording; main says otherwise
+  capability_retries:          # measured from the matchers in the 2.1.289 and 2.1.309
+                               # binaries (the same in both unless noted): a 400 whose message matches
+                               # makes Claude Code drop that capability and retry
+    - {field: thinking.display, wording: "Unknown parameter: 'thinking.adaptive.display'"}
+                               # display "updates": ANY 400 no other rule claims is retried once without
+                               # it, and it is not sent again in that conversation; this wording is main's
+    - {field: thinking.display, wording: "thinking. ... .display: Input should be"}   # "highlights" -> "omitted"
+    - {field: thinking.type, wording: "adaptive thinking is not supported"}
+    - {field: thinking.type, wording: "thinking.type: enabled ... is not supported"}
+    - {field: thinking.signature, wording: "bound to a different conversation"}
+    - {field: thinking.signature, wording: "not created in this conversation"}
+    - {field: thinking.signature, wording: "Invalid signature in thinking block"}
+    - {field: thinking.block_binding, wording: "thinking. ... .block_binding ... Extra inputs are not permitted"}
+    - {field: "messages[].role=system", wording: "Unexpected role ... input message role"}
+    - {field: output_config.effort, wording: "requires a model that supports per-turn effort"}
+    - {field: output_config.effort, wording: "This model does not support the effort parameter"}
+    - {field: output_config, wording: "messages. ... .output_config: Extra inputs are not permitted"}
+    - {field: output_config.format, wording: "output_config.format: Extra inputs are not permitted"}
+    - {field: context_management, wording: "context_management: Extra inputs are not permitted"}  # 2.1.304+
+  overload: {status: 529, error_type: overloaded_error}
+  retry_after: integer seconds; above 60 stops automatic retries
+
+timeouts:                   # measured on 2.1.289 and 2.1.309 (the same), default environment,
+                            # custom ANTHROPIC_BASE_URL, against fake_agent_server slow_first_event /
+                            # silent_gap / silent_gap_pings with a 900 s wait
+  first_event_s: 360        # no response at all: dropped and sent again (api_retry, up to 10 attempts,
+                            # backoff from about 0.56 s); CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS sets it
+  idle_s: 300               # no bytes mid-stream: dropped, and the request sent again without streaming;
+                            # CLAUDE_STREAM_IDLE_TIMEOUT_MS sets it
+  keepalive: ping           # a ping every 5 s held the idle watchdog off, up to request_s
+  request_s: 600            # API_TIMEOUT_MS: a stream of pings only was dropped at 600 s, then sent again
+                            # without streaming
+
+echo:                       # what the next request carries back of our reply (C-03)
+  text: exact               # 2.1.289 vs fake_agent_server: blocks in order, verbatim
+  reasoning: exact          # thinking text and signature, verbatim, at the appended position
+  tool_input:               # 2.1.289 vs DeepSeek-V4.1-Flash: every
+    - schema_defaults       # Edit came back with replace_all: false, its declared default, added (12/12)
+    - cd_cwd_prefix         # every Bash `cd <session cwd> && <cmd>` came back as <cmd> (6/6); no other change
+
+reasoning:
+  carrier: thinking signature   # main emits no signature; a rejected signature makes it drop thinking
+  request: {thinking: adaptive for unknown model ids}
+
+stream:
+  requires: [message_delta, message_stop]   # ending early reads as a dropped connection
+  keepalive: ping
+
+context_window:
+  default_for_unknown_ids: 200000           # 1000000 when the id carries [1m]
+  configure: TODO - record the model-config mechanism for a gateway or custom model id
+
+background_tasks: main model unless ANTHROPIC_DEFAULT_HAIKU_MODEL is set
+
+direct_egress: [fast-mode availability check, WebFetch domain safety check]   # api.anthropic.com

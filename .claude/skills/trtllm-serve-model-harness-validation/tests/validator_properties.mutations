@@ -1,0 +1,393 @@
+# Mutation gate for tests/test_validator_properties.py (the method: references/verify-logic.md;
+# the gate: scripts/mutate.py).
+#
+# `file` is relative to the root of the repository that holds this skill. Run from that root,
+# against a green baseline, otherwise DETECTED proves nothing:
+#
+#   python3 .claude/skills/trtllm-serve-model-harness-validation/scripts/mutate.py \
+#       .claude/skills/trtllm-serve-model-harness-validation/tests/validator_properties.mutations \
+#       --python <validator venv python, with hypothesis importable> \
+#       --runner <absolute path of tests/test_validator_properties.py>
+#
+# Each entry is a bug a reviewer could plausibly introduce. A MISSED result names behaviour the
+# properties do not constrain: strengthen a property rather than delete the mutation.
+
+[mutation]
+name = reask-ignores-messages-after-the-last-user-message
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = frame = dict(body, messages=messages[:last] + [None] + messages[last + 1 :])
+replace = frame = dict(body, messages=messages[:last])
+
+[mutation]
+name = reask-ignores-request-fields
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = frame = dict(body, messages=messages[:last] + [None] + messages[last + 1 :])
+replace = frame = {"messages": messages[:last] + [None] + messages[last + 1 :]}
+
+[mutation]
+name = reask-counts-system-messages-as-user
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if isinstance(m, dict) and m.get("role") == "user"]
+replace = if isinstance(m, dict) and m.get("role") in ("user", "system")]
+
+[mutation]
+name = reask-accepts-the-same-request
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return any(order > turn["order"] and len(later) > len(blocks)
+replace = return any(order > turn["order"] and len(later) >= len(blocks)
+
+[mutation]
+name = reask-ignores-order
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return any(order > turn["order"] and len(later) > len(blocks)
+replace = return any(order != turn["order"] and len(later) > len(blocks)
+
+[mutation]
+name = reask-drops-the-prefix-check
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = and later[:len(blocks)] == blocks
+replace = and True
+
+[mutation]
+name = wording-case-sensitive
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = text, at = message.lower(), 0
+replace = text, at = message, 0
+
+[mutation]
+name = wording-ignores-order
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = at = text.find(part, at)
+replace = at = text.find(part)
+
+[mutation]
+name = wording-empty-matches-everything
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return bool(parts)
+replace = return True
+
+[mutation]
+name = raw-window-check-dropped
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return stamp is not None and (stamp[1] < low or stamp[0] > high)
+replace = return False
+
+[mutation]
+name = raw-count-check-dropped
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = and (reported is None or r.get("output_tokens") in (None, reported))]  # fmt: skip
+replace = ]  # fmt: skip
+
+[mutation]
+name = raw-skew-ignored
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = low, high = window[0] - RAW_CLOCK_SKEW_S, window[1] + RAW_CLOCK_SKEW_S
+replace = low, high = window
+
+[mutation]
+name = raw-first-of-several-joined
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if len(left) != 1 or left[0].get("started_at") is None or left[0].get("finished_at") is None:
+replace = if not left or left[0].get("started_at") is None or left[0].get("finished_at") is None:
+
+[mutation]
+name = raw-unknown-times-joined
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if len(left) != 1 or left[0].get("started_at") is None or left[0].get("finished_at") is None:
+replace = if len(left) != 1:
+
+[mutation]
+name = raw-unique-id-window-checked
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if len(readings) == 1:
+replace = if len(readings) == 1 and fitting_raw(readings, window, reported) is not None:
+
+[mutation]
+name = raw-disagg-id-resolved
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = fit = fitting_raw(readings, window, reported) if key.startswith("r:") else None
+replace = fit = fitting_raw(readings, window, reported)
+
+[mutation]
+name = raw-ambiguity-not-reported
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return None, ("ambiguous" if named else None)
+replace = return None, None
+
+[mutation]
+name = stamp-whole-second-read-as-exact
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return at, at + (0.0 if "." in clock or "," in clock else 1.0)
+replace = return at, at
+
+[mutation]
+name = window-ends-at-the-start-of-its-last-second
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return start[0], end[1]
+replace = return start[0], end[0]
+
+[mutation]
+name = window-from-total-counts-from-the-start-of-the-arrival-second
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return start[0], start[1] + float(total)
+replace = return start[0], start[0] + float(total)
+
+[mutation]
+name = r04-fails-every-run-the-raw-record-shows
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if shown or delivered_as_answer(reply):
+replace = if found:
+
+[mutation]
+name = r04-reads-the-delivered-text-only
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if shown or delivered_as_answer(reply):
+replace = if shown:
+
+[mutation]
+name = answer-excludes-a-reply-cut-at-its-budget
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return reply.terminal.get("kind") in ("completed", "incomplete")
+replace = return reply.terminal.get("kind") == "completed"
+
+[mutation]
+name = answer-excludes-a-completed-reply
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return reply.terminal.get("kind") in ("completed", "incomplete")
+replace = return reply.terminal.get("kind") == "incomplete"
+
+[mutation]
+name = answer-includes-an-error
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return reply.terminal.get("kind") in ("completed", "incomplete")
+replace = return reply.terminal.get("kind") in ("completed", "incomplete", "error")
+
+[mutation]
+name = answer-includes-a-reply-without-terminal
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return reply.terminal.get("kind") in ("completed", "incomplete")
+replace = return reply.terminal.get("kind") in ("completed", "incomplete", "none")
+
+[mutation]
+name = m02-ignores-the-raw-record
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = found = shown or bool(raw_degenerate)
+replace = found = shown
+
+[mutation]
+name = stopped-record-compared-as-finished
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = completed and not stopped,
+replace = completed,
+
+[mutation]
+name = stopped-ignores-aborted
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if record.get("aborted") is True:
+replace = if False:
+
+[mutation]
+name = stopped-reads-a-false-aborted-flag
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if record.get("aborted") is True:
+replace = if "aborted" in record:
+
+[mutation]
+name = stopped-ignores-partial
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if record.get("partial") is True or record.get("end_reason") not in (None, ""):
+replace = if record.get("end_reason") not in (None, ""):
+
+[mutation]
+name = stopped-ignores-the-end-reason
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if record.get("partial") is True or record.get("end_reason") not in (None, ""):
+replace = if record.get("partial") is True:
+
+[mutation]
+name = build-ids-not-counted
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = self.counts["I-05:with_build_id"] += 1
+replace = pass
+
+[mutation]
+name = undeclared-revision-not-blocked
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/verdict.py
+find = elif not revision and counts.get("I-05:with_build_id"):
+replace = elif False:
+
+[mutation]
+name = empty-build-id-declares-a-revision
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/verdict.py
+find = return (build_id.strip() or None) if isinstance(build_id, str) else None
+replace = return build_id
+
+[mutation]
+name = blank-build-id-not-stripped
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/verdict.py
+find = return (build_id.strip() or None) if isinstance(build_id, str) else None
+replace = return (build_id or None) if isinstance(build_id, str) else None
+
+[mutation]
+name = records-checked-against-the-build-id-as-given
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/verdict.py
+find = declared_revision(args.build_id),
+replace = args.build_id,
+
+# C-10 under `shape: any_error`: the error's text against the harness's patterns (pi).
+
+[mutation]
+name = overlength-ignores-exclusions
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = and not any(p.search(text) for p in patterns.get("unless", ())))  # fmt: skip
+replace = and True)  # fmt: skip
+
+[mutation]
+name = overlength-ignores-errors-in-the-stream
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = or terminal.get("kind") in ("error", "failed"))  # fmt: skip
+replace = or False)  # fmt: skip
+
+[mutation]
+name = overlength-reads-only-statuses-above-400
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = failed = ((isinstance(http_status, int) and http_status >= 400)
+replace = failed = ((isinstance(http_status, int) and http_status > 400)
+
+[mutation]
+name = overlength-reads-any-status
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = failed = ((isinstance(http_status, int) and http_status >= 400)
+replace = failed = ((isinstance(http_status, int) or True)
+
+[mutation]
+name = overlength-text-without-the-code
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = text = " ".join(str(x) for x in (http_status, error.get("code"), error.get("type"),
+replace = text = " ".join(str(x) for x in (http_status, error.get("type"),
+
+[mutation]
+name = overlength-text-without-the-status
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = text = " ".join(str(x) for x in (http_status, error.get("code"), error.get("type"),
+replace = text = " ".join(str(x) for x in (error.get("code"), error.get("type"),
+
+[mutation]
+name = overlength-text-without-the-message
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = terminal.get("message")) if x)  # fmt: skip
+replace = ) if x)  # fmt: skip
+
+[mutation]
+name = overlength-any-error-text-is-recognized
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return (failed and any(p.search(text) for p in patterns.get("matches", ()))
+replace = return (failed
+
+[mutation]
+name = overlength-patterns-case-sensitive
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = compiled[key] = [re.compile(p, re.I) for p in patterns]
+replace = compiled[key] = [re.compile(p) for p in patterns]
+
+[mutation]
+name = overlength-bad-pattern-skipped
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = raise ValueError(f"harness profile errors.overlength.{key}: {error}") from error
+replace = compiled[key] = []
+
+[mutation]
+name = overlength-compiles-every-shape
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if not isinstance(spec, dict) or spec.get("shape") != "any_error":
+replace = if not isinstance(spec, dict):
+
+# H-02: a resend is ours after over-length or a client error other than capacity.
+
+[mutation]
+name = resend-after-capacity-is-ours
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = and http_status not in CAPACITY_STATUSES)  # fmt: skip
+replace = )  # fmt: skip
+
+[mutation]
+name = resend-after-server-error-is-ours
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = client_error = (isinstance(http_status, int) and 400 <= http_status < 500
+replace = client_error = (isinstance(http_status, int) and 400 <= http_status < 600
+
+[mutation]
+name = resend-after-overlength-is-a-retry
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if overlength or client_error:
+replace = if client_error:
+
+[mutation]
+name = resend-after-failure-is-other
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return "H-02:retry_after_failure" if failed else "H-02:other"
+replace = return "H-02:other"
+
+# USG-08: a prompt may shrink only by the tools the next request no longer declares.
+
+[mutation]
+name = tools-the-same-names-are-fewer
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if not left < names:
+replace = if not left <= names:
+
+[mutation]
+name = tools-fewer-by-count-not-by-name
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = if not left < names:
+replace = if not len(left) < len(names):
+
+[mutation]
+name = tools-kept-by-name-not-as-declared
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = kept = {d[1] for d in following}
+replace = kept = {d[1] for d in following} | {d[1] for d in turn if d[0] in left}
+
+[mutation]
+name = tools-preamble-whatever-is-left
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = return removed + (0 if left else TOOLS_PREAMBLE_TOKENS)
+replace = return removed + TOOLS_PREAMBLE_TOKENS
+
+[mutation]
+name = tools-sized-in-characters
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/turnlib.py
+find = return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass"))
+replace = return len(json.dumps(value, ensure_ascii=False, default=str))
+
+[mutation]
+name = tools-namespace-fields-counted-once
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/turnlib.py
+find = _json_size(wrapper) + _json_size(tool)))  # fmt: skip
+replace = _json_size(tool)))  # fmt: skip
+
+[mutation]
+name = tools-any-change-excused
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = elif bound is not None and shrank <= bound:
+replace = elif bound is not None:
+
+[mutation]
+name = tools-the-bound-itself-is-too-much
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/pipeline.py
+find = elif bound is not None and shrank <= bound:
+replace = elif bound is not None and shrank < bound:
+
+# GLM's raw view: argument markup inside a value is the model's slip (M-07).
+
+[mutation]
+name = glm-value-markup-only-a-key-close
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/native.py
+find = if key_close in value or value_open in value:
+replace = if key_close in value:
+
+[mutation]
+name = glm-value-markup-ignored
+file = .claude/skills/trtllm-serve-model-harness-validation/scripts/validate/native.py
+find = if key_close in value or value_open in value:
+replace = if False:

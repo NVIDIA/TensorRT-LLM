@@ -1,0 +1,5 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# pi kit entry point: see `pikit --help` (bin/pikit.py). Run it on the docker host.
+exec /usr/bin/python3 "$(dirname "$(readlink -f "$0")")/pikit.py" "$@"

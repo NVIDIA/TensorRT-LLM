@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Model profile: DeepSeek V4.1. Derived from the checkpoint's own encoder
+# (encoding/encoding.py). The validator reads markers, degenerate ids and the format card.
+schema: trtllm-serve-model-harness-validation/model-profile@1
+id: deepseek-v41
+status: draft               # draft until S1's golden renders pass
+checkpoints:
+  - {name: DeepSeek-V4.1-Flash, model_type: deepseek_v41, size_gb: 510}
+  - {name: DeepSeek-V4.1-Flash-NVFP4, model_type: deepseek_v41, size_gb: 510}
+upstream: "main: #19727"
+
+renderer:
+  kind: custom_tokenizer
+  flag: --custom_tokenizer deepseek_v41     # never auto-selected from model_type
+  reference: encoding/encoding.py           # sha256 prefix 502bdaec8a3fd88e
+  reference_tests: encoding/test_encoding.py
+  notes:
+    - "Six prompt changes from V4, including spaced DSML tag names."
+    - "Mid-conversation system messages render as <｜System｜>."
+    - "Thinking mode is per request (chat_template_kwargs); effort renders as a numeric line,
+       default high. A harness that sends only reasoning effort needs a server-side mapping."
+
+parsers:
+  tool: deepseek_v41
+  reasoning: deepseek_v41
+  family: [deepseekv32, deepseekv4, deepseekv41]   # siblings share defects: run the fault matrix on all
+
+format_card:                                # for scripts/fault_mutations.py
+  block_open: "<｜DSML｜ calls>"
+  block_close: "</｜DSML｜ calls>"
+  call_open: "<｜DSML｜ invoke name=\""
+  name_end: "\">"
+  call_close: "</｜DSML｜ invoke>"
+  value_open: "string=\"true\">"
+  value_close: "</｜DSML｜ parameter>"
+  qualified_prefix: "functions."
+
+native:                                     # the raw view (C-13); grammar of encoding/encoding.py
+  kind: dsml
+  prompt_opens: think                       # thinking mode; chat mode starts in content
+  prompt_opens_without_thinking: content    # a Messages request without `thinking` renders chat
+                                            # mode (no </think> in the reply), e.g. Claude Code's
+                                            # side requests
+  stop_markers: ["<｜end▁of▁sentence｜>"]
+  repairs: []
+  measured: "golden renders only (tests/fixtures/native_goldens.json); no traffic yet"
+
+markers:                                    # bare occurrences in delivered text are leak suspects
+  - "｜DSML｜"
+  - "<think>"
+  - "</think>"
+  - "<｜end▁of▁sentence｜>"
+  - "<｜System｜>"
+  - "<｜User｜>"
+  - "<｜Assistant｜>"
+  - "<｜latest_reminder｜>"
+
+special_tokens:
+  bos: "<｜begin▁of▁sentence｜>"
+  eos: "<｜end▁of▁sentence｜>"
+  think_open: "<think>"
+  think_close: "</think>"
+
+vocab_size: 129280                          # resolves id: last_vocab_id (M-02 on token ids)
+degenerate:                                 # from the tokenizer (vocab 129280), as a precaution: no
+                                            # V4.1 run has shown one (M-02 counted 0 in every cell)
+  - {token: "<｜▁pad▁｜>", id: 2, run: 20}                            # config pad_token_id
+  - {token: "<|place_holder_mm_span_0442|>", id: last_vocab_id, run: 20}
+  - '(?:<\|place_holder_mm_span_\d+\|>){20,}'                    # a run of any placeholder
+                                            # All are special tokens: they reach the text M-02 reads only
+                                            # if detokenization keeps them. S1: confirm with a forced run
+
+reasoning:
+  channel: think tags
+  history_policy: S1 - record from the encoder how past reasoning is rendered
+  effort_levels: S1 - record the exact mapping (header says 50/75/100)
+
+context:
+  model_max: 1048576                        # max_position_embeddings; the served window is max_seq_len
+  serving: "The production serving configuration (references/smoke.md 3c): max_seq_len 1048576,
+    chunked prefill, max_num_tokens 8192. The full config and serve command for one node of 4 GB300
+    GPUs: profiles/model/serving/deepseek-v41.4xgb300.yaml."
+
+known_findings:
+  - "Long context (GB300, chunked prefill): with max_num_tokens 65,536 or 131,072, a prompt
+     longer than 65,536 tokens loses everything before its last 65,536; with 8192, recall held to
+     417k. max_seq_len changes nothing. Chunks between 8192 and 65,536 are untested, and the cause
+     in the code is not located (references/smoke.md 3c)."
+  - "Synthetic fault matrix: 23 of 28 samples flagged, the same pattern as V4
+     (missing block close changes the calls; truncated or trailing text lost). Confirm at L2."
