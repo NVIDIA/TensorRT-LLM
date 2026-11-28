@@ -245,7 +245,7 @@ def test_splitk_first_call_compiles_every_plan_up_to_the_callers_reach(monkeypat
     assert plans(4) < plans(reach), "the reach adds plans past the first call's rows"
     for named in (None, reach):
         monkeypatch.setattr(splitk_mod, "_COMPILED", {})
-        monkeypatch.setattr(splitk_mod, "_PLANNED", set())
+        monkeypatch.setattr(splitk_mod, "_PLANNED", {})
         call(4, max_rows=named)
         want = plans(4 if named is None else reach)
         splits, merges = _splitk_compiled()
