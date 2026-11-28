@@ -1303,13 +1303,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "minimal", "low", "medium", "high", "xhigh", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
-            description=(
-                "The level of reasoning effort to use. Controls how much "
-                "reasoning is shown in the model's response. Options: "
-                "'low', 'medium', 'high' (harmony/gpt-oss), 'max' and "
-                "'none' for models with Kimi-style thinking control, plus "
-                "'minimal' and 'xhigh' for models whose chat template "
-                "supports the extended effort scale."),
+            description=
+            ("The level of reasoning effort to use. Controls how much "
+             "reasoning is shown in the model's response. Options: "
+             "'none', 'minimal', 'low', 'medium', 'high', 'xhigh' and "
+             "'max', as in OpenAI's API. Models whose serving integration "
+             "forwards this field to a chat template supporting the extended "
+             "scale consume 'minimal' and 'xhigh' natively. "
+             "Models with explicit serving-side effort mapping fall back to "
+             "their lowest or highest level: 'low' or 'high' on "
+             "harmony/gpt-oss (low/medium/high, which also uses 'high' for "
+             "'max'), 'low' or 'max' with Kimi-style thinking control "
+             "(low/high/max, where 'none' turns thinking off). Models that "
+             "validate against checkpoint-declared levels (such as "
+             "Mistral-native checkpoints) reject unsupported values. gpt-oss "
+             "cannot turn reasoning off, so on harmony/gpt-oss 'none' gives "
+             "the server's default level, 'high', not this field's default, "
+             "'low'."),
         )
     # Kimi/Moonshot extension: structured control of reasoning output. The
     # serving layer maps it into the chat-template kwargs for models whose
