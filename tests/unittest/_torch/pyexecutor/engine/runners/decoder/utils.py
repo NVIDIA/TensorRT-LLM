@@ -80,6 +80,7 @@ def decoder_config(**changes: Any) -> DecoderRunnerConfig:
         samples_from_vocab_shards=False,
         spec_decode_fast_paths=False,
         is_disagg=False,
+        is_disagg_context=False,
     )
     spec = changes.get("spec_config")
     if spec is not None and changes.get("is_spec_decode", True):
@@ -215,7 +216,7 @@ def decoder_warmup(
         metadata=Mock(),
         dummy_requests=dummy_requests,
         graphs=graphs,
-        inputs=SimpleNamespace(guided_decoder=guided_decoder),
+        inputs=SimpleNamespace(guided_decoder=guided_decoder, warmup_speculative_inputs=Mock()),
         forward_warmup=forward_warmup,
         torch_compile_bypass=nullcontext,
         context_warmups_supported=True,

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import os
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
@@ -542,6 +543,7 @@ class ModelEngine:
     ) -> DecoderRunnerConfig:
         from ._util import is_disagg_enabled
 
+        is_disagg = is_disagg_enabled(self.llm_args.cache_transceiver_config)
         return config_cls(
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -593,7 +595,8 @@ class ModelEngine:
             spec_samples_sharded_temperature=self.spec_samples_sharded_temperature,
             guided_decoding_enabled=self.llm_args.guided_decoding_backend is not None,
             watermark_config=self.llm_args.watermark_config,
-            is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
+            is_disagg=is_disagg,
+            is_disagg_context=is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context",
             steady_decode_prepare=runtime_hooks_of(self.model).steady_decode_prepare,
             **extra_fields,
         )

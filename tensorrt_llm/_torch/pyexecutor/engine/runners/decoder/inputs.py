@@ -60,6 +60,7 @@ from tensorrt_llm._torch.pyexecutor.steady_spec_prepare import (
     SteadyMtpRecord,
     steady_glue_enabled,
 )
+from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.speculative import SpecMetadata, get_num_extra_kv_tokens
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
@@ -539,6 +540,43 @@ class DecoderInputPreparer:
                 and not config.use_mrope
                 and not self._dspark_trims_submitted_tokens
                 and not mapping.has_cp_helix()
+            )
+
+    def warmup_speculative_inputs(self, warmup_timer: _WarmupTimer) -> None:
+        """Initialize staged speculative copies before serving, without reading request data.
+
+        The zero-row launch zero-fills ``previous_pos_id_offsets_cuda`` and
+        ``previous_kv_lens_offsets_cuda``. This is startup-only; neither buffer
+        may hold live request state.
+        """
+        if not self._spec_overlap_staging:
+            return
+        with warmup_timer.phase("speculative_input_staging"):
+            buffers = self._buffers
+            source = buffers.input_ids_cuda[:1]
+            # Match SpecSampler.Store.allocate: num_slots is max_num_sequences,
+            # new_tokens uses beam width 1, and the draft row width is max_total_draft_tokens.
+            num_slots = (
+                self._config.max_batch_size
+                if self._config.num_seq_slots is None
+                else self._config.num_seq_slots
+            )
+            stage_spec_overlap_inputs(
+                source,
+                (0, 0, 0, 0, 0, 0),
+                buffers.input_ids_cuda,
+                buffers.draft_tokens_cuda,
+                buffers.draft_tokens_cuda,
+                buffers.previous_batch_indices_cuda,
+                buffers.position_ids_cuda,
+                buffers.gather_ids_cuda,
+                buffers.previous_pos_id_offsets_cuda,
+                buffers.previous_kv_lens_offsets_cuda,
+                source.as_strided((1, 1, 1), (num_slots, 1, 1)),
+                source.as_strided((1, 1), (max(1, self._config.max_total_draft_tokens), 1)),
+                source,
+                0,
+                self.get_runtime_tokens_per_gen_step(self._config.max_draft_len),
             )
 
     def _new_extra_inputs(self) -> ExtraInputsCollector:

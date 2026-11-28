@@ -344,7 +344,13 @@ class DecoderWarmup:
         return self._inputs.guided_decoder
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
-        """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
+        """Warm up and capture graphs; return the eager workspace reclaimer to serve with.
+
+        Decode-input staging is prewarmed for generation and aggregated workers,
+        not workers configured for the disaggregated context role. A context-role
+        worker that accepts an aggregated request initializes staging on demand
+        at its first staged step.
+        """
         from tensorrt_llm._torch.modules.low_m_gemm import release_mma_staging_buffers
 
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -360,6 +366,8 @@ class DecoderWarmup:
                 self._warmup_timer,
                 KernelBuilder.get().warmup_pass(self._warmup_timer.purpose),
             ):
+                if not self._config.is_disagg_context:
+                    self._inputs.warmup_speculative_inputs(self._warmup_timer)
                 return self._warmup_scheduled(resource_manager, kv_cache_manager)
         finally:
             # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage

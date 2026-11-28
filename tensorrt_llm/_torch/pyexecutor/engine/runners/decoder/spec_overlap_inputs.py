@@ -5,6 +5,9 @@
 The step's host inputs arrive as one int32 slab; the rows that verify the
 previous step's drafts take their tokens, drafts and acceptance corrections
 from that step's device outputs. One kernel writes all of it.
+
+The sampler's packed length and draft views need not have the alignment of
+standalone warmup tensors.
 """
 
 from collections.abc import Sequence
@@ -28,7 +31,10 @@ _PER_STEP_ARGS = [
 ]
 
 
-@triton.jit(do_not_specialize=_PER_STEP_ARGS, do_not_specialize_on_alignment=_PER_STEP_ARGS)
+@triton.jit(
+    do_not_specialize=_PER_STEP_ARGS,
+    do_not_specialize_on_alignment=_PER_STEP_ARGS + ["next_drafts", "new_tokens_lens"],
+)
 def _stage_kernel(
     slab,
     ids_end,
