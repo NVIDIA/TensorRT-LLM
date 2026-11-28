@@ -244,7 +244,35 @@ class BaseToolParser(ABC):
                 "the stream; the calls it reported may be incomplete. This is "
                 "a bug in the parser's parse_streaming_increment.",
                 key=f"{parser_name}.finish_did_not_converge")
+        normal_text += self._release_held_tail(tools)
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _release_held_tail(self, tools: List[Tool]) -> str:
+        """Release, as content, the tail the stream ended while holding back.
+
+        A streaming pass holds back a tail that could still begin a tool call:
+        a trailing ``<`` that may grow into the start token, or a call block
+        whose end has not arrived. Once the stream ends nothing can complete
+        it. When ``detect_and_parse`` returns the whole tail as content, the
+        stream does too. A tail that belongs to a call whose name was already
+        streamed, or that ``detect_and_parse`` would parse or drop, stays with
+        the parser.
+        """
+        held = self._buffer
+        if not held or self.current_tool_name_sent:
+            return ""
+        try:
+            parsed = self.detect_and_parse(held, tools)
+        except Exception:
+            return ""
+        if (parsed is None or parsed.calls
+                or (parsed.normal_text or "").strip() != held.strip()):
+            return ""
+        self._buffer = ""
+        if self.eot_token and self.bot_token not in held:
+            # Mid-stream, content outside a call drops a stray end token.
+            held = held.replace(self.eot_token, "")
+        return held
 
     def _streaming_state(self) -> tuple:
         """What a streaming pass changes when it makes progress."""

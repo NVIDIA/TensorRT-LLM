@@ -112,6 +112,32 @@ class Qwen3ToolParser(BaseToolParser):
                 continue
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Report what the stream left buffered when generation ends.
+
+        A stream that never decided between the wrapped and the bare-JSON form
+        holds its text in ``_bare_json_buffer``, e.g. a reply that ends in
+        ``<``. It can no longer become a bare-JSON call, so it is handed to
+        the wrapped path, whose ``finish`` releases it as content.
+        """
+        if (self._stream_mode == self._STREAM_MODE_UNDECIDED
+                and self._bare_json_buffer):
+            self._stream_mode = self._STREAM_MODE_WRAPPED
+            self._buffer += self._bare_json_buffer
+            self._bare_json_buffer = ""
+        return super().finish(tools)
+
+    def _release_held_tail(self, tools: List[Tool]) -> str:
+        """Also release content held back as a possible partial end token.
+
+        Text after a call stays dropped, as ``detect_and_parse`` drops it.
+        """
+        held, self._normal_text_buffer = self._normal_text_buffer, ""
+        if self.current_tool_id == -1:
+            held += super()._release_held_tail(tools)
+        # The same scrubbing `_wrapped_streaming` applies to released content.
+        return held.replace(self.eot_token[1:], "")
+
     def parse_streaming_increment(self, new_text: str,
                                   tools: List[Tool]) -> StreamingParseResult:
         r"""
