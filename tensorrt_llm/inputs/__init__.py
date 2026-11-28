@@ -23,10 +23,12 @@ from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     ConversationMessage, MultimodalData, MultimodalDataTracker,
                     add_multimodal_placeholders, apply_chat_template,
                     apply_mm_placeholders, async_build_multimodal_prompt,
-                    async_load_audio, async_load_image, async_load_video,
-                    convert_image_mode, default_multimodal_input_loader,
+                    async_load_audio, async_load_base64_tensor,
+                    async_load_image, async_load_video, convert_image_mode,
+                    default_multimodal_input_loader,
                     encode_base64_content_from_url, encode_base64_image,
-                    load_base64_image_embeds, load_image, load_video)
+                    load_base64_image_embeds, load_base64_tensor, load_image,
+                    load_video)
 
 # yapf: enable
 
@@ -78,4 +80,6 @@ __all__ = [
     "compute_retained_tokens_from_tubelet_budget",
     "compute_retention_mask",
     "load_base64_image_embeds",
+    "load_base64_tensor",
+    "async_load_base64_tensor",
 ]
