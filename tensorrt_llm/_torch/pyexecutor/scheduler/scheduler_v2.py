@@ -260,6 +260,32 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
         # Disaggregated generation-init requests admitted per pass (None: all that fit).
         self.max_gen_init_admissions_per_pass = max_gen_init_admissions_per_pass
+        # Wait before a destructive recompute pause. A generation request that
+        # suspension cannot make room for, while another generation request is
+        # scheduled ahead of it in the pass, waits up to this many consecutive
+        # passes as the first blocked generation request. Another waiter restarts
+        # the count. 0 recompute-pauses right away; a negative value is unbounded.
+        # By default, wait only with a tier below GPU, where suspension frees pages.
+        wait_env = os.environ.get("TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS")
+        if wait_env is None:
+            max_wait_iters = -1 if kv_cache_manager.has_cache_tier_below_gpu else 0
+        else:
+            try:
+                max_wait_iters = int(wait_env)
+            except ValueError as error:
+                raise ValueError(
+                    "TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS must be an integer "
+                    "(0 disables waiting; negative means unbounded), "
+                    f"got {wait_env!r}"
+                ) from error
+        self._recompute_pause_max_wait_iters: int | None = (
+            None if max_wait_iters < 0 else max_wait_iters
+        )
+        # The request currently waiting and the iterations it has waited. The
+        # count restarts when another request starts waiting, and ends when the
+        # request is scheduled or its KV cache is given up.
+        self._recompute_pause_waiter_id: int | None = None
+        self._recompute_pause_wait_iters = 0
         # Every input to the prefix-aware skip is fixed for this scheduler's
         # lifetime: the knob is a constructor argument, and both manager
         # attributes are assigned once in ``KVCacheManagerV2.__init__``. Resolve
@@ -300,6 +326,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_mgr_name = (
             type(cross_kv_cache_manager).__name__ if cross_kv_cache_manager is not None else "None"
         )
+        wait_bound = self._recompute_pause_max_wait_iters
+        wait_label = "unbounded" if wait_bound is None else str(wait_bound)
         logger.info(
             f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
@@ -307,7 +335,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}, "
             f"prefix_skip_enabled={self._prefix_skip_enabled}, "
             f"enable_recompute_pause={enable_recompute_pause}, "
-            f"max_gen_init_admissions_per_pass={max_gen_init_admissions_per_pass}"
+            f"max_gen_init_admissions_per_pass={max_gen_init_admissions_per_pass}, "
+            f"recompute_pause_max_wait_iters={wait_label}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -940,6 +969,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                     recompute_paused,
                     inflight_request_ids,
                     scheduled_beam_width,
+                    # Requests still in flight from an earlier pass (another
+                    # pipeline-parallel micro-batch) do not count: without a
+                    # teardown this pass would schedule no generation request.
+                    generation_scheduled=bool(scheduled_gen),
                 )
                 if action is ScheduleAction.STOP:
                     break
@@ -2460,8 +2493,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_paused: RequestList,
         inflight_request_ids: set[int],
         scheduled_beam_width: int,
+        *,
+        generation_scheduled: bool,
     ) -> tuple[ScheduleAction, int, int, int]:
         """Try to schedule a generation request.
+
+        *generation_scheduled* says whether another generation request has
+        already been scheduled in this pass. If so, a request that suspension
+        cannot make room for may wait for pages (see `_try_wait_for_pages`)
+        rather than tear down another started request.
 
         Returns ``(action, tokens, scheduled_beam_width, req_it_end)``.
         *tokens* is meaningful only when *action* is ``SCHEDULED``.
@@ -2521,7 +2561,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
                 )
 
-        if not success and self._lost_kv_error is None:
+        waiting = (
+            not success
+            and self._lost_kv_error is None
+            and generation_scheduled
+            and self.enable_recompute_pause
+            and self._try_wait_for_pages(req)
+        )
+        if not success and self._lost_kv_error is None and not waiting:
             req_it_end, success = self._try_recompute_pause_for_gen(
                 req,
                 requests_list,
@@ -2539,6 +2586,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             return lost, 0, scheduled_beam_width, req_it_end
 
         if success:
+            self._reset_recompute_pause_wait(req)
             return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
 
         # Self-eviction: suspend this gen request to free its
@@ -2550,7 +2598,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             # The request still sits out this step, so clear its stale batch
             # index.
             logger.debug(
-                f"[V2Scheduler] Helix request {req.py_request_id} found no pages or victim; waiting"
+                f"[V2Scheduler] Helix request {req.py_request_id} has no free pages; "
+                "sitting out this step"
             )
             self._clear_request_runtime_state(req)
         elif self.kv_cache_manager.is_request_active(
@@ -3063,6 +3112,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         victim, so one drains at a time and the next pass finds those pages
         instead of a second request having given up its cache for nothing.
         """
+        self._reset_recompute_pause_wait(req)
         if not self.kv_cache_manager.preempt_request(req):
             logger.debug(
                 f"[V2Scheduler] Preemption of request {req.py_request_id} "
@@ -3117,6 +3167,42 @@ class KVCacheV2Scheduler(RequestScheduler):
                 break  # no victim brings its pages back
 
         return req_it_end, False
+
+    def _reset_recompute_pause_wait(self, req: LlmRequest) -> None:
+        if req.py_request_id == self._recompute_pause_waiter_id:
+            self._recompute_pause_waiter_id = None
+            self._recompute_pause_wait_iters = 0
+
+    def _try_wait_for_pages(self, req: LlmRequest) -> bool:
+        """Count one more iteration of *req* waiting for pages, if its wait is not over.
+
+        Called when suspension cannot make room for generation request *req*
+        while another generation request is scheduled ahead of it in the pass.
+        Scheduled requests release pages as they finish, so *req* waits rather
+        than tearing down a victim, which would cost the victim a re-prefill.
+        The bound counts consecutive passes as the first blocked generation
+        request; another waiter restarts the count. Once the count reaches
+        `_recompute_pause_max_wait_iters` (never, when None), *req* tears down a
+        victim as it would with nothing else scheduled.
+
+        Returns True if *req* waits in this iteration.
+        """
+        waited = (
+            self._recompute_pause_wait_iters
+            if req.py_request_id == self._recompute_pause_waiter_id
+            else 0
+        )
+        bound = self._recompute_pause_max_wait_iters
+        if bound is not None and waited >= bound:
+            return False
+        self._recompute_pause_waiter_id = req.py_request_id
+        self._recompute_pause_wait_iters = waited + 1
+        logger.debug(
+            f"[V2Scheduler] Request {req.py_request_id} waits for pages "
+            f"({waited + 1}/{bound if bound is not None else 'unbounded'}) "
+            "instead of recompute-pausing a started request"
+        )
+        return True
 
     def _try_recompute_pause_for_gen(
         self,

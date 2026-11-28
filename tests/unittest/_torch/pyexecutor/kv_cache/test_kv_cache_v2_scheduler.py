@@ -34,7 +34,11 @@ from tensorrt_llm._torch.pyexecutor.scheduler.prefix_wait_planner import (
     MAX_WAIT_PASSES,
     MIN_GAIN_BLOCKS,
 )
-from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker, ScheduleAction
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+    BudgetTracker,
+    KVCacheV2Scheduler,
+    ScheduleAction,
+)
 from tensorrt_llm.llmapi.llm_args import (
     CapacitySchedulerPolicy,
     ContextChunkingPolicy,
@@ -43,6 +47,11 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _clear_recompute_pause_wait_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS", raising=False)
 
 
 def _manager_for_release(request_id: int, is_draft: bool = False):
@@ -625,7 +634,7 @@ def make_scheduler(
     context_starvation_iterations: int | None = None,
     recover_lost_kv_per_rank: bool = True,
     **scheduler_kwargs,
-) -> object:
+) -> KVCacheV2Scheduler:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -694,6 +703,16 @@ def ids(reqs):
 
 
 class TestConstruction:
+    @pytest.mark.parametrize("value", ["", "4.0"])
+    def test_invalid_recompute_pause_wait_names_variable(self, value: str) -> None:
+        with (
+            patch.dict("os.environ", {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": value}),
+            pytest.raises(
+                ValueError, match="TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS must be an integer"
+            ),
+        ):
+            make_scheduler(make_kv_cache_manager())
+
     def test_valid_construction(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr)
@@ -1087,41 +1106,344 @@ class TestKVCacheFailuresGen:
         # gen99 evicted as victim for gen1; gen1 self-evicts after
         assert set(ids(out.paused_requests)) == {1, 99}
 
-    def test_secondary_tier_recompute_pause_retries_immediately(self):
+    @pytest.mark.parametrize("generation_ahead", [False, True])
+    def test_secondary_tier_recompute_pause_retries_immediately(
+        self, generation_ahead: bool
+    ) -> None:
         """Full teardown is retried without conservatively waiting one pass."""
         call_count = [0]
 
-        def alloc_fn(req):
+        def alloc_fn(req: Mock) -> bool:
             call_count[0] += 1
-            # gen0 succeeds, then gen1 succeeds only on the immediate retry
-            # after its ordinary victim is upgraded to full recompute teardown.
-            return call_count[0] in (1, 4)
+            return call_count[0] in ((1, 4) if generation_ahead else (3,))
 
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
-        sched = make_scheduler(mgr, max_num_tokens=100)
+        env = {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": "0"} if generation_ahead else {}
+        with patch.dict("os.environ", env):
+            sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
-        reqs = [make_gen_request(0), make_gen_request(1), victim]
+        reqs = [make_gen_request(1), victim]
+        if generation_ahead:
+            reqs.insert(0, make_gen_request(0))
         out = sched.schedule_request(reqs, set())
-        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.generation_requests) == ([0, 1] if generation_ahead else [1])
         assert ids(out.paused_requests) == []
         assert ids(out.recompute_paused_requests) == [99]
-        assert call_count[0] == 4
+        assert call_count[0] == (4 if generation_ahead else 3)
         mgr.free_resources.assert_called_once_with(victim)
 
-    def test_recompute_pause_gate_stops_destructive_fallback(self):
+    @pytest.mark.parametrize("max_wait_iters", [None, -1])
+    def test_recompute_pause_waits_while_generation_progresses(
+        self, max_wait_iters: int | None
+    ) -> None:
+        """No teardown while a generation request is scheduled ahead in the pass.
+
+        The scheduled request releases pages as it finishes, so the blocked
+        request suspends itself and waits; re-prefilling a victim instead
+        would redo work that is not needed for progress.
+        """
+
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert set(ids(out.paused_requests)) == {1, 99}
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    @pytest.mark.parametrize("max_wait_iters", [-1, 2])
+    def test_recompute_pause_waits_while_generation_progresses_gpu_only(
+        self, max_wait_iters: int
+    ) -> None:
+        """Explicitly opt into waiting in a GPU-only pool, where suspension frees nothing.
+
+        There the teardown candidate is a request suspended in an earlier pass:
+        it still holds its pages, and recompute pause is the only way to get
+        them back.
+        """
+
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters, gpu_only=True)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.paused_requests) == [1]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    @staticmethod
+    def _bounded_wait_case(
+        max_wait_iters: int | None,
+        gpu_only: bool = False,
+        fits: set[int] | None = None,
+        helix: bool = False,
+    ) -> tuple[KVCacheV2Scheduler, Mock, list[Mock]]:
+        """Scheduler and requests [0, 1, 99] where 1 fits only once 99 is torn down.
+
+        *fits* holds the ids that fit without a teardown (default: only 0).
+        In a GPU-only pool the victim is a request suspended in an earlier
+        pass, which still holds its pages.
+        """
+        fits = {0} if fits is None else fits
+        freed_request_ids = set()
+
+        def alloc_fn(req: Mock) -> bool:
+            return req.request_id in fits or 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn,
+            can_evict=not gpu_only,
+            has_cache_tier_below_gpu=not gpu_only,
+        )
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        mgr._has_cp_helix = helix
+        env = (
+            {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": str(max_wait_iters)}
+            if max_wait_iters is not None
+            else {}
+        )
+        with patch.dict("os.environ", env):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(99)]
+        if gpu_only:
+            mgr.kv_cache_map[99].is_active = False
+        return sched, mgr, reqs
+
+    @pytest.mark.parametrize("gpu_only", [False, True])
+    def test_recompute_pause_after_bounded_wait(self, gpu_only: bool) -> None:
+        """The wait is bounded: after TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS
+        iterations the blocked request tears down a victim, as the first
+        generation request of a pass would."""
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters=2, gpu_only=gpu_only)
+        for _ in range(2):
+            out = sched.schedule_request(reqs, set())
+            assert ids(out.generation_requests) == [0]
+            assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(reqs[2])
+
+    @pytest.mark.parametrize("helix", [False, True])
+    def test_gpu_only_default_recompute_pauses_right_away(self, helix: bool) -> None:
+        sched, mgr, reqs = self._bounded_wait_case(None, gpu_only=True, helix=helix)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(reqs[2])
+
+    @pytest.mark.parametrize("max_wait_iters", [-1, 0])
+    def test_helix_recompute_pause_wait_override(self, max_wait_iters: int) -> None:
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters, gpu_only=True, helix=True)
+        reqs[1].py_batch_idx = 7
+        out = sched.schedule_request(reqs, set())
+        assert out.paused_requests == []
+        mgr.suspend_request.assert_not_called()
+        if max_wait_iters < 0:
+            assert ids(out.generation_requests) == [0]
+            assert out.recompute_paused_requests == []
+            assert reqs[1].py_batch_idx is None
+            mgr.free_resources.assert_not_called()
+        else:
+            assert ids(out.generation_requests) == [0, 1]
+            assert ids(out.recompute_paused_requests) == [99]
+            mgr.free_resources.assert_called_once_with(reqs[2])
+
+    def test_zero_wait_recompute_pauses_right_away(self) -> None:
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters=0)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(reqs[2])
+
+    @pytest.mark.parametrize("max_wait_iters", [-1, -4])
+    def test_negative_wait_lasts_while_generation_progresses(self, max_wait_iters: int) -> None:
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters=max_wait_iters)
+        for _ in range(8):
+            out = sched.schedule_request(reqs, set())
+            assert ids(out.generation_requests) == [0]
+            assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    def test_wait_restarts_after_the_request_runs(self) -> None:
+        """Only iterations waited since the request last ran count."""
+        fits = {0}
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters=1, fits=fits)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+
+        fits.update((1, 99))
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1, 99]
+
+        fits.difference_update((1, 99))
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert out.recompute_paused_requests == []
+
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.recompute_paused_requests) == [99]
+
+    def test_wait_restarts_when_another_request_takes_over(self) -> None:
+        fits = {0, 7}
+        freed_request_ids: set[int] = set()
+
+        def alloc_fn(req: Mock) -> bool:
+            return (
+                req.request_id in fits
+                or (req.request_id == 7 and 99 in freed_request_ids)
+                or (req.request_id == 1 and 98 in freed_request_ids)
+            )
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        with patch.dict("os.environ", {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": "1"}):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(request_id) for request_id in (0, 7, 1, 98, 99)]
+
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 7]
+        assert out.recompute_paused_requests == []
+
+        fits.remove(7)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert out.recompute_paused_requests == []
+
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 7]
+        assert ids(out.recompute_paused_requests) == [99]
+
+        out = sched.schedule_request(reqs[:-1], set())
+        assert ids(out.generation_requests) == [0, 7, 1]
+        assert ids(out.recompute_paused_requests) == [98]
+
+    @pytest.mark.parametrize("gpu_only", [False, True])
+    @pytest.mark.parametrize("deferred", [False, True])
+    def test_wait_restarts_after_the_request_is_torn_down(
+        self, gpu_only: bool, deferred: bool
+    ) -> None:
+        """A request torn down while it waits starts a fresh wait once it is back.
+
+        Suspension makes the mock cache inactive in either pool, but does not
+        make the allocation fit. The future victim sits out a first-generation
+        pass, without taking the waiter's slot, before the requester returns.
+        """
+        fits = {0}
+        freed_request_ids = set()
+
+        def alloc_fn(req: Mock) -> bool:
+            return req.request_id in fits or (req.request_id == 0 and 1 in freed_request_ids)
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn,
+            can_evict=not gpu_only,
+            has_cache_tier_below_gpu=not gpu_only,
+        )
+
+        def suspend_fn(req: Mock) -> None:
+            mgr.kv_cache_map[req.py_request_id].is_active = False
+
+        mgr.suspend_request.side_effect = suspend_fn
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        deferred_request_ids = defer_preemption(mgr, 1) if deferred else set()
+        with patch.dict("os.environ", {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": "1"}):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(99)]
+        # While 99 is in flight it is neither a victim nor scheduled.
+        in_flight = {99}
+
+        out = sched.schedule_request(reqs, in_flight)
+        assert ids(out.generation_requests) == [0]
+
+        # 0 is blocked first in its pass, so it tears down the waiting request.
+        fits.clear()
+        out = sched.schedule_request(reqs, in_flight)
+        assert ids(out.generation_requests) == ([] if deferred else [0])
+        assert ids(out.recompute_paused_requests) == ([] if deferred else [1])
+        if deferred:
+            mgr.free_resources.assert_not_called()
+            mgr.free_resources(reqs[1])
+            deferred_request_ids.clear()
+        mgr.free_resources.assert_called_once_with(reqs[1])
+
+        out = sched.schedule_request([reqs[2]], set())
+        assert out.generation_requests == []
+        assert ids(out.paused_requests) == [99]
+        assert out.recompute_paused_requests == []
+
+        # Blocked again once it is back, 1 waits instead of tearing down 99.
+        mgr.kv_cache_map[1].is_active = True
+        fits.add(0)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert out.recompute_paused_requests == []
+
+    def test_first_generation_request_recompute_pauses_gpu_only(self) -> None:
+        """In a GPU-only pool the first generation request of a pass still tears
+        down a request suspended in an earlier pass, which is the only way out
+        of a full pool there.
+        """
+        freed_request_ids = set()
+
+        def alloc_fn(req: Mock) -> bool:
+            return req.request_id == 1 and 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn, can_evict=False, has_cache_tier_below_gpu=False
+        )
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        out = sched.schedule_request([make_gen_request(1), victim], set())
+        assert ids(out.generation_requests) == [1]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(victim)
+
+    def test_requests_in_flight_do_not_hold_back_recompute_pause(self) -> None:
+        """Work in flight from an earlier pass does not count as progress.
+
+        Under pipeline parallelism the previous micro-batch is still in flight
+        while this one is scheduled. When only a teardown makes room for the
+        first generation request of the pass, it still happens, so the
+        micro-batch schedules generation work.
+        """
+        freed_request_ids = set()
+
+        def alloc_fn(req: Mock) -> bool:
+            return 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        in_flight = make_gen_request(7)
+        victim = make_gen_request(99)
+        out = sched.schedule_request(
+            [in_flight, make_gen_request(1), victim], {in_flight.request_id}
+        )
+        assert ids(out.generation_requests) == [1]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(victim)
+
+    def test_recompute_pause_gate_stops_destructive_fallback(self) -> None:
         """Disabling recompute pause keeps ordinary suspension as the last fallback."""
         call_count = [0]
 
-        def alloc_fn(req):
+        def alloc_fn(req: Mock) -> bool:
             call_count[0] += 1
             return call_count[0] == 1
 
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
-        sched = make_scheduler(
-            mgr,
-            max_num_tokens=100,
-            enable_recompute_pause=False,
-        )
+        with patch.dict("os.environ", {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": "0"}):
+            sched = make_scheduler(
+                mgr,
+                max_num_tokens=100,
+                enable_recompute_pause=False,
+            )
         victim = make_gen_request(99)
 
         out = sched.schedule_request(
@@ -1177,17 +1499,18 @@ class TestKVCacheFailuresGen:
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
 
-    def test_recompute_frontier_survives_ordinary_frontier_shrink(self):
+    @pytest.mark.parametrize("generation_ahead", [False, True])
+    def test_recompute_frontier_survives_ordinary_frontier_shrink(
+        self, generation_ahead: bool
+    ) -> None:
         """Recompute still sees a suspended tail after ordinary eviction skips it."""
-        attempts = {}
         freed_request_ids = set()
 
-        def alloc_fn(req):
+        def alloc_fn(req: Mock) -> bool:
             request_id = req.request_id
-            attempts[request_id] = attempts.get(request_id, 0) + 1
-            if request_id == 0:
-                return attempts[request_id] == 2
-            if request_id == 1:
+            if generation_ahead and request_id == 0:
+                return not mgr.kv_cache_map[2].is_active
+            if request_id == (1 if generation_ahead else 0):
                 return 3 in freed_request_ids
             raise AssertionError(f"Evicted request {request_id} was revisited")
 
@@ -1196,20 +1519,24 @@ class TestKVCacheFailuresGen:
             can_evict=True,
         )
         mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
-        sched = make_scheduler(mgr, max_num_tokens=100)
+        env = {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": "0"} if generation_ahead else {}
+        with patch.dict("os.environ", env):
+            sched = make_scheduler(mgr, max_num_tokens=100)
 
+        # Suspending the active victim shrinks the ordinary frontier to it and
+        # does not make room; the recompute frontier must still reach the
+        # suspended tail behind it.
         current = make_gen_request(0)
-        next_request = make_gen_request(1)
         active_victim = make_gen_request(2)
         suspended_tail = make_gen_request(3)
         mgr.kv_cache_map[suspended_tail.py_request_id].is_active = False
 
-        out = sched.schedule_request(
-            [current, next_request, active_victim, suspended_tail],
-            set(),
-        )
+        reqs = [current, active_victim, suspended_tail]
+        if generation_ahead:
+            reqs.insert(1, make_gen_request(1))
+        out = sched.schedule_request(reqs, set())
 
-        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.generation_requests) == ([0, 1] if generation_ahead else [0])
         assert ids(out.paused_requests) == [2]
         assert ids(out.recompute_paused_requests) == [3]
         mgr.suspend_request.assert_called_once_with(active_victim)
