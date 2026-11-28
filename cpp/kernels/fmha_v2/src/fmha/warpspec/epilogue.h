@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1176,7 +1176,7 @@ struct Tile_o_epilogue_base
             // The global max needs to be scaled by the bmm1 scale if exp2f optimization is enabled.
             if constexpr (EXP2F_OPTIMIZATION)
             {
-                sum += exp2f(attention_sink_ * M_LOG2E - max * scale_bmm1_f_);
+                sum += exp2f(attention_sink_ * static_cast<float>(M_LOG2E) - max * scale_bmm1_f_);
             }
             else
             {
@@ -1365,7 +1365,8 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
             float quant_scale_in_log2 = log2f(Traits_o::SOFTMAX_FP_QUANT_SCALE);
             if constexpr (EXP2F_OPTIMIZATION)
             {
-                sum += exp2f(this->attention_sink_ * M_LOG2E - max * this->scale_bmm1_f_ + quant_scale_in_log2);
+                sum += exp2f(this->attention_sink_ * static_cast<float>(M_LOG2E) - max * this->scale_bmm1_f_
+                    + quant_scale_in_log2);
             }
             else
             {
