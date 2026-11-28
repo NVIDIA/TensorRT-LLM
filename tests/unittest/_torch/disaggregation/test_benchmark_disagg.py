@@ -109,7 +109,7 @@ def _stub_transfer_entry_points(ex) -> None:
 
     def build_and_stub():
         coordinator = build()
-        coordinator.poll_gen_transfers = Mock()
+        coordinator.poll_gen_transfers = Mock(return_value=[])
         coordinator.check_transfer_timeouts = Mock()
         coordinator.reap_context_sends = Mock()
         coordinator.align_gen_admission_across_cp = Mock(side_effect=lambda admitted: admitted)

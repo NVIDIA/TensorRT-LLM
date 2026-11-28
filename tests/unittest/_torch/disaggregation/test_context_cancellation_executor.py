@@ -9,6 +9,7 @@ test_context_cancellation_retirement.py rather than simulated here.
 
 import pickle
 import queue
+import time
 from contextlib import nullcontext
 from datetime import timedelta
 from types import MethodType, SimpleNamespace
@@ -17,6 +18,7 @@ from unittest.mock import Mock, call
 import pytest
 from fake_dist import FakeDistGroup, FakeDistRank
 
+from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_mod
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
@@ -291,6 +293,76 @@ def test_context_retirement_coexists_with_replicated_gen_vote(
         engine._do_terminate_request.assert_called_once_with(request)
         engine._enqueue_responses.assert_called_once()
         assert request.is_finished_due_to_cancellation
+
+
+def test_replicated_batch_retires_a_timed_out_receive_on_every_rank_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rank 1's clock passes the transfer timeout first and rank 1's cancel is refused once: both ranks keep the
+    receive until rank 0 times it out and broadcasts its retirement, then fail it as timed out in the same pass."""
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    engines = [_executor(group.rank(rank)) for rank in range(2)]
+    requests = [_request(context=False) for _ in engines]
+    started = time.monotonic()
+    for rank, (engine, request) in enumerate(zip(engines, requests)):
+        transceiver = engine.kv_cache_transceiver
+        transceiver.consumes_transfer_buffer = False
+        transceiver.supports_idle_request_cancellation.return_value = False
+        transceiver.kv_transfer_timeout_ms = 60_000
+        transceiver._recv_reqs = {}
+        transceiver.cancel_request.side_effect = [True] * 2 if rank == 0 else [False, True]
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        assert engine.disagg.requires_gen_cancellation_consensus
+        # The receives' status collectives are the transceiver's.
+        engine.disagg.reap_gen_receives = lambda at_least=0: None
+        engine._handle_errors = Mock()
+        request.py_kv_transfer_start_time = started - (120.0 if rank == 1 else 0.0)
+        engine.active_requests.append(request)
+
+    def poll_and_check() -> list:
+        timed_out = [engine.disagg.poll_gen_transfers() for engine in engines]
+        for engine in engines:
+            engine.disagg.check_transfer_timeouts()
+        return timed_out
+
+    assert poll_and_check() == [[], []]
+    # Rank 0's clock passes the timeout between its poll and its timeout check.
+    requests[0].py_kv_transfer_start_time = started - 120.0
+    for engine in engines:
+        engine.disagg.check_transfer_timeouts()
+    assert poll_and_check() == [[11], []]
+    engines[0].executor_request_queue.enqueue_timed_out_receive(11)
+    # Rank 0's request broadcast carries the retirement to every rank.
+    (item,) = engines[0].executor_request_queue.get_from_request_queue(timedelta(0))
+    for engine in engines:
+        assert engine._handle_special_queue_items([pickle.loads(pickle.dumps(item))]) == []
+
+    # Rank 1 refuses its first cancel, so the first vote retires nothing on either rank.
+    for _ in range(2):
+        for engine, request in zip(engines, requests):
+            assert engine.active_requests == [request] and engine.canceled_req_ids == [11]
+            assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+            engine._handle_errors.assert_not_called()
+        group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    for engine, request in zip(engines, requests):
+        engine._handle_errors.assert_called_once_with(
+            error_msg="Request 11 timed out", requests=[request], charge_budget=False
+        )
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert not request.is_finished_due_to_cancellation
+        assert not engine.active_requests and not engine.canceled_req_ids
+        assert not engine._timed_out_receive_ids
 
 
 def test_staged_context_cancellation_survives_retirement(executor: PyExecutor) -> None:

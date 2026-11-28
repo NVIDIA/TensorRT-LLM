@@ -53,6 +53,9 @@ class RequestQueueItem:
     # A completed frontend result may no longer map its client identity to an
     # engine request. Resolve this only against retained CTX transfers.
     cancel_context_client_id: Optional[int] = None
+    # A cancellation that retires a generation receive rank 0 timed out: it
+    # fails the request as timed out rather than as cancelled by the client.
+    cancel_timed_out_receive: bool = False
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler
     # step boundary with in-flight requests still in the engine.
@@ -306,6 +309,18 @@ class ExecutorRequestQueue:
                 return
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
+
+    def enqueue_timed_out_receive(self, req_id: int) -> None:
+        """Queue the retirement of a generation receive that rank 0 timed out.
+
+        Also during shutdown, which waits for the request to leave.
+        """
+        with self.enqueue_lock:
+            if self.dist.rank == 0:
+                self.request_queue.put(
+                    RequestQueueItem(req_id,
+                                     is_canceled_request=True,
+                                     cancel_timed_out_receive=True))
 
     def enqueue_context_transfer_cancel(self, client_id: int) -> None:
         """Queue a late CTX cancellation in the client-ID namespace.

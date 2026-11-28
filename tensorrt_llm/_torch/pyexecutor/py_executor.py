@@ -808,6 +808,8 @@ class PyExecutor:
     _loop_iteration = 0
     _staged_at = 0
     _fetch_may_block = False
+    # Cancelled request IDs whose cancellation retires a receive rank 0 timed out.
+    _timed_out_receive_ids: frozenset = frozenset()
     # Holds context final windows across passes when that empties decoder passes (set by __init__).
     ctx_decoder_batcher: Optional[CtxDecoderBatcher] = None
 
@@ -6219,7 +6221,9 @@ class PyExecutor:
         new_requests = self._progress_context_cancellations(new_requests)
         new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self.disagg.prepare_context_schedulable(new_requests)
-        self.disagg.poll_gen_transfers()
+        # Rank 0 broadcasts these with its next requests, like cancellations.
+        for request_id in self.disagg.poll_gen_transfers() or ():
+            self.executor_request_queue.enqueue_timed_out_receive(request_id)
         self._activate_completed_remote_tails()
         self.disagg.check_transfer_timeouts()
         # After the polls so a transfer that completed this iteration releases
@@ -10372,6 +10376,12 @@ class PyExecutor:
                 break
             elif req_item.is_canceled_request:
                 if req_item.cancel_context_client_id is None:
+                    # A client cancellation of the request decides its outcome.
+                    if not req_item.cancel_timed_out_receive:
+                        if req_item.id in self._timed_out_receive_ids:
+                            self._timed_out_receive_ids -= {req_item.id}
+                    elif req_item.id not in self.canceled_req_ids:
+                        self._timed_out_receive_ids |= {req_item.id}
                     self.canceled_req_ids.append(req_item.id)
                 else:
                     # Never reinterpret a client ID as an executor ID. A late
@@ -13382,6 +13392,7 @@ class PyExecutor:
         else:
             completed_ids = set()
 
+        timed_out = []
         for request in ready_to_cancel:
             cancel_id = (request.parent_request_id
                          if request.is_child else request.py_request_id)
@@ -13390,6 +13401,12 @@ class PyExecutor:
                 # Keep the failure outcome. The pending cancel must no longer
                 # block the coordinator's rank-synchronized error cleanup.
                 failed_ids.add(request.py_request_id)
+                continue
+            if cancel_id in self._timed_out_receive_ids:
+                # Every rank of the batch retires it in this pass, after the vote.
+                request.py_kv_transfer_timed_out = True
+                timed_out.append(request)
+                retired_ids.add(request.py_request_id)
                 continue
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
@@ -13406,6 +13423,8 @@ class PyExecutor:
             self._pending_response_terminations.append(request)
             retired_ids.add(request.py_request_id)
 
+        if timed_out:
+            self.disagg.fail_timed_out(timed_out)
         if not cancel_queued:
             self.waiting_queue.remove_by_ids(handled_cancel_ids | completed_ids)
         self.active_requests[:] = [
@@ -13423,6 +13442,9 @@ class PyExecutor:
                 request_id in active_cancel_ids or
                 (not cancel_queued and request_id not in handled_cancel_ids))
         ]
+        if self._timed_out_receive_ids:
+            self._timed_out_receive_ids = (
+                self._timed_out_receive_ids.intersection(self.canceled_req_ids))
         return [
             req for req in new_requests if req.py_request_id not in retired_ids
         ]
@@ -13911,6 +13933,11 @@ class PyExecutor:
                 # loop-head error vote; re-cancelling here would desync that
                 # vote.
                 if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                    new_active_requests.append(request)
+                    continue
+                # Rank 0's broadcast retires it on every rank of the batch at once.
+                if (request.is_generation_only_request
+                        and self.disagg.requires_gen_cancellation_consensus):
                     new_active_requests.append(request)
                     continue
 
