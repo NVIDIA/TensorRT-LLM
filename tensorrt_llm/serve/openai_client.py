@@ -63,8 +63,12 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.perf_metrics import (
     _PERF_METRICS_HEADER_BUDGET_BYTES,
+    CTX_CHUNK_METRICS_HEADER,
     RETURN_METRICS_HEADER,
+    SERVER_TIMING_HEADER,
     SSE_METRICS_EVENT,
+    START_END_TIME_HEADER,
+    STEP_METRICS_HEADER,
     ClientMetricsCollector,
     adjusted_clock_from_headers,
     build_metrics_record_from_headers,
@@ -82,6 +86,7 @@ from tensorrt_llm.serve.router import ReservationNotFoundError, Router
 # msgpack and flagged with the X-TRTLLM-Msgpack header.
 _msgpack_encoder = msgspec.msgpack.Encoder()
 MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
+_SSE_DONE_EVENT = b"data: [DONE]\n\n"
 
 # A Responses stream opens with these events before the model emits anything.
 _RESPONSES_OPENING_EVENTS = frozenset((b"response.created", b"response.in_progress"))
@@ -800,6 +805,8 @@ class OpenAIHttpClient(OpenAIClient):
                 self._post_with_retry(server, url, request, hooks, req_id, fallback_url)
             ) as response_generator:
                 async for chunk in response_generator:
+                    if chunk == _SSE_DONE_EVENT:
+                        success = True
                     yield chunk
             success = True
         finally:
@@ -1079,6 +1086,8 @@ class OpenAIHttpClient(OpenAIClient):
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"
         )
+        # Also read by the except block below.
+        pending = b""
         try:
             last_token_time = start_time
             chunk_count = 0
@@ -1087,7 +1096,6 @@ class OpenAIHttpClient(OpenAIClient):
             awaiting_output = isinstance(request, ResponsesRequest)
             marker = f"event: {SSE_METRICS_EVENT}\n".encode()
             event_delimiter = b"\n\n"
-            pending = b""
             metrics_event = b""
             async for chunk in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
@@ -1117,47 +1125,66 @@ class OpenAIHttpClient(OpenAIClient):
                 pending += chunk
                 marker_index = pending.find(marker)
                 if marker_index >= 0:
-                    if marker_index:
-                        yield pending[:marker_index]
                     metrics_event = pending[marker_index:]
-                    pending = b""
-                    continue
+                    pending = pending[:marker_index]
                 event_end = pending.rfind(event_delimiter)
                 if event_end >= 0:
-                    emit_size = event_end + len(event_delimiter)
-                    yield pending[:emit_size]
-                    pending = pending[emit_size:]
+                    complete_end = event_end + len(event_delimiter)
+                    # Hold back [DONE]; it is forwarded after on_resp_done.
+                    ready = pending[:complete_end].removesuffix(_SSE_DONE_EVENT)
+                    if ready:
+                        yield ready
+                        pending = pending[len(ready) :]
                 await asyncio.sleep(0)
 
-            if pending:
-                yield pending
-            if hooks and metrics_event:
-                data_prefix = b"data: "
-                data_index = metrics_event.find(data_prefix)
-                if data_index >= 0:
-                    data = metrics_event[data_index + len(data_prefix) :].split(b"\n", 1)[0]
-                    try:
-                        headers = json.loads(data)
-                        metrics = build_metrics_record_from_headers(
-                            headers,
-                            _metrics_phase(self._role),
-                            adjusted_clock=response_clock,
-                        )
-                    except (TypeError, ValueError) as error:
-                        logger.warning("Ignoring malformed perf metrics event: %s", error)
-                        metrics = None
-                    if metrics:
-                        hooks.on_perf_metrics(server, _metrics_phase(self._role), metrics)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if not pending.startswith(_SSE_DONE_EVENT):
+                logger.error(f"{self._role} client {server} error: {e}")
+                raise
+            # The upstream broke after [DONE], while its trailing metrics event was
+            # arriving. The client has every token, so end its stream normally.
+            logger.warning(f"{self._role} client {server} error after [DONE]: {e}")
+            # Forward only the held [DONE]; drop any partial metrics trailer.
+            pending = _SSE_DONE_EVENT
 
-            if hooks:
-                hooks.on_resp_done(server, request, None)
-            self._metrics_collector.complete_latency_seconds.observe(
-                get_steady_clock_now_in_seconds() - start_time
-            )
-        except aiohttp.ClientError as e:
-            # a client error is expected when the response stream is done if the connector has close=True
-            logger.error(f"{self._role} client {server} error: {e}")
-            raise
+        if hooks and metrics_event:
+            data_prefix = b"data: "
+            data_index = metrics_event.find(data_prefix)
+            if data_index >= 0:
+                data = metrics_event[data_index + len(data_prefix) :].split(b"\n", 1)[0]
+                try:
+                    headers = json.loads(data)
+                    if not isinstance(headers, dict):
+                        raise TypeError("perf metrics payload must be a JSON object")
+                    for header in (
+                        SERVER_TIMING_HEADER,
+                        START_END_TIME_HEADER,
+                        STEP_METRICS_HEADER,
+                        CTX_CHUNK_METRICS_HEADER,
+                    ):
+                        if header in headers and not isinstance(headers[header], str):
+                            raise TypeError(f"perf metrics header {header} must be a string")
+                    metrics = build_metrics_record_from_headers(
+                        headers,
+                        _metrics_phase(self._role),
+                        adjusted_clock=response_clock,
+                    )
+                except (TypeError, ValueError) as error:
+                    logger.warning("Ignoring malformed perf metrics event: %s", error)
+                    metrics = None
+                if metrics:
+                    hooks.on_perf_metrics(server, _metrics_phase(self._role), metrics)
+
+        if hooks:
+            hooks.on_resp_done(server, request, None)
+        # pending holds the held-back [DONE]. Clients disconnect at [DONE], and that
+        # cancels this generator, so forward it only after on_resp_done has recorded
+        # the request.
+        self._metrics_collector.complete_latency_seconds.observe(
+            get_steady_clock_now_in_seconds() - start_time
+        )
+        if pending:
+            yield pending
 
     async def _finish_request(
         self,

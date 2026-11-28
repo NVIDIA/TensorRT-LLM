@@ -443,6 +443,9 @@ l0_cpu:
   - unittest/llmapi/apps/test_request_metrics.py::TestJsonlWriterSurvival
   - unittest/llmapi/apps/test_request_metrics.py::test_input_metrics_survive_headers_disagg_and_jsonl
   - unittest/llmapi/apps/test_request_metrics.py::test_input_metrics_are_request_local_and_exported
+  - unittest/llmapi/apps/test_request_metrics.py::test_file_middleware_intercepts_detail_headers
+  - unittest/llmapi/apps/test_request_metrics.py::test_record_is_submitted_when_stream_is_cancelled_before_final_body
+  - unittest/llmapi/apps/test_request_metrics.py::test_record_is_submitted_when_client_disconnects_at_done
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_deepseek_v41_namespaces.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
