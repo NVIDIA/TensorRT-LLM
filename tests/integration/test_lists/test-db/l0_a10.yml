@@ -72,6 +72,7 @@ l0_a10:
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_mamba_transfer.py
+  - unittest/_torch/distributed/test_host_exchange_native.py
   # unittest/tools is listed per file rather than as a directory. The directory
   # form swept test_layer_wise_benchmarks.py onto A10, whose DeepSeek FP4 cases
   # pin SM100+ checkpoints -- that is https://nvbugs/6337228.
