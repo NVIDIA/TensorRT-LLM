@@ -28,7 +28,7 @@ from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3Model
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.llmapi.llm import EncoderOutput, PromptInputs
 
-from .test_llm import get_model_path
+from .model_paths import get_model_path
 
 
 def _build_prompt(

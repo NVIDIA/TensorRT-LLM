@@ -37,7 +37,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi import AutoTunerNvMMHConfig, CudaGraphConfig, KvCacheConfig
 
 from ....conftest import llm_models_root
 from .._env import scoped_env_overrides
@@ -64,6 +64,7 @@ def _llm(model_path: str, speculative_config=None, **llm_kwargs) -> Iterator[LLM
             cuda_graph_config=CudaGraphConfig(max_batch_size=64, enable_padding=True),
             enable_chunked_prefill=True,
             disable_mm_encoder=True,
+            autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
             speculative_config=speculative_config,
             env_overrides=rank_env,
             **llm_kwargs,

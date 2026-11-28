@@ -733,6 +733,7 @@ class DecoderCudaGraphs:
         position_id_offsets: torch.Tensor | None,
         is_dummy: bool = False,
         static_inputs_staged: int = 0,
+        pre_replay_staged: bool = False,
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
 
@@ -757,6 +758,7 @@ class DecoderCudaGraphs:
                 position_id_offsets=position_id_offsets,
                 is_dummy=is_dummy,
                 static_inputs_staged=static_inputs_staged,
+                pre_replay_staged=pre_replay_staged,
             )
 
     def _run(
@@ -774,6 +776,7 @@ class DecoderCudaGraphs:
         position_id_offsets: torch.Tensor | None,
         is_dummy: bool = False,
         static_inputs_staged: int = 0,
+        pre_replay_staged: bool = False,
     ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
         if key is None:
@@ -827,6 +830,8 @@ class DecoderCudaGraphs:
                         inputs,
                         position_id_offsets=position_id_offsets,
                         static_inputs_staged=static_inputs_staged,
+                        # Capture can update the inputs the Engram hook reads.
+                        pre_replay_staged=False,
                     )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -841,6 +846,7 @@ class DecoderCudaGraphs:
                             inputs,
                             position_id_offsets=position_id_offsets,
                             static_inputs_staged=static_inputs_staged,
+                            pre_replay_staged=pre_replay_staged,
                         )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -984,7 +990,8 @@ class DecoderCudaGraphs:
                             _MXFP8_GEMM_AUTOTUNED_OP,
                         )
 
-                        # Every rank captures the GEMM kernels most ranks tuned.
+                        # Every rank captures the same tactics: the vote settles the quantizer
+                        # and the GEMM profiles only some ranks tuned (see agree_mxfp8_tactics).
                         agree_mxfp8_tactics(_MXFP8_GEMM_AUTOTUNED_OP)
                         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
                         if cache_path:
@@ -1400,10 +1407,14 @@ class DecoderCudaGraphs:
                                     runtime_draft_len=runtime_draft_len,
                                 ),
                                 self._warmup_inputs,
-                                can_capture=lambda: getattr(
-                                    self._metadata.attn_metadata, "decoder_replay_plan", None
-                                )
-                                is None,
+                                # All ranks keep the same buckets, so the prefill graph
+                                # vote picks one bucket for all of them.
+                                can_capture=lambda: self._agreement.agree_flag(
+                                    getattr(
+                                        self._metadata.attn_metadata, "decoder_replay_plan", None
+                                    )
+                                    is None
+                                ),
                             )
                             if not captured:
                                 logger.info(
@@ -1436,11 +1447,14 @@ class DecoderCudaGraphs:
                             )
                             torch.cuda.synchronize()
                 # Break graphs remove host time, which dominates only the
-                # shorter prefill iterations.
+                # shorter prefill iterations. Their capture runs forwards, so
+                # all ranks run it or none.
                 if (
                     self.breakable_cuda_graph_runner is not None
                     and num_tokens <= self._config.max_num_tokens // 4
-                    and self.breakable_cuda_graph_runner.has_graphable_breaks(num_tokens)
+                    and self._agreement.agree_flag(
+                        self.breakable_cuda_graph_runner.has_graphable_breaks(num_tokens)
+                    )
                 ):
                     free_bytes = torch.cuda.mem_get_info()[0]
                     with timing_metric("ctx_cuda_graph_capture_seconds", self._metrics):

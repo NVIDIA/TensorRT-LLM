@@ -128,16 +128,18 @@ def in_package(name: str) -> bool:
     return name == PACKAGE or name.startswith(f"{PACKAGE}.")
 
 
-def package_names(names: set[str]) -> set[str]:
+def package_names(names: set[str], package: str = PACKAGE) -> set[str]:
     """The names under the subtree among `names`, with the packages that hold them.
 
     Importing a.b.c runs a/__init__.py and a/b/__init__.py too. A name counts
     whether or not its file exists, so the importers of a deleted or moved
     module are still found: CI reads the PR head, where the file is gone.
     """
-    depth = PACKAGE.count(".") + 1
+    depth = package.count(".") + 1
     found = set()
-    for name in filter(in_package, names):
+    for name in names:
+        if name != package and not name.startswith(package + "."):
+            continue
         parts = name.split(".")
         found.update(".".join(parts[:i]) for i in range(depth, len(parts) + 1))
     return found
@@ -150,7 +152,9 @@ def _is_route(node: ast.AST) -> bool:
     )
 
 
-def route_returns(tree: ast.AST) -> list[tuple[ast.Return, Optional[str]]]:
+def route_returns(
+    tree: ast.AST, *, function_name: Optional[str] = None
+) -> list[tuple[ast.Return, Optional[str]]]:
     """Each `return` of a `@routes(...)` function in `routing.py`, with the target it returns.
 
     The target is the directory `<D>` of the `from .<D>... import <Class>` that
@@ -168,7 +172,12 @@ def route_returns(tree: ast.AST) -> list[tuple[ast.Return, Optional[str]]]:
                 name = alias.asname or alias.name.split(".")[0]
                 bound.setdefault(name, set()).add(target)
     returns = []
-    for function in filter(_is_route, ast.walk(tree)):
+    for function in ast.walk(tree):
+        if function_name is None:
+            if not _is_route(function):
+                continue
+        elif not isinstance(function, ast.FunctionDef) or function.name != function_name:
+            continue
         todo = list(function.body)
         while todo:
             node = todo.pop()
@@ -185,13 +194,13 @@ def route_returns(tree: ast.AST) -> list[tuple[ast.Return, Optional[str]]]:
     return found
 
 
-def routed_targets(tree: ast.AST) -> Optional[set[str]]:
+def routed_targets(tree: ast.AST, *, function_name: Optional[str] = None) -> Optional[set[str]]:
     """The target directories a family's `routing.py` returns classes from.
 
     None when a return's target is unknown or there is no return, so a caller
     cannot tell targets from family code.
     """
-    targets = [target for _, target in route_returns(tree)]
+    targets = [target for _, target in route_returns(tree, function_name=function_name)]
     if not targets or None in targets:
         return None
     return set(targets)

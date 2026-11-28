@@ -83,9 +83,10 @@ from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve._visual_gen_errors import \
     render_visual_gen_validation_error
 from tensorrt_llm.serve.anthropic_adapter import (
-    AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
+    AnthropicRequestError, AnthropicResponseError,
+    anthropic_chat_error_response, anthropic_error_response,
     convert_anthropic_count_tokens_request, convert_anthropic_request,
-    convert_chat_response, reframe_openai_stream)
+    convert_chat_response, reframe_openai_stream, wait_for_stream_start)
 from tensorrt_llm.serve.anthropic_batches import (AnthropicBatchStore,
                                                   BatchStoreFullError,
                                                   results_to_jsonl)
@@ -145,8 +146,9 @@ from tensorrt_llm.serve.postprocess_handlers import (
 from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        UnsupportedRenderError,
                                        mount_render_endpoints,
-                                       prepare_chat_request, render_chat,
-                                       render_chat_for_length,
+                                       prepare_chat_request,
+                                       prompt_tokens_excluded_from_usage,
+                                       render_chat, render_chat_for_length,
                                        render_conversation_with_media)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
@@ -2461,14 +2463,9 @@ class OpenAIServer(_VideoRoutesMixin):
             self._apply_spec_decode_stats_opt_in(postproc_args)
             # Some models' prompt-token accounting excludes trailing rendered
             # tokens (kimi_k3: the generation channel opener); the model still
-            # sees the full prompt.
+            # sees the full prompt. count_tokens leaves out the same tokens.
             postproc_args.num_prompt_tokens_offset = (
-                render_resources.prompt_tokens_excluded_from_usage(
-                    add_generation_prompt=request.add_generation_prompt,
-                    pre_tokenized=request.prompt_token_ids is not None
-                    or request.prompt_token_ids_b64 is not None,
-                    request_chat_template=request.chat_template,
-                ))
+                prompt_tokens_excluded_from_usage(request, render_resources))
             if dynamic_tool_params:
                 # The tool parser must see dynamic tools to recognize their
                 # calls in the model output.
@@ -2530,7 +2527,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Render (and append the forced named-tool prefix, see
                 # ``_build_forced_tool_call_decoding``) while the media loads,
                 # or once it has loaded for a renderer that needs it.
-                # Tokenization stays with the engine's input processor.
+                # Tokenization stays with the engine's input processor, except
+                # that a tokenizer-native renderer's own ids are taken: it
+                # keeps control-token strings in message content as text, and
+                # encoding its rendered string would not. Only for text-only
+                # prompts, since the input processor expands media placeholders
+                # in the text.
                 rendered, (
                     mm_data,
                     mm_embeddings) = await render_conversation_with_media(
@@ -2546,6 +2548,9 @@ class OpenAIServer(_VideoRoutesMixin):
                         injected_chat_template_kwargs=request.
                         injected_chat_template_kwargs,
                         forced_prefix=forced_tool_begin_prefix,
+                        prefer_native_ids=not any(
+                            message.get("media") for message in conversation),
+                        add_special_tokens=request.add_special_tokens,
                         truncate_prompt_tokens=request.truncate_prompt_tokens,
                     )
                 if rendered.text is None:
@@ -2755,8 +2760,13 @@ class OpenAIServer(_VideoRoutesMixin):
         executor_client_id = getattr(raw_request.state, "executor_client_id",
                                      None)
         if isinstance(response, StreamingResponse):
-            return StreamingResponse(
-                content=reframe_openai_stream(response.body_iterator,
+            # A prompt the engine rejects as too long is answered with a 400,
+            # not with a stream (see wait_for_stream_start).
+            stream = await wait_for_stream_start(response.body_iterator)
+            if isinstance(stream, JSONResponse):
+                return stream
+            return ClosingStreamingResponse(
+                content=reframe_openai_stream(stream,
                                               model=self.model,
                                               request_id=executor_client_id),
                 media_type="text/event-stream",
@@ -2769,9 +2779,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 message = payload.get("message") or json.dumps(payload)
             except (json.JSONDecodeError, AttributeError):
                 message = "Internal server error"
-            err_type = ("invalid_request_error"
-                        if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(message, err_type, status)
+            return anthropic_chat_error_response(message, status)
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
@@ -2823,7 +2831,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     # Media, an own-processor model or an unconvertible Harmony
                     # request: count the text, tools and template without the media.
                     rendered = render_chat_for_length(chat_request, resources)
-                return len(rendered.token_ids)
+                # Reported like the chat route's prompt usage, which leaves out
+                # the rendered tokens the model extension excludes from it.
+                excluded = prompt_tokens_excluded_from_usage(
+                    chat_request, resources)
+                return max(0, len(rendered.token_ids) - excluded)
 
             input_tokens = await asyncio.to_thread(_count)
         except Exception:

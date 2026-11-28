@@ -18,7 +18,13 @@ The ranks of a launch compile the same kernels, each on its own. With
 ``TLLM_JIT_SHARE_DIR`` set to a directory that every process of the launch
 can see (on a multi-node launch, a shared file system; use a fresh directory
 per launch), the first process to claim a kernel builds it and the others
-reuse the result. Every process runs the kernels it finds there, so
+reuse the result. Without it, the processes of a launch that run on one node
+share their builds through the launch's directory on the node's local disk,
+``/tmp/tllm-jit-<uid>/<launch>`` (:func:`_default_share_dir`): a launch of
+several processes per node that the launcher names (PMIx namespace, Slurm job
+step, torchrun run, DWDP rendezvous). That directory leaves DeepGEMM's disk
+cache where it is; ``TLLM_JIT_SHARE_DEFAULT=0`` or ``TLLM_KERNEL_BUILDER=0``
+turns it off. Every process runs the kernels it finds there, so
 :func:`install` shares builds only when the directory, and the ones it holds
 kernels in, belong to this user and other users cannot write to them (group
 members who can write to them must be trusted). Where the directory cannot be
@@ -40,7 +46,9 @@ without sharing. Two kinds of kernels are shared:
   dict a :class:`SharedKernelCache`: while :class:`sharing_kernels` is active
   (the autotuner turns it on while it tunes), a lookup that misses loads the
   kernel another process exported as ``<dir>/cute/<name>.o``, and a kernel
-  stored in it is exported there.
+  stored in it is exported there. A runner class whose kernels another library
+  caches (FlashInfer's) has that cache shared the same way by its
+  ``TunableRunner.share_library_kernel_caches()``.
 
 Either way, a process that finds a kernel claimed by another waits for it (at
 most ``TLLM_JIT_SHARE_WAIT_S`` seconds, default 60, and not past the deadline
@@ -55,9 +63,11 @@ for as long as that client is unreachable.
 
 A DeepGEMM key hashes the kernel source, the compiler arguments with the
 temporary directory left out, and the contents of the compiler and of
-DeepGEMM's headers. A CuTe DSL name hashes the runner class, the ``repr`` of
-the cache key (keys whose ``repr`` holds an object address are not shared),
-the TensorRT-LLM and CuTe DSL versions, and the GPU's compute capability.
+DeepGEMM's headers. A CuTe DSL name hashes the cache's owner (the runner class
+and a digest of its source file, or the library cache's name), what names the key
+(:meth:`SharedKernelCache._shared_text`: by default its ``repr``, and keys whose
+``repr`` holds an object address are not shared), the TensorRT-LLM and CuTe DSL
+versions, and the GPU's compute capability.
 Every other compiler invocation (``--version`` and the like) runs the real
 compiler unchanged. With ``TLLM_JIT_SHARE_LOG=1`` each kernel adds a line
 ``<start> <seconds> <action> <key>`` to ``<dir>/log/<host>-<pid>.txt``.
@@ -72,12 +82,18 @@ interpreter. Modules that only some paths need are imported where they are
 used, to keep the compiler's start-up short.
 """
 
+import functools
 import hashlib
 import os
 import stat
 import sys
 import threading
 import time
+from collections.abc import Hashable, Iterable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.autotuner import TunableRunner
 
 SHARE_DIR_ENV = "TLLM_JIT_SHARE_DIR"
 BUSY_MARK = "TLLM_JIT_SHARE_BUSY"
@@ -93,9 +109,31 @@ _PROCESS_ENV = "TLLM_JIT_SHARE_PROCESS"
 # Linux reads at most this much of a script's "#!" line on older kernels.
 _SHEBANG_LIMIT = 127
 
+# Set in a BuildPool worker process (tensorrt_llm._torch.build_pool): its rank's store.
+_POOL_STORE_ENV = "TLLM_BUILD_POOL_STORE"
+# "1" when TLLM_JIT_SHARE_DIR is the launch's directory that install() chose, not one the user set;
+# "0", set by the user, leaves the launch without a default directory.
+_DEFAULT_ENV = "TLLM_JIT_SHARE_DEFAULT"
+# A DWDP rendezvous over a store (tensorrt_llm._torch.modules.dwdp.rendezvous).
+_DWDP_RANK_ENV = "TRTLLM_DWDP_RANK"
+_DWDP_ADDR_ENV = "TRTLLM_DWDP_MASTER_ADDR"
+_DWDP_PORT_ENV = "TRTLLM_DWDP_MASTER_PORT"
+# "0" (tensorrt_llm._torch.build_pool.ENABLE_ENV) leaves a launch without a default directory.
+_KERNEL_BUILDER_ENV = "TLLM_KERNEL_BUILDER"
+# Where the launches' default directories are made: this node's local disk.
+_DEFAULT_ROOT = "/tmp"  # nosec B108 - used through a directory of this user alone (_private_dir)
+# A launch directory is removed once its processes have exited and it is older than this.
+_PRUNE_AFTER_S = 6 * 3600
+
 _installed = False
+# The records of this process in its launch's directory, held open with their flocks until it
+# exits (_register_process).
+_process_records: list[int] = []
 _slot: int | None = None
 _kernel_sharing_depth = 0
+# The store of this rank's BuildPool build pass (set_pool_store), where shared kernel caches
+# keep CuTe DSL kernels while the pass runs.
+_pool_store: str | None = None
 _cute_salt: str | None = None
 # .claim: (claim, failed) of the kernel this thread claimed and has not stored.
 _unstored = threading.local()
@@ -264,8 +302,27 @@ class sharing_kernels:
         return False
 
 
+def set_pool_store(path: str | None) -> None:
+    """Have shared kernel caches keep CuTe DSL kernels in ``path``, the store of this rank's
+    BuildPool build pass, where its worker processes build them; None when the pass ends."""
+    global _pool_store
+    _pool_store = path
+
+
+def _cute_store() -> str | None:
+    """Where shared kernel caches keep CuTe DSL kernels: inside a BuildPool build pass, the
+    rank's store (in a worker process, the store of the rank it builds for); else
+    ``<TLLM_JIT_SHARE_DIR>/cute`` when this process shares builds through it. A directory
+    :func:`install` refused is never one: its kernels would run unchecked."""
+    store = _pool_store or os.environ.get(_POOL_STORE_ENV)
+    if store:
+        return store
+    share_dir = os.environ.get(SHARE_DIR_ENV)
+    return os.path.join(share_dir, "cute") if share_dir and enabled() else None
+
+
 def _kernel_sharing_active() -> bool:
-    return _kernel_sharing_depth > 0 and bool(os.environ.get(SHARE_DIR_ENV))
+    return _kernel_sharing_depth > 0 and _cute_store() is not None
 
 
 def _release_unstored_claim() -> str | None:
@@ -295,7 +352,8 @@ def _mark_failed(failed: str, reason: str) -> None:
 
 
 class SharedKernelCache(dict):
-    """A runner class's ``kernel_cache`` whose CuTe DSL kernels are shared through the directory.
+    """A CuTe DSL kernel cache (a runner class's ``kernel_cache``, or a library's) whose kernels
+    are shared through the directory.
 
     The runner's code is unchanged: it tests ``key in kernel_cache``, compiles
     on a miss, stores the result, and reads it back. Here a miss loads the
@@ -304,24 +362,43 @@ class SharedKernelCache(dict):
     :class:`KernelBusy`), and otherwise claims it, so that the store that
     follows exports it. A claimed kernel whose compile raises is marked failed
     at the thread's next lookup or store, which the waiting processes see.
+
+    A subclass adapts a cache whose keys or values hold more than the kernel
+    (:meth:`_shared_text`, :meth:`_export`, :meth:`_load`).
     """
 
-    def __init__(self, owner: str, entries=()):
+    def __init__(self, owner: str, entries: Iterable = ()):
         super().__init__(entries)
         self.owner = owner
 
-    def _paths(self, key):
+    def _shared_text(self, key: Hashable) -> str | None:
+        """What names ``key``'s kernel in the directory besides the owner, or None to keep it in
+        this process: the key's ``repr``, unless it holds an object address."""
         text = repr(key)
-        if " at 0x" in text:
+        return None if " at 0x" in text else text
+
+    def _export(self, key: Hashable, value: Any, obj: str, name: str, meta: str) -> None:
+        """Export the kernel of the ``value`` stored under ``key`` (:func:`_export_kernel`); here
+        the value is the kernel. Raising leaves the kernel to the other processes to compile."""
+        _export_kernel(value, obj, name, meta)
+
+    def _load(self, key: Hashable, obj: str, name: str, meta: str) -> Any:
+        """The value to keep under ``key`` for the kernel another process exported
+        (:meth:`_export`). Raising compiles the kernel here instead."""
+        return _load_kernel(obj, name, meta)
+
+    def _paths(self, key: Hashable) -> tuple[str, str, str, str, str] | None:
+        text = self._shared_text(key)
+        if text is None:
             return None
         name = (
             "k"
             + hashlib.sha256(f"{_cute_identity()}|{self.owner}|{text}".encode()).hexdigest()[:32]
         )
-        base = os.path.join(os.environ[SHARE_DIR_ENV], "cute", name)
+        base = os.path.join(_cute_store(), name)
         return name, base + ".o", base + ".claim", base + ".failed", base + ".json"
 
-    def __contains__(self, key) -> bool:
+    def __contains__(self, key: object) -> bool:
         failed_here = _release_unstored_claim()
         if dict.__contains__(self, key):
             return True
@@ -345,21 +422,21 @@ class SharedKernelCache(dict):
                 _unstored.claim = (claim, failed)
                 return False  # This process compiles it; the store exports it.
             if os.environ.get(_DEFER_ENV) == "1" and not os.path.exists(failed):
-                _log(os.environ[SHARE_DIR_ENV], start, "cute-busy", name)
+                _log(os.environ.get(SHARE_DIR_ENV, ""), start, "cute-busy", name)
                 raise KernelBusy(f"{BUSY_MARK} {name}")
             if not _wait(obj, failed):
                 return False
             action = "cute-waited"
         try:
-            kernel = _load_kernel(obj, name, meta)
+            value = self._load(key, obj, name, meta)
         except Exception:  # noqa: BLE001 - a kernel that does not load is compiled here instead
             return False
-        dict.__setitem__(self, key, kernel)
-        _log(os.environ[SHARE_DIR_ENV], start, action, name)
+        dict.__setitem__(self, key, value)
+        _log(os.environ.get(SHARE_DIR_ENV, ""), start, action, name)
         return True
 
-    def __setitem__(self, key, kernel) -> None:
-        dict.__setitem__(self, key, kernel)
+    def __setitem__(self, key: Hashable, value: Any) -> None:
+        dict.__setitem__(self, key, value)
         if not _kernel_sharing_active():
             return
         paths = self._paths(key)
@@ -374,27 +451,53 @@ class SharedKernelCache(dict):
             return
         start = time.time()
         try:
-            _export_kernel(kernel, obj, name, meta)
+            self._export(key, value, obj, name, meta)
         except Exception as e:  # noqa: BLE001 - the kernel works here; the others compile it
             _mark_failed(failed, f"{type(e).__name__}: {e}")
             return
-        _log(os.environ[SHARE_DIR_ENV], start, "cute-built", name)
+        _log(os.environ.get(SHARE_DIR_ENV, ""), start, "cute-built", name)
 
 
-def share_kernel_caches(runners) -> None:
-    """Make the ``kernel_cache`` dict of each runner's class a :class:`SharedKernelCache`."""
+def share_kernel_caches(runners: Iterable["TunableRunner"]) -> None:
+    """Make the ``kernel_cache`` dict of each runner's class a :class:`SharedKernelCache`, and
+    have each runner class share the caches of the libraries whose kernels it runs
+    (``TunableRunner.share_library_kernel_caches``)."""
     for runner in runners:
+        type(runner).share_library_kernel_caches()
         for cls in type(runner).__mro__:
             cache = cls.__dict__.get("kernel_cache")
             if cache is None:
                 continue
             if isinstance(cache, dict) and not isinstance(cache, SharedKernelCache):
-                setattr(
-                    cls,
-                    "kernel_cache",
-                    SharedKernelCache(f"{cls.__module__}.{cls.__qualname__}", cache),
-                )
+                owner = f"{cls.__module__}.{cls.__qualname__}|{source_digest(cls)}"
+                setattr(cls, "kernel_cache", SharedKernelCache(owner, cache))
             break
+
+
+def source_digest(obj: Any) -> str:
+    """A digest of the source file that defines ``obj``, for the names of the kernels it
+    compiles: a kernel compiled from another version of the file, which an editable install
+    does not tell by its version, gets another name. Empty when the file cannot be read."""
+    import inspect
+
+    try:
+        path = inspect.getsourcefile(obj)
+        if not path:
+            return ""
+        status = os.stat(path)
+    except (TypeError, OSError):
+        return ""
+    return _file_digest(path, status.st_mtime_ns, status.st_size)
+
+
+@functools.lru_cache(maxsize=None)
+def _file_digest(path: str, mtime_ns: int, size: int) -> str:
+    """The digest of ``path`` as it is at ``mtime_ns`` and ``size``."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return ""
 
 
 def _cute_identity() -> str:
@@ -415,8 +518,9 @@ def _cute_identity() -> str:
     return _cute_salt
 
 
-def _export_kernel(kernel, obj: str, name: str, meta: str) -> None:
-    """Write a compiled CuTe DSL kernel to ``obj`` as an object file with entry symbol ``name``."""
+def _export_kernel(kernel: Any, obj: str, name: str, meta: str, extra: Any = None) -> None:
+    """Write a compiled CuTe DSL kernel to ``obj`` as an object file with entry symbol ``name``,
+    and ``extra``, a JSON value, beside it (:func:`_exported_extra`)."""
     import json
 
     tvm_ffi = any(c.__name__.startswith("TVMFFI") for c in type(kernel).__mro__)
@@ -431,13 +535,21 @@ def _export_kernel(kernel, obj: str, name: str, meta: str) -> None:
         with open(part, "wb") as f:
             f.write(kernel.dump_to_object(name))
     with open(f"{meta}.{tag}.part", "w") as f:
-        json.dump({"tvm_ffi": tvm_ffi}, f)
+        json.dump({"tvm_ffi": tvm_ffi, "extra": extra}, f)
     os.replace(f"{meta}.{tag}.part", meta)
     _fsync(part)
     os.replace(part, obj)
 
 
-def _load_kernel(obj: str, name: str, meta: str):
+def _exported_extra(meta: str) -> Any:
+    """The ``extra`` value :func:`_export_kernel` wrote beside a kernel."""
+    import json
+
+    with open(meta) as f:
+        return json.load(f).get("extra")
+
+
+def _load_kernel(obj: str, name: str, meta: str) -> Any:
     """Load the kernel another process exported with :func:`_export_kernel`."""
     import json
 
@@ -449,15 +561,23 @@ def _load_kernel(obj: str, name: str, meta: str):
 
 
 def install() -> bool:
-    """Make this file DeepGEMM's compiler if ``TLLM_JIT_SHARE_DIR`` is set.
+    """Make this file DeepGEMM's compiler, sharing builds through ``TLLM_JIT_SHARE_DIR`` or, when
+    it is not set, through the launch's directory on this node's local disk
+    (:func:`_default_share_dir`).
 
     Must run before the process's first DeepGEMM call, which reads
     ``DG_JIT_NVCC_COMPILER``. Returns whether sharing is active.
     """
     global _installed
-    share_dir = os.environ.get(SHARE_DIR_ENV)
-    if _installed or not share_dir or os.name != "posix":
+    if _installed or os.name != "posix":
         return _installed
+    share_dir = os.environ.get(SHARE_DIR_ENV)
+    # A process started by one that chose the launch's directory inherits it.
+    default = bool(share_dir) and os.environ.get(_DEFAULT_ENV) == "1"
+    if not share_dir:
+        share_dir, default = _default_share_dir(), True
+    if not share_dir:
+        return False
     # A process started by one that installed inherits the variables below;
     # its compiler is still the real one, not the parent's wrapper.
     compiler = (
@@ -466,27 +586,32 @@ def install() -> bool:
         or _default_compiler()
     )
     if not compiler or not os.access(compiler, os.X_OK):
+        _not_shared(f"no compiler to run ({compiler or 'nvcc not found'})")
         return False
-    # Every process runs the kernels it finds in these directories.
+    # Every process runs the kernels it finds in these directories. The launch's own directory
+    # leaves DeepGEMM's disk cache where it is, since that cache outlives the launch.
     deep_gemm = os.path.join(share_dir, "deep_gemm")
     code_dirs = [share_dir, os.path.join(share_dir, "kernels"), os.path.join(share_dir, "cute")]
-    if os.environ.get("DG_JIT_CACHE_DIR", deep_gemm) == deep_gemm:
+    if not default and os.environ.get("DG_JIT_CACHE_DIR", deep_gemm) == deep_gemm:
         code_dirs.append(deep_gemm)
     try:
         for path in code_dirs:
-            os.makedirs(path, mode=0o755, exist_ok=True)
-    except OSError:
+            os.makedirs(path, mode=0o700 if default else 0o755, exist_ok=True)
+    except OSError as e:
+        _not_shared(f"{path} cannot be made ({type(e).__name__}: {e})")
         return False
     untrusted = next((path for path in code_dirs if not _trusted_dir(path)), None)
     if untrusted is not None:
-        import warnings
+        if not default:
+            import warnings
 
-        warnings.warn(
-            f"{SHARE_DIR_ENV} is ignored: {untrusted} must be a directory of this user "
-            "that other users cannot write to",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+            warnings.warn(
+                f"{SHARE_DIR_ENV} is ignored: {untrusted} must be a directory of this user "
+                "that other users cannot write to",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        _not_shared(f"{untrusted} is not a directory of this user that other users cannot write to")
         return False
     wrapper = None
     for bin_dir in _wrapper_dirs(share_dir):
@@ -497,15 +622,176 @@ def install() -> bool:
         if wrapper is not None:
             break
     if wrapper is None:
+        _not_shared(f"no directory of {share_dir} takes the compiler wrapper")
         return False
     os.environ[_REAL_COMPILER_ENV] = compiler
     if not os.environ.get(_SALT_ENV):
         os.environ[_SALT_ENV] = _salt(compiler)
     os.environ[_PROCESS_ENV] = f"{os.uname().nodename}-{os.getpid()}"
     os.environ["DG_JIT_NVCC_COMPILER"] = wrapper
-    os.environ.setdefault("DG_JIT_CACHE_DIR", os.path.join(share_dir, "deep_gemm"))
+    if default:
+        os.environ[SHARE_DIR_ENV] = share_dir
+        os.environ[_DEFAULT_ENV] = "1"
+        _register_process(share_dir)
+    else:
+        os.environ.setdefault("DG_JIT_CACHE_DIR", os.path.join(share_dir, "deep_gemm"))
     _installed = True
     return True
+
+
+def _not_shared(reason: str) -> None:
+    """Log, once per process, why a launch that could share its JIT builds does not."""
+    from tensorrt_llm.logger import logger
+
+    logger.info_once(
+        f"[jit_share] this process builds its JIT kernels on its own: {reason}; "
+        f"{SHARE_DIR_ENV} names a directory to share them through",
+        key="jit_share_not_shared",
+    )
+
+
+def _default_share_dir() -> str | None:
+    """The directory on this node's local disk through which the processes of this launch that
+    run on the node share their builds; None outside a launch of several processes per node,
+    with ``TLLM_KERNEL_BUILDER=0`` or ``TLLM_JIT_SHARE_DEFAULT=0``, and where no directory of
+    this user alone can be made."""
+    if os.environ.get(_KERNEL_BUILDER_ENV, "1") == "0" or os.environ.get(_DEFAULT_ENV) == "0":
+        return None
+    if _processes_per_node() < 2:
+        return None
+    launch = _launch_id()
+    if launch is None:
+        _not_shared("no launcher names the launch")
+        return None
+    root = os.path.join(_DEFAULT_ROOT, f"tllm-jit-{os.getuid()}")
+    try:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+    except OSError as e:
+        _not_shared(f"{root} cannot be made ({type(e).__name__}: {e})")
+        return None
+    if not _private_dir(root):
+        _not_shared(f"{root} is not a directory of this user alone")
+        return None
+    _prune_launch_dirs(root)
+    name = hashlib.sha256(f"{launch}|{os.uname().nodename}".encode()).hexdigest()[:16]
+    return os.path.join(root, name)
+
+
+def _launch_id() -> str | None:
+    """What every process of a launch finds in its environment, and no other launch: the PMIx
+    namespace (Open MPI, ``srun --mpi=pmix``, the processes one ``MPI_Comm_spawn`` starts), the
+    store of a DWDP rendezvous (context workers launched one ``trtllm-serve`` each), the Slurm
+    job step, or the torchrun run (``--rdzv_id``, or ``--standalone``'s random one)."""
+    if os.environ.get(_DWDP_RANK_ENV) and os.environ.get(_DWDP_ADDR_ENV):
+        return f"dwdp:{os.environ[_DWDP_ADDR_ENV]}:{os.environ.get(_DWDP_PORT_ENV, '29600')}"
+    namespace = os.environ.get("PMIX_NAMESPACE")
+    if namespace:
+        return f"pmix:{namespace}"
+    job, step = os.environ.get("SLURM_JOB_ID"), os.environ.get("SLURM_STEP_ID")
+    if job and step:
+        return f"slurm:{job}.{step}"
+    run = os.environ.get("TORCHELASTIC_RUN_ID")
+    # torchrun's default --rdzv_id, "none", is every such launch's: it names none of them.
+    if run and run != "none":
+        return f"torchrun:{run}"
+    return None
+
+
+def _processes_per_node() -> int:
+    """How many processes of the launch run on this node, as the launcher tells; 1 if it does
+    not. A DWDP rendezvous joins several workers, without telling how many share a node: it
+    counts as two."""
+    if os.environ.get(_DWDP_RANK_ENV) and os.environ.get(_DWDP_ADDR_ENV):
+        return 2
+    for name in ("OMPI_COMM_WORLD_LOCAL_SIZE", "LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS"):
+        value = os.environ.get(name, "")
+        if value.isdigit():
+            return int(value)
+    tasks = os.environ.get("SLURM_STEP_TASKS_PER_NODE") or os.environ.get("SLURM_TASKS_PER_NODE")
+    # "4", "4(x2)" or "2,1": the most on one node.
+    counts = [part.split("(")[0] for part in (tasks or "").split(",")]
+    return max((int(count) for count in counts if count.isdigit()), default=1)
+
+
+def _register_process(share_dir: str) -> None:
+    """Record this process in the launch's directory, which stays until no process of it runs.
+
+    The record is a file this process holds an exclusive ``flock`` on until it exits, however it
+    exits: unlike a PID, the lock tells processes in any PID namespace (containers that share the
+    node's ``/tmp``) that it runs (:func:`_process_alive`).
+    """
+    import fcntl
+
+    try:
+        procs = os.path.join(share_dir, "procs")
+        os.makedirs(procs, mode=0o700, exist_ok=True)
+        # A PID can repeat across the PID namespaces that share the directory.
+        record = os.path.join(procs, f"{os.getpid()}.{os.urandom(4).hex()}")
+        fd = os.open(record, os.O_CREAT | os.O_WRONLY, 0o600)
+    except OSError:
+        return  # The directory is then removed once it is old, whether or not its launch runs.
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return
+    _process_records.append(fd)
+
+
+def _prune_launch_dirs(root: str) -> None:
+    """Remove the launch directories under ``root`` that are older than ``_PRUNE_AFTER_S`` and
+    whose processes have all exited: no process of a launch knows it is the last one."""
+    import shutil
+
+    now = time.time()
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if now - entry.stat(follow_symlinks=False).st_mtime < _PRUNE_AFTER_S:
+                continue
+            procs = os.path.join(entry.path, "procs")
+            records = [os.path.join(procs, name) for name in os.listdir(procs)]
+        except FileNotFoundError:
+            records = []
+        except OSError:
+            continue
+        if not any(_process_alive(record) for record in records):
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _process_alive(record: str) -> bool:
+    """Whether the process of a record in a launch's ``procs`` runs: it holds the record's
+    ``flock`` while it does (:func:`_register_process`). A record named by a bare PID, which
+    holds no lock, is checked by its PID in this PID namespace."""
+    import fcntl
+
+    name = os.path.basename(record)
+    if name.isdigit():
+        try:
+            os.kill(int(name), 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True  # It runs, as another user's process.
+        return True
+    try:
+        fd = os.open(record, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # Unreadable here: keep the directory.
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True  # Locked: its process runs.
+    finally:
+        os.close(fd)
+    return False
 
 
 def _default_compiler() -> str | None:
@@ -635,7 +921,7 @@ def _update_with_file(digest, path: str) -> None:
 
 
 def _log(share_dir: str, start: float, action: str, key: str) -> None:
-    if os.environ.get(_LOG_ENV) != "1":
+    if os.environ.get(_LOG_ENV) != "1" or not share_dir:
         return
     process = os.environ.get(_PROCESS_ENV) or str(os.getppid())
     try:

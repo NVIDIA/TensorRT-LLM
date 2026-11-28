@@ -908,6 +908,30 @@ def install_modeling_v2_libs(mv2_build_dir: Path, lib_dir: Path,
             stale.unlink()
 
 
+def install_visual_gen_libs(vg_build_dir: Path, lib_dir: Path,
+                            install_file) -> None:
+    """Install every VisualGen library selected by this configure and its scope manifest."""
+    manifest = vg_build_dir / "visual_gen_native.json"
+    scopes = json.loads(manifest.read_text())
+    libraries = sorted({entry["library"] for entry in scopes.values()})
+    for name in libraries:
+        if not re.fullmatch(r"libth_visual_gen_[A-Za-z0-9_]+\.(?:so|dll)",
+                            name):
+            raise ValueError(
+                f"Invalid VisualGen library name {name!r} in {manifest}")
+        if not (vg_build_dir / name).is_file():
+            raise FileNotFoundError(
+                f"Missing VisualGen library {vg_build_dir / name} listed in {manifest}"
+            )
+    for name in libraries:
+        install_file(vg_build_dir / name, lib_dir / name)
+    install_file(manifest, lib_dir / manifest.name)
+    for suffix in ("so", "dll"):
+        for stale in lib_dir.glob(f"libth_visual_gen_*.{suffix}"):
+            if stale.name not in libraries:
+                stale.unlink()
+
+
 def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
     """Stage NCCL-EP namespace packages from the intermediate wheel."""
     package_root = staging_dir / "3rdparty" / "nccl_extensions"
@@ -1130,7 +1154,7 @@ def main(*,
 
     targets = [
         "tensorrt_llm", "th_common", "bindings", "deep_ep", "deep_gemm",
-        "pg_utils", "flash_mla", "modeling_v2_libs"
+        "pg_utils", "flash_mla", "modeling_v2_libs", "visual_gen_libs"
     ]
     build_nccl_extensions_enabled = has_sm90_or_newer(cuda_architectures)
     if build_nccl_extensions_enabled:
@@ -1508,6 +1532,9 @@ def main(*,
             lib_dir / "libdecoder_attention_1.so")
         install_file(build_dir / "tensorrt_llm/runtime/utils/libpg_utils.so",
                      lib_dir / "libpg_utils.so")
+
+    install_visual_gen_libs(build_dir / "tensorrt_llm/visual_gen", lib_dir,
+                            install_file)
 
     # deep_ep/deep_gemm are synced in place below (sync_tree removes stale
     # entries); deep_ep is deleted explicitly when this build does not

@@ -149,6 +149,7 @@ l0_b200:
   - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
   - unittest/_torch/kv_cache_compression
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
+  - unittest/disaggregated/test_nixl_vmm_preflight.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
   # Locality domains via mock localization: per-domain KV pools on one GPU.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_locality_domains
@@ -253,8 +254,6 @@ l0_b200:
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
-  - unittest/_torch/moe/test_kimi_k3_mlp.py
-  - unittest/_torch/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/moe/test_workspace_cuda.py
   # Ungrouped noaux_tc top-16 + moe_sort routing kernel and the MoE tables hand-off.
   - unittest/_torch/moe/test_kimi_k3_route_sort.py
@@ -307,14 +306,14 @@ l0_b200:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
   - unittest/_torch/moe/test_trtllm_gen_bf16_moe_inplace_refit.py
+  # Pre-merge runs the SM-agnostic MoE checks on one GPU type each: the load balancer and
+  # the fused DeepGEMM helpers here; test_moe_routing.py, the test_cutlass_moe_* checks and
+  # test_kimi_k3_mlp.py on H100 (l0_h100), and post-merge here.
   - unittest/_torch/moe/test_moe_load_balancer.py
-  - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/test_moe_comm_timeout_guard.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
-  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
-  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_mxfp4_fp8_input_quantization
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
@@ -324,7 +323,9 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
-  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  # Four of the 16 cases, covering every value of each parameter, in one entry like the
+  # function entry they replace; the full set runs post-merge.
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[deepseekv3-relu2-8-fused_routing] unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[deepseekv3-swiglu-256-separated_routing] unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[renormalize-relu2-256-separated_routing] unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[renormalize-swiglu-8-fused_routing]
   - unittest/_torch/moe/test_moe_backend.py::test_moe_mxe2m1_weights_valid_dimensions
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_in_kernel_routing_256_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
@@ -332,15 +333,15 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass
-  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise
   # ------------- MoE: test_single_gpu (by backend) ---------------
+  # The paths SM103 runs differently: CUTLASS (NVFP4 picks the Ultra kernels on SM103),
+  # MegaMoE CuteDSL (K=96 variant on SM103) and TRTLLM W4A8_NVFP4_FP8 (separate sm_100a and
+  # sm_103a cubins; B300 runs the sm_103a ones). The other single-GPU module cases share
+  # their sm_100f kernels with SM103; they run on B300 (l0_b300) before merge and here
+  # post-merge.
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
   - unittest/_torch/moe/test_moe_module.py::test_a_tactic_builds_the_implementation_it_names
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
@@ -395,15 +396,15 @@ l0_b200:
   # Vocab-parallel token selection kernels on a single shard.
   - unittest/_torch/speculative/test_vocab_parallel.py
   - unittest/_torch/speculative/test_vocab_parallel_argmax.py
-  - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
   - unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
-  - unittest/_torch/modeling -k "modeling_llama"
-  - unittest/_torch/modeling -k "modeling_gpt_oss"
+  - unittest/_torch/modeling/test_modeling_llama.py
+  - unittest/_torch/modeling/test_modeling_llama_min_latency.py
+  - unittest/_torch/modeling/test_modeling_gpt_oss.py
   - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
@@ -429,10 +430,9 @@ l0_b200:
   - unittest/_torch/modeling/test_musespark_open_moe_finalize.py
   - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
   - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
-  - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
-  - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
+  # The single-GPU layer-wise benchmark cases in one entry, so they share one inner pytest
+  # session and its nsys capability check instead of paying for both per case.
+  - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1] unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1] unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1] unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests -k "not RemoteInPlaceOfDisk"
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
@@ -485,7 +485,27 @@ l0_b200:
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
+  - unittest/_torch/visual_gen/test_attention_deco.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/activation/test_swiglu.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/activation/test_swiglu_block_fp8.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_cudnn_sdpa.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sol_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_block_weight_layout.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_quantize.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_static_quantize.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_cute_bf16_gemm.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_block_sparse_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_cute_fmha.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_flash_attention_4.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_flashinfer_prefill.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_prims_dense_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_prims_routed_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sol_predictor.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_trtllm_context_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/gemm/test_gate_up_swiglu_quack.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_fp8_weight_quantize.py
+  - unittest/_torch/visual_gen/modeling_v2/catalog/quantization/test_nvfp4_weight_quantize.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_attention.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_kernels.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py
@@ -581,6 +601,20 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (60)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_minimax_h3_transformer.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_dense_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_projection.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_low_m_mma_gemm.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_trtllm_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_lora.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/ops/test_text_attention.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/ops/test_text_qk_norm_rope.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_minimax_h3_vsa.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_rope.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/kernels/test_minimax_h3_fused_rope.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/kernels/test_minimax_h3_fused_adaln.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_minimax_h3_vae_decode.py
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va]
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -722,6 +756,16 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_public_visual_gen_api_smoke
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va]
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_loads_and_runs TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_loading.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/fasth3/test_smoke.py::test_released_checkpoint_runs_vsa TIMEOUT (30)
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
@@ -740,6 +784,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_fp8_offload_matches_baseline
   - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
   - visual_gen/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1-cuda-graph] TIMEOUT (10)
@@ -773,3 +818,17 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
   # ---- non-quantized (quant=None) moved to post-merge ----
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
+  # SM100 runs of the MoE tests that pre-merge runs on B300 (shared sm_100f kernels) or
+  # H100 (SM-agnostic), and the cases pre-merge trims.
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM and not W4A8_NVFP4_FP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/kernels/parallel
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py
+  - unittest/_torch/moe/test_kimi_k3_mlp.py
+  - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe

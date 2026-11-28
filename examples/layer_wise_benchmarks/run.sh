@@ -46,7 +46,11 @@ fi
 
 SCRIPT_PATH=$(realpath --relative-to="$(pwd)" -- "$(dirname -- "$0")"/run.py)
 
+# Start the profiled shell without BASH_ENV. Container images point it at a startup file that
+# forks hundreds of processes (the NGC PyTorch image reads the vendor ID of every PCI device),
+# and under nsys each of them loads the profiler's injection libraries, so a bash that sources
+# it takes over a minute to start. The environment inherited here already has what it exports.
 set -x
-${PROFILE_CMD[@]+"${PROFILE_CMD[@]}"} bash -o pipefail -c \
+${PROFILE_CMD[@]+"${PROFILE_CMD[@]}"} env -u BASH_ENV bash -o pipefail -c \
     'python3 -u "$1" "${@:3}" 2>&1 | tee "$2/report_np'"${WORLD_SIZE}"'_rank'"${RANK}"'.log"' \
     bash "$SCRIPT_PATH" "$PROFILE_DIR" "$@"

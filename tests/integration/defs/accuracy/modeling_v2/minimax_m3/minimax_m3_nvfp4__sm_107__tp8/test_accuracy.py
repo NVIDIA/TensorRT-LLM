@@ -14,7 +14,8 @@
 # limitations under the License.
 """Whole-model gate for the MiniMax-M3 modeling_v2 target minimax_m3_nvfp4__sm_107__tp8.
 
-GSM8K without speculation and with one-model Eagle3 plus its acceptance probe; the harness is in ``../_common.py``.
+GSM8K with fullgraph piecewise prefill CUDA graphs, and with eager prefill plus one-model Eagle3 and its acceptance
+probe; the harness is in ``../_common.py``.
 """
 
 import pytest
@@ -29,10 +30,10 @@ class TestModelingV2MiniMaxM3Nvfp4Sm107Tp8(_MiniMaxM3Target):
 
     @skip_not_sm107
     @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k(self):
-        self._gsm8k(eagle3=False)
+    def test_eagle3_gsm8k_and_acceptance(self):
+        self._gsm8k(eagle3=True)
 
     @skip_not_sm107
     @pytest.mark.skip_less_mpi_world_size(8)
-    def test_eagle3_gsm8k_and_acceptance(self):
-        self._gsm8k(eagle3=True)
+    def test_gsm8k_piecewise_cuda_graph(self):
+        self._gsm8k(eagle3=False, piecewise=True)

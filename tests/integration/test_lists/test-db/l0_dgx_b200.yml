@@ -45,6 +45,7 @@ l0_dgx_b200:
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[bf16-2gpu]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[bf16-2gpu]
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_ulysses_qkv.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[TRTLLM-2-1]
@@ -57,6 +58,13 @@ l0_dgx_b200:
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-TRTLLM] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FLASHINFER] TIMEOUT (30)
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[VANILLA-2-1]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[FA4-2-1]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[TRTLLM-2-1]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[FLASHINFER-2-1]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_ulysses_and_parallel_vae
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world2]
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] TIMEOUT (30)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
   - visual_gen/test_dynamic_batching.py::test_dynamic_batching_multi_gpu[flux1-ulysses2] TIMEOUT (15)
   - visual_gen/test_dynamic_batching.py::test_dynamic_batching_multi_gpu[flux2-tp2] TIMEOUT (20)
@@ -91,6 +99,16 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world4]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_text_encoder_tp_lpips[4] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[VANILLA-4-1]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[FA4-4-1]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[TRTLLM-4-1]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[FLASHINFER-4-1]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[VANILLA-2-2]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[FA4-2-2]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[TRTLLM-2-2]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_tensor_parallel[FLASHINFER-2-2]
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/components/test_distributed_transformer_and_vae.py::test_h3_partial_vae_groups
+  - unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/h3_pipeline/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world4]
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
   # Vocab-parallel token selection over TP2/TP4 vocab shards (default all-reduce),
@@ -153,33 +171,17 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
-  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
-  # --- CUTLASS ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_FP8"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and NVFP4"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_MXFP8"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and MXFP8 and not W4A8"
-  # --- TRTLLM ---
+  # ------------- MoE: multi-GPU module tests ---------------
+  # The SM100 part of the pre-merge subset (_MULTI_GPU_PREMERGE_CASES in test_moe_module.py);
+  # the per-backend entries it replaces run post-merge. EPLB runs before merge on DGX H100 and
+  # DGX B300 only: DGX B200 hosts have no host-accessible device memory, so every EPLB case
+  # skips here.
+  - unittest/_torch/moe/test_moe_module.py::test_moe_multi_gpu_premerge
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_TWO_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=ALLGATHER-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
   # GPT-OSS MXFP4/FP8 reference checks for DEP/DeepEP and TTP (aligned and padded shards).
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_FP8 and 1.702 and bfloat16 and Renormalize and ((DEP and DEEPEP and not DEEPEPLOWLATENCY and e60_k4_h2048_i1408) or (TTP and NVLINK_ONE_SIDED and (e8_k1_h512_i512 or e60_k4_h2048_i1408)))"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
-  # --- CUTEDSL (NVFP4 only) ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
-  # --- DEEPGEMM (FP8_BLOCK_SCALES only) ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  # --- MEGAMOE_DEEPGEMM (W4A8_MXFP4_MXFP8 only) ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_DEEPGEMM"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_CUTEDSL"
-  # ------------- MoE: test_multi_gpu_eplb ---------------
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "not None"
 - condition:
     ranges:
       system_gpu_count:
@@ -330,6 +332,13 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_tp2_example_lpips TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_text_encoder_tp_lpips[2] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-TRTLLM] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FLASHINFER] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_text_encoder_tp_lpips[4] TIMEOUT (30)
+  - visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_parallel_quality.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
   # GLM-5.3-Flash modeling_v2 split target without speculation (SM100 only).
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k
   # GLM-5.3-Flash FP8 modeling_v2 target: GSM8K without speculation.
@@ -388,7 +397,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-one_model-no_overlap_scheduler]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v1_kv_cache-one_model]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v2_kv_cache-one_model]
-  - unittest/_torch/multi_gpu_modeling -k "deepseek"
+  - unittest/_torch/multi_gpu_modeling/test_deepseek.py
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-ep4-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-low_precision_combine=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=True-torch_compile=False]
@@ -406,8 +415,31 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=True]
   - disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8]
-  # ---- FP8 per-tensor (QDQ) moved to post-merge; block-scale/W4A8 stay in pre ----
+  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
+  # The entries that test_moe_multi_gpu_premerge replaces before merge, and the CUTLASS FP8
+  # per-tensor (QDQ) slice.
+  # --- CUTLASS ---
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_FP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and NVFP4"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_MXFP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and MXFP8 and not W4A8"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES and not W4A8 and not MXFP8"
+  # --- TRTLLM ---
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
+  # --- CUTEDSL (NVFP4 only) ---
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
+  # --- DEEPGEMM (FP8_BLOCK_SCALES only) ---
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  # --- MEGAMOE_DEEPGEMM (W4A8_MXFP4_MXFP8 only) ---
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_CUTEDSL"
+  # ------------- MoE: test_multi_gpu_eplb ---------------
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "not None"
   # Kimi K3 Tier-1: truncated 4-layer (KDA + first full-attention) SA spec-dec
   # logits parity on TP=4 (skips cleanly when the Kimi-K3 checkpoint is not
   # staged under LLM_MODELS_ROOT).
