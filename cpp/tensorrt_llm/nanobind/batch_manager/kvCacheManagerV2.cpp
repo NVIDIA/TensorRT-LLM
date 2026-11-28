@@ -2496,6 +2496,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](double seconds) { kv::delayDiskWriteBehindFlushesForTesting(seconds); }, nb::arg("seconds"),
         "A disk write-behind flush starts only once it has been queued for `seconds`.");
     mIntrospection.def(
+        "wait_for_disk_io_for_testing", []() { kv::waitForDiskIo(); }, nb::call_guard<nb::gil_scoped_release>(),
+        "Return once the async disk I/O pool has no piece queued or running (at once without the pool).");
+    mIntrospection.def(
         "delay_background_disk_writes_for_testing",
         [](double seconds) { kv::delayBackgroundDiskWritesForTesting(seconds); }, nb::arg("seconds"),
         "The async disk I/O pool starts a background write piece only once it has been queued for `seconds`.");
@@ -2994,6 +2997,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             result["bytes"] = info.bytes;
             result["depth"] = info.depth;
             result["lane_chunks"] = info.laneChunks;
+            result["lane_read_chunks"] = info.laneReadChunks;
             return result;
         },
         nb::arg("manager"));

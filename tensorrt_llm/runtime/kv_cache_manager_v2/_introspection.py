@@ -122,6 +122,12 @@ def disk_write_behind_pages_for_testing() -> int:
     return int(_cpp().disk_write_behind_pages_for_testing())
 
 
+def wait_for_disk_io_for_testing() -> None:
+    """Return once the async disk I/O pool has no piece queued or running (at once without the pool): every queued
+    write-behind flush has then been attempted."""
+    _cpp().wait_for_disk_io_for_testing()
+
+
 def delay_disk_write_behind_flushes_for_testing(seconds: float) -> None:
     """A disk write-behind flush starts only once it has been queued for ``seconds`` (0: no delay), so reads of the
     staged pages are served from staging meanwhile."""
@@ -324,7 +330,8 @@ def level_pool_groups(manager: Any, cache_level: int) -> list[tuple[int, int, li
 
 def page_staging(manager: Any) -> dict[str, int]:
     """The page staging ring of the storage manager: ``bytes`` (0 without one), ``depth`` (stretches one disk move
-    keeps in flight) and ``lane_chunks`` (stretches issued on a move's extra streams so far)."""
+    keeps in flight), ``lane_chunks`` (stretches issued on a move's extra streams so far) and ``lane_read_chunks``
+    (those of them that moved pages from disk to GPU)."""
     return dict(_cpp().page_staging(manager))
 
 
