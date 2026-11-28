@@ -2966,7 +2966,7 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
             weight.float() * weight_scale.repeat_interleave(self.scaling_group_size, dim=0).float()
         ).to(self.dtype)
         if weight_scale_2 is not None:
-            weight = weight / weight_scale_2
+            weight = (weight / weight_scale_2).to(self.dtype)
 
         # Step 4: Compute matmul and scale output
         output = torch.matmul(act, weight) * input_scale
