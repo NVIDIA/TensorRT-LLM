@@ -760,6 +760,45 @@ class TestMoeConfigAdaptiveEplb:
         assert isinstance(config.load_balancer, MoeAdaptiveLoadBalancerConfig)
         assert config.load_balancer.num_slots == 512
 
+    @pytest.mark.parametrize("backend", ["AUTO", "MEGAMOE_CUTEDSL"])
+    def test_keeps_a_backend_that_can_balance(self, backend: str) -> None:
+        """AUTO stays AUTO; no model is refused here.
+
+        Resolution picks MegaMoE CuteDSL per layer and runs a layer it cannot
+        serve as plain EP.
+        """
+        config = MoeConfig(backend=backend,
+                           load_balancer={
+                               "mode": "adaptive",
+                               "num_slots": 512
+                           })
+        assert config.backend == backend
+
+    @pytest.mark.parametrize("backend",
+                             ["CUTLASS", "TRTLLM", "MEGAMOE_DEEPGEMM"])
+    def test_refuses_a_backend_that_cannot_balance(self, backend: str) -> None:
+        """The error says which backend balances, why, and what to set.
+
+        Before, every layer ran outside the balancer and it only logged.
+        """
+        with pytest.raises(ValidationError) as error:
+            MoeConfig(backend=backend,
+                      load_balancer={
+                          "mode": "adaptive",
+                          "num_slots": 512
+                      })
+        text = str(error.value)
+        assert f"moe_config.backend='{backend}' cannot run adaptive EPLB" in text
+        assert "runs only on the MEGAMOE_CUTEDSL MoE backend" in text
+        assert "Set moe_config.backend to 'MEGAMOE_CUTEDSL' or 'AUTO'" in text
+
+    def test_tactic_must_match_an_implementation_that_balances(self) -> None:
+        adaptive = {"mode": "adaptive", "num_slots": 512}
+        MoeConfig(tactic="cutedsl.mega_moe", load_balancer=adaptive)
+        with pytest.raises(ValidationError,
+                           match="none of which supports adaptive EPLB"):
+            MoeConfig(tactic="cutlass", load_balancer=adaptive)
+
     @pytest.mark.parametrize(
         "num_slots, num_experts, message",
         [

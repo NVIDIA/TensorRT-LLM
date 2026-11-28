@@ -2741,7 +2741,12 @@ class MoeConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def resolve_load_balancer_compatibility(self) -> "MoeConfig":
-        """Resolve the backend required by per-layer dynamic EPLB."""
+        """Resolve the backend required by per-layer dynamic EPLB.
+
+        Also refuse a backend or tactic that cannot run adaptive EPLB.
+        """
+        if getattr(self.load_balancer, "mode", None) == "adaptive":
+            self._check_adaptive_backend()
         required_backend = auto_moe_backend_for_load_balancer(
             self.load_balancer)
         if required_backend == "AUTO":
@@ -2767,6 +2772,40 @@ class MoeConfig(StrictBaseModel):
             raise ValueError("per-layer dynamic EPLB requires "
                              f"backend={required_backend!r}")
         return self
+
+    def _check_adaptive_backend(self) -> None:
+        """Refuse a backend or tactic under which no MoE layer can balance.
+
+        ``AUTO`` stays: resolution picks an implementation that supports
+        adaptive EPLB for each layer that has one and runs the others (an MTP
+        layer in another format, say) as plain EP outside the balancer. A
+        backend or tactic that excludes every such implementation would leave
+        the balancer with no layer, so it is refused here, before the model
+        loads.
+        """
+        supported = "MEGAMOE_CUTEDSL"
+        fix = (f"Set moe_config.backend to {supported!r} or 'AUTO' (AUTO "
+               f"selects {supported} for every layer it can serve), or drop "
+               "moe_config.load_balancer to run without a load balancer.")
+        why = (f"adaptive EPLB runs only on the {supported} MoE backend "
+               "(NVFP4 experts, SM100 / SM103 / SM107): the balancer installs "
+               "replicas into that backend's expert slots and routes through "
+               "its route table")
+        if self.tactic is not None:
+            request = _moe_tactic_request(self.tactic, "moe_config.tactic")
+            if not any(impl_cls.capabilities.supports_adaptive_eplb
+                       for impl_cls in request.impls):
+                matched = [
+                    impl_cls.descriptor.impl_id for impl_cls in request.impls
+                ]
+                raise ValueError(
+                    f"moe_config.tactic={self.tactic!r} matches {matched}, none "
+                    f"of which supports adaptive EPLB; {why}. Use a tactic "
+                    f"that matches {supported} (e.g. 'cutedsl.mega_moe'), or drop "
+                    "moe_config.load_balancer.")
+        elif self.backend not in ("AUTO", supported):
+            raise ValueError(f"moe_config.backend={self.backend!r} cannot run "
+                             f"adaptive EPLB: {why}. {fix}")
 
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
