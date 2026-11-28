@@ -1215,6 +1215,8 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
         rows_on_n: bool = False,
     ):
         if rows_on_n:
+            # The plan's own rows (what `is_valid` holds it to), not the raw helper's wider range.
+            assert ROWSN_ROWS[0] <= normed.shape[0] <= ROWSN_ROWS[1], normed.shape
             bn = -(-normed.shape[0] // 16) * 16
             return hc_first_rowsn(normed, first, rank, hc_count, with_inject, bn)
         if tm == 64:
