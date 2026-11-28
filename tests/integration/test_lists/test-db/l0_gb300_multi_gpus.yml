@@ -107,6 +107,9 @@ l0_gb300_multi_gpus:
   # Adaptive EPLB on four ranks: the dispatch router's route bit for bit against the staged route and a layer
   # without the balancer, and a graph replayed after an install.
   - unittest/_torch/moe/test_megamoe_adaptive_route_e2e.py
+  # A fused shared expert's live rows under the adaptive route on four ranks: padding rows zero, statistics of
+  # the live rows only.
+  - unittest/_torch/moe/test_megamoe_live_rows_gpu.py::test_an_adaptive_route_keeps_the_fused_shared_experts_live_rows
   # Adaptive EPLB: expert copies between four local ranks over MNNVL memory (torchrun).
   - unittest/_torch/moe/multi_gpu/test_adaptive_eplb_transport_peer.py
   # Pre-merge runs it on DGX B200 only.

@@ -9,6 +9,7 @@ equal the histogram of the live rows' routes. Generic routing stages through meg
 DeepSeek-V4 routing through its fused route+quant.
 """
 
+import contextlib
 import os
 import pickle
 import sys
@@ -102,8 +103,12 @@ def _drop_worker(real_requests_by_rank: tuple, combine_format: str, routing: str
 
 
 @contextmanager
-def _megamoe_layer(combine_format: str, routing: str, rows: int = _REQUESTS * _ROWS_PER_REQUEST):
-    """One MegaMoE CuteDSL layer on this rank, the same inputs and weights on every rank."""
+def _megamoe_layer(
+    combine_format: str, routing: str, rows: int = _REQUESTS * _ROWS_PER_REQUEST, adaptive=False
+):
+    """One MegaMoE CuteDSL layer on this rank, the same inputs and weights on every rank; with
+    ``adaptive``, under an adaptive load balancer with two spare slots per rank, its routes mapped
+    in the dispatch router (home route tables), and the balancer is yielded too."""
     from _torch.moe.moe_test_utils import MoeBackendType
     from _torch.moe.quantize_utils import FP8BlockScalesQuantizeUtil, get_test_quant_params
     from _torch.moe.test_moe_module import (
@@ -189,8 +194,20 @@ def _megamoe_layer(combine_format: str, routing: str, rows: int = _REQUESTS * _R
             model_cfg.pretrained_config.architectures = ["DeepseekV41ForCausalLM"]
             model_cfg.pretrained_config.n_shared_experts = 1
             model_cfg = model_cfg.copy_with(megamoe_fuse_shared_expert=True)
+        balancer = contextlib.nullcontext()
+        if adaptive:
+            from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+                maybe_create_moe_load_balancer,
+            )
+            from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
+
+            model_cfg.moe_load_balancer = MoeAdaptiveLoadBalancerConfig(
+                num_slots=num_experts + 2 * _WORLD
+            )
+            balancer = maybe_create_moe_load_balancer(model_cfg, mapping)
         with (
             nccl_window_tensor_scope(x),
+            balancer as moe_balancer,
             create_moe(
                 routing_method=routing_method,
                 reduce_results=True,
@@ -235,7 +252,20 @@ def _megamoe_layer(combine_format: str, routing: str, rows: int = _REQUESTS * _R
                 )
                 # Before the Linear transforms, as DeepseekV4ForCausalLM.post_load_weights does.
                 assert fused_moe.fuse_shared_expert(mlp)
-            yield fused_moe, x, router_logits, routing_method, rank
+            if not adaptive:
+                yield fused_moe, x, router_logits, routing_method, rank
+                return
+            from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.transport import (
+                find_backends,
+                prepare_layers,
+            )
+
+            moe_balancer.register_weight_slots_after_to_cuda()
+            moe_balancer.finalize_model()
+            prepare_layers(
+                find_backends(fused_moe, moe_balancer.layers), moe_balancer.layers, x.device
+            )
+            yield fused_moe, x, router_logits, routing_method, rank, moe_balancer
 
 
 def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing: str) -> None:
@@ -329,4 +359,78 @@ def test_megamoe_cutedsl_drops_padding_rows(
             [routing] * _WORLD,
         )
     )
+    assert results == [None] * _WORLD
+
+
+def _adaptive_shared_worker(real_requests_by_rank: tuple) -> None:
+    try:
+        _adaptive_shared_worker_impl(real_requests_by_rank)
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        patch.stopall()
+
+
+def _adaptive_shared_worker_impl(real_requests_by_rank: tuple) -> None:
+    from _torch.moe.test_megamoe_adaptive_route_e2e import _fixed_order, _order_bound, _pick_terms
+
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    rows, rank = _REQUESTS * _ROWS_PER_REQUEST, mpi_rank()
+    real = real_requests_by_rank[rank]
+    requests = [SimpleNamespace(is_dummy=index >= real) for index in range(_REQUESTS)]
+    seq_lens = torch.full((_REQUESTS,), _ROWS_PER_REQUEST, dtype=torch.int32)
+    value = live_rows.forward_word(requests, num_contexts=0, seq_lens=seq_lens)
+    live = live_rows.live_row_count(value, rows)
+    word = live_rows.LiveRowWord()
+
+    def forward(layer, x, logits, value) -> torch.Tensor:
+        word.write(value)
+        with torch.inference_mode(), model_extra_attrs({live_rows.LIVE_ROW_WORD_ATTR: word}):
+            output = layer.forward(x, logits, all_rank_num_tokens=[rows] * _WORLD).clone()
+        torch.cuda.synchronize()
+        return output
+
+    with (
+        _megamoe_layer("bf16", _FUSED_SHARED) as (plain, x, logits, routing_method, _),
+        _megamoe_layer("bf16", _FUSED_SHARED, adaptive=True) as (adaptive, *_, balancer),
+    ):
+        stats = balancer.statistics(x.device)
+        stats["storage"].zero_()
+        balancer.observe_scheduled_batch(real, True, False, lambda start, stop: (0, 0, 0))
+        got = forward(adaptive, x, logits, value)
+        balancer.observe_scheduled_batch(0, True, False, lambda start, stop: (0, 0, 0))
+        want = forward(plain, x, logits, value)
+        with torch.inference_mode():
+            routes, _ = routing_method.apply(logits)
+        picks = torch.bincount(routes[:live].long().flatten(), minlength=_DSV4_SHAPE[0]).float()
+        # The adaptive kernel maps and counts the live rows' routes; the padding rows add nothing.
+        assert torch.equal(stats["rows"][0].cpu(), picks.cpu()), "the router counted other routes"
+        # The fused shared expert reads the word in the adaptive build too: the dropped rows are zero.
+        assert not got[live:].any() and not want[live:].any()
+        if _fixed_order(adaptive.backend, rows, plain.backend):
+            assert torch.equal(got[:live], want[:live])
+            return
+
+        # Another tactic or an arrival-order sum: within the order bound of the k + 1 terms, the
+        # shared expert's (no pick kept) and each pick's (less the shared expert's).
+        def run():
+            return [forward(plain, x, logits, value)]
+
+        (shared,) = _pick_terms([plain.backend], run, [None])
+        terms = [[t[0] - shared[0]] for t in _pick_terms([plain.backend], run)] + [shared]
+        bound = _order_bound(terms, 0)[:live]
+        assert bool(((got[:live].float() - want[:live].float()).abs() <= bound).all())
+
+
+@requires_blackwell
+@pytest.mark.skipif(torch.cuda.device_count() < _WORLD, reason=f"needs {_WORLD} GPUs")
+@pytest.mark.threadleak(enabled=False)  # the pool's manager thread persists by design
+def test_an_adaptive_route_keeps_the_fused_shared_experts_live_rows(moe_multi_gpu_executor) -> None:
+    """A layer whose fused shared expert bounds its rows by the live-row word, under an adaptive
+    load balancer whose routes its dispatch router maps: its live rows return what the same layer
+    without the balancer returns, its padding rows are zero, and its statistics count the live
+    rows' routes alone."""
+    results = list(moe_multi_gpu_executor.map(_adaptive_shared_worker, [_REAL_REQUESTS] * _WORLD))
     assert results == [None] * _WORLD

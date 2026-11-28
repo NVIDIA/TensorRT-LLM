@@ -79,14 +79,14 @@ def _fixed_order(backend, rows: int, other=None) -> bool:
     )
 
 
-def _pick_terms(backends, run) -> list:
+def _pick_terms(backends, run, positions=range(_TOP_K)) -> list:
     """The terms the top-k reduce adds, as the kernels compute them: ``run()``'s outputs once per pick
-    position j, with every other pick of every row set to -1, which the route drops. A row's FC2 output
-    depends on no other row or pick, so the j-th output is the j-th pick's term of each row. The fused
-    route also wrote the picks into the launch bucket, which the launch then reads as they are: both
-    are masked."""
+    position j, with every other pick of every row set to -1, which the route drops (position None
+    keeps no pick: what a fused shared expert adds alone). A row's FC2 output depends on no other row
+    or pick, so the j-th output is the j-th pick's term of each row. The fused route also wrote the
+    picks into the launch bucket, which the launch then reads as they are: both are masked."""
     terms = []
-    for j in range(_TOP_K):
+    for j in positions:
         fused = [backend.try_fused_route_quant for backend in backends]
 
         def keep_one(*args, _fused, _j=j, **kwargs):
@@ -99,9 +99,10 @@ def _pick_terms(backends, run) -> list:
             if staged is not None and staged[1] is ids:
                 picks.append(staged[0][: ids.shape[0]])
             for tensor in picks:
-                kept = tensor[:, _j].clone()
+                kept = None if _j is None else tensor[:, _j].clone()
                 tensor.fill_(-1)
-                tensor[:, _j] = kept
+                if kept is not None:
+                    tensor[:, _j] = kept
             return result
 
         for backend, original in zip(backends, fused):
@@ -115,15 +116,15 @@ def _pick_terms(backends, run) -> list:
 
 
 def _order_bound(terms, layer: int) -> torch.Tensor:
-    """Elementwise bound on the difference of two bf16 sums of one row's k = top-k terms (the test
-    builds no shared expert) taken in different orders. Each sum rounds at most k times: k - 1
-    additions and its conversion to the output, or, for a layer that adds the terms in fp32, the
-    terms' own roundings. Each rounding moves the partial result by at most u times its magnitude,
-    and every partial result is at most sum |t_j|, so each sum lies within gamma_k * sum |t_j| of the
-    exact sum, gamma_k = k u / (1 - k u) (Higham, Accuracy and Stability of Numerical Algorithms,
-    Lemma 3.1 and Section 4.2), and the two within twice that. The terms come back from the kernel
-    rounded to bf16 (|t| <= |t_hat| / (1 - u))."""
-    u, k = _BF16_UNIT_ROUNDOFF, _TOP_K
+    """Elementwise bound on the difference of two bf16 sums of one row's k = len(terms) terms (the
+    top-k picks', and a fused shared expert's when the layer has one) taken in different orders.
+    Each sum rounds at most k times: k - 1 additions and its conversion to the output, or, for a
+    layer that adds the terms in fp32, the terms' own roundings. Each rounding moves the partial
+    result by at most u times its magnitude, and every partial result is at most sum |t_j|, so each
+    sum lies within gamma_k * sum |t_j| of the exact sum, gamma_k = k u / (1 - k u) (Higham,
+    Accuracy and Stability of Numerical Algorithms, Lemma 3.1 and Section 4.2), and the two within
+    twice that. The terms come back from the kernel rounded to bf16 (|t| <= |t_hat| / (1 - u))."""
+    u, k = _BF16_UNIT_ROUNDOFF, len(terms)
     gamma = k * u / (1 - k * u)
     magnitude = torch.stack([t[layer].float().abs() for t in terms]).sum(0)
     return 2 * gamma / (1 - u) * magnitude
