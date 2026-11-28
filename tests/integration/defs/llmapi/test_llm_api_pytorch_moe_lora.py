@@ -26,6 +26,7 @@ deterministic failure rather than a silent pass.
 import json
 import os
 import tempfile
+from typing import Any
 
 import pytest
 import torch
@@ -353,16 +354,9 @@ def _run_paired_adapter_engine(
             runner = _local_worker(llm).engine.model_engine.cuda_graph_runner
             original_replay = runner.replay
 
-            def counted_replay(
-                key, current_inputs, *, position_id_offsets=None, static_inputs_staged=0
-            ):
+            def counted_replay(*args: Any, **kwargs: Any) -> torch.Tensor | None:
                 replay_count[0] += 1
-                return original_replay(
-                    key,
-                    current_inputs,
-                    position_id_offsets=position_id_offsets,
-                    static_inputs_staged=static_inputs_staged,
-                )
+                return original_replay(*args, **kwargs)
 
             runner.replay = counted_replay
 
