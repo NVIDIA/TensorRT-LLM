@@ -1674,9 +1674,10 @@ def mid_mm_raw(
 ) -> torch.Tensor:
     """The GEMM alone: `x [M, K]` (e4m3 with `sx [M]`, or bf16) contiguous, `w [N, K]` of the
     same dtype contiguous, `sw` None / fp32 [1] / fp32 [N]. Returns a fresh bf16 `[M, N]`.
-    `mpad`: the MMA N (a multiple of 16, at least `M`); default `mma_rows(M)`. A row's output
-    depends on that row alone and TMA zero-fills the tile past `M`, so any `mpad` gives the
-    same bits; a smaller one streams fewer activation bytes."""
+    `mpad`: the MMA N (a multiple of 16, at least `M`, and a multiple of the plan's epilogue
+    width `min(plan.epi, mpad)`); default `mma_rows(M)`. A row's output depends on that row
+    alone and TMA zero-fills the tile past `M`, so any such `mpad` gives the same bits; a
+    smaller one streams fewer activation bytes."""
     m, k = x.shape
     n = w.shape[0]
     fp8 = x.dtype == torch.float8_e4m3fn
@@ -1685,6 +1686,9 @@ def mid_mm_raw(
     assert fp8 == (sx is not None)
     mpad = mma_rows(m) if mpad is None else mpad
     assert m <= mpad <= MAX_ROWS and mpad % 16 == 0, (m, mpad)
+    # The epilogue stores `min(plan.epi, mpad)` columns a pass: checked here, before the output
+    # is allocated or the kernel compiled.
+    assert mpad % min(plan.epi, mpad) == 0, f"mpad {mpad} is not a multiple of epi {plan.epi}"
     w_mode = 0 if sw is None else (1 if sw.numel() == 1 else 2)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     fn = _compiled_mm(n, k, plan, mpad, fp8, w_mode, bool(pdl and _env_pdl()))

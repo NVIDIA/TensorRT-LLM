@@ -11,7 +11,10 @@ kernel therefore loads every scalar with coherent `ld.global` (and the inject mo
 and injection); this test compiles each operand mode for sm_103a (`CUTE_DSL_ARCH`, no GPU
 launch), dumps PTX and SASS, and fails on any `ld.global.nc` / `LDG.*.CONSTANT`. It also
 checks that the dump holds the grid-dependency wait (`ACQBULK`), so a variant that silently
-dropped PDL does not pass vacuously.
+dropped PDL does not pass vacuously, and that an FP8 variant's PTX holds a wait in each of the
+two warp roles that read a predecessor's output (the TMA warp before the activation, the
+epilogue warps before the activation scales): with the epilogue's lost, the TMA warp's would
+still satisfy the first check.
 
 Needs the CuTe DSL and the CUDA toolchain (as every test of this directory), not a GPU.
 """
@@ -98,9 +101,14 @@ def test_no_non_coherent_global_load(variant, tmp_path: Path) -> None:
     ptx = [p.read_text() for p in tmp_path.glob("*.ptx")]
     sass = [p.read_text() for p in tmp_path.glob("*.sass")]
     assert ptx and sass, f"no PTX / SASS dumped in {sorted(os.listdir(tmp_path))}"
+    fp8 = bool(variant[4])
     for text in ptx:
         assert "griddepcontrol.wait" in text, "the variant lost its grid-dependency wait"
         assert "ld.global.nc" not in text, "a non-coherent global load in the PTX"
+    waits = sum(text.count("griddepcontrol.wait") for text in ptx)
+    if fp8:
+        # The TMA warp's wait and the epilogue's, which guards the activation-scale loads.
+        assert waits >= 2, f"{waits} grid-dependency wait(s): the epilogue's is gone"
     for text in sass:
         assert "ACQBULK" in text, "no grid-dependency wait in the SASS"
         constant = [
