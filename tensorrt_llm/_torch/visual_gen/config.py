@@ -631,7 +631,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         runtime_lora_cfg = args.runtime_lora_config if args else None
         enable_layerwise_nvtx_marker = bool(args.enable_layerwise_nvtx_marker) if args else False
 
-        from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
+        from .pipeline_registry import PipelineComponent
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
@@ -812,9 +812,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             vae_conv_dynamic_weight_quant = None
             vae_conv_dynamic_activation_quant = None
 
-        entry = PIPELINE_REGISTRY.get(family)
-        h3_v2 = family == "MiniMaxH3ModularPipeline" and entry is not None and entry.opt_in_enabled
-        if not h3_v2:
+        # MiniMax-H3 selects its own quantization kernels.
+        if family != "MiniMaxH3ModularPipeline":
             if QuantAlgo.NVFP4 in transformer_quant_algos:
                 from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 

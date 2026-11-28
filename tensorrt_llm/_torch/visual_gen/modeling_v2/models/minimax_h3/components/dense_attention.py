@@ -12,11 +12,66 @@ from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
+from ....catalog.attention import KeyPadding
 from .skip_softmax_threshold import (
     H3SkipSoftmax,
     dense_prefix,
     resolve_skip_softmax_threshold_scale_factor,
 )
+
+
+def uses_deco_attention(attention) -> bool:
+    recipe = attention.quant_attention_config
+    return attention.backend == "CUTEDSL" and recipe is not None and recipe.deco_attention
+
+
+PADDED_ATTENTION = (
+    "VANILLA, FA4, unquantized FLASHINFER, TRTLLM without a quantized recipe or skip-softmax, "
+    "or CUTEDSL with deco_attention"
+)
+
+
+def key_padding(attention) -> KeyPadding:
+    """The padded keys H3 attention excludes under ``attention``: what the catalog op of its
+    backend declares for the recipe, what H3's TRTLLM attention trims, or for VANILLA what H3's
+    own SDPA call takes."""
+    backend = attention.backend
+    recipe = getattr(attention, "quant_attention_config", None)
+    sparse = getattr(attention, "sparse_attention_config", None)
+    if backend == "VANILLA":
+        return KeyPadding.MASK
+    if backend == "TRTLLM":
+        from .trtllm_attention import H3TrtllmAttention
+
+        return H3TrtllmAttention.key_padding(recipe, sparse)
+    if uses_deco_attention(attention):
+        from ....catalog.attention.deco_attention import deco_attention
+
+        return deco_attention.key_padding()
+    if backend == "CUTEDSL" and isinstance(sparse, SolAttentionConfig):
+        from ....catalog.attention.sol_attention import sol_attention
+
+        return sol_attention.key_padding()
+    if backend == "CUTEDSL":
+        from ....catalog.attention.cute_fmha import cute_fmha
+
+        return cute_fmha.key_padding()
+    if backend == "FA4":
+        from ....catalog.attention.flash_attention_4 import flash_attention_4
+
+        return flash_attention_4.key_padding()
+    if backend == "FLASHINFER":
+        from ....catalog.attention.flashinfer_prefill import flashinfer_prefill
+
+        return flashinfer_prefill.key_padding(
+            qk_dtype=recipe.qk_dtype if recipe is not None else None,
+            v_dtype=recipe.v_dtype if recipe is not None else None,
+        )
+    if backend == "CUDNN":
+        from ....catalog.attention.cudnn_sdpa import cudnn_sdpa
+
+        return cudnn_sdpa.key_padding()
+    return KeyPadding.NONE
 
 
 def _cute_output(q, k, v, scale, *, recipe=None, threshold=None):
@@ -77,6 +132,13 @@ class H3DenseAttention:
         self.runner = None
         self.sparse_params = sparse_params
         self.sol = None
+        self.deco = uses_deco_attention(config.attention)
+        if self.deco:
+            from ....catalog.attention.deco_attention import deco_unavailable_reason
+
+            reason = deco_unavailable_reason(self.recipe.qk_dtype, self.recipe.v_dtype)
+            if reason is not None:
+                raise ValueError(reason)
         if backend == "CUDNN":
             from ....catalog.attention.cudnn_sdpa import CudnnSdpaRunner
 
@@ -126,7 +188,21 @@ class H3DenseAttention:
             return phase == 0
         return dense_prefix(timestep, self.sol_params.disabled_until_timestep)
 
+    def _deco_forward(self, q, k, v, key_padding_mask, token_tags):
+        from ....catalog.attention.deco_attention import deco_attention
+
+        return deco_attention(
+            q,
+            k,
+            v,
+            v_dtype=self.recipe.v_dtype,
+            key_padding_mask=key_padding_mask,
+            token_tags=token_tags,
+        )
+
     def forward(self, q, k, v, *, key_padding_mask=None, timestep=None, **kwargs):
+        if self.deco:
+            return self._deco_forward(q, k, v, key_padding_mask, kwargs.get("token_tags"))
         if self.sol is not None:
 
             def dense(a, b, c):

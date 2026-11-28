@@ -6,6 +6,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ._cudnn_sdpa import CudnnSdpaRunner
+from ._key_padding import KeyPadding
 
 __all__ = ["CudnnSdpaRunner", "cudnn_sdpa"]
 
@@ -19,6 +20,9 @@ class CudnnSdpa(OpWrapper):
         Cell("Per-tensor FP8 attention", dict(quant="fp8", rows=256)),
         Cell("Block-scaled MXFP8 attention", dict(quant="mxfp8", rows=200)),
     )
+
+    def key_padding(self) -> KeyPadding:
+        return KeyPadding.NONE
 
     def __call__(self, q, k, v, *, runner: CudnnSdpaRunner):
         return runner.run_dense(q, k, v)

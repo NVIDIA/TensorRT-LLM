@@ -30,6 +30,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from ....catalog.attention import KeyPadding
 from ..kernels.fused_adaln import h3_adaln_supported
 from ..ops.adaln import gate_res_norm_mod as h3_gate_res_norm_mod
 from ..ops.adaln import norm_mod as h3_norm_mod
@@ -41,12 +42,17 @@ from .attention import (
     MiniMaxH3VSAAttention,
     _dense_attention_model_config,
 )
+from .dense_attention import key_padding, uses_deco_attention
 from .linear import Linear
 from .mlp import GatedMLP
 from .norm import RMSNorm
 from .sequence_sharder import H3SequenceSharder, shard_dit_inputs, shard_refiner_inputs
 
 MINIMAX_H3_MODALITY_NUM = 3
+
+
+def takes_key_padding_mask(attention) -> bool:
+    return key_padding(attention) is not KeyPadding.NONE
 
 
 @dataclass
@@ -231,12 +237,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
     ) -> None:
         super().__init__()
         self._attn_backend = model_config.attention.backend.upper()
-        self._supports_key_padding_mask = self._attn_backend in (
-            "VANILLA",
-            "FA4",
-            "TRTLLM",
-            "FLASHINFER",
-        )
+        self._supports_key_padding_mask = takes_key_padding_mask(model_config.attention)
         self.sharder = H3SequenceSharder(
             model_config.visual_gen_mapping,
             num_attention_heads=num_attention_heads,
@@ -349,6 +350,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
         vsa_metadata: H3VSAMetadata | None = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self._fused_adaln and hidden_states.dtype == torch.bfloat16:
             return self._forward_fused_adaln(
@@ -360,6 +362,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 timestep,
                 valid_seq_len,
                 vsa_metadata,
+                token_tags,
             )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
@@ -375,6 +378,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             timestep,
             valid_seq_len,
             vsa_metadata=vsa_metadata,
+            token_tags=token_tags,
         )
 
         residual = hidden_states
@@ -397,6 +401,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         timestep: Optional[torch.Tensor],
         valid_seq_len: Optional[int],
         vsa_metadata: H3VSAMetadata | None,
+        token_tags: Optional[torch.Tensor],
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
@@ -410,6 +415,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             timestep,
             valid_seq_len,
             vsa_metadata=vsa_metadata,
+            token_tags=token_tags,
         )
         hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
             hidden_states,
@@ -447,12 +453,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     ) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
-        self._supports_key_padding_mask = self._attn_backend in (
-            "VANILLA",
-            "FA4",
-            "TRTLLM",
-            "FLASHINFER",
-        )
+        padding = key_padding(model_config.attention)
+        self._supports_key_padding_mask = padding is not KeyPadding.NONE
+        self._requires_trailing_padding = padding is KeyPadding.PREFIX
+        self._uses_deco = uses_deco_attention(model_config.attention)
         quant_algo = model_config.quant_config.quant_algo
         if quant_algo is not None and not (
             quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4)
@@ -741,6 +745,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             rotary_emb,
             key_padding_mask,
             valid_seq_len,
+            padded_token_tags,
         ) = shard_dit_inputs(
             packed_hidden_states,
             adaln_indices,
@@ -750,9 +755,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             self.sharder,
             self._attn_backend,
             self._supports_key_padding_mask,
+            self._requires_trailing_padding,
         )
 
-        sparse_inputs = {} if vsa_metadata is None else {"vsa_metadata": vsa_metadata}
+        attention_inputs = {} if vsa_metadata is None else {"vsa_metadata": vsa_metadata}
+        if self._uses_deco:
+            attention_inputs["token_tags"] = padded_token_tags
         for block in self.transformer_blocks:
             packed_hidden_states = block(
                 packed_hidden_states,
@@ -762,7 +770,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 key_padding_mask,
                 timestep,
                 valid_seq_len=valid_seq_len,
-                **sparse_inputs,
+                **attention_inputs,
             )
 
         packed_hidden_states = self.norm_out(

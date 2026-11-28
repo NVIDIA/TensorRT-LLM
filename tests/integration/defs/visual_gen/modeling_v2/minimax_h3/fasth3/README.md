@@ -3,14 +3,14 @@
 
 # FastH3 quality references
 
-The B200 post-merge smoke loads the released eight-step checkpoint, selects the FastH3 VSA target and generates video and audio. The separate SM100 quality tests compare each backend with a V1 capture from the same checkpoint, request and GPU architecture. Set `FASTH3_CHECKPOINT` to an immutable checkpoint snapshot or stage `FastVideo-FastH3-8-Step-V2` under `LLM_MODELS_ROOT`.
+The B200 post-merge smoke loads the released eight-step checkpoint, selects the FastH3 VSA target and generates video and audio. The separate SM100 quality tests compare each backend with a baseline capture from the same checkpoint, request and GPU architecture. Set `FASTH3_CHECKPOINT` to an immutable checkpoint snapshot or stage `FastVideo-FastH3-8-Step-V2` under `LLM_MODELS_ROOT`.
 
 Capture fixed references using the baseline installation on SM100.
 
 ```bash
 mkdir -p "$BASELINE_OUTPUT"
 for backend in TRTLLM CUTEDSL; do
-    TLLM_VISUALGEN_MODELING2_H3=0 "$BASELINE_PYTHON" "$CASE/quality_case.py" --checkpoint "$FASTH3_CHECKPOINT" --backend "$backend" --output "$BASELINE_OUTPUT/$backend.pt"
+    "$BASELINE_PYTHON" "$CASE/quality_case.py" --checkpoint "$FASTH3_CHECKPOINT" --backend "$backend" --output "$BASELINE_OUTPUT/$backend.pt"
 done
 ```
 

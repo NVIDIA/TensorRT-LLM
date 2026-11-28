@@ -11,8 +11,9 @@ from torch.nn import functional as F
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
-from tensorrt_llm.visual_gen.sparse_attention import SolAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
+from ....catalog.attention import KeyPadding
 from ....catalog.attention.prims_routed_attention import PrimsRoutes
 from ....catalog.attention.trtllm_context_attention import (
     TrtllmContextWorkspace,
@@ -36,6 +37,14 @@ class H3TrtllmAttention:
     """Full self-attention on NHD activations with one host prefix length per batch."""
 
     heads_first = False
+
+    @staticmethod
+    def key_padding(recipe, sparse_config) -> KeyPadding:
+        """Dense and SOL calls trim padding to one prefix length shared by the batch; quantized
+        and skip-softmax calls take no padding."""
+        if recipe is not None or isinstance(sparse_config, SkipSoftmaxAttentionConfig):
+            return KeyPadding.NONE
+        return KeyPadding.PREFIX
 
     def __init__(
         self,

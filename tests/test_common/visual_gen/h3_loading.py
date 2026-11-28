@@ -8,13 +8,6 @@ from unittest.mock import patch
 
 import pytest
 
-H3_V2 = "TLLM_VISUALGEN_MODELING2_H3"
-
-
-@pytest.fixture(autouse=True)
-def h3_modeling_v2(monkeypatch):
-    monkeypatch.setenv(H3_V2, "1")
-
 
 def _record_worker_pipeline(directory: Path, **worker_args):
     import torch.distributed as dist

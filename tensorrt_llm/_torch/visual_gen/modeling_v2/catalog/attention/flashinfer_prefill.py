@@ -8,6 +8,7 @@ from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, t
 
 from . import _flashinfer_runtime
 from ._flashinfer_runtime import FlashInferPrefillRunner
+from ._key_padding import KeyPadding
 
 
 def _validate_inputs(
@@ -90,6 +91,14 @@ class FlashInferPrefill(OpWrapper):
             ),
         ),
     )
+
+    def key_padding(
+        self, *, qk_dtype: str | None = None, v_dtype: str | None = None, is_causal: bool = False
+    ) -> KeyPadding:
+        """Quantized and causal calls take no key padding mask."""
+        if is_causal or qk_dtype is not None or v_dtype is not None:
+            return KeyPadding.NONE
+        return KeyPadding.MASK
 
     def __call__(
         self,

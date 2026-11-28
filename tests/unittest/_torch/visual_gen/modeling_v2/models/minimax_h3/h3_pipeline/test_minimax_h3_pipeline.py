@@ -650,8 +650,12 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
             calls.append(("weights", checkpoint_dir, mapping, kwargs))
             return {"weight": torch.ones(1)}
 
+    from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.h3_pipeline import (
+        text_encoder_tp,
+    )
+
     monkeypatch.setattr(
-        h3_pipeline.MiniMaxH3TensorParallelTextEncoder,
+        text_encoder_tp.MiniMaxH3TensorParallelTextEncoder,
         "from_pretrained_config",
         from_pretrained_config,
     )
@@ -1750,7 +1754,7 @@ def _ulysses_pipeline_config(world_size: int = 8) -> SimpleNamespace:
         mapping=SimpleNamespace(world_size=1, tp_size=1),
         parallel=SimpleNamespace(parallel_vae_size=1),
         visual_gen_mapping=_ulysses_mapping(world_size),
-        attention=SimpleNamespace(backend="VANILLA"),
+        attention=SimpleNamespace(backend="VANILLA", quant_attention_config=None),
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
         cuda_graph=SimpleNamespace(enable=False),

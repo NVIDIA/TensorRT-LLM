@@ -432,7 +432,7 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
         "ops": {f"{unit}/ops/test_vsa.py"},
         "legacy": {
             "visual_gen/test_unrelated.py",
-            "examples/visual_gen/test_minimax_h3_e2e.py",
+            "examples/visual_gen/test_visual_gen_multi_gpu.py",
             "unittest/_torch/visual_gen/models/minimax_h3/test_minimax_h3_pipeline.py",
         },
         "catalog": {"unittest/_torch/visual_gen/modeling_v2/catalog/attention/test_sparse.py"},

@@ -31,23 +31,18 @@ Example structure:
             __init__.py           # Exports: __all__ = ["MyModelPipeline"]
 """
 
-from ..modeling_v2 import resolve_minimax_h3
+from ..modeling_v2.models.minimax_h3 import MiniMaxH3Pipeline
 from ..pipeline import BasePipeline
-from ..pipeline_registry import AutoPipeline, register_pipeline, register_pipeline_opt_in
+from ..pipeline_registry import AutoPipeline, register_pipeline
 from .cosmos3 import Cosmos3OmniMoTPipeline
 from .flux import Flux2Pipeline, FluxPipeline
 from .glm_image import GlmImagePipeline
 from .hunyuan_video1_5 import HunyuanVideo15Pipeline
 from .ltx2 import LTX2Pipeline  # noqa: F401
 from .ltx23 import LTX23Pipeline, LTX23RetakePipeline
-from .minimax_h3 import MiniMaxH3Pipeline
 from .qwen_image import QwenImageEditPlusPipeline, QwenImagePipeline
 from .qwen_image_layered import QwenImageLayeredPipeline
 from .wan import WanDMDPipeline, WanImageToVideoPipeline, WanPipeline
-
-register_pipeline_opt_in(
-    "MiniMaxH3ModularPipeline", "TLLM_VISUALGEN_MODELING2_H3", resolve_minimax_h3
-)
 
 __all__ = [
     "AutoPipeline",

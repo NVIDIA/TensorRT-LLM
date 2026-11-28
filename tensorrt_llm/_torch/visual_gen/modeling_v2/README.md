@@ -13,7 +13,7 @@ Keep changes for one deployment local to its pipeline so developers can merge wo
 | --- | --- |
 | `visual_gen/modeling_v2/models/<family>/<target>/` | The pipeline and the parts of loading or execution specific to that target. |
 | `visual_gen/modeling_v2/models/<family>/` | The checkpoint router and components, ops or kernels that sibling targets import from the family. |
-| `visual_gen/modeling_v2/catalog/` | **Model-agnostic operations only.** Another family can pass its own tensors to the same op unchanged. Each entry defines its inputs and results, provides a reference and tests its implementations. |
+| `visual_gen/modeling_v2/catalog/` | **Model-agnostic operations only.** Another family can pass its own tensors to the same op unchanged. Each entry defines its inputs and results, provides a reference and tests its implementations. A dense attention entry that a family selects by backend declares in `key_padding()` which padded keys it excludes under a given configuration; the family reads its padding support from there. |
 
 #### When to split or merge a target
 
@@ -39,7 +39,7 @@ Keep parallel rules with their caller. Create a component when several operation
 **The family router selects one pipeline before model construction.** Use the checkpoint and the deployment settings that distinguish its targets. Return the selected target class directly so CI can identify its tests. The pipeline constructs its components, and each component or op selects its implementation for the hardware and inputs.
 
 - **V2-only family.** Register the pipeline through the usual VisualGen entry point. Users need no version switch.
-- **Full migration with a short V1 rollout.** A temporary family switch can select V2 while V1 remains the default. Within V2, use the functional target for the same checkpoint when a deployment specialization does not match. [H3 rollout](models/minimax_h3/README.md#run-a-target)
+- **Full migration with a short V1 rollout.** A temporary family switch can select V2 while V1 remains the default. Implement the switch in the family router passed to `register_pipeline(..., router=...)`. Within V2, use the functional target for the same checkpoint when a deployment specialization does not match.
 - **Partial migration with ongoing V1 support.** A family can route deployments covered by a V2 target to V2 and keep the existing V1 pipeline for the others. Make the choice at load time and test both routes.
 
 ### Allowed dependencies
@@ -54,7 +54,7 @@ Keep parallel rules with their caller. Create a component when several operation
 - **New model families use V2.** Discuss exceptions with the model owner case by case.
 - **For an existing model, develop in the implementation its family uses.** A V1-only family can keep developing in V1, and its owner decides when to migrate. Check the [V2 families](models/) and the family’s migration plan.
 
-When V1 is retiring soon, as in MiniMax-H3, **add new features only in V2**. When V1 and V2 will both remain in active use, **support important family-wide features on every supported V1 and V2 target**. A deployment-specific optimization can stay in its own target.
+When V1 is retiring soon, **add new features only in V2**. When V1 and V2 will both remain in active use, **support important family-wide features on every supported V1 and V2 target**. A deployment-specific optimization can stay in its own target.
 
 ## Test a change
 

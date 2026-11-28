@@ -6,7 +6,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention import _flashinfer_runtime
+from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention import (
+    KeyPadding,
+    _flashinfer_runtime,
+)
 from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention import (
     flashinfer_prefill as prefill_module,
 )
@@ -62,6 +65,7 @@ def test_quantized_prefill_rejects_key_padding_mask():
     q = torch.empty(1, 5, 2, 128, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(1, 5, device="cuda", dtype=torch.bool)
     runner = FlashInferPrefillRunner(num_heads=2, head_dim=128, plan_cache={})
+    assert flashinfer_prefill.key_padding(qk_dtype="nvfp4", v_dtype="fp8") is KeyPadding.NONE
     with pytest.raises(ValueError, match="quantized attention does not support key padding masks"):
         flashinfer_prefill(
             q, q, q, runner=runner, key_padding_mask=mask, qk_dtype="nvfp4", v_dtype="fp8"
