@@ -2151,6 +2151,13 @@ def getPytestBaseCommandLine(
     // container is destroyed. Never point this at a bind-mounted / shared path:
     // the AutoTuner cache uses fcntl.lockf, which is unreliable over NFS.
     extraInternalEnv += " TLLM_AUTOTUNER_CACHE_PATH=/tmp/trtllm_autotuner_cache/autotuner_cache.json"
+    // Build each JIT kernel once per stage instead of once per rank: the processes
+    // of a launch claim and publish their DeepGEMM and CuTe DSL builds in this
+    // directory, and the autotuner splits its builds across them (see
+    // tensorrt_llm/_jit_share.py). Container-local like the AutoTuner cache above,
+    // so on a multi-node stage each node shares within itself. Perf-sanity
+    // cold-start measurements unset it themselves.
+    extraInternalEnv += " TLLM_JIT_SHARE_DIR=/tmp/trtllm_jit_share"
     // CBTS stages put cbts_plugin/sitecustomize (bare-importable guest hooks) plus the cbts
     // package itself on PYTHONPATH (via ${VAR:-} for set -u safety), plus the config env vars
     // sitecustomize.py reads in subprocesses. The context channel's address is created and
