@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,6 +36,7 @@
 #include "nvrtc.h"
 #include "runtime.cuh"
 #include "scheduler.cuh"
+#include "tensorrt_llm/common/packageLocation.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -153,66 +154,15 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
     static std::vector<std::filesystem::path> includeDirs;
     if (includeDirs.empty())
     {
-        // Command to execute
-        char const* cmd = "pip show tensorrt_llm 2>/dev/null";
-
-        // Buffer to store the output
-        std::array<char, 128> buffer;
-        std::string result;
-
-// Open pipe to command
-#ifdef _MSC_VER
-        FILE* pipe = _popen(cmd, "r");
-#else
-        FILE* pipe = popen(cmd, "r");
-#endif
-
-        if (pipe)
+        auto const location = tensorrt_llm::common::getPackageLocation();
+        if (location)
         {
-            // Read the output
-            while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
+            auto const includeDir = *location / "tensorrt_llm" / "include";
+            includeDirs.push_back(includeDir);
+
+            if (!kJitUseNvcc)
             {
-                result += buffer.data();
-            }
-
-// Close the pipe
-#ifdef _MSC_VER
-            _pclose(pipe);
-#else
-            pclose(pipe);
-#endif
-
-            // Parse the location using regex
-            // `pip show tensorrt_llm` will output something like:
-            // Location: /usr/local/lib/python3.12/dist-packages
-            // Editable project location: /code
-            std::regex locationRegex("(Location|Editable project location): (.+)");
-
-            // Find all matches
-            auto match_begin = std::sregex_iterator(result.begin(), result.end(), locationRegex);
-            auto match_end = std::sregex_iterator();
-
-            // Get the number of matches
-            auto match_count = std::distance(match_begin, match_end);
-
-            if (match_count > 0)
-            {
-                // Get the last match
-                auto last_match_iter = match_begin;
-                std::advance(last_match_iter, match_count - 1);
-
-                // Get the path from the second capture group
-                std::string location = last_match_iter->str(2);
-                location.erase(location.find_last_not_of(" \n\r\t") + 1);
-
-                // Set the include directory based on the package location
-                includeDirs.push_back(std::filesystem::path(location) / "tensorrt_llm" / "include");
-
-                if (!kJitUseNvcc)
-                {
-                    includeDirs.push_back(
-                        std::filesystem::path(location) / "tensorrt_llm" / "include" / "cuda" / "include");
-                }
+                includeDirs.push_back(includeDir / "cuda" / "include");
             }
         }
         else
