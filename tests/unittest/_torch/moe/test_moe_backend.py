@@ -5033,6 +5033,10 @@ def test_sm107_glm52_genphase_rows_apply_to_their_key_only(monkeypatch: pytest.M
     if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
         pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
     monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
+    # get_valid_tactics builds each shortlist member; construction only needs the cluster occupancy
+    # (the measured SM107 values), which otherwise needs a device.
+    occupancy = {1: 212, 2: 106, 4: 46, 8: 22}
+    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: occupancy[size])
     runner = megamoe_op.Sm100MegaMoENvfp4Runner(
         local_rank=0,
         output_dtype=torch.bfloat16,
@@ -5196,6 +5200,8 @@ def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
     monkeypatch.setattr(megamoe_op, "RubinInferenceGenphaseMegaMoE", Genphase)
     monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
     monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
+    # Offered lists resolved by an earlier query would skip the builds this test counts.
+    monkeypatch.setattr(megamoe_op, "_MEGAMOE_OFFERED_TACTICS_CACHE", {})
     query = dict(
         world_size=4,
         num_topk=6,
@@ -5207,7 +5213,7 @@ def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
         gate_up_clamp=10.0,
     )
     # A decode default the generation-phase kernel refuses runs its own tile on the generic
-    # kernel, not the non-bulk fallback.
+    # kernel, not the non-bulk fallback; the query tries each tactic once.
     warnings.clear()
     assert megamoe_op.query_megamoe_kernel_properties(**query) == (4096, False)
     assert built == [("genphase", tuple(default[3])), ("generic", ("phase_interleave", None))]

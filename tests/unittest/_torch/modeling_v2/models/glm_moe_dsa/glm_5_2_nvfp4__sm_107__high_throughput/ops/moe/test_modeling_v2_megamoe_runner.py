@@ -48,5 +48,10 @@ def test_runner_builds_its_phase_interleave_genphase_kernel(
     shared_tactic = megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[bucket])
     with pytest.raises(ValueError, match="no decode scheduler"):
         runner._build_kernel_once(shared_tactic)
+    # The dedup form of the tactic: N256 tile, bulk FC2 store pushed from the dispatch warps.
+    dedup = list(tactic)
+    dedup[0] = [tactic[0][0], 256, tactic[0][2]]
+    dedup[5:9] = ["reuse_dispatch_warps", True, tactic[7] or 1, 1]
+    dedup[11:] = [True, 1]
     with pytest.raises(ValueError, match="does not support combine_dedup"):
-        runner._build_kernel_once(megamoe_op._with_combine_dedup(tactic))
+        runner._build_kernel_once(tuple(dedup))

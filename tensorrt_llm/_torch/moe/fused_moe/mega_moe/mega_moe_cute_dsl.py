@@ -1308,6 +1308,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
                 ugpu_weight_layout=self._ugpu_weight_layout,
+                tactic_autotune=self.tactic_autotune,
             )
             if supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
@@ -1818,6 +1819,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
                 ugpu_weight_layout=self._ugpu_weight_layout,
+                tactic_autotune=self.tactic_autotune,
             )
             if supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)

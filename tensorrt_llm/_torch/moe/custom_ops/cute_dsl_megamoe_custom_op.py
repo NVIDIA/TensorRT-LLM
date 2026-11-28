@@ -19,9 +19,9 @@ standard TRT-LLM CuteDSL op pattern used by
   custom op that the ``MegaMoECuteDsl`` backend calls from
   ``run_moe``. ``tactic_autotune=True`` (bench-only, enabled via the
   ``MEGAMOE_TACTIC_AUTOTUNE=1`` env var read by the backend) runs
-  ``AutoTuner.choose_one`` per call; the default bypasses the AutoTuner
-  and uses a shape-tuned tactic when available, otherwise the deterministic
-  token-bucket heuristic tactic.
+  ``AutoTuner.choose_one`` per call over the key's default and its region
+  shortlist (BF16 combine); the default bypasses the AutoTuner and uses the
+  heuristic-v2 tactic of the runner key (``_heuristic_megamoe_tactic``).
 
 The backend never instantiates :class:`Sm100MegaMoENvfp4Runner`
 directly; this mirrors how ``CuteDslFusedMoE`` only consumes
@@ -411,8 +411,8 @@ _DEFAULT_TACTIC_PREFILL_ATOMIC: Tuple = (
 
 
 def default_megamoe_tactic(num_tokens: int) -> Tuple:
-    """Deterministic token-bucket fallback when no shape-tuned default
-    exists; never profiled by the autotuner."""
+    """Deterministic token-bucket fallback for keys without a heuristic-v2
+    tactic; never profiled by the autotuner."""
     if num_tokens <= 1024:
         # Deterministic fallback for the smallest token bucket.
         return (
@@ -464,201 +464,93 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
     )
 
 
-# Static defaults for the explicitly keyed SM107 configurations. Routing is not
-# rank-identical, so each bucket uses one deterministic tactic. The complete
-# runner key prevents applying an entry to a different shape or codegen mode.
-def _sm107_dsv4_pro_problem_key(
-    world_size: int, num_experts_per_rank: int, max_tokens_per_rank: int
-) -> Tuple:
-    return (
-        107,
-        world_size,
-        6,
-        num_experts_per_rank,
-        7168,
-        3072,
-        6144,
-        max_tokens_per_rank,
-        str(torch.bfloat16),
-        True,
-        10.0,
-        None,
-        None,
-        False,
-        "bf16",
-        None,
-        None,
-        0,
-    )
-
-
-_SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
-    _sm107_dsv4_pro_problem_key(world_size, num_experts_per_rank, max_tokens_per_rank): (
-        list(mma_tiler),
-        [4, 1, 1],
-        [2, 1, 1],
-        ("phase_interleave", phase_hint),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        2,
-        flag_batch,
-        (1, 4),
-    )
-    for (world_size, num_experts_per_rank), bucket_tactics in {
-        (4, 96): {
-            256: ((256, 128, 256), 4, 1),
-            1024: ((256, 128, 256), 3, 1),
-            2048: ((256, 256, 256), 3, 1),
-            4096: ((256, 256, 256), 4, 1),
-            8192: ((256, 256, 256), 3, 1),
-            16384: ((256, 256, 256), 3, 1),
-            32768: ((256, 256, 256), 3, 1),
-        },
-        (8, 48): {
-            256: ((256, 128, 256), 4, 1),
-            1024: ((256, 128, 256), 3, 1),
-            4096: ((256, 256, 256), 3, 1),
-            16384: ((256, 128, 256), 4, 1),
-        },
-    }.items()
-    for max_tokens_per_rank, (
-        mma_tiler,
-        phase_hint,
-        flag_batch,
-    ) in bucket_tactics.items()
-}
-
-# DSv4-Pro (world_size, num_experts_per_rank) -> inclusive max_tokens_per_rank range whose
-# default turns combine_dedup on. Only buckets measured faster are listed: dedup trims the
-# combine traffic by the duplicate-destination rate, which falls as the world size grows.
-# EP16 stays off: its best bucket gained ~4.5% but the dedup combine region holds 16 rows
-# per token instead of top-k's 6, about 1.2 GB more shared workspace per rank.
-_SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS: dict[Tuple[int, int], Tuple[int, int]] = {
-    (4, 96): (8192, 32768),
-    (8, 48): (4096, 16384),
-}
-
-
-def _sm107_default_combine_dedup(problem_key: Tuple) -> bool:
-    tokens = _SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS.get((problem_key[1], problem_key[3]))
-    return (
-        tokens is not None
-        and tokens[0] <= problem_key[7] <= tokens[1]
-        and _sm107_tactic_bucket(problem_key[7]) is None
-        and problem_key
-        == _sm107_dsv4_pro_problem_key(problem_key[1], problem_key[3], problem_key[7])
-    )
-
-
-def _with_combine_dedup(tactic: Tuple) -> Tuple:
-    """Return ``tactic`` with combine dedup and the token-back settings it needs.
-
-    Dedup pushes the reduced rows from the dispatch warps, which need the N256
-    tile, a bulk FC2 store and one epilogue warpgroup; the remaining fields keep
-    the shape default.
-    """
-    tactic = list(_unpack_tactic(tactic))
-    tactic[0] = [tactic[0][0], 256, tactic[0][2]]
-    tactic[5] = "reuse_dispatch_warps"
-    tactic[6] = True
-    if tactic[7] is None:
-        tactic[7] = 1
-    tactic[8] = 1
-    tactic[11] = True
-    # The dedup push runs from the dispatch warps, which two epilogue warpgroups cannot share.
-    tactic[12] = 1
-    return tuple(tactic)
-
-
-# Static defaults for the SM107 DeepSeek-V4.1-Flash DEP4/8/16 shapes.
-# Full runner keys keep selection rank-identical and limit it to the listed
-# launch capacities and activation modes, independently of routing or live rows.
-# A None phase hint selects the minimum safe FC1 prologue.
-_SM107_DSV41_FLASH_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
-    (
-        107,
-        world_size,
-        6,
-        384 // world_size,
-        5120,
-        2304,
-        4608,
-        max_tokens_per_rank,
-        str(torch.bfloat16),
-        True,
-        gate_up_clamp,
-        None,
-        None,
-        False,
-        "bf16",
-        swiglu_alpha,
-        swiglu_beta,
-        0,
-    ): (
-        list(mma_tiler),
-        [cluster_m, 1, 1],
-        [fallback_cluster_m, 1, 1] if fallback_cluster_m is not None else None,
-        schedule_policy,
-        "atomic_counter" if schedule_policy[0] == "phase_interleave" else "grid_stride",
-        "epi_warps",
-        True,
-        1,
-        flag_batch,
-        epi_flag_batch,
-    )
-    for world_size, bucket_tactics in {
-        4: {
-            2048: ((256, 256, 256), 4, None, ("phase_interleave", None), 1, (1, 4)),
-            4096: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 4)),
-            8192: ((256, 256, 256), 4, 2, ("phase_interleave", 3), 1, (1, 4)),
-            16384: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 1)),
-            32768: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 1)),
-        },
-        8: {
-            2048: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 4)),
-            4096: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 2)),
-            8192: ((256, 256, 256), 4, 2, ("phase_interleave", 3), 1, (1, 4)),
-            16384: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 4)),
-            32768: ((256, 128, 512), 4, None, ("phase_interleave", None), 4, (1, 4)),
-        },
-        16: {
-            2048: ((256, 128, 512), 4, None, ("phase_interleave", 3), 1, (1, 1)),
-            4096: ((256, 128, 512), 4, None, ("phase_interleave", 4), 1, (1, 4)),
-            8192: ((256, 256, 256), 4, 2, ("phase_interleave", 3), 1, (1, 2)),
-            16384: ((256, 128, 512), 4, None, ("phase_interleave", 3), 4, (1, 1)),
-            32768: ((256, 256, 256), 2, None, ("grouped", 512), 1, (1, 1)),
-        },
-    }.items()
-    for max_tokens_per_rank, (
-        mma_tiler,
-        cluster_m,
-        fallback_cluster_m,
-        schedule_policy,
-        flag_batch,
-        epi_flag_batch,
-    ) in bucket_tactics.items()
-    for gate_up_clamp, swiglu_alpha, swiglu_beta in (
-        (None, None, None),
-        (10.0, None, None),
-        (10.0, 1.0, 0.0),
-    )
-}
-
-
-# Static defaults for the SM103 DeepSeek-V4.1-Flash shapes at DEP2/4/8/16, also with one extra slot
-# per rank (warmup placement with hot-expert copies): above
-# _SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT, the phase-interleaved cluster-4 schedule with one FC2
-# TMA stage; the key omits max_tokens_per_rank (index 7 of the runner key) and covers every bucket.
-_SM103_DSV41_FLASH_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
+# Default tactics for the BF16 combine, keyed on rank-invariant features of the runner key (heuristic
+# v2). Each region's entries are the tactics with the best worst-case regret over the measured runner
+# keys of the region, nine MoE shapes at EP4/8/16 on SM107, SM100 and SM103. Regret is against the best
+# measured tactic, averaged over balanced, power-law, partial-fill, attention-DP-uneven and
+# destination-hotspot routing. Rows per rank is max_tokens_per_rank x top-k, so a key's tactic never
+# depends on live tokens or routing, and every EP rank selects the same one.
+# SM107 prefill (generic kernel). Top-k applied before the FC1 quantization: combine dedup with the
+# standalone token-back warps.
+_SM107_PREFILL_COMBINE_DEDUP_TACTIC: Tuple = (
+    [256, 256, 256],
+    [4, 1, 1],
+    [2, 1, 1],
+    ("phase_interleave", None),
+    "atomic_counter",
+    "standalone_warps",
+    True,
+    1,
+    1,
+    (1, 1),
+    _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+    True,
+    1,
+)
+# Dedup holds world_size combine rows per token instead of top-k, so the shared workspace grows with the
+# world size. Up to this world size every top-k-at-FC1 prefill key may take it; past it only the
+# allowlisted shapes of _SM107_COMBINE_DEDUP_WIDE_EP_SHAPES do.
+_MEGAMOE_COMBINE_DEDUP_MAX_WORLD_SIZE = 8
+_SM107_PREFILL_TACTIC: Tuple = (
+    [256, 256, 256],
+    [4, 1, 1],
+    [2, 1, 1],
+    ("phase_interleave", 3),
+    "atomic_counter",
+    "epi_warps",
+    True,
+    2,
+    1,
+    (1, 1),
+    _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+    False,
+    1,
+)
+# Above this many rows per rank the epilogue drains with two warpgroups.
+_SM107_PREFILL_TWO_WARPGROUP_MIN_ROWS_PER_RANK = 49152
+_SM107_PREFILL_TWO_WARPGROUP_TACTIC: Tuple = (
+    [256, 256, 256],
+    [4, 1, 1],
+    [2, 1, 1],
+    ("phase_interleave", 4),
+    "atomic_counter",
+    "epi_warps",
+    True,
+    2,
+    1,
+    (1, 4),
+    _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+    False,
+    2,
+)
+# SM100 and SM103: one tactic at every bucket.
+_BLACKWELL_TACTIC: Tuple = (
+    [256, 256, 256],
+    [4, 1, 1],
+    [2, 1, 1],
+    ("phase_interleave", None),
+    "atomic_counter",
+    "epi_warps",
+    True,
+    1,
+    1,
+    (1, 1),
+    _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+    False,
+    1,
+)
+# Exact runner keys whose measured tactic beats the rule by more than 1%: SM103 DSv4.1-Flash DEP4 at
+# 256 tokens per rank (16 rows per expert) keeps the grouped schedule.
+_MEGAMOE_EXACT_KEY_TACTICS: dict[Tuple, Tuple] = {
     (
         103,
-        world_size,
+        4,
         6,
-        384 // world_size + extra_slots,
+        96,
         5120,
         2304,
         4608,
+        256,
         str(torch.bfloat16),
         True,
         10.0,
@@ -670,26 +562,6 @@ _SM103_DSV41_FLASH_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
         None,
         0,
     ): (
-        [256, 128, 256],
-        [4, 1, 1],
-        [2, 1, 1],
-        ("phase_interleave", 3),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (1, 4),
-    )
-    for world_size in (2, 4, 8, 16)
-    for extra_slots in (0, 1)
-}
-# Mean routed rows per local expert at the rung (max_tokens_per_rank x top-k / experts per rank) up to
-# which the grouped schedule of _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS beats phase interleave.
-_SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT = 32
-
-_SM103_DSV41_FLASH_SMALL_RUNG_TACTICS: dict[Tuple, Tuple] = {
-    key: (
         [256, 128, 256],
         [4, 1, 1],
         [2, 1, 1],
@@ -700,9 +572,156 @@ _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS: dict[Tuple, Tuple] = {
         2,
         1,
         (1, 4),
-    )
-    for key in _SM103_DSV41_FLASH_DEFAULT_TACTICS
+    ),
 }
+# Autotune shortlists per region, offered with the key's default: at most one more compile per member
+# and within 2% of the best measured tactic on every measured key of the region.
+_SM107_PREFILL_SHORTLIST: Tuple[Tuple, ...] = (
+    (
+        [256, 256, 256],
+        [4, 1, 1],
+        None,
+        ("phase_interleave", None),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (1, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        False,
+        1,
+    ),
+    (
+        [256, 256, 256],
+        [2, 1, 1],
+        None,
+        ("grouped", 512),
+        "grid_stride",
+        "standalone_warps",
+        False,
+        None,
+        1,
+        (2, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        False,
+        1,
+    ),
+)
+# Up to this many rows per rank the best decode tactic beat every phase / grouped tactic on every measured
+# gen-phase key, so the shortlist offers decode tactics only (_SM107_GENPHASE_DECODE_SHORTLIST).
+_SM107_GENPHASE_DECODE_ONLY_MAX_ROWS_PER_RANK = 6144
+_SM107_GENPHASE_SHORTLIST: Tuple[Tuple, ...] = (
+    (
+        [256, 128, 256],
+        [4, 1, 1],
+        None,
+        ("decode", 14),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (2, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        False,
+        1,
+    ),
+    (
+        [256, 256, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 4),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (2, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        False,
+        1,
+    ),
+)
+# get_valid_tactics drops a member the op refuses for the key: the two dedup members until SM100 / SM103
+# have combine dedup, and a phase hint of 3 where the shape needs at least 4 (e.g. 896 experts, top-16).
+_BLACKWELL_SHORTLIST: Tuple[Tuple, ...] = (
+    (
+        [256, 256, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (2, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        False,
+        1,
+    ),
+    (
+        [256, 128, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 4),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        2,
+        1,
+        (1, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        False,
+        1,
+    ),
+    (
+        [256, 256, 128],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (1, 1),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        False,
+        1,
+    ),
+    (
+        [256, 256, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "standalone_warps",
+        True,
+        1,
+        2,
+        (1, 1),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        True,
+        1,
+    ),
+    (
+        [256, 256, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "standalone_warps",
+        True,
+        1,
+        1,
+        (2, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        True,
+        1,
+    ),
+)
 
 # The evict-first L2 hint on the expert-weight TMA loads pays while each weight tile is streamed
 # about once: through a mean of 96 received rows per expert (DEP32 at 192 tokens per rank), within
@@ -715,7 +734,7 @@ _WEIGHT_EVICT_FIRST_MAX_ROWS_PER_RANK = 3072  # 3K received rows
 def _megamoe_weight_evict_first(
     sm_version: int, max_tokens_per_rank: int, num_topk: int, num_experts_per_rank: int
 ) -> bool:
-    """Whether the expert-weight TMA loads of this rung take the evict-first L2 hint."""
+    """Whether the expert-weight TMA loads of this bucket take the evict-first L2 hint."""
     received_rows = max_tokens_per_rank * num_topk
     return (
         sm_version == 103
@@ -807,94 +826,24 @@ _MEGAMOE_NVFP4_COMBINE_BULK_TACTIC: Tuple = (
 
 # Generation-phase kernel tactics per max_tokens_per_rank bucket. The kernel runs the decode
 # scheduler only: ("decode", L) claims FC1 tiles up to L token blocks ahead of FC2 (None: every FC1
-# tile of a stream before its FC2 tiles; 65535 keeps that order on one shared counter). Each entry
-# is the decode tactic with the best worst case over DSv4-Pro and Kimi K3 at EP4 on VR200, under
-# balanced and power-law routing.
+# tile of a stream before its FC2 tiles; 65535 keeps that order on one shared counter). The keys are
+# the SM107 gen-phase ladder; the entries are the heuristic-v2 gen rule (see _SM107_PREFILL_TACTIC):
+# the N128 tile with an FC1 lead of 22 blocks up to 512 tokens per rank, the N256 tile with a lead of
+# 14 and two FC2 stages at 1024. A row of _SM107_GENPHASE_SHAPE_TACTICS replaces them for its key.
+_SM107_GENPHASE_SMALL_TACTIC: Tuple = (
+    [256, 128, 256],
+    [4, 1, 1],
+    None,
+    ("decode", 22),
+    "atomic_counter",
+    "epi_warps",
+    True,
+    1,
+    1,
+    (1, 1),
+)
 _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
-    32: (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("decode", None),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (2, 4),
-    ),
-    64: (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("decode", 22),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (2, 2),
-    ),
-    128: (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("decode", 27),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (1, 1),
-    ),
-    192: (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("decode", 65535),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (4, 4),
-    ),
-    256: (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("decode", 65535),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (4, 4),
-    ),
-    384: (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("decode", 91),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (2, 4),
-    ),
-    512: (
-        [256, 128, 256],
-        [4, 1, 1],
-        None,
-        ("decode", 91),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (2, 4),
-    ),
+    **{bucket: _SM107_GENPHASE_SMALL_TACTIC for bucket in (32, 64, 128, 192, 256, 384, 512)},
     1024: (
         [256, 256, 256],
         [4, 1, 1],
@@ -929,7 +878,9 @@ def _sm107_tactic_bucket(max_tokens_per_rank: int) -> Optional[int]:
 # tactic measured fastest for its key and bucket on VR200: GLM 5.2 (top-8, hidden 6144,
 # intermediate 2048, top-k weights at FC1) at EP4 and EP16, and DeepSeek-V4.1-Flash and Kimi K3.1
 # at EP16.
-def _sm107_glm52_problem_key(world_size: int, num_experts_per_rank: int, bucket: int) -> Tuple:
+def _sm107_glm52_problem_key(
+    world_size: int, num_experts_per_rank: int, bucket: Optional[int]
+) -> Tuple:
     return (
         107,
         world_size,
@@ -1024,6 +975,96 @@ _SM107_GENPHASE_SHAPE_TACTICS: dict[Tuple, Tuple] = {
     _sm107_kimi_k3_problem_key(16, 384): _SM107_N256_LEAD14,
     _sm107_kimi_k3_problem_key(16, 512): _SM107_N256_LEAD14,
 }
+# The gen-phase shortlist up to _SM107_GENPHASE_DECODE_ONLY_MAX_ROWS_PER_RANK rows per rank: its decode
+# member and the N256 lead-14 tile (the 1024 bucket's tactic). On VR200, for a 288-expert top-8 shape at
+# EP4 and 384 tokens per rank, the N256 tile was 19% faster than the N128 default on the receive hotspot
+# and 3-4% slower on balanced routing; the default's mean per-workload ratio over balanced full,
+# balanced partial and receive-hotspot routing was 6% worse.
+_SM107_GENPHASE_DECODE_SHORTLIST: Tuple[Tuple, ...] = tuple(
+    t for t in _SM107_GENPHASE_SHORTLIST if t[3][0] == "decode"
+) + (_SM107_N256_LEAD14,)
+
+
+def _sm107_prefill_shape_key(problem_key: Tuple) -> Tuple:
+    """``problem_key`` with max_tokens_per_rank set to None, the key of the prefill shape tables."""
+    return problem_key[:7] + (None,) + problem_key[8:]
+
+
+def _tokens_per_rank_in(spans: Tuple[Tuple[int, int], ...], tokens_per_rank: int) -> bool:
+    """Whether ``tokens_per_rank`` lies in one of the inclusive ``(low, high)`` spans."""
+    return any(low <= tokens_per_rank <= high for low, high in spans)
+
+
+# Prefill exceptions of single shapes: shape key (the runner key with max_tokens_per_rank set to None)
+# -> (tactic, the inclusive tokens-per-rank spans it was measured at). Outside its spans the shape takes
+# the rule. Provenance: VR200, mean over six routing workloads (balanced, power-law, partial fill,
+# attention-DP uneven, destination hotspot).
+_SM107_PREFILL_SHAPE_TACTICS: dict[Tuple, Tuple[Tuple, Tuple[Tuple[int, int], ...]]] = {
+    # GLM 5.2 at EP16 (16 experts per rank, top-k weights at FC1): the grouped schedule with
+    # standalone token-back warps beat the rule tactic on the six-workload mean by 3% / 2% / 6-7% / 8%
+    # at 4096 / 8192 / 16384 / 32768 tokens per rank (two runs at 16384); at 2048 the rule was 1% faster.
+    _sm107_glm52_problem_key(16, 16, None): (
+        (
+            [256, 256, 256],
+            [2, 1, 1],
+            None,
+            ("grouped", 512),
+            "grid_stride",
+            "standalone_warps",
+            False,
+            None,
+            1,
+            (2, 4),
+            _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+            False,
+            1,
+        ),
+        ((4096, 32768),),
+    ),
+}
+# Shapes past _MEGAMOE_COMBINE_DEDUP_MAX_WORLD_SIZE allowed combine dedup -> the inclusive
+# tokens-per-rank spans. Provenance as above: DSv4.1-Flash at EP16 (24 experts per rank, top-6,
+# hidden 5120, intermediate 2304, top-k weights at FC1, with and without explicit SwiGLU
+# alpha / beta), dedup 24% / 15% / 15-20% faster than the rule at 4096 / 8192 / 16384 (six-workload
+# mean; two runs at 16384). At 32768 dedup stays off, in the default and the shortlist, on purpose:
+# it is 23-26% slower on balanced full batches and takes 3.1 GiB more shared workspace per rank, and
+# it saves total time only once hotspot steps, which send part of every rank's routes to one rank,
+# make up roughly 10-30% of the mix: about 10-15% when three quarters of the routes go there (three
+# runs), about 30% when a quarter do (one run). DSv4-Pro at EP16 is not listed: dedup there is 2-5%
+# slower on every workload but the receiver hotspot and takes 0.55 / 2.19 GiB more workspace per
+# rank at 4096 / 16384.
+_SM107_COMBINE_DEDUP_WIDE_EP_SHAPES: dict[Tuple, Tuple[Tuple[int, int], ...]] = {
+    _sm107_prefill_shape_key(_sm107_dsv41_flash_problem_key(16, 0, swiglu)): ((4096, 16384),)
+    for swiglu in (None, (1.0, 0.0))
+}
+
+
+def _sm107_prefill_shape_tactic(problem_key: Tuple) -> Optional[Tuple]:
+    """Prefill exception row of ``problem_key``'s shape at its tokens per rank, or None."""
+    row = _SM107_PREFILL_SHAPE_TACTICS.get(_sm107_prefill_shape_key(problem_key))
+    if row is None or not _tokens_per_rank_in(row[1], problem_key[7]):
+        return None
+    return row[0]
+
+
+def _sm107_combine_dedup_allowed(problem_key: Tuple) -> bool:
+    """Whether an SM107 prefill key may run combine dedup: its default, its shortlist and the workspace
+    sizing all follow this one predicate. Top-k weights at FC1, BF16 combine, no in-kernel FC2 reduce,
+    no helper experts, up to EP8 or an allowlisted wider shape inside its spans, and no shape row."""
+    if (
+        problem_key[0] != 107
+        or not problem_key[9]
+        or problem_key[13]
+        or problem_key[14] != "bf16"
+        or problem_key[17] != 0
+        or _sm107_tactic_bucket(problem_key[7]) is not None
+        or _sm107_prefill_shape_tactic(problem_key) is not None
+    ):
+        return False
+    if problem_key[1] <= _MEGAMOE_COMBINE_DEDUP_MAX_WORLD_SIZE:
+        return True
+    spans = _SM107_COMBINE_DEDUP_WIDE_EP_SHAPES.get(_sm107_prefill_shape_key(problem_key))
+    return spans is not None and _tokens_per_rank_in(spans, problem_key[7])
 
 
 def _sm107_genphase_shape_tactic(problem_key: Tuple) -> Optional[Tuple]:
@@ -1087,20 +1128,49 @@ def _megamoe_problem_key(
     )
 
 
-def _shape_tuned_megamoe_tactic(problem_key: Tuple) -> Optional[Tuple]:
-    """Static default tactic of a measured runner key, or None."""
-    tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key)
+def _heuristic_megamoe_tactic(problem_key: Tuple, *, combine_dedup: bool = True) -> Optional[Tuple]:
+    """Heuristic-v2 default tactic of a BF16-combine runner key outside the SM107 gen-phase ladder.
+
+    Selects on the runner key alone: SM, world size, top-k, top-k before the FC1 quantization, helper
+    experts and rows per rank (max_tokens_per_rank x top-k). ``combine_dedup=False`` returns the tactic
+    the key gets without combine dedup. None for SMs without a rule.
+    """
+    # Precedence: exact runner key, then a shape row inside its spans, then the region rule.
+    tactic = _MEGAMOE_EXACT_KEY_TACTICS.get(problem_key)
     if tactic is None:
-        tactic = _SM107_DSV41_FLASH_DEFAULT_TACTICS.get(problem_key)
-    if tactic is None:
-        rows_per_expert = problem_key[7] * problem_key[2] / problem_key[3]
-        table = (
-            _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS
-            if rows_per_expert <= _SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT
-            else _SM103_DSV41_FLASH_DEFAULT_TACTICS
-        )
-        tactic = table.get(problem_key[:7] + problem_key[8:])
-    return tactic
+        tactic = _sm107_prefill_shape_tactic(problem_key)
+    if tactic is not None:
+        return tactic
+    sm_version, num_topk = problem_key[0], problem_key[2]
+    if sm_version in (100, 103):
+        return _BLACKWELL_TACTIC
+    if sm_version != 107:
+        return None
+    if combine_dedup and _sm107_combine_dedup_allowed(problem_key):
+        return _SM107_PREFILL_COMBINE_DEDUP_TACTIC
+    if problem_key[7] * num_topk > _SM107_PREFILL_TWO_WARPGROUP_MIN_ROWS_PER_RANK:
+        return _SM107_PREFILL_TWO_WARPGROUP_TACTIC
+    return _SM107_PREFILL_TACTIC
+
+
+def _megamoe_shortlist_for_key(problem_key: Tuple) -> Tuple[Tuple, ...]:
+    """Heuristic-v2 autotune shortlist of a BF16-combine runner key, excluding its default."""
+    sm_version = problem_key[0]
+    if sm_version in (100, 103):
+        return _BLACKWELL_SHORTLIST
+    if sm_version != 107:
+        return ()
+    if _sm107_tactic_bucket(problem_key[7]) is not None:
+        if problem_key[7] * problem_key[2] <= _SM107_GENPHASE_DECODE_ONLY_MAX_ROWS_PER_RANK:
+            return _SM107_GENPHASE_DECODE_SHORTLIST
+        return _SM107_GENPHASE_SHORTLIST
+    if problem_key[1] > _MEGAMOE_COMBINE_DEDUP_MAX_WORLD_SIZE and _sm107_combine_dedup_allowed(
+        problem_key
+    ):
+        # Past EP8 offer dedup to the tuner only where the default may take it, so an autotuned key
+        # never sizes the larger dedup workspace that its default does not.
+        return _SM107_PREFILL_SHORTLIST + (_SM107_PREFILL_COMBINE_DEDUP_TACTIC,)
+    return _SM107_PREFILL_SHORTLIST
 
 
 def _default_megamoe_tactic_for_problem(
@@ -1111,7 +1181,7 @@ def _default_megamoe_tactic_for_problem(
     apply_topk_in_fc1: bool,
     in_kernel_fc2_reduce: bool,
     combine_format: str,
-    shape_tuned_tactic: Optional[Tuple] = None,
+    keyed_tactic: Optional[Tuple] = None,
     genphase_shape_tactic: Optional[Tuple] = None,
 ) -> Tuple:
     if combine_format != "bf16":
@@ -1135,28 +1205,25 @@ def _default_megamoe_tactic_for_problem(
         return _unpack_tactic(_SM107_GENPHASE_TACTICS[bucket])
     if in_kernel_fc2_reduce:
         return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
-    if shape_tuned_tactic is not None:
-        return _unpack_tactic(shape_tuned_tactic)
+    if keyed_tactic is not None:
+        return _unpack_tactic(keyed_tactic)
     return default_megamoe_tactic(num_tokens)
 
 
 def _default_megamoe_tactic_for_key(
     problem_key: Tuple, *, num_tokens: int, combine_dedup: bool = True
 ) -> Tuple:
-    """Default tactic for ``problem_key``; ``combine_dedup=False`` returns it without the dedup rule."""
-    tactic = _default_megamoe_tactic_for_problem(
+    """Default tactic for ``problem_key``; ``combine_dedup=False`` returns the one without combine dedup."""
+    return _default_megamoe_tactic_for_problem(
         sm_version=problem_key[0],
         max_tokens_per_rank=problem_key[7],
         num_tokens=num_tokens,
         apply_topk_in_fc1=problem_key[9],
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
-        shape_tuned_tactic=_shape_tuned_megamoe_tactic(problem_key),
+        keyed_tactic=_heuristic_megamoe_tactic(problem_key, combine_dedup=combine_dedup),
         genphase_shape_tactic=_sm107_genphase_shape_tactic(problem_key),
     )
-    if combine_dedup and _sm107_default_combine_dedup(problem_key):
-        return _with_combine_dedup(tactic)
-    return tactic
 
 
 def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
@@ -1175,10 +1242,18 @@ def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
     if tactic[12] != 1:
         # Keep the shape's bulk FC2 path before the non-bulk fallback.
         candidates.append((*tactic[:12], 1))
+    if tactic[11]:
+        # A dedup default the kernel refuses keeps its tile and schedule without dedup.
+        candidates.append((*tactic[:11], False, tactic[12]))
     nonbulk_tactic = _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
     if nonbulk_tactic not in candidates:
         candidates.append(nonbulk_tactic)
     return tuple(candidates)
+
+
+# What a kernel build raises for a tactic it refuses for the key; default resolution and the offered
+# tactic list both skip exactly these.
+_MEGAMOE_REFUSED_TACTIC_ERRORS = (ValueError, NotImplementedError)
 
 
 def _resolve_megamoe_kernel_tactic(
@@ -1190,7 +1265,7 @@ def _resolve_megamoe_kernel_tactic(
     for candidate in candidates:
         try:
             kernel = build(candidate)
-        except ValueError as exc:
+        except _MEGAMOE_REFUSED_TACTIC_ERRORS as exc:
             if first_error is None:
                 first_error = exc
             logger.debug(f"[MegaMoE] rejected tactic {candidate!r}: {type(exc).__name__}: {exc}")
@@ -1206,6 +1281,46 @@ def _resolve_megamoe_kernel_tactic(
     if first_error is None:
         raise RuntimeError("MegaMoE default tactic resolution had no candidates")
     raise first_error
+
+
+# (runner key, uGPU weight layout, tuning) -> the query's offered tactics; deterministic per key.
+_MEGAMOE_OFFERED_TACTICS_CACHE: dict = {}
+
+
+def _megamoe_offered_tactics(
+    problem_key: Tuple, *, build: Any, allow_fallback: bool = True, shortlist: bool = True
+) -> Tuple[Tuple, ...]:
+    """The tactics a runner key offers, in order: its default as resolved (a refused default falls
+    back like the launch does), then, for the BF16 combine without the in-kernel FC2 reduce, each
+    region-shortlist member this op builds for the key. ``get_valid_tactics`` tunes exactly this list,
+    and ``query_megamoe_kernel_properties`` sizes the shared workspace over it (over its default only,
+    ``shortlist=False``, when the runner does not tune)."""
+    default = _default_megamoe_tactic_for_key(problem_key, num_tokens=problem_key[7])
+    _, resolved = _resolve_megamoe_kernel_tactic(
+        default, allow_fallback=allow_fallback, build=build
+    )
+    offered = [_unpack_tactic(resolved)]
+    if shortlist and problem_key[14] == "bf16" and not problem_key[13]:
+        for tactic in _megamoe_shortlist_for_key(problem_key):
+            tactic = _unpack_tactic(tactic)
+            if tactic in offered:
+                continue
+            try:
+                build(tactic)
+            except _MEGAMOE_REFUSED_TACTIC_ERRORS as exc:
+                logger.debug(f"[MegaMoE] dropping shortlist tactic {tactic!r}: {exc}")
+                continue
+            offered.append(tactic)
+    choices = _token_back_ready_granularity_choices(load_balance=problem_key[17] > 0)
+    return tuple(t for t in offered if t[10] in choices)
+
+
+def _megamoe_launch_variant_keys(problem_key: Tuple) -> Tuple[Tuple, ...]:
+    """Runner keys one workspace serves: the helper-free key and, where helper experts change the
+    tactics (combine dedup needs a helper-free launch), the key of a load-balanced launch."""
+    if problem_key[17] == 0 and _sm107_combine_dedup_allowed(problem_key):
+        return (problem_key, problem_key[:17] + (1,))
+    return (problem_key,)
 
 
 # group_hint saturates ~512; omission (-> ~74) is worst.
@@ -2702,8 +2817,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
         ugpu_weight_layout: str = "none",
+        tactic_autotune: bool = False,
     ) -> Tuple[int, bool]:
-        """Probe workspace size and direct-input support of the default kernel."""
+        """Probe workspace size and direct-input support of the default kernel.
+
+        With ``tactic_autotune`` the shared workspace also fits every member of the key's autotune
+        shortlist that this op accepts (see ``get_valid_tactics``).
+        """
 
         sm_version = get_sm_version()
         if ugpu_weight_layout != "none" and _megamoe_ugpu_is_genphase(max_tokens_per_rank):
@@ -2827,26 +2947,49 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 ugpu_weight_layout=ugpu_weight_layout,
             )
 
-        probe, resolved = _resolve_megamoe_kernel_tactic(
-            tactic,
-            allow_fallback=use_default_tactic and ugpu_weight_layout == "none",
-            build=build,
-        )
+        # One construction per tactic and query, a refusal included.
+        built = {}
+
+        def build_once(candidate: Tuple):
+            name = repr(_unpack_tactic(candidate))
+            if name not in built:
+                try:
+                    built[name] = build(candidate)
+                except _MEGAMOE_REFUSED_TACTIC_ERRORS as exc:
+                    built[name] = exc
+            if isinstance(built[name], Exception):
+                raise built[name]
+            return built[name]
+
+        offered_lists = []
+        if problem_key is None:
+            probe, _ = _resolve_megamoe_kernel_tactic(
+                tactic, allow_fallback=False, build=build_once
+            )
+        else:
+            # The workspace serves every tactic a launch of this key may run: the offered list's
+            # default, or the whole list when tuning, of each launch variant (helper experts are
+            # only known per launch). The key's own list, the first, starts with its default as
+            # resolved, so a refused default is resolved once and the probe is what launches.
+            for key in _megamoe_launch_variant_keys(problem_key):
+                cache_key = (key, ugpu_weight_layout, bool(tactic_autotune))
+                offered = _MEGAMOE_OFFERED_TACTICS_CACHE.get(cache_key)
+                if offered is None:
+                    offered = _MEGAMOE_OFFERED_TACTICS_CACHE[cache_key] = _megamoe_offered_tactics(
+                        key,
+                        build=build_once,
+                        allow_fallback=ugpu_weight_layout == "none",
+                        shortlist=bool(tactic_autotune),
+                    )
+                offered_lists.append(offered)
+            probe = build_once(offered_lists[0][0])
         # The probe MUST build the SAME kernel that runs (same combine_format):
         # otherwise the provider carves an undersized shared region and the
         # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
         _, shared_bytes = probe.get_workspace_sizes()
-        if problem_key is not None and _unpack_tactic(resolved)[11]:
-            # A dedup default's combine region holds world_size rows per token, the
-            # non-dedup one top-k rows; autotuned tactics never dedup, so fit both.
-            plain, _ = _resolve_megamoe_kernel_tactic(
-                _default_megamoe_tactic_for_key(
-                    problem_key, num_tokens=max_tokens_per_rank, combine_dedup=False
-                ),
-                allow_fallback=True,
-                build=build,
-            )
-            shared_bytes = max(shared_bytes, plain.get_workspace_sizes()[1])
+        for offered in offered_lists:
+            for candidate in offered:
+                shared_bytes = max(shared_bytes, build_once(candidate).get_workspace_sizes()[1])
         return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
@@ -3041,6 +3184,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ) -> List[Tuple]:
             del profile, kwargs
             num_tokens = int(inputs[0].shape[0])
+            problem_key = self._tactic_lookup_key()
+            if self.combine_format == "bf16" and not self.in_kernel_fc2_reduce:
+                # Heuristic v2: the key's offered list (resolved default, then the region shortlist
+                # members this op builds for the key), resolved once per runner configuration;
+                # query_megamoe_kernel_properties(tactic_autotune=True) sizes the provider over it.
+                cache_key = ("offered", self.unique_id(), problem_key)
+                offered = self.__class__._kernel_descriptor_cache.get(cache_key)
+                if offered is None:
+                    offered = _megamoe_offered_tactics(
+                        problem_key,
+                        build=self._build_kernel_once,
+                        allow_fallback=self.ugpu_weight_layout == "none",
+                    )
+                    self.__class__._kernel_descriptor_cache[cache_key] = offered
+                return list(offered)
+            default_tactic = _default_megamoe_tactic_for_key(problem_key, num_tokens=num_tokens)
+            # The quantized combines and the in-kernel FC2 reduce keep the curated enumeration.
             candidates = enumerate_megamoe_candidate_tactics(
                 num_tokens,
                 sm_version=self.sm_version,
@@ -3057,32 +3217,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     for t in candidates
                     if not (_unpack_tactic(t)[6] and _unpack_tactic(t)[5] == "epi_warps")
                 ]
-            default_tactic = _default_megamoe_tactic_for_problem(
-                sm_version=self.sm_version,
-                max_tokens_per_rank=self.max_tokens_per_rank,
-                num_tokens=num_tokens,
-                apply_topk_in_fc1=self.apply_topk_in_fc1,
-                in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
-                combine_format=self.combine_format,
-            )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
-            for default_tactic in (
-                _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
-                _sm107_genphase_shape_tactic(self._tactic_lookup_key()),
-            ):
-                if default_tactic is not None:
-                    default_tactic = _unpack_tactic(default_tactic)
-                    if default_tactic not in candidates:
-                        candidates.append(default_tactic)
-            # The provider fits a dedup default and its non-dedup base (see
-            # query_megamoe_kernel_properties); no other dedup tactic is sized for.
-            if _sm107_default_combine_dedup(self.unique_id()):
-                default_tactic = _default_megamoe_tactic_for_key(
-                    self.unique_id(), num_tokens=num_tokens
-                )
-                if default_tactic not in candidates:
-                    candidates.append(default_tactic)
             choices = _token_back_ready_granularity_choices(
                 load_balance=self.helper_expert_count > 0
             )
