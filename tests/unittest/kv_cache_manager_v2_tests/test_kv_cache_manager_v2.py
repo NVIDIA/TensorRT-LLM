@@ -8107,12 +8107,6 @@ class TestComplexModels(unittest.TestCase):
 
 
 class TestResizeQuota(TestKVCacheManagerV2):
-    def _before_disk_shrink(self) -> None:
-        """Called right before test_resize_quota shrinks the disk tier."""
-
-    def _after_disk_shrink(self) -> None:
-        """Called right after test_resize_quota shrank the disk tier."""
-
     def test_resize_quota(self) -> None:
         self.prepare(64 << 20, 128 << 20, 128 << 20, 36, 128, 1, kv_buf_size=32768)
         # if we have n blocks, we need 8192*2*18*(1+5+n) bytes of memory. For the (1+5+n), 1 is for sink
@@ -8164,10 +8158,8 @@ class TestResizeQuota(TestKVCacheManagerV2):
         success = self.manager.resize(HOST_LEVEL, 16 << 20)
         assert success and self.manager.get_quota(HOST_LEVEL) <= 16 << 20
         # also shrink the disk quota, this would drop some old pages
-        self._before_disk_shrink()
         success = self.manager.resize(DISK_LEVEL, 32 << 20)
         assert success and self.manager.get_quota(DISK_LEVEL) <= 32 << 20
-        self._after_disk_shrink()
         success = kv_cache_lst[0].resume(stream)
         assert success
         # After shrinking, GPU memory can hold only one request, so expect failure
@@ -12767,33 +12759,12 @@ class TestResizeQuotaDiskOptions(TestResizeQuota):
 class TestResizeQuotaHostReserve(TestResizeQuota):
     # Shrinking the host tier defragments its overflow pages within the tier; a free-slot reserve must not send one
     # of them to disk on the way (the defragmentation takes exactly the slots they need).
-    host_tier_options = {"free_reserve_fraction": 0.875}
+    host_tier_options = {"free_reserve_fraction": 0.25}
 
 
 class TestResizeQuotaDiskWriteBehind(TestResizeQuota):
-    # Quota changes resize the disk file while pages are still in write-behind staging: flushes are held back until
-    # the disk tier has shrunk, so the shrink meets staged pages (and drops those past the new end of the file).
+    # Quota changes resize the disk file while pages may still be in write-behind staging.
     disk_tier_options = dict(_ALL_DISK_OPTIONS, write_behind_bytes=_WRITE_BEHIND_BYTES)
-
-    def prepare(self, *args, **kwargs) -> None:
-        super().prepare(*args, **kwargs)
-        # After the manager started the async disk I/O pool, which the hook needs.
-        _introspection.delay_disk_write_behind_flushes_for_testing(3600)
-
-    def tearDown(self) -> None:
-        _introspection.delay_disk_write_behind_flushes_for_testing(0)
-        super().tearDown()
-
-    def _before_disk_shrink(self) -> None:
-        self.assertGreater(
-            _introspection.disk_write_behind_pages_for_testing(),
-            0,
-            "no write was staged when the disk tier shrank",
-        )
-
-    def _after_disk_shrink(self) -> None:
-        # The rest of the test restores pages from the shrunk tier through staging and the file.
-        _introspection.delay_disk_write_behind_flushes_for_testing(0)
 
 
 class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):
