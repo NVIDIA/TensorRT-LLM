@@ -59,7 +59,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | SeaCache | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | Text Encoder TP | SOL-Attn |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT\*\*\* | SeaCache | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | Text Encoder TP | SOL-Attn |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
@@ -81,6 +81,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
 \*\* SeaCache on Cosmos3: single-GPU base (non-distilled) checkpoints, multi-frame video generation without audio, action or transfer controls; see [SeaCache](#seacache).
+
+\*\*\* With CUDA graphs on, Cache-DiT caches blocks only on FLUX.1 and FLUX.2, which capture each block as its own graph. Other models capture the whole transformer forward, so Cache-DiT caches nothing; disable `cuda_graph_config.enable` to use Cache-DiT with them. See [VisualGen CUDA Graphs](../features/visualgen-cuda-graph.md).
 
 SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
 

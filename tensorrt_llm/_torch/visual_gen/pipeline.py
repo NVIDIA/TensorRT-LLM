@@ -42,7 +42,13 @@ from tensorrt_llm.visual_gen.params import MediaRole
 
 from .cache import CacheDiTAccelerator, SeaCacheAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
-from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .cuda_graph_runner import (
+    BlockCUDAGraphRunner,
+    CUDAGraphRunner,
+    CUDAGraphRunnerConfig,
+    SharedGraphPool,
+    wrap_blocks_with_cuda_graphs,
+)
 from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
@@ -117,6 +123,13 @@ class BasePipeline(nn.Module):
     supports_image_edit: bool = False
     # Opt in only after implementing per-request noise and batched media output.
     supports_dynamic_batching: bool = False
+    # With Cache-DiT + CUDA graphs, capture each transformer block as its own graph. Block
+    # graphs are captured only during warmup, so opt in only when the warmup shapes give the
+    # block graph keys of the requests to serve (e.g. text padded to a fixed length). Blocks
+    # whose inputs warmup did not produce (another batch size or text length, or a graph key
+    # warmup did not reach, such as a later sparse-attention phase) run without graphs and
+    # log a warning once per new input.
+    supports_blockwise_cuda_graphs: bool = False
 
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
@@ -173,13 +186,21 @@ class BasePipeline(nn.Module):
         profiler_scope = (
             contextlib.nullcontext() if self._is_warmup else self._profiler.request_scope()
         )
-        with profiler_scope:
-            anchor_fn = getattr(self, "_nccl_window_tensor_scope_anchor", None)
-            anchor = anchor_fn() if anchor_fn is not None else None
-            if anchor is None:
-                return self.infer(req)
-            with nccl_window_tensor_scope(anchor) as scope:
-                return scope.escape(self.infer(req))
+        try:
+            with profiler_scope:
+                anchor_fn = getattr(self, "_nccl_window_tensor_scope_anchor", None)
+                anchor = anchor_fn() if anchor_fn is not None else None
+                if anchor is None:
+                    output = self.infer(req)
+                else:
+                    with nccl_window_tensor_scope(anchor) as scope:
+                        output = scope.escape(self.infer(req))
+        finally:
+            if not self._is_warmup:
+                # Without a warmup, block graphs are captured during the first request
+                # only. Close on every rank, also when the request failed on this one.
+                self._stop_block_graph_capture()
+        return output
 
     def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
         """Enumerate a denoise loop's steps within its profiling windows.
@@ -235,6 +256,8 @@ class BasePipeline(nn.Module):
         triggered torch.compile's lazy compilation, so the captured graph
         contains the optimized compiled kernels. (The ``LTX2Pipeline`` override
         relies on the same ordering.)
+
+        With Cache-DiT, blocks are captured individually (_setup_blockwise_cuda_graphs).
         """
         if not self.pipeline_config.cuda_graph.enable:
             return
@@ -244,6 +267,9 @@ class BasePipeline(nn.Module):
                 "CUDA graphs are not supported with visual generation offloading yet. "
                 "Disable either cuda_graph_config.enable or cpu_offload_config.enable."
             )
+
+        if self._uses_blockwise_cuda_graphs():
+            return  # Cache-DiT: blocks are captured one by one in _setup_cache_acceleration
 
         if len(self.transformer_components) > 1:
             logger.info(
@@ -267,6 +293,66 @@ class BasePipeline(nn.Module):
             logger.info(f"CUDA graph runner: wrapping {name}.forward{compile_note}")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
+
+    def _uses_blockwise_cuda_graphs(self) -> bool:
+        """Cache-DiT picks the blocks inside ``forward``, so graphs must be per block."""
+        cfg = getattr(self, "pipeline_config", None)  # None if built without __init__
+        return (
+            self.supports_blockwise_cuda_graphs
+            and cfg is not None
+            and bool(cfg.cuda_graph.enable)
+            and cfg.cache_backend == "cache_dit"
+        )
+
+    def _stop_block_graph_capture(self) -> None:
+        """Run block graph keys first seen from now on eagerly, once block graphs exist.
+
+        Warmup decides the captured shapes, as batch sizes do for LLM CUDA graphs: a shape
+        it did not cover runs without graphs instead of adding graphs and input buffers to
+        every block for the rest of the process. Capture stays open while no block graph
+        exists, e.g. after a first request that ran with graphs disabled (a FLUX.2 edit).
+        Every rank captures the same block graphs, so every rank decides alike. Blocks that
+        are still without a graph when capture closes (a first request that failed partway
+        through capture) are logged.
+        """
+        runners = [
+            runner
+            for runner in getattr(self, "_cuda_graph_runners", {}).values()
+            if isinstance(runner, BlockCUDAGraphRunner)
+        ]
+        if any(runner.graphs for runner in runners):
+            uncaptured = [r.name for r in runners if r.allow_capture and not r.graphs]
+            if uncaptured:
+                more = ", ..." if len(uncaptured) > 1 else ""
+                logger.warning(
+                    f"Block CUDA graph capture closed with {len(uncaptured)} of {len(runners)} "
+                    f"blocks uncaptured ({uncaptured[0]}{more}); they run without CUDA graphs."
+                )
+            for runner in runners:
+                runner.allow_capture = False
+
+    def _setup_blockwise_cuda_graphs(self) -> None:
+        """Capture each block as its own graph (after torch.compile, before Cache-DiT)."""
+        if self.offloader.stages():
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph_config.enable or cpu_offload_config.enable."
+            )
+
+        shared_pool = self._get_or_create_cuda_graph_shared_pool()
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
+        for name in self.transformer_components:
+            model = getattr(self, name, None)
+            if model is None:
+                continue
+            block_attrs = self._find_transformer_blocks(model)
+            runners = wrap_blocks_with_cuda_graphs(model, block_attrs, shared_pool, name=name)
+            logger.info(
+                f"CUDA graph runner: Cache-DiT is enabled, capturing each of the "
+                f"{len(runners)} blocks in {name}.{{{', '.join(block_attrs)}}} as its "
+                f"own graph{compile_note}"
+            )
+            self._cuda_graph_runners.update(runners)
 
     @contextlib.contextmanager
     def disallow_cuda_graph_capture(self):
@@ -305,7 +391,8 @@ class BasePipeline(nn.Module):
         """Return the cache key for a given warmup shape.
 
         Image models (FLUX) override to return (height, width), ignoring
-        num_frames.  Video models use the default (height, width, num_frames).
+        num_frames, plus batch size and text length with per-block CUDA graphs.
+        Video models use the default (height, width, num_frames).
         The executor uses this to check whether a request shape was warmed up.
         """
         return (height, width, num_frames)
@@ -767,9 +854,19 @@ class BasePipeline(nn.Module):
         cfg = self.pipeline_config
 
         if cfg.cache_backend == "cache_dit":
+            # Pipelines that install their own forward-level runner (LTX-2) keep it.
+            if self._uses_blockwise_cuda_graphs() and not self._cuda_graph_runners:
+                self._setup_blockwise_cuda_graphs()
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
             acc.wrap()
             self.cache_accelerator = acc
+            if cfg.cuda_graph.enable and not self._uses_blockwise_cuda_graphs():
+                logger.warning(
+                    f"{type(self).__name__} has no per-block CUDA graphs: with Cache-DiT, its "
+                    "whole-forward CUDA graph freezes one cache decision, so no block is "
+                    "cached, and max_warmup_steps <= 2 can fail graph capture. Disable "
+                    "cuda_graph_config.enable to use Cache-DiT with this pipeline."
+                )
             return
 
         if cfg.cache_backend == "seacache":
@@ -1016,6 +1113,7 @@ class BasePipeline(nn.Module):
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
         )
+        self._stop_block_graph_capture()
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
 

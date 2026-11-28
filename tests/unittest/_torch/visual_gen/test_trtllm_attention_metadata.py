@@ -381,8 +381,10 @@ def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> No
 
 def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> None:
     """Without the CUDA graph runner the layer drops the value grouping of a previous
-    K/V shape; under the runner every captured shape keeps its grouping. The grouped
-    token range of a call reaches the preprocessor."""
+    K/V shape; under the runner every captured shape keeps its grouping, which eager calls
+    at that shape share, and eager calls for new shapes (a block call warmup did not
+    capture) leave those groupings unchanged. The grouped token range of a call reaches the
+    preprocessor."""
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
@@ -399,17 +401,26 @@ def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> Non
         x = torch.randn(seq_len, 2 * 128, device="cuda", dtype=torch.bfloat16)
         attention._vc_operands(x, x, x, 1, seq_len, seq_len, None)
 
-    first = attention._vc_preprocessor
+    runner = attention._vc_preprocessor
+    first = attention._vc_eager_preprocessor
     operands(256)
     operands(256)
-    assert attention._vc_preprocessor is first
+    assert attention._vc_eager_preprocessor is first
     operands(384)
-    second = attention._vc_preprocessor
-    assert second is not first
+    assert attention._vc_eager_preprocessor is not first
     with resolved_extra_keys_scope({"vc_smooth_phase": 2}):
         operands(512)
         operands(256)
-    assert attention._vc_preprocessor is second
+    captured = dict(runner._groupings)
+    assert list(captured) == [(1, 512, 2, None), (1, 256, 2, None)]
+    operands(256)
+    assert list(attention._vc_eager_preprocessor._groupings) == [(1, 384, 2, None)]
+    operands(640)
+    operands(768)
+    assert attention._vc_preprocessor is runner
+    assert list(runner._groupings) == list(captured)
+    assert all(runner._groupings[shape] is entry for shape, entry in captured.items())
+    assert list(attention._vc_eager_preprocessor._groupings) == [(1, 768, 2, None)]
     # The grouped token range of a forward call reaches the preprocessor. A call
     # without one groups the whole sequence. Under the runner the resolved phase
     # names the preprocessor path in place of a step.
@@ -445,11 +456,17 @@ def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> Non
             monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
             with pytest.raises(_StopAtFmhaDispatch):
                 attention.forward(x, x, x, batch_size=1, seq_len=256)
+    # An eager call at a captured shape passes the mode of its step's phase and no step.
+    attention.metadata._metadata_state["denoise_step"] = (4, 50)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with pytest.raises(_StopAtFmhaDispatch):
+        attention.forward(x, x, x, batch_size=1, seq_len=256)
     assert seen == [
         (None, None, None),
         ((0, 128), None, None),
         (None, None, "cold"),
         (None, None, "keep"),
+        (None, None, "warm"),
         (None, None, "warm"),
     ]
 
