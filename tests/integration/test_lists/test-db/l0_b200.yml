@@ -322,6 +322,7 @@ l0_b200:
   - unittest/_torch/moe/test_megamoe_streaming_load.py
   - unittest/_torch/moe/test_megamoe_combine_dedup_tactic.py
   - unittest/_torch/moe/test_megamoe_heuristic_v2.py
+  - unittest/_torch/moe/test_megamoe_router_padding.py
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
