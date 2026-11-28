@@ -89,7 +89,7 @@ window.MOE_DASHBOARD_CONFIG = {
   // Curation over the index: what to surface and default selections.
   display: {
     topN: 3,
-    hardwareOrder: ["GB200", "GB300", "B200", "B300", "H100"],
+    hardwareOrder: ["GB200", "GB300", "B200", "B300", "Rubin", "H100"],
     hiddenFiles: [],
     // Backstop, not a curation rule: every real scenario fans out well under this
     // (107 cards is the widest dataset today). It exists to catch a future dataset
@@ -100,7 +100,7 @@ window.MOE_DASHBOARD_CONFIG = {
     // chunk of this data version; if a future scenario drops it, renderFilters
     // falls back to that dimension's first offered value.
     defaults: {
-      hardware: "GB200", model: "deepseek_v4_pro", precision: "NVFP4",
+      hardware: "GB300", model: "deepseek_v4_1_flash", precision: "NVFP4",
       num_tokens: 512, dispatch: "balanced",
     },
   },
