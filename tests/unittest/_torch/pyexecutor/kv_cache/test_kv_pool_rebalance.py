@@ -611,6 +611,10 @@ class TestConsumePreviousBatch:
             exe._process_previous_batch = MagicMock(
                 wraps=MethodType(PyExecutor._process_previous_batch, exe)
             )
+            exe._publish_responses_and_terminate = MethodType(
+                PyExecutor._publish_responses_and_terminate, exe
+            )
+            exe._is_final_response_ready = MethodType(PyExecutor._is_final_response_ready, exe)
             exe._handle_responses = MethodType(PyExecutor._handle_responses, exe)
             exe._create_request_response = MethodType(PyExecutor._create_request_response, exe)
             exe._enqueue_responses = MethodType(PyExecutor._enqueue_responses, exe)
