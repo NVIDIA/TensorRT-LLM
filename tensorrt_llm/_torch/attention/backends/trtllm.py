@@ -40,7 +40,8 @@ if TYPE_CHECKING:
 from itertools import accumulate
 
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
-                                 maybe_pin_memory, prefer_pinned)
+                                 maybe_pin_memory, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
                                      RotaryScalingType)
@@ -60,6 +61,7 @@ from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
+from .fmha.fallback import FallbackFmha
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
 from .fmha.registry import is_fmha_lib_enabled, step_planning_fmha_lib_classes
@@ -144,7 +146,7 @@ def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
 
 
 class _ContextPlan:
-    """Host state of a context-only trtllm-gen call, shared by the layers of one forward.
+    """Host state of a dense context-only FMHA call, shared by the layers of one forward.
 
     TrtllmAttentionMetadata drops it whenever the lengths or the batch can change (prepare(), KV-length and
     spec-dec updates, draft swaps); the bound tensors are also compared by identity. ``sig`` is the
@@ -3322,7 +3324,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             gqa_decode (GqaDecodeSetup): Enables the GQA decode FMHA library
                 (fmha/gqa_decode.py) for this layer.
             cache_context_plan (bool): Plan a context-only forward once for the
-                layers that share its metadata and run the trtllm-gen context
+                layers sharing metadata, using FlashInfer trtllm-gen or the dense,
+                non-quantized BF16/FP16 FallbackFmha context
                 kernel from that plan (dense, non-sparse layers only).
             context_fmha_head_dim_per_stage_kv (int): See the class attribute.
             context_last_rows_only (bool): See the class attribute.
@@ -3447,6 +3450,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = self.quant_config.layer_quant_mode
+        self._context_plan_unquantized = not self.quant_mode.has_any_quant()
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
@@ -3990,9 +3994,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             raise ValueError(
                 "variable-window bounds are supported only for context attention"
             )
-        if self.cache_context_plan and not has_variable_window_starts and self._run_context_plan(
-                q, k, v, metadata, forward_args):
-            return forward_args.output
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -4037,6 +4038,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
             forward_args.output = outputs[0]
             forward_args.output_sf = outputs[1] if len(outputs) == 2 else None
+
+        if self.cache_context_plan and not has_variable_window_starts and self._run_context_plan(
+                q, k, v, metadata, forward_args):
+            return forward_args.output
 
         has_q_only = False
         if self.is_mla_enable:
@@ -4350,9 +4355,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                           metadata: TrtllmAttentionMetadata) -> tuple:
         """Key of a context plan besides the forward state that the metadata invalidates.
 
-        With the layer's KV-pool bound (checked in _run_context_plan) it holds
-        every input of the FMHA selection and of the context workspace size
-        that _is_plain_context_call leaves variable.
+        Together with the bound metadata identities and per-call admission,
+        it holds the variable inputs of FMHA selection and context workspace
+        sizing. Libraries that need a block extent also recheck the layer's
+        KV-pool bound in _run_context_plan.
         """
         return (self._context_plan_layer_key, q.dtype, fwd.output.dtype,
                 fwd.attention_input_type, fwd.attention_window_size,
@@ -4382,7 +4388,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and fwd.sparse_backend_args is None
                 and not fwd.skip_mla_rope_generation
                 and metadata.num_generations == 0 and metadata.num_contexts > 0
-                and not metadata.is_cross
+                and not metadata.is_cross and metadata.beam_width == 1
+                and metadata.max_context_q_len_override is None
+                and metadata.spec_decoding_bl_tree_mask is None
+                and metadata.spec_bl_tree_first_sparse_mask_offset_kv is None
+                and metadata.helix_position_offsets is None
+                and not metadata.enable_flash_mla
                 and q.shape[0] == metadata.num_ctx_tokens and q.size(-1)
                 == (self.num_heads + 2 * self.num_kv_heads) * self.head_dim)
 
@@ -4399,6 +4410,52 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and plan.workspace is metadata.effective_workspace
                 and plan.kv_cache_manager is metadata.kv_cache_manager
                 and plan.pool_pointers is metadata.host_kv_cache_pool_pointers)
+
+    def _fallback_context_plan_eligible(self, q: torch.Tensor,
+                                        metadata: TrtllmAttentionMetadata,
+                                        fwd: AttentionForwardArgs) -> bool:
+        """Whether the dense fallback recipe can use a context plan."""
+        if (q.dtype not in (torch.bfloat16, torch.float16) or fwd.output is None
+                or fwd.output.dtype != q.dtype or self.is_mla_enable
+                or self.sparse_params is not None
+                or not self._context_plan_unquantized):
+            return False
+        expected_kv_dtype = torch_dtype_to_binding(q.dtype)
+        if getattr(metadata.kv_cache_manager, "dtype",
+                   None) != expected_kv_dtype:
+            return False
+        if (metadata.mixed_precision_staging is not None
+                or metadata.draft_mixed_precision_staging is not None
+                or metadata.mixed_precision_high_block_table is not None
+                or metadata.mixed_precision_low_block_offsets is not None
+                or metadata.draft_mixed_precision_high_block_table is not None
+                or metadata.draft_mixed_precision_low_block_offsets is not None
+                or getattr(metadata.kv_cache_manager,
+                           "mixed_precision_high_layers", None)):
+            return False
+        if (fwd.out_scale is not None or fwd.sage_attn_num_elts_per_blk_q != 0
+                or fwd.sage_attn_num_elts_per_blk_k != 0
+                or fwd.sage_attn_num_elts_per_blk_v != 0
+                or fwd.sage_attn_qk_int8 or fwd.sage_attn_smooth_k
+                or fwd.sage_attn_smooth_v or fwd.sage_quantized is not None
+                or fwd.vc_attention or fwd.vc_operands is not None
+                or fwd.timestep is not None
+                or fwd.sparse_attn_phase is not None):
+            return False
+        sparse = fwd.sparse_runtime_params
+        return (sparse is not None and sparse.sparse_kv_indices is None
+                and sparse.sparse_kv_offsets is None
+                and sparse.sparse_attn_indices is None
+                and sparse.sparse_attn_offsets is None
+                and type(sparse.sparse_attn_indices_block_size) is int
+                and sparse.sparse_attn_indices_block_size == 0
+                and sparse.sparse_attn_kv_lens is None
+                and sparse.aux_kv_cache_pool_ptr is None
+                and type(sparse.threshold_scale_factor_prefill) in (int, float)
+                and sparse.threshold_scale_factor_prefill == 0
+                and type(sparse.threshold_scale_factor_decode) in (int, float)
+                and sparse.threshold_scale_factor_decode == 0
+                and sparse.block_sparse_inputs is None)
 
     def _build_context_plan(self, q: torch.Tensor,
                             metadata: TrtllmAttentionMetadata,
@@ -4422,23 +4479,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         plan.sig = sig
         plan.fmha_cls = None
         if (metadata.kv_cache_manager is None or plan.block_offsets is None
-                or plan.workspace is None or metadata.beam_width != 1
-                or metadata.max_context_q_len_override is not None
-                or metadata.spec_decoding_bl_tree_mask is not None
-                or metadata.spec_bl_tree_first_sparse_mask_offset_kv is not None
-                or metadata.helix_position_offsets is not None
-                or metadata.enable_flash_mla):
+                or plan.workspace is None):
             return plan
         from .fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
         fmha = self._fmha_manager.select(self, q, None, None, metadata, fwd)
-        if not isinstance(fmha, FlashInferTrtllmGenFmha):
+        if type(fmha) is FallbackFmha:
+            if not self._fallback_context_plan_eligible(q, metadata, fwd):
+                return plan
+        elif not isinstance(fmha, FlashInferTrtllmGenFmha):
             return plan
         # PhasedFmha.forward, context part (seq_offset 0, every sequence a context request)
         n = plan.num_contexts
         fmha.prepare_workspace(q, None, None, metadata, fwd, plan.workspace)
         plan.counter_rows = (metadata.max_num_sequences
                              or metadata.max_num_requests)
-        plan.total_num_blocks = fmha._get_total_num_blocks(metadata)
+        plan.total_num_blocks = (fmha._get_total_num_blocks(metadata)
+                                 if fmha.NEEDS_BLOCK_EXTENT else 0)
         plan.max_q_len = int(plan.prompt_lens[0:n].max())
         plan.max_kv_len = int(plan.kv_lens[0:n].max())
         plan.fmha_cls = type(fmha)
@@ -4499,12 +4555,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self._context_plan_matches(plan, sig, metadata):
             plan = self._build_context_plan(q, metadata, fwd, sig)
             metadata.context_plan = plan
+        elif plan.fmha_cls is FallbackFmha and not self._fallback_context_plan_eligible(
+                q, metadata, fwd):
+            return False
         if plan.fmha_cls is None:
             return False
         fmha = self._context_plan_fmha_for(plan)
         if fmha is None:
             return False
-        total_num_blocks = fmha._get_total_num_blocks(metadata)
+        total_num_blocks = (fmha._get_total_num_blocks(metadata)
+                            if fmha.NEEDS_BLOCK_EXTENT else 0)
         if total_num_blocks != plan.total_num_blocks:
             # The selection also depends on the KV-pool bound of the layer.
             plan = self._build_context_plan(q, metadata, fwd, sig)
