@@ -30,6 +30,7 @@ from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
+from .fast_custom_op import fast_custom_op
 
 _MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
     "TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION")
@@ -1124,15 +1125,17 @@ def _run_fp4_block_scale_moe(routing_logits: Optional[torch.Tensor],
         if rows_in_lamport(result[0], lamport_fc2_out):
             return [result[0].new_empty(0), *result[1:]]
     # When output is provided and do_finalize=True, the result is written in-place to output.
-    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
-    # (custom op output cannot be the same tensor as input).
+    # The schema declares no output that aliases an input, so return an empty
+    # placeholder rather than output itself.
     # Callers should use output directly when they provide it.
     if output is not None and do_finalize:
         return [torch.empty(0, device=output.device, dtype=output.dtype)]
     return result
 
 
-@torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
+@fast_custom_op("trtllm::fp4_block_scale_moe_runner",
+                mutates_args=(),
+                device_types=None)
 def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                routing_bias: Optional[torch.Tensor],
                                hidden_states: torch.Tensor,
@@ -1651,7 +1654,9 @@ class FP8BlockScaleMoERunner(_TrtllmGenMoERunner):
         return tuning_config
 
 
-@torch.library.custom_op("trtllm::fp8_block_scale_moe_runner", mutates_args=())
+@fast_custom_op("trtllm::fp8_block_scale_moe_runner",
+                mutates_args=(),
+                device_types=None)
 def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                routing_bias: torch.Tensor,
                                hidden_states: torch.Tensor,
@@ -1747,8 +1752,8 @@ def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
     result = kernel_runner(input_tensors, tactic=best_tactic, output=output)
     # When output is provided, the result is written in-place to output.
-    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
-    # (custom op output cannot be the same tensor as input).
+    # The schema declares no output that aliases an input, so return an empty
+    # placeholder rather than output itself.
     # Callers should use output directly when they provide it.
     if output is not None:
         return torch.empty(0, device=result.device, dtype=result.dtype)
@@ -2012,8 +2017,9 @@ class MxE4m3MxE2m1BlockScaleMoERunner(_TrtllmGenMoERunner):
         return tuning_config
 
 
-@torch.library.custom_op("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
-                         mutates_args=())
+@fast_custom_op("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
+                mutates_args=(),
+                device_types=None)
 def mxe4m3_mxe2m1_block_scale_moe_runner(
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
@@ -2119,8 +2125,8 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
         output=output)
     # When output is provided, the result is written in-place to output.
-    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
-    # (custom op output cannot be the same tensor as input).
+    # The schema declares no output that aliases an input, so return an empty
+    # placeholder rather than output itself.
     # Callers should use output directly when they provide it.
     if output is not None:
         return torch.empty(0, device=result.device, dtype=result.dtype)

@@ -14,8 +14,12 @@ def recover_pass(gm: GraphModule):
     for idx, node in enumerate(graph.nodes):
         node2idx[node] = idx
     for idx, node in enumerate(graph.nodes):
-        if is_call_function(
-                node, torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default):
+        # Accept the packet as well as the overload, so a caller that invokes
+        # the packet still gets its add and norm split for fusion.
+        if is_call_function(node, [
+                torch.ops.trtllm.flashinfer_fused_add_rmsnorm,
+                torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default
+        ]):
             input = get_arg(node, 0, 'input')
             residual = get_arg(node, 1, 'residual')
             weight = get_arg(node, 2, 'weight')
