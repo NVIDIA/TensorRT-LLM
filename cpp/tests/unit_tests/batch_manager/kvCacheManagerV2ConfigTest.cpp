@@ -57,6 +57,39 @@ TEST(KvCacheManagerV2ConfigTest, ExistingBufferConfigurationDefaultsToDense)
     EXPECT_NO_THROW(makeConfig().validate());
 }
 
+TEST(KvCacheManagerV2ConfigTest, PageStagingOptionsReachTheStorageConfig)
+{
+    auto config = makeTieredConfig();
+    ASSERT_NO_THROW(config.validate());
+    // The defaults are the ring the storage manager always built: 64 MiB, one stretch in flight per disk move.
+    EXPECT_EQ(config.pageStagingMiB, 64);
+    EXPECT_EQ(config.pageStagingDepth, 1);
+    auto storage = createStorageConfig(config);
+    EXPECT_EQ(storage.pageStagingBytes, StorageConfig::kDefaultPageStagingBytes);
+    EXPECT_EQ(storage.pageStagingBytes, size_t{64} << 20u);
+    EXPECT_EQ(storage.pageStagingDepth, 1u);
+
+    config.pageStagingMiB = 1024;
+    config.pageStagingDepth = 4;
+    ASSERT_NO_THROW(config.validate());
+    storage = createStorageConfig(config);
+    EXPECT_EQ(storage.pageStagingBytes, size_t{1024} << 20u);
+    EXPECT_EQ(storage.pageStagingDepth, 4u);
+
+    for (int const mib : {0, -1, KVCacheManagerConfig::kMaxPageStagingMiB + 1})
+    {
+        auto bad = makeTieredConfig();
+        bad.pageStagingMiB = mib;
+        EXPECT_THROW(bad.validate(), std::invalid_argument) << mib;
+    }
+    for (int const depth : {0, -1, KVCacheManagerConfig::kMaxPageStagingDepth + 1})
+    {
+        auto bad = makeTieredConfig();
+        bad.pageStagingDepth = depth;
+        EXPECT_THROW(bad.validate(), std::invalid_argument) << depth;
+    }
+}
+
 TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityRespectsProbeLimitAfterPageRounding)
 {
     constexpr int kTokensPerBlock = 128;

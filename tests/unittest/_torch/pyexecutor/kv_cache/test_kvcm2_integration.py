@@ -8527,3 +8527,85 @@ class TestVetoedContextChunk:
         assert cache.capacity == cache.history_length == long_turn.context_current_position
         for request in (long_turn, short_turn):
             manager.free_resources(request)
+
+
+@pytest.fixture
+def per_request_reuse_manager() -> KVCacheManagerV2:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=True, max_gpu_total_bytes=16 << 20, host_cache_size=16 << 20
+        ),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=128,
+        head_dim=1024,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+    try:
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def _claimed_context_run(manager: KVCacheManagerV2, request: _ContextRequest, *, claim: bool):
+    """Run `request` with its cache claimed ahead on the host helper (driven on this thread) or
+    created by prepare_context; return its reused tokens and the page indices of those blocks."""
+    helper = manager.enable_host_helper(
+        torch.cuda.current_device(),
+        claim_ahead=1 if claim else 0,
+        prefetch_blocks=8,
+        start_thread=False,
+    )
+    try:
+        if claim:
+            assert manager.claim_context_ahead([request]) == 1
+        assert manager.offer_context_prefetch([request]) == 1
+        helper.begin_forward(may_capture=False)
+        while helper.run_one():
+            pass
+        helper.end_forward()
+        batch = _prepare_context_resources(manager, request)
+        assert manager.prepare_context(request)
+        assert manager._claims == {}
+        reused = request.context_current_position
+        request.context_remaining_length = request.prompt_len - reused
+        assert manager.resize_context(request, num_tokens=request.context_remaining_length)
+        request.context_current_position = request.prompt_len
+        request.context_remaining_length = 0
+        _update_context_resources(manager, batch)
+        index = manager.index_mapper.get_index(request.py_request_id)
+        pages = manager.host_kv_cache_block_offsets[0, index * manager.max_beam_width, 0]
+        torch.cuda.synchronize()
+        return reused, pages[: reused // TOKENS_PER_BLOCK].tolist()
+    finally:
+        manager.free_resources(request)
+        manager.stop_host_helper()
+
+
+def test_a_claimed_cache_reuses_and_maps_like_an_inline_one(per_request_reuse_manager) -> None:
+    """The host helper's claim and prefetch on the real manager: the adopted cache matches the
+    prefix and fills the page-index row exactly as a cache prepare_context creates."""
+    manager = per_request_reuse_manager
+    prompt = list(range(1, 14))
+    first = _ContextRequest(1, prompt, len(prompt), "c1")
+    _run_context(manager, first)
+    manager.free_resources(first)
+
+    inline = _claimed_context_run(
+        manager, _ContextRequest(2, prompt, len(prompt), "c2"), claim=False
+    )
+    claimed = _claimed_context_run(
+        manager, _ContextRequest(3, prompt, len(prompt), "c3"), claim=True
+    )
+
+    assert inline[0] > 0
+    assert claimed == inline

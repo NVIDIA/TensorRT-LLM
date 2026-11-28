@@ -5756,6 +5756,73 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "disables it."),
         status="prototype")
 
+    context_demote_probe: bool = Field(
+        default=False,
+        description=(
+            "With long-prefill demotion on (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS "
+            "> 0, chunked prefill, KV cache manager V2): a context request "
+            "that has no router estimate of its uncached prefill, as on a "
+            "worker without the attention-DP conversation router, is measured "
+            "by the scheduler's reuse probe, once while it waits, and demoted "
+            "when more than the threshold is uncached. Off: such a request is "
+            "never demoted. Changes the context order only."),
+        status="prototype")
+
+    gen_handoff_seat: bool = Field(
+        default=False,
+        description=(
+            "On a disaggregated generation server (KV cache manager V2, no "
+            "attention DP, max_batch_size >= 2): a forward runs at most "
+            "max_batch_size - 1 requests, so the last seat only takes the next "
+            "request's KV transfer, which then runs beside the decoding "
+            "requests instead of holding one of their places. Decoding "
+            "requests are scheduled ahead of received ones. Set it on "
+            "generation servers only: a context server would lose a forward "
+            "place. Changes batch composition only."),
+        status="prototype")
+
+    gen_init_pause_after_release: bool = Field(
+        default=False,
+        description=(
+            "On a disaggregated generation server with the KV cache manager V2 "
+            "scheduler: a scheduling pass right after this rank released a "
+            "finished generation request admits no generation-init request "
+            "(each admission allocates the request's KV cache). With "
+            "max_gen_init_admissions_per_pass=1, a step then makes at most one "
+            "KV allocation or release of a whole request, which every "
+            "attention-DP rank waits for. Delays the start of a KV transfer by "
+            "one pass at most; outputs are unchanged."),
+        status="prototype")
+
+    context_claim_hold: bool = Field(
+        default=False,
+        description=
+        ("With kv_cache_config.context_claim_ahead > 0, long-prefill "
+         "demotion (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0, chunked prefill) "
+         "and the FCFS context order (KV cache manager V2): a first context "
+         "chunk goes behind the demoted long prefills of the scheduling pass "
+         "that first sees it, once, so that when the token budget is taken "
+         "it waits one pass and the host helper claims its cache under the "
+         "next forward instead of the executor thread claiming it inline. "
+         "The scheduler also picks what the helper claims: the waiting first "
+         "chunks the next pass is expected to admit, not every waiting one "
+         "in arrival order. Set it on context servers. Changes the context "
+         "order by at most one pass; outputs are unchanged."),
+        status="prototype")
+
+    context_demote_no_walk: bool = Field(
+        default=False,
+        description=(
+            "With context_demote_probe on: a waiting request whose "
+            "conversation's earlier prompt (kept by the scheduler for requests "
+            "it scheduled, up to the depth their prefill left reusable) proves "
+            "it short is classified without the probe's radix walk over its "
+            "whole prompt. A record that leaves the request long, or no record, "
+            "falls back to the probe; when the recorded blocks are no longer "
+            "cached the request is not demoted. Needs the FCFS context order. "
+            "Changes the context order only."),
+        status="prototype")
+
     @model_validator(mode="after")
     def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
         if (self.waiting_queue_max_wait_s is not None
@@ -6539,6 +6606,16 @@ class MixedPrecisionKV(NamedTuple):
     last_n: int
 
 
+# KvCacheConfig fields of the overlap loop's deferred releases and KV cache host helper.
+_KV_CACHE_HOST_HELPER_FIELDS = (
+    "defer_generation_only_release",
+    "defer_context_only_release",
+    "deferred_release_thread",
+    "context_claim_ahead",
+    "context_prefetch_blocks",
+)
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -6584,6 +6661,65 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "the GPU reports no host NUMA node or that node cannot hold the tiers of all "
         "co-located ranks. Only used by KV cache manager v2 in the PyTorch backend.",
         status="prototype")
+    host_cache_free_reserve_fraction: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.25,
+        status="prototype",
+        description=
+        "Share of the host cache tier, 0 to 0.25, that evictions to the disk cache keep free ahead of need. A host "
+        "block freed by an eviction is usable only once it has been copied to disk, so on a full host tier every "
+        "block evicted from GPU, and the restore waiting for the GPU block it frees, waits for a disk write. With a "
+        "reserve, evictions run that far ahead of need. 0 evicts only what is needed. Requires a disk cache. Only "
+        "used by KV cache manager v2.")
+    host_copy_threads: PositiveInt = Field(
+        default=1,
+        le=64,
+        status="prototype",
+        description=
+        "Threads, the CUDA callback thread included, that one host-side KV cache copy (host to host between "
+        "host-memory cache levels, disk to disk, and host to/from disk when `disk_io_threads` is 0) spreads its "
+        "blocks over. GPU-to-host offloads and host-to-GPU restores run on the GPU and do not use it. CUDA runs "
+        "host callbacks one at a time, so "
+        "with 1 every later host callback, and every copy queued behind one, waits for the whole copy. The copy "
+        "still completes only once every block is copied. Process-wide: the first KV cache manager that sets a "
+        "value above 1 sets it for the life of the process. Only used by KV cache manager v2."
+    )
+    copy_stream_busy_skip: NonNegativeInt = Field(
+        default=0,
+        le=4096,
+        status="prototype",
+        description=
+        "Pooled CUDA streams that a KV cache block copy skips while they still have work pending (0: it takes "
+        "the next pooled stream, busy or not). A stream goes back to the pool once its work is submitted, so "
+        "without skipping, a restore can wait behind an unrelated copy still pending on the stream it is handed, "
+        "such as a disk write waiting for the disk I/O pool. Skipped streams go back to the pool, which grows "
+        "until enough streams are idle. Process-wide: the first KV cache manager that sets a nonzero value sets "
+        "it for the life of the process. Only used by KV cache manager v2. Refused together with "
+        "`page_staging_depth` above 1: that pair ran a context server out of GPU memory after about 30 "
+        "minutes.")
+    page_staging_mib: PositiveInt = Field(
+        default=64,
+        le=65536,
+        status="prototype",
+        description=
+        "Size in MiB of the pinned host buffer that KV cache blocks moving between GPU and the disk cache (or a "
+        "remote cache level) pass through. A move takes one stretch of the buffer at a time and waits for the "
+        "earlier move that used the same stretch, so a burst of restores from disk larger than the buffer runs "
+        "one buffer-full at a time. The buffer is never smaller than three of the largest cold blocks. Per KV "
+        "cache manager. Only used by KV cache manager v2.")
+    page_staging_depth: PositiveInt = Field(
+        default=1,
+        le=16,
+        status="prototype",
+        description=
+        "Stretches of the page staging buffer (`page_staging_mib`) that one move of KV cache blocks between GPU "
+        "and the disk cache keeps in flight. 1 copies one stretch after another, each as large as the buffer "
+        "allows. N > 1 cuts the move into stretches of at most 1/N of the buffer, issued round-robin on N CUDA "
+        "streams, so up to N of its disk reads or writes run at once and other moves still find room in the "
+        "buffer. Requires a disk cache. Per KV cache manager. Only used by KV cache manager v2. Refused "
+        "together with `copy_stream_busy_skip` above 0: that pair ran a context server out of GPU memory "
+        "after about 30 minutes.")
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
@@ -6637,6 +6773,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "them, which saves the most writes; lower values keep more distinct blocks on disk when disk capacity, "
         "not write bandwidth, limits reuse. Only used by KV cache manager v2 with a disk cache."
     )
+    disk_write_behind_mib: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Host memory, in MiB, for write-behind of host-to-disk KV cache writes (0: off). A block's write completes "
+        "once its bytes are copied there, so the host memory it came from can be reused without waiting for the "
+        "disk; a disk I/O thread writes the file afterwards, and reads of the block are served from that memory "
+        "until then. Writes that do not fit run as before. Requires `disk_io_threads` > 0. Process-wide, like the "
+        "disk I/O pool. Only used by KV cache manager v2 with a disk cache.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -6838,6 +6983,52 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "are published one iteration later too, "
         "or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler "
         "without pipeline parallelism.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    defer_context_only_release: bool = Field(
+        default=False,
+        status="prototype",
+        description="Release the KV cache of a finished context-only request "
+        "(disaggregated context server) late, as defer_generation_only_release does for "
+        "generation-only requests. Its blocks were committed for reuse while it ran, so "
+        "later requests can match them before the release. Requires KV cache manager v2 and "
+        "the overlap scheduler without pipeline parallelism.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    deferred_release_thread: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Run the deferred releases of defer_generation_only_release and "
+        "defer_context_only_release on a background thread instead of the executor thread: "
+        "a release starts only while the executor waits for the previous step's GPU work, or "
+        "inside the forward call of a context-only batch, which captures no CUDA graph. The "
+        "scheduler and the idle path still release on the executor thread when they need the "
+        "pages. Requires one of the two options.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    context_claim_ahead: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Create and resume the KV cache (reuse match and page restore) of up to "
+        "this many waiting first context chunks on a background thread, inside the forward "
+        "call of a context-only batch; the next scheduling pass adopts the cache instead of "
+        "creating it. A claim not adopted within four passes, or whose pages the scheduler "
+        "needs, is released. 0 disables it. Requires KV cache manager v2 with block reuse, "
+        "and the overlap scheduler without pipeline parallelism.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    context_prefetch_blocks: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Bring the reusable prefix of each new first context chunk to the GPU "
+        "tier on a background thread, inside the forward call of a context-only batch, while "
+        "at most this many prefetched blocks wait for their request's KV cache. A request "
+        "whose prefix sits in a lower tier then resumes without waiting for those copies. 0 "
+        "disables it. Requires KV cache manager v2 with block reuse, and the overlap "
+        "scheduler without pipeline parallelism.")
 
     enable_kv_pool_rebalance: bool = Field(
         default=False,
@@ -7125,6 +7316,27 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.disk_write_through requires disk_io_threads > 0"
             )
+        if self.disk_write_behind_mib > 0 and self.disk_io_threads == 0:
+            raise ValueError(
+                "kv_cache_config.disk_write_behind_mib requires disk_io_threads > 0"
+            )
+        if self.host_copy_threads > 1 and self.use_kv_cache_manager_v2 is False:
+            raise ValueError(
+                "kv_cache_config.host_copy_threads requires use_kv_cache_manager_v2"
+            )
+        if self.copy_stream_busy_skip > 0 and self.use_kv_cache_manager_v2 is False:
+            raise ValueError(
+                "kv_cache_config.copy_stream_busy_skip requires use_kv_cache_manager_v2"
+            )
+        if self.page_staging_depth > 1 and self.copy_stream_busy_skip > 0:
+            raise ValueError(
+                "kv_cache_config.page_staging_depth > 1 cannot be combined with copy_stream_busy_skip > 0: "
+                "together they ran a context server out of GPU memory after about 30 minutes"
+            )
+        if self.page_staging_mib != 64 and self.use_kv_cache_manager_v2 is False:
+            raise ValueError(
+                "kv_cache_config.page_staging_mib requires use_kv_cache_manager_v2"
+            )
         disk_options = [
             name for name, value in (
                 ("disk_io_threads", self.disk_io_threads > 0),
@@ -7133,6 +7345,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 ("disk_write_through", self.disk_write_through),
                 ("disk_protected_copy_fraction",
                  self.disk_protected_copy_fraction != 1.0),
+                ("disk_write_behind_mib", self.disk_write_behind_mib > 0),
+                ("host_cache_free_reserve_fraction",
+                 self.host_cache_free_reserve_fraction > 0.0),
+                ("page_staging_depth", self.page_staging_depth > 1),
             ) if value
         ]
         if disk_options:
@@ -7182,11 +7398,21 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def validate_defer_generation_only_release(self) -> 'KvCacheConfig':
-        if (self.defer_generation_only_release
-                and self.use_kv_cache_manager_v2 is False):
+        for name in _KV_CACHE_HOST_HELPER_FIELDS:
+            if getattr(self, name) and self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    f"kv_cache_config.{name} requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
+        if self.deferred_release_thread and not (
+                self.defer_generation_only_release
+                or self.defer_context_only_release):
             raise ValueError(
-                "kv_cache_config.defer_generation_only_release requires "
-                "kv_cache_config.use_kv_cache_manager_v2=True.")
+                "kv_cache_config.deferred_release_thread needs "
+                "defer_generation_only_release or defer_context_only_release.")
+        for name in ("context_claim_ahead", "context_prefetch_blocks"):
+            if getattr(self, name) and not self.enable_block_reuse:
+                raise ValueError(
+                    f"kv_cache_config.{name} requires enable_block_reuse=True.")
         return self
 
     @model_validator(mode='after')
@@ -9366,13 +9592,15 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_defer_generation_only_release(self) -> 'TorchLlmArgs':
-        if self.kv_cache_config.defer_generation_only_release and (
-                self.disable_overlap_scheduler
-                or self.pipeline_parallel_size > 1):
-            raise ValueError(
-                "kv_cache_config.defer_generation_only_release is used only "
-                "by the overlap scheduler loop, which needs "
-                "disable_overlap_scheduler=False and pipeline_parallel_size=1.")
+        for name in _KV_CACHE_HOST_HELPER_FIELDS:
+            if getattr(self.kv_cache_config,
+                       name) and (self.disable_overlap_scheduler
+                                  or self.pipeline_parallel_size > 1):
+                raise ValueError(
+                    f"kv_cache_config.{name} is used only "
+                    "by the overlap scheduler loop, which needs "
+                    "disable_overlap_scheduler=False and pipeline_parallel_size=1."
+                )
         return self
 
     @model_validator(mode="after")

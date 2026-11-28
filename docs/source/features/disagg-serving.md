@@ -517,7 +517,7 @@ serve_graceful_shutdown_timeout_s: 30
 
 ### Generation server options
 
-Two prototype options of a generation server's configuration:
+Three prototype options of a generation server's configuration:
 
 * `scheduler_config.max_gen_init_admissions_per_pass` bounds how many
   disaggregated generation requests a rank admits, allocating their KV cache, per
@@ -525,6 +525,14 @@ Two prototype options of a generation server's configuration:
   in later passes, in order. A bound trades the start latency of a burst of
   requests for shorter passes, which every attention-DP rank waits for. Unset,
   the default, admits all that fit; KV cache manager V1 ignores it with a warning.
+* `scheduler_config.gen_handoff_seat: true` runs at most `max_batch_size - 1`
+  requests a forward, so the last seat only takes the next request's KV
+  transfer, which then runs beside the decoding requests instead of holding one
+  of their places; decoding requests are scheduled ahead of received ones. It
+  needs the KV cache manager V2 scheduler and `max_batch_size` of at least 2,
+  and is ignored with a warning under attention DP or
+  `TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN=1`. Set it on generation servers only:
+  a context server would lose a forward place.
 * `gen_prompt_tail_tokens: N` (at least 256) sends a context-first
   generation-only request to the generation workers with only its last `N`
   prompt ids and the number of ids left out, since its KV cache comes from the

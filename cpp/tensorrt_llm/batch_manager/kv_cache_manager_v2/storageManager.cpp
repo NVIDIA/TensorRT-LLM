@@ -546,7 +546,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         TLLM_CHECK_WITH_INFO(maxColdPageBytes <= std::numeric_limits<size_t>::max() / kPageStagingDepth,
             "Cold-page staging size overflow");
-        pageStagingBytes = std::max(kDefaultPageStagingBytes, kPageStagingDepth * maxColdPageBytes);
+        pageStagingBytes = std::max(config.pageStagingBytes, kPageStagingDepth * maxColdPageBytes);
+        mPageStagingDepth = std::max<size_t>(config.pageStagingDepth, 1);
+        if (config.pageStagingBytes != StorageConfig::kDefaultPageStagingBytes || mPageStagingDepth != 1)
+        {
+            TLLM_LOG_INFO("[kvCacheManagerV2] page staging ring %zu MiB, %zu stretches in flight per disk move",
+                pageStagingBytes >> 20u, mPageStagingDepth);
+        }
     }
 
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
@@ -695,8 +701,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mKeepCopyAfterRestoreAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
     mProtectedCopyFractionAt = TypedVec<CacheLevel, float>(numCacheLevels(), 1.0F);
     mWriteThroughAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    mFreeReserveFractionAt = TypedVec<CacheLevel, float>(numCacheLevels(), 0.0F);
     for (CacheLevel level{0}; level < config.cacheTiers.size(); ++level)
     {
+        if (auto const* host = std::get_if<HostCacheTierConfig>(&config.cacheTiers[level]))
+        {
+            mFreeReserveFractionAt[level] = host->freeReserveFraction;
+        }
         if (auto const* disk = std::get_if<DiskCacheTierConfig>(&config.cacheTiers[level]))
         {
             mKeepCopyAfterRestoreAt[level] = disk->keepCopyAfterRestore;
@@ -714,6 +725,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             mWriteThroughAt[level] = disk->writeThrough && hostAbove;
             mDiskWriteThrough = mDiskWriteThrough || mWriteThroughAt[level];
             configureAsyncDiskIo(static_cast<size_t>(disk->numIoThreads)); // validate() rejects negative values
+            if (asyncDiskIoEnabled())
+            {
+                configureDiskWriteBehind(disk->writeBehindBytes);
+            }
         }
     }
     if (mDiskWriteThrough && !asyncDiskIoEnabled())
@@ -1202,19 +1217,28 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     }
 
     TLLM_CHECK_WITH_INFO(coldTier == CacheTier::DISK, "Unsupported cold cache tier");
+    submitStagedDiskMigration(
+        srcIsHot, batchingLayerGroupId, srcPoolGroup, dstPoolGroup, coldPageBytes, pageIndices, numPages, stream);
+}
+
+void StorageManager::submitStagedDiskMigration(bool srcIsHot, LayerGroupId batchingLayerGroupId,
+    PoolGroupBase& srcPoolGroup, PoolGroupBase& dstPoolGroup, size_t coldPageBytes, PageIndexPair const* pageIndices,
+    size_t numPages, CUstream stream)
+{
     thread_local std::vector<PageIndexPair> stagingPageIndices;
-    size_t remaining = numPages;
-    size_t offset = 0;
-    while (remaining > 0)
+    // One stretch of the ring: up to `maxPages` pages from `offset`, as many as the ring hands out, copied through it
+    // on `chunkStream`. Returns the pages it took.
+    auto stageChunk = [&](size_t offset, size_t maxPages, CUstream chunkStream) -> size_t
     {
-        size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
+        size_t const maxStagingBytes = maxPages > std::numeric_limits<size_t>::max() / coldPageBytes
             ? std::numeric_limits<size_t>::max()
-            : coldPageBytes * remaining;
+            : coldPageBytes * maxPages;
         // 16-byte alignment: the cold-page codec's copy path uses 16-byte vector accesses and
         // requires its base pointer to be 16-aligned. Nothing here needs finer granularity, so
         // this is a floor rather than a computed requirement.
-        auto const staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
-        size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
+        auto const staging
+            = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, chunkStream);
+        size_t const batchSize = std::min(maxPages, staging.size() / coldPageBytes);
         stagingPageIndices.resize(batchSize);
 
         if (srcIsHot)
@@ -1223,8 +1247,8 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
             {
                 stagingPageIndices[index] = PageIndexPair{static_cast<int32_t>(index), pageIndices[offset + index].src};
             }
-            TLLM_CHECK_WITH_INFO(
-                encodeBatch(reinterpret_cast<void*>(staging.address()), stagingPageIndices.data(), batchSize, stream),
+            TLLM_CHECK_WITH_INFO(encodeColdPages(batchingLayerGroupId, reinterpret_cast<void*>(staging.address()),
+                                     stagingPageIndices.data(), batchSize, chunkStream),
                 "Cold-page codec rejected a migration batch");
 
             std::vector<CopyTask> tasks;
@@ -1234,7 +1258,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].dst)).at(PoolIndex{0}),
                     Address{std::in_place_type<MemAddress>, staging.address() + index * coldPageBytes}});
             }
-            mCopyEngine->transfer(CacheTier::DISK, CacheTier::HOST_MEM, coldPageBytes, tasks, stream);
+            mCopyEngine->transfer(CacheTier::DISK, CacheTier::HOST_MEM, coldPageBytes, tasks, chunkStream);
         }
         else
         {
@@ -1245,20 +1269,82 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({Address{std::in_place_type<MemAddress>, staging.address() + index * coldPageBytes},
                     srcPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].src)).at(PoolIndex{0})});
             }
-            mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::DISK, coldPageBytes, tasks, stream);
+            mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::DISK, coldPageBytes, tasks, chunkStream);
             for (size_t index = 0; index < batchSize; ++index)
             {
                 stagingPageIndices[index] = PageIndexPair{pageIndices[offset + index].dst, static_cast<int32_t>(index)};
             }
-            TLLM_CHECK_WITH_INFO(decodeBatch(reinterpret_cast<void const*>(staging.address()),
-                                     stagingPageIndices.data(), batchSize, stream),
+            TLLM_CHECK_WITH_INFO(decodeColdPages(batchingLayerGroupId, reinterpret_cast<void const*>(staging.address()),
+                                     stagingPageIndices.data(), batchSize, chunkStream),
                 "Cold-page codec rejected a migration batch");
         }
+        return batchSize;
+    };
 
-        offset += batchSize;
-        remaining -= batchSize;
+    // Stretches in flight: at most the depth, the pages of the move, and the cold pages the ring holds.
+    size_t const ringPages = mPageStagingManager->totalSize() / coldPageBytes;
+    size_t const lanes = std::min({mPageStagingDepth, numPages, ringPages});
+    if (lanes <= 1)
+    {
+        // One stretch after another on `stream`, each as large as the ring hands out.
+        size_t offset = 0;
+        while (offset < numPages)
+        {
+            offset += stageChunk(offset, numPages - offset, stream);
+        }
+        trimRetainedPageIndices(stagingPageIndices);
+        return;
     }
 
+    // Bounded parallel form. Every stretch is at most 1/lanes of the ring, so `lanes` of them fit side by side and
+    // the ring stays open to other moves; stretch i runs on lane i % lanes. Issued round-robin, each lease reuses the
+    // part of the ring that the lane's previous stretch (or an older move) used, so a lane waits only for that
+    // stretch and the lanes' disk reads and writes overlap on the async disk I/O pool. Every lane starts after
+    // `stream` (which already waits for the move's source pages and destination slots) and `stream` waits for every
+    // lane before returning, so the caller's finish event covers the whole move -- also when a stretch throws.
+    size_t const lanePages = ringPages / lanes;
+    CachedCudaEvent const forkEvent(reinterpret_cast<CudaStream>(stream));
+    std::vector<std::unique_ptr<TemporaryCudaStream>> laneStreams;
+    laneStreams.reserve(lanes);
+    auto join = FuncGuard(
+        [&]()
+        {
+            try
+            {
+                std::vector<CUevent> laneEnds;
+                std::vector<CachedCudaEvent> laneEvents;
+                laneEvents.reserve(laneStreams.size());
+                for (auto const& lane : laneStreams)
+                {
+                    laneEvents.emplace_back(reinterpret_cast<CudaStream>(lane->get()));
+                    laneEnds.push_back(laneEvents.back().handle());
+                }
+                streamWaitEvents(reinterpret_cast<CudaStream>(stream), std::move(laneEnds));
+            }
+            catch (...)
+            {
+                // `stream` may not wait for every lane, yet the caller publishes readiness from it (also while
+                // unwinding): finish the lanes' work on the host first, so that whatever it publishes covers their
+                // writes. A lane that cannot be synchronized leaves the error to propagate (and poison).
+                for (auto const& lane : laneStreams)
+                {
+                    cuCheck(cuStreamSynchronize(lane->get()));
+                }
+                throw;
+            }
+        });
+    for (size_t lane = 0; lane < lanes; ++lane)
+    {
+        laneStreams.push_back(std::make_unique<TemporaryCudaStream>(std::vector<CUevent>{forkEvent.handle()}));
+    }
+    size_t offset = 0;
+    for (size_t chunk = 0; offset < numPages; ++chunk)
+    {
+        offset += stageChunk(offset, std::min(lanePages, numPages - offset), laneStreams[chunk % lanes]->get());
+        ++mPageStagingLaneChunks;
+        mPageStagingLaneReadChunks += srcIsHot ? 0 : 1;
+    }
+    join.run();
     trimRetainedPageIndices(stagingPageIndices);
 }
 
@@ -1504,6 +1590,12 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 {
     PoolGroupIndex pg = getPoolGroupIndex(level, lc);
     mLevels.at(level).storage->release(pg, std::move(slot));
+}
+
+StorageManager::PageStagingInfo StorageManager::pageStagingInfo() const noexcept
+{
+    return {mPageStagingManager ? mPageStagingManager->totalSize() : 0, mPageStagingDepth, mPageStagingLaneChunks,
+        mPageStagingLaneReadChunks};
 }
 
 StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept
@@ -2023,9 +2115,30 @@ void StorageManager::_prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex
         goals.at(level).at(pgIdx) = requirements.at(pgIdx);
     }
 
-    PagesByLifeCycle fallenPages(numLifeCycles());
-    std::vector<SharedPtr<Page>> keepAlive;
-    _prepareFreeSlots(goals, level, fallenPages, keepAlive, migrationRecorder, dropRecorder, localityDomainId);
+    auto const attempt = [&]()
+    {
+        PagesByLifeCycle fallenPages(numLifeCycles());
+        std::vector<SharedPtr<Page>> keepAlive;
+        _prepareFreeSlots(goals, level, fallenPages, keepAlive, migrationRecorder, dropRecorder, localityDomainId);
+    };
+    mFreeReserveApplied = false;
+    try
+    {
+        attempt();
+    }
+    catch (OutOfPagesError const&)
+    {
+        // The free-slot reserve is best effort: its extra evictions may need room the tiers below do not have (held
+        // pages falling to a full last level). The rollback guards have put every evicted page back, so try again
+        // for exactly what was asked.
+        if (!mFreeReserveApplied || mFreeReserveSuppressed != 0)
+        {
+            throw;
+        }
+        ++mFreeReserveSuppressed;
+        auto restore = FuncGuard([this]() noexcept { --mFreeReserveSuppressed; });
+        attempt();
+    }
 }
 
 void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
@@ -2303,7 +2416,22 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         SlotCount const oldFree = isFailed ? 0 : freeSlots(pgIdx);
         SlotCount const evictableCount = isFailed ? 0 : ctrl.numEvictablePages(pgIdx, domainFilter);
         SlotCount const required = goal + fallen;
-        SlotCount const shortage = required > oldFree ? required - oldFree : 0;
+        SlotCount shortage = required > oldFree ? required - oldFree : 0;
+        if (!isLast && !isFailed && lvlId != kHotLevel && mFreeReserveSuppressed == 0
+            && mFreeReserveFractionAt.at(lvlId) > 0.0F)
+        {
+            // Free-slot reserve of a middle tier: evict one reserve ahead of need, so incoming pages are more likely
+            // to take slots whose write-out to the tier below has finished. Best effort (see the 5-argument
+            // _prepareFreeSlots).
+            auto const reserve = static_cast<SlotCount>(
+                static_cast<double>(storage.numSlots(pgIdx)) * static_cast<double>(mFreeReserveFractionAt.at(lvlId)));
+            if (reserve > 0 && oldFree < required + reserve)
+            {
+                SlotCount const withReserve = required + reserve - oldFree;
+                mFreeReserveApplied = mFreeReserveApplied || std::min(withReserve, evictableCount) > shortage;
+                shortage = withReserve;
+            }
+        }
         numToEvict.at(pgIdx) = std::min(shortage, evictableCount);
 
         SlotCount fallenHeld = 0;
@@ -3146,8 +3274,14 @@ void StorageManager::shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
     // Ensure free slots for the overflow pages.
     TypedVec<PoolGroupIndex, SlotCount> reqs(numPoolGroups(level), 0);
     reqs[pgIdx] = slotCountValueFromSize(overflowPages.size());
-    // The eviction order captured above must remain stable through defragmentation.
-    _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{}, domainFilter);
+    // The eviction order captured above must remain stable through defragmentation: take exactly the slots the
+    // overflow pages need, without the free-slot reserve, whose extra evictions could take one of those pages to
+    // the tier below while the defragmentation still moves it as a page of this level.
+    {
+        ++mFreeReserveSuppressed;
+        auto restore = FuncGuard([this]() noexcept { --mFreeReserveSuppressed; });
+        _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{}, domainFilter);
+    }
 
     // A17: all overflow pages must be at the expected cache level.
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(overflowPages.begin(), overflowPages.end(),

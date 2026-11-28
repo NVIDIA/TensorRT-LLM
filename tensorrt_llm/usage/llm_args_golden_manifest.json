@@ -732,9 +732,24 @@
       "path": "kv_cache_config.cold_tier_offload_min_priority"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.context_claim_ahead"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.context_prefetch_blocks"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.copy_on_partial_reuse"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.copy_stream_busy_skip"
     },
     {
       "capture_policy": "float|none",
@@ -744,7 +759,17 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "kv_cache_config.defer_context_only_release"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "kv_cache_config.defer_generation_only_release"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.deferred_release_thread"
     },
     {
       "capture_policy": "int|none",
@@ -770,6 +795,11 @@
       "capture_policy": "float",
       "kind": "value",
       "path": "kv_cache_config.disk_protected_copy_fraction"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.disk_write_behind_mib"
     },
     {
       "capture_policy": "bool",
@@ -834,9 +864,19 @@
       "path": "kv_cache_config.host_cache_bind_to_gpu_numa_node"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.host_cache_free_reserve_fraction"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "kv_cache_config.host_cache_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.host_copy_threads"
     },
     {
       "capture_policy": "int",
@@ -978,6 +1018,16 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_config.mixed_precision_reuse"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.page_staging_depth"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.page_staging_mib"
     },
     {
       "capture_policy": "list[float]|none",
@@ -1715,6 +1765,21 @@
       "path": "scheduler_config.context_chunking_policy"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.context_claim_hold"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.context_demote_no_walk"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.context_demote_probe"
+    },
+    {
       "allowed_values": [
         "fcfs",
         "shortest_uncached_first"
@@ -1747,6 +1812,16 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "scheduler_config.enable_prefix_aware_scheduling"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.gen_handoff_seat"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.gen_init_pause_after_release"
     },
     {
       "capture_policy": "float|none",

@@ -594,6 +594,7 @@ void DiskSlotPool::destroy()
         // are recorded after each transfer's completion wait, before destroying them. The wait guards the descriptor
         // against any piece still in flight. It is process-wide, so it also waits for other managers' disk I/O.
         waitForDiskIo();
+        discardDiskWriteBehind(mFd, 0); // a page whose flush failed stays in staging; the descriptor may be reused
         ::close(mFd);
         mFd = kBadFileDescriptor;
     }
@@ -602,6 +603,11 @@ void DiskSlotPool::destroy()
 
 void DiskSlotPool::resize(SlotCount newNumSlots)
 {
+    if (newNumSlots < mNumSlots)
+    {
+        // A pending write-behind flush past the new end would grow the file again.
+        discardDiskWriteBehind(mFd, static_cast<ssize_t>(slotCountToSizeT(newNumSlots) * mSlotSize));
+    }
     // Recorded only once the file really changed size: resizeFile throws without resizing.
     resizeFile(mFd, slotCountToSizeT(newNumSlots) * mSlotSize);
     mNumSlots = newNumSlots;

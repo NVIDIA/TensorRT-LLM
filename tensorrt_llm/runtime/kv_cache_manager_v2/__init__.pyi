@@ -280,6 +280,9 @@ class HostCacheTierConfig:
     max_quota: int | None = None
     # Deprecated: set KVCacheManagerConfig.host_mem_backing. False still makes the placement strict.
     allow_remote_numa_fallback: bool = True
+    # Share of each pool group's slots, 0 to 0.25, that evictions keep free ahead of need while a tier
+    # below takes them. No effect on the last tier.
+    free_reserve_fraction: float = 0.0
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -292,6 +295,7 @@ class DiskCacheTierConfig:
     keep_copy_after_restore: bool = False
     write_through: bool = False
     protected_copy_fraction: float = 1.0
+    write_behind_bytes: int = 0
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -622,6 +626,17 @@ class KVCacheManagerConfig:
     # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
     # per-layer-group slot-count proportions at cold page sizes.
     cold_typical_step: BatchDesc | None = None
+    # Threads, 1 to 64, that one host-side copy callback spreads its page tasks over, the CUDA
+    # callback thread included. Process-wide: the first manager that sets a value above 1 sets it.
+    host_copy_threads: int = 1
+    # Pooled CUDA streams, 0 to 4096, a page copy skips while they still have work pending (0: off).
+    # Process-wide: the first manager that sets a nonzero value sets it.
+    copy_stream_busy_skip: int = 0
+    # Size in MiB, 1 to 65536, of the pinned ring page moves between GPU and disk (or a remote level) pass
+    # through; at least three of the largest cold pages. Per manager.
+    page_staging_mib: int = 64
+    # Ring stretches, 1 to 16, one page move between GPU and disk keeps in flight on its own streams. Per manager.
+    page_staging_depth: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

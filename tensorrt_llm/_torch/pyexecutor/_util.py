@@ -30,10 +30,11 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, CapacitySchedulerPolicy, ContextSchedulingPolicy,
-    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
-    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    _KV_CACHE_HOST_HELPER_FIELDS, CacheTransceiverConfig,
+    CapacitySchedulerPolicy, ContextSchedulingPolicy, KVEventsConfig,
+    KvCacheCompressionConfig, KvCacheConfig, MultimodalEncoderSchedulingPolicy,
+    PeftCacheConfig, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
+    TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -1346,11 +1347,16 @@ class KvCacheCreator:
         """Raise for KV cache fields the resolved manager or executor loop would ignore."""
         kv_cache_config = self._kv_cache_config
         used_fields = {
-            "remote_cache_config":
-            kv_cache_config.remote_cache_config is not None,
-            "defer_generation_only_release":
-            kv_cache_config.defer_generation_only_release,
+            "remote_cache_config": kv_cache_config.remote_cache_config
+            is not None,
+            # Copy-path settings that KvCacheConfig accepts with
+            # use_kv_cache_manager_v2="auto": only V2 reads them.
+            "host_copy_threads": kv_cache_config.host_copy_threads > 1,
+            "copy_stream_busy_skip": kv_cache_config.copy_stream_busy_skip > 0,
+            "page_staging_mib": kv_cache_config.page_staging_mib != 64,
         }
+        for field in _KV_CACHE_HOST_HELPER_FIELDS:
+            used_fields[field] = getattr(kv_cache_config, field)
         for field, is_set in used_fields.items():
             if is_set and not self._is_kv_cache_manager_v2:
                 raise ValueError(
@@ -1359,18 +1365,22 @@ class KvCacheCreator:
                     "kv_cache_config.use_kv_cache_manager_v2=True and disable "
                     "features that fall back to V1.")
         # TorchLlmArgs rejects the same at parse time; this sees the resolved values.
-        if kv_cache_config.defer_generation_only_release and (
-                llm_args.disable_overlap_scheduler or mapping.pp_size > 1):
-            raise ValueError(
-                "kv_cache_config.defer_generation_only_release is used only "
-                "by the overlap scheduler loop, which needs "
-                "disable_overlap_scheduler=False and pipeline parallel size 1.")
-        if kv_cache_config.defer_generation_only_release and not self._is_disagg:
-            logger.warning(
-                "kv_cache_config.defer_generation_only_release has no effect "
-                "without a cache transceiver: only the generation-only "
-                "requests of a disaggregated generation server are released "
-                "late.")
+        for field in _KV_CACHE_HOST_HELPER_FIELDS:
+            if getattr(kv_cache_config,
+                       field) and (llm_args.disable_overlap_scheduler
+                                   or mapping.pp_size > 1):
+                raise ValueError(
+                    f"kv_cache_config.{field} is used only "
+                    "by the overlap scheduler loop, which needs "
+                    "disable_overlap_scheduler=False and pipeline parallel size 1."
+                )
+        for field in ("defer_generation_only_release",
+                      "defer_context_only_release"):
+            if getattr(kv_cache_config, field) and not self._is_disagg:
+                logger.warning(
+                    f"kv_cache_config.{field} has no effect without a cache "
+                    "transceiver: only the generation-only and context-only "
+                    "requests of disaggregated servers are released late.")
 
     @property
     def _is_agg_helix(self) -> bool:
@@ -5805,6 +5815,48 @@ def create_py_executor_resources(
         logger.warning(
             "scheduler_config.max_gen_init_admissions_per_pass is ignored: it "
             "needs the KV cache manager V2 scheduler")
+    if (not isinstance(kv_cache_manager, KVCacheManagerV2)
+            and scheduler_config is not None
+            and scheduler_config.context_demote_probe):
+        logger.warning("scheduler_config.context_demote_probe is ignored: it "
+                       "needs the KV cache manager V2 scheduler")
+    gen_handoff_seat = (scheduler_config is not None
+                        and scheduler_config.gen_handoff_seat)
+    if gen_handoff_seat and not (isinstance(kv_cache_manager, KVCacheManagerV2)
+                                 and is_disagg
+                                 and not mapping.enable_attention_dp):
+        logger.warning(
+            "scheduler_config.gen_handoff_seat is ignored: it needs a "
+            "disaggregated server, the KV cache manager V2 scheduler and no "
+            "attention DP")
+        gen_handoff_seat = False
+    gen_init_pause_after_release = (
+        scheduler_config is not None
+        and scheduler_config.gen_init_pause_after_release)
+    if gen_init_pause_after_release and not (isinstance(
+            kv_cache_manager, KVCacheManagerV2) and is_disagg):
+        logger.warning(
+            "scheduler_config.gen_init_pause_after_release is ignored: it "
+            "needs a disaggregated server and the KV cache manager V2 scheduler"
+        )
+        gen_init_pause_after_release = False
+    context_claim_hold = (scheduler_config is not None
+                          and scheduler_config.context_claim_hold)
+    if context_claim_hold and not (
+            isinstance(kv_cache_manager, KVCacheManagerV2)
+            and llm_args.kv_cache_config.context_claim_ahead > 0):
+        logger.warning(
+            "scheduler_config.context_claim_hold is ignored: it needs "
+            "kv_cache_config.context_claim_ahead > 0 and the KV cache manager V2 "
+            "scheduler")
+        context_claim_hold = False
+    context_demote_no_walk = (scheduler_config is not None
+                              and scheduler_config.context_demote_no_walk)
+    if context_demote_no_walk and not isinstance(kv_cache_manager,
+                                                 KVCacheManagerV2):
+        logger.warning("scheduler_config.context_demote_no_walk is ignored: it "
+                       "needs the KV cache manager V2 scheduler")
+        context_demote_no_walk = False
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -5845,6 +5897,14 @@ def create_py_executor_resources(
                 if scheduler_config is not None else None),
             exact_context_demotion=runtime_hooks_of(
                 model_engine.model).exact_context_demotion,
+            context_demote_probe=(scheduler_config.context_demote_probe
+                                  if scheduler_config is not None else False),
+            gen_handoff_seat=gen_handoff_seat,
+            gen_init_pause_after_release=gen_init_pause_after_release,
+            reclaim_context_claims=llm_args.kv_cache_config.context_claim_ahead
+            > 0,
+            context_claim_hold=context_claim_hold,
+            context_demote_no_walk=context_demote_no_walk,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
@@ -6077,6 +6137,13 @@ def create_py_executor_instance(
         kv_pool_rebalance_config.check_interval,
         defer_generation_only_release=llm_args.kv_cache_config.
         defer_generation_only_release,
+        defer_context_only_release=llm_args.kv_cache_config.
+        defer_context_only_release,
+        deferred_release_thread=llm_args.kv_cache_config.
+        deferred_release_thread,
+        context_claim_ahead=llm_args.kv_cache_config.context_claim_ahead,
+        context_prefetch_blocks=llm_args.kv_cache_config.
+        context_prefetch_blocks,
         enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
         enable_scheduler_aware_adp_dummy=should_enable_scheduler_aware_adp_dummy(
             getattr(config, "model_type", None), mapping,

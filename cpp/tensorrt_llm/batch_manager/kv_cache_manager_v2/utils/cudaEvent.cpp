@@ -18,6 +18,13 @@
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
+#include "tensorrt_llm/common/logger.h"
+
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
@@ -140,6 +147,11 @@ CachedCudaStream::CachedCudaStream()
 {
 }
 
+CachedCudaStream::CachedCudaStream(CudaStreamPool::PoolItem item) noexcept
+    : mPoolItem(std::move(item))
+{
+}
+
 CachedCudaEvent CachedCudaStream::recordEvent() noexcept
 {
     return CachedCudaEvent{reinterpret_cast<CudaStream>(handle())};
@@ -154,8 +166,131 @@ void CachedCudaStream::synchronize()
 // TemporaryCudaStream implementation
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
+std::atomic<size_t> gBusyStreamSkip{0};
+std::atomic<uint64_t> gBusyStreamsSkipped{0};
+
+//! A pooled stream, skipping up to busyStreamSkip() streams that still have work pending. The last one taken is
+//! returned even if it is busy.
+CudaStreamPool::PoolItem acquireTemporaryStream()
+{
+    auto& pool = CudaStreamPool::instance();
+    auto item = pool.get();
+    size_t const maxBusy = gBusyStreamSkip.load(std::memory_order_relaxed);
+    if (maxBusy == 0 || cuStreamQuery(item.get()) != CUDA_ERROR_NOT_READY)
+    {
+        return item;
+    }
+    // Skipped streams stay out of the pool until this returns, so none is offered twice; they go back to the pool's
+    // tail when `busy` is destroyed. A stream that reports an error is not busy: its user sees the error.
+    std::vector<CudaStreamPool::PoolItem> busy;
+    do
+    {
+        busy.push_back(std::move(item));
+        item = pool.get();
+    } while (busy.size() < maxBusy && cuStreamQuery(item.get()) == CUDA_ERROR_NOT_READY);
+    gBusyStreamsSkipped.fetch_add(busy.size(), std::memory_order_relaxed);
+    return item;
+}
+
+} // namespace
+
+void configureBusyStreamSkip(size_t maxBusy) noexcept
+{
+    if (maxBusy == 0)
+    {
+        return;
+    }
+    static std::atomic<size_t> configured{0};
+    size_t expected = 0;
+    if (!configured.compare_exchange_strong(expected, maxBusy))
+    {
+        if (expected != maxBusy)
+        {
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2] copy streams already skip up to %zu busy streams in this process; ignoring a "
+                "request for %zu",
+                expected, maxBusy);
+        }
+        return;
+    }
+    gBusyStreamSkip.store(maxBusy, std::memory_order_relaxed);
+    TLLM_LOG_INFO("[kvCacheManagerV2] copy streams skip up to %zu busy pooled streams", maxBusy);
+}
+
+size_t busyStreamSkip() noexcept
+{
+    return gBusyStreamSkip.load(std::memory_order_relaxed);
+}
+
+void setBusyStreamSkipForTesting(size_t maxBusy) noexcept
+{
+    gBusyStreamSkip.store(maxBusy, std::memory_order_relaxed);
+}
+
+namespace
+{
+
+std::mutex gCopyStreamConfigMutex;
+size_t gDeepPageStagingManagers = 0; // guarded by gCopyStreamConfigMutex
+
+} // namespace
+
+DeepPageStagingHold configureCopyStreams(size_t busySkip, size_t pageStagingDepth)
+{
+    std::lock_guard<std::mutex> lock(gCopyStreamConfigMutex);
+    if (pageStagingDepth > 1)
+    {
+        size_t const effective = gBusyStreamSkip.load(std::memory_order_relaxed);
+        if (busySkip > 0 || effective > 0)
+        {
+            throw std::invalid_argument("KVCacheManagerV2: pageStagingDepth " + std::to_string(pageStagingDepth)
+                + " cannot be combined with busy-stream skipping, which is process-wide ("
+                + (busySkip > 0 ? "copyStreamBusySkip " + std::to_string(busySkip) + " of this manager"
+                                : "copyStreamBusySkip " + std::to_string(effective) + " set in this process")
+                + ")");
+        }
+    }
+    else if (busySkip > 0 && gDeepPageStagingManagers > 0)
+    {
+        throw std::invalid_argument("KVCacheManagerV2: copyStreamBusySkip " + std::to_string(busySkip)
+            + " cannot be set while " + std::to_string(gDeepPageStagingManagers)
+            + " manager(s) with pageStagingDepth > 1 live in this process: busy-stream skipping is process-wide");
+    }
+    configureBusyStreamSkip(busySkip);
+    DeepPageStagingHold hold;
+    if (pageStagingDepth > 1)
+    {
+        ++gDeepPageStagingManagers;
+        hold.mActive = true;
+    }
+    return hold;
+}
+
+void DeepPageStagingHold::release() noexcept
+{
+    if (std::exchange(mActive, false))
+    {
+        std::lock_guard<std::mutex> lock(gCopyStreamConfigMutex);
+        --gDeepPageStagingManagers;
+    }
+}
+
+size_t deepPageStagingManagersForTesting() noexcept
+{
+    std::lock_guard<std::mutex> lock(gCopyStreamConfigMutex);
+    return gDeepPageStagingManagers;
+}
+
+uint64_t busyStreamsSkippedForTesting() noexcept
+{
+    return gBusyStreamsSkipped.load(std::memory_order_relaxed);
+}
+
 TemporaryCudaStream::TemporaryCudaStream(std::vector<CUevent> priorEvents)
-    : mStream()
+    : mStream(acquireTemporaryStream())
 {
     CudaStream cs = reinterpret_cast<CudaStream>(mStream.handle());
     streamWaitEvents(cs, std::move(priorEvents));
