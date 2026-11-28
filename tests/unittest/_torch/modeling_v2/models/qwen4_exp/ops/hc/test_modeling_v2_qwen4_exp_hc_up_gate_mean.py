@@ -61,11 +61,14 @@ def _build(spec, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))
-    mixed = op(*args)
+    kw = {k: cell.spec[k] for k in ("release_early", "tm") if k in cell.spec}
+    mixed = op(*args, **kw)
     assert mixed.shape == (cell.spec["rows"], cell.spec.get("hidden", 2560))
     # The answer came from the CuTe DSL kernel, JIT-compiled for this device.
-    assert (_BLOCK_H, args[3], mixed.shape[1], args[0].shape[1], False, False) in _COMPILED
-    _compare(mixed, op.reference(*args))
+    key = (_BLOCK_H, args[3], mixed.shape[1], args[0].shape[1], False, False)
+    key += (kw.get("release_early", False), kw.get("tm", 128))
+    assert key in _COMPILED
+    _compare(mixed, op.reference(*args, **kw))
 
 
 def test_guard_refuses_a_contiguous_up() -> None:
@@ -105,6 +108,29 @@ def test_wide_epilogue_is_bitwise_the_four_warp_one(rows) -> None:
     with torch.cuda.graph(graph):
         out = op(static, up, normed, hc, wide=True)
     fresh, _, _, _ = _build(dict(rows=rows), seed=4200 + rows)
+    static.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, op(fresh, up, normed, hc))
+
+
+@pytest.mark.parametrize("rows", [5, 17, 36, 63, 64, 65, 96, 105, 127, 128])
+@pytest.mark.parametrize("release_early", [False, True])
+def test_tile64_is_bitwise_the_128_row_kernel(rows, release_early) -> None:
+    """`tm=64` (one tile up to 64 rows, two above) and `release_early` give the default
+    kernel's bits, eagerly and replayed from a CUDA graph; the output is `[rows, H]` with
+    unit column stride whatever its padded allocation."""
+    low, up, normed, hc = _build(dict(rows=rows), seed=4300 + rows)
+    ref = op(low, up, normed, hc)
+    got = op(low, up, normed, hc, release_early=release_early, tm=64)
+    torch.cuda.synchronize()
+    assert got.shape == ref.shape and got.is_contiguous()
+    assert torch.equal(ref, got)
+    static = low.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(static, up, normed, hc, release_early=release_early, tm=64)
+    fresh, _, _, _ = _build(dict(rows=rows), seed=4400 + rows)
     static.copy_(fresh)
     graph.replay()
     torch.cuda.synchronize()

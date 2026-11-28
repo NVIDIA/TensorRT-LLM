@@ -125,6 +125,10 @@ MAX_PLAN_SPLITS = 32
 MAX_TAIL_SPLITS = 4
 #: Fewer request groups than this take the per-row kernel.
 MIN_GROUPS = 8
+#: The fewest groups a caller may ask `takes_grouped` to serve (`min_groups`): two groups of a
+#: rank's verify rows over many splits each. A caller that asks below `MIN_GROUPS` plans those
+#: launches on its first such call (`reachable_plans` from its own count up).
+SMALL_MIN_GROUPS = 2
 #: Scan scratch words: (row, column round) x warp counts.
 SCAN_WORDS = 256
 # --- inline PTX beyond the per-row kernel's ---
@@ -2320,10 +2324,12 @@ def plan_launch(n_groups: int, kv_heads: int, width: int, num_sms: int):
     return tail_splits, units - tail
 
 
-def reachable_plans(max_groups: int, kv_heads: int, width: int, num_sms: int) -> list:
-    """Every `(splits, tail)` pair `plan_launch` returns for `MIN_GROUPS..max_groups` groups."""
+def reachable_plans(
+    max_groups: int, kv_heads: int, width: int, num_sms: int, min_groups: int = MIN_GROUPS
+) -> list:
+    """Every `(splits, tail)` pair `plan_launch` returns for `min_groups..max_groups` groups."""
     plans = set()
-    for n_groups in range(MIN_GROUPS, max(MIN_GROUPS, max_groups) + 1):
+    for n_groups in range(min_groups, max(min_groups, max_groups) + 1):
         splits, n_whole = plan_launch(n_groups, kv_heads, width, num_sms)
         plans.add((max(1, min(MAX_SPLITS, int(splits))), n_whole is not None))
     return sorted(plans)
@@ -2373,14 +2379,19 @@ def _compile_plan(pkey: tuple, plan_kw: dict, plan_args: tuple):
     return fn
 
 
-def takes_grouped(q, k_cache, selected_tokens, rows_per_request) -> bool:
+def takes_grouped(
+    q, k_cache, selected_tokens, rows_per_request, min_groups: int = MIN_GROUPS
+) -> bool:
     """Whether `sparse_gqa_grouped` serves this call (on shapes only, so a per-capture constant):
-    an e4m3 pool on SM103/SM107, 2..4 rows a request, `MIN_GROUPS` groups, a shared-memory plan."""
+    an e4m3 pool on SM103/SM107, 2..4 rows a request, at least `min_groups` groups (`MIN_GROUPS`
+    unless the caller asks for as few as `SMALL_MIN_GROUPS`), a shared-memory plan."""
+    if not SMALL_MIN_GROUPS <= int(min_groups):
+        raise ValueError(f"min_groups={min_groups}: at least {SMALL_MIN_GROUPS}")
     if q.dim() != 3 or k_cache.dim() != 4 or k_cache.dtype != torch.float8_e4m3fn:
         return False
     rows, num_q_heads, head_dim = q.shape
     rpr = int(rows_per_request)
-    if rpr < 2 or rpr > MAX_RPR or -(-rows // rpr) < MIN_GROUPS or head_dim != HEAD_DIM:
+    if rpr < 2 or rpr > MAX_RPR or -(-rows // rpr) < int(min_groups) or head_dim != HEAD_DIM:
         return False
     if k_cache.shape[3] != HEAD_DIM or num_q_heads % k_cache.shape[1]:
         return False
@@ -2429,9 +2440,11 @@ def sparse_gqa_grouped(
     softmax_scale: float,
     rows_per_request: int,
     output_gate: Optional[torch.Tensor] = None,
+    min_groups: Optional[int] = None,
 ) -> torch.Tensor:
     """The grouped kernel (and the row merge with more than one split) over an e4m3 pool; see
-    `QsaSparseGqaGroupedCute` for the contract."""
+    `QsaSparseGqaGroupedCute` for the contract. `min_groups`: the fewest groups the caller routes
+    here (what it passes `takes_grouped`), from which the first call of a geometry plans."""
     rows, num_q_heads, head_dim = q.shape
     num_pages, num_kv_heads, tpb, dim = k_cache.shape
     rpr = int(rows_per_request)
@@ -2595,12 +2608,15 @@ def sparse_gqa_grouped(
         bal_ctas=n_sms,
     )
     # A launch plan depends on the call's row count: the first call of a geometry compiles every
-    # plan its row counts can reach, so no serving step compiles one.
-    if key[:5] + key[7:] not in _PLANNED:
-        _PLANNED.add(key[:5] + key[7:])
+    # plan its row counts can reach, so no serving step compiles one. Below `MIN_GROUPS` groups
+    # the reach starts at the caller's `min_groups` (else at the call's own count), so a later
+    # call at fewer groups than the first, but not fewer than the caller routes, compiles none.
+    floor = min(MIN_GROUPS, n_groups if min_groups is None else int(min_groups))
+    if key[:5] + key[7:] + (floor,) not in _PLANNED:
+        _PLANNED.add(key[:5] + key[7:] + (floor,))
         max_groups = block_table.shape[0]
         for plan_splits_, plan_tail in reachable_plans(
-            max_groups, num_kv_heads, width, _num_sms(q.device.index or 0)
+            max_groups, num_kv_heads, width, _num_sms(q.device.index or 0), floor
         ):
             if _layout(rpr, group, width, 1 if plan_tail else plan_splits_) is None:
                 continue
@@ -2716,6 +2732,16 @@ class QsaSparseGqaGroupedCute(OpWrapper):
             spec=_grouped(_DEP4, 8, rows=4, capture=True, **_DEP4_ROW),
         ),
         Cell(
+            why="dep8 MTP-3 verify at 2 requests a rank (min_groups 2): 2 x 4 rows, 32 splits a "
+            "(group, KV head) and their merge, gated, captured",
+            spec=_grouped(_DEP4, 2, rows=4, capture=True, min_groups=2, **_DEP4_ROW),
+        ),
+        Cell(
+            why="dep8 MTP-3 verify at 5 requests a rank (min_groups 2): 5 x 4 rows deep in long "
+            "sequences, gated",
+            spec=_grouped(_DEP4, 5, rows=4, last=196607, step=4099, min_groups=2, **_DEP4_ROW),
+        ),
+        Cell(
             why="draft layer: 16 x 3 rows, the gate half of the interleaved q projection (head "
             "stride 512)",
             spec=_grouped(_TEP2, 16, gate="interleaved"),
@@ -2738,11 +2764,12 @@ class QsaSparseGqaGroupedCute(OpWrapper):
     )
 
     note = """
-    Source: this target's CuTe DSL kernels (`_GroupedKernel`, `_RowMergeKernel`, `_BalPlanKernel`),
+    Source: this module's CuTe DSL kernels (`_GroupedKernel`, `_RowMergeKernel`, `_BalPlanKernel`),
     `cute.compile`d per (T, splits, launch mode); every reachable plan of a geometry is compiled on
     its first call. Called by `modeling._sparse_gqa` for verify / draft-extend rows over an e4m3
     pool with `rows_per_request` > 1 where `serves` (an e4m3 pool on SM103/SM107, 2..4 rows a request,
-    at least `MIN_GROUPS` groups, T x q heads a KV head <= 128); the per-row
+    at least `MIN_GROUPS` groups, or `SMALL_MIN_GROUPS` when the caller passes `min_groups`, T x q
+    heads a KV head <= 128); the per-row
     `qsa_sparse_gqa_splitk_cute` otherwise. Graph-capturable (the row count is a runtime value).
 
     Numerics: K/V widened exactly to f16, q rounded to f16, f16 MMAs with fp32 accumulation, P
@@ -2772,7 +2799,9 @@ class QsaSparseGqaGroupedCute(OpWrapper):
         softmax_scale: float,
         rows_per_request: int,
         output_gate: Optional[torch.Tensor] = None,
+        min_groups: Optional[int] = None,
     ) -> torch.Tensor:
+        """`min_groups`: the floor the caller passes `serves` (planning reach only)."""
         return sparse_gqa_grouped(
             q,
             k_cache,
@@ -2784,6 +2813,7 @@ class QsaSparseGqaGroupedCute(OpWrapper):
             softmax_scale,
             rows_per_request,
             output_gate=output_gate,
+            min_groups=min_groups,
         )
 
     def reference(
@@ -2798,10 +2828,12 @@ class QsaSparseGqaGroupedCute(OpWrapper):
         softmax_scale: float,
         rows_per_request: int,
         output_gate: Optional[torch.Tensor] = None,
+        min_groups: Optional[int] = None,
     ) -> torch.Tensor:
         """The per-row entry's reference (fp32 sparse GQA over every resident selected token,
         rounded once; gated in fp32 over that rounding and rounded again). `rows_per_request`
-        is ignored: the grouping changes which loads serve a row, not what it attends."""
+        and `min_groups` are ignored: they change which loads serve a row and what is compiled
+        when, not what a row attends."""
         return qsa_sparse_gqa_splitk_cute.reference(
             q,
             k_cache,

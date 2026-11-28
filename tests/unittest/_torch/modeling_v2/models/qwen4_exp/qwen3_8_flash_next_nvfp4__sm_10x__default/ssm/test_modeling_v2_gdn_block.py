@@ -77,6 +77,8 @@ def _core(d, seed: int, state: torch.dtype, one_rank: bool) -> types.SimpleNames
         in_proj_split=(d.conv, d.vd, d.hv, d.hv),
         one_rank=one_rank,
         tp_sum=lambda x: x,
+        # The attention-DP bf16 output projections are off (`DP_OUT_PROJ_BF16_ENV`).
+        _out_proj=None,
         decode_mm=M._one_rank_projection if one_rank else M._decode_projection,
         decode_in_mm=(
             M._one_rank_projection
@@ -284,7 +286,9 @@ def test_captured_one_rank_fp32_decode_block() -> None:
 def _prefill(core, L, x, step):
     tokens = x.shape[0]
     out = torch.empty([1, tokens, core.num_v_heads, V], dtype=BF16, device=DEV)
-    target = _target(M.PrefillTarget, core, L, types.SimpleNamespace(gdn=step, num_tokens=tokens))
+    target = _target(
+        M.PrefillTarget, core, L, types.SimpleNamespace(gdn=step, num_tokens=tokens, inforward=None)
+    )
     return target._gdn_block(x, 0, L, out)
 
 

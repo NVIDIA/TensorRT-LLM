@@ -19,7 +19,10 @@ A table wider than one CTA's four keys a thread (`MAX_WIDTH`, e.g. the 65536 col
 launch: the row's window is staged in shared memory, a bound every top-k key clears is
 read off the lanes' maxima, the keys above it are compacted in block order, and the same
 selection runs over that short list (or over the window, slab by slab, when the list
-cannot hold them).
+cannot hold them). A context chunk's rows (`context=True`, past `CONTEXT_MIN_ROWS`) run
+that kernel as smaller CTAs without the window cache and with the bound read off all lanes at
+once (`CONTEXT_THREADS`, `CONTEXT_CTAS`): thousands of one-CTA rows are bound by how many CTAs
+an SM runs, not by one row's latency.
 """
 
 from __future__ import annotations
@@ -77,6 +80,15 @@ _SMEM_RESERVED = 1024
 #: and the alignment padding of its allocations.
 _WIDE_FIXED_WORDS = _HIST + 2 * CAP + 3 * 32 + 64 + 16
 _WIDE_PAD = 10 * 128
+#: The wide kernel for a context chunk's rows (`context=True` with more than `CONTEXT_MIN_ROWS`
+#: rows): `CONTEXT_THREADS`-thread CTAs, `CONTEXT_CTAS` an SM, no window cache, the prefilter's
+#: bound from all lanes (`_TopkExpandWideKernel(lane_bound=True)`). The same selection as the
+#: decode launch, bit for bit. GB300, 16384 context rows over 65568 columns: 22.6 -> 19.3 ms
+#: for a 12-layer step's scoring and selection, about 0.2 us a row; on real score tables 11.1
+#: -> 8.1 ms for the selection alone. At or below `CONTEXT_MIN_ROWS` rows the decode launch.
+CONTEXT_THREADS = 640
+CONTEXT_CTAS = 3
+CONTEXT_MIN_ROWS = 256
 
 
 def _threads(width: int) -> int:
@@ -450,7 +462,13 @@ class _TopkExpandWideKernel:
     the `k / warps` rounded up, the smallest over the warps of the `per_warp`-th largest lane
     maximum of each warp (`lo`) has at least `k` keys at or above it. The `k`-th largest key,
     every key tied with it and everything above are among those, so the keys below `lo` are
-    no candidates and the selection is unchanged.
+    no candidates and the selection is unchanged. With `lane_bound` the bound is the radix bin
+    of the `k`-th largest of all `threads >= k` lane maxima instead (two radix passes over one
+    lane maximum a thread, `_bound_passes`): at least `k` keys reach that bin's prefix, so it is
+    as valid, and on clustered real score tables it keeps far fewer candidates than the per-warp
+    bound at fewer than 1024 threads, whose list would overflow into the whole-window walk.
+    `window_cache=False` reads every slab from global (L2); the cache is sized for one decode
+    row's latency.
 
     Two walks of the window: the lane maxima, then the candidates (keys at or above `lo`)
     compacted in block order into a shared list of up to `KPT` a thread (a window of ~21k
@@ -474,6 +492,8 @@ class _TopkExpandWideKernel:
         ctas=1,
         prefilter=True,
         order=False,
+        window_cache=True,
+        lane_bound=False,
     ):
         self.width, self.key_stride, self.k, self.cr, self.token_topk, self.pdl = (
             width,
@@ -492,9 +512,15 @@ class _TopkExpandWideKernel:
         # `order`: CTA b takes row `row_order[b]` (longest window first), so the CTAs launched
         # last get the shortest windows. Every row's selection is the same.
         self.order = bool(order)
-        self.cache_slabs = _cache_slabs(width, threads, ctas)
+        self.cache_slabs = _cache_slabs(width, threads, ctas) if window_cache else 0
         self.per_warp = -(-block_topk // self.warps)
         self.prefilter = bool(prefilter) and self.per_warp <= 32
+        # The bound from all lanes needs a lane maximum for each of the k keys it ranks.
+        self.lane_bound = bool(lane_bound)
+        assert not self.lane_bound or (self.prefilter and threads >= block_topk), (
+            threads,
+            block_topk,
+        )
 
     def smem_bytes(self) -> int:
         return (self.cache_slabs * self.slab + 2 * self.slab + _WIDE_FIXED_WORDS) * 4 + _WIDE_PAD
@@ -619,6 +645,70 @@ class _TopkExpandWideKernel:
                                 state[4] = cutlass.Int32(
                                     cutlass.select_((h[j] <= CAP) | (shift == 0), 1, 0)
                                 )
+                                state[6] = cutlass.max(shift - 11, 0)
+                        run = run + h[j]
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _bound_passes(self, keys, tidx, warp, lane, hist, wsum, state):
+        """`_passes` for the lane bound: two radix passes (22 bits below the largest key's
+        highest bit) whatever the first pass's bin holds (`_bound_narrow`). `_passes` stops
+        once the threshold's bin has at most CAP keys, which is right for ranking that bin
+        pairwise but leaves a bound at the edge of an 11-bit bin: up to an eighth of an octave
+        below the k-th lane maximum, which on real score tables lets several times more keys
+        through."""
+        for _p in cutlass.range_constexpr(2):
+            if state[4] == 0:
+                prefix = state[0]
+                mask = state[1]
+                need = state[2]
+                shift = state[6]
+                for c in cutlass.range_constexpr(KPT):
+                    if keys[c] >= 0:
+                        if (keys[c] & mask) == prefix:
+                            digit = (keys[c] >> shift) & (_HIST - 1)
+                            cute.arch.atomic_add(
+                                hist.iterator + digit, cutlass.Int32(1), scope="cta"
+                            )
+                cute.arch.sync_threads()
+                self._bound_narrow(tidx, warp, lane, hist, wsum, state, prefix, mask, need, shift)
+
+    @cute.jit
+    def _bound_narrow(self, tidx, warp, lane, hist, wsum, state, prefix, mask, need, shift):
+        """`_narrow` for the lane bound: the same histogram read (and cleared) from the top bin
+        down, done only when no bits are left (not when the bin is small)."""
+        h = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Int32)
+        h.fill(0)
+        own = cutlass.Int32(0)
+        if tidx < _SCAN_THREADS:
+            for j in cutlass.range_constexpr(4):
+                h[j] = hist[_HIST - 1 - 4 * tidx - j]
+                hist[_HIST - 1 - 4 * tidx - j] = cutlass.Int32(0)
+                own = own + h[j]
+        incl = own
+        for off in (1, 2, 4, 8, 16):
+            up = cute.arch.shuffle_sync_up(incl, offset=off)
+            if lane >= off:
+                incl = incl + up
+        if lane == 31:
+            wsum[warp] = incl
+        cute.arch.sync_threads()
+        above = cutlass.Int32(0)
+        if lane < warp:
+            above = wsum[lane]
+        before = cute.arch.warp_reduction_sum(above) + incl - own
+        if tidx < _SCAN_THREADS:
+            if before < need:
+                if need <= before + own:
+                    run = before
+                    for j in cutlass.range_constexpr(4):
+                        if run < need:
+                            if need <= run + h[j]:
+                                state[0] = prefix | ((_HIST - 1 - 4 * tidx - j) << shift)
+                                state[1] = mask | ((_HIST - 1) << shift)
+                                state[2] = need - run
+                                state[3] = h[j]
+                                state[4] = cutlass.Int32(cutlass.select_(shift == 0, 1, 0))
                                 state[6] = cutlass.max(shift - 11, 0)
                         run = run + h[j]
         cute.arch.sync_threads()
@@ -989,7 +1079,7 @@ class _TopkExpandWideKernel:
         kmax = cute.arch.warp_reduction_max(tmax)
         if lane == 0:
             wa[warp] = kmax
-        if const_expr(self.prefilter):
+        if const_expr(self.prefilter and not self.lane_bound):
             ahead = cutlass.Int32(0)
             for i in cutlass.range_constexpr(32):
                 v = cute.arch.shuffle_sync(tmax, offset=i)
@@ -1004,7 +1094,36 @@ class _TopkExpandWideKernel:
         gmax = cute.arch.warp_reduction_max(gmax)
         # Keys below `lo` are no candidates; all are when the window holds at most k.
         lo = cutlass.Int32(0)
-        if const_expr(self.prefilter):
+        if const_expr(self.lane_bound):
+            # The bound from ALL lanes. Every lane's largest key is a distinct key of the
+            # window, and a window of more than one slab gives every lane a key, so the radix
+            # bin of the k-th largest of the `nt >= k` lane maxima starts at a value (`lo`, the
+            # bin's prefix) that at least k keys reach: the k-th largest key, every key tied
+            # with it and everything above are at or above `lo`. A window of at most one slab
+            # keeps `lo` 0: its keys all fit the list.
+            k2 = cute.make_rmem_tensor(cute.make_layout((KPT,), stride=(1,)), cutlass.Int32)
+            k2.fill(-1)
+            k2[0] = tmax
+            hb2 = cutlass.Int32(-1)
+            if gmax > 0:
+                hb2 = 31 - cutlass.Int32(cute.arch.clz(gmax))
+            low2 = (cutlass.Int64(1) << cutlass.Int64(hb2 + 1)) - 1
+            mask2 = cutlass.Int32(cutlass.Int64(_I32_MAX) & (cutlass.Int64(-1) ^ low2))
+            if tidx == 0:
+                state[0] = cutlass.Int32(0)  # the bound's prefix
+                state[1] = mask2  # its mask
+                state[2] = cutlass.Int32(k)  # the k-th largest lane maximum
+                state[3] = cutlass.Int32(nt)
+                state[4] = cutlass.Int32(1)  # narrowing done
+                state[6] = cutlass.max(hb2 - 10, 0)
+                if n > slab:
+                    if hb2 >= 0:
+                        state[4] = cutlass.Int32(0)
+            cute.arch.sync_threads()
+            self._bound_passes(k2, tidx, warp, lane, hist, wb, state)
+            if n > slab:
+                lo = state[0]
+        if const_expr(self.prefilter and not self.lane_bound):
             if n > k:
                 bound = cutlass.Int32(_I32_MAX)
                 if lane < nw:
@@ -1158,17 +1277,30 @@ def _sms(device) -> int:
     return sms
 
 
-def _wide_config(rows: int, device, ordered: bool = False) -> tuple:
-    """The wide kernel's `(threads, CTAs an SM, prefilter, order)` for a call of `rows` rows:
-    one 1024-thread CTA an SM (the largest window cache) while the rows fit one wave, two once
-    they do not, so one CTA's walks overlap the other's loads. With `ordered` (a `row_order`
-    given), past one wave the CTAs take the rows in that order, so the last wave takes the
-    shortest windows: one CTA an SM up to two waves, two past them. The same selection either
-    way."""
+def _wide_config(rows: int, device, ordered: bool = False, context: bool = False) -> tuple:
+    """The wide kernel's `(threads, CTAs an SM, prefilter, order, context)` for a call of `rows`
+    rows: one 1024-thread CTA an SM (the largest window cache) while the rows fit one wave, two
+    once they do not, so one CTA's walks overlap the other's loads. With `ordered` (a
+    `row_order` given), past one wave the CTAs take the rows in that order, so the last wave
+    takes the shortest windows: one CTA an SM up to two waves, two past them. A `context` call
+    (`takes_context`) runs `CONTEXT_CTAS` CTAs of `CONTEXT_THREADS` an SM without the window
+    cache, the bound from all lanes. The same selection every way."""
+    if context:
+        return (CONTEXT_THREADS, CONTEXT_CTAS, True, False, True)
     sms = _sms(device)
     if ordered and rows > sms:
-        return (_WIDE_THREADS, 1 if rows <= 2 * sms else 2, True, True)
-    return (_WIDE_THREADS, 1 if rows <= sms else 2, True, False)
+        return (_WIDE_THREADS, 1 if rows <= 2 * sms else 2, True, True, False)
+    return (_WIDE_THREADS, 1 if rows <= sms else 2, True, False, False)
+
+
+def takes_context(scores, block_topk: int) -> bool:
+    """Whether a `context=True` call over `scores` takes the context launch: a wide table, more
+    than `CONTEXT_MIN_ROWS` rows, and a lane for each of the k keys the bound ranks."""
+    return (
+        scores.shape[1] > MAX_WIDTH
+        and scores.shape[0] > CONTEXT_MIN_ROWS
+        and CONTEXT_THREADS >= block_topk
+    )
 
 
 def orders_rows(scores) -> bool:
@@ -1190,10 +1322,12 @@ def launch(
     pdl=True,
     out=None,
     row_order=None,
+    context=False,
 ):
     """The launch behind `QsaTopkExpandDecode.__call__`: writes `topk_indices` and returns the
     token selection `[rows, token_topk + compress_ratio - 1]` int32 (`out` when given).
-    `row_order`: int32 `[rows]`, a permutation of the rows, longest window first."""
+    `row_order`: int32 `[rows]`, a permutation of the rows, longest window first. `context`: the
+    rows are a context chunk's (`takes_context`; `row_order` is then not read)."""
     rows, width = scores.shape
     block_topk = topk_indices.shape[1]
     sel = out
@@ -1205,6 +1339,9 @@ def launch(
         return sel
     pdl = bool(pdl and get_env_enable_pdl())
     keys = scores.view(torch.int32)
+    context = bool(context) and takes_context(scores, block_topk)
+    if context:
+        row_order = None
     key = (
         width,
         scores.stride(0),
@@ -1214,7 +1351,9 @@ def launch(
         query_positions.dtype,
         sequence_lengths.dtype,
         pdl,
-        None if width <= MAX_WIDTH else _wide_config(rows, scores.device, row_order is not None),
+        None
+        if width <= MAX_WIDTH
+        else _wide_config(rows, scores.device, row_order is not None, context),
     )
     ptrs = (
         row_ends.data_ptr(),
@@ -1238,9 +1377,15 @@ def launch(
         if width <= MAX_WIDTH:
             kernel = _TopkExpandKernel(**geometry)
         else:
-            threads, ctas, prefilter, order = key[-1]
+            threads, ctas, prefilter, order, ctx = key[-1]
             kernel = _TopkExpandWideKernel(
-                **geometry, threads=threads, ctas=ctas, prefilter=prefilter, order=order
+                **geometry,
+                threads=threads,
+                ctas=ctas,
+                prefilter=prefilter,
+                order=order,
+                window_cache=not ctx,
+                lane_bound=ctx,
             )
         fn = _COMPILED[key] = cute.compile(
             kernel,
@@ -1441,6 +1586,18 @@ class QsaTopkExpandDecode(OpWrapper):
                 width=_TUNE_WIDTH_NO_MTP,
             ),
         ),
+        Cell(
+            why="wide: a CTX's context chunk on the context launch, 4096 rows (positions "
+            "90000..94095) at 65568, relu-sum, through `out`",
+            spec=dict(
+                rows=4096,
+                chunk=(90000, 4096),
+                relu_sum=True,
+                out_margin=64,
+                width=_TUNE_WIDTH,
+                context=True,
+            ),
+        ),
     )
 
     note = """
@@ -1453,7 +1610,10 @@ class QsaTopkExpandDecode(OpWrapper):
     block at the threshold, as `qsa_canonical_selection` rewrites the CUDA top-k's pick.
     `row_order` (optional): int32 `[rows]`, a permutation of the rows, longest window first,
     read by the wide kernel past one wave of rows (`orders_rows`), after the wait; a caller
-    sorts once a step for every layer.
+    sorts once a step for every layer. `context=True`: the rows are a context chunk's; past
+    `CONTEXT_MIN_ROWS` rows over a wide table (`takes_context`) the wide kernel runs as
+    `CONTEXT_CTAS` CTAs of `CONTEXT_THREADS` an SM without its window cache, the prefilter's
+    bound from all lanes, and `row_order` is not read. The selection is the same either way.
 
     Compiled once per score-table width and row stride (the block table's, fixed for an
     engine), k, compress ratio, token budget, index dtypes and PDL: the row count is a
@@ -1479,7 +1639,8 @@ class QsaTopkExpandDecode(OpWrapper):
       (relu-sum scores); 4 rows of log-normal scores (threshold bins ranked pairwise); 2
       relu-sparse rows (more candidates than the list holds: the whole-window path, the
       zero class straddling the budget); 3 rows of equal scores; and ht_dep4's 8160-row
-      context chunk through `out` (two CTAs an SM past one wave of rows).
+      context chunk through `out` (two CTAs an SM past one wave of rows); and a 4096-row
+      context chunk on the context launch (`context=True`).
     - A CUDA-graph replay at 1x2560, 1x2304, 128x2304, 1024x4096, 4x65568, 16x65536 and
       2x65536. The scores are refilled before each replay, and the selection, read after
       the wait, must equal the reference.
@@ -1495,7 +1656,9 @@ class QsaTopkExpandDecode(OpWrapper):
     - threshold bins ranked pairwise at 2304 and 4096 columns (the log-normal cell is at 2560);
     - decode batches other than 1, 4, 16 and 128 rows;
     - a NaN inside a window (it ranks above every finite score: the caller keeps the window finite);
-    - index dtypes other than int64 positions and int32 lengths.
+    - index dtypes other than int64 positions and int32 lengths;
+    - the context launch on a window past ~82k tokens of a real prompt: a row whose candidates
+      pass its 2560-entry list takes the whole-window walk (still exact, slower).
 
     Index limits, read from the source, not probed. The row count is an Int32 argument and
     the row layouts are built from it, so these products must stay below 2^31:
@@ -1515,6 +1678,7 @@ class QsaTopkExpandDecode(OpWrapper):
         token_topk,
         out=None,
         row_order=None,
+        context=False,
     ):
         return launch(
             scores,
@@ -1526,6 +1690,7 @@ class QsaTopkExpandDecode(OpWrapper):
             token_topk,
             out=out,
             row_order=row_order,
+            context=context,
         )
 
     def reference(
@@ -1539,10 +1704,11 @@ class QsaTopkExpandDecode(OpWrapper):
         token_topk,
         out=None,
         row_order=None,
+        context=False,
     ):
         """`(topk_indices_after, selection)`: a stable descending sort per row (ties to the
         higher block), the k first in block order, then the expansion entry's reference.
-        `row_order` picks a launch, not a result."""
+        `row_order` and `context` pick a launch, not a result."""
         rows, _ = scores.shape
         k = topk_indices.shape[1]
         out = torch.full_like(topk_indices, -1)
@@ -1575,6 +1741,7 @@ class QsaTopkExpandDecode(OpWrapper):
         token_topk,
         out=None,
         row_order=None,
+        context=False,
     ):
         assert scores.dtype == torch.float32 and scores.stride(1) == 1, (
             "fp32 scores, unit column stride"

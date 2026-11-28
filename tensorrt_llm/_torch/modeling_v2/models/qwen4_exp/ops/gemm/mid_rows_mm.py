@@ -105,8 +105,13 @@ def _ldg_v4(addr, *, loc=None, ip=None):
 
 @dsl_user_op
 def _ldg_f32(addr, *, loc=None, ip=None):
+    """One fp32 from global by a coherent load. Not `ld.global.nc`: the activation scales are
+    the previous launch's output, read after a `griddepcontrol.wait` that is not the kernel's
+    first statement, and ptxas may hoist a non-coherent load above such a wait (it treats the
+    data as read-only for the kernel's lifetime). `test_modeling_v2_mid_rows_mm_sass.py` holds
+    every variant to no non-coherent global load."""
     return cutlass.Float32(
-        _asm(T.f32(), [cutlass.Int64(addr)], "ld.global.nc.f32 $0, [$1];", "=f,l", loc, ip, True)
+        _asm(T.f32(), [cutlass.Int64(addr)], "ld.global.f32 $0, [$1];", "=f,l", loc, ip, True)
     )
 
 
@@ -1130,18 +1135,28 @@ def mid_mm_raw(
     sx: torch.Tensor | None = None,
     sw: torch.Tensor | None = None,
     pdl: bool = True,
+    mpad: int | None = None,
 ) -> torch.Tensor:
     """The GEMM alone: `x [M, K]` (e4m3 with `sx [M]`, or bf16) contiguous, `w [N, K]` of the
-    same dtype contiguous, `sw` None / fp32 [1] / fp32 [N]. Returns a fresh bf16 `[M, N]`."""
+    same dtype contiguous, `sw` None / fp32 [1] / fp32 [N]. Returns a fresh bf16 `[M, N]`.
+    `mpad`: the MMA N (a multiple of 16, at least `M`, and a multiple of the plan's epilogue
+    width `min(plan.epi, mpad)`); default `mma_rows(M)`. A row's output depends on that row
+    alone and TMA zero-fills the tile past `M`, so any such `mpad` gives the same bits; a
+    smaller one streams fewer activation bytes."""
     m, k = x.shape
     n = w.shape[0]
     fp8 = x.dtype == torch.float8_e4m3fn
     assert w.dtype == x.dtype and w.shape[1] == k and x.is_contiguous() and w.is_contiguous()
     assert 1 <= m <= MAX_ROWS and n % 16 == 0
     assert fp8 == (sx is not None)
+    mpad = mma_rows(m) if mpad is None else mpad
+    assert m <= mpad <= MAX_ROWS and mpad % 16 == 0, (m, mpad)
+    # The epilogue stores `min(plan.epi, mpad)` columns a pass: checked here, before the output
+    # is allocated or the kernel compiled.
+    assert mpad % min(plan.epi, mpad) == 0, f"mpad {mpad} is not a multiple of epi {plan.epi}"
     w_mode = 0 if sw is None else (1 if sw.numel() == 1 else 2)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    fn = _compiled_mm(n, k, plan, mma_rows(m), fp8, w_mode, bool(pdl and _env_pdl()))
+    fn = _compiled_mm(n, k, plan, mpad, fp8, w_mode, bool(pdl and _env_pdl()))
     dummy = out.data_ptr()
     fn(
         m,

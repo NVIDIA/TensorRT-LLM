@@ -4417,6 +4417,14 @@ class KvCacheCreator:
         other managers are built per build, as the estimation one is shut down.
         """
         config = self._llm_args.kv_cache_compression_config
+        model_codec = runtime_hooks_of(self._model_engine.model).cold_page_codec
+        if config is None and model_codec is not None:
+            # The model's own codec (RuntimeHooks.cold_page_codec), built once like the
+            # configured cold-page provider.
+            if not self._cold_page_codec_provider_built:
+                self._cold_page_codec_provider = model_codec(kv_cache_config)
+                self._cold_page_codec_provider_built = True
+            return self._cold_page_codec_provider
         if config is None or config.algorithm != "quantization_for_cold_page":
             return create_kv_cache_compression_manager(
                 config,
@@ -5210,6 +5218,9 @@ def _create_kv_cache_manager(
             if model_engine is not None:
                 mamba_manager_extra_kwargs["inforward_snapshot_min_main"] = int(
                     getattr(model_engine.model, "inforward_snapshot_min_main",
+                            0) or 0)
+                mamba_manager_extra_kwargs["inforward_snapshot_max_tail"] = int(
+                    getattr(model_engine.model, "inforward_snapshot_max_tail",
                             0) or 0)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
