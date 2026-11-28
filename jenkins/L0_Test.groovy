@@ -4805,8 +4805,10 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
     def extraDeviceEnv = ""
     def serviceContainerConfig = ""
 
-    def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImageName = arch == "arm64" ?
+        "custom_jnlp_images_arm_linux:jdk17" :
+        "custom_jnlp_images_amd_linux:jdk17-java4shell-fix"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/${jnlpImageName}"
 
     switch(type)
     {
