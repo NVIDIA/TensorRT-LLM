@@ -4290,5 +4290,7 @@
    "visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark": 77.7633,
    "visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]": 98.27860000000001,
    "test_unittests.py::test_unittests_v2[unittest/_torch/multi_gpu/test_allreduce.py::test_mhc_moe_boundary_behind_lowm_fc2]": 41.0,
+   "unittest/_torch/multi_gpu/test_allreduce.py::test_mhc_ob_boundary_matches_ob_then_boundary": 59.0,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/multi_gpu/test_allreduce.py::test_mhc_ob_boundary_matches_ob_then_boundary]": 59.0,
    "unittest/_torch/multi_gpu/test_allreduce.py::test_mhc_moe_boundary_behind_lowm_fc2": 41.0
 }

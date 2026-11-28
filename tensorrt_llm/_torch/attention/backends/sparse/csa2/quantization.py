@@ -292,6 +292,7 @@ def store_layer_rows(
     main=None,
     index=None,
     index_q: torch.Tensor | None = None,
+    release_after_wait: bool = False,
 ):
     """Publish one layer's cache rows with a single quantize launch when possible.
 
@@ -331,7 +332,7 @@ def store_layer_rows(
         if views is not None:
             jobs.append(split_job(*views))
     with torch.cuda.device(swa_values.device):
-        quantize_scatter_jobs(jobs)
+        quantize_scatter_jobs(jobs, release_after_wait=release_after_wait)
     return packed
 
 

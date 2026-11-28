@@ -16,6 +16,7 @@ import os
 import pickle
 import sys
 import traceback
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cloudpickle
@@ -36,12 +37,16 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.low_m_gemm import (mxfp8_linear_scale,
+                                                    mxfp8_lowm_linear)
 from tensorrt_llm._torch.modules.mhc.mhc_lowm import (
     LamportAllReduce, MnnvlLamportAllReduce, MoeUnfinalized,
-    mhc_allreduce_post_collapse_norm, mhc_post_collapse_norm)
+    defer_ob_projection, mhc_allreduce_post_collapse_norm,
+    mhc_post_collapse_norm)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     discard_nccl_window_tensor_outputs
+from tensorrt_llm._torch.utils import swizzle_sf
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -1187,6 +1192,24 @@ def _mhc_moe_inputs(m: int, seed: int, rank: int, top_k: int = 6):
     return parts, res, post, comb, pre, weight
 
 
+def _mhc_ob_inputs(m: int, seed: int, rank: int, k: int = 1024):
+    """This rank's o_b input and MXFP8 weight with UE8M0 scales stored swizzled, as the attention's
+    O-B holds them, and the boundary operands."""
+    _, res, post, comb, pre, weight = _mhc_inputs(m, seed, rank)
+    gen = torch.Generator(device="cuda").manual_seed(seed * 100 + rank + 11)
+    o_lat = torch.randn(m, k, generator=gen, device="cuda").bfloat16()
+    ob_weight = (torch.randn(MHC_HIDDEN, k, generator=gen, device="cuda") *
+                 0.5).to(torch.float8_e4m3fn)
+    ob_scale = torch.randint(118,
+                             126, (MHC_HIDDEN, k // 32),
+                             generator=gen,
+                             device="cuda",
+                             dtype=torch.uint8)
+    o_b = SimpleNamespace(weight=ob_weight,
+                          weight_scale=swizzle_sf(ob_scale, MHC_HIDDEN, k, 32))
+    return o_lat, o_b, res, post, comb, pre, weight
+
+
 def _flat(outputs):
     for out in outputs:
         if isinstance(out, tuple):
@@ -1303,6 +1326,73 @@ def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
     return True
 
 
+# Pool workers run later tests: restore the environment.
+@patch.dict(os.environ)
+@torch.inference_mode()
+def run_mhc_ob_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
+    """The attention's o_b projected in the boundary's launch vs the o_b GEMM then the boundary:
+    the same bits, also with the NVFP4 copy of the output and in a replayed graph."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        allreduce, lamport = _mhc_allreduce_and_lamport(tp_size, mnnvl, rank)
+        nvfp4_scale = torch.tensor([0.37], device="cuda")
+        for m in (1, 6, 16):
+            o_lat, o_b, *args = _mhc_ob_inputs(m, 500 + m, rank)
+            # The boundary takes the linear copy; the attention's GEMM reads the stored scales.
+            deferred = defer_ob_projection(o_lat, o_b.weight,
+                                           mxfp8_linear_scale(o_b))
+            assert deferred is not None
+            partial = mxfp8_lowm_linear(o_lat,
+                                        o_b.weight,
+                                        o_b.weight_scale,
+                                        scale_swizzled=True)
+            for scale in (None, nvfp4_scale):
+                want = mhc_allreduce_post_collapse_norm(partial,
+                                                        *args,
+                                                        MHC_NORM_EPS,
+                                                        lamport,
+                                                        nvfp4_scale=scale)
+                got = mhc_allreduce_post_collapse_norm(deferred,
+                                                       *args,
+                                                       MHC_NORM_EPS,
+                                                       lamport,
+                                                       nvfp4_scale=scale)
+                for g, w in zip(_flat(got), _flat(want)):
+                    assert torch.equal(g.view(torch.uint8), w.view(torch.uint8))
+        # Replays of the o_b boundary between the MoE-finalize boundary and a library all-reduce
+        # on one workspace: whichever CTA arrives last hands the triple buffer over.
+        o_lat, o_b, *args = _mhc_ob_inputs(6, 507, rank)
+        scale_lin = mxfp8_linear_scale(o_b)
+        parts, *moe_args = _mhc_moe_inputs(6, 508, rank)
+        lib_in = _mhc_inputs(6, 509, rank)[0]
+
+        def launches(deferred):
+            return (*mhc_allreduce_post_collapse_norm(parts, *moe_args,
+                                                      MHC_NORM_EPS, lamport),
+                    *mhc_allreduce_post_collapse_norm(deferred, *args,
+                                                      MHC_NORM_EPS, lamport),
+                    allreduce(lib_in))
+
+        want = launches(
+            mxfp8_lowm_linear(o_lat,
+                              o_b.weight,
+                              o_b.weight_scale,
+                              scale_swizzled=True))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = launches(defer_ob_projection(o_lat, o_b.weight, scale_lin))
+        for _ in range(50):
+            graph.replay()
+            torch.cuda.synchronize()
+            for g, w in zip(got, want):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
@@ -1318,6 +1408,22 @@ def test_mhc_allreduce_boundary_matches_allreduce_then_boundary(
     tp_size = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(run_mhc_allreduce_boundary_single_rank,
                                     *zip(*[(tp_size, mnnvl)] * tp_size))
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="needs 2 SM100/SM103 GPUs",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mhc_ob_boundary_matches_ob_then_boundary(mpi_pool_executor):
+    if not MnnvlMemory.supports_mnnvl():
+        pytest.skip("needs MNNVL memory")
+    tp_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(run_mhc_ob_boundary_single_rank,
+                                    *zip(*[(tp_size, True)] * tp_size))
     for r in results:
         assert r is True
 

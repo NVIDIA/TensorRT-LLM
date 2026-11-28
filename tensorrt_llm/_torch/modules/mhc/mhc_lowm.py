@@ -282,6 +282,136 @@ class MoeUnfinalized:
         return (routed + self.shared.float()).to(self.shared.dtype)
 
 
+# Rows up to which the attention's o_b runs inside the all-reduce boundary: one MMA row tile.
+_OB_BOUNDARY_MAX_ROWS = 16
+
+
+@dataclass
+class ObUnprojected:
+    """A TP rank's attention output before its row-parallel small-M MXFP8 ``o_b`` projection; the
+    all-reduce boundary that follows projects, all-reduces and finishes it in one launch."""
+
+    o_lat: torch.Tensor
+    weight: torch.Tensor
+    scale_lin: torch.Tensor
+    k_warps: int
+
+    @property
+    def shape(self):
+        return torch.Size((self.o_lat.shape[0], self.weight.shape[0]))
+
+
+def ob_boundary_enabled(rows: int) -> bool:
+    """Whether a decode boundary of ``rows`` rows takes the attention's ``o_b`` into its launch."""
+    return 0 < rows <= _OB_BOUNDARY_MAX_ROWS and is_blackwell_datacenter()
+
+
+def defer_ob_projection(
+    o_lat: torch.Tensor, weight: torch.Tensor, scale_lin: torch.Tensor | None
+) -> ObUnprojected | None:
+    """``mxfp8_lowm_linear(o_lat, weight, scale)`` deferred to the boundary, or None where the fused
+    launch cannot reproduce it. ``scale_lin`` is the linear [N, K/32] UE8M0 layout
+    (``mxfp8_linear_scale``), not the swizzled one the small-M GEMM reads."""
+    from ..low_m_gemm import default_k_warps
+
+    if scale_lin is None or o_lat.dtype != torch.bfloat16 or weight.dtype != torch.float8_e4m3fn:
+        return None
+    rows, k = o_lat.shape
+    n = weight.shape[0]
+    if (
+        scale_lin.dtype != torch.uint8
+        or scale_lin.shape != (n, k // 32)
+        or not scale_lin.is_contiguous()
+    ):
+        return None
+    if not 0 < rows <= _OB_BOUNDARY_MAX_ROWS or not ob_boundary_fits(weight):
+        return None
+    return ObUnprojected(o_lat.contiguous(), weight, scale_lin, default_k_warps(k))
+
+
+def ob_boundary_fits(weight: torch.Tensor) -> bool:
+    """Whether the fused launch tiles an ``o_b`` shard of ``weight``'s shape."""
+    from ..low_m_gemm import default_k_warps
+
+    n, k = weight.shape
+    k_warps = default_k_warps(k)
+    return k_warps in (2, 4) and _ob_tiles(n, k, k_warps)
+
+
+@functools.lru_cache(maxsize=None)
+def _ob_tiles(hidden: int, k: int, k_warps: int) -> bool:
+    from ...kernels.blackwell.mhc.mhc_ob_boundary import ob_boundary_tiles
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return ob_boundary_tiles(hidden, k, k_warps, props.shared_memory_per_block_optin)
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_ob_boundary(
+    m: int,
+    hidden: int,
+    k: int,
+    k_warps: int,
+    norm_eps: float,
+    nranks: int,
+    use_pdl: bool,
+    mnnvl: bool,
+    quant: str | None,
+    mbar_exchange: bool,
+    bf16_dequant: bool,
+):
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+
+    from ...kernels.blackwell.mhc.mhc_ob_boundary import ObAllReduceBoundaryKernel
+
+    kernel = ObAllReduceBoundaryKernel(
+        hidden=hidden,
+        k_extent=k,
+        num_rows=m,
+        k_warps=k_warps,
+        norm_eps=norm_eps,
+        nranks=nranks,
+        use_pdl=use_pdl,
+        mnnvl=mnnvl,
+        quant=quant,
+        mbar_exchange=mbar_exchange,
+        bf16_dequant=bf16_dequant,
+    )
+    dev = torch.device("cuda")
+    a = torch.empty((m, k), dtype=torch.bfloat16, device=dev)
+    b = torch.empty((hidden, k), dtype=torch.uint8, device=dev)
+    s = torch.empty((hidden, k // 32), dtype=torch.uint8, device=dev)
+    res = torch.empty((m, 4 * hidden), dtype=torch.bfloat16, device=dev)
+    post = torch.empty((m, 4), dtype=torch.float32, device=dev)
+    comb = torch.empty((m, 16), dtype=torch.float32, device=dev)
+    pre = torch.empty((m, 4), dtype=torch.float32, device=dev)
+    w = torch.empty((1, hidden), dtype=torch.bfloat16, device=dev)
+    out = torch.empty((m, hidden), dtype=torch.bfloat16, device=dev)
+    table = torch.empty((3 if mnnvl else nranks + 2,), dtype=torch.int64, device=dev)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cute.compile(
+        kernel,
+        graph_safe_from_dlpack(a),
+        graph_safe_from_dlpack(b),
+        graph_safe_from_dlpack(s),
+        graph_safe_from_dlpack(res),
+        graph_safe_from_dlpack(post),
+        graph_safe_from_dlpack(comb),
+        graph_safe_from_dlpack(pre),
+        graph_safe_from_dlpack(w),
+        graph_safe_from_dlpack(res),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(table),
+        cutlass.Int32(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        stream,
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def _placeholder_moe_operands(hidden: int, device_index: int):
     dev = torch.device("cuda", device_index)
@@ -425,7 +555,7 @@ def mhc_allreduce_post_collapse_norm(
     up to the FP32 summation order). ``mxfp8`` / ``nvfp4_scale`` add a quantized copy of the
     normalized output as :func:`mhc_post_collapse_norm` does. Up to two contiguous
     ``l2_prefetch`` tensors (sizes multiples of 16 bytes) are read into L2 by the launch, for a
-    later kernel.
+    later kernel; an ``ObUnprojected`` partial ignores them.
     """
     import cuda.bindings.driver as cuda
     import cutlass
@@ -433,6 +563,19 @@ def mhc_allreduce_post_collapse_norm(
     m, mult, hidden = residual_prev.shape
     assert mult == 4 and residual_prev.dtype == torch.bfloat16
     res_flat = residual_prev.reshape(m, mult * hidden).contiguous()
+    if isinstance(x_partial, ObUnprojected):
+        return _ob_allreduce_post_collapse_norm(
+            x_partial,
+            res_flat,
+            post_mix_prev,
+            comb_mix_prev,
+            pre_mix,
+            norm_weight,
+            norm_eps,
+            allreduce,
+            mxfp8,
+            nvfp4_scale,
+        )
     moe_key = None
     if isinstance(x_partial, MoeUnfinalized):
         fc2 = x_partial.fc2
@@ -510,6 +653,72 @@ def mhc_allreduce_post_collapse_norm(
         cutlass.Int64(regions[0][1]),
         cutlass.Int64(regions[1][0]),
         cutlass.Int64(regions[1][1]),
+        stream,
+    )
+    if quant:
+        return res_out.view(m, mult, hidden), out, quantized
+    return res_out.view(m, mult, hidden), out
+
+
+def _ob_allreduce_post_collapse_norm(
+    x_partial: ObUnprojected,
+    res_flat: torch.Tensor,
+    post_mix_prev: torch.Tensor,
+    comb_mix_prev: torch.Tensor,
+    pre_mix: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    allreduce: "LamportAllReduce | MnnvlLamportAllReduce",
+    mxfp8: bool,
+    nvfp4_scale: torch.Tensor | None,
+) -> tuple[torch.Tensor, ...]:
+    """``mhc_allreduce_post_collapse_norm`` of ``o_b(o_lat)``, the projection in the same launch."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+
+    from ..low_m_gemm import lowm_mma_options
+
+    m, k = x_partial.o_lat.shape
+    hidden = x_partial.weight.shape[0]
+    mult = res_flat.shape[1] // hidden
+    pre = pre_mix.reshape(m, mult).to(torch.float32).contiguous()
+    post = post_mix_prev.reshape(m, mult).to(torch.float32).contiguous()
+    comb = comb_mix_prev.reshape(m, mult * mult).to(torch.float32).contiguous()
+    weight = norm_weight.to(torch.bfloat16).contiguous().view(1, hidden)
+    out = torch.empty((m, hidden), dtype=torch.bfloat16, device=res_flat.device)
+    res_out = torch.empty_like(res_flat)
+    quant, quantized, scale_addr = _quantized_outputs(m, hidden, out.device, mxfp8, nvfp4_scale)
+    table = allreduce.prepare(allreduce.nranks * m * hidden * res_flat.element_size())
+    fn = _compiled_ob_boundary(
+        m,
+        hidden,
+        k,
+        x_partial.k_warps,
+        float(norm_eps),
+        allreduce.nranks,
+        get_env_enable_pdl(),
+        allreduce.mnnvl,
+        quant,
+        is_blackwell_datacenter(),
+        lowm_mma_options()[0],
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        graph_safe_from_dlpack(x_partial.o_lat),
+        graph_safe_from_dlpack(x_partial.weight.view(torch.uint8)),
+        graph_safe_from_dlpack(x_partial.scale_lin),
+        graph_safe_from_dlpack(res_flat),
+        graph_safe_from_dlpack(post),
+        graph_safe_from_dlpack(comb),
+        graph_safe_from_dlpack(pre),
+        graph_safe_from_dlpack(weight),
+        graph_safe_from_dlpack(res_out),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(table),
+        cutlass.Int32(allreduce.rank),
+        cutlass.Int64(quantized[0].data_ptr() if quant else 0),
+        cutlass.Int64(quantized[1].data_ptr() if quant else 0),
+        cutlass.Int64(scale_addr),
         stream,
     )
     if quant:
