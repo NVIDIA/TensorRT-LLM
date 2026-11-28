@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+attention_config:
+  backend: TRTLLM
+cuda_graph_config:
+  enable: false
+torch_compile_config:
+  enable: false
+compilation_config:
+  skip_warmup: true

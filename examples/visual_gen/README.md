@@ -35,6 +35,10 @@ python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
 python models/cosmos3/cosmos3.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"
 python models/qwen_image.py --visual_gen_args configs/qwen-image-fp8-1gpu.yaml
+
+# MiniMax-H3-Image: local converted image checkpoint, single SM100 GPU
+python models/minimax_h3_image.py --model "$LLM_MODELS_ROOT/MiniMax-H3-Image" \
+  --visual_gen_args configs/minimax-h3-image-bf16-1gpu.yaml --output_path image.png
 python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-1gpu.yaml --image /path/to/image.png
 python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-fp8-1gpu.yaml --image /path/to/image.png
 python models/qwen_image_edit.py --visual_gen_args configs/qwen-image-edit-2511-fp8-1gpu.yaml --image /path/to/source.png --prompt "Make the image look like a watercolor painting"
