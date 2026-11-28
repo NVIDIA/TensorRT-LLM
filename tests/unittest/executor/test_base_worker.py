@@ -8,6 +8,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+from queue import Queue
 from threading import Event, Lock
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -15,7 +16,8 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest, LlmResponse,
+                                                        LlmResult, PyResult)
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
@@ -28,10 +30,12 @@ from utils.util import skip_single_gpu
 
 from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.executor.postproc_worker import PostprocWorker
+from tensorrt_llm.executor.rank_failure_requests import RankFailureError
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.result import GenerationResult, LogProbsResult
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
-from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import LogprobParams, SamplingParams
 
@@ -1040,3 +1044,309 @@ def test_worker_enqueues_serializable_python_input_envelope(
         assert translated.py_return_routed_experts
         torch.testing.assert_close(translated.py_multimodal_data["embedding"],
                                    torch.ones(2, 4))
+
+
+def _ipc_worker(monkeypatch, fault_tolerance=True):
+    """Return the executor worker of rank 0 past its startup and its response helper.
+
+    The worker has two postprocessing workers. A request's responses go to its
+    postprocessing worker and its errors go to the result queue.
+    """
+    monkeypatch.setattr(
+        base_worker, "GenerationResult",
+        lambda request, **kwargs: SimpleNamespace(
+            _params_transmitted=False,
+            _streaming=True,
+            sampling_params="sampling params",
+            postproc_params="postproc params",
+            disaggregated_params=None,
+        ))
+    monkeypatch.setattr(base_worker, "_maybe_wrap_response",
+                        lambda worker, response: response)
+    worker = BaseWorker(llm_args=TorchLlmArgs(
+        model="dummy",
+        enable_wide_ep_fault_tolerance=fault_tolerance,
+        enable_attention_dp=True,
+        tensor_parallel_size=2,
+        max_seq_len=4096,
+        moe_config={"load_balancer": {
+            "num_slots": 4
+        }},
+    ))
+    worker.doing_shutdown = True  # Nothing to shut down at exit.
+    worker.rank = 0
+    worker.start = Mock()
+    worker._get_logprob_params = Mock(return_value=None)
+    worker._handle_background_error = Mock()
+    worker._has_background_error = Mock(return_value=False)
+    # The engine numbers the enqueued requests from 100 on.
+    worker._enqueue_request = Mock(side_effect=range(100, 200))
+    worker.postproc_config = SimpleNamespace(num_postprocess_workers=2,
+                                             enabled=True)
+    worker.postproc_queues = [Mock(), Mock()]
+    worker.frontend_result_queues = None
+    worker.result_queue = Mock()
+    return worker, base_worker.AwaitResponseHelper(worker)
+
+
+def _submit(worker, client_id, multimodal_params=None):
+    request = SimpleNamespace(id=client_id,
+                              multimodal_params=multimodal_params,
+                              disaggregated_params=None)
+    worker.submit(request)
+    return request
+
+
+def _sent(worker):
+    """Map each client id to the outputs and error types that reached the client."""
+    sent = {}
+    for postproc_queue in worker.postproc_queues:
+        for (batch, ), _ in postproc_queue.put.call_args_list:
+            for item in batch:
+                sent.setdefault(item.rsp.client_id, []).append(
+                    ("output", item.sampling_params))
+    for (batch, ), _ in worker.result_queue.put.call_args_list:
+        for error in batch:
+            assert isinstance(error, ErrorResponse)
+            sent.setdefault(error.client_id, []).append(
+                ("error", type(error.error_msg)))
+    return sent
+
+
+def _output(client_id, final=False):
+    return LlmResponse(request_id=1,
+                       result=SimpleNamespace(is_final=final),
+                       client_id=client_id)
+
+
+def _ended_by_rank_failure(client_id, resubmit=True):
+    return LlmResponse(request_id=1,
+                       error_msg=RankFailureError(resubmit=resubmit),
+                       client_id=client_id)
+
+
+@pytest.mark.cpu_only
+def test_worker_reenqueues_unanswered_failed_request(monkeypatch):
+    """Check that a request a rank failure ended is resubmitted once if it had no response."""
+    worker, helper = _ipc_worker(monkeypatch)
+    requests = {client_id: _submit(worker, client_id) for client_id in (7, 8)}
+    helper.handle_for_ipc_batched([_output(8), _ended_by_rank_failure(7)])
+    assert worker._enqueue_request.call_args_list[-1].args == (requests[7], )
+    assert worker.outstanding_requests() == {102: 7, 101: 8}
+    assert _sent(worker) == {8: [("output", "sampling params")]}
+
+    helper.handle_for_ipc_batched([_output(7), _ended_by_rank_failure(8)])
+    assert _sent(worker) == {
+        # The first response of the resubmitted request.
+        7: [("output", "sampling params")],
+        8: [("output", "sampling params"), ("error", RankFailureError)],
+    }
+    helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
+    assert _sent(worker)[7][-1] == ("error", RankFailureError)
+    assert worker._enqueue_request.call_count == 3
+
+    _submit(worker, 9)
+    helper.handle_for_ipc_batched([_ended_by_rank_failure(9)])
+    # It was resubmitted already.
+    helper.handle_for_ipc_batched([_ended_by_rank_failure(9)])
+    assert _sent(worker)[9] == [("error", RankFailureError)]
+    assert worker._enqueue_request.call_count == 5
+    assert worker.outstanding_requests() == {}
+
+
+@pytest.mark.cpu_only
+def test_worker_reenqueues_multimodal_input(monkeypatch):
+    """Check that a multimodal request is resubmitted with its multimodal input."""
+    worker, helper = _ipc_worker(monkeypatch)
+    multimodal_input = object()
+    params = SimpleNamespace(multimodal_input=multimodal_input)
+    enqueued = []
+
+    def enqueue(request):  # The enqueue consumes the multimodal input.
+        enqueued.append((request.multimodal_params,
+                         request.multimodal_params.multimodal_input))
+        request.multimodal_params.multimodal_input = None
+        return 100 + len(enqueued)
+
+    worker._enqueue_request = Mock(side_effect=enqueue)
+    request = _submit(worker, 7, multimodal_params=params)
+    del request.multimodal_params
+    helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
+    assert enqueued == [(params, multimodal_input)] * 2
+    assert _sent(worker) == {}
+    assert worker.outstanding_requests() == {102: 7}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("case", [
+    "cancelled", "cancelled_during_enqueue", "flag_off", "waits_for_replacement"
+])
+def test_worker_ends_request_after_rank_failure(monkeypatch, case):
+    """Check that a request a rank failure ended is not resubmitted.
+
+    Its client cancelled it, before or during the resubmit, it cannot run before a replacement
+    joins, or the flag is off.
+    """
+    worker, helper = _ipc_worker(monkeypatch,
+                                 fault_tolerance=case != "flag_off")
+    worker.engine = Mock(**{"can_enqueue_requests.return_value": True})
+    _submit(worker, 7)
+    during_enqueue = case == "cancelled_during_enqueue"
+    if during_enqueue:
+        worker._enqueue_request.side_effect = lambda request: (
+            worker.abort_request(7), 101)[1]
+    elif case == "cancelled":
+        worker.abort_request(7)
+    helper.handle_for_ipc_batched(
+        [_ended_by_rank_failure(7, resubmit=case != "waits_for_replacement")])
+    if during_enqueue:
+        assert worker.engine.cancel_request.call_args.args == (101, )
+        assert _sent(worker) == {}
+    else:
+        assert worker._enqueue_request.call_count == 1
+        assert _sent(worker) == {7: [("error", RankFailureError)]}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("same_batch", [True, False])
+@pytest.mark.parametrize("resubmit", [True, False])
+def test_worker_withholds_rank_failure_after_final_response(
+        monkeypatch, resubmit, same_batch):
+    """Check that a request's RankFailureError after its final response does not reach the client.
+
+    Rank 0 fails the requests that were outstanding when it read them, so a request that got its
+    final response meanwhile still gets the error.
+    """
+    worker, helper = _ipc_worker(monkeypatch)
+    _submit(worker, 7)
+    responses = [
+        _output(7, final=True),
+        _ended_by_rank_failure(7, resubmit=resubmit)
+    ]
+    if same_batch:
+        helper.handle_for_ipc_batched(responses)
+    else:
+        for response in responses:
+            helper.handle_for_ipc_batched([response])
+    assert _sent(worker) == {7: [("output", "sampling params")]}
+    assert worker._enqueue_request.call_count == 1
+    assert worker.outstanding_requests() == {}
+
+
+@pytest.mark.cpu_only
+def test_worker_fails_request_before_id_stored(monkeypatch):
+    """Check that a request a rank failure ended before its submit returned is not resubmitted."""
+    worker, helper = _ipc_worker(monkeypatch)
+
+    def enqueue(request):
+        if worker._enqueue_request.call_count == 1:
+            helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
+        return 99 + worker._enqueue_request.call_count
+
+    worker._enqueue_request.side_effect = enqueue
+    _submit(worker, 7)
+    assert worker._enqueue_request.call_count == 1
+    assert _sent(worker) == {7: [("error", RankFailureError)]}
+    # The submit stored the request id after the error, so the id stays without a result.
+    assert worker._client_id_to_request_id == {7: 100}
+    assert worker.outstanding_requests() == {}
+
+
+@pytest.mark.cpu_only
+def test_resubmit_stores_the_new_request_id(monkeypatch):
+    """Check that a resubmit enqueues the request again only while its result is pending."""
+    worker, _ = _ipc_worker(monkeypatch, fault_tolerance=False)
+    request = _submit(worker, 7)
+    assert worker.resubmit(7, request)
+    assert worker._enqueue_request.call_args.args == (request, )
+    assert worker._client_id_to_request_id == {7: 101}
+    worker._enqueue_request.side_effect = RequestError("shutting down")
+    assert not worker.resubmit(7, request)
+    assert worker._client_id_to_request_id == {7: 101}
+    worker._results.pop(7)
+    assert not worker.resubmit(7, request)
+
+
+def _set_up_engine(monkeypatch, worker, rank_failure_recovery):
+    """Set up the worker's engine, whose rank failure recovery is ``rank_failure_recovery``."""
+    engine = SimpleNamespace(max_seq_len=None,
+                             rank_failure_recovery=rank_failure_recovery)
+    # Patching create_py_executor first imports py_executor_creator, so that
+    # module keeps the real construct_checkpoint_loader after the test.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor_creator.create_py_executor",
+        Mock(return_value=engine))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.construct_checkpoint_loader",
+        Mock())
+    worker._configure_device = Mock()
+    worker.setup_engine()
+    assert worker.engine is engine
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fault_tolerance", [True, False])
+def test_worker_gives_engine_its_outstanding_requests(monkeypatch,
+                                                      fault_tolerance):
+    """Check that the engine's rank failure recovery, if any, reads the outstanding requests."""
+    worker, _ = _ipc_worker(monkeypatch, fault_tolerance=fault_tolerance)
+    recovery = Mock() if fault_tolerance else None
+    _set_up_engine(monkeypatch, worker, recovery)
+    if fault_tolerance:
+        _submit(worker, 7)
+        recovery.set_outstanding_requests.assert_called_once()
+        outstanding, = recovery.set_outstanding_requests.call_args.args
+        assert outstanding() == {100: 7}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("route",
+                         ["error_queue", "postprocessing", "in_process"])
+def test_rank_failure_error_after_final_response_is_dropped(monkeypatch, route):
+    """Check that a rank failure error that follows a request's final response is dropped.
+
+    Rank 0 fails the requests that no active rank holds after a rank failure,
+    including request 7, whose final response the worker thread has not handled
+    yet. That response comes first and ends request 7; request 8 had none, and
+    its error is not resubmittable, so its client gets it on every route.
+    """
+    worker, helper = _ipc_worker(monkeypatch)
+    _submit(worker, 7)
+    _submit(worker, 8)
+    final = LlmResponse(request_id=100,
+                        result=LlmResult(b"",
+                                         PyResult(prompt_len=1,
+                                                  max_new_tokens=1),
+                                         is_final=True),
+                        client_id=7)
+    responses = [
+        final,
+        LlmResponse(request_id=100, error_msg=RankFailureError(), client_id=7),
+        LlmResponse(request_id=101,
+                    error_msg=RankFailureError(resubmit=False),
+                    client_id=8),
+    ]
+    if route == "in_process":
+        worker.result_queue = None
+        queues = [Queue(), Queue()]
+        worker._results[7].queue, worker._results[8].queue = queues
+        helper.handle_for_worker(responses)
+        delivered = [
+            queue.get_nowait() for queue in queues for _ in range(queue.qsize())
+        ]
+    else:
+        if route == "postprocessing":
+            worker.result_queue = None
+        helper.handle_for_ipc_batched(responses)
+        queues = [*worker.postproc_queues, worker.result_queue]
+        delivered = [
+            item.rsp if isinstance(item, PostprocWorker.Input) else item
+            for queue in queues if queue is not None
+            for call in queue.put.call_args_list for item in call.args[0]
+        ]
+
+    delivered.sort(key=lambda response: response.client_id)
+    assert [response.client_id for response in delivered] == [7, 8]
+    assert delivered[0] is final
+    assert isinstance(delivered[1].error_msg, RankFailureError)
+    assert worker.outstanding_requests() == {}

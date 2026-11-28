@@ -122,6 +122,7 @@ class TestClassicSendRspLaneRouting:
             postproc_queues=None,
             frontend_result_queues=[_LaneStub() for _ in range(num_lanes)],
             _pop_result=pops.append,
+            _rank_failure_requests=None,
         ), pops
 
     def test_error_response_routes_to_origin_lane(self):

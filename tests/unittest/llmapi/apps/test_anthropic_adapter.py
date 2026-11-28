@@ -2137,6 +2137,43 @@ def test_stream_ends_with_an_error_when_the_upstream_fails_mid_stream(monkeypatc
     assert events[-1][1]["error"]["message"] == "Internal server error"
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"message": "engine failed: internal detail", "type": "server_error"},
+        "engine failed: internal detail",
+    ],
+)
+def test_stream_ends_with_a_generic_error_at_an_upstream_error_event(error):
+    """An upstream error event ends the message with a generic error once the upstream ends."""
+    lines = [
+        _line(chunk({"content": "hello"})),
+        f"data: {json.dumps({'error': error})}\n\n",
+        # More lines than the task reading the upstream reads ahead.
+        *[": keep-alive\n\n"] * 3,
+        "data: [DONE]\n\n",
+    ]
+    read = []
+
+    async def source():
+        for line in lines:
+            read.append(line)
+            yield line
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    frames = asyncio.run(collect())
+    events = parse_frames(frames)
+    names = [name for name, _ in events]
+    assert names[-1] == "error"
+    assert "message_stop" not in names
+    assert events[-1][1]["error"]["message"] == "Internal server error"
+    assert not any("internal detail" in frame for frame in frames)
+    # The upstream is read to [DONE] so the chat stream's own cleanup runs.
+    assert read == lines
+
+
 def test_stream_ends_when_the_upstream_is_cancelled_on_its_own(monkeypatch):
     """A cancellation raised inside the upstream ends the stream instead of leaving it to pings."""
     monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)

@@ -83,6 +83,7 @@ class _ArgsOnlyLLM:
             enable_chunked_prefill=True,
             max_num_tokens=None,
             speculative_config=spec_config,
+            enable_wide_ep_fault_tolerance=False,
         )
 
 

@@ -872,6 +872,7 @@ def _register_fake():
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
         use_sentinel: bool = False,
+        abort_state: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
@@ -905,6 +906,7 @@ def _register_fake():
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
         use_sentinel: bool = False,
+        abort_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
@@ -914,6 +916,7 @@ def _register_fake():
         metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
+        barrier: bool = True,
     ) -> None:
         return None
 
@@ -924,6 +927,15 @@ def _register_fake():
         metainfo: torch.Tensor,
         ep_rank: int,
         invalid_expert_id: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::moe_a2a_check_incomplete_round")
+    def _(
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        ep_rank: int,
+        abort_state: torch.Tensor,
     ) -> None:
         return None
 
@@ -982,6 +994,15 @@ def _register_fake():
     def _(single_layer_load_balancer_ptr: int,
           token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
+
+    @torch.library.register_fake("trtllm::moe_unbacked_slots_set_backed")
+    def _(tensors: List[torch.Tensor], slots: List[int],
+          slots_per_tensor: List[int], backed: bool) -> int:
+        return 0
+
+    @torch.library.register_fake("trtllm::moe_unbacked_slots_bytes_to_back")
+    def _(tensor: torch.Tensor, slots: List[int]) -> int:
+        return 0
 
     @torch.library.register_fake("trtllm::memset_expert_ids")
     def _(experts_ids: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,

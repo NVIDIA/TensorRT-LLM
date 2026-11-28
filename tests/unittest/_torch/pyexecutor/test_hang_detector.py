@@ -1,9 +1,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from unittest import mock
 
 import pytest
+
+
+@pytest.mark.cpu_only
+def test_disarm_and_checkpoint_write_pause_word() -> None:
+    """The shared pause word holds this process's PID while detection is disarmed, else 0."""
+    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
+
+    word = memoryview(bytearray(4)).cast("i")
+    detector = HangDetector(timeout=600)
+    detector.start()
+    try:
+        detector.share_pause_word(word)
+        # Disarmed until the first checkpoint.
+        assert word[0] == os.getpid()
+        detector.checkpoint()
+        assert word[0] == 0
+        with detector.pause():
+            assert word[0] == os.getpid()
+        assert word[0] == 0
+        detector.disarm()
+        assert word[0] == os.getpid()
+    finally:
+        detector.stop()
 
 
 @pytest.mark.cpu_only

@@ -21,6 +21,7 @@ from ...impl_contract import (
     MoEProblem,
     MoERejectReason,
     check_quant_matches_identity,
+    spare_slots_rejection,
 )
 from ...impl_environment import MoEDep
 from ...interface import _reject
@@ -32,10 +33,11 @@ def check_grouped_gemm_leaf(
     d: MoEDeployment,
     *leaf_gates: MoEEligibility | None,
 ) -> MoEEligibility:
-    """Run the family gates in order, then the leaf's own, and admit.
+    """Run the family gates in order, then the leaf's own, then spare slots, and admit.
 
     Identity, SM and dtype come first, so a wrong format, SM or dtype is
-    reported as such rather than as a later gate's failure. ``leaf_gates`` are already-evaluated
+    reported as such rather than as a later gate's failure; spare slots come
+    last, so a leaf's own reason wins. ``leaf_gates`` are already-evaluated
     verdicts that abstain (``None``) on a format they do not police.
     """
     for verdict in (
@@ -44,6 +46,7 @@ def check_grouped_gemm_leaf(
         check_dtype(cls, p),
         check_grouped_gemm_shared(cls, p, d),
         *leaf_gates,
+        spare_slots_rejection(cls, d),
     ):
         if verdict is not None:
             return verdict

@@ -162,7 +162,8 @@ torch::Tensor moeLoadBalanceRouting(
     auto tokenRoutedSlotIds = torch::empty_like(tokenSelectedExperts);
 
     tensorrt_llm::kernels::moeComputeRouteDevice(metaInfo, loadBalancer->getGpuPlacementInfo(),
-        tokenSelectedExperts.data_ptr<int>(), tokenRoutedSlotIds.data_ptr<int>(), tokenCount, offsetByEpRank, stream);
+        tokenSelectedExperts.data_ptr<int>(), tokenRoutedSlotIds.data_ptr<int>(), tokenCount, offsetByEpRank, stream,
+        loadBalancer->usesSingleReplicaRouting());
 
     return tokenRoutedSlotIds;
 }

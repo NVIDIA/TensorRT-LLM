@@ -277,7 +277,16 @@ class GroupedGemmInputsHelper:
                  num_local_experts: int,
                  local_expert_offset: int,
                  tile_size: int,
-                 seed: int = 515):
+                 seed: int = 515,
+                 tuner_num_local_experts: Optional[int] = None):
+        # num_experts, num_local_experts and local_expert_offset below describe
+        # the tuned layout, which has only the first tuner_num_local_experts
+        # slots of each rank. Row padding and expert-major capacities cover
+        # all runtime_num_local_experts slots that the kernels run over.
+        self.runtime_num_local_experts = num_local_experts
+        num_experts, num_local_experts, local_expert_offset = self.tuner_expert_layout(
+            num_experts, num_local_experts, local_expert_offset,
+            tuner_num_local_experts)
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -287,6 +296,43 @@ class GroupedGemmInputsHelper:
         # Padding values should never be accessed.
         # Intentionally use a large padding value to expose issues early.
         self.pad_val = int(2e9)
+
+    @staticmethod
+    def tuner_expert_layout(
+            num_experts: int, num_local_experts: int, local_expert_offset: int,
+            tuner_num_local_experts: Optional[int]) -> Tuple[int, int, int]:
+        """Return the expert layout of the first ``tuner_num_local_experts`` slots of each rank.
+
+        Spare slots without an expert get no tokens, so this is the layout of a
+        layer without them; the MoE runners key their tuning results and
+        choose their L2 policy by it.
+        """
+        if tuner_num_local_experts is None:
+            return num_experts, num_local_experts, local_expert_offset
+        ep_size = num_experts // num_local_experts
+        ep_rank = local_expert_offset // num_local_experts
+        return (ep_size * tuner_num_local_experts, tuner_num_local_experts,
+                ep_rank * tuner_num_local_experts)
+
+    @staticmethod
+    def tuner_inputs(
+            inputs: List[torch.Tensor],
+            tuner_num_local_experts: Optional[int]) -> List[torch.Tensor]:
+        """Return the grouped GEMM ``inputs`` (``a, b, a_sf, b_sf, alpha, ...``) for the autotuner.
+
+        With ``tuner_num_local_experts``, the expert weights ``b``, ``b_sf``
+        and ``alpha`` keep only the first ``tuner_num_local_experts`` slots,
+        so the tuner profiles and caches the problem of a layer without spare
+        slots.
+        """
+        if tuner_num_local_experts is None:
+            return inputs
+        a, b, a_sf, b_sf, alpha, *others = inputs
+        return [
+            a, b[:tuner_num_local_experts], a_sf,
+            b_sf[:tuner_num_local_experts], alpha[:tuner_num_local_experts],
+            *others
+        ]
 
     def get_max_num_tiles(self, num_tokens: int) -> int:
         num_expanded_tokens = num_tokens * self.top_k
@@ -303,15 +349,15 @@ class GroupedGemmInputsHelper:
         """Return padded rows for a fixed-capacity expert layout."""
         if expert_capacity <= 0:
             raise ValueError("Expert capacity must be positive")
-        return (self.num_local_experts *
+        return (self.runtime_num_local_experts *
                 ceil_div(expert_capacity, self.tile_size) * self.tile_size)
 
     def _expert_capacity_from_rows(self, num_rows: int) -> int:
-        if num_rows <= 0 or num_rows % self.num_local_experts != 0:
+        if num_rows <= 0 or num_rows % self.runtime_num_local_experts != 0:
             raise ValueError(
                 "Expert-major rows must be positive and divisible by the "
                 "number of local experts")
-        return num_rows // self.num_local_experts
+        return num_rows // self.runtime_num_local_experts
 
     def gen_expert_capacity_tuning_buckets(self,
                                            num_rows: int) -> Tuple[int, ...]:
@@ -319,14 +365,15 @@ class GroupedGemmInputsHelper:
         capacity = max(self.tile_size,
                        self._expert_capacity_from_rows(num_rows))
         capacities = get_last_power_of_2_num_tokens_buckets(capacity)
-        return tuple(self.num_local_experts * value for value in capacities
-                     if value >= self.tile_size)
+        return tuple(self.runtime_num_local_experts * value
+                     for value in capacities if value >= self.tile_size)
 
     def map_to_expert_capacity_tuning_bucket(self, num_rows: int) -> int:
         """Map an expert-major layout to a stable power-of-two capacity bucket."""
         capacity = max(self.tile_size,
                        self._expert_capacity_from_rows(num_rows))
-        return (self.num_local_experts * last_positive_power_of_2(capacity))
+        return (self.runtime_num_local_experts *
+                last_positive_power_of_2(capacity))
 
     def infer_shape_input0_rows(self, input_shapes: List[torch.Size]) -> int:
         return input_shapes[0][0]
@@ -339,24 +386,33 @@ class GroupedGemmInputsHelper:
         capacity = self._expert_capacity_from_rows(input_shapes[5][0])
         return self.get_expert_capacity_num_permuted_tokens(capacity)
 
-    def infer_num_tokens(self, max_num_permuted_tokens: int) -> int:
+    def infer_num_tokens(self,
+                         max_num_permuted_tokens: int,
+                         num_local_experts: Optional[int] = None) -> int:
         """Infer the maximum possible number of tokens given the max_num_permuted_tokens.
+
+        ``num_local_experts`` defaults to the tuned layout's. Pass
+        ``runtime_num_local_experts`` for the rows of every local slot.
         """
+        if num_local_experts is None:
+            num_local_experts = self.num_local_experts
         max_num_tiles = max_num_permuted_tokens // self.tile_size
-        if max_num_tiles >= self.num_local_experts:
+        if max_num_tiles >= num_local_experts:
             return (max_num_permuted_tokens - (self.tile_size - 1) *
-                    (self.num_local_experts - 1)) // self.top_k
+                    (num_local_experts - 1)) // self.top_k
         return max_num_tiles // self.top_k
 
     def gen_tuning_buckets(self, max_num_tokens: int) -> List[int]:
         buckets = get_last_power_of_2_num_tokens_buckets(
-            self.infer_num_tokens(max_num_tokens))
+            self.infer_num_tokens(max_num_tokens,
+                                  self.runtime_num_local_experts))
         return sorted(
             list(set(self.get_max_num_permuted_tokens(x) for x in buckets)))
 
     def map_to_tuning_buckets(self, x: int) -> int:
         return self.get_max_num_permuted_tokens(
-            last_positive_power_of_2(self.infer_num_tokens(x)))
+            last_positive_power_of_2(
+                self.infer_num_tokens(x, self.runtime_num_local_experts)))
 
     def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
         return self.infer_num_tokens(input_shapes[self.IDX_SHAPE_INFER][0])
@@ -3091,13 +3147,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      output_dtype: torch.dtype,
-                     scaling_vector_size: int = 16):
+                     scaling_vector_size: int = 16,
+                     tuner_num_local_experts: Optional[int] = None):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
             self.num_local_experts = num_local_experts
             self.local_expert_offset = local_expert_offset
             self.tile_size = tile_size
+            self.tuner_num_local_experts = tuner_num_local_experts
+            self.active_layout = GroupedGemmInputsHelper.tuner_expert_layout(
+                num_experts, num_local_experts, local_expert_offset,
+                tuner_num_local_experts)
 
             assert output_dtype == torch.bfloat16
             self.output_dtype = output_dtype
@@ -3114,11 +3175,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
         def unique_id(self):
+            num_experts, num_local_experts, local_expert_offset = self.active_layout
             return (
-                self.num_experts,
+                num_experts,
                 self.top_k,
-                self.num_local_experts,
-                self.local_expert_offset,
+                num_local_experts,
+                local_expert_offset,
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
@@ -3170,12 +3232,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = self.unique_id()
+            # The helper maps the rows of every local slot.
+            key = (self.unique_id(), self.num_local_experts)
             if key not in self.__class__.tuning_config_cache:
-                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
-                                                 self.num_local_experts,
-                                                 self.local_expert_offset,
-                                                 self.tile_size)
+                helper = GroupedGemmInputsHelper(
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                    tuner_num_local_experts=self.tuner_num_local_experts)
                 self.__class__.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
                         0, 0, helper.gen_tuning_buckets,
@@ -3335,12 +3401,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        tuner_num_local_experts: Optional[int] = None,
     ) -> torch.Tensor:
         tuner = AutoTuner.get()
 
         runner = Sm100BlockScaledContiguousGroupedGemmRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size)
+            tile_size, output_dtype, scaling_vector_size,
+            tuner_num_local_experts)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, num_non_exiting_tiles
@@ -3350,7 +3418,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
             [runner],
             runner.get_tuning_config(),
-            inputs,
+            GroupedGemmInputsHelper.tuner_inputs(inputs,
+                                                 tuner_num_local_experts),
         )
         output = runner(inputs, tactic=best_tactic)
         return output
@@ -3372,6 +3441,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        tuner_num_local_experts: Optional[int] = None,
     ) -> torch.Tensor:
         m = input.size(0)
         n = weight.size(1)
@@ -3393,7 +3463,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      scaling_vector_size: int = 16,
                      use_expert_counts: bool = False,
                      weights_evict_first: bool = False,
-                     weights_evict_first_max_tokens: int = 0):
+                     weights_evict_first_max_tokens: int = 0,
+                     tuner_num_local_experts: Optional[int] = None):
             """``weights_evict_first``: load the expert weights (B / SFB) evict-first. Such a runner serves calls
             of up to ``weights_evict_first_max_tokens`` tokens (the caller's bound; 0: unknown), and its tuning
             covers row buckets up to that bound whatever the tuning call's rows."""
@@ -3403,6 +3474,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.num_local_experts = num_local_experts
             self.local_expert_offset = local_expert_offset
             self.tile_size = tile_size
+            self.tuner_num_local_experts = tuner_num_local_experts
+            self.active_layout = GroupedGemmInputsHelper.tuner_expert_layout(
+                num_experts, num_local_experts, local_expert_offset,
+                tuner_num_local_experts)
 
             assert output_dtype == torch.bfloat16
             self.output_dtype = output_dtype
@@ -3411,6 +3486,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if self.use_expert_counts:
                 if self.top_k != 1:
                     raise ValueError("Expert-count scheduling requires top_k=1")
+                if tuner_num_local_experts is not None:
+                    # The counts cover every local slot, but the tuner gets
+                    # the weights of the active slots only.
+                    raise ValueError(
+                        "Expert-count scheduling takes no spare slots")
             self.fc2_n_tile_size_override = (
                 _get_cutedsl_fc2_n_tile_size_override())
             self.weights_evict_first = weights_evict_first
@@ -3428,11 +3508,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
         def unique_id(self):
+            num_experts, num_local_experts, local_expert_offset = self.active_layout
             runner_id = (
-                self.num_experts,
+                num_experts,
                 self.top_k,
-                self.num_local_experts,
-                self.local_expert_offset,
+                num_local_experts,
+                local_expert_offset,
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
@@ -3508,15 +3589,42 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return valid_tactics
 
+        def tuner_helper(self) -> GroupedGemmInputsHelper:
+            """The tuning helper of the active slots' layout, which ``tuner_inputs`` have."""
+            num_experts, num_local_experts, local_expert_offset = self.active_layout
+            return GroupedGemmInputsHelper(num_experts, self.top_k,
+                                           num_local_experts,
+                                           local_expert_offset, self.tile_size)
+
+        def tuner_inputs(self,
+                         inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+            """Return the ``inputs`` the autotuner gets.
+
+            With spare slots, these are the inputs of a layer without them for
+            the same tokens: the active slots' weights, and the permuted rows
+            and tiles that the active slots' layout pads those tokens to.
+            """
+            if self.tuner_num_local_experts is None:
+                return inputs
+            (a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx,
+             tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+             *others) = GroupedGemmInputsHelper.tuner_inputs(
+                 inputs, self.tuner_num_local_experts)
+            rows = self.tuner_helper().get_max_num_permuted_tokens(c.size(0))
+            tiles = rows // self.tile_size
+            scale_k = a.size(1) * 2 // self.scaling_vector_size
+            return [
+                a[:rows], b, a_sf[:rows * scale_k], b_sf, alpha, c,
+                tile_idx_to_group_idx[:tiles], tile_idx_to_mn_limit[:tiles],
+                permuted_idx_to_expanded_idx[:rows], *others
+            ]
+
         def get_tuning_config(self) -> TuningConfig:
             """The runner's TuningConfig; an evict-first runner with a token bound tunes up to the permuted rows of
             that bound (``tune_max_num_tokens``), so its tactics cover every call it serves."""
             key = (self.unique_id(), self.weights_evict_first_max_tokens)
             if key not in self.__class__.tuning_config_cache:
-                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
-                                                 self.num_local_experts,
-                                                 self.local_expert_offset,
-                                                 self.tile_size)
+                helper = self.tuner_helper()
                 if self.use_expert_counts:
                     self.__class__.tuning_config_cache[key] = TuningConfig(
                         dynamic_tensor_specs=(DynamicTensorSpec(
@@ -3666,15 +3774,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # A kernel class a subclass swaps in need not take the L2 hint. The
             # runner's own weights_evict_first (a model-declared token bound)
-            # adds to the shape rule.
+            # adds to the shape rule, which counts the rows of the active slots.
+            active_num_experts, active_num_local_experts, _ = self.active_layout
             weight_evict_first = (
                 issubclass(
                     self.__class__.kernel_class,
                     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel)
                 and (self.weights_evict_first or
                      (not self.use_expert_counts and _moe_weight_evict_first(
-                         num_tokens, self.top_k, self.num_experts,
-                         self.num_local_experts, self.tile_size))))
+                         num_tokens, self.top_k, active_num_experts,
+                         active_num_local_experts, self.tile_size))))
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn, raster_along_m,
                          self.use_expert_counts, self.num_local_experts,
@@ -3779,6 +3888,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         weights_evict_first: bool = False,
         weights_evict_first_max_tokens: int = 0,
+        tuner_num_local_experts: Optional[int] = None,
     ) -> None:
         """``weights_evict_first``: load the expert weights (B / SFB) with an L2 evict_first policy (same math).
         ``weights_evict_first_max_tokens``: the most tokens of a call that takes ``weights_evict_first`` (the
@@ -3807,7 +3917,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             scaling_vector_size,
             use_expert_counts=expert_counts is not None,
             weights_evict_first=weights_evict_first,
-            weights_evict_first_max_tokens=weights_evict_first_max_tokens)
+            weights_evict_first_max_tokens=weights_evict_first_max_tokens,
+            tuner_num_local_experts=tuner_num_local_experts)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -3820,7 +3931,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
             [runner],
             runner.get_tuning_config(),
-            inputs,
+            runner.tuner_inputs(inputs),
         )
         runner(inputs, tactic=best_tactic)
 
@@ -3849,6 +3960,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         weights_evict_first: bool = False,
         weights_evict_first_max_tokens: int = 0,
+        tuner_num_local_experts: Optional[int] = None,
     ) -> None:
         num_tokens = token_final_scales.size(0)
         n = weight.size(1)
@@ -4288,7 +4400,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      swiglu_limit_scalar: float = float("inf"),
                      use_expert_counts: bool = False,
                      situ_beta: Optional[float] = None,
-                     situ_linear_beta: Optional[float] = None):
+                     situ_linear_beta: Optional[float] = None,
+                     tuner_num_local_experts: Optional[int] = None):
             """Initialize the runner.
 
             Args:
@@ -4299,6 +4412,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 situ_beta: Gate-side SiTU soft-cap. Required for -- and only
                     valid with -- ``ActivationType.SiTu``.
                 situ_linear_beta: Linear-side SiTU soft-cap, same rule.
+                tuner_num_local_experts: If set, the first
+                    ``tuner_num_local_experts`` local slots of each rank are
+                    the active ones: the runner tunes for their layout
+                    (``GroupedGemmInputsHelper.tuner_expert_layout``) and
+                    picks its L2 policy by it, and the kernel runs over
+                    every local slot.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -4309,6 +4428,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.top_k = top_k
             self.num_local_experts = num_local_experts
             self.local_expert_offset = local_expert_offset
+            self.tuner_num_local_experts = tuner_num_local_experts
+            self.active_layout = GroupedGemmInputsHelper.tuner_expert_layout(
+                num_experts, num_local_experts, local_expert_offset,
+                tuner_num_local_experts)
             if tile_size not in [128, 256]:
                 raise ValueError(
                     f"Tile size {tile_size} is not supported, it only supports 128 and 256."
@@ -4320,6 +4443,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if self.use_expert_counts:
                 if self.top_k != 1:
                     raise ValueError("Expert-count scheduling requires top_k=1")
+                if tuner_num_local_experts is not None:
+                    # The counts cover every local slot, but the tuner gets
+                    # the weights of the active slots only.
+                    raise ValueError(
+                        "Expert-count scheduling takes no spare slots")
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -4340,11 +4468,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             soft-caps appear: ``swiglu_limit_scalar`` and the two SiTU betas
             are baked in as ``const_expr``, not passed at launch.
             """
+            num_experts, num_local_experts, local_expert_offset = self.active_layout
             return (
-                self.num_experts,
+                num_experts,
                 self.top_k,
-                self.num_local_experts,
-                self.local_expert_offset,
+                num_local_experts,
+                local_expert_offset,
                 self.tile_size,
                 self.scaling_vector_size,
                 self.activation_type,
@@ -4414,6 +4543,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return valid_tactics
 
+        def tuner_helper(self) -> GatherGroupedGemmInputsHelper:
+            """The tuning helper of the active slots' layout, which ``tuner_inputs`` have."""
+            num_experts, num_local_experts, local_expert_offset = self.active_layout
+            return GatherGroupedGemmInputsHelper(num_experts, self.top_k,
+                                                 num_local_experts,
+                                                 local_expert_offset,
+                                                 self.tile_size)
+
+        def tuner_inputs(self, inputs: List) -> List:
+            """Return the ``inputs`` the autotuner gets.
+
+            With spare slots, these are the inputs of a layer without them for
+            the same tokens: the active slots' weights, and the permuted rows
+            and tiles that the active slots' layout pads those tokens to.
+            """
+            if self.tuner_num_local_experts is None:
+                return inputs
+            (a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx,
+             tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+             *others) = GroupedGemmInputsHelper.tuner_inputs(
+                 inputs, self.tuner_num_local_experts)
+            rows = self.tuner_helper().get_max_num_permuted_tokens(a.size(0))
+            tiles = rows // self.tile_size
+            return [
+                a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx[:tiles],
+                tile_idx_to_mn_limit[:tiles],
+                permuted_idx_to_expanded_idx[:rows], *others
+            ]
+
         def get_tuning_config(self) -> TuningConfig:
             key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
@@ -4434,13 +4592,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         use_cold_l2_cache=True,
                         share_jit_builds=True)
                     return self.__class__.tuning_config_cache[key]
-                helper = GatherGroupedGemmInputsHelper(
-                    self.num_experts,
-                    self.top_k,
-                    self.num_local_experts,
-                    self.local_expert_offset,
-                    self.tile_size,
-                )
+                helper = self.tuner_helper()
                 # Tuning uses layout:
                 # a, b, a_sf, b_sf, alpha, tile_idx, tile_mn_limit, permuted_idx, ...
                 self.__class__.tuning_config_cache[key] = TuningConfig(
@@ -4613,10 +4765,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
+            # The L2 rule counts the rows of the active slots.
+            active_num_experts, active_num_local_experts, _ = self.active_layout
             weight_evict_first = (not self.use_expert_counts
                                   and _moe_weight_evict_first(
-                                      orig_m, self.top_k, self.num_experts,
-                                      self.num_local_experts, self.tile_size))
+                                      orig_m, self.top_k, active_num_experts,
+                                      active_num_local_experts, self.tile_size))
             # The SiTU betas are folded into the kernel at trace time, so they
             # are part of the compiled-kernel identity, not just runtime args.
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
@@ -4741,6 +4895,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        tuner_num_local_experts: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -4778,7 +4933,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             swiglu_limit_scalar=swiglu_limit_scalar,
             use_expert_counts=expert_counts is not None,
             situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta)
+            situ_linear_beta=situ_linear_beta,
+            tuner_num_local_experts=tuner_num_local_experts)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4789,7 +4945,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
             [runner],
             runner.get_tuning_config(),
-            inputs,
+            runner.tuner_inputs(inputs),
         )
         output = runner.forward(inputs, tactic=best_tactic)
         return output
@@ -4818,6 +4974,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+        tuner_num_local_experts: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell`` (with its tactic) whose
         scheduler warp also zeroes the contiguous ``zero_out`` while FC1 runs."""
@@ -4836,7 +4993,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             scaling_vector_size,
             activation_type=ActivationType(activation_type),
-            swiglu_limit_scalar=swiglu_limit_scalar)
+            swiglu_limit_scalar=swiglu_limit_scalar,
+            tuner_num_local_experts=tuner_num_local_experts)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4846,7 +5004,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
             [runner],
             runner.get_tuning_config(),
-            inputs,
+            runner.tuner_inputs(inputs),
         )
         runner.zero_args = (zero_out.data_ptr(),
                             zero_out.numel() * zero_out.element_size())
@@ -4877,6 +5035,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+        tuner_num_local_experts: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return _fake_single_b(input, weight, input_scale, weight_scale, alpha,
                               tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4911,6 +5070,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        tuner_num_local_experts: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Meta-device shapes for the FC1 output and its block scales.
 

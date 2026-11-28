@@ -102,6 +102,7 @@ def _assert_allgathered_state(dist, expected_values):
     dist.tp_allgather_int64.assert_called_once()
     (payload,) = dist.tp_allgather_int64.call_args.args
     assert list(payload) == list(expected_values)
+    assert dist.tp_allgather_int64.call_args.kwargs == {"active_only": True}
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attention_dp_relax=False):
@@ -253,9 +254,16 @@ class TestRankState:
         assert state.num_active_tokens == 100
 
     def test_serialize(self) -> None:
-        state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
+        state = RankState(
+            rank=0,
+            num_active_requests=5,
+            num_active_tokens=100,
+            num_in_transfer_requests=2,
+            has_pending_context_retirement=True,
+        )
         # rank, active, tokens, retiring, pending_new, the iter-stats payload, then the
-        # forward work (context, generation) and the connector counters
+        # forward work (context, generation), the connector counters and the tagged
+        # in-transfer section
         assert state.serialize() == [
             0,
             5,
@@ -267,7 +275,11 @@ class TestRankState:
             0,
             0,
             0,
+            RankState._IN_TRANSFER_TAG,
+            2,
+            1,
         ]
+        assert RankState.deserialize(state.serialize()) == state
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
@@ -397,6 +409,19 @@ class TestRankState:
         assert RankState.deserialize(wire) == state
         assert not RankState.deserialize(wire).iter_stats.has_iter_stats
 
+    def test_in_transfer_section_beside_queued_stats(self) -> None:
+        """The in-transfer tag and the queued stats' version are both -4, at different places."""
+        state = RankState(
+            rank=1,
+            iter_stats=RankIterStatsPayload(num_queued_context_requests=2, has_pending_work=True),
+            num_in_transfer_requests=3,
+            has_pending_context_retirement=True,
+        )
+        wire = state.serialize()
+        assert wire[5] == RankIterStatsPayload._QUEUED_WIRE_VERSION == RankState._IN_TRANSFER_TAG
+        assert wire[-3] == RankState._IN_TRANSFER_TAG
+        assert RankState.deserialize(wire) == state
+
     def test_snapshot_wire_schema_is_stable(self) -> None:
         """Pin field order and the complete versioned frame independently of roundtrips."""
         assert RankSpecDecodingStats._fields == (
@@ -506,6 +531,9 @@ class TestRankState:
             4,
             6,
             1,  # Scheduling and connector tail.
+            -4,
+            0,
+            0,  # Tagged in-transfer section.
         ]
 
         assert state.serialize(include_kv_cache_load=True) == expected
@@ -577,7 +605,7 @@ class TestDefaultADPRouter:
         assert isinstance(router, ADPRouter)
 
     def test_empty_requests(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
@@ -587,7 +615,7 @@ class TestDefaultADPRouter:
         assert expected >= 0
 
     def test_balanced_distribution(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
@@ -599,7 +627,7 @@ class TestDefaultADPRouter:
         assert abs(len(result[0]) - len(result[1])) <= 1
 
     def test_target_dp_rank_respected(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
@@ -610,7 +638,7 @@ class TestDefaultADPRouter:
         assert result[1][0].id == 1
 
     def test_target_dp_rank_at_capacity_falls_through(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=2, num_active_tokens=20),
@@ -621,7 +649,7 @@ class TestDefaultADPRouter:
         assert len(result[1]) == 0
 
     def test_default_attention_dp_relax_is_relaxed(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
@@ -638,7 +666,7 @@ class TestDefaultADPRouter:
         assert req_relax in result[1]
 
     def test_favors_less_loaded_rank(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=3, num_active_tokens=300),
             RankState(rank=1, num_active_requests=1, num_active_tokens=100),
@@ -657,7 +685,7 @@ class TestDefaultADPRouter:
         assert expected == 5
 
     def test_four_ranks(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=4))
         states = [RankState(rank=i, num_active_requests=0, num_active_tokens=0) for i in range(4)]
         reqs = [_make_request_item(i, num_tokens=10) for i in range(8)]
         result, _ = router.route_requests(states, reqs, max_num_active_requests=10)
@@ -665,6 +693,59 @@ class TestDefaultADPRouter:
         assert total == 8
         for rank_reqs in result.values():
             assert len(rank_reqs) == 2
+
+    def test_absent_rank_gets_no_requests(self):
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=3))
+        states = [  # rank 1 left the group
+            RankState(rank=0, num_active_requests=2, num_active_tokens=200),
+            RankState(rank=2, num_active_requests=2, num_active_tokens=200),
+        ]
+        reqs = [_make_request_item(i, num_tokens=10) for i in range(4)]
+        reqs.append(_make_request_item(4, target_dp_rank=1, attention_dp_relax=True))
+        reqs.append(_make_request_item(5, target_dp_rank=2, attention_dp_relax=False))
+        result, expected = router.route_requests(states, reqs, max_num_active_requests=10)
+        assert set(result) == {0, 2}
+        assert sorted(item.id for items in result.values() for item in items) == list(range(6))
+        assert 5 in [item.id for item in result[2]]
+        assert expected == 5  # (2 + 2 + 6) / 2 serving ranks
+
+    def test_absent_rank_holds_its_strict_requests(self):
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=3))
+        queue = FCFSWaitingQueue()
+        queue.add_requests(
+            [
+                RequestQueueItem(
+                    0,
+                    create_mock_request_with_py_schedule_params(
+                        attention_dp_rank=1, attention_dp_relax=False
+                    ),
+                ),
+                RequestQueueItem(
+                    1,
+                    create_mock_request_with_py_schedule_params(
+                        attention_dp_rank=1, attention_dp_relax=True
+                    ),
+                ),
+                RequestQueueItem(2, create_mock_request_with_py_schedule_params()),
+            ]
+        )
+        states = [  # rank 1 left the group
+            RankState(rank=0, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=2, num_active_requests=0, num_active_tokens=0),
+        ]
+        admitted, placement = router.pop_requests(queue, states, 8, max_num_active_requests=4)
+        assert [item.id for item in admitted] == [1, 2]
+        assert [item.id for item in queue] == [0]
+        result, _ = router.route_requests(states, admitted, 4, placement=placement)
+        assert set(result) == {0, 2}
+        assert sorted(item.id for items in result.values() for item in items) == [1, 2]
+
+        # Rank 1 is back: the held request is admitted on it.
+        states.insert(1, RankState(rank=1, num_active_requests=0, num_active_tokens=0))
+        admitted, placement = router.pop_requests(queue, states, 8, max_num_active_requests=4)
+        assert [item.id for item in admitted] == [0]
+        result, _ = router.route_requests(states, admitted, 4, placement=placement)
+        assert [item.id for item in result[1]] == [0]
 
     def test_create_rank_state_default(self):
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
@@ -695,7 +776,7 @@ class TestDefaultADPRouter:
             _retiring_request(prompt_len=200),
             _retiring_request(prompt_len=300),
         ]
-        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
+        dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray([payload])
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -709,7 +790,7 @@ class TestDefaultADPRouter:
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
         router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [_retiring_request(), _retiring_request()]
-        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
+        dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray([payload])
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -726,7 +807,7 @@ class TestDefaultADPRouter:
             _retiring_request(prompt_len=200),
             _retiring_request(prompt_len=300),
         ]
-        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
+        dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray([payload])
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -836,6 +917,33 @@ class TestDefaultADPRouter:
             dist, RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize()
         )
 
+    @pytest.mark.parametrize("iter_stats_enabled", [False, True])
+    def test_gather_all_rank_states_skips_inactive(self, iter_stats_enabled: bool) -> None:
+        dist = _mock_dist(tp_rank=0, tp_size=3, has_cp_helix=False)
+        # The active-only gathers leave out inactive rank 1. The full gathers give it as None
+        # (object gather) or as a zero row (int64 gather).
+        active_rows = [[0, 1, 10], [2, 2, 20]]
+        dist.tp_allgather.side_effect = lambda payload, active_only: (
+            active_rows if active_only else [active_rows[0], None, active_rows[1]]
+        )
+        dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray(
+            active_rows if active_only else [active_rows[0], [0, 0, 0], active_rows[1]]
+        )
+        states = DefaultADPRouter(dist=dist).gather_all_rank_states(
+            [Mock(py_orig_prompt_len=10)], iter_stats_enabled=iter_stats_enabled
+        )
+        assert [state.rank for state in states] == [0, 2]
+
+    def test_gather_iter_stats_skips_inactive(self) -> None:
+        dist = _mock_dist(tp_rank=0, tp_size=3, has_cp_helix=False)
+        # The active-only gather leaves out inactive rank 1; the full gather gives it as None.
+        active_rows = [RankState(rank=0).serialize(), RankState(rank=2).serialize()]
+        dist.tp_allgather.side_effect = lambda payload, active_only=False: (
+            active_rows if active_only else [active_rows[0], None, active_rows[1]]
+        )
+        states = DefaultADPRouter(dist=dist).gather_iter_stats(None)
+        assert [state.rank for state in states] == [0, 2]
+
     @pytest.mark.parametrize("include_kv_cache_load", [False, True])
     def test_gather_all_rank_states_piggybacks_iter_stats(
         self, include_kv_cache_load: bool
@@ -897,7 +1005,7 @@ class TestDefaultADPRouter:
         # DP rank. The peer CP rank still holds a 20-token request that this CP
         # rank already retired.
         dist.cp_allgather_int64.return_value = np.array([[1, 10], [2, 30]])
-        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
+        dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray([payload])
         router = DefaultADPRouter(dist=dist)
 
         [state] = router.gather_all_rank_states(
@@ -962,7 +1070,7 @@ class TestDefaultADPRouter:
                     for cp in cp_ranks
                 ]
             )
-            dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
+            dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray([payload])
             requests = [Mock(total_input_len_cp=t) for t in active_tokens[(cp_rank, dp_rank)]]
             [state] = DefaultADPRouter(dist=dist).gather_all_rank_states(requests)
             return state
@@ -988,12 +1096,15 @@ class TestDefaultADPRouter:
             num_generation_requests=3,
             num_connector_transfers=5,
             connector_poll_failed=True,
+            num_in_transfer_requests=1,
+            has_pending_context_retirement=True,
         )
 
         disabled = state.serialize()
         # rank, active requests, active tokens, retiring requests, pending-request
-        # hint, the 9 iteration stats, the 2 forward-work counters and the 2 connector counters.
-        assert len(disabled) == 18
+        # hint, the 9 iteration stats, the 2 forward-work counters, the 2 connector counters
+        # and the tagged in-transfer section of 3.
+        assert len(disabled) == 21
         restored = RankState.deserialize(disabled)
         assert restored.num_context_requests == 2
         assert restored.num_generation_requests == 3
@@ -1001,15 +1112,22 @@ class TestDefaultADPRouter:
         assert restored.connector_poll_failed
         assert restored.iter_stats.kv_used_blocks == -1
         enabled = state.serialize(include_kv_cache_load=True)
-        assert len(enabled) == 21
+        assert len(enabled) == 24
         restored = RankState.deserialize(enabled)
         assert restored.iter_stats.kv_used_blocks == 4
         assert restored.num_context_requests == 2
         assert restored.num_generation_requests == 3
         assert restored.num_connector_transfers == 5
         assert restored.connector_poll_failed
+        assert restored.num_in_transfer_requests == 1
+        assert restored.has_pending_context_retirement
         for wire in (disabled, enabled):
-            legacy = RankState.deserialize(wire[:-2])
+            without_in_transfer = RankState.deserialize(wire[:-3])
+            assert without_in_transfer.num_connector_transfers == 5
+            assert without_in_transfer.connector_poll_failed
+            assert without_in_transfer.num_in_transfer_requests == 0
+            assert not without_in_transfer.has_pending_context_retirement
+            legacy = RankState.deserialize(wire[:-5])
             assert legacy.num_context_requests == 2
             assert legacy.num_generation_requests == 3
             assert legacy.num_connector_transfers == 0
@@ -1657,7 +1775,9 @@ class TestKVCacheAwareADPRouterRouting:
         dist = _mock_dist(tp_rank=tp_rank, tp_size=tp_size)
         # Echo the payload back for every rank: rank-state gathers use the
         # int64 gather, prefix-match gathers the object gather.
-        dist.tp_allgather_int64 = lambda data: np.asarray([list(data) for _ in range(tp_size)])
+        dist.tp_allgather_int64 = lambda data, active_only: np.asarray(
+            [list(data) for _ in range(tp_size)]
+        )
         dist.tp_allgather = lambda data: [list(data) for _ in range(tp_size)]
         kv_cache_manager = MagicMock()
         kv_cache_manager.enable_block_reuse = True
@@ -2054,7 +2174,7 @@ class TestConversationAwareADPRouter:
             Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
             _retiring_request(prompt_len=50),
         ]
-        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
+        dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray([payload])
 
         states = router.gather_all_rank_states(active_requests=active)
 

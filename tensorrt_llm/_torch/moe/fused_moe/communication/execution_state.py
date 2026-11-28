@@ -1,0 +1,291 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The active-rank mask and abort state that the MoE all-to-all kernels read under Wide-EP fault tolerance.
+
+When a peer stops, ``request_abort`` releases the collectives that wait for it. Then, with the model
+idle on every surviving rank, ``rearm`` returns the bound workspaces and layers to their first round,
+and ``install_mask`` writes the new rank mask (see ``rearm`` for the required order). Long waits on
+peers publish the round flag they wait for in the abort state (``waited_flags``). After each
+forward, ``check_incomplete_rounds`` marks the abort state cancelled if a peer may have overwritten
+rows that the forward's combines read.
+"""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Protocol
+
+import torch
+
+from tensorrt_llm._utils import confidential_compute_enabled, prefer_pinned
+from tensorrt_llm.bindings import internal as _tllm_internal
+
+from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed.membership import StoreGroup
+
+_MASK_WORD_BITS = 64
+_ABORT_REQUESTED = 0
+_ABORT_STATUS = 1
+# The words ``requested`` and ``status``, then the round flag awaited from each peer.
+_ABORT_WORDS = slice(0, int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX))
+_WAITED_FLAGS = slice(int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX), None)
+
+
+def _mask_words(mask: int, ep_rank: int) -> tuple[int, ...]:
+    """Split ``mask`` into the uint64 words of the kernels' mask, which must mark ``ep_rank``."""
+    word_mask = (1 << _MASK_WORD_BITS) - 1
+    words = tuple((mask >> (i * _MASK_WORD_BITS)) & word_mask for i in range(EP_MASK_NUM_WORDS))
+    if not (words[ep_rank // _MASK_WORD_BITS] >> (ep_rank % _MASK_WORD_BITS)) & 1:
+        raise RuntimeError(f"active_rank_mask must mark the local ep_rank ({ep_rank}) as active")
+    return words
+
+
+class MembershipWorkspace(Protocol):
+    """Peer-writable memory that a membership change remaps among the active ranks in place."""
+
+    @property
+    def local_device_bytes(self) -> int:
+        """Return the device bytes that :meth:`remap` allocates for this rank's row."""
+
+    def rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
+        """Return every row if a former member may still write into the workspace, else no row."""
+
+    def remap(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
+        """Map the workspace among the active ranks with ``fresh_rows`` on fresh pages."""
+
+
+class MoeExecutionState:
+    """Own the active-rank mask and abort state that the kernels of a model's NVLinkOneSided layers read.
+
+    Both stay at one address and change only in place, so CUDA graphs that captured the all-to-all
+    kernels follow every mask that :meth:`install_mask` writes and every abort request.
+
+    Args:
+        ep_group_health: The EP membership whose active ranks the mask holds.
+        ep_rank: This rank's EP rank, which every mask must mark active.
+        device: The device of the all-to-all workspace.
+    """
+
+    def __init__(self, ep_group_health: EPGroupHealth, ep_rank: int, device: torch.device) -> None:
+        self.ep_group_health = ep_group_health
+        self.ep_rank = ep_rank
+        self._device = device
+        # The kernels read the abort state at its host address, so the all-to-all ops take it only in
+        # pinned memory.
+        if confidential_compute_enabled():
+            raise RuntimeError(
+                "Wide-EP fault tolerance is not supported with Confidential Computing: the MoE "
+                "All-to-All kernels read their abort state in pinned host memory"
+            )
+        self.abort = torch.zeros(
+            int(_tllm_internal.thop.MOE_A2A_ABORT_STATE_WORDS),
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+        self._abort_words = self.abort.numpy()[_ABORT_WORDS]
+        # Orders the updates of ``requested`` by request_abort and rearm.
+        self._abort_lock = threading.Lock()
+        # The callbacks of each bound layer, and of each workspace per bound layer that uses it.
+        self._layers: dict[object, tuple[Callable[[], None], Callable[[], bool]]] = {}
+        self._workspaces: dict[
+            MembershipWorkspace,
+            dict[object, tuple[Callable[[], None], Callable[[], None], torch.Tensor]],
+        ] = {}
+        snapshot = ep_group_health.snapshot()
+        self._generation = snapshot.generation
+        # A layer bound after a membership change has a workspace that the change's remaps left out.
+        self._bound_generation = snapshot.generation
+        self.active_rank_mask = torch.tensor(
+            _mask_words(snapshot.mask, ep_rank), dtype=torch.uint64, device=device
+        )
+
+    def register_layer(
+        self, layer: object, reset_state: Callable[[], None], between_rounds: Callable[[], bool]
+    ) -> None:
+        """Register the dispatch/combine state machine of a bound ``layer``.
+
+        ``reset_state`` returns it to idle, and ``between_rounds`` returns whether it is idle, that
+        is, no dispatch of the layer waits for its combine.
+
+        Raises:
+            RuntimeError: The EP membership changed since this state was created.
+        """
+        if self.ep_group_health.generation != self._bound_generation:
+            raise RuntimeError("Bind MoE layers only before the EP membership changes")
+        self._layers[layer] = (reset_state, between_rounds)
+
+    def register_workspace(
+        self,
+        layer: object,
+        workspace: MembershipWorkspace,
+        reset_workspace: Callable[[], None],
+        check_incomplete_round: Callable[[], None],
+        rows: torch.Tensor,
+    ) -> None:
+        """Register the workspace of a bound ``layer``. Layers may share a workspace.
+
+        ``reset_workspace`` resets this rank's row of it, ``check_incomplete_round`` enqueues the
+        check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`), and
+        ``rows`` is the workspace's ``[ep_size, bytes]`` uint8 view. Each workspace is reset and
+        checked once, through the callbacks of a layer still registered.
+        """
+        self._workspaces.setdefault(workspace, {})[layer] = (
+            reset_workspace,
+            check_incomplete_round,
+            rows,
+        )
+
+    def unregister(self, layer: object) -> None:
+        """Drop the callbacks of ``layer``, and its workspace once no registered layer uses it."""
+        self._layers.pop(layer, None)
+        for workspace, layers in list(self._workspaces.items()):
+            layers.pop(layer, None)
+            if not layers:
+                del self._workspaces[workspace]
+
+    def _workspace_callbacks(
+        self,
+    ) -> list[tuple[Callable[[], None], Callable[[], None], torch.Tensor]]:
+        """Return the callbacks and rows of one registered layer per bound workspace."""
+        return [next(iter(layers.values())) for layers in self._workspaces.values()]
+
+    def staging_workspace(self) -> torch.Tensor:
+        """Return the rows of the largest bound workspace.
+
+        The workspace is idle from :meth:`remap_workspaces` until :meth:`rearm`, so restores may
+        stage expert weights through it.
+        """
+        return max(
+            (rows for _, _, rows in self._workspace_callbacks()), key=lambda rows: rows.shape[1]
+        )
+
+    def workspace_bytes(self) -> int:
+        """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
+        return sum(workspace.local_device_bytes for workspace in self._workspaces)
+
+    def workspace_rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
+        """Return every row if a former member may still write into any bound workspace.
+
+        Pass the result to :meth:`remap_workspaces`. This call is collective over ``comm``.
+        """
+        return frozenset().union(
+            *(workspace.rows_needing_fresh_pages(comm) for workspace in self._workspaces)
+        )
+
+    def remap_workspaces(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
+        """Map every bound workspace at the same addresses among the active members of ``comm``.
+
+        ``fresh_rows`` is :meth:`workspace_rows_needing_fresh_pages` of the same ``comm``. Call only
+        while no rank is in a collective: after a membership change, between the barrier that
+        follows the aborted collectives and :meth:`rearm` (see :meth:`rearm` for the order). Every
+        rank must :meth:`rearm` before the next collective. This call is collective over ``comm``.
+
+        A workspace's remap that raises on this rank before its own exchanges (an unmap failure, or
+        a workspace in an unexpected state) leaves the other active ranks waiting in that exchange
+        until the membership removes this rank.
+        """
+        for workspace in self._workspaces:
+            workspace.remap(comm, fresh_rows)
+
+    def request_abort(self) -> None:
+        """Make running and future collectives return without their peers. Safe from any thread.
+
+        The request stays in effect until a :meth:`rearm` that starts after it.
+        """
+        with self._abort_lock:
+            self._abort_words[_ABORT_REQUESTED] += 1
+
+    def aborted(self) -> bool:
+        """Return whether an abort was requested or a collective aborted since the last :meth:`rearm`."""
+        return bool(self._abort_words.any())
+
+    def check_incomplete_rounds(self) -> None:
+        """Enqueue the check of this rank's incomplete-round word in every bound workspace.
+
+        A peer sets the word before it overwrites rows that this rank's combines may have read, and
+        the check then marks the abort state cancelled, so :meth:`aborted` holds. Call once per
+        forward, on the stream of its last combine, before the event that the host waits on to
+        accept the forward.
+        """
+        for _, check_incomplete_round, _ in self._workspace_callbacks():
+            check_incomplete_round()
+
+    def waited_flags(self) -> dict[int, int]:
+        """Return each EP rank that a kernel has long waited on, with the round flag it waits for."""
+        # The abort state stores the uint32 flags in int32 words.
+        return {
+            peer: round_flag & 0xFFFFFFFF
+            for peer, round_flag in enumerate(self.abort[_WAITED_FLAGS].tolist())
+            if round_flag
+        }
+
+    def rearm(self) -> None:
+        """Clear the abort state and return every bound workspace and layer to its first round.
+
+        It resets this rank's row of each bound workspace without a barrier, so every surviving
+        rank recovers in this order: :meth:`request_abort` if a collective waits on a failed peer,
+        a device synchronization, a barrier over the surviving ranks, :meth:`remap_workspaces`
+        after a membership change, ``rearm``, :meth:`install_mask`, then a barrier over the
+        surviving ranks before its next collective. The first barrier keeps a peer's aborted
+        collectives from writing into the row after its reset, the second keeps a peer's next
+        collective from writing into it before. ``install_mask`` needs no barrier of its own: it
+        writes only this rank's device mask, after a device synchronization, and refuses a layer
+        that is between its dispatch and its combine. The device is synchronized before and after,
+        so no queued collective sees a partial reset.
+
+        The abort requests made before ``rearm`` starts are cleared. A request made meanwhile
+        stays in effect, so :meth:`aborted` then holds and :meth:`install_mask` raises.
+        """
+        with self._abort_lock:
+            handled_requests = int(self._abort_words[_ABORT_REQUESTED])
+        torch.cuda.synchronize(self._device)
+        for reset_workspace, _, _ in self._workspace_callbacks():
+            reset_workspace()
+        for reset_state, _ in self._layers.values():
+            reset_state()
+        torch.cuda.synchronize(self._device)
+        # The kernels write the status and waited flags, and none runs now.
+        self.abort[_ABORT_STATUS:].zero_()
+        with self._abort_lock:
+            self._abort_words[_ABORT_REQUESTED] -= handled_requests
+
+    def install_mask(self) -> None:
+        """Write the active ranks of the EP group health into the device mask.
+
+        Call only while no all-to-all collective is queued or running, and after :meth:`rearm` if a
+        collective aborted (see :meth:`rearm` for the order across ranks). The device is
+        synchronized first, so no collective reads a partly written mask.
+
+        Raises:
+            RuntimeError: A bound layer dispatched without its combine, which would read the rows
+                of another mask, or the abort state is set.
+        """
+        snapshot = self.ep_group_health.snapshot()
+        if snapshot.generation == self._generation:
+            return
+        words = _mask_words(snapshot.mask, self.ep_rank)
+        if not all(between_rounds() for _, between_rounds in self._layers.values()):
+            raise RuntimeError(
+                "Install the MoE All-to-All rank mask only between rounds: a bound layer "
+                "dispatched without its combine"
+            )
+        torch.cuda.synchronize(self._device)
+        if self.aborted():
+            raise RuntimeError(f"MoE All-to-All abort state is {self.abort[_ABORT_WORDS].tolist()}")
+        self.active_rank_mask.copy_(torch.tensor(words, dtype=torch.uint64))
+        self._generation = snapshot.generation

@@ -190,6 +190,7 @@ class ScheduledEncoderExecutor:
 
     is_generation_model = False
     kv_cache_transceiver = None
+    rank_failure_recovery = None
 
     def __init__(
         self,

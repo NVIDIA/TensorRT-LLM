@@ -3173,7 +3173,8 @@ void StorageManager::shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
 
 void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
     TypedVec<PoolGroupIndex, float> const& ratioList,
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+    std::optional<TypedVec<PoolGroupIndex, SlotCount>> const& maxNumSlots)
 {
     auto& lvlStorage = *mLevels.at(level).storage;
     size_t const granularity = lvlStorage.poolSizeGranularity(lvlStorage.cacheTier());
@@ -3208,7 +3209,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
             + std::to_string(*maxQuota) + " for this cache level (raise the tier's max_quota)");
     }
     // Fixed hot-tier groups keep their size; only elastic groups are resized.
-    auto newNumSlots = slotCountsForLevel(level, quota, ratioList);
+    auto newNumSlots = slotCountsForLevel(level, quota, ratioList, maxNumSlots);
     for (PoolGroupIndex pgIdx{0}; level == kHotLevel && pgIdx < newNumSlots.size(); ++pgIdx)
     {
         for (LocalityDomainId localityDomainId{0}; localityDomainId < numDomains; ++localityDomainId)
@@ -3684,13 +3685,55 @@ size_t StorageManager::minQuotaForLevel(CacheLevel level) const
         _minSlotsFor(level), _secondaryBudget(storage));
 }
 
-TypedVec<PoolGroupIndex, SlotCount> StorageManager::slotCountsForLevel(
-    CacheLevel level, size_t quota, TypedVec<PoolGroupIndex, float> const& ratio) const
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::slotCountsForLevel(CacheLevel level, size_t quota,
+    TypedVec<PoolGroupIndex, float> const& ratio,
+    std::optional<TypedVec<PoolGroupIndex, SlotCount>> const& maxNumSlots) const
 {
     auto const& storage = *mLevels.at(level).storage;
-    return CacheLevelStorage::ratioToSlotCountList(quota, storage.slotSizeLists(), ratio,
-        storage.poolSizeGranularity(storage.cacheTier()), _minSlotsFor(level), _secondaryBudget(storage),
-        level == kHotLevel ? mFixedSlots : FixedSlotCounts{});
+    auto const minSlots = _minSlotsFor(level);
+    FixedSlotCounts fixedSlots = level == kHotLevel ? mFixedSlots : FixedSlotCounts{};
+    auto const split = [&]
+    {
+        return CacheLevelStorage::ratioToSlotCountList(quota, storage.slotSizeLists(), ratio,
+            storage.poolSizeGranularity(storage.cacheTier()), minSlots, _secondaryBudget(storage), fixedSlots);
+    };
+    auto slotCounts = split();
+    if (!maxNumSlots.has_value())
+    {
+        return slotCounts;
+    }
+    PoolGroupIndex const numPg = storage.slotSizeLists().size();
+    TLLM_CHECK_WITH_INFO(maxNumSlots->size() == numPg, "maxNumSlots must hold one count per pool group");
+    if (fixedSlots.empty())
+    {
+        fixedSlots = FixedSlotCounts(numPg, std::nullopt);
+    }
+    // The split fills the quota rung by rung, so a smaller quota can give one group more slots
+    // than a larger one. Each round holds at least one more group at its cap, which the split
+    // that took it past the cap could afford, so this ends within numPg rounds.
+    while (true)
+    {
+        bool held = false;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+        {
+            if (slotCounts[pgIdx] > (*maxNumSlots)[pgIdx])
+            {
+                TLLM_CHECK_WITH_INFO((*maxNumSlots)[pgIdx] >= minSlots[pgIdx],
+                    "Pool group %d cannot be capped at %lld slots, below its floor of %lld", pgIdx.value(),
+                    static_cast<long long>((*maxNumSlots)[pgIdx]), static_cast<long long>(minSlots[pgIdx]));
+                TLLM_CHECK_WITH_INFO(!fixedSlots[pgIdx].has_value(),
+                    "Pool group %d holds a fixed slot count past its cap of %lld slots", pgIdx.value(),
+                    static_cast<long long>((*maxNumSlots)[pgIdx]));
+                fixedSlots[pgIdx] = (*maxNumSlots)[pgIdx];
+                held = true;
+            }
+        }
+        if (!held)
+        {
+            return slotCounts;
+        }
+        slotCounts = split();
+    }
 }
 
 size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,

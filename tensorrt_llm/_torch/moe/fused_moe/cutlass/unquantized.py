@@ -35,6 +35,7 @@ class TrtllmCutlassUnquantizedImpl(CutlassMoELoraMixin, CutlassFusedMoEBase):
         "none",
         "CUTLASS grouped GEMM over unquantized fp16/bf16 weights, SM80+.",
         supports_moe_lora=True,
+        supports_spare_slots=True,
     )
     sm_support = SmSupport(minimum=80)
     supported_dtypes = HP_DTYPES

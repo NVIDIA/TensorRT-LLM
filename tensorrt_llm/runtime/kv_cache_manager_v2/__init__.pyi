@@ -1937,7 +1937,19 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> bytes | None: ...
-    def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
+    def resize(
+        self,
+        cache_level: CacheLevel,
+        quota: int,
+        best_efforts: bool = False,
+        max_num_slots: Sequence[int] | None = None,
+    ) -> bool:
+        """Resize a cache level to ``quota`` bytes, split by the target ratio.
+
+        ``max_num_slots``, when given, caps the slots of each pool group in each locality
+        domain: a group the split would take past its cap is held at it and the other groups
+        split the rest.
+        """
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_storage_statistics(self, cache_level: CacheLevel = ...) -> list[StorageStatistics]: ...
     def get_life_cycle_pool_group_indices(

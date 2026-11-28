@@ -121,6 +121,7 @@ Encoder and LLM forward Params are execution views.
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/PAGE_TABLE_SPEC_GUIDE.md` | The page table spec each KV cache manager states for disaggregated transfer and KV cache sharing — **read before changing a KV cache manager's roles, layer naming or page table spec** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
+| `tensorrt_llm/_torch/distributed/membership/FAULT_TOLERANCE_DEVELOPER_GUIDE.md` | Wide-EP fault tolerance: membership protocol, node supervisor, rejoin, startup record and replay, backend contract — **read before modifying fault-tolerance code or a shared path it runs (`Distributed`, the attention-DP vote, `NVLinkOneSided`, EPLB)** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager/RECURRENT_STATE_DEVELOPER_GUIDE.md` | Recurrent state (Mamba2, GDN, KDA): the state a model declares, how shared runtime code finds the declaration, and what a family provides to its cache manager — **read before adding a recurrent family or a check on a recurrent model or cache manager** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 

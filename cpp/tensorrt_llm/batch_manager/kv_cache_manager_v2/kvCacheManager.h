@@ -345,7 +345,12 @@ public:
 
     // ---- Resize -----------------------------------------------------------
 
-    bool resize(CacheLevel level, size_t quota, bool bestEfforts = false);
+    //! Resize `level` to `quota` bytes, split by the target ratio. `maxNumSlots`, when given,
+    //! caps the slots of each pool group in each locality domain: a group the split would take
+    //! past its cap is held at it and the other groups split the rest, so memory that views of
+    //! the pools cover is never outgrown.
+    bool resize(CacheLevel level, size_t quota, bool bestEfforts = false,
+        std::optional<TypedVec<PoolGroupIndex, SlotCount>> const& maxNumSlots = std::nullopt);
     size_t getQuota(CacheLevel level) const;
 
     // ---- Statistics -------------------------------------------------------
@@ -712,7 +717,8 @@ private:
     // points at the mistake rather than at whatever breaks later.
     void _checkNoLivingKvCaches(char const* api) const;
 
-    void _adjustLevel(CacheLevel level, size_t quota);
+    void _adjustLevel(CacheLevel level, size_t quota,
+        std::optional<TypedVec<PoolGroupIndex, SlotCount>> const& maxNumSlots = std::nullopt);
     bool _needAdjustment(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;

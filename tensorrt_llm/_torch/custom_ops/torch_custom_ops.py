@@ -292,6 +292,7 @@ def fused_moe(
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
     swiglu_clamp_after_silu: bool = False,
+    tuner_num_local_experts: Optional[int] = None,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -305,6 +306,18 @@ def fused_moe(
         assert tuner_top_k is None
         tuner_input = input
         tuner_top_k = token_selected_experts.size(1)
+
+    tuner_weights = [
+        fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+        fc2_expert_biases
+    ]
+    if tuner_num_local_experts is not None:
+        # The tuner gets only the active slots, so it profiles and caches the
+        # problem of a layer without spare slots.
+        tuner_weights = [
+            None if w is None else w[:tuner_num_local_experts]
+            for w in tuner_weights
+        ]
 
     # allocate workspace for profiling
     moe_runner = MoERunner(
@@ -335,10 +348,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        [tuner_input, *tuner_weights],
         gemm_idx=1,
     )
 
@@ -346,10 +356,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        [tuner_input, *tuner_weights],
         gemm_idx=2,
     )
 
@@ -469,7 +476,8 @@ def _(input: torch.Tensor,
       gated_slot_lora_ranks: Optional[torch.Tensor] = None,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       token_to_slot: Optional[torch.Tensor] = None,
-      swiglu_clamp_after_silu: bool = False):
+      swiglu_clamp_after_silu: bool = False,
+      tuner_num_local_experts: Optional[int] = None):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,

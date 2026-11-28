@@ -38,7 +38,7 @@ def prepare_response(
     if response is None:
         return None
     result = response.result
-    result.cached_tokens = request.cached_tokens
+    result.cached_tokens = request.reported_cached_tokens
     result.ctx_computed_tokens = getattr(request, "py_ctx_computed_tokens", 0)
     result.ctx_first_begin = getattr(request, "py_ctx_first_begin", -1)
     result.ctx_num_chunks = getattr(request, "py_ctx_num_chunks", 0)

@@ -113,6 +113,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     engine.kv_cache_transceiver = Mock()
     engine._disagg_coordinator = Mock(
         spec=[
+            "logical_context_cancellation_enabled",
             "supports_logical_context_cancellation",
             "request_logical_context_cancellation",
             "has_retiring_gen_receives",
@@ -123,6 +124,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
             "requires_gen_cancellation_consensus",
         ]
     )
+    engine.disagg.logical_context_cancellation_enabled = True
     engine.disagg.supports_logical_context_cancellation.return_value = True
     engine.disagg.request_logical_context_cancellation.return_value = True
     engine.disagg.has_retiring_gen_receives = False
@@ -174,7 +176,9 @@ def _broadcast_rank(group: FakeDistGroup, rank: int) -> FakeDistRank:
 def _consume_abort(engine: PyExecutor, client_id: int, request_id: int | None) -> None:
     """Deliver the real worker abort through the executor control queue."""
     mapping = {} if request_id is None else {client_id: request_id}
-    worker = SimpleNamespace(engine=engine, _client_id_to_request_id=mapping)
+    worker = SimpleNamespace(
+        engine=engine, _client_id_to_request_id=mapping, _rank_failure_requests=None
+    )
     BaseWorker.abort_request(worker, client_id)
     item = engine.executor_request_queue.get_request_queue().get_nowait()
     # The distributed request envelope carries the whole dataclass, including
@@ -294,8 +298,8 @@ def test_staged_context_cancellation_survives_retirement(executor: PyExecutor) -
     assert not executor._response_channel.result_wait_queues
     executor._free_request_resources.assert_called_once_with(request)
 
-    executor._flush_staged_responses()
-    executor._flush_staged_responses()
+    executor.flush_staged_responses()
+    executor.flush_staged_responses()
     assert executor._response_channel.responses == {request.py_request_id: [response]}
     result_queue.put_response.remote.assert_called_once_with(response.client_id, response)
     assert not executor._staged_responses
@@ -498,7 +502,9 @@ def test_legacy_engine_without_late_cancel_hook_remains_unchanged() -> None:
     """C++/other backends retain their old already-completed-request behavior."""
     engine = Mock(spec=["can_enqueue_requests", "cancel_request"])
     engine.can_enqueue_requests.return_value = True
-    worker = SimpleNamespace(engine=engine, _client_id_to_request_id={})
+    worker = SimpleNamespace(
+        engine=engine, _client_id_to_request_id={}, _rank_failure_requests=None
+    )
     BaseWorker.abort_request(worker, 101)
     engine.cancel_request.assert_not_called()
 
@@ -613,7 +619,7 @@ def test_draining_control_waits_for_retained_transfer(
     executor.control_action_done = Mock()
     executor.hang_detector = SimpleNamespace(pause=nullcontext)
     executor.dwdp_manager = None
-    executor._retire_inflight_batch_for_control = Mock()
+    executor.retire_inflight_batch = Mock()
     executor._pop_sleep_wakeup_abort = Mock(return_value=None)
     synchronize = Mock()
     monkeypatch.setattr("torch.cuda.synchronize", synchronize)
@@ -639,7 +645,7 @@ def test_draining_control_waits_for_retained_transfer(
     assert not executor.control_requests
     executor.control_request_barrier.set.assert_called_once()
     executor.control_action_done.wait.assert_called_once()
-    executor._retire_inflight_batch_for_control.assert_called_once()
+    executor.retire_inflight_batch.assert_called_once()
     synchronize.assert_called_once()
 
 
@@ -738,7 +744,7 @@ def test_control_drain_delivers_accumulated_and_live_aborts_on_every_rank(
     for engine in engines:
         engine.control_request_barrier = Mock()
         engine.control_action_done = Mock()
-        engine._retire_inflight_batch_for_control = Mock()
+        engine.retire_inflight_batch = Mock()
         engine._pop_sleep_wakeup_abort = Mock(return_value=None)
         engine.dwdp_manager = None
     # Exercise the group control gate with asymmetric local readiness. This is
@@ -783,7 +789,7 @@ def test_adp_drain_delivers_parking_abort_to_the_owning_rank(
         engine.control_requests = [RequestQueueItem(CONTROL_REQUEST_ID, control_id="drain")]
         engine.control_request_barrier = Mock()
         engine.control_action_done = Mock()
-        engine._retire_inflight_batch_for_control = Mock()
+        engine.retire_inflight_batch = Mock()
         engine._pop_sleep_wakeup_abort = Mock(return_value=None)
         engine.dwdp_manager = None
     monkeypatch.setattr("torch.cuda.synchronize", Mock())
@@ -801,7 +807,9 @@ def test_adp_drain_delivers_parking_abort_to_the_owning_rank(
     root.request_accumulated = deferred.copy()
     root.executor_request_queue.begin_sleep_transition(["model_weights"])
     root.executor_request_queue.batch_wait_timeout_ms = 1000
-    worker = SimpleNamespace(engine=root, _client_id_to_request_id={101: 11})
+    worker = SimpleNamespace(
+        engine=root, _client_id_to_request_id={101: 11}, _rank_failure_requests=None
+    )
     BaseWorker.abort_request(worker, request.py_client_id)
     original_get = root.executor_request_queue.request_queue.get
 
@@ -978,7 +986,9 @@ def test_worker_cancellation_admission_does_not_reopen_requests(
         with pytest.raises(RuntimeError, match="admission is"):
             request_queue.enqueue_request(Mock())
     worker = SimpleNamespace(
-        engine=executor, _client_id_to_request_id={} if late_abort else {101: 11}
+        engine=executor,
+        _client_id_to_request_id={} if late_abort else {101: 11},
+        _rank_failure_requests=None,
     )
     BaseWorker.abort_request(worker, 101)
     items = request_queue.get_from_request_queue(timedelta(0), wait_for_batch=False)
@@ -1006,7 +1016,9 @@ def test_cancellation_enqueue_rechecks_state_after_worker_admission(
 
     monkeypatch.setattr(executor, "_can_enqueue_cancellation", stale_admission)
     worker = SimpleNamespace(
-        engine=executor, _client_id_to_request_id={} if late_abort else {101: 11}
+        engine=executor,
+        _client_id_to_request_id={} if late_abort else {101: 11},
+        _rank_failure_requests=None,
     )
     BaseWorker.abort_request(worker, 101)
     assert request_queue.request_queue.empty()
@@ -1021,7 +1033,10 @@ def test_cancellation_ingress_rejects_non_root_or_inactive_executor(
     executor.executor_request_queue.begin_sleep_transition(["model"])
     for mapping in ({}, {101: 11}):
         BaseWorker.abort_request(
-            SimpleNamespace(engine=executor, _client_id_to_request_id=mapping), 101
+            SimpleNamespace(
+                engine=executor, _client_id_to_request_id=mapping, _rank_failure_requests=None
+            ),
+            101,
         )
     executor.cancel_request(11)
     executor._cancel_context_transfer(101)
@@ -1033,7 +1048,10 @@ def test_legacy_engine_cancellation_keeps_original_admission_gate(can_enqueue: b
     engine = Mock(spec=["can_enqueue_requests", "cancel_request"])
     engine.can_enqueue_requests.return_value = can_enqueue
     BaseWorker.abort_request(
-        SimpleNamespace(engine=engine, _client_id_to_request_id={101: 11}), 101
+        SimpleNamespace(
+            engine=engine, _client_id_to_request_id={101: 11}, _rank_failure_requests=None
+        ),
+        101,
     )
     if can_enqueue:
         engine.cancel_request.assert_called_once_with(11)

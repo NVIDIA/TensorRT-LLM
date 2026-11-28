@@ -1060,7 +1060,8 @@ TypedVec<CacheGroupId, std::vector<BufferId>> KvCacheManager::bufferGrouping() c
 
 // ---- Resize ---------------------------------------------------------------
 
-bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
+bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts,
+    std::optional<TypedVec<PoolGroupIndex, SlotCount>> const& maxNumSlots)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
@@ -1074,7 +1075,7 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
         throw std::runtime_error("best_efforts resize not implemented");
     try
     {
-        _adjustLevel(level, quota);
+        _adjustLevel(level, quota, maxNumSlots);
         return true;
     }
     catch (std::exception const& e)
@@ -1533,7 +1534,8 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
     return std::min(lb * tokPerBlock, tokenNumUpperBound);
 }
 
-void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
+void KvCacheManager::_adjustLevel(
+    CacheLevel level, size_t quota, std::optional<TypedVec<PoolGroupIndex, SlotCount>> const& maxNumSlots)
 {
     auto const& ratioList = _getTargetRatioList(level);
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistent = nullptr;
@@ -1543,7 +1545,7 @@ void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
         persistentPages = _gatherLastLevelPersistentPages();
         persistent = &persistentPages;
     }
-    mStorage->adjustCacheLevel(level, quota, ratioList, persistent);
+    mStorage->adjustCacheLevel(level, quota, ratioList, persistent, maxNumSlots);
 }
 
 TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLastLevelPersistentPages() const

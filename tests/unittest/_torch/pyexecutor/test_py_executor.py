@@ -75,6 +75,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 )
 from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
+from tensorrt_llm.executor.rank_failure_requests import RankFailureError
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import CpType
@@ -110,6 +111,7 @@ def _forward_step_executor(
         _handle_errors=Mock(),
         _finish_inforward_snapshots=False,
         kv_cache_manager=Mock(),
+        rank_failure_recovery=None,
     )
 
 
@@ -257,6 +259,26 @@ def test_forward_step_finishes_inforward_snapshots_before_the_stream_handoff():
     _run_forward_step(executor, batch)
 
     assert calls == [("finish", batch), "handoff"]
+
+
+def test_forward_step_checks_incomplete_rounds_before_the_stream_handoff():
+    """Under rank failure recovery, the all-to-all check is enqueued after the forward and before
+    the stream handoff, so the batch's sampler event, which accept_step waits for, follows it."""
+    calls = []
+
+    def forward(*args, **kwargs):
+        calls.append("forward")
+        return {"logits": None}
+
+    engine = Mock(route_capture=None)
+    engine.forward.side_effect = forward
+    executor = _forward_step_executor(engine)
+    executor.rank_failure_recovery = Mock(check_step=lambda: calls.append("check"))
+    executor._stream_ordering_events[1].record.side_effect = lambda stream: calls.append("handoff")
+
+    _run_forward_step(executor, ScheduledRequests())
+
+    assert calls == ["forward", "check", "handoff"]
 
 
 def test_forward_step_keeps_draft_len_when_forward_fails():
@@ -2091,6 +2113,232 @@ def test_kv_pool_rebalance_refreshes_capacity_without_mixing_discovery_metadata(
     assert executor.get_openengine_discovery() == {"node": {"engine_id": "test"}}
 
 
+def test_kv_pools_suspended_resumes_requests():
+    """Check that a resize in kv_pools_suspended resumes every request and reads the capacity."""
+
+    class Manager:
+        tokens_per_block = 32
+
+        def __init__(self):
+            self.total_blocks = 100
+            self.impl = Mock()
+            self.suspended = []
+
+        def get_primary_block_counts(self):
+            return 0, self.total_blocks
+
+        def is_request_active(self, request_id):
+            return True
+
+        def suspend_request(self, request):
+            self.suspended.append(request)
+
+        def resume_request(self, request):
+            self.suspended.remove(request)
+
+    manager = Manager()
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.kv_cache_manager = manager
+    executor.active_requests = [types.SimpleNamespace(py_request_id=1)]
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    executor._resume_padding_dummies_after_rebalance = Mock()
+
+    with executor.kv_pools_suspended() as kv_cache_manager:
+        assert kv_cache_manager is manager
+        assert manager.suspended == executor.active_requests
+        manager.total_blocks = 60
+    manager.impl.adjust.assert_not_called()
+    assert manager.suspended == []
+    executor._resume_padding_dummies_after_rebalance.assert_called_once_with(manager, [])
+    assert executor.get_kv_cache_capacity()["maxNumBlocks"] == 60
+
+
+def test_kv_pools_suspended_flushes_deferred_closes_first():
+    """Check that kv_pools_suspended closes the deferred KV caches before the pools change."""
+
+    class Manager:
+        tokens_per_block = 32
+
+        def __init__(self):
+            self.events = []
+
+        def get_primary_block_counts(self):
+            return 0, 100
+
+        def flush_deferred_closes(self):
+            self.events.append("flush_deferred_closes")
+
+        def is_request_active(self, request_id):
+            return True
+
+        def suspend_request(self, request):
+            self.events.append("suspend_request")
+
+        def resume_request(self, request):
+            self.events.append("resume_request")
+
+    manager = Manager()
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.kv_cache_manager = manager
+    executor.active_requests = [types.SimpleNamespace(py_request_id=1)]
+    executor._defer_generation_only_release = True
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    executor._resume_padding_dummies_after_rebalance = Mock()
+
+    with executor.kv_pools_suspended():
+        pass
+    assert manager.events == ["flush_deferred_closes", "suspend_request", "resume_request"]
+
+
+def test_fail_requests_by_id_flushes_errors():
+    """Check that requests failed by id reach the next flush, each with its own error.
+
+    The client raises the error of every failed response, so a shared exception would grow its
+    traceback with every raise.
+    """
+    executor = object.__new__(PyExecutor)
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor.enable_attention_dp = True
+    executor._enqueue_responses = Mock()
+    error = RankFailureError()
+    executor.fail_requests_by_id({11: 111, 12: 112, 13: 113}, error)
+    executor._flush_pending_transfer_responses()
+    ((responses,), _) = executor._enqueue_responses.call_args
+    assert [(request_id, response.client_id) for request_id, response in responses] == [
+        (11, 111),
+        (12, 112),
+        (13, 113),
+    ]
+    for _, response in responses:
+        assert type(response.error_msg) is RankFailureError
+        assert str(response.error_msg) == str(error)
+        with pytest.raises(RankFailureError) as raised:
+            raise response.error_msg
+        assert raised.value.__traceback__.tb_next is None
+
+
+def _previous_batch_consumer(consumer, dropped):
+    """Return an overlap executor whose rank failure recovery accepts or drops its previous batch.
+
+    Also return the list of its steps and ``consumer``, the path that applies the previous batch.
+    """
+    executor = object.__new__(PyExecutor)
+    calls = []
+    kv_cache_manager = Mock()
+    kv_cache_manager.commit_context_blocks.side_effect = lambda *args: calls.append("commit")
+    executor.previous_batch = types.SimpleNamespace(
+        scheduled_requests=Mock(all_requests=Mock(return_value=["request"])),
+        sample_state="sample state",
+        context_commits=[(kv_cache_manager, {7: 64})],
+        guided_batch_id=3,
+        gpu_forward_events_from_perf_pool=False,
+    )
+
+    def accept_step(batch):
+        calls.append("accept_step")
+        return not dropped
+
+    executor.rank_failure_recovery = Mock(accept_step=accept_step)
+    executor.capturable_guided_decoder = Mock()
+    executor._update_requests = Mock(side_effect=lambda state: calls.append("update"))
+    executor.dist = Mock(pp_size=1)
+    executor.enable_attention_dp = True
+    executor.disable_overlap_scheduler = False
+    executor.enable_kv_cache_events = False
+    executor.enable_early_first_token_response = False
+    executor.speculation_gate = None
+    executor.drafter = None
+    executor.perf_manager = Mock()
+    for name in (
+        "_send_kv_async",
+        "_flush_pending_transfer_responses",
+        "_process_previous_batch",
+        "_enqueue_responses",
+        "_commit_kv_cache_stats",
+        "_wait_for_model_engine_input_copy",
+    ):
+        setattr(executor, name, Mock())
+    return (
+        executor,
+        calls,
+        {
+            "rebalance": executor._consume_previous_batch_for_rebalance,
+            "control": executor.retire_inflight_batch,
+        }[consumer],
+    )
+
+
+@pytest.mark.parametrize("consumer", ["rebalance", "control"])
+@pytest.mark.parametrize("dropped", [False, True])
+def test_previous_batch_accepted_before_use(consumer, dropped):
+    """Check that the rebalance and the control drain apply the previous batch only once accepted.
+
+    An accepted batch commits its context chunks first. A dropped batch is not applied, and its
+    guided decoding build failures are dropped.
+    """
+    executor, calls, consume = _previous_batch_consumer(consumer, dropped)
+    consume()
+    if dropped:
+        assert calls == ["accept_step"]
+        executor.capturable_guided_decoder.discard_batch.assert_called_once_with(3)
+    else:
+        assert calls == ["accept_step", "commit", "update"]
+        executor.capturable_guided_decoder.discard_batch.assert_not_called()
+
+
+def test_accepted_batch_commits_once():
+    """Check that a later consumer of an accepted batch neither accepts nor commits it again."""
+    executor, calls, consume = _previous_batch_consumer("rebalance", dropped=False)
+    executor._accept_or_discard_previous_batch()
+    consume()
+    assert calls == ["accept_step", "commit", "update"]
+
+
+def test_previous_batch_applied_without_recovery():
+    executor, calls, consume = _previous_batch_consumer("rebalance", dropped=False)
+    executor.rank_failure_recovery = None
+    executor.previous_batch.context_commits = None
+    consume()
+    assert calls == ["update"]
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_v2_context_update_defers_commits_only_with_recovery(fault_tolerance):
+    """Without rank failure recovery each cache updates its context at once, as before."""
+    calls = []
+
+    def manager(name):
+        @contextmanager
+        def deferred_context_commits():
+            calls.append((name, "defer"))
+            yield f"{name} commits"
+
+        return types.SimpleNamespace(
+            update_context_resources=lambda batch: calls.append((name, "update")),
+            deferred_context_commits=deferred_context_commits,
+        )
+
+    caches = {name: manager(name) for name in ("self", "draft", "cross")}
+    executor = types.SimpleNamespace(
+        kv_cache_manager=caches["self"],
+        enable_joint_kv_cache_reuse=True,
+        draft_kv_cache_manager=caches["draft"],
+        resource_manager=types.SimpleNamespace(
+            get_resource_manager=lambda kind: (
+                caches["cross"] if kind == ResourceManagerType.CROSS_KV_CACHE_MANAGER else None
+            )
+        ),
+    )
+    context_commits = [] if fault_tolerance else None
+    PyExecutor._update_v2_context_resources(executor, Mock(), context_commits)
+    if not fault_tolerance:
+        assert calls == [(name, "update") for name in caches]
+        return
+    assert calls == [(name, step) for name in caches for step in ("defer", "update")]
+    assert context_commits == [(cache, f"{name} commits") for name, cache in caches.items()]
+
+
 def test_adp_running_counts_update_without_a_new_block_sample():
     """The final request count must update even inside the sampling interval."""
     from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload, RankState
@@ -2133,6 +2381,191 @@ def test_adp_running_counts_update_without_a_new_block_sample():
             running,
             running,
         ]
+
+
+def _make_adp_ranks_at_shutdown(
+    account_for_in_transfer: bool, busy_rank: int, monkeypatch: pytest.MonkeyPatch
+) -> tuple[object, list[PyExecutor]]:
+    """Build two idle attention-DP ranks that consumed the shutdown, and their group.
+
+    The ranks run each collective together on the group, and every rank routes the requests it
+    pops to ``busy_rank``.
+    """
+    from test_adp_packed_sync import _FakeGroup
+
+    from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+        AsyncTransferManager,
+    )
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import KVCacheAwareADPRouter
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
+
+    # The tests check stop decisions only, so a routed request stays a queue item.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+        lambda requests, **_kwargs: requests,
+    )
+
+    def route_to_busy_rank(
+        states: list[RankState], new_requests: list, *_args, **_kwargs
+    ) -> tuple[dict[int, list], int]:
+        routed = {rank: [] for rank in range(len(states))}
+        routed[busy_rank] = list(new_requests)
+        return routed, len(new_requests)
+
+    group = _FakeGroup(2)
+    ranks = []
+    for rank in range(2):
+        # The ranks have no KV cache manager and no model: no KV cache capacity and no
+        # token-id range to check.
+        executor = PyExecutor.__new__(PyExecutor)
+        executor._kv_connector_deadlines = {}
+        executor._fetch_hint_enabled = False
+        executor._kv_cache_capacity = {}
+        executor._num_embeddings = None
+        executor.enable_attention_dp = True
+        executor.enable_iter_perf_stats = False
+        executor._kv_load_tracker = KvLoadTracker(None, rank=rank, enabled=False)
+        executor.dist = types.SimpleNamespace(
+            rank=rank, tp_rank=rank, cp_config={}, cp_rank=0, cp_size=1
+        )
+        executor.kv_cache_transceiver = None
+        executor.canceled_req_ids = []
+        executor.num_fetch_requests = executor.num_fetch_requests_cur_rank = 0
+        executor.max_num_active_requests = 4
+        executor._enable_non_overlap_adp_forward_intent = False
+        executor._should_exclude_last_generation_logits = lambda: False
+        executor._fetch_and_enqueue_requests = Mock()
+        executor._pop_from_waiting_queue = Mock(return_value=([], {}))
+        executor.request_broadcaster = Mock()
+        executor.track_unique_tokens = False
+        executor.waiting_queue = FCFSWaitingQueue()
+        executor.active_requests = []
+        executor.is_shutdown = True
+        executor.async_transfer_manager = AsyncTransferManager(
+            types.SimpleNamespace(resource_managers={}), should_store_blocks=False
+        )
+        group_dist = group.dist(rank)
+        router_dist = types.SimpleNamespace(
+            tp_rank=rank,
+            has_cp_helix=False,
+            # Every rank is active, so a gather over the active ranks gathers all of them.
+            tp_allgather_int64=lambda message, active_only=False, dist=group_dist: (
+                dist.tp_allgather_int64(message)
+            ),
+            tp_allgather=lambda message, active_only=False, dist=group_dist: dist.tp_allgather(
+                message
+            ),
+        )
+        executor.adp_router = KVCacheAwareADPRouter(
+            router_dist,
+            kv_cache_manager=None,
+            async_transfer_manager=executor.async_transfer_manager,
+            account_for_in_transfer=account_for_in_transfer,
+        )
+        executor.adp_router.route_requests = Mock(side_effect=route_to_busy_rank)
+        ranks.append(executor)
+    return group, ranks
+
+
+def _stop_decisions(group, ranks: list[PyExecutor]) -> list[bool]:
+    """Fetch one iteration's requests on every rank, then return each rank's stop decision."""
+
+    def step(executor: PyExecutor) -> bool:
+        executor._fetch_new_requests(executor.waiting_queue, executor.active_requests)
+        return executor.should_stop_processing
+
+    return group.run([lambda executor=executor: step(executor) for executor in ranks])
+
+
+@pytest.mark.parametrize("busy_rank", [0, 1])
+@pytest.mark.parametrize("account_for_in_transfer", [False, True])
+def test_adp_ranks_stop_on_same_iteration(
+    account_for_in_transfer: bool, busy_rank: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attention-DP ranks at shutdown keep stepping while any rank has or gets a request.
+
+    A rank that stopped alone would leave its peers' next collective without it. A request that
+    is only sending KV needs no step, also when the router counts it as load.
+    """
+    group, ranks = _make_adp_ranks_at_shutdown(account_for_in_transfer, busy_rank, monkeypatch)
+    busy = ranks[busy_rank]
+    running = types.SimpleNamespace(py_orig_prompt_len=16, cached_tokens=0)
+    busy.active_requests = [running]
+    assert _stop_decisions(group, ranks) == [False, False]
+    busy.active_requests = []
+    assert _stop_decisions(group, ranks) == [True, True]
+
+    # A request accepted with the shutdown is popped on every rank and routed after the allgather.
+    for executor in ranks:
+        executor._pop_from_waiting_queue.return_value = ([RequestQueueItem(2)], {})
+    assert _stop_decisions(group, ranks) == [False, False]
+    for executor in ranks:
+        executor._pop_from_waiting_queue.return_value = ([], {})
+    assert _stop_decisions(group, ranks) == [True, True]
+
+    # The busy rank sends KV for a finished request while it runs another, then only sends KV.
+    sending = types.SimpleNamespace(py_request_id=7, py_orig_prompt_len=16, cached_tokens=0)
+    busy.async_transfer_manager.start_transfer(sending)
+    busy.active_requests = [running]
+    assert _stop_decisions(group, ranks) == [False, False]
+    busy.active_requests = []
+    assert _stop_decisions(group, ranks) == [True, True]
+
+
+@pytest.mark.parametrize("busy_rank", [0, 1])
+@pytest.mark.parametrize("account_for_in_transfer", [False, True])
+def test_adp_ranks_wait_for_peer_context_retirement(
+    account_for_in_transfer: bool, busy_rank: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attention-DP ranks at shutdown keep stepping while a peer's context send awaits retirement.
+
+    A context-first request whose KV send the transceiver retires keeps its rank stepping until
+    the send retires, so its peers step with it.
+    """
+    group, ranks = _make_adp_ranks_at_shutdown(account_for_in_transfer, busy_rank, monkeypatch)
+    for executor in ranks:
+        # A transceiver that holds a context-first send until the send retires.
+        executor.kv_cache_transceiver = types.SimpleNamespace(
+            supports_logical_context_cancellation=lambda request: True
+        )
+        executor._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=executor.kv_cache_transceiver,
+            transfer_manager=executor.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=types.SimpleNamespace(world_size=2),
+            effects=Mock(),
+            registry=Mock(),
+            enable_attention_dp=True,
+        )
+    retiring = types.SimpleNamespace(py_request_id=7, py_orig_prompt_len=16, cached_tokens=0)
+    ranks[busy_rank].async_transfer_manager.start_transfer(retiring)
+    assert _stop_decisions(group, ranks) == [False, False]
+    assert ranks[busy_rank].async_transfer_manager.end_transfer(retiring)
+    assert _stop_decisions(group, ranks) == [True, True]
+
+
+def test_context_retirement_check_skips_transfers_without_logical_cancellation() -> None:
+    """Without logical context cancellation no transfer can await retirement, so none is read."""
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_cache_transceiver = types.SimpleNamespace(
+        supports_logical_context_cancellation=lambda request=None: False
+    )
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {
+        7: types.SimpleNamespace(py_request_id=7)
+    }
+    executor._disagg_coordinator = DisaggTransferCoordinator(
+        transceiver=executor.kv_cache_transceiver,
+        transfer_manager=executor.async_transfer_manager,
+        kv_cache_manager=None,
+        dist=types.SimpleNamespace(world_size=2),
+        effects=Mock(),
+        registry=Mock(active_requests=Mock(return_value=[])),
+        enable_attention_dp=True,
+    )
+
+    assert not executor._has_pending_context_retirement()
+    executor.async_transfer_manager.requests_in_transfer.assert_not_called()
 
 
 def _classify_termination(
@@ -3058,6 +3491,7 @@ class _CleanupStub:
     shutdown notification and PP-handle wait happen."""
 
     _executor_events = None
+    rank_failure_recovery = None
 
     def __init__(self, pp_handles_raise=False):
         self._response_channel = ResponseChannel()
@@ -3087,7 +3521,7 @@ class _CleanupStub:
             raise RuntimeError("PP send handle in bad state")
 
     _executor_loop_cleanup = PyExecutor._executor_loop_cleanup
-    _flush_staged_responses = PyExecutor._flush_staged_responses
+    flush_staged_responses = PyExecutor.flush_staged_responses
 
 
 class TestExecutorLoopCleanup:
@@ -3167,6 +3601,7 @@ class _StubADPExecutor:
     _dspark_adp_shape_cache_enabled = PyExecutor._dspark_adp_shape_cache_enabled
     _num_skipped_forward_ctx_chunks = 0
     _num_reverted_ctx_tokens = 0
+    rank_failure_recovery = None
 
     def __init__(
         self,
@@ -3223,7 +3658,7 @@ class _StubADPExecutor:
         self.dist.tp_size = tp_size
         self.dist.cp_size = 1
         self.dist.tp_rank = 0
-        self.dist.tp_allgather.side_effect = lambda value: [value]
+        self.dist.tp_allgather.side_effect = lambda value, active_only=False: [value]
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
         self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
 
@@ -4730,6 +5165,52 @@ class TestPendingTransferResponseFlush:
         # Once for the retry pass and once for the following clean exit.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
+    @pytest.mark.parametrize("fault_tolerance", [False, True])
+    def test_overlap_idle_pass_runs_rank_failure_hooks_only_with_recovery(
+        self, monkeypatch, fault_tolerance
+    ):
+        """Without rank failure recovery the loop calls none of its hooks."""
+        executor = self._make_executor_loop_stub()
+        recovery = Mock() if fault_tolerance else None
+        executor.rank_failure_recovery = recovery
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[], paused_requests=[], generation_requests=[]
+        )
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        executor._terminate_requests = Mock()
+        executor._pause_requests = Mock()
+        executor._can_queue = Mock(return_value=(False, False))
+        executor.kv_connector_manager = None
+        executor._release_unused_connector_reservations = Mock()
+        executor._revert_gen_alloc = Mock()
+        executor._finalize_adp_dummy_allocation = Mock()
+        executor.enable_early_first_token_response = False
+        executor.enable_kv_cache_events = False
+        executor.previous_batch = None
+        executor._enqueue_responses = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor._adp_clear_packed_sync_state = Mock()
+        executor._kv_connector_terminate_requests = Mock()
+        executor._accept_or_discard_previous_batch = Mock()
+        executor._update_v2_context_resources = Mock()
+        executor.iter_counter = 0
+        monkeypatch.setattr(
+            PyExecutor, "disagg", Mock(handle_errors_synced=Mock(return_value=False))
+        )
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        assert executor._accept_or_discard_previous_batch.call_count == int(fault_tolerance)
+        executor._update_v2_context_resources.assert_not_called()
+        if fault_tolerance:
+            assert recovery.before_iteration.call_count == 2
+
 
 class TestOneModelMTPDraftTokenScheduling:
     """Regression tests for the one-model MTP over-scheduling bug (#16101).
@@ -4981,6 +5462,21 @@ class TestAdpBalanceExcludesPadDummies:
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
 
+    def test_absent_rank_row_is_ignored(self):
+        """Rank 2 left the group and its stale row would release the held context requests."""
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4), (0, 0, 0), (1, 4, 4)], threshold=0)
+        rows = executor.dist.tp_allgather_int64.return_value
+        executor.dist.tp_allgather_int64 = Mock(
+            side_effect=lambda values, active_only: rows[[0, 1, 3]] if active_only else rows
+        )
+
+        balanced = executor._balance_adp_requests(
+            [self._make_context_request()], [self._make_generation_request(False)]
+        )
+
+        assert balanced == []
+        assert executor.adp_ctx_waiting_iters_count == 1
+
 
 def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
@@ -5088,7 +5584,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
         py_decoding_iter=1,
         py_batch_idx=None,
         py_result=py_result,
-        cached_tokens=0,
+        reported_cached_tokens=0,
         py_draft_tokens=[],
         py_per_pos_drafted=[],
         py_per_pos_accepted=[],
