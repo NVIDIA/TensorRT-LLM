@@ -9,7 +9,21 @@ MODEL_DIR="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TP_SIZE=1
 TRANSCEIVER_BACKEND="NIXL"
 TRANSCEIVER_RUNTIME="PYTHON"
-USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--transceiver_backend DEFAULT|NIXL] [--transceiver_runtime auto|PYTHON] [--help]"
+PORT=8000
+CTX_PORT=8001
+GEN_PORT=8002
+USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--transceiver_backend DEFAULT|NIXL] [--transceiver_runtime auto|PYTHON] [--port N] [--ctx_port N] [--gen_port N] [--help]"
+
+# Exit with the usage message unless $2, the value given for option $1,
+# is a port number. Digits are spelled out because [0-9] also matches
+# non-ASCII digits in UTF-8 locales.
+require_port() {
+    if [[ ! "$2" =~ ^[123456789][0123456789]{0,4}$ ]] || (( $2 > 65535 )); then
+        echo "Error: $1 needs a port number between 1 and 65535"
+        echo "$USAGE"
+        exit 1
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -37,6 +51,21 @@ while [[ $# -gt 0 ]]; do
             TRANSCEIVER_RUNTIME="$2"
             shift 2
             ;;
+        --port)
+            require_port "$1" "${2:-}"
+            PORT="$2"
+            shift 2
+            ;;
+        --ctx_port)
+            require_port "$1" "${2:-}"
+            CTX_PORT="$2"
+            shift 2
+            ;;
+        --gen_port)
+            require_port "$1" "${2:-}"
+            GEN_PORT="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "$USAGE"
             echo "Options:"
@@ -46,6 +75,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --tp_size N          Tensor parallel size (default: 1)"
             echo "  --transceiver_backend DEFAULT|NIXL  Cache-transceiver backend (default: NIXL)"
             echo "  --transceiver_runtime auto|PYTHON  Cache transceiver runtime (default: PYTHON)"
+            echo "  --port N             Disaggregated server port (default: 8000)"
+            echo "  --ctx_port N         Context server port (default: 8001)"
+            echo "  --gen_port N         Generation server port (default: 8002)"
             echo "  --help, -h           Show this help message"
             exit 0
             ;;
@@ -109,7 +141,7 @@ fi
 echo "Generating disagg_config_local.yaml"
 cat > disagg_config_local.yaml << EOF
 hostname: localhost
-port: 8000
+port: $PORT
 model: $MODEL_DIR
 free_gpu_memory_fraction: 0.25
 backend: "pytorch"
@@ -124,7 +156,7 @@ context_servers:
     backend: "$TRANSCEIVER_BACKEND"
     transceiver_runtime: "$TRANSCEIVER_RUNTIME"
   urls:
-      - "localhost:8001"
+      - "localhost:$CTX_PORT"
 generation_servers:
   num_instances: 1
   tensor_parallel_size: $TP_SIZE
@@ -133,7 +165,7 @@ generation_servers:
     backend: "$TRANSCEIVER_BACKEND"
     transceiver_runtime: "$TRANSCEIVER_RUNTIME"
   urls:
-      - "localhost:8002"
+      - "localhost:$GEN_PORT"
 EOF
 
 # Conditionally start ray head if using ray backend and not in attach mode
@@ -158,14 +190,14 @@ if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=0
 fi
 
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port $CTX_PORT --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
 
 if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=1
 fi
 # Launching generation servers
 echo "Launching generation servers..."
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_gen0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port $GEN_PORT --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_gen0 &
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."
