@@ -19,7 +19,9 @@ same dequantized values (the KV scale is a power of two, so ``int8 * scale`` is 
 Each case checks that the XQA kernel splits every sequence into more than one sub-sequence, that
 the INT8 output matches the BF16-cache output and a float64 reference, that the appended tokens
 are stored exactly, and that repeated steps are bitwise identical.
-The SM89 FP8 case checks the same split and compares against its dequantized cache.
+The SM89 FP8 cases check the same on an FP8 (E4M3) cache, with K/V values rounded to E4M3 so that
+the BF16 control holds the same values. They include short histories and small batches, where the
+BF16 control does not run on the XQA kernel and each output is only compared with the reference.
 """
 
 import json
@@ -78,6 +80,11 @@ def _inputs(num_heads, num_kv_heads, head_dim, cached, q_len, seed):
     new_k = kv_ints(num_tokens, num_kv_heads, head_dim)
     new_v = kv_ints(num_tokens, num_kv_heads, head_dim)
     return q.to(torch.bfloat16), cached_k, cached_v, new_k, new_v
+
+
+def _e4m3(x):
+    """Round to the nearest E4M3 number."""
+    return x.to(torch.float8_e4m3fn).to(x.dtype)
 
 
 def _pool(manager, int8):
@@ -308,39 +315,69 @@ def test_int8_kv_generation_uses_multi_block(
     reason="FP8 KV multi-block regression targets SM89",
 )
 @pytest.mark.parametrize(
-    "cached",
-    [[4096], [2048, 4096]],
-    ids=["batch1", "batch2-mixed"],
+    "num_heads,num_kv_heads,head_dim,cached,q_len",
+    [
+        (32, 8, 128, [4096], 1),
+        (32, 8, 128, [2048, 4096], 1),
+        (32, 8, 128, [384], 1),
+        (32, 8, 128, [128, 1000, 4097, 2048], 1),
+        (24, 4, 256, [8192], 1),
+        (24, 4, 256, [8192], 4),
+        (32, 8, 128, [3000, 20000], 4),
+    ],
+    ids=[
+        "batch1",
+        "batch2-mixed",
+        "batch1-384",
+        "batch4-mixed",
+        "h24kv4d256-8k",
+        "h24kv4d256-8k-specdec4",
+        "batch2-mixed-specdec4",
+    ],
 )
-def test_fp8_kv_generation_uses_multi_block(tmp_path, cached):
-    num_heads, num_kv_heads, head_dim = 32, 8, 128
-    inputs = _inputs(num_heads, num_kv_heads, head_dim, cached, q_len=1, seed=0)
-    output, cache, grids, repeats = _generation_step(
-        DataType.FP8,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        cached,
-        1,
-        inputs,
-        tmp_path,
-    )
+def test_fp8_kv_generation_uses_multi_block(
+    tmp_path, num_heads, num_kv_heads, head_dim, cached, q_len
+):
+    q, *kv_inputs = _inputs(num_heads, num_kv_heads, head_dim, cached, q_len, seed=0)
+    # Round the K/V values to E4M3, so that the FP8 cache and the BF16 control hold the same
+    # values (``fp8 * scale`` is exact in BF16).
+    cached_k, cached_v = ([_e4m3(x) for x in xs] for xs in kv_inputs[:2])
+    new_k, new_v = (_e4m3(x) for x in kv_inputs[2:])
+    inputs = (q, cached_k, cached_v, new_k, new_v)
+    args = (num_heads, num_kv_heads, head_dim, cached, q_len, inputs, tmp_path)
+    out_fp8, cache_fp8, grids_fp8, repeats_fp8 = _generation_step(DataType.FP8, *args)
+    out_bf16, cache_bf16, grids_bf16, _ = _generation_step(DataType.BF16, *args)
 
-    assert grids and all(grid[0] > 1 for grid in grids), grids
-    assert all(torch.equal(repeat, output) for repeat in repeats)
-    assert not output.isnan().any()
-
-    for i, kv in enumerate(cache):
-        expected = torch.stack(
-            [
-                torch.cat([inputs[1][i], inputs[3][i : i + 1]]),
-                torch.cat([inputs[2][i], inputs[4][i : i + 1]]),
-            ]
+    # Both caches hold exactly the input values, including the FP8-quantized new tokens.
+    for i, (kv_fp8, kv_bf16) in enumerate(zip(cache_fp8, cache_bf16, strict=True)):
+        tokens = slice(i * q_len, (i + 1) * q_len)
+        expected = (
+            torch.stack(
+                [
+                    torch.cat([cached_k[i], new_k[tokens]]),
+                    torch.cat([cached_v[i], new_v[tokens]]),
+                ]
+            ).double()
+            * KV_SCALE
         )
-        expected = expected.to(torch.float8_e4m3fn).double() * KV_SCALE
-        torch.testing.assert_close(kv, expected, atol=0, rtol=0)
+        torch.testing.assert_close(kv_fp8, expected, atol=0, rtol=0)
+        torch.testing.assert_close(kv_bf16, expected, atol=0, rtol=0)
 
-    reference = _reference(inputs[0], cache, cached, q_len=1)
-    rel_err = ((output.double() - reference).norm() / reference.norm()).item()
+    # The XQA kernel serves the FP8 step and splits each sequence into sub-sequences. The BF16
+    # control runs on the non-XQA kernel when the batch is small and the history is short.
+    assert grids_fp8 and all(grid[0] > 1 for grid in grids_fp8), grids_fp8
+    assert all(grid[0] > 1 for grid in grids_bf16), grids_bf16
+
+    assert all(torch.equal(r, out_fp8) for r in repeats_fp8)
+    assert not out_fp8.isnan().any()
+
+    reference = _reference(q, cache_fp8, cached, q_len)
+    rel_err = ((out_fp8.double() - reference).norm() / reference.norm()).item()
+    rel_err_bf16 = ((out_bf16.double() - reference).norm() / reference.norm()).item()
     assert rel_err < 1e-2, rel_err
-    torch.testing.assert_close(output.double(), reference, atol=2e-2, rtol=2e-2)
+    assert rel_err_bf16 < 1e-2, rel_err_bf16
+    torch.testing.assert_close(out_fp8.double(), reference, atol=2e-2, rtol=2e-2)
+    if grids_bf16:
+        # Both XQA kernels read the same values; they differ only in rounding of the partial
+        # results.
+        torch.testing.assert_close(out_fp8, out_bf16, atol=1e-3, rtol=1e-2)
