@@ -126,6 +126,8 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
     from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
     worker = object.__new__(DFlashWorker)
+    # Block tables come from the drafter's paged pool.
+    worker._ctx_paged = True
     worker._ctx_block_tables = object()
     worker._ctx_block_counts = torch.tensor([300])
     worker._ctx_page_size = 64
@@ -152,6 +154,7 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
         get_hidden_states=lambda n: torch.zeros(n, 8),
         host_position_ids=torch.arange(first_pos, first_pos + slen),
         request_ids=[7],
+        spec_resource_manager=None,
     )
     attn_metadata = SimpleNamespace(
         num_ctx_tokens=slen, num_contexts=1, _seq_lens=torch.tensor([slen])
