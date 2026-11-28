@@ -379,6 +379,27 @@ struct KernelConfig : public KernelConfigBase {
         }
         // Calculate the number of stages for smemKv.
         mNumStagesKv = calculateNumStagesKv(maxBufferSizeKBForSmemKv, options.mClusterDimX);
+      } else if (isContextKernel(options.mFmhaKernelType) && mHeadDimPerStageKv > 0 &&
+                 mDtypeK == mDtypeV) {
+        // K and V tiles share the smemKv stages and are loaded in order (K, then V). When the head
+        // dims are split into stages of headDimPerStageKv (e.g. MLA: headDimQk = 192 takes 2
+        // stages, headDimV = 128 takes 1), the default 3 stages hold only one K/V pair and the next
+        // K tile cannot be loaded until V is consumed. Use enough stages for the current K and V
+        // tiles plus the next K tile, if they fit in the smemKv budget.
+        int32_t const numStagesPerTileK{ceilDiv(mHeadDimQk, mHeadDimPerStageKv)};
+        int32_t const numStagesPerTileV{ceilDiv(mHeadDimV, mHeadDimPerStageKv)};
+        int32_t const numStagesKvNextK{mNumInstsKv * (2 * numStagesPerTileK + numStagesPerTileV)};
+        // The numHeadDimBytes (padded to multiple of 128B).
+        int32_t numHeadDimBytes = ceilDiv(tg::dtypeGetNumBits(mDtypeQ) * mHeadDimQk / 8, 128) * 128;
+        // The total number of KB for smemQ.
+        int32_t totalNumKBSmemQ = numHeadDimBytes * mTileSizeQ / 1024;
+        // The maximum buffer size for smemKv (at most 144KB for KV, and at most 218KB for Qkv).
+        int32_t maxBufferSizeKBForSmemKv = std::min(144, 218 - totalNumKBSmemQ * mNumStagesQ);
+        // Keep the default number of stages if the extra stages do not fit.
+        mNumStagesKv = std::max(mNumStagesKv,
+                                std::min(numStagesKvNextK,
+                                         calculateNumStagesKv(maxBufferSizeKBForSmemKv,
+                                                              options.mClusterDimX)));
       }
       mNumStagesTransformedKv = tg::dtypeGetNumBits(mDtypeKv) >= 8 ? 2 : 4;
       // Apply the KV override after all architecture-specific defaults are selected.

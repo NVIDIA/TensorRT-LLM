@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaKernels.h"
 
 #include <climits>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
@@ -130,7 +131,9 @@ py::dict selectKernel(int64_t sm, int64_t numSms, int64_t numHeadsQ, int64_t num
         = makeParams(numSms, numHeadsQ, numHeadsKv, headDim, batch, maxQ, maxKv, tokensPerPage, headDimPerStageKv);
     auto& kernel = kernelFor(sm);
     fmha::FmhaConfig cfg = kernel.nvrtcConfig(params);
-    fmha::FmhaInterface const fmhaInterface{false, 1};
+    auto const execDir = std::filesystem::path(cfg.mExecPath).parent_path().string();
+    fmha::FmhaInterface const fmhaInterface{
+        execDir, /*exportsCubin=*/false, /*numRotations=*/1, /*verbose=*/false, /*enableDiskCache=*/false};
     return describe(cfg, fmhaInterface.getKernelNameFromConfigs(cfg));
 }
 
@@ -150,7 +153,8 @@ py::dict generateKernel(int64_t sm, int64_t numSms, int64_t numHeadsQ, int64_t n
     cfg.mGenCfgJsonStr.insert(open.size(), "\"emitsNvRtcSource\": true,\n\"emitsCubin\": true,\n");
     // The generator reads the kernel headers from, and writes its dumps to, the exec path.
     cfg.mExecPath = execPath.c_str();
-    fmha::FmhaInterface const fmhaInterface{/*exportsCubin=*/true, /*numRotations=*/1, /*verbose=*/true};
+    fmha::FmhaInterface fmhaInterface{
+        execPath, /*exportsCubin=*/true, /*numRotations=*/1, /*verbose=*/true, /*enableDiskCache=*/false};
     fmhaInterface.generateAndCompileKernel(cfg);
     py::dict d = describe(cfg, cfg.mFunctionName);
     return d;

@@ -141,7 +141,9 @@ public:
   // Prevents early exit of producer blocks in Cluster.
   // This should be called once before kernel exits.
   CUTLASS_DEVICE
-  void producer_tail(PipelineState state) { impl_.producer_tail(state); }
+  void producer_tail(PipelineState state, uint32_t stage_stride = 1) {
+    impl_.producer_tail(state, stage_stride);
+  }
 
   CUTLASS_DEVICE
   ProducerBarrierType* producer_get_barrier(PipelineState state) {
@@ -413,7 +415,9 @@ public:
   // Prevents early exit of producer blocks in Cluster.
   // This should be called once before kernel exits.
   CUTLASS_DEVICE
-  void producer_tail(PipelineState state) { impl_.producer_tail(state); }
+  void producer_tail(PipelineState state, uint32_t stage_stride = 1) {
+    impl_.producer_tail(state, stage_stride);
+  }
 
   CUTLASS_DEVICE
   ProducerBarrierType* producer_get_barrier(PipelineState state) {
@@ -659,7 +663,9 @@ public:
   // Prevents early exit of producer blocks in Cluster.
   // This should be called once before kernel exits.
   CUTLASS_DEVICE
-  void producer_tail(PipelineState state) { impl_.producer_tail(state); }
+  void producer_tail(PipelineState state, uint32_t stage_stride = 1) {
+    impl_.producer_tail(state, stage_stride);
+  }
 
   CUTLASS_DEVICE
   ProducerBarrierType* producer_get_barrier(PipelineState state) {
@@ -800,7 +806,9 @@ public:
   // Prevents early exit of producer blocks in Cluster.
   // This should be called once before kernel exits.
   CUTLASS_DEVICE
-  void producer_tail(PipelineState state) { impl_.producer_tail(state); }
+  void producer_tail(PipelineState state, uint32_t stage_stride = 1) {
+    impl_.producer_tail(state, stage_stride);
+  }
 
   CUTLASS_DEVICE
   ProducerBarrierType* producer_get_barrier(PipelineState state) {
@@ -994,9 +1002,22 @@ public:
     producer_acquire(state.index(), state.phase(), barrier_token);
   }
 
+  // Synchronous shared-memory producers do not have async transaction bytes.
+  // Wait for EMPTY here and publish FULL only after their ordinary stores.
+  CUTLASS_DEVICE
+  void producer_acquire_no_tx(PipelineState state) {
+    cutlass::detail::pipeline_check_is_producer(params_.role);
+    empty_barrier_ptr_[state.index()].wait(state.phase());
+  }
+
   // Manual completion of transaction count
   CUTLASS_DEVICE
   void producer_commit(PipelineState state) { producer_commit(state.index(), state.phase()); }
+
+  // Called by the single thread that wrote the payload. The release arrival
+  // orders its stores before consumers acquire FULL.
+  CUTLASS_DEVICE
+  void producer_commit_no_tx(PipelineState state) { full_barrier_ptr_[state.index()].arrive(); }
 
   // Prevents early exit of producer blocks in Cluster.
   // Does NOT reset transaction bytes.

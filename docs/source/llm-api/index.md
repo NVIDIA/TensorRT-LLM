@@ -247,6 +247,7 @@ configured environment variable takes precedence.
 | `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
 | `TLLM_JIT_SHARE_DIR` | Not set: `/tmp/tllm-jit-<uid>/<launch>` for a launch of several processes per node (see below) | Not set (one directory per launch, see below) |
 | `TRTLLM_DG_CACHE_DIR` | Disabled | `trtllm_deep_gemm` |
+| `TRTLLM_GEN_JIT_CACHE_DIR` | `$HOME/.cache/trtllm-gen` | `trtllm_gen` |
 | `CUDA_CACHE_PATH` | `$HOME/.nv/ComputeCache` | `cuda` |
 
 **Important note**: while some of the caches controlled by `TRTLLM_CACHE_DIR`

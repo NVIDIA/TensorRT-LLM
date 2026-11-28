@@ -17,6 +17,7 @@
 #pragma once
 
 #include "FmhaOptions.h"
+#include <filesystem>
 #include <unordered_map>
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
@@ -180,19 +181,28 @@ public:
   using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
   enum class KernelCacheStatus { Unknown, CacheHit, CacheMiss };
 
-  FmhaInterface(bool exportsCubin = false, int32_t numRotations = 1, bool verbose = false)
-    : mExportsCubin(exportsCubin)
+  FmhaInterface(std::string const& execDir,
+                bool exportsCubin = false,
+                int32_t numRotations = 1,
+                bool verbose = false,
+                bool enableDiskCache = false)
+    : mExecDir(std::filesystem::canonical(execDir).string())
+    , mExportsCubin(exportsCubin)
     , mNumRotations(numRotations)
     , mVerbose(verbose) {
     setVerbose(verbose);
+    TLLM_CHECK_ERROR(std::filesystem::is_directory(mExecDir), "JIT execDir is not a directory");
+    mEnableDiskCache = enableDiskCache && initializeJitCache();
   }
 
-  // Set the verbosity level for logging. When false, TLLM_LOG_INFO messages are suppressed.
-  void setVerbose(bool verbose);
-
-  KernelCacheStatus generateAndCompileKernel(FmhaConfig& fmhaConfig) const;
+  KernelCacheStatus generateAndCompileKernel(FmhaConfig& fmhaConfig);
 
   std::string getKernelNameFromConfigs(FmhaConfig const& fmhaConfig) const;
+
+  // Optional disk caching uses $HOME/.cache/trtllm-gen by default, overridden by
+  // TRTLLM_GEN_JIT_CACHE_DIR. No total size limit or automatic cleanup is provided;
+  // cache size and cleanup of old signature directories must be managed manually.
+  bool isDiskCacheEnabled() const { return mEnableDiskCache; }
 
   int32_t run(FmhaConfig const& config,
               FmhaData& data,
@@ -200,9 +210,25 @@ public:
               int32_t multiProcessorCount,
               int32_t rotatedKernelInstanceIdx) const;
 
+  // Set the verbosity level for logging. When false, TLLM_LOG_INFO messages are suppressed.
+  void setVerbose(bool verbose);
+
 private:
+  // Prepare the cache directory and signatures. Returns false if the disk cache cannot be used.
+  bool initializeJitCache();
+
+  // Whether the disk cache is currently in use.
+  bool mEnableDiskCache{false};
+  // The SHA-256 identifying the CUDA, CUTLASS and NVRTC versions.
+  std::string mEnvironmentSignature;
+  // The canonical directory that holds external header dependencies.
+  std::string mExecDir;
   // Whether to export the cubin file.
   bool mExportsCubin;
+  // The cache directory for this library and environment signature pair.
+  std::filesystem::path mJitCacheDirectory;
+  // The SHA-256 identifying the FMHA library build.
+  std::string mLibrarySignature;
   // The number of rotations
   int32_t mNumRotations;
   // Whether to log info messages.

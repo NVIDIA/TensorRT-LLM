@@ -711,6 +711,13 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   }
 #endif // TLLM_RUBIN_FEATURES
 
+  if (options.mSkipsSoftmaxScale) {
+    // SageAttention folds its block scales into the per-element softmax multiply.
+    TLLM_CHECK_ERROR(options.mNumEltsPerSageAttnBlkQ == 0 && options.mNumEltsPerSageAttnBlkK == 0
+                       && options.mNumEltsPerSageAttnBlkP == 0 && options.mNumEltsPerSageAttnBlkV == 0,
+                     "skipsSoftmaxScale is not supported with SageAttention.");
+  }
+
 #ifdef TLLM_RUBIN_FEATURES
   if (options.mUsesSpcompress) {
     TLLM_CHECK_ERROR(options.mCudaArch == tg::CudaArch::Sm107a,

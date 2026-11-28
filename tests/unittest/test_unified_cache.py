@@ -31,7 +31,7 @@ def test_unified_cache_is_disabled_without_root() -> None:
     assert _bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV not in os.environ
 
 
-def test_unified_cache_enables_trtllm_deep_gemm_cubin_dump(
+def test_unified_cache_configures_trtllm_kernel_caches(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache_root = tmp_path / "unified"
@@ -41,6 +41,7 @@ def test_unified_cache_enables_trtllm_deep_gemm_cubin_dump(
 
     assert os.environ[_bootstrap._TRTLLM_DG_CACHE_ENV] == str(cache_root / "trtllm_deep_gemm")
     assert os.environ[_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV] == "1"
+    assert os.environ["TRTLLM_GEN_JIT_CACHE_DIR"] == str(cache_root / "trtllm_gen")
 
 
 def test_explicit_trtllm_deep_gemm_cache_enables_cubin_dump(

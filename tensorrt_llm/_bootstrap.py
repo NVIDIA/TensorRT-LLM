@@ -70,6 +70,7 @@ _UNIFIED_CACHE_ENV_VARS = (
     "CUTE_DSL_CACHE_DIR",
     "DG_JIT_CACHE_DIR",
     _TRTLLM_DG_CACHE_ENV,
+    "TRTLLM_GEN_JIT_CACHE_DIR",
     "CUDA_CACHE_PATH",
 )
 
@@ -86,6 +87,7 @@ def _unified_cache_defaults(cache_root: str) -> dict[str, str]:
         "CUTE_DSL_CACHE_DIR": os.path.join(cache_root, "cute_dsl"),
         "DG_JIT_CACHE_DIR": os.path.join(cache_root, "deep_gemm"),
         _TRTLLM_DG_CACHE_ENV: os.path.join(cache_root, "trtllm_deep_gemm"),
+        "TRTLLM_GEN_JIT_CACHE_DIR": os.path.join(cache_root, "trtllm_gen"),
         "CUDA_CACHE_PATH": os.path.join(cache_root, "cuda"),
     }
 

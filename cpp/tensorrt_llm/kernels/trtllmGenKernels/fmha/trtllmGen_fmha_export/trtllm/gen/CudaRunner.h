@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <optional>
 #ifndef TLLM_GEN_EXPORT_INTERFACE
 #include <trtllm/gen/Kernel.h>
 #else
@@ -41,14 +42,36 @@ public:
 
   // The options to compile the kernel.
   using Options = std::vector<std::string>;
-  // Compile the kernel.
-  void compile(Options options = Options{},
-               bool loadFromCubin = false,
-               bool exportCubin = false,
-               int32_t numInstances = 1);
+
+  // Opaque linked program and launch metadata; no filesystem policy lives in the runner.
+  struct CompiledArtifact {
+    // The serialized jitify2::LinkedProgram, which holds the CUBIN and lowered kernel names.
+    std::string mProgram;
+    // The dynamic shared memory size in bytes. Loading uses it instead of launching GetSmemSize.
+    int32_t mSmemSize{0};
+  };
+
+  // Compile the kernel and return a linked NVRTC artifact when available.
+  // Returning nullopt means no serializable artifact was produced, not that compilation failed.
+  std::optional<CompiledArtifact> compile(Options options = Options{},
+                                          bool loadFromCubin = false,
+                                          bool exportCubin = false,
+                                          int32_t numInstances = 1);
+
+  // Return the SHA-256 digest of bytes as uppercase hex; empty without TLLM_ENABLE_CUDA.
+  static std::string computeSha256(std::string const& bytes);
 
   // Get the kernel.
   Kernel const* getKernel() const;
+
+  // Version of the runtime compilation NVRTC instance encoded like CUDA_VERSION;
+  // zero when unavailable.
+  static int getNvRtcVersion();
+
+  // Load an artifact returned by compile() or loaded from disk, looking up the current
+  // kernel by name. Returns false and leaves the runner unchanged if the artifact cannot be used.
+  // Requires a bound kernel. A successful load restores one instance, used with instanceId == 0.
+  bool loadArtifact(CompiledArtifact const& artifact);
 
   // The dimensions of the grid. It will be determined automatically if Grid{} is used.
   using Grid = std::vector<int32_t>;
