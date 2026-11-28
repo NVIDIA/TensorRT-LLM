@@ -3892,6 +3892,11 @@ class TestGenHandoffSeat:
     """scheduler_config.gen_handoff_seat: a forward runs at most max_batch_size - 1
     requests; the last seat only takes the next request's KV handoff."""
 
+    @pytest.fixture(autouse=True)
+    def _no_first_token_priority(self, monkeypatch):
+        # First-token priority turns the seat off: only the test that is about it sets it.
+        monkeypatch.delenv("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", raising=False)
+
     @staticmethod
     def _received(request_id):
         req = make_gen_request(request_id)
@@ -6835,6 +6840,32 @@ class TestGenInitPauseAfterRelease:
             pending = [req for req in pending if req.py_request_id not in got]
         assert admitted == [[1], [], [2], []]
 
+    def test_a_retry_within_the_pass_keeps_the_pause(self):
+        """The pause is consumed once per public pass and handed to the loop: a second attempt
+        within the pass (the remote-tail retry calls the loop again with the same pause) admits
+        no generation-init request either, and the next pass does."""
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, gen_init_pause_after_release=True)
+        receive = make_disagg_request(2)
+        real_loop = sched._schedule_loop
+        pauses = []
+
+        def loop_with_retry(*args, **kwargs):
+            pauses.append(kwargs.get("pause_gen_init"))
+            real_loop(*args, **kwargs)  # the attempt the retry replaces
+            return real_loop(*args, **kwargs)
+
+        sched._schedule_loop = loop_with_retry
+        sched.note_generation_release()
+        out = sched.schedule_request([receive], set())
+
+        assert pauses == [True]
+        assert out.fitting_disagg_gen_init_requests == []
+        mgr.prepare_disagg_gen_init.assert_not_called()
+        sched._schedule_loop = real_loop
+        out = sched.schedule_request([receive], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [2]
+
 
 def _context_out_of_pages(closes_deferred: bool, claims_parked: bool = False, **scheduler_kwargs):
     """Request 0 runs out of pages beside started request 99, the preemption candidate."""
@@ -6858,6 +6889,24 @@ class TestDeferredClosesBeforeContextPreemption:
         mgr.flush_deferred_closes.assert_called_once_with()
         mgr.preempt_request.assert_not_called()
         assert out.recompute_paused_requests == []
+
+    @pytest.mark.parametrize("source", ["deferred closes", "claims"])
+    def test_pages_given_back_count_as_progress(self, source):
+        """A pass that only took pages back is not a stall for the deadlock detector: the
+        request that needed them retries next pass."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0), has_cache_tier_below_gpu=False
+        )
+        mgr.flush_deferred_closes.return_value = source == "deferred closes"
+        mgr.release_claims_ahead.return_value = source == "claims"
+        sched = make_scheduler(mgr, max_num_tokens=1000, reclaim_context_claims=True)
+        sched._stalled_schedules = 5
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        assert out.context_requests == [] and out.recompute_paused_requests == []
+        assert sched._stalled_schedules == 0
 
     def test_without_deferred_closes_a_started_request_pays_as_before(self):
         mgr, victim, out = _context_out_of_pages(closes_deferred=False)
@@ -7044,7 +7093,7 @@ class TestContextClaimHold:
         long_req, a, claimed, gone, waiter, b, c = (
             self._req(i, 10_000 if i == 0 else 600) for i in range(7)
         )
-        sched._ctx_demote_probes = {1: 600, 2: 300, 5: 600, 6: 600}
+        sched._ctx_demote_probes = {1: 600, 2: 300, 3: 100, 5: 600, 6: 600}
         sched._pick_claim_candidates(
             [long_req, a, claimed, gone, waiter, b, c], [], [], {0}, {4: None}
         )
@@ -7054,6 +7103,20 @@ class TestContextClaimHold:
         started.is_first_context_chunk = False
         sched._pick_claim_candidates([started, a, b], [], [], set(), {})
         assert ids(sched.context_claim_candidates) == [1]
+
+    def test_a_given_up_request_still_takes_the_next_pass_budget(self):
+        """A request whose claim was given up is not claimed again, but the next pass admits
+        it: its tokens leave no budget for a claim behind it."""
+        sched, _ = self._make(given_up={1})
+        started = self._req(0, 1024)
+        started.is_first_context_chunk = False
+        gone, small = self._req(1, 1024), self._req(2, 200)
+        self._arm(sched, started)
+
+        out = sched.schedule_request([started, gone, small], set())
+
+        assert ids(out.context_requests) == [0]  # the started request takes this pass
+        assert sched.context_claim_candidates == []
 
     def test_without_claims_ahead_on_the_manager_the_executor_order_stays(self):
         sched, mgr = self._make()
@@ -7102,6 +7165,21 @@ class TestDemoteNoWalk:
             request_id
         )
 
+    @staticmethod
+    def _prefill(sched, req, max_passes=10):
+        """Schedule *req* chunk by chunk, as the executor would run it, until its prefill is
+        complete."""
+        for _ in range(max_passes):
+            out = sched.schedule_request([req], set())
+            assert ids(out.context_requests) == [req.py_request_id]
+            chunk = req.context_chunk_size
+            req.context_current_position += chunk
+            req.context_remaining_length -= chunk
+            req.is_first_context_chunk = False
+            if req.context_remaining_length == 0:
+                return
+        raise AssertionError("prefill did not complete")
+
     def test_ignored_without_the_probe(self):
         sched, _ = self._make(probe=False)
         assert sched._ctx_prompt_records is None
@@ -7109,7 +7187,9 @@ class TestDemoteNoWalk:
     def test_a_continuing_turn_is_short_without_a_walk(self):
         sched, mgr = self._make()
         turn1 = list(range(3000))
-        sched.schedule_request([self._req(0, turn1)], set())
+        writer = self._req(0, turn1)
+        self._prefill(sched, writer)
+        assert writer.context_current_position == 3000  # more than one chunk
         turn2 = turn1 + list(range(5000, 5500))
         sched.schedule_request([self._req(1, turn2)], set())
         assert self._walks(mgr, 1) == 0
@@ -7117,17 +7197,30 @@ class TestDemoteNoWalk:
         assert sched._ctx_demote_probes[1] == 502
         assert sched._ctx_prompt_records.stats["no_walk"] == 1
 
+    def test_an_unfinished_prefill_leaves_no_record(self):
+        """A writer cancelled after its first chunk committed only that chunk: the continuation
+        is walked, not given the whole prompt's depth."""
+        sched, mgr = self._make()
+        turn1 = list(range(3000))
+        writer = self._req(0, turn1)
+        out = sched.schedule_request([writer], set())
+        assert ids(out.context_requests) == [0] and writer.context_chunk_size < 3000
+        # Cancelled: it leaves without finishing its prefill (and holds no cache).
+        sched.schedule_request([self._req(1, turn1 + list(range(5000, 5500)))], set())
+        assert self._walks(mgr, 1) == 1
+        assert sched._ctx_prompt_records.stats["no_walk"] == 0
+
     def test_a_record_that_leaves_the_request_long_is_walked(self):
         sched, mgr = self._make(reused={1: 0})
         turn1 = list(range(3000))
-        sched.schedule_request([self._req(0, turn1)], set())
+        self._prefill(sched, self._req(0, turn1))
         sched.schedule_request([self._req(1, turn1 + list(range(5000, 7000)))], set())
         assert self._walks(mgr, 1) == 1
         assert sched._ctx_prompt_records.stats["record_long"] == 1
 
     def test_another_prefix_or_conversation_is_walked(self):
         sched, mgr = self._make()
-        sched.schedule_request([self._req(0, list(range(3000)))], set())
+        self._prefill(sched, self._req(0, list(range(3000))))
         sched.schedule_request([self._req(1, [7] + list(range(1, 3200)))], set())
         sched.schedule_request([self._req(2, list(range(3200)), conversation="c1")], set())
         sched.schedule_request([self._req(3, list(range(3200)), conversation=None)], set())
@@ -7135,7 +7228,7 @@ class TestDemoteNoWalk:
 
     def test_a_record_whose_request_still_holds_its_cache_is_not_trusted(self):
         sched, mgr = self._make()
-        sched.schedule_request([self._req(0, list(range(3000)))], set())
+        self._prefill(sched, self._req(0, list(range(3000))))
         mgr.kv_cache_map[0] = Mock()
         sched.schedule_request([self._req(1, list(range(3200)))], set())
         assert self._walks(mgr, 1) == 1
