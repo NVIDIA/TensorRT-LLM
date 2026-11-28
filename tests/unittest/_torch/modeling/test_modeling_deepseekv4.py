@@ -55,6 +55,10 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
 )
+from tensorrt_llm._torch.models.modeling_speculative import (
+    _copy_mtp_model_config_with_moe_selection,
+    _draft_moe_selection,
+)
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import moe_impl_request
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
@@ -867,6 +871,240 @@ def test_deepseek_v4_routed_moe_quant_config_covers_mtp_layers(tmp_path, monkeyp
     quant_algo = layer_quant_config["model.layers.0.mlp.experts"].quant_algo
     for layer_idx in range(1, 5):
         assert layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"].quant_algo == quant_algo
+
+
+def _write_deepseek_v4_mtp_checkpoint(tmp_path, dense_dtype, mtp_dtype):
+    """Two-shard checkpoint whose dense and MTP routed experts may differ.
+
+    Mirrors the ModelOpt experts-only repacks (e.g. nvidia/DeepSeek-V4-Pro-NVFP4),
+    which re-quantize the dense experts but leave the MTP shard at the base
+    model's layout. Passing mtp_dtype=None omits the MTP entry entirely.
+    """
+    dense_tensor = "layers.0.ffn.experts.0.w1.weight"
+    mtp_tensor = "mtp.0.ffn.experts.0.w1.weight"
+    dense_shard = "model-00001-of-00002.safetensors"
+    mtp_shard = "model-00002-of-00002.safetensors"
+
+    _write_safetensors_header(tmp_path / dense_shard, dense_tensor, dense_dtype, [2, 2])
+    weight_map = {dense_tensor: dense_shard}
+    if mtp_dtype is not None:
+        _write_safetensors_header(tmp_path / mtp_shard, mtp_tensor, mtp_dtype, [2, 2])
+        weight_map[mtp_tensor] = mtp_shard
+
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+
+def _deepseek_v4_mtp_spec_config(num_nextn_predict_layers):
+    class MTPMode:
+        @staticmethod
+        def is_mtp_one_model():
+            return True
+
+    class MTPConfig:
+        spec_dec_mode = MTPMode()
+
+    MTPConfig.num_nextn_predict_layers = num_nextn_predict_layers
+    return MTPConfig()
+
+
+@pytest.mark.parametrize(
+    "dense_dtype,mtp_dtype,dense_algo,dense_group,mtp_algo,mtp_group",
+    [
+        # ModelOpt experts-only NVFP4 repack: dense re-quantized to NVFP4 (U8),
+        # MTP left at the base model's MXFP4 (I8).
+        ("U8", "I8", QuantAlgo.NVFP4, 16, QuantAlgo.W4A8_MXFP4_MXFP8, 32),
+        # Inverse direction, to pin that neither layout is hard-coded.
+        ("I8", "U8", QuantAlgo.W4A8_MXFP4_MXFP8, 32, QuantAlgo.NVFP4, 16),
+        # Original MXFP4 checkpoint: the probe finds the dense layout again.
+        ("I8", "I8", QuantAlgo.W4A8_MXFP4_MXFP8, 32, QuantAlgo.W4A8_MXFP4_MXFP8, 32),
+    ],
+)
+def test_deepseek_v4_mtp_routed_experts_detected_separately(
+    tmp_path, monkeypatch, dense_dtype, mtp_dtype, dense_algo, dense_group, mtp_algo, mtp_group
+):
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
+    _write_deepseek_v4_mtp_checkpoint(tmp_path, dense_dtype, mtp_dtype)
+    # A probe that misses falls back to the dense layout with a warning, so
+    # no warning shows the MTP layout was read, not assumed.
+    messages = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.logger.warning_once",
+        lambda msg, *args, key: messages.append(msg % args),
+    )
+
+    num_hidden_layers = 2
+    num_mtp = 3
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        DeepseekV4Config(num_hidden_layers=num_hidden_layers),
+        str(tmp_path),
+        moe_impl_request("TRTLLM"),
+        None,
+        _deepseek_v4_mtp_spec_config(num_mtp),
+    )
+
+    for layer_idx in range(num_hidden_layers):
+        dense_config = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
+        assert dense_config.quant_algo == dense_algo
+        assert dense_config.group_size == dense_group
+
+    for i in range(num_mtp):
+        mtp_config = layer_quant_config[f"model.layers.{num_hidden_layers + i}.mlp.experts"]
+        assert mtp_config.quant_algo == mtp_algo
+        assert mtp_config.group_size == mtp_group
+    assert messages == []
+
+
+def test_deepseek_v4_mtp_routed_experts_warn_when_probe_missing(tmp_path, monkeypatch):
+    """An undetectable MTP layout must fall back loudly, not silently.
+
+    The warning is captured by patching the logger rather than via caplog:
+    tensorrt_llm's logger sets propagate=False, so root-handler capture would
+    not see it.
+    """
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
+    _write_deepseek_v4_mtp_checkpoint(tmp_path, "U8", None)
+
+    messages = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.logger.warning_once",
+        lambda msg, *args, key: messages.append(msg % args),
+    )
+
+    num_hidden_layers = 2
+    num_mtp = 1
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        DeepseekV4Config(num_hidden_layers=num_hidden_layers),
+        str(tmp_path),
+        moe_impl_request("TRTLLM"),
+        None,
+        _deepseek_v4_mtp_spec_config(num_mtp),
+    )
+
+    # Falls back to the dense layout, and says which probe missed.
+    mtp_config = layer_quant_config[f"model.layers.{num_hidden_layers}.mlp.experts"]
+    assert mtp_config.quant_algo == QuantAlgo.NVFP4
+    assert any("mtp.0.ffn.experts.0.w1.weight" in m for m in messages)
+
+
+def test_deepseek_v4_mtp_routed_experts_wait_for_a_layer_count(tmp_path, monkeypatch):
+    """An unset MTP layer count writes no MTP entries and does not fail.
+
+    V4's from_pretrained reads the count before it gets here; V4.1's does
+    not, so its first config load arrives with the count unset, and V4.1
+    rejects one-model MTP only when the model is built.
+    """
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
+    _write_deepseek_v4_mtp_checkpoint(tmp_path, "U8", "I8")
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        DeepseekV4Config(num_hidden_layers=2),
+        str(tmp_path),
+        moe_impl_request("TRTLLM"),
+        None,
+        _deepseek_v4_mtp_spec_config(None),
+    )
+
+    assert sorted(layer_quant_config) == [
+        "model.layers.0.mlp.experts",
+        "model.layers.1.mlp.experts",
+    ]
+
+
+def test_without_mtp_layers_keeps_the_target_entries():
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    quant_config_dict = {
+        name: quant_config
+        for name in (
+            "model.layers.0.mlp.experts",
+            "model.layers.1.self_attn.wq_a",
+            "model.layers.2.mlp.experts",
+            "model.layers.10.mlp.experts",
+            "mtp.0.ffn.experts",
+            "model.norm",
+        )
+    }
+
+    kept = ModelConfig._without_mtp_layers(quant_config_dict, num_hidden_layers=2)
+
+    assert sorted(kept) == [
+        "model.layers.0.mlp.experts",
+        "model.layers.1.self_attn.wq_a",
+        "model.norm",
+    ]
+    assert ModelConfig._without_mtp_layers(None, num_hidden_layers=2) is None
+    assert ModelConfig._without_mtp_layers({}, num_hidden_layers=2) == {}
+
+
+@pytest.mark.parametrize(
+    "tactic, backend",
+    [
+        # Names only NVFP4 implementations, so it cannot pick an MXFP4 run format.
+        ("trtllm.cutlass.grouped_gemm.nvfp4", "CUTLASS"),
+        # Names a CuteDSL NVFP4 and a DeepGEMM MXFP4 leaf; the dense NVFP4 experts settle it.
+        ("mega_moe", "MEGAMOE_CUTEDSL"),
+    ],
+)
+def test_deepseek_v4_mtp_routed_experts_do_not_take_the_target_tactic(
+    tmp_path, monkeypatch, tactic, backend
+):
+    """A tactic pinned for the target names the dense experts' implementations.
+
+    The MTP layers select their MoE for themselves, so their MXFP4 experts
+    neither have to run under the target's tactic nor widen its family.
+    """
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
+    _write_deepseek_v4_mtp_checkpoint(tmp_path, "U8", "I8")
+    num_hidden_layers = 2
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=num_hidden_layers,
+        compress_ratios=[0, 4],
+        num_nextn_predict_layers=1,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path), moe_tactic=tactic, spec_config=MTPDecodingConfig(max_draft_len=1)
+    )
+
+    assert model_config.moe_backend == backend
+    layer_quant_config = model_config.quant_config_dict
+    for layer_idx in range(num_hidden_layers):
+        assert layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"].quant_algo == (
+            QuantAlgo.NVFP4
+        )
+    mtp_config = layer_quant_config[f"model.layers.{num_hidden_layers}.mlp.experts"]
+    assert mtp_config.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
+    assert mtp_config.group_size == 32
+
+    # The MTP layers resolve AUTO for themselves and build their MXFP4 experts.
+    selection = _draft_moe_selection(
+        model_config, model_config.spec_config, load_balancer=model_config.moe_load_balancer
+    )
+    mtp_model_config = _copy_mtp_model_config_with_moe_selection(
+        model_config, selection, num_hidden_layers
+    )
+    assert mtp_model_config.moe_tactic is None
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    mtp_config = mtp_model_config.quant_config_dict[f"model.layers.{num_hidden_layers}.mlp.experts"]
+    assert mtp_config.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
+    assert mtp_config.group_size == 32
+
+    # The entry parsed above is only a placeholder: a draft tactic naming
+    # another MXFP4 format rewrites the copy's entry, not the target's.
+    selection = _draft_moe_selection(
+        model_config,
+        MTPDecodingConfig(max_draft_len=1, moe_tactic="trtllm.trtllm_gen.fused_moe.w4a16_mxfp4"),
+        load_balancer=model_config.moe_load_balancer,
+    )
+    mtp_model_config = _copy_mtp_model_config_with_moe_selection(
+        model_config, selection, num_hidden_layers
+    )
+    mtp_key = f"model.layers.{num_hidden_layers}.mlp.experts"
+    assert mtp_model_config.quant_config_dict[mtp_key].quant_algo == QuantAlgo.W4A16_MXFP4
+    assert layer_quant_config[mtp_key].quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
 
 
 def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
