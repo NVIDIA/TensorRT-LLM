@@ -12,19 +12,6 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
 # the License.
-set(EXECUTOR_TARGET_NAME tensorrt_llm_executor)
-set(EXECUTOR_STATIC_TARGET ${EXECUTOR_TARGET_NAME}_static)
-
-set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-
-# keep this list sorted alphabetically
-set(SRCS
-    cache_transmission/cacheSplitConcat.cu
-    cache_transmission/mpi_utils/connection.cpp
-    cache_transmission/rnnCacheSplitConcat.cu
-    executorKVCacheEventManager.cpp
-    jsonSerialization.cpp)
-
 if(NOT WIN32)
   # additional warnings
   #
@@ -63,6 +50,20 @@ target_link_libraries(
 target_compile_features(tllm_executor_types PUBLIC cxx_std_20)
 set_target_properties(tllm_executor_types PROPERTIES POSITION_INDEPENDENT_CODE
                                                      ON)
+
+add_library(tllm_executor_json_serialization STATIC jsonSerialization.cpp)
+add_library(tllm::executor_json_serialization ALIAS
+            tllm_executor_json_serialization)
+target_link_libraries(tllm_executor_json_serialization
+                      PUBLIC tllm::common_headers)
+target_include_directories(
+  tllm_executor_json_serialization SYSTEM
+  PUBLIC ${CUDAToolkit_INCLUDE_DIRS}
+  PRIVATE ${CMAKE_BINARY_DIR}/_deps/json-src/include)
+target_compile_features(tllm_executor_json_serialization PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_executor_json_serialization PROPERTIES CXX_EXTENSIONS OFF
+                                              POSITION_INDEPENDENT_CODE ON)
 
 add_library(tllm_executor_serialization STATIC samplingConfigSerialization.cpp)
 add_library(tllm::executor_serialization ALIAS tllm_executor_serialization)
@@ -138,6 +139,27 @@ target_link_libraries(
   PRIVATE tllm::executor_agent_name tllm::executor_cache_routing
           tllm::common_environment pg_utils ${Python3_LIBRARIES})
 
+add_library(
+  tllm_executor_cache_transfer_cuda STATIC
+  cache_transmission/cacheSplitConcat.cu
+  cache_transmission/rnnCacheSplitConcat.cu)
+add_library(tllm::executor_cache_transfer_cuda ALIAS
+            tllm_executor_cache_transfer_cuda)
+target_link_libraries(
+  tllm_executor_cache_transfer_cuda
+  PUBLIC tllm::runtime_buffers tllm::executor_cache_routing
+  PRIVATE tllm::common_environment tllm::executor_values)
+set_target_properties(
+  tllm_executor_cache_transfer_cuda
+  PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
+             CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+add_library(tllm_executor_mpi_connection STATIC
+            cache_transmission/mpi_utils/connection.cpp)
+add_library(tllm::executor_mpi_connection ALIAS tllm_executor_mpi_connection)
+target_link_libraries(tllm_executor_mpi_connection
+                      PUBLIC tllm::runtime_distributed tllm::executor_values)
+
 foreach(
   component
   tllm_executor_values
@@ -146,28 +168,27 @@ foreach(
   tllm_executor_memory_desc
   tllm_executor_cache_routing
   tllm_executor_socket_serialization
-  tllm_executor_agent_connection)
+  tllm_executor_agent_connection
+  tllm_executor_cache_transfer_cuda
+  tllm_executor_mpi_connection)
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(${component} PROPERTIES CXX_EXTENSIONS OFF
                                                 POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
-add_library(${EXECUTOR_STATIC_TARGET} STATIC ${SRCS})
+add_library(tllm_executor_kv_cache_events STATIC
+            executorKVCacheEventManager.cpp)
+add_library(tllm::executor_kv_cache_events ALIAS tllm_executor_kv_cache_events)
 target_link_libraries(
-  ${EXECUTOR_STATIC_TARGET}
-  PUBLIC tllm::executor_values tllm::executor_transfer_agent
-         tllm::executor_agent_name tllm::executor_memory_desc
-         tllm::executor_cache_routing tllm::executor_agent_connection)
+  tllm_executor_kv_cache_events
+  PUBLIC tllm::common_headers
+  PRIVATE tllm::kv_cache_legacy)
+target_include_directories(tllm_executor_kv_cache_events SYSTEM
+                           PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+target_compile_features(tllm_executor_kv_cache_events PUBLIC cxx_std_20)
 set_target_properties(
-  ${EXECUTOR_STATIC_TARGET}
-  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
-             POSITION_INDEPENDENT_CODE ON)
-
-set_property(TARGET ${EXECUTOR_STATIC_TARGET}
-             PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
-target_compile_definitions(${EXECUTOR_STATIC_TARGET}
-                           PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+  tllm_executor_kv_cache_events PROPERTIES CXX_EXTENSIONS OFF
+                                           POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory(cache_transmission/ucx_utils)
 add_subdirectory(cache_transmission/mooncake_utils)

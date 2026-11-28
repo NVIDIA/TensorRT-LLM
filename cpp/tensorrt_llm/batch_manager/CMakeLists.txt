@@ -12,24 +12,6 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
 # the License.
-set(BATCH_MANAGER_TARGET_NAME tensorrt_llm_batch_manager)
-set(BATCH_MANAGER_STATIC_TARGET ${BATCH_MANAGER_TARGET_NAME}_static)
-
-set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-
-# keep this list sorted alphabetically
-set(SRCS
-    cacheFormatter.cpp
-    cacheTransceiver.cpp
-    cacheTransferLayer.cpp
-    contextTransferCoordinator.cpp
-    dataTransceiver.cpp
-    kvCacheManagerV2Utils.cpp
-    kvCacheManagerV2Utils.cu
-    mlaCacheFormatter.cpp
-    rnnCacheFormatter.cpp
-    rnnCacheTransBuffer.cpp)
-
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
@@ -107,12 +89,18 @@ target_link_libraries(
   PRIVATE tllm::common_environment tllm::executor_transfer_agent
           tllm::kernel_kv_cache_copy)
 
+add_library(tllm_batch_context_progress STATIC contextProgress.cpp)
+add_library(tllm::batch_context_progress ALIAS tllm_batch_context_progress)
+target_link_libraries(tllm_batch_context_progress PUBLIC tllm::common_cuda)
+
 add_library(
-  tllm_batch_scheduler STATIC
-  agentTree.cpp capacityScheduler.cpp contextProgress.cpp
-  microBatchScheduler.cpp noOpPeftCacheManager.cpp)
+  tllm_batch_scheduler STATIC agentTree.cpp capacityScheduler.cpp
+                              microBatchScheduler.cpp noOpPeftCacheManager.cpp)
 add_library(tllm::batch_scheduler ALIAS tllm_batch_scheduler)
-target_link_libraries(tllm_batch_scheduler PUBLIC tllm::kv_cache_legacy)
+target_link_libraries(
+  tllm_batch_scheduler
+  PUBLIC tllm::kv_cache_legacy
+  PRIVATE tllm::batch_context_progress)
 target_include_directories(tllm_batch_scheduler
                            PRIVATE ${maybe_nvtx_includedir})
 
@@ -158,7 +146,7 @@ set_target_properties(tllm_peft_cache PROPERTIES CXX_EXTENSIONS OFF
                                                  POSITION_INDEPENDENT_CODE ON)
 
 foreach(component tllm_kv_cache_host_memory tllm_kv_cache tllm_kv_cache_legacy
-                  tllm_batch_scheduler)
+                  tllm_batch_scheduler tllm_batch_context_progress)
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(
     ${component} PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON
@@ -168,41 +156,46 @@ target_compile_options(
   tllm_kv_cache PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 add_cuda_architectures(tllm_kv_cache 89)
 
-add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
+add_library(
+  tllm_batch_cache_transceiver STATIC
+  cacheFormatter.cpp
+  cacheTransceiver.cpp
+  cacheTransferLayer.cpp
+  contextTransferCoordinator.cpp
+  dataTransceiver.cpp
+  mlaCacheFormatter.cpp
+  rnnCacheFormatter.cpp
+  rnnCacheTransBuffer.cpp)
+add_library(tllm::batch_cache_transceiver ALIAS tllm_batch_cache_transceiver)
 target_link_libraries(
-  ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC tllm::kv_cache tllm::batch_scheduler tllm::context_transfer_consensus
-         tllm::peft_cache tllm::batch_request_info
-         tllm::batch_rnn_cache_routing)
-target_include_directories(
-  ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
-         ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-
+  tllm_batch_cache_transceiver
+  PUBLIC tllm::kv_cache_legacy tllm::batch_request_info
+  PRIVATE tllm::executor_cache_transfer_cuda
+          tllm::executor_mpi_connection
+          tllm::executor_agent_connection
+          tllm::batch_rnn_cache_routing
+          tllm::batch_context_progress
+          tllm::context_transfer_consensus
+          tllm::common_environment
+          pg_utils
+          ${TORCH_PYTHON_LIB}
+          ${Python3_LIBRARIES}
+          ${CMAKE_DL_LIBS}
+          Threads::Threads)
+target_compile_features(tllm_batch_cache_transceiver PUBLIC cxx_std_20)
 set_target_properties(
-  ${BATCH_MANAGER_STATIC_TARGET}
-  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
-             POSITION_INDEPENDENT_CODE ON)
+  tllm_batch_cache_transceiver PROPERTIES CXX_EXTENSIONS OFF
+                                          POSITION_INDEPENDENT_CODE ON)
 
-set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}
-             PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
-target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
-                           PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
-
-if(ENABLE_UCX)
-  find_package(ucx REQUIRED)
-  find_package(ucxx REQUIRED)
-  target_include_directories(
-    ${BATCH_MANAGER_STATIC_TARGET}
-    PRIVATE $<TARGET_PROPERTY:ucxx::ucxx,INTERFACE_INCLUDE_DIRECTORIES>)
-  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
-
-endif()
-
-find_library(TORCH_PYTHON_LIB torch_python REQUIRED
-             HINTS ${TORCH_INSTALL_PREFIX}/lib)
-target_link_libraries(
-  ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils
-  PRIVATE tensorrt_llm_xgrammar_static)
+add_library(tllm_kv_cache_v2_utils STATIC kvCacheManagerV2Utils.cpp
+                                          kvCacheManagerV2Utils.cu)
+add_library(tllm::kv_cache_v2_utils ALIAS tllm_kv_cache_v2_utils)
+target_include_directories(tllm_kv_cache_v2_utils
+                           PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR})
+target_link_libraries(tllm_kv_cache_v2_utils PUBLIC tllm::runtime_buffers
+                                                    torch_cpu c10)
+target_compile_features(tllm_kv_cache_v2_utils PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_kv_cache_v2_utils
+  PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)

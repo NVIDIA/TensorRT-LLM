@@ -195,12 +195,8 @@ add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(runtime)
 
-set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
-set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
 add_subdirectory(batch_manager)
 
-set(EXECUTOR_TARGET tensorrt_llm_executor_static)
-set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
 set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
 
 if(NIXL_ROOT)
@@ -213,9 +209,6 @@ if(MOONCAKE_ROOT)
 endif()
 
 add_subdirectory(executor)
-
-target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
-target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
 set(TRTLLM_LINK_LIBS
     ${CUDA_DRV_LIB}
@@ -316,8 +309,16 @@ endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
+find_library(TORCH_PYTHON_LIB torch_python REQUIRED
+             HINTS ${TORCH_INSTALL_PREFIX}/lib)
+target_link_libraries(
+  ${SHARED_TARGET} PRIVATE ${TORCH_PYTHON_LIB} Python3::Python pg_utils
+                           tensorrt_llm_xgrammar_static Threads::Threads)
+
 set(TLLM_FACADE_COMPONENT_TARGETS
     ipc_nvls_memory_src
+    tllm_batch_cache_transceiver
+    tllm_batch_context_progress
     tllm_batch_request_info
     tllm_batch_rnn_cache_routing
     tllm_batch_scheduler
@@ -340,7 +341,11 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_executor_agent_connection
     tllm_executor_agent_name
     tllm_executor_cache_routing
+    tllm_executor_cache_transfer_cuda
+    tllm_executor_json_serialization
+    tllm_executor_kv_cache_events
     tllm_executor_memory_desc
+    tllm_executor_mpi_connection
     tllm_executor_serialization
     tllm_executor_socket_serialization
     tllm_executor_transfer_agent
@@ -350,6 +355,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_kv_cache
     tllm_kv_cache_host_memory
     tllm_kv_cache_legacy
+    tllm_kv_cache_v2_utils
     tllm_peft_cache
     tllm_runtime_buffers
     tllm_runtime_debug
@@ -371,10 +377,8 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_worker_pool
     userbuffers_src)
 
-foreach(
-  component
-  ${TLLM_FACADE_COMPONENT_TARGETS} ${BATCH_MANAGER_TARGET} ${EXECUTOR_TARGET}
-  fp8_blockscale_gemm_src ${INTERNAL_CUTLASS_KERNELS_TARGET})
+foreach(component ${TLLM_FACADE_COMPONENT_TARGETS} fp8_blockscale_gemm_src
+                  ${INTERNAL_CUTLASS_KERNELS_TARGET})
   target_link_libraries(${SHARED_TARGET}
                         PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
 endforeach()
@@ -394,11 +398,6 @@ endforeach()
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
-
-# Cyclic dependency of batch manager on TRT-LLM
-target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
-# Cyclic dependency of executor on TRT-LLM
-target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 
 if(TARGET ${UCX_WRAPPER_TARGET})
   add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
