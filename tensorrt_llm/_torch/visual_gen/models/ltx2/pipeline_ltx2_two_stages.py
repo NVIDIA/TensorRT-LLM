@@ -57,6 +57,42 @@ from .transformer_ltx2 import Stage2Groups
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 
+def _load_spatial_upsampler(
+    path: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    strict: bool = False,
+) -> torch.nn.Module:
+    """Load a spatial upsampler; strict mode rejects invalid metadata and weights."""
+    sft_paths = _find_safetensors_files(path)
+    if not sft_paths:
+        raise ValueError(f"No safetensors files found at {path}")
+    _prefetch_ltx2_safetensors_files(sft_paths)
+
+    config: Dict[str, Any] = {}
+    try:
+        with safetensors.torch.safe_open(sft_paths[0], framework="pt") as handle:
+            metadata = handle.metadata()
+            if metadata and "config" in metadata:
+                config = json.loads(metadata["config"])
+    except Exception:
+        if strict:
+            raise
+
+    upsampler = LatentUpsamplerConfigurator.from_config(config)
+    state_dict: Dict[str, torch.Tensor] = {}
+    for checkpoint in sft_paths:
+        with safetensors.torch.safe_open(checkpoint, framework="pt") as handle:
+            for key in handle.keys():
+                state_dict[key] = handle.get_tensor(key)
+
+    missing, unexpected = upsampler.load_state_dict(state_dict, strict=strict)
+    if missing:
+        logger.warning(f"Upsampler missing keys ({len(missing)}): {missing[:5]}")
+    return upsampler.to(device=device, dtype=dtype)
+
+
 class _TwoStagePhaseTimer(CudaPhaseTimer):
     """CudaPhaseTimer + the two-stage extras: the stage-2 refinement loop and
     the decode section.
@@ -206,6 +242,7 @@ def _load_lora_deltas(
     transformer: torch.nn.Module,
     transformer_prefix: str = "model.diffusion_model.",
     strength: float = 1.0,
+    strict: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Load LoRA weights and pre-compute parameter deltas.
 
@@ -254,6 +291,10 @@ def _load_lora_deltas(
             base_name = key[: -len(".alpha")]
             alpha_dict[base_name] = tensor.item()
 
+    if strict and down_keys.keys() != up_keys.keys():
+        missing = sorted(down_keys.keys() ^ up_keys.keys())
+        raise ValueError(f"Unpaired LoRA factors: {missing[:5]}")
+
     # Build list of prefixes to try stripping, ordered from longest to
     # shortest so we prefer the most specific match.  LoRA checkpoints
     # may use the full ``model.diffusion_model.`` prefix, or just the
@@ -276,6 +317,8 @@ def _load_lora_deltas(
 
         param_name = _map_lora_param_name(base_name, strip_prefixes)
         if not _has_lora_target(param_name, model_params):
+            if strict:
+                raise ValueError(f"LoRA target does not match the transformer: {base_name}")
             skipped_non_targets += 1
             continue
 
@@ -783,8 +826,9 @@ class _PersistentLoRAWeightCache:
     Stage 2 distilled LoRA.
     It removes per-request merge/unmerge math by rebinding parameter storage to
     precomputed resident tensors.  FP8 and FP4 keep exact original quantized
-    state.  FP4's merged state is BF16 and swaps the parent Linear to
-    UnquantizedLinearMethod, matching the existing per-request Stage 2 path.
+    state. By default, FP4's merged state is BF16 and swaps the parent Linear
+    to UnquantizedLinearMethod. Callers may instead requantize the merged FP4
+    weights and keep the original quantized Linear method.
     """
 
     def __init__(
@@ -816,7 +860,20 @@ class _PersistentLoRAWeightCache:
         cls,
         module: torch.nn.Module,
         deltas: Dict[str, torch.Tensor],
+        *,
+        requantize_fp4: bool = False,
+        lora_compute_dtype: Optional[torch.dtype] = None,
     ) -> "_PersistentLoRAWeightCache":
+        """Prepare resident original and LoRA-merged parameter storage.
+
+        Args:
+            module: Transformer whose parameter storage is switched between stages.
+            deltas: Dense LoRA deltas keyed by target parameter name.
+            requantize_fp4: Requantize merged NVFP4 weights instead of using the
+                default BF16 refinement weights and unquantized Linear method.
+            lora_compute_dtype: Optional dtype for FP8 weight/delta addition;
+                ``None`` preserves the dequantizer's existing computation dtype.
+        """
         state, module_dict = cls._module_state(module)
         entries: List[_PersistentLoRAParamState] = []
 
@@ -850,6 +907,8 @@ class _PersistentLoRAWeightCache:
                         ws_param.data,
                         packed=is_packed,
                     )
+                    if lora_compute_dtype is not None:
+                        bf16 = bf16.to(lora_compute_dtype)
                     bf16.add_(delta.to(bf16.device, bf16.dtype))
                     qw, new_scale = _requantize_fp8_weight(
                         bf16,
@@ -920,28 +979,38 @@ class _PersistentLoRAWeightCache:
                         f"Linear module at '{base}'."
                     )
 
+                scale_params = {scale_key: ws_param, scale2_key: ws2_param}
+                original_scales = {key: value.data for key, value in scale_params.items()}
+                merged_scales = dict(original_scales)
+                merged_weight = bf16
+                merged_quant_method = UnquantizedLinearMethod()
+                if requantize_fp4:
+                    merged_weight, merged_scale, merged_scale_2 = _requantize_fp4_weight(bf16)
+                    merged_scales[scale_key] = _scale_like(merged_scale, ws_param.data)
+                    merged_scales[scale2_key] = _scale_like(merged_scale_2, ws2_param.data)
+                    merged_quant_method = linear_mod.quant_method
+                    alpha_key = f"{base}.alpha"
+                    if alpha_key in state:
+                        alpha_param = state[alpha_key]
+                        scale_params[alpha_key] = alpha_param
+                        original_scales[alpha_key] = alpha_param.data
+                        merged_scales[alpha_key] = _scale_like(
+                            alpha_param.data * merged_scale_2 / ws2_param.data, alpha_param.data
+                        )
+
                 entries.append(
                     _PersistentLoRAParamState(
                         param_name=param_name,
                         precision="fp4",
                         weight_param=param,
                         original_weight=param.data,
-                        merged_weight=bf16,
-                        scale_params={
-                            scale_key: ws_param,
-                            scale2_key: ws2_param,
-                        },
-                        original_scales={
-                            scale_key: ws_param.data,
-                            scale2_key: ws2_param.data,
-                        },
-                        merged_scales={
-                            scale_key: ws_param.data,
-                            scale2_key: ws2_param.data,
-                        },
+                        merged_weight=merged_weight,
+                        scale_params=scale_params,
+                        original_scales=original_scales,
+                        merged_scales=merged_scales,
                         linear_module=linear_mod,
                         original_quant_method=linear_mod.quant_method,
-                        merged_quant_method=UnquantizedLinearMethod(),
+                        merged_quant_method=merged_quant_method,
                     )
                 )
                 continue
@@ -1178,38 +1247,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         distilled_lora_path: str,
         lora_future,
     ) -> None:
+        """Load the upsampler and consume precomputed LoRA deltas for refinement."""
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
             logger.info(f"Loading spatial upsampler from {spatial_upsampler_path}...")
-            sft_paths = _find_safetensors_files(spatial_upsampler_path)
-            if not sft_paths:
-                raise ValueError(f"No safetensors files found at {spatial_upsampler_path}")
-            _prefetch_ltx2_safetensors_files(sft_paths)
-
-            config: Dict[str, Any] = {}
-            try:
-                with safetensors.torch.safe_open(sft_paths[0], framework="pt") as f:
-                    meta = f.metadata()
-                    if meta and "config" in meta:
-                        config = json.loads(meta["config"])
-            except Exception:
-                pass
-
-            self.spatial_upsampler = LatentUpsamplerConfigurator.from_config(config)
-
-            state_dict: Dict[str, torch.Tensor] = {}
-            for path in sft_paths:
-                with safetensors.torch.safe_open(path, framework="pt") as f:
-                    for key in f.keys():
-                        state_dict[key] = f.get_tensor(key)
-
-            missing, unexpected = self.spatial_upsampler.load_state_dict(
-                state_dict,
-                strict=False,
-            )
-            if missing:
-                logger.warning(f"Upsampler missing keys ({len(missing)}): {missing[:5]}")
-            self.spatial_upsampler = self.spatial_upsampler.to(device=device, dtype=dtype)
+            self.spatial_upsampler = _load_spatial_upsampler(spatial_upsampler_path, device, dtype)
             logger.info("Spatial upsampler loaded")
         else:
             self.spatial_upsampler = None
