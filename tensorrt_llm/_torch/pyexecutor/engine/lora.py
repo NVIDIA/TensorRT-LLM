@@ -170,121 +170,123 @@ class LoraParamBuilder:
         enable_spec_decode: bool,
         runtime_draft_len: int,
     ) -> dict:
-        """Eager mode LoRA parameter preparation logic.
+        """Build eager-mode LoRA parameters keyed by ``layer_id`` then ``module_id``.
 
-        lora_params: dict
-        {
-            layer_id: dict
-            {
-                module_id: dict
-                {
-                    adapter_size: torch tensor: int
-                    weight_pointers: torch tensor: int64
-                }
-            }
-        }
+        Each ``(layer_id, module_id)`` entry contains CPU contiguous tensors ordered by
+        ``scheduled_requests.all_requests()``:
+        - ``adapter_size``: ``int32`` tensor of shape ``[num_requests]``
+        - ``weight_pointers``: ``int64`` tensor of shape ``[3 * num_requests]`` holding
+          ``(weights_in, weights_out, scaling_vec)`` pointer triples per request
+
+        Requests without an entry for a ``(layer_id, module_id)`` receive zeros. When at
+        least one entry is present, ``host_request_types``, ``prompt_lens_cpu``, and
+        ``num_seqs`` metadata keys are also populated. Returned per-entry tensors are
+        views into shared backing tables, so callers must treat them as read-only and not
+        resize or rebind them in place.
         """
-        lora_params = {}
-        tmp_lora_params = {}
-
         request_list = scheduled_requests.all_requests()
 
-        # trace all requests to get the union set of the lora params
+        # Map each distinct lora_task_id (in first-seen order) to a column 1..num_adapters;
+        # column 0 stays zero for base requests and adapters with empty config lists.
+        adapter_to_col: dict[int, int] = {}
+        adapter_configs: list[list[TaskLayerModuleConfig]] = []
+        req_adapter_cols: list[int] = []
+
         for request in request_list:
-            if request.lora_task_id is None:
+            task_id = request.lora_task_id
+            if task_id is None:
+                req_adapter_cols.append(0)
                 continue
 
-            layer_module_configs = peft_table[request.lora_task_id]
+            col = adapter_to_col.get(task_id)
+            if col is None:
+                configs = peft_table[task_id]
+                if configs:
+                    col = len(adapter_configs) + 1
+                    adapter_configs.append(configs)
+                else:
+                    col = 0
+                adapter_to_col[task_id] = col
+            req_adapter_cols.append(col)
 
-            for module in layer_module_configs:
-                module_id = module.module_id
-                layer_id = module.layer_id
+        if not adapter_configs:
+            return {}
 
-                if layer_id not in lora_params:
-                    lora_params[layer_id] = {}
-                if module_id not in lora_params[layer_id]:
-                    lora_params[layer_id][module_id] = {
-                        "adapter_size": [],
-                        "weight_pointers": [],
-                    }
+        num_cols = len(adapter_configs) + 1
+        ptr_row_len = 3 * num_cols
+        entry_rows: dict[tuple[int, int], tuple[list[int], list[int]]] = {}
+        sizes_by_entry: list[list[int]] = []
+        ptrs_by_entry: list[list[int]] = []
 
+        # Populate an entry-major [num_entries, num_cols] table once per unique adapter so
+        # index_select along dim=1 yields contiguous per-entry [num_requests] rows directly.
+        for adapter_col, configs in enumerate(adapter_configs, start=1):
+            ptr_base = adapter_col * 3
+            for module in configs:
+                key = (module.layer_id, module.module_id)
+                pair = entry_rows.get(key)
+                if pair is None:
+                    sizes_row = [0] * num_cols
+                    ptrs_row = [0] * ptr_row_len
+                    pair = (sizes_row, ptrs_row)
+                    entry_rows[key] = pair
+                    sizes_by_entry.append(sizes_row)
+                    ptrs_by_entry.append(ptrs_row)
+                else:
+                    sizes_row, ptrs_row = pair
+
+                sizes_row[adapter_col] = module.adapter_size
+                ptrs_row[ptr_base] = module.weights_in_pointer
+                ptrs_row[ptr_base + 1] = module.weights_out_pointer
                 scaling_vec_pointer = module.scaling_vec_pointer
-                if scaling_vec_pointer is None:
-                    scaling_vec_pointer = 0
-                tmp_lora_params[(request.py_request_id, layer_id, module_id)] = {
-                    "adapter_size": [module.adapter_size],
-                    "weight_pointers": [
-                        module.weights_in_pointer,
-                        module.weights_out_pointer,
-                        scaling_vec_pointer,
-                    ],
-                }
+                ptrs_row[ptr_base + 2] = 0 if scaling_vec_pointer is None else scaling_vec_pointer
 
-        for request in request_list:
-            # Need to set default values for this case
-            if request.lora_task_id is None:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        current_lora_params = lora_params[layer_id][module_id]
-                        current_lora_params["adapter_size"].append(0)
-                        current_lora_params["weight_pointers"] += [0, 0, 0]
+        num_entries = len(entry_rows)
+        req_idx = torch.tensor(req_adapter_cols, dtype=torch.int64, device="cpu")
+        sizes_table = torch.tensor(sizes_by_entry, dtype=torch.int32, device="cpu")
+        ptrs_table = torch.tensor(ptrs_by_entry, dtype=torch.int64, device="cpu").view(
+            num_entries, num_cols, 3
+        )
 
-            else:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        current_tmp_lora_params = tmp_lora_params.get(
-                            (request.py_request_id, layer_id, module_id), None
-                        )
-                        current_lora_params = lora_params[layer_id][module_id]
-                        if current_tmp_lora_params is None:
-                            current_lora_params["adapter_size"].append(0)
-                            current_lora_params["weight_pointers"] += [0, 0, 0]
-                        else:
-                            current_lora_params["adapter_size"] += current_tmp_lora_params[
-                                "adapter_size"
-                            ]
-                            current_lora_params["weight_pointers"] += current_tmp_lora_params[
-                                "weight_pointers"
-                            ]
+        sizes_out = sizes_table.index_select(1, req_idx).unbind(0)
+        ptrs_out = ptrs_table.index_select(1, req_idx).flatten(1).unbind(0)
 
-        for layer_id in lora_params:
-            for module_id in lora_params[layer_id]:
-                current_lora_params = lora_params[layer_id][module_id]
-                current_lora_params["adapter_size"] = torch.IntTensor(
-                    current_lora_params["adapter_size"]
-                )
-                current_lora_params["weight_pointers"] = torch.LongTensor(
-                    current_lora_params["weight_pointers"]
-                )
+        lora_params: dict = {}
+        for (layer_id, module_id), adapter_size, weight_pointers in zip(
+            entry_rows, sizes_out, ptrs_out
+        ):
+            lora_params.setdefault(layer_id, {})[module_id] = {
+                "adapter_size": adapter_size,
+                "weight_pointers": weight_pointers,
+            }
 
-        if lora_params:
-            host_request_types = attn_metadata.host_request_types
-            prompt_lens_cpu = attn_metadata.prompt_lens_cpu
-            num_seqs = attn_metadata.num_seqs
-            num_contexts = attn_metadata.num_contexts
-            num_generations = attn_metadata.num_generations
+        host_request_types = attn_metadata.host_request_types
+        prompt_lens_cpu = attn_metadata.prompt_lens_cpu
+        num_seqs = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_generations = attn_metadata.num_generations
 
-            # During spec decode verification (non-extend_ctx mode), each
-            # generation request processes (runtime_draft_len + 1) tokens at
-            # once. The LoRA op's C++ kernel only advances 1 token per
-            # kGENERATION request, so we re-label generation requests as
-            # kCONTEXT and set prompt_lens_cpu to the actual per-request token
-            # count so the kernel correctly expands LoRA weights for all tokens.
-            if (
-                enable_spec_decode
-                and runtime_draft_len > 0
-                and self._spec_config.is_linear_tree
-                and not self._spec_config.spec_dec_mode.extend_ctx(self._attn_backend)
-                and num_generations > 0
-            ):
-                tokens_per_req = runtime_draft_len + 1
-                host_request_types = host_request_types.clone()
-                host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT
-                prompt_lens_cpu = prompt_lens_cpu.clone()
-                prompt_lens_cpu[num_contexts:num_seqs].fill_(tokens_per_req)
+        # During spec decode verification (non-extend_ctx mode), each
+        # generation request processes (runtime_draft_len + 1) tokens at
+        # once. The LoRA op's C++ kernel only advances 1 token per
+        # kGENERATION request, so we re-label generation requests as
+        # kCONTEXT and set prompt_lens_cpu to the actual per-request token
+        # count so the kernel correctly expands LoRA weights for all tokens.
+        if (
+            enable_spec_decode
+            and runtime_draft_len > 0
+            and self._spec_config.is_linear_tree
+            and not self._spec_config.spec_dec_mode.extend_ctx(self._attn_backend)
+            and num_generations > 0
+        ):
+            tokens_per_req = runtime_draft_len + 1
+            host_request_types = host_request_types.clone()
+            host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT
+            prompt_lens_cpu = prompt_lens_cpu.clone()
+            prompt_lens_cpu[num_contexts:num_seqs].fill_(tokens_per_req)
 
-            lora_params["host_request_types"] = host_request_types
-            lora_params["prompt_lens_cpu"] = prompt_lens_cpu
-            lora_params["num_seqs"] = num_seqs
+        lora_params["host_request_types"] = host_request_types
+        lora_params["prompt_lens_cpu"] = prompt_lens_cpu
+        lora_params["num_seqs"] = num_seqs
 
         return lora_params

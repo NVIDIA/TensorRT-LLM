@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for LoRA parameter construction and CUDA-graph model scope."""
 
+import random
 from collections.abc import Sequence
 from importlib import import_module
 from types import SimpleNamespace
@@ -301,16 +302,303 @@ def test_missing_peft_table_yields_none_and_an_empty_one_yields_an_empty_dict() 
     assert empty_table == {}
 
 
-def test_batch_without_any_adapter_gets_no_metadata_keys() -> None:
-    """No LoRA request means no parameters at all -- not zero-filled ones."""
-    batch = _batch(context=[_request(0, lora_task_id=None)])
+@pytest.mark.parametrize(
+    ("batch", "attn_metadata"),
+    [
+        (_batch(context=[_request(0, lora_task_id=None)]), _attn_metadata()),
+        (_batch(), None),
+        (_batch(context=[_request(0, lora_task_id=1)]), None),
+    ],
+    ids=["no-adapter-requests", "empty-batch", "empty-adapter-config-list"],
+)
+def test_batch_without_any_adapter_gets_no_metadata_keys(
+    batch: ScheduledRequests, attn_metadata: SimpleNamespace | None
+) -> None:
+    """No active adapter entry means no parameters or metadata keys at all."""
+    peft_table = {
+        1: [],
+        7: [_module(layer_id=0, module_id=1, adapter_size=4, weights_in=11, weights_out=22)],
+    }
+
+    params = _build(_builder(), batch, attn_metadata, peft_table)
+
+    assert params == {}
+
+
+def test_empty_adapter_config_mixed_with_active_adapter_fills_zero_rows() -> None:
+    """An adapter with an empty config list produces zero entries alongside active adapters."""
+    peft_table = {
+        1: [],
+        2: [_module(layer_id=2, module_id=5, adapter_size=8, weights_in=101, weights_out=202)],
+    }
+
+    mixed = _build(
+        _builder(),
+        _batch(
+            context=[_request(0, lora_task_id=1), _request(1, lora_task_id=2)],
+            generation=[_request(2, lora_task_id=1)],
+        ),
+        _attn_metadata(num_contexts=2, num_generations=1),
+        peft_table,
+    )
+    entry = mixed[2][5]
+    assert entry["adapter_size"].tolist() == [0, 8, 0]
+    assert entry["weight_pointers"].tolist() == [0, 0, 0, 101, 202, 0, 0, 0, 0]
+
+
+def test_missing_adapter_in_peft_table_raises_key_error() -> None:
+    """A task ID missing from the PEFT table raises KeyError for the first such request in batch order."""
+    batch = _batch(
+        context=[_request(0, lora_task_id=None), _request(1, lora_task_id=7)],
+        generation=[_request(2, lora_task_id=99), _request(3, lora_task_id=42)],
+    )
     peft_table = {
         7: [_module(layer_id=0, module_id=1, adapter_size=4, weights_in=11, weights_out=22)]
     }
 
-    params = _build(_builder(), batch, _attn_metadata(), peft_table)
+    with pytest.raises(KeyError) as exc_info:
+        _build(_builder(), batch, _attn_metadata(num_contexts=2, num_generations=2), peft_table)
+    assert exc_info.value.args == (99,)
 
-    assert params == {}
+
+def test_repeated_adapters_and_mixed_base_requests_preserve_layout() -> None:
+    """Shared adapters (including task_id=0) preserve key order, 64-bit pointers, and contiguity."""
+    hi = 1 << 40
+    batch = _batch(
+        context=[
+            _request(0, lora_task_id=None),
+            _request(1, lora_task_id=0),
+            _request(2, lora_task_id=5),
+        ],
+        generation=[
+            _request(3, lora_task_id=0),
+            _request(4, lora_task_id=None),
+            _request(5, lora_task_id=5),
+        ],
+    )
+    peft_table = {
+        0: [
+            _module(
+                layer_id=3,
+                module_id=2,
+                adapter_size=8,
+                weights_in=hi + 10,
+                weights_out=hi + 20,
+                scaling_vec_pointer=hi + 30,
+            ),
+            _module(
+                layer_id=1,
+                module_id=0,
+                adapter_size=4,
+                weights_in=hi + 40,
+                weights_out=hi + 50,
+            ),
+        ],
+        5: [
+            _module(
+                layer_id=1,
+                module_id=4,
+                adapter_size=16,
+                weights_in=hi + 60,
+                weights_out=hi + 70,
+                scaling_vec_pointer=None,
+            ),
+            _module(
+                layer_id=3,
+                module_id=2,
+                adapter_size=12,
+                weights_in=hi + 80,
+                weights_out=hi + 90,
+            ),
+        ],
+    }
+
+    params = _build(
+        _builder(),
+        batch,
+        _attn_metadata(num_contexts=3, num_generations=3),
+        peft_table,
+    )
+
+    assert list(params.keys()) == [
+        3,
+        1,
+        "host_request_types",
+        "prompt_lens_cpu",
+        "num_seqs",
+        "data_type",
+    ]
+    assert list(params[3].keys()) == [2]
+    assert list(params[1].keys()) == [0, 4]
+
+    zero = [0, 0, 0]
+    a0_l3 = [hi + 10, hi + 20, hi + 30]
+    a5_l3 = [hi + 80, hi + 90, 0]
+    a0_l1 = [hi + 40, hi + 50, 0]
+    a5_l1 = [hi + 60, hi + 70, 0]
+
+    assert params[3][2]["adapter_size"].tolist() == [0, 8, 12, 8, 0, 12]
+    assert params[3][2]["weight_pointers"].tolist() == [
+        *zero,
+        *a0_l3,
+        *a5_l3,
+        *a0_l3,
+        *zero,
+        *a5_l3,
+    ]
+    assert params[1][0]["adapter_size"].tolist() == [0, 4, 0, 4, 0, 0]
+    assert params[1][0]["weight_pointers"].tolist() == [*zero, *a0_l1, *zero, *a0_l1, *zero, *zero]
+    assert params[1][4]["adapter_size"].tolist() == [0, 0, 16, 0, 0, 16]
+    assert params[1][4]["weight_pointers"].tolist() == [*zero, *zero, *a5_l1, *zero, *zero, *a5_l1]
+
+    for layer_id in (3, 1):
+        for entry in params[layer_id].values():
+            sizes = entry["adapter_size"]
+            ptrs = entry["weight_pointers"]
+            assert sizes.dtype == torch.int32
+            assert sizes.device.type == "cpu"
+            assert sizes.shape == (6,)
+            assert sizes.is_contiguous()
+            assert ptrs.dtype == torch.int64
+            assert ptrs.device.type == "cpu"
+            assert ptrs.shape == (18,)
+            assert ptrs.is_contiguous()
+
+
+def _reference_build_eager(
+    scheduled_requests: ScheduledRequests,
+    peft_table: dict[int, list[SimpleNamespace]],
+) -> dict:
+    """Per-request reference for the per-(layer_id, module_id) rows of _build_eager.
+
+    adapter_size is int32 [num_requests] and weight_pointers is int64 [3 * num_requests]
+    ((weights_in, weights_out, scaling_vec) per request) in all_requests() order, with
+    zeros where a request has no entry. Metadata keys are not included.
+    """
+    lora_params: dict = {}
+    tmp_lora_params: dict = {}
+    request_list = scheduled_requests.all_requests()
+
+    for request in request_list:
+        if request.lora_task_id is None:
+            continue
+        for module in peft_table[request.lora_task_id]:
+            layer_id = module.layer_id
+            module_id = module.module_id
+            lora_params.setdefault(layer_id, {}).setdefault(
+                module_id, {"adapter_size": [], "weight_pointers": []}
+            )
+            scaling = 0 if module.scaling_vec_pointer is None else module.scaling_vec_pointer
+            tmp_lora_params[(request.py_request_id, layer_id, module_id)] = (
+                module.adapter_size,
+                [module.weights_in_pointer, module.weights_out_pointer, scaling],
+            )
+
+    for request in request_list:
+        for layer_id, modules in lora_params.items():
+            for module_id, current in modules.items():
+                if request.lora_task_id is None:
+                    entry = None
+                else:
+                    entry = tmp_lora_params.get((request.py_request_id, layer_id, module_id))
+                if entry is None:
+                    current["adapter_size"].append(0)
+                    current["weight_pointers"] += [0, 0, 0]
+                else:
+                    current["adapter_size"].append(entry[0])
+                    current["weight_pointers"] += entry[1]
+
+    for modules in lora_params.values():
+        for current in modules.values():
+            current["adapter_size"] = torch.IntTensor(current["adapter_size"])
+            current["weight_pointers"] = torch.LongTensor(current["weight_pointers"])
+
+    return lora_params
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_eager_build_matches_reference_across_randomized_batches(seed: int) -> None:
+    """Randomized parity test across mixed adapters, empty/duplicate configs, and layouts."""
+    rng = random.Random(seed)
+    builder = _builder()
+    hi = 1 << 40
+
+    num_adapters = rng.randint(1, 6)
+    peft_table: dict[int, list[SimpleNamespace]] = {}
+    task_ids = list(range(num_adapters))
+    for task_id in task_ids:
+        num_entries = rng.choice([0, 1, 2, 4, 8])
+        configs = []
+        for _ in range(num_entries):
+            configs.append(
+                _module(
+                    layer_id=rng.randint(0, 4),
+                    module_id=rng.randint(0, 3),
+                    adapter_size=rng.choice([0, 4, 8, 16, 64]),
+                    weights_in=hi + rng.randint(1, 10_000),
+                    weights_out=hi + rng.randint(1, 10_000),
+                    scaling_vec_pointer=rng.choice([None, 0, hi + rng.randint(1, 10_000)]),
+                )
+            )
+        peft_table[task_id] = configs
+
+    num_contexts = rng.randint(0, 8)
+    num_generations = rng.randint(0, 8)
+    choices = [None, *task_ids]
+    ctx_reqs = [_request(i, rng.choice(choices)) for i in range(num_contexts)]
+    gen_reqs = [_request(num_contexts + i, rng.choice(choices)) for i in range(num_generations)]
+    batch = _batch(context=ctx_reqs, generation=gen_reqs)
+    attn_metadata = _attn_metadata(num_contexts=num_contexts, num_generations=num_generations)
+    orig_req_types = attn_metadata.host_request_types.clone()
+    orig_prompt_lens = attn_metadata.prompt_lens_cpu.clone()
+    enable_spec = rng.choice([False, True])
+    draft_len = rng.choice([0, 2])
+
+    actual = _build(
+        builder,
+        batch,
+        attn_metadata,
+        peft_table,
+        enable_spec_decode=enable_spec,
+        runtime_draft_len=draft_len,
+    )
+    expected = _reference_build_eager(batch, peft_table)
+
+    assert torch.equal(attn_metadata.host_request_types, orig_req_types)
+    assert torch.equal(attn_metadata.prompt_lens_cpu, orig_prompt_lens)
+
+    if not expected:
+        assert actual == {}
+        return
+
+    expected_layers = list(expected.keys())
+    assert list(actual.keys()) == [
+        *expected_layers,
+        "host_request_types",
+        "prompt_lens_cpu",
+        "num_seqs",
+        "data_type",
+    ]
+    assert actual["num_seqs"] == num_contexts + num_generations
+    if enable_spec and draft_len > 0 and num_generations > 0:
+        expected_types = [K_CONTEXT] * (num_contexts + num_generations)
+        expected_lens = orig_prompt_lens[:num_contexts].tolist() + [draft_len + 1] * num_generations
+    else:
+        expected_types = [K_CONTEXT] * num_contexts + [K_GENERATION] * num_generations
+        expected_lens = orig_prompt_lens.tolist()
+    assert actual["host_request_types"].tolist() == expected_types
+    assert actual["prompt_lens_cpu"].tolist() == expected_lens
+
+    for layer_id in expected_layers:
+        assert list(actual[layer_id].keys()) == list(expected[layer_id].keys())
+        for module_id, exp_entry in expected[layer_id].items():
+            act_entry = actual[layer_id][module_id]
+            assert act_entry["adapter_size"].dtype == torch.int32
+            assert act_entry["adapter_size"].is_contiguous()
+            assert torch.equal(act_entry["adapter_size"], exp_entry["adapter_size"])
+            assert act_entry["weight_pointers"].dtype == torch.int64
+            assert act_entry["weight_pointers"].is_contiguous()
+            assert torch.equal(act_entry["weight_pointers"], exp_entry["weight_pointers"])
 
 
 class _FakeCudaGraphLoraManager:
