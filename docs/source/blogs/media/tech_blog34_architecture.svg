@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif'>
+<defs><marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2a78d6"/></marker><marker id="arrG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker></defs>
+<rect width="1000" height="640" fill="#fcfcfb"/>
+<rect x="20" y="16" width="960" height="34" rx="6" fill="#f1f0ec" stroke="#c3c2b7" stroke-width="1"/>
+<text x="500" y="38" font-size="14" fill="#0b0b0b" font-weight="600" text-anchor="middle">LLM API  ·  trtllm-serve</text>
+<line x1="500" y1="50" x2="500" y2="66" stroke="#52514e" stroke-width="1.5" marker-end="url(#arrG)"/>
+<rect x="300" y="68" width="400" height="30" rx="15" fill="#ffffff" stroke="#52514e" stroke-width="1"/>
+<text x="500" y="88" font-size="12.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">route()   ·   modeling_v2: auto / require / off</text>
+<line x1="399" y1="98" x2="399" y2="136" stroke="#2a78d6" stroke-width="1.5" marker-end="url(#arrB)"/>
+<text x="409" y="122" font-size="11.5" fill="#2a78d6" font-weight="400" text-anchor="start">a ModelCore matches</text>
+<line x1="700" y1="83" x2="884" y2="83" stroke="#52514e" stroke-width="1.2"/>
+<line x1="884" y1="83" x2="884" y2="136" stroke="#52514e" stroke-width="1.2" marker-end="url(#arrG)"/>
+<text x="874" y="122" font-size="11.5" fill="#52514e" font-weight="400" text-anchor="end">otherwise</text>
+<text x="20" y="132" font-size="11" fill="#898781" font-weight="600" text-anchor="start">MODELING CODE  ·  not shared between models</text>
+<rect x="20" y="140" width="758" height="296" rx="8" fill="#ffffff" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="36" y="164" font-size="15" fill="#2a78d6" font-weight="700" text-anchor="start">Modeling V2</text>
+<text x="136" y="164" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">each ModelCore has its own modules; none are shared with another ModelCore</text>
+<rect x="34" y="180" width="220" height="240" rx="6" fill="#f3f2ef" stroke="#c3c2b7" stroke-width="1"/>
+<text x="44" y="199" font-size="12.5" fill="#0b0b0b" font-weight="700" text-anchor="start" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>deepseek_v3/</text>
+<rect x="42" y="214" width="204" height="68" rx="5" fill="#ffffff" stroke="#2a78d6" stroke-width="1"/>
+<text x="50" y="232" font-size="9.6" fill="#0b0b0b" font-weight="400" text-anchor="start" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>r1_0528_nvfp4__sm_10x__default</text>
+<rect x="50" y="248" width="72" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="86.0" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Attention</text>
+<rect x="128" y="248" width="33" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="144.5" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">MoE</text>
+<rect x="167" y="248" width="53" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="193.5" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Linear</text>
+<rect x="263" y="180" width="230" height="240" rx="6" fill="#f3f2ef" stroke="#c3c2b7" stroke-width="1"/>
+<text x="273" y="199" font-size="12.5" fill="#0b0b0b" font-weight="700" text-anchor="start" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>glm5_next/</text>
+<rect x="271" y="214" width="214" height="68" rx="5" fill="#ffffff" stroke="#2a78d6" stroke-width="1"/>
+<text x="279" y="232" font-size="9.6" fill="#0b0b0b" font-weight="400" text-anchor="start" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>glm_5_3_flash_nvfp4__sm_10x__tp4</text>
+<rect x="279" y="248" width="72" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="315.0" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Attention</text>
+<rect x="357" y="248" width="33" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="373.5" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">MoE</text>
+<rect x="396" y="248" width="53" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="422.5" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Linear</text>
+<rect x="271" y="292" width="214" height="68" rx="5" fill="#ffffff" stroke="#2a78d6" stroke-width="1"/>
+<text x="279" y="310" font-size="9.6" fill="#0b0b0b" font-weight="400" text-anchor="start" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>glm_5_3_flash_fp8__sm_10x__tp4</text>
+<rect x="279" y="326" width="72" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="315.0" y="340" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Attention</text>
+<rect x="357" y="326" width="33" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="373.5" y="340" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">MoE</text>
+<rect x="396" y="326" width="53" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="422.5" y="340" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Linear</text>
+<text x="378.0" y="392" font-size="11" fill="#52514e" font-weight="400" text-anchor="middle">+ 2 more ModelCores</text>
+<rect x="502" y="180" width="262" height="240" rx="6" fill="#f3f2ef" stroke="#c3c2b7" stroke-width="1"/>
+<text x="512" y="199" font-size="12.5" fill="#0b0b0b" font-weight="700" text-anchor="start" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>minimax_m3/</text>
+<rect x="510" y="214" width="246" height="68" rx="5" fill="#ffffff" stroke="#2a78d6" stroke-width="1"/>
+<text x="518" y="232" font-size="9.6" fill="#0b0b0b" font-weight="400" text-anchor="start" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>minimax_m3_1_flash_nvfp4__sm_107__tp2</text>
+<rect x="518" y="248" width="72" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="554.0" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Attention</text>
+<rect x="596" y="248" width="33" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="612.5" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">MoE</text>
+<rect x="635" y="248" width="53" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="661.5" y="262" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Linear</text>
+<rect x="510" y="292" width="246" height="68" rx="5" fill="#ffffff" stroke="#2a78d6" stroke-width="1"/>
+<text x="518" y="310" font-size="9.6" fill="#0b0b0b" font-weight="400" text-anchor="start" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>minimax_m3_1_flash_nvfp4__sm_107__tp8</text>
+<rect x="518" y="326" width="72" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="554.0" y="340" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Attention</text>
+<rect x="596" y="326" width="33" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="612.5" y="340" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">MoE</text>
+<rect x="635" y="326" width="53" height="20" rx="10" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1"/>
+<text x="661.5" y="340" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle">Linear</text>
+<text x="633.0" y="392" font-size="11" fill="#52514e" font-weight="400" text-anchor="middle">+ 9 more ModelCores</text>
+<rect x="790" y="140" width="190" height="296" rx="8" fill="#ffffff" stroke="#898781" stroke-width="1.5"/>
+<text x="804" y="164" font-size="15" fill="#52514e" font-weight="700" text-anchor="start">Modeling V1</text>
+<line x1="837" y1="204" x2="825" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="837" y1="204" x2="885" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="837" y1="204" x2="945" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="925" y1="204" x2="825" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="925" y1="204" x2="885" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="925" y1="204" x2="945" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="837" y1="232" x2="825" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="837" y1="232" x2="885" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="837" y1="232" x2="945" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="925" y1="232" x2="825" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="925" y1="232" x2="885" y2="336" stroke="#898781" stroke-width="0.8"/>
+<line x1="925" y1="232" x2="945" y2="336" stroke="#898781" stroke-width="0.8"/>
+<rect x="797" y="184" width="80" height="20" rx="10" fill="#f3f2ef" stroke="#898781" stroke-width="1"/>
+<text x="837" y="198" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>llama</text>
+<rect x="885" y="184" width="80" height="20" rx="10" fill="#f3f2ef" stroke="#898781" stroke-width="1"/>
+<text x="925" y="198" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>qwen3</text>
+<rect x="797" y="212" width="80" height="20" rx="10" fill="#f3f2ef" stroke="#898781" stroke-width="1"/>
+<text x="837" y="226" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>deepseekv3</text>
+<rect x="885" y="212" width="80" height="20" rx="10" fill="#f3f2ef" stroke="#898781" stroke-width="1"/>
+<text x="925" y="226" font-size="10.5" fill="#0b0b0b" font-weight="400" text-anchor="middle" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>mixtral</text>
+<rect x="798" y="336" width="54" height="22" rx="4" fill="#f1f0ec" stroke="#52514e" stroke-width="1"/>
+<text x="825" y="351" font-size="10" fill="#0b0b0b" font-weight="400" text-anchor="middle">Attn/MLA</text>
+<rect x="858" y="336" width="54" height="22" rx="4" fill="#f1f0ec" stroke="#52514e" stroke-width="1"/>
+<text x="885" y="351" font-size="10" fill="#0b0b0b" font-weight="400" text-anchor="middle">MoE</text>
+<rect x="918" y="336" width="54" height="22" rx="4" fill="#f1f0ec" stroke="#52514e" stroke-width="1"/>
+<text x="945" y="351" font-size="10" fill="#0b0b0b" font-weight="400" text-anchor="middle">Linear</text>
+<text x="885.0" y="384" font-size="11" fill="#52514e" font-weight="400" text-anchor="middle">shared modules:</text>
+<text x="885.0" y="400" font-size="11" fill="#52514e" font-weight="400" text-anchor="middle">a change is checked</text>
+<text x="885.0" y="416" font-size="11" fill="#52514e" font-weight="400" text-anchor="middle">against every user</text>
+<line x1="20" y1="466" x2="980" y2="466" stroke="#52514e" stroke-width="2" stroke-dasharray="9 6"/>
+<rect x="315.2" y="453" width="369.6" height="26" rx="13" fill="#fcfcfb" stroke="#52514e" stroke-width="1"/>
+<text x="500" y="471" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="middle" font-family='ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace'>DecoderModel / DecoderModelForCausalLM interface</text>
+<line x1="399" y1="436" x2="399" y2="452" stroke="#2a78d6" stroke-width="1.2"/>
+<line x1="885" y1="436" x2="885" y2="465" stroke="#898781" stroke-width="1.2"/>
+<text x="20" y="500" font-size="11" fill="#898781" font-weight="600" text-anchor="start">RUNTIME  ·  shared by every model</text>
+<rect x="20" y="508" width="960" height="110" rx="8" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+<text x="36" y="534" font-size="15" fill="#0b0b0b" font-weight="700" text-anchor="start">TensorRT LLM runtime</text>
+<text x="214" y="534" font-size="12" fill="#52514e" font-weight="400" text-anchor="start">reviewed and tested against every model</text>
+<rect x="36.0" y="556" width="224.5" height="40" rx="6" fill="#f1f0ec" stroke="#c3c2b7" stroke-width="1"/>
+<text x="148.25" y="581" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="middle">Scheduler</text>
+<rect x="270.5" y="556" width="224.5" height="40" rx="6" fill="#f1f0ec" stroke="#c3c2b7" stroke-width="1"/>
+<text x="382.75" y="581" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="middle">KV cache manager</text>
+<rect x="505.0" y="556" width="224.5" height="40" rx="6" fill="#f1f0ec" stroke="#c3c2b7" stroke-width="1"/>
+<text x="617.25" y="581" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="middle">Attention metadata</text>
+<rect x="739.5" y="556" width="224.5" height="40" rx="6" fill="#f1f0ec" stroke="#c3c2b7" stroke-width="1"/>
+<text x="851.75" y="581" font-size="12" fill="#0b0b0b" font-weight="400" text-anchor="middle">Distributed execution</text>
+</svg>

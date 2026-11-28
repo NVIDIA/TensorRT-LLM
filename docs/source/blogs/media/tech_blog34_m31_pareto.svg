@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="590" viewBox="0 0 900 590" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif'>
+<rect width="900" height="590" fill="#fcfcfb"/>
+<text x="8" y="24" font-size="17" font-weight="600" fill="#0b0b0b">MiniMax M3.1 NVFP4 on Modeling V2: 10/23 to 11/10</text>
+<text x="8" y="44" font-size="13" fill="#52514e">VR200 · AgentX workload</text>
+<line x1="64.0" x2="876.0" y1="504.0" y2="504.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="508.0" font-size="12" fill="#898781" text-anchor="end">0</text>
+<line x1="64.0" x2="876.0" y1="430.6666666666667" y2="430.6666666666667" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="434.6666666666667" font-size="12" fill="#898781" text-anchor="end">50k</text>
+<line x1="64.0" x2="876.0" y1="357.33333333333337" y2="357.33333333333337" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="361.33333333333337" font-size="12" fill="#898781" text-anchor="end">100k</text>
+<line x1="64.0" x2="876.0" y1="284.0" y2="284.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="288.0" font-size="12" fill="#898781" text-anchor="end">150k</text>
+<line x1="64.0" x2="876.0" y1="210.66666666666669" y2="210.66666666666669" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="214.66666666666669" font-size="12" fill="#898781" text-anchor="end">200k</text>
+<line x1="64.0" x2="876.0" y1="137.33333333333331" y2="137.33333333333331" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="141.33333333333331" font-size="12" fill="#898781" text-anchor="end">250k</text>
+<line x1="64.0" x2="876.0" y1="64.0" y2="64.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="68.0" font-size="12" fill="#898781" text-anchor="end">300k</text>
+<text x="64.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">0</text>
+<text x="180.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">200</text>
+<text x="296.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">400</text>
+<text x="412.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">600</text>
+<text x="528.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">800</text>
+<text x="644.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">1000</text>
+<text x="760.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">1200</text>
+<text x="876.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">1400</text>
+<line x1="64.0" x2="876.0" y1="504.0" y2="504.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="470.0" y="546.0" font-size="13" fill="#52514e" text-anchor="middle">Interactivity: 1 / P90 TPOT (tok/s/user)</text>
+<text transform="translate(16,284.0) rotate(-90)" font-size="13" fill="#52514e" text-anchor="middle">Total throughput per GPU (tok/s/GPU)</text>
+<polyline points="113.3,316.7 127.2,331.1 131.3,339.1 144.0,359.4 158.5,376.1 184.6,400.2 205.5,436.7 227.0,449.9 247.9,468.9 262.9,477.7 287.3,490.1 304.7,495.8" fill="none" stroke="#898781" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6 5"/>
+<circle cx="113.3" cy="316.7" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="113.3" y="302.7" font-size="12" fill="#52514e" text-anchor="middle">TP2 c45 (85, 127.7k)</text>
+<circle cx="127.2" cy="331.1" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="131.3" cy="339.1" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="144.0" cy="359.4" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="158.5" cy="376.1" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="184.6" cy="400.2" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="205.5" cy="436.7" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="227.0" cy="449.9" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="247.9" cy="468.9" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="262.9" cy="477.7" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="287.3" cy="490.1" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="304.7" cy="495.8" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="314.7" y="499.8" font-size="12" fill="#52514e" text-anchor="start">TP4 c1 (415, 5.6k)</text>
+<polyline points="159.1,145.8 180.6,190.0 227.6,315.7 341.8,391.1 419.0,429.3 633.0,475.3 775.7,486.7" fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="159.1" cy="145.8" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="169.1" y="141.8" font-size="12" fill="#52514e" text-anchor="start">agg TP2 c68 (164, 244.2k)</text>
+<circle cx="180.6" cy="190.0" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="227.6" cy="315.7" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="341.8" cy="391.1" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="419.0" cy="429.3" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="633.0" cy="475.3" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="775.7" cy="486.7" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="775.7" y="508.7" font-size="12" fill="#52514e" text-anchor="middle">disagg c16 (1227, 11.8k)</text>
+<polyline points="309.9,106.4 311.1,105.4 326.2,202.3 335.4,288.7 436.9,393.7 733.9,461.8 735.1,462.9 740.3,471.6 841.8,485.1" fill="none" stroke="#2a78d6" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="309.9" cy="106.4" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="311.1" cy="105.4" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="323.1" y="109.4" font-size="12" fill="#52514e" text-anchor="start">DEP c520 (426, 271.8k)</text>
+<circle cx="326.2" cy="202.3" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="335.4" cy="288.7" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="436.9" cy="393.7" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="446.9" y="383.7" font-size="12" fill="#52514e" text-anchor="start">TP2 c250 (643, 75.2k)</text>
+<circle cx="733.9" cy="461.8" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="735.1" cy="462.9" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="740.3" cy="471.6" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="841.8" cy="485.1" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="829.8" y="437.1" font-size="12" fill="#52514e" text-anchor="end">TP8 c28 (1341, 12.9k)</text>
+<line x1="576.0" x2="604.0" y1="72" y2="72" stroke="#898781" stroke-width="2" stroke-linecap="round" stroke-dasharray="6 5"/>
+<circle cx="590.0" cy="72" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="614.0" y="76" font-size="13" fill="#0b0b0b">10/23: Day 0 (estimate)</text>
+<line x1="576.0" x2="604.0" y1="94" y2="94" stroke="#eb6834" stroke-width="2" stroke-linecap="round"/>
+<circle cx="590.0" cy="94" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="614.0" y="98" font-size="13" fill="#0b0b0b">10/30: Rubin megakernel</text>
+<line x1="576.0" x2="604.0" y1="116" y2="116" stroke="#2a78d6" stroke-width="3" stroke-linecap="round"/>
+<circle cx="590.0" cy="116" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="614.0" y="120" font-size="13" fill="#0b0b0b">11/10: disaggregated DEP / TP2 / TP4 / TP8</text>
+<text x="8" y="564" font-size="12" fill="#898781">Each marker is one measured configuration. 10/30 high-throughput points are aggregated; 11/10 points are disaggregated.</text>
+</svg>

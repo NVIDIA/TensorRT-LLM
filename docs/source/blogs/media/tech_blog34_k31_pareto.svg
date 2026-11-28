@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="590" viewBox="0 0 900 590" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif'>
+<rect width="900" height="590" fill="#fcfcfb"/>
+<text x="8" y="24" font-size="17" font-weight="600" fill="#0b0b0b">Kimi K3.1 Pro: Day 0 (v1) vs Modeling V2</text>
+<text x="8" y="44" font-size="13" fill="#52514e">GB300 · disaggregated serving · AgentX workload, 3,600 s</text>
+<line x1="64.0" x2="876.0" y1="504.0" y2="504.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="508.0" font-size="12" fill="#898781" text-anchor="end">0</text>
+<line x1="64.0" x2="876.0" y1="416.0" y2="416.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="420.0" font-size="12" fill="#898781" text-anchor="end">10k</text>
+<line x1="64.0" x2="876.0" y1="328.0" y2="328.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="332.0" font-size="12" fill="#898781" text-anchor="end">20k</text>
+<line x1="64.0" x2="876.0" y1="240.0" y2="240.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="244.0" font-size="12" fill="#898781" text-anchor="end">30k</text>
+<line x1="64.0" x2="876.0" y1="152.0" y2="152.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="156.0" font-size="12" fill="#898781" text-anchor="end">40k</text>
+<line x1="64.0" x2="876.0" y1="64.0" y2="64.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="68.0" font-size="12" fill="#898781" text-anchor="end">50k</text>
+<text x="64.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">0</text>
+<text x="226.4" y="524.0" font-size="12" fill="#898781" text-anchor="middle">100</text>
+<text x="388.8" y="524.0" font-size="12" fill="#898781" text-anchor="middle">200</text>
+<text x="551.2" y="524.0" font-size="12" fill="#898781" text-anchor="middle">300</text>
+<text x="713.6" y="524.0" font-size="12" fill="#898781" text-anchor="middle">400</text>
+<text x="876.0" y="524.0" font-size="12" fill="#898781" text-anchor="middle">500</text>
+<line x1="64.0" x2="876.0" y1="504.0" y2="504.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="470.0" y="546.0" font-size="13" fill="#52514e" text-anchor="middle">Interactivity: 1000 / P90 ITL (tok/s/user)</text>
+<text transform="translate(16,284.0) rotate(-90)" font-size="13" fill="#52514e" text-anchor="middle">Total throughput per GPU (tok/s/GPU)</text>
+<polyline points="161.4,173.4 164.6,189.0 166.3,206.2 186.1,339.0 361.2,428.6 804.2,498.4" fill="none" stroke="#898781" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6 5"/>
+<circle cx="161.4" cy="173.4" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="151.4" y="177.4" font-size="12" fill="#52514e" text-anchor="end">c448 (60, 37.6k)</text>
+<circle cx="164.6" cy="189.0" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="166.3" cy="206.2" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="186.1" cy="339.0" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="176.1" y="355.0" font-size="12" fill="#52514e" text-anchor="end">c192 (75, 18.8k)</text>
+<circle cx="361.2" cy="428.6" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="361.2" y="446.6" font-size="12" fill="#52514e" text-anchor="middle">c40 (183, 8.6k)</text>
+<circle cx="804.2" cy="498.4" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="160.0,140.7 188.5,250.0 195.6,288.1 274.1,332.1 367.6,380.1 391.3,389.3 478.8,436.5 562.3,462.9 846.2,498.1" fill="none" stroke="#2a78d6" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="160.0" cy="140.7" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="170.0" y="134.7" font-size="12" fill="#52514e" text-anchor="start">c540 (59, 41.3k)</text>
+<circle cx="188.5" cy="250.0" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="198.5" y="246.0" font-size="12" fill="#52514e" text-anchor="start">c192 (77, 28.9k)</text>
+<circle cx="195.6" cy="288.1" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="274.1" cy="332.1" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="367.6" cy="380.1" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="375.6" y="366.1" font-size="12" fill="#52514e" text-anchor="start">c48 (187, 14.1k)</text>
+<circle cx="391.3" cy="389.3" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="478.8" cy="436.5" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="562.3" cy="462.9" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="846.2" cy="498.1" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="846.2" y="484.1" font-size="12" fill="#52514e" text-anchor="end">c1 (482, 669)</text>
+<line x1="576.0" x2="604.0" y1="72" y2="72" stroke="#898781" stroke-width="2" stroke-linecap="round" stroke-dasharray="6 5"/>
+<circle cx="590.0" cy="72" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="614.0" y="76" font-size="13" fill="#0b0b0b">Day 0: v1 Kimi K3 code, K3 drafter</text>
+<line x1="576.0" x2="604.0" y1="94" y2="94" stroke="#2a78d6" stroke-width="3" stroke-linecap="round"/>
+<circle cx="590.0" cy="94" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="614.0" y="98" font-size="13" fill="#0b0b0b">Modeling V2: K3.1 ModelCores, DFlash2</text>
+<text x="8" y="564" font-size="12" fill="#898781">Each marker is one measured configuration (label: concurrency). Throughput includes prefix-cache hits.</text>
+</svg>
