@@ -1231,14 +1231,14 @@ dev = ["Sphinx (==2.1.0)", "future (==0.17.1)", "numpy (==1.16.4)", "pytest (==4
 
 [[package]]
 name = "filelock"
-version = "4.3.1"
+version = "4.3.2"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 files = [
-    {file = "filelock-4.3.1-py3-none-any.whl", hash = "sha256:79e43df8e9fe509cd83a3899a7c186c8077cbbe4d200a1ed3705c2f3bb6bc487"},
-    {file = "filelock-4.3.1.tar.gz", hash = "sha256:4c5ee627c401f1863ac6a0de9a14a28d3bb5f8c730b45e2fd6e5dbc79cf34b9e"},
+    {file = "filelock-4.3.2-py3-none-any.whl", hash = "sha256:02a8801bc6b2a80921bf3d7895c63084d53bae2a3c86783adce5ae2b89a1825b"},
+    {file = "filelock-4.3.2.tar.gz", hash = "sha256:4f0a21c70447782453c06bb20a9863ee385ead1abaef22049af79289496851b3"},
 ]
 
 [[package]]
@@ -3252,14 +3252,14 @@ xmp = ["defusedxml"]
 
 [[package]]
 name = "platformdirs"
-version = "4.14.8"
+version = "4.14.9"
 description = "A small Python package for determining appropriate platform-specific dirs, e.g. a `user data dir`."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 files = [
-    {file = "platformdirs-4.14.8-py3-none-any.whl", hash = "sha256:1e34af590de4d978631b751eb2202f2fee4497537a17c1720b12fcf57b331392"},
-    {file = "platformdirs-4.14.8.tar.gz", hash = "sha256:96893d686e84e9e6f358a9ea41a8de544df66dbf2ba6cda250e7dc73acf85b9b"},
+    {file = "platformdirs-4.14.9-py3-none-any.whl", hash = "sha256:d0d3a23e7ff282cfa94b77f5a22b81030dcb68ba0430f90c74f4bd8d090782ea"},
+    {file = "platformdirs-4.14.9.tar.gz", hash = "sha256:c6b188e03ffd4dfe1bf8c4bcb47cd94711af244a9852dbff60297bd753684d5d"},
 ]
 
 [[package]]
@@ -5050,14 +5050,14 @@ full = ["httpx (>=0.27.0,<0.29.0)", "httpx2 (>=2.0.0)", "itsdangerous", "jinja2"
 
 [[package]]
 name = "starlette-compress"
-version = "2.0.0"
+version = "3.0.0"
 description = "Compression middleware for Starlette - supporting ZStd, Brotli, and GZip"
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 files = [
-    {file = "starlette_compress-2.0.0-py3-none-any.whl", hash = "sha256:7fcea21754ced44e4487870dcf7993348be6c4d697716fb7984ff5627827f529"},
-    {file = "starlette_compress-2.0.0.tar.gz", hash = "sha256:1381d5a0e963a845ab6427e8444e62330eda6e7561f1804c6c8c8081564623e6"},
+    {file = "starlette_compress-3.0.0-py3-none-any.whl", hash = "sha256:5dae86a25746b45c0e6f6665cce945cd1f096f297d7fce2af81ea02a7704ab4a"},
+    {file = "starlette_compress-3.0.0.tar.gz", hash = "sha256:0b1d9c2f9aaab68c217818cc2c07af2de47e34a27094f91fe2005663294eb7d1"},
 ]
 
 [package.dependencies]
