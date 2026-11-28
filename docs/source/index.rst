@@ -31,6 +31,7 @@ Welcome to TensorRT LLM's Documentation!
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
    deployment-guide/configuring-cpu-affinity.md
+   deployment-guide/loading-checkpoints-from-object-storage.md
 
 .. toctree::
    :maxdepth: 2
