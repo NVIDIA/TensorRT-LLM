@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -806,6 +806,24 @@ __device__ __host__ inline void assertClose(half a, half b, float threshold = 0.
     assertClose(__half2float(a), __half2float(b), threshold);
 }
 
+// Exact int8 -> bf16 conversion for 8-bit KV cache words. The generic path (InputElem(int8_t)) compiles to three I2F
+// (one per rounding mode, on the 1/4-rate XU pipe) plus select logic per element on SM80-SM89, which makes the INT8-KV
+// XQA kernel issue-bound. Instead: biased = s8 ^ 0x80 is an unsigned byte u = s8 + 128; prmt places it in the low
+// mantissa byte of 2^23 (0x4B0000uu == 2^23 + u, exact), one FADD subtracts 2^23 + 128 (exact), and
+// cvt.rn.bf16x2.f32 packs two results (exact: |s8| <= 128 fits in the 8-bit bf16 significand).
+__device__ inline float int8BiasedByteToFloat(uint32_t biased, uint32_t idxByte)
+{
+    uint32_t bits;
+    asm("prmt.b32 %0, %1, %2, %3;\n" : "=r"(bits) : "r"(biased), "r"(0x4B000000u), "r"(0x7540u | idxByte));
+    return __uint_as_float(bits) - 8388736.f; // 2^23 + 128
+}
+
+__device__ inline uint32_t packBf16x2(float lo, float hi)
+{
+    __nv_bfloat162 const v = __floats2bfloat162_rn(lo, hi);
+    return reinterpret_cast<uint32_t const&>(v);
+}
+
 template <typename InputElem, typename CacheElem>
 __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data)
 {
@@ -826,6 +844,14 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data)
         return ret;
     }
 #endif
+    if constexpr (mha::is_same_v<InputElem, __nv_bfloat16> && mha::is_same_v<CacheElem, int8_t>)
+    {
+        // same element order as the generic path below: word i = {byte 2i, byte 2i + 1}
+        uint32_t const biased = i8data ^ 0x80808080u;
+        ret[0] = packBf16x2(int8BiasedByteToFloat(biased, 0), int8BiasedByteToFloat(biased, 1));
+        ret[1] = packBf16x2(int8BiasedByteToFloat(biased, 2), int8BiasedByteToFloat(biased, 3));
+        return ret;
+    }
     CacheElem const(&src)[4] = reinterpret_cast<CacheElem(&)[4]>(i8data);
     InputElem(&dst)[4] = reinterpret_cast<InputElem(&)[4]>(ret);
 #pragma unroll
@@ -862,6 +888,14 @@ __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data)
         return ret;
     }
 #endif
+    if constexpr (mha::is_same_v<InputElem, __nv_bfloat16> && mha::is_same_v<CacheElem, int8_t>)
+    {
+        // same element order as the generic path below: word i = {byte i, byte i + 2}
+        uint32_t const biased = i8data ^ 0x80808080u;
+        ret[0] = packBf16x2(int8BiasedByteToFloat(biased, 0), int8BiasedByteToFloat(biased, 2));
+        ret[1] = packBf16x2(int8BiasedByteToFloat(biased, 1), int8BiasedByteToFloat(biased, 3));
+        return ret;
+    }
     CacheElem const(&src)[2][2] = reinterpret_cast<CacheElem(&)[2][2]>(i8data);
     InputElem(&dst)[2][2] = reinterpret_cast<InputElem(&)[2][2]>(ret);
 #pragma unroll
