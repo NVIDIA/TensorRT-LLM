@@ -14,7 +14,9 @@
 # limitations under the License.
 import json
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
+from io import StringIO
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 from tensorrt_llm.logger import logger
@@ -98,6 +100,32 @@ def _prompt_tokens_details(prompt_tokens: int,
     return PromptTokensDetails(cached_tokens=min(cached_tokens, prompt_tokens))
 
 
+@dataclass
+class _ForcedToolArguments:
+    buffer: Optional[StringIO] = field(default_factory=StringIO)
+    closing: Optional[str] = None
+
+    def take(self, delta: str) -> str:
+        if self.buffer is None:
+            return ""
+        if self.closing is None:
+            first = delta.lstrip()[:1]
+            if first:
+                self.closing = {"{": "}", "[": "]"}.get(first, "")
+
+        offset = self.buffer.tell()
+        self.buffer.write(delta)
+        # An object or array cannot finish in a delta without its closing
+        # delimiter. A delimiter inside a string or nested value is only a
+        # hint: the JSON decoder still decides where the root value ends.
+        if self.closing is not None and self.closing in delta:
+            end = forced_tool_arguments_end(self.buffer.getvalue())
+            if end is not None:
+                self.buffer = None
+                return delta[:end - offset]
+        return delta
+
+
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
     echo: bool = False
@@ -126,14 +154,8 @@ class ChatPostprocArgs(PostprocArgs):
     # generated once on the first non-empty delta; subsequent deltas omit it
     # and only stream argument fragments.
     forced_tool_name_sent: dict[int, bool] = field(default_factory=dict)
-    # Streaming forced-call bookkeeping, per output index: the raw text seen so
-    # far, how much of it has already been streamed as ``arguments``, and
-    # whether the arguments value has finished. Together these let the stream
-    # stop at the end of the JSON value instead of forwarding whatever the
-    # model generates afterwards.
-    forced_tool_args_buffer: dict[int, str] = field(default_factory=dict)
-    forced_tool_args_sent_len: dict[int, int] = field(default_factory=dict)
-    forced_tool_args_done: dict[int, bool] = field(default_factory=dict)
+    forced_tool_args: dict[int, _ForcedToolArguments] = field(
+        default_factory=lambda: defaultdict(_ForcedToolArguments))
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
     # Cache per-request stream metadata so every chunk reuses the same response
@@ -508,19 +530,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             # enclosing object, emit the parser's end tag and then plain
             # prose, none of which belongs in ``arguments``.
             forced_name = forced_tool.function.name
-            delta_arguments = ""
-            if delta_text and not args.forced_tool_args_done.get(i, False):
-                buffered = args.forced_tool_args_buffer.get(i, "") + delta_text
-                args.forced_tool_args_buffer[i] = buffered
-                arguments_end = forced_tool_arguments_end(buffered)
-                if arguments_end is None:
-                    limit = len(buffered)
-                else:
-                    limit = arguments_end
-                    args.forced_tool_args_done[i] = True
-                already_sent = args.forced_tool_args_sent_len.get(i, 0)
-                delta_arguments = buffered[already_sent:limit]
-                args.forced_tool_args_sent_len[i] = max(already_sent, limit)
+            delta_arguments = args.forced_tool_args[i].take(
+                delta_text) if delta_text else ""
 
             tool_calls = []
             if delta_arguments:
