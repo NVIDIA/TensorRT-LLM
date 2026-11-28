@@ -106,7 +106,7 @@ class _Worker(torch.nn.Module):
         self.calls = calls
 
     def target_logits(self, rows, lm_head, logits_processor, md, spec_md, draft_model):
-        self.calls.append(("worker", rows.shape[0]))
+        self.calls.append(("worker", rows.clone()))
         return "shard"
 
     def forward(self, **kwargs):
@@ -125,7 +125,7 @@ def test_verify_logits_go_through_the_worker_with_the_exchange(monkeypatch, exch
     shell._dp_head_shard = None
     shell.lm_head = "head"
     shell.logits_processor = SimpleNamespace(
-        forward=lambda rows, head, md, ctx: calls.append(("gather", rows.shape[0])) or "gathered"
+        forward=lambda rows, head, md, ctx: calls.append(("gather", rows.clone())) or "gathered"
     )
     layer = SimpleNamespace(spec_metadata=None)
     shell.draft_model = SimpleNamespace(mtp_layers=[layer])
@@ -135,5 +135,8 @@ def test_verify_logits_go_through_the_worker_with_the_exchange(monkeypatch, exch
     md = SimpleNamespace(padded_num_tokens=None)
     out = shell.forward(md, torch.zeros(3, dtype=torch.int32), None, spec_metadata=spec_md)
     assert out == ("shard" if exchange else "gathered")
-    assert calls == [("worker" if exchange else "gather", 2)]
+    # The receiver gets the verified rows themselves (rows 0 and 2), not the first two.
+    [(who, rows)] = calls
+    assert who == ("worker" if exchange else "gather")
+    assert torch.equal(rows, shell.model.final[spec_md.gather_ids])
     assert layer.spec_metadata is spec_md
