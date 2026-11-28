@@ -128,6 +128,31 @@ void EventManager::setLayerGroupWindowSizes(std::map<int, int> windowSizes)
     mWindowSizeByLayerGroup = std::move(windowSizes);
 }
 
+void EventManager::declareLifeCycles(LifeCycleRegistry const& lifeCycles)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mKindByLayerGroup.clear();
+    for (LifeCycleId id{0}; id < lifeCycles.size(); ++id)
+    {
+        if (auto const kind = eventLifeCycleKind(lifeCycles[id]))
+        {
+            mKindByLayerGroup.emplace(id.value(), std::string(*kind));
+        }
+    }
+}
+
+void EventManager::setPublishRecurrentCheckpoints(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mPublishRecurrentCheckpoints = enabled;
+}
+
+bool EventManager::publishesRecurrentCheckpoints() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mMaxKvEventEntries > 0 && mPublishRecurrentCheckpoints;
+}
+
 void EventManager::addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId)
 {
     if (data.blocks.empty() || mMaxKvEventEntries <= 0)
@@ -186,12 +211,25 @@ void EventManager::addStoredBlock(Block const& block)
     addStoredBlockUnlocked(block);
 }
 
+bool EventManager::announcesLifeCycleUnlocked(Block const& block, LifeCycleId lifeCycle) const
+{
+    auto const kind = mKindByLayerGroup.find(lifeCycle.value());
+    if (kind == mKindByLayerGroup.end() || kind->second != "mamba")
+    {
+        return true;
+    }
+    // A recurrent-state snapshot is a resume point only for the exact token depth it was taken
+    // at. It is announced only on opt-in and only when it covers a full block: a mid-block
+    // snapshot cannot be expressed by a stored event that carries the block's token list.
+    return mPublishRecurrentCheckpoints && block.isFull();
+}
+
 void EventManager::addStoredBlockUnlocked(Block const& block)
 {
     std::set<int> lifeCycleIds;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
     {
-        if (pageCoversBlock(block.getPage(lifeCycle), block))
+        if (pageCoversBlock(block.getPage(lifeCycle), block) && announcesLifeCycleUnlocked(block, lifeCycle))
         {
             lifeCycleIds.insert(lifeCycle.value());
         }
@@ -229,7 +267,7 @@ void EventManager::addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle)
         return;
     }
     int const lifeCycleId = lifeCycle.value();
-    if (state->second.lifeCycleIds.count(lifeCycleId) != 0)
+    if (state->second.lifeCycleIds.count(lifeCycleId) != 0 || !announcesLifeCycleUnlocked(block, lifeCycle))
     {
         return;
     }
@@ -394,8 +432,8 @@ KVCacheEvent& EventManager::addEventUnlocked(KVCacheEventData data, EventLayerGr
     {
         flushAllRemovedEventsUnlocked();
     }
-    mPendingEvents.push_back(KVCacheEvent{
-        mNextEventId++, std::move(data), getWindowSize(layerGroupId), mHashAlgoName, mAttentionDpRank, layerGroupId});
+    mPendingEvents.push_back(KVCacheEvent{mNextEventId++, std::move(data), getWindowSize(layerGroupId), mHashAlgoName,
+        mAttentionDpRank, layerGroupId, getLayerGroupKind(layerGroupId)});
     if (!std::holds_alternative<KVCacheStoredData>(mPendingEvents.back().data))
     {
         mLatestStoredEventIds.erase(layerGroupId);
@@ -502,6 +540,20 @@ int EventManager::getWindowSize(EventLayerGroupId layerGroupId) const
     }
     auto const windowSize = mWindowSizeByLayerGroup.find(*layerGroupId);
     return windowSize == mWindowSizeByLayerGroup.end() ? mWindowSize : windowSize->second;
+}
+
+std::optional<std::string> EventManager::getLayerGroupKind(EventLayerGroupId layerGroupId) const
+{
+    if (!layerGroupId.has_value())
+    {
+        return std::nullopt;
+    }
+    auto const kind = mKindByLayerGroup.find(*layerGroupId);
+    if (kind == mKindByLayerGroup.end())
+    {
+        return std::nullopt;
+    }
+    return kind->second;
 }
 
 uint64_t EventManager::truncateDigestToInt64(Digest const& digest)

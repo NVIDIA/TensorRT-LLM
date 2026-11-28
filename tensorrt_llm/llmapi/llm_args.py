@@ -6150,6 +6150,33 @@ class KVEventsConfig(StrictBaseModel):
         default="",
         description="ZeroMQ subscription topic used for KV cache event batches."
     )
+    publish_recurrent_checkpoints: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Publish the recurrent-state (Mamba/GDN/KDA) snapshots of hybrid models as tagged "
+        "checkpoint events on the streaming path: a BlockStored with group_idx (the "
+        "recurrent layer group's id), kv_cache_spec_kind='mamba' and an empty token_ids list "
+        "under the block hash of the attention block the snapshot sits on, and a tagged "
+        "BlockRemoved when the snapshot is evicted. Consumers must index or drop events that "
+        "carry group_idx/kv_cache_spec_kind: a tagged BlockRemoved names a still-cached "
+        "attention block. Consumers that ignore the tags are compatible only while this "
+        "option is off. Requires enable_kv_cache_events=True, "
+        "kv_cache_config.enable_block_reuse and a mamba_state_config snapshot policy whose "
+        "points are multiples of tokens_per_block; only snapshots covering a full block are "
+        "published, prompt-end and other mid-block snapshots are not. On the buffered path "
+        "(event_buffer_max_size) the same option adds stored/removed events for the "
+        "recurrent layer groups, tagged by layer_group_kind='mamba'.")
+
+    @model_validator(mode="after")
+    def _warn_recurrent_checkpoints_without_streaming(self) -> "KVEventsConfig":
+        if self.publish_recurrent_checkpoints and not self.enable_kv_cache_events:
+            logger.warning(
+                "kv_events_config.publish_recurrent_checkpoints=True has no streaming effect "
+                "without enable_kv_cache_events=True; it then only adds layer_group_kind="
+                "'mamba' stored/removed events to the buffered get_kv_cache_events() path "
+                "when event_buffer_max_size > 0.")
+        return self
 
     def model_post_init(self, __context) -> None:
         if self.publisher is None:

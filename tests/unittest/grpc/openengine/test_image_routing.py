@@ -44,6 +44,8 @@ def test_streaming_native_image_uuids_preserve_content_sensitive_keys(monkeypatc
             token_ids = [1, hashes[0], 1001, 7]
             lora_id = None
             mm_keys = [[(bytes.fromhex(hashes[0]), 0, uuid, True)]]
+            group_idx = None
+            kv_cache_spec_kind = None
 
         monkeypatch.setattr(events.kv_cache_manager_v2_runtime, "StreamingBlockStoredData", Stored)
         source._event_sink = SimpleNamespace(drain_iteration_events=lambda: [Stored()])
@@ -89,6 +91,8 @@ def test_native_integer_image_continuations_keep_routing_metadata(monkeypatch, u
             token_ids = [1003, 1004, 1005, 7]
             lora_id = None
             mm_keys = [[(digest, 3, uuid, True)]]
+            group_idx = None
+            kv_cache_spec_kind = None
 
         monkeypatch.setattr(events.kv_cache_manager_v2_runtime, "StreamingBlockStoredData", Stored)
         source._event_sink = SimpleNamespace(drain_iteration_events=lambda: [Stored()])

@@ -209,6 +209,40 @@ def test_kv_events_config_publisher_default() -> None:
     assert KVEventsConfig(enable_kv_cache_events=False, publisher="zmq").publisher == "zmq"
 
 
+def test_kv_events_config_recurrent_checkpoints_default_off() -> None:
+    """Recurrent checkpoint publishing is opt-in and reaches the streaming manager."""
+    assert KVEventsConfig().publish_recurrent_checkpoints is False
+    config = KVEventsConfig(enable_kv_cache_events=True, publisher="null")
+    manager = StreamingKVCacheEventManager(
+        config, data_parallel_rank=0, block_size=4, max_window_size=128
+    )
+    try:
+        assert manager.publish_recurrent_checkpoints is False
+        assert manager.event_sink.publishes_recurrent_checkpoints is False
+        # No sink call is made while the gate is closed; an invalid id must not raise.
+        manager.set_recurrent_life_cycles([-1])
+    finally:
+        manager.shutdown()
+    enabled = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null", publish_recurrent_checkpoints=True
+    )
+    manager = StreamingKVCacheEventManager(
+        enabled, data_parallel_rank=0, block_size=4, max_window_size=128
+    )
+    try:
+        assert manager.publish_recurrent_checkpoints is True
+        # The gate is open, but no recurrent life cycle was declared yet.
+        assert manager.event_sink.publishes_recurrent_checkpoints is False
+        manager.set_recurrent_life_cycles([1])
+        assert manager.event_sink.publishes_recurrent_checkpoints is True
+        # Closing the gate must disable native publication, not only the Python flag.
+        manager.set_publish_recurrent_checkpoints(False)
+        assert manager.publish_recurrent_checkpoints is False
+        assert manager.event_sink.publishes_recurrent_checkpoints is False
+    finally:
+        manager.shutdown()
+
+
 @pytest.mark.parametrize(
     "endpoint,rank,expected",
     [

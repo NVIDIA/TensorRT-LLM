@@ -24,6 +24,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 struct Block;
+class LifeCycleRegistry;
 
 // Boundary between the cache implementation and the native event manager.
 class EventSink
@@ -33,6 +34,18 @@ public:
 
     //! Whether blocks should retain the latest digest token in their prefix for event decoding.
     virtual bool needsTokenDigestContext() const
+    {
+        return false;
+    }
+
+    //! Called once by the owning KvCacheManager with its life cycle registry, before any block is
+    //! announced. Sinks derive what each life cycle caches from it (attention, sliding-window
+    //! attention, recurrent state) instead of being told by the caller.
+    virtual void declareLifeCycles(LifeCycleRegistry const&) {}
+
+    //! Whether recurrent-state (SSM) snapshots are announced as checkpoints through
+    //! addStoredLifeCycle. Off by default: the default event stream never mentions them.
+    virtual bool publishesRecurrentCheckpoints() const
     {
         return false;
     }

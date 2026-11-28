@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/eventData.h"
 #include "kv_cache_manager_v2/eventSink.h"
+#include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
 #include <condition_variable>
 #include <cstdint>
@@ -134,12 +135,16 @@ struct KVCacheEvent
     std::optional<std::string> hashAlgo;
     std::optional<int> attentionDpRank;
     EventLayerGroupId layerGroupId;
+    //! What the layer group caches: "attention", "sliding_window" or "mamba" (a recurrent-state
+    //! checkpoint); see eventLifeCycleKind(). Unset for events without a layer group and for
+    //! PRIVATE life cycles.
+    std::optional<std::string> layerGroupKind;
 
     bool operator==(KVCacheEvent const& other) const
     {
         return eventId == other.eventId && data == other.data && windowSize == other.windowSize
             && hashAlgo == other.hashAlgo && attentionDpRank == other.attentionDpRank
-            && layerGroupId == other.layerGroupId;
+            && layerGroupId == other.layerGroupId && layerGroupKind == other.layerGroupKind;
     }
 };
 
@@ -163,6 +168,9 @@ public:
     void addCreatedEvent(
         std::vector<int> numBlocksPerCacheLevel, std::optional<std::vector<int>> layerGroupIds = std::nullopt);
     void setLayerGroupWindowSizes(std::map<int, int> windowSizes);
+    //! Opt in to announcing recurrent-state snapshots (stored and removed events of the SSM
+    //! layer groups). Off by default, so the default stream is unchanged for hybrid models.
+    void setPublishRecurrentCheckpoints(bool enabled);
     void addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId = std::nullopt);
     void addRemovedEvent(std::vector<EventBlockHash> blockHashes, EventLayerGroupId layerGroupId = std::nullopt);
     void addUpdatedEvent(EventBlockHash blockHash, std::optional<KVCacheEventDiff> cacheLevel = std::nullopt,
@@ -185,6 +193,8 @@ public:
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt,
         std::optional<std::uint64_t> cacheSaltId = std::nullopt);
 
+    void declareLifeCycles(LifeCycleRegistry const& lifeCycles) override;
+    bool publishesRecurrentCheckpoints() const override;
     void addStoredBlock(Block const& block) override;
     void addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle) override;
     void addRemovedBlock(Digest const& blockKey) override;
@@ -222,6 +232,7 @@ private:
     std::optional<KVCacheStoredBlockData> storedBlockFromBlock(
         Block const& block, std::optional<std::set<int>> const& lifeCycleIds = std::nullopt);
 
+    bool announcesLifeCycleUnlocked(Block const& block, LifeCycleId lifeCycle) const;
     void addStoredBlockUnlocked(Block const& block);
     void addStoredEventUnlocked(KVCacheStoredData data, EventLayerGroupId layerGroupId);
     void enqueueRemovedEventUnlocked(std::vector<EventBlockHash> blockHashes, EventLayerGroupId layerGroupId);
@@ -231,11 +242,15 @@ private:
     std::vector<KVCacheEvent> drainPendingEventsUnlocked();
     void publishEventsUnlocked(std::vector<KVCacheEvent> events, std::optional<int> maxKvEventEntries = std::nullopt);
     int getWindowSize(EventLayerGroupId layerGroupId) const;
+    std::optional<std::string> getLayerGroupKind(EventLayerGroupId layerGroupId) const;
     void dropHashCache(Digest const& blockKey);
 
     int mMaxKvEventEntries;
     int mWindowSize;
     std::map<int, int> mWindowSizeByLayerGroup;
+    //! Kind per life cycle id, from declareLifeCycles(); PRIVATE life cycles are absent.
+    std::map<int, std::string> mKindByLayerGroup;
+    bool mPublishRecurrentCheckpoints = false;
     std::optional<int> mAttentionDpRank;
     AttentionDpGatherFn mAttentionDpGather;
     HashAlgorithm mHashAlgo;

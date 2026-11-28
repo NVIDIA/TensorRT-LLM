@@ -26,6 +26,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -141,6 +142,27 @@ inline bool requiresPrefixCoverage(LifeCycle const& lc)
 inline bool allowsCheckpoint(LifeCycle const& lc)
 {
     return reusePolicy(lc) == ReusePolicy::OPTIONAL || reusePolicy(lc) == ReusePolicy::SINK_REQUIRED_ONLY;
+}
+
+//! What a life cycle caches, as reported on KV cache events: "attention" (full attention),
+//! "sliding_window" (windowed attention) or "mamba" (a recurrent-state snapshot that marks a
+//! block at which a hybrid model can resume a cached prefix). PRIVATE life cycles, such as the
+//! speculative-decoding replay regions, never store a reusable block and report no kind.
+inline std::optional<std::string_view> eventLifeCycleKind(LifeCycle const& lc)
+{
+    if (isPrivateLifeCycle(lc))
+    {
+        return std::nullopt;
+    }
+    if (auto const* attn = std::get_if<AttnLifeCycle>(&lc))
+    {
+        return attn->windowSize.has_value() ? std::string_view{"sliding_window"} : std::string_view{"attention"};
+    }
+    if (std::holds_alternative<SsmLifeCycle>(lc))
+    {
+        return std::string_view{"mamba"};
+    }
+    return std::nullopt;
 }
 
 //! Reuse policy that decides which pools a lifecycle shares. SINK_REQUIRED_ONLY shares the REQUIRED pools, so its

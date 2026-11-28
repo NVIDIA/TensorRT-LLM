@@ -3550,11 +3550,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 "evicted pages a host tier."
             )
         if self.event_manager is not None:
+            is_streaming_events = isinstance(self.event_manager, StreamingKVCacheEventManager)
             self.event_manager.set_layer_group_window_sizes(
-                self._get_event_window_sizes_by_layer_group(
-                    attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
-                )
+                self._get_event_window_sizes_by_layer_group(attention_only=is_streaming_events)
             )
+            # The native sink derives each life cycle's kind and the recurrent (SSM) groups from
+            # the manager's life cycle registry; Python only passes the opt-in.
+            publish_recurrent = (
+                kv_events_config is not None and kv_events_config.publish_recurrent_checkpoints
+            )
+            if publish_recurrent:
+                self._warn_recurrent_checkpoint_publishing(kv_cache_config, tokens_per_block)
+            self.event_manager.set_publish_recurrent_checkpoints(publish_recurrent)
             self.event_manager.add_created_event(
                 self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
@@ -4589,6 +4596,52 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             window_sizes[int(layer_group_id)] = get_event_window_size(layer_config)
         return window_sizes
+
+    @staticmethod
+    def _warn_recurrent_checkpoint_publishing(
+        kv_cache_config: KvCacheConfig, tokens_per_block: int
+    ) -> None:
+        """Explain snapshot policies under which few or no recurrent checkpoints get published.
+
+        Only a snapshot that covers its whole block is published, so every snapshot point must
+        be a multiple of ``tokens_per_block``; prompt-end and other mid-block snapshots are
+        counted as suppressed instead.
+        """
+        if not kv_cache_config.enable_block_reuse:
+            logger.warning(
+                "kv_events_config.publish_recurrent_checkpoints is set but block reuse is "
+                "disabled, so no recurrent-state snapshot is ever committed or published."
+            )
+            return
+        state_config = kv_cache_config.mamba_state_config
+        interval = int(state_config.periodic_snapshot_interval)
+        unaligned = []
+        if interval > 0 and interval % tokens_per_block != 0:
+            unaligned.append(f"periodic_snapshot_interval={interval}")
+        for offset in state_config.additional_snapshot_offsets_from_start:
+            if int(offset) % tokens_per_block != 0:
+                unaligned.append(f"additional_snapshot_offsets_from_start={int(offset)}")
+        if state_config.additional_snapshot_offsets_from_end:
+            unaligned.append(
+                "additional_snapshot_offsets_from_end="
+                f"{list(state_config.additional_snapshot_offsets_from_end)} (prompt lengths are "
+                "not block-aligned in general)"
+            )
+        if interval == 0 and not state_config.additional_snapshot_offsets_from_start:
+            logger.warning(
+                "kv_events_config.publish_recurrent_checkpoints is set but mamba_state_config "
+                "takes no block-aligned snapshots (periodic_snapshot_interval=0 and no "
+                "additional_snapshot_offsets_from_start), so only branch snapshots can be "
+                "published; set periodic_snapshot_interval to a multiple of "
+                f"tokens_per_block={tokens_per_block}."
+            )
+        if unaligned:
+            logger.warning(
+                "kv_events_config.publish_recurrent_checkpoints: these snapshot points are not "
+                f"multiples of tokens_per_block={tokens_per_block} and land inside a block, so "
+                "their snapshots are not published as checkpoints (see the "
+                f"recurrent_checkpoints_suppressed statistic): {', '.join(unaligned)}."
+            )
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         for pool_group in self.impl.pool_group_descs:

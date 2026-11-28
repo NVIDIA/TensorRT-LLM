@@ -74,6 +74,7 @@ from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     CacheTransceiverConfig,
     KvPoolRebalanceConfig,
+    MambaStateConfig,
     RemoteCacheConfig,
 )
 
@@ -191,6 +192,7 @@ class KvCacheConfigV2:
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
     block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
+    mamba_state_config: MambaStateConfig = field(default_factory=MambaStateConfig)
     enable_swa_scratch_reuse: bool = False
     max_util_for_resume: float = 0.95
     # Mirrors KvCacheConfig.kv_pool_rebalance_config in

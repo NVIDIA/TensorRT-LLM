@@ -105,6 +105,11 @@ def make_test_block(
     return _cpp().make_test_block(manager, list(tokens), coverage_per_lc, parent, reuse_scope)
 
 
+def add_test_block_page(manager: Any, block: Any, life_cycle_id: int, coverage: int) -> None:
+    """Attach a page of `life_cycle_id` covering `coverage` tokens to an existing test block."""
+    _cpp().add_test_block_page(manager, block, life_cycle_id, coverage)
+
+
 def close_test_block(block: Any) -> None:
     """Unlink and release a test block pages before its manager shuts down."""
     block.close()

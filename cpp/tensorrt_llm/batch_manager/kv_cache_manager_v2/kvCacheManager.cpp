@@ -137,6 +137,12 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 {
     mConfig.validate();
 
+    if (mEventSink)
+    {
+        // The sink learns what each life cycle caches (attention, windowed attention, recurrent
+        // state) from the registry; no caller re-derives it.
+        mEventSink->declareLifeCycles(mLifeCycles);
+    }
     mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);

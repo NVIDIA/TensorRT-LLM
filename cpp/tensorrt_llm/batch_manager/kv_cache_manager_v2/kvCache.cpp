@@ -1580,19 +1580,19 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 // _snapshot_ssm_to_tree_block.
 // ---------------------------------------------------------------------------
 
-void KvCache::_snapshotSsmToTreeBlock(
+bool KvCache::_snapshotSsmToTreeBlock(
     SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens, bool move, bool fromPending)
 {
     if (isPrivateLifeCycle(mManager->lifeCycles()[ssmLcId]))
     {
-        return;
+        return false;
     }
     int const numTokensInBlock = numTokens - treeBlock->ordinal().value() * mTokensPerBlock;
     TLLM_CHECK_DEBUG(0 < numTokensInBlock && numTokensInBlock <= mTokensPerBlock);
 
     if (treeBlock->pageCoverage(ssmLcId) >= numTokensInBlock)
     {
-        return;
+        return false;
     }
 
     if (fromPending)
@@ -1606,7 +1606,7 @@ void KvCache::_snapshotSsmToTreeBlock(
         // convertToCommitted() installs via replacePage(), dropping any shorter snapshot.
         auto committed = up->convertToCommitted(treeBlock, finishEvent(), numTokensInBlock);
         mManager->storage().scheduleForEviction(*committed);
-        return;
+        return true;
     }
 
     auto& ssmBlock = mSsmBlocks[kDefaultBeamIndex];
@@ -1622,10 +1622,10 @@ void KvCache::_snapshotSsmToTreeBlock(
         // convertToCommitted() installs via replacePage(), dropping any shorter snapshot.
         auto committed = up->convertToCommitted(treeBlock, finishEvent(), numTokensInBlock);
         mManager->storage().scheduleForEviction(*committed);
-        return;
+        return true;
     }
 
-    _copyPageToTreeBlock(treeBlock, ssmLcId, srcPage, numTokensInBlock);
+    return _copyPageToTreeBlock(treeBlock, ssmLcId, srcPage, numTokensInBlock) != nullptr;
 }
 
 void KvCache::_reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& root)
@@ -1742,8 +1742,13 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, 
     }
     if (commitSsm)
     {
+        // A snapshot on a partial block is a resume point only at that token depth, which the
+        // stored-event payload (the block's whole token list) cannot express, so it is never
+        // announced as a checkpoint; the sinks also drop it themselves.
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
+        {
             _snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens, /*move=*/false, ssmFromPending);
+        }
     }
     if (treeBlock->eventSink)
     {
@@ -2767,9 +2772,21 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm, b
 
     if (didCommit && commitSsm)
     {
+        // The block itself was announced before the snapshot existed (addStoredBlock above only
+        // sees the pages present at that time). When the sink opted in to recurrent checkpoints,
+        // the snapshot is announced here so that the SSM life cycle enters the sink's stored set,
+        // its later eviction is reported, and consumers can tell at which blocks a hybrid model
+        // can resume a cached prefix. Without the opt-in the stream is as before.
+        bool const announceSsm = newBlock->eventSink && newBlock->eventSink->publishesRecurrentCheckpoints();
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
-            _snapshotSsmToTreeBlock(
+        {
+            bool const attached = _snapshotSsmToTreeBlock(
                 newBlock, lcId, start + static_cast<int>(tokenBlock.size()), moveSsm, ssmFromPending);
+            if (attached && announceSsm)
+            {
+                newBlock->eventSink->addStoredLifeCycle(*newBlock, lcId);
+            }
+        }
     }
 
     if (sb.isCommitted())

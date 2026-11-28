@@ -193,6 +193,13 @@ class KvCacheAwareServerState(ServerState):
 
             hash_algo = event_raw.get(
                 "hash_algo", event.get("hash_algo", KV_CACHE_HASH_ALGO_DEFAULT))
+            # Recurrent-state checkpoint events (kv_events_config.publish_recurrent_checkpoints)
+            # share the attention block's hash; they describe where a hybrid model can resume,
+            # not whether the attention block is cached, so they must not touch the block table.
+            layer_group_kind = event_raw.get("layer_group_kind",
+                                             event.get("layer_group_kind"))
+            if layer_group_kind not in (None, "attention", "sliding_window"):
+                continue
             if event["type"] == "created":
                 self.set_hash_algo(hash_algo)
             if event["type"] == "stored":

@@ -69,7 +69,12 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestTyp
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig, RemoteCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
+    KvPoolRebalanceConfig,
+    MambaStateConfig,
+    RemoteCacheConfig,
+)
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -111,6 +116,7 @@ class KvCacheConfigV2:
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
     block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
+    mamba_state_config: MambaStateConfig = field(default_factory=MambaStateConfig)
     enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
