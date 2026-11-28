@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/weimwang/pod-oom-kill-count']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -477,12 +477,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
                     tty: true
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 5Gi
+                        cpu: '1'
+                        memory: 2Gi
                         ephemeral-storage: 25Gi
                       limits:
-                        cpu: '2'
-                        memory: 5Gi
+                        cpu: '1'
+                        memory: 2Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -496,11 +496,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 20Gi
+                        memory: 8Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 20Gi
+                        memory: 8Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -543,12 +543,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 5Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                       limits:
-                        cpu: '2'
-                        memory: 5Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:

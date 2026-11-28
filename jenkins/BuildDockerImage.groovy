@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/weimwang/pod-oom-kill-count']) _
 
 import java.lang.Exception
 import groovy.transform.Field
@@ -107,9 +107,9 @@ ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
 
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
 
-BUILD_JOBS = "32"
-BUILD_JOBS_RELEASE_X86_64 = "32"
-BUILD_JOBS_RELEASE_SBSA = "32"
+BUILD_JOBS = "16"
+BUILD_JOBS_RELEASE_X86_64 = "16"
+BUILD_JOBS_RELEASE_SBSA = "16"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
@@ -189,6 +189,9 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false, stageNa
                     imagePullPolicy: Always"""
         break
     case "build":
+        // The x86_64 release images can build the wheel from source, which needs more CPU and memory.
+        def buildCores = (build_wheel && arch == "amd64") ? 16 : 12
+        def buildMemoryRequest = (build_wheel && arch == "amd64") ? "72Gi" : "24Gi"
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
@@ -198,11 +201,11 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false, stageNa
                     tty: true
                     resources:
                       requests:
-                        cpu: 16
-                        memory: 72Gi
+                        cpu: ${buildCores}
+                        memory: ${buildMemoryRequest}
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: 16
+                        cpu: ${buildCores}
                         memory: 256Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
@@ -249,12 +252,12 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false, stageNa
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 10Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                       limits:
-                        cpu: '2'
-                        memory: 10Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                 volumeMounts:
                     - name: sw-tensorrt-pvc
