@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm.logger import logger
 
 # Self-attention over fewer rows runs unquantized.
 DECO_MIN_SEQ_LEN = 8192
@@ -51,6 +52,25 @@ def deco_attention_ineligible_reason(q, k, v) -> str | None:
     return None
 
 
+def _unquantized(q, k, v, key_padding_mask):
+    padded = None
+    if key_padding_mask is not None:
+        counts = key_padding_mask.sum(dim=1, dtype=torch.int32)
+        positions = torch.arange(q.shape[1], dtype=torch.int32, device=q.device)
+        key_padding_mask = positions[None] < counts[:, None]
+        padded = ~key_padding_mask[:, :, None, None]
+        # SDPA spreads a NaN in a zero-weight V row over the valid rows.
+        k = k.masked_fill(padded, 0)
+        v = v.masked_fill(padded, 0)
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=None if key_padding_mask is None else key_padding_mask[:, None, None, :],
+    ).transpose(1, 2)
+    return out if padded is None else out.masked_fill(padded, 0)
+
+
 class DeCoAttention(OpWrapper):
     """Self-attention on NVFP4 Q/K that corrects the first-order score quantization error, with V
     smoothed over key blocks and quantized to ``v_dtype``.
@@ -58,6 +78,8 @@ class DeCoAttention(OpWrapper):
     ``key_padding_mask`` ``[B, S]`` is read as each sample's count of leading tokens; padded rows
     get no attention weight and return zero. ``token_tags`` ``[S]`` (0 video, positive text or
     audio, negative padding) draws half of the compensation-basis tokens from text and audio.
+    A call the kernels do not take (``deco_attention_ineligible_reason``) runs unquantized with
+    the same padding semantics.
     """
 
     ARCHS = frozenset({Arch.SM_100})
@@ -67,10 +89,26 @@ class DeCoAttention(OpWrapper):
             "FP8 V with trailing padding and modality tags",
             dict(v_dtype="fp8", tokens=8448, padding=256),
         ),
+        Cell(
+            "Shorter sequence with per-sample padding runs unquantized",
+            dict(v_dtype="fp8", tokens=320, padding=(64, 0)),
+        ),
     )
 
-    @torch.compiler.disable
     def __call__(self, q, k, v, *, v_dtype: str, key_padding_mask=None, token_tags=None):
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask.to(q.device)
+        reason = deco_attention_ineligible_reason(q, k, v)
+        if reason is None:
+            return self._launch(q, k, v, v_dtype, key_padding_mask, token_tags)
+        logger.warning_once(
+            f"DeCo-Attention runs unquantized because of {reason}.",
+            key=("deco_unquantized", reason),
+        )
+        return _unquantized(q, k, v, key_padding_mask)
+
+    @torch.compiler.disable
+    def _launch(self, q, k, v, v_dtype, key_padding_mask, token_tags):
         kernels = _kernels()
         # The kernels read contiguous tensors and slices of a fused projection in place.
         q, k, v = (
@@ -83,7 +121,6 @@ class DeCoAttention(OpWrapper):
         batch_size, seq_len, num_heads, _ = q.shape
         token_counts, rows = None, None
         if key_padding_mask is not None:
-            key_padding_mask = key_padding_mask.to(q.device)
             token_counts = key_padding_mask.sum(dim=1, dtype=torch.int32)
         if token_tags is not None:
             rows = kernels.sample_rows(seq_len, q.device, token_tags, tokens=key_padding_mask)
@@ -119,8 +156,9 @@ class DeCoAttention(OpWrapper):
         return out.to(q.dtype)
 
     def is_valid(self, q, k, v, *, v_dtype: str, key_padding_mask=None, token_tags=None):
-        assert deco_attention_ineligible_reason(q, k, v) is None
-        assert deco_unavailable_reason("nvfp4", v_dtype) is None
+        assert q.ndim == 4 and q.shape == k.shape == v.shape
+        if deco_attention_ineligible_reason(q, k, v) is None:
+            assert deco_unavailable_reason("nvfp4", v_dtype) is None
         if key_padding_mask is not None:
             assert key_padding_mask.dtype == torch.bool
             assert key_padding_mask.shape == q.shape[:2]
