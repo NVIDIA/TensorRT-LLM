@@ -392,6 +392,7 @@ def test_minicpmv46_multimodal_forward():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TRTLLM attention metadata requires CUDA")
 def test_minicpmv46_vision_attn_capacity_is_stable_across_grids():
+    from tensorrt_llm._torch.attention.attention import Attention
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6VisionModel
     from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_attn_metadata
@@ -413,6 +414,9 @@ def test_minicpmv46_vision_attn_capacity_is_stable_across_grids():
             max_num_tokens=64,
         )
     )
+    # Vision attention stays out of the registry the decoder's custom op reads.
+    attentions = [module for module in vision.modules() if isinstance(module, Attention)]
+    assert attentions and not any(module.register_to_config for module in attentions)
 
     # Grids of different resolutions share the configured capacity, not their own lengths.
     small = vision._make_attn_metadata([16, 4])

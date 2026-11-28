@@ -14,6 +14,7 @@ import torch
 import transformers
 from PIL import Image
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_utils import fuse_input_embeds
 from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
     AUDIO_PLACEHOLDER,
@@ -871,7 +872,8 @@ class TestGetNumTokensPerVideoTemporal:
         proc.video_target_num_patches = 256
         proc.video_maintain_aspect_ratio = True
 
-        frames = [Image.new("RGB", self.FRAME_SIZE) for _ in range(8)]
+        frames = np.zeros((8, h, w, 3), dtype=np.uint8)
+        frames.setflags(write=False)
 
         # Predicted count (used for token budget accounting).
         predicted = proc.get_num_tokens_per_video(video=frames)
@@ -879,6 +881,7 @@ class TestGetNumTokensPerVideoTemporal:
         # Actual count from the preprocessing pipeline.
         preprocessed = proc._process_videos_frames([frames])
         video_size_lst = preprocessed["video_size"]
+        assert proc._compute_video_shape_descriptor(frames) == video_size_lst[0]
         actual_tokens_per_frame_lst = proc._compute_token_numbers_per_video(video_size_lst)
         T = proc.video_temporal_patch_size
         num_tubelets = math.ceil(len(frames) / T) if T > 1 else len(frames)
@@ -1346,7 +1349,7 @@ class TestEvsVideoContextTokenId:
             video_context_token_id=video_context_token_id,
             sound_context_token_id=None,
         )
-        model_config = SimpleNamespace(pretrained_config=config, video_pruning_rate=0.5)
+        model_config = ModelConfig(pretrained_config=config, video_pruning_rate=0.5)
         with (
             mock.patch.object(NemotronHMultimodalModel, "_update_config_for_quantization"),
             mock.patch.object(NemotronHMultimodalModel, "post_config"),

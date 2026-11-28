@@ -5,13 +5,20 @@
 import math
 import random
 from contextlib import contextmanager
+from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
-from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.csa2 import cache_manager, kernel
+from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
+    BAD_PAGE_INDEX,
+    CSA2CacheManager,
+    CSA2CacheRole,
+)
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -22,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestState,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import is_blackwell_datacenter
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig
@@ -117,6 +125,20 @@ def _accept(manager, requests, accepted):
     manager.update_resources(batch)
 
 
+def _generation_batch(manager, active):
+    for request in active:
+        assert manager.try_allocate_generation(request)
+    batch = list(active)
+    return batch, [r.max_beam_num_tokens + DRAFT_LEN for r in batch]
+
+
+def _accept_pending(manager, active, pending):
+    # Under overlap scheduling, the previous step's acceptance lands after prepare.
+    requests = [r for r in active if r.py_request_id in pending]
+    if requests:
+        _accept(manager, requests, [pending.pop(r.py_request_id) for r in requests])
+
+
 def _prepare(metadata, batch, starts):
     metadata.request_ids = [request.py_request_id for request in batch]
     metadata.num_contexts = 0
@@ -124,6 +146,18 @@ def _prepare(metadata, batch, starts):
     metadata.prompt_lens = [request.py_prompt_len for request in batch]
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=starts)
     metadata.prepare()
+
+
+def _prepare_steady_entry(metadata, batch, starts, repeated):
+    """prepare_steady_decode_step where it may stand in for prepare() (``repeated``: the previous step
+    prepared this metadata for these requests), after writing kv_lens_cuda as the input staging does."""
+    if not (repeated and metadata.is_cuda_graph and metadata.supports_steady_decode_step):
+        _prepare(metadata, batch, starts)
+        return
+    kv_lens = [start + DRAFT_LEN + 1 for start in starts]
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=starts)
+    metadata.kv_lens_cuda[: len(kv_lens)].copy_(torch.tensor(kv_lens, dtype=torch.int32))
+    metadata.prepare_steady_decode_step(kv_lens)
 
 
 def _forward_inputs(metadata, count):
@@ -180,10 +214,11 @@ def _always_convert(manager):
         manager._batch_conversion_inputs = None
         manager._table_live[:] = manager.host_kv_cache_block_offsets.shape[-1]
         manager._swa_table_live[:] = manager.host_kv_cache_block_offsets.shape[-1]
-        convert(request_ids, num_contexts, swa_out=swa_out, **kwargs)
+        written = convert(request_ids, num_contexts, swa_out=swa_out, **kwargs)
         manager._batch_conversion_inputs = previous
         np.maximum(manager._table_live, live[0], out=manager._table_live)
         np.maximum(manager._swa_table_live, live[1], out=manager._swa_table_live)
+        return written
 
     manager.compute_batch_page_tables = full
     try:
@@ -214,6 +249,8 @@ class _Graph:
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
                 self.outputs = _clone(_forward_inputs(self.metadata, self.count))
+            # As a decode graph's query-tile capture records it: no replay geometry.
+            self.metadata._csa2_replay_capture_signature = None
         self.graph.replay()
         observed = _clone(self.outputs)
         # The replayed consumer reads the buffers captured at the first step.
@@ -224,10 +261,22 @@ class _Graph:
 class _Executor:
     """One eager metadata and graph metadata per batch size, as an executor holds them."""
 
-    def __init__(self, manager):
+    def __init__(self, manager, steady_entry=False, *, force_full_prepare=False):
         self.manager = manager
         self.eager = _metadata(manager)
         self.graphs = {}
+        self.steady_entry = steady_entry
+        self.force_full_prepare = force_full_prepare
+        self.previous = None
+
+    def _prepare_step(self, metadata, batch, starts, repeated=False):
+        if self.force_full_prepare:
+            with patch.object(metadata, "_steady_generation_step", return_value=None):
+                _prepare(metadata, batch, starts)
+        elif self.steady_entry:
+            _prepare_steady_entry(metadata, batch, starts, repeated)
+        else:
+            _prepare(metadata, batch, starts)
 
     def step(self, batch, starts, use_graph):
         """Prepare one decode step; return the batch tables and every forward input."""
@@ -236,9 +285,17 @@ class _Executor:
             graph = self.graphs.get(count)
             if graph is None:
                 graph = self.graphs[count] = _Graph(self.eager, count)
-            _prepare(graph.metadata, batch, starts)
+            ids = [r.py_request_id for r in batch]
+            repeated = (
+                self.previous is not None
+                and self.previous[0] is graph.metadata
+                and self.previous[1] == ids
+            )
+            self.previous = (graph.metadata, ids)
+            self._prepare_step(graph.metadata, batch, starts, repeated)
             return _batch_tables(self.manager), graph.run()
-        _prepare(self.eager, batch, starts)
+        self.previous = None
+        self._prepare_step(self.eager, batch, starts)
         return _batch_tables(self.manager), _clone(_forward_inputs(self.eager, count))
 
 
@@ -248,6 +305,137 @@ def _assert_identical(observed, expected, step):
         assert torch.equal(observed[name], tensor), f"step {step}: {name} differs"
 
 
+def _run_mixed_adp_preparation(rank: int, rendezvous: str) -> None:
+    from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, input_preparer
+    from _torch.pyexecutor.engine_test_utils import DummyModel
+
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputBuffers
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    torch.cuda.set_device(rank)
+    dist = torch.distributed
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=120)
+    )
+    exchanges = []
+
+    def allgather(values):
+        exchanges.append(tuple(values))
+        local = torch.tensor(values, dtype=torch.int64)
+        gathered = [torch.empty_like(local) for _ in range(2)]
+        dist.all_gather(gathered, local)
+        return torch.stack(gathered).numpy()
+
+    manager = _manager(True, False, False)
+    active = []
+    try:
+        active.extend(_admit(manager, i, 20 * i + rank) for i in (1, 2, 3))
+        for slot, request in enumerate(active, 1):
+            request.py_seq_slot = request.py_batch_idx = slot
+            assert manager.try_allocate_generation(request)
+        padding = _dummy(manager, CUDA_GRAPH_DUMMY_REQUEST_ID)
+        padding.is_cuda_graph_dummy = True
+        active.append(padding)
+        batch = ScheduledRequests()
+        batch.generation_requests = [*active[:2], padding, padding]
+        count = len(batch.generation_requests)
+        t = DRAFT_LEN + 1
+        bound = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+        config = decoder_config(
+            spec_config=MTPDecodingConfig(max_draft_len=DRAFT_LEN),
+            enable_attention_dp=True,
+            steady_decode_prepare=True,
+        )
+        mapping = Mapping(world_size=2, rank=rank, tp_size=2, enable_attention_dp=True)
+        model = DummyModel(config.dtype)
+        tensors = SampleStateTensorsSpec(
+            new_tokens=torch.arange(t * MAX_BATCH, device="cuda", dtype=torch.int32).view(
+                t, MAX_BATCH, 1
+            ),
+            new_tokens_lens=torch.ones(MAX_BATCH, device="cuda", dtype=torch.int32),
+            next_draft_tokens=torch.arange(
+                MAX_BATCH * DRAFT_LEN, device="cuda", dtype=torch.int32
+            ).view(MAX_BATCH, DRAFT_LEN),
+        )
+
+        def prepare(preparer, metadata, spec):
+            return preparer.prepare_inputs(
+                batch,
+                manager,
+                metadata,
+                spec,
+                tensors,
+                resource_manager=bound,
+                enable_spec_decode=True,
+                runtime_draft_len=DRAFT_LEN,
+                is_dummy=False,
+            )
+
+        arms = []
+        for _ in range(2):
+            buffers = DecoderInputBuffers.for_config(config, False)
+            preparer = input_preparer(config, model=model, buffers=buffers, mapping=mapping)
+            preparer.dist = SimpleNamespace(tp_cp_allgather_int64=allgather)
+            graph_runner = SimpleNamespace(
+                enabled=True,
+                shared_static_tensors={},
+                take_agreed_replay_key=lambda _: None,
+            )
+            preparer.attach_cuda_graph_runners(graph_runner, None)
+            metadata = _metadata(manager).create_cuda_graph_metadata(
+                count, max_draft_tokens=DRAFT_LEN
+            )
+            spec = Mock(
+                context_prompt_lookahead_tokens=None,
+                supports_steady_prepare=False,
+                runtime_draft_len=DRAFT_LEN,
+            )
+            spec.dp_num_tokens = lambda spec=spec: spec.num_tokens
+            prepare(preparer, metadata, spec)
+            assert preparer._steady_mtp.record.attn_steady
+            _forward_inputs(metadata, count)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = _clone(_forward_inputs(metadata, count))
+                output["input_ids"] = buffers.input_ids_cuda[: count * t].clone()
+            arms.append((preparer, metadata, spec, graph, output))
+
+        batch.generation_requests = [active[0], active[1 + rank], padding, padding]
+        outputs = []
+        for index, (preparer, metadata, spec, graph, output) in enumerate(arms):
+            if rank:
+                # A joining request alongside an existing request takes the full pass.
+                active[2].py_batch_idx = None
+            if index:
+                preparer._steady_mtp.invalidate()
+            with patch.object(
+                preparer,
+                "_apply_steady_mtp_fast_prepare",
+                wraps=preparer._apply_steady_mtp_fast_prepare,
+            ) as steady:
+                prepare(preparer, metadata, spec)
+            assert steady.called == (rank == 0 and index == 0)
+            graph.replay()
+            outputs.append(_clone(output))
+        _assert_identical(*outputs, "mixed attention-DP replay")
+        assert len(exchanges) == 4 and exchanges[-2] == exchanges[-1]
+    finally:
+        for request in active:
+            manager.free_resources(request)
+        manager.shutdown()
+        dist.destroy_process_group()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_mixed_attention_dp_steady_and_full_replay(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_mixed_adp_preparation, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2
+    )
+
+
 def _counted_conversions(monkeypatch):
     """Record each conversion launch: True when it converted only some rows."""
     conversions = []
@@ -255,8 +443,9 @@ def _counted_conversions(monkeypatch):
     monkeypatch.setattr(
         kernel,
         "convert_page_tables",
-        lambda *args, **kwargs: conversions.append(kwargs.get("dst_rows") is not None)
-        or convert(*args, **kwargs),
+        lambda *args, **kwargs: (
+            conversions.append(kwargs.get("dst_rows") is not None) or convert(*args, **kwargs)
+        ),
     )
     return conversions
 
@@ -365,21 +554,15 @@ def test_steady_spec_steps_match_full_prepare(monkeypatch, scratch, seed, block)
 
     def counted(self, snapshot):
         hit = predicate(self, snapshot)
-        if not getattr(self, "_full_reference", False):
-            hits.append(hit is not None)
-            joins.append(isinstance(hit, np.ndarray) and bool((hit < 0).any()))
+        hits.append(hit is not None)
+        joins.append(isinstance(hit, np.ndarray) and bool((hit < 0).any()))
         return hit
 
     monkeypatch.setattr(CSA2TrtllmMetadata, "_steady_generation_step", counted)
     manager = _manager(False, False, scratch, block)
-    steady, full = _Executor(manager), _Executor(manager)
+    steady, full = _Executor(manager), _Executor(manager, force_full_prepare=True)
     active, pending = [], {}
     next_id = 1
-
-    def accept(requests):
-        requests = [r for r in requests if r.py_request_id in pending]
-        if requests:
-            _accept(manager, requests, [pending.pop(r.py_request_id) for r in requests])
 
     try:
         for step in range(200):
@@ -399,28 +582,19 @@ def test_steady_spec_steps_match_full_prepare(monkeypatch, scratch, seed, block)
                 next_id += 1
             if len(active) > 1 and rng.random() < 0.03:
                 rng.shuffle(active)
-            for request in active:
-                assert manager.try_allocate_generation(request)
-            batch = list(active)
-            starts = [r.max_beam_num_tokens - 1 + DRAFT_LEN + 1 for r in batch]
+            batch, starts = _generation_batch(manager, active)
             use_graph = rng.random() < 0.75
             try:
                 tables, observed = steady.step(batch, starts, use_graph)
             except AssertionError as error:
                 raise AssertionError(f"steady executor, step {step}, graph {use_graph}") from error
-            for metadata in (full.eager, *(graph.metadata for graph in full.graphs.values())):
-                metadata._csa2_steady_snapshot = None
-                metadata._full_reference = True
-            if use_graph and len(batch) not in full.graphs:
-                full.graphs[len(batch)] = _Graph(full.eager, len(batch))
-                full.graphs[len(batch)].metadata._full_reference = True
             try:
                 expected_tables, expected = full.step(batch, starts, use_graph)
             except AssertionError as error:
                 raise AssertionError(f"full executor, step {step}, graph {use_graph}") from error
             assert torch.equal(tables[0], expected_tables[0]), f"step {step}: batch tables differ"
             _assert_identical(observed, expected, step)
-            accept(active)
+            _accept_pending(manager, active, pending)
             # A step may also commit nothing.
             pending.update(
                 (r.py_request_id, rng.randrange(DRAFT_LEN + 1))
@@ -495,6 +669,283 @@ def test_block_offsets_refill_only_stale_entries(seed):
             if requests:
                 _accept(manager, requests, [pending.pop(r.py_request_id) for r in requests])
             pending.update((r.py_request_id, rng.randrange(DRAFT_LEN + 1)) for r in active)
+    finally:
+        for request in active:
+            manager.free_resources(request)
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("scratch", [False, True], ids=["no_scratch", "scratch"])
+@torch.inference_mode()
+def test_unchanged_page_storage_exit_matches_full_prepare(monkeypatch, scratch):
+    """Steady-entry steps that keep growth blocks and the last conversion of unchanged page storage
+    read what a full preparation writes over growth, retirements and admissions."""
+    rng = random.Random(0)
+    manager = _manager(False, False, scratch)
+    manager.keep_growth_blocks()
+    manager._unchanged_page_exit = True
+    exits = []
+    check = manager._unchanged_page_storage
+    monkeypatch.setattr(
+        manager, "_unchanged_page_storage", lambda *args: exits.append(check(*args)) or exits[-1]
+    )
+    steady = _Executor(manager, steady_entry=True)
+    full = _Executor(manager, force_full_prepare=True)
+    steady_calls = 0
+    prepare_steady = CSA2TrtllmMetadata.prepare_steady_decode_step
+
+    def counted_prepare(metadata, *args, **kwargs):
+        nonlocal steady_calls
+        steady_calls += 1
+        return prepare_steady(metadata, *args, **kwargs)
+
+    monkeypatch.setattr(CSA2TrtllmMetadata, "prepare_steady_decode_step", counted_prepare)
+    active, pending, next_id = [], {}, 1
+    previous, taken = None, 0
+    try:
+        for step in range(200):
+            if len(active) < 3 and (not active or rng.random() < 0.05):
+                active.append(_admit(manager, next_id, rng.randrange(BLOCK - 8, 3 * BLOCK)))
+                next_id += 1
+            elif len(active) > 1 and rng.random() < 0.04:
+                done = active.pop(rng.randrange(len(active)))
+                pending.pop(done.py_request_id, None)
+                manager.free_resources(done)
+            batch, starts = _generation_batch(manager, active)
+            state = (
+                [r.py_request_id for r in batch],
+                [manager.kv_cache_map[r.py_request_id].page_storage_version for r in batch],
+            )
+            before = len(exits)
+            tables, observed = steady.step(batch, starts, True)
+            if any(exits[before:]):
+                assert state == previous, f"step {step}: exit with changed caches or pages"
+                taken += 1
+            with _always_convert(manager):
+                expected_tables, expected = full.step(batch, starts, True)
+            assert torch.equal(tables[0], expected_tables[0]), f"step {step}: batch tables differ"
+            _assert_identical(observed, expected, step)
+            previous = state
+            _accept_pending(manager, active, pending)
+            pending.update((r.py_request_id, rng.randrange(DRAFT_LEN + 1)) for r in active)
+        assert taken > 200 // 4, taken
+        assert steady_calls > 200 // 4, steady_calls
+    finally:
+        for request in active:
+            manager.free_resources(request)
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+@torch.inference_mode()
+def test_overlapping_block_offset_views_convert_only_live_columns(monkeypatch):
+    manager = _manager(False, False, False)
+    active = []
+    try:
+        active.extend(_admit(manager, i, 10 * i) for i in (1, 2))
+        widths = []
+        convert = manager._convert_all_rows
+
+        def capture_width(count, width, *args):
+            widths.append(width)
+            return convert(count, width, *args)
+
+        monkeypatch.setattr(manager, "_convert_all_rows", capture_width)
+        max_blocks = manager.max_blocks_per_seq
+        shape = (len(manager.pp_layers), MAX_BATCH, 2, max_blocks)
+        storage = torch.full(shape, 123, dtype=torch.int32, device="cuda")
+        for ids in ([1], [2, 1], [1]):
+            view = storage[:, : len(ids)]
+            manager.copy_batch_block_offsets(view, ids, 1, 0, len(ids))
+            live = max(manager.batch_table_live())
+            assert 0 < live <= widths[-1] < max_blocks
+            assert (view[..., live:] == BAD_PAGE_INDEX).all()
+            assert (view[..., 0, :live] != BAD_PAGE_INDEX).any()
+        assert len(widths) == 3
+        expected = view.clone()
+        other_stream = torch.cuda.Stream()
+        other_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(other_stream):
+            manager.copy_batch_block_offsets(view, [], 1, 0, 0)
+        manager.copy_batch_block_offsets(view, [1], 1, 0, 1)
+        assert torch.equal(view, expected)
+
+        # Direct metadata copies can write a wider row into a previously published view.
+        # Switching to another destination and back must clear the earlier wide row.
+        active.append(_admit(manager, 3, 7 * BLOCK))
+        first = storage[:, :2]
+        second = torch.empty_like(first)
+        manager.copy_batch_block_offsets(first, [3, 1], 1, 0, 2)
+        reference = first.clone()
+        metadata = _metadata(manager)
+        for layer, pages in zip(manager.pp_layers, first[:, :, 0]):
+            metadata._bind_swa_pages(layer, pages, pages, [])
+        other_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(other_stream):
+            manager.compute_batch_page_tables([1, 3], 0)
+            copies = []
+            for layer in manager.pp_layers:
+                pages = manager.batch_page_table((layer, CSA2CacheRole.SWA), max_blocks)
+                metadata._bind_swa_pages(layer, pages, None, copies)
+            assert copies
+            targets, sources = zip(*copies)
+            with manager._write_swa_page_tables(targets):
+                torch._foreach_copy_(targets, sources, non_blocking=True)
+        manager.copy_batch_block_offsets(second, [3, 1], 1, 0, 2)
+        manager.copy_batch_block_offsets(first, [3, 1], 1, 0, 2)
+        assert torch.equal(second, reference)
+        assert torch.equal(first, reference)
+    finally:
+        for request in active:
+            manager.free_resources(request)
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+@torch.inference_mode()
+def test_full_conversions_order_shared_row_upload_across_streams(monkeypatch):
+    manager = _manager(False, False, False)
+    active = []
+    try:
+        active.extend(_admit(manager, i, BLOCK * i) for i in (1, 2))
+        manager.compute_batch_page_tables([1, 2], 0)
+        expected = manager._batch_page_tables.clone()
+        manager._batch_conversion_inputs = None
+        first, second = torch.cuda.Stream(), torch.cuda.Stream()
+        for stream in (first, second):
+            stream.wait_stream(torch.cuda.current_stream())
+        convert = kernel.convert_page_tables
+        snapshots = []
+
+        def take_snapshot(base, rows, params, out, *args, **kwargs):
+            convert(base, rows, params, out, *args, **kwargs)
+            if torch.cuda.current_stream() == first:
+                snapshots.append(out.clone())
+
+        monkeypatch.setattr(kernel, "convert_page_tables", take_snapshot)
+        with torch.cuda.stream(first):
+            manager.compute_batch_page_tables([1, 2], 0)
+        first_read_done = manager._base_rows_read[manager._base_rows_slot]
+        operations = Mock()
+        with (
+            torch.cuda.stream(second),
+            patch.object(
+                torch.cuda.Stream,
+                "wait_event",
+                autospec=True,
+                side_effect=torch.cuda.Stream.wait_event,
+            ) as wait_event,
+            patch.object(
+                cache_manager, "copy_host_to_device", wraps=cache_manager.copy_host_to_device
+            ) as upload,
+        ):
+            operations.attach_mock(wait_event, "wait_event")
+            operations.attach_mock(upload, "upload")
+            manager.compute_batch_page_tables([2, 1], 0)
+        handoff = [
+            name
+            for name, args, _ in operations.mock_calls
+            if (name == "wait_event" and args == (second, first_read_done))
+            or (name == "upload" and args[1] == "batch_rows")
+        ]
+        torch.cuda.current_stream().wait_stream(first)
+        torch.cuda.current_stream().wait_stream(second)
+        assert len(snapshots) == 1
+        torch.testing.assert_close(snapshots[0], expected[..., : snapshots[0].shape[-1]])
+        assert handoff == ["wait_event", "upload"]
+    finally:
+        for request in active:
+            manager.free_resources(request)
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+def test_kept_growth_slack_is_returned_after_suspend_resume():
+    manager = _manager(False, False, False)
+    request = None
+    try:
+        manager.keep_growth_blocks()
+        request = _admit(manager, 1, BLOCK - 16)
+        cache = manager.kv_cache_map[1]
+        assert cache.resize(BLOCK + 2)
+        assert cache.resize(manager._kept_generation_update(1, cache.capacity, 4, 3))
+        assert cache.capacity == BLOCK + 1 and manager._kept_growth_slack[1] == 3
+        manager.suspend_request(request)
+        assert not cache.is_active
+        assert manager.try_allocate_generation(request)
+        assert manager._kept_growth_slack[1] == 3
+        assert manager._kept_generation_update(1, cache.capacity, 12, DRAFT_LEN) == (
+            cache.capacity - 12 - 3
+        )
+        assert 1 not in manager._kept_growth_slack
+    finally:
+        if request is not None:
+            manager.free_resources(request)
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("attention_dp", [False, True], ids=["tep", "adp"])
+@torch.inference_mode()
+def test_row_bounded_page_tables_match_full_width(monkeypatch, attention_dp):
+    """Page tables converted and copied per row's live columns, with one long request among short
+    ones, read what full-width conversions and copies write in every eager and graph step."""
+    rng = random.Random(0)
+    narrowed = {"convert": 0, "copy": 0}
+    convert, copy_tables = kernel.convert_page_tables, kernel.copy_tables_
+
+    def narrower(kind, columns, width):
+        # Some row stops well short of the launch width.
+        if columns is not None and int(columns.min()) < width // 4:
+            narrowed[kind] += 1
+
+    def counted_convert(base, rows, params, out, *args, **kwargs):
+        narrower("convert", kwargs.get("row_columns"), out.shape[-1])
+        return convert(base, rows, params, out, *args, **kwargs)
+
+    def counted_copy(descriptors, max_rows, max_columns, row_columns=None):
+        narrower("copy", row_columns, max_columns)
+        return copy_tables(descriptors, max_rows, max_columns, row_columns)
+
+    monkeypatch.setattr(kernel, "convert_page_tables", counted_convert)
+    monkeypatch.setattr(kernel, "copy_tables_", counted_copy)
+    manager = _manager(attention_dp, False, False)
+    bounded, full = _Executor(manager), _Executor(manager, force_full_prepare=True)
+    long_len = 20 * BLOCK + 40
+    active = [_admit(manager, 1, long_len)]
+    pending, next_id = {}, 2
+    try:
+        for step in range(120):
+            if step == 60:
+                # The long request leaves; short ones take its rows.
+                done = active.pop(0)
+                pending.pop(done.py_request_id, None)
+                manager.free_resources(done)
+            if step == 80 or (len(active) < 6 and rng.random() < 0.2):
+                prompt = long_len if step == 80 else rng.randrange(BLOCK - 8, 3 * BLOCK)
+                active.append(_admit(manager, next_id, prompt))
+                next_id += 1
+            elif len(active) > 2 and rng.random() < 0.1:
+                done = active.pop(rng.randrange(1, len(active)))
+                pending.pop(done.py_request_id, None)
+                manager.free_resources(done)
+            if len(active) > 1 and rng.random() < 0.1:
+                rng.shuffle(active)
+            batch, starts = _generation_batch(manager, active)
+            use_graph = rng.random() < 0.75
+            tables, observed = bounded.step(batch, starts, use_graph)
+            with (
+                _always_convert(manager),
+                patch.object(CSA2TrtllmMetadata, "_table_copy_bounds", return_value=None),
+            ):
+                expected_tables, expected = full.step(batch, starts, use_graph)
+            assert torch.equal(tables[0], expected_tables[0]), f"step {step}: batch tables differ"
+            _assert_identical(observed, expected, step)
+            _accept_pending(manager, active, pending)
+            pending.update((r.py_request_id, rng.randrange(DRAFT_LEN + 1)) for r in active)
+        if is_blackwell_datacenter():
+            assert narrowed["convert"] > 20 and narrowed["copy"] > 20, narrowed
     finally:
         for request in active:
             manager.free_resources(request)

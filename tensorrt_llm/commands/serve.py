@@ -53,6 +53,10 @@ from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
+from tensorrt_llm.commands.serve_cli._net import (_bind_listener,
+                                                  _diagnose_port_in_use,
+                                                  _listener_address_family,
+                                                  _publish_bound_address)
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -63,6 +67,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     parse_disagg_config_file, parse_metadata_server_config_file,
     validate_config_bool, validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
+                                          BaseCudaGraphConfig,
                                           CacheTransceiverConfig,
                                           KvCacheConnectorConfig, SleepConfig,
                                           TorchLlmArgs, build_cli_config)
@@ -144,20 +149,25 @@ def _report_observed_child_failure(return_code: int, component: str,
 def _apply_effective_telemetry_config(llm_args: dict,
                                       *,
                                       telemetry: bool,
-                                      component: str = "server") -> None:
-    """Apply a parsed config opt-out before later setup can fail."""
+                                      component: str = "server") -> dict:
+    """Apply a parsed config opt-out before later setup can fail.
+
+    Returns the mapping to use; never modifies ``llm_args``. The caller
+    rebinds its name to the result.
+    """
     telemetry_config = llm_args.get("telemetry_config")
     if telemetry_config is not None:
         if not telemetry:
             telemetry_config = telemetry_config.model_copy(
                 update={"disabled": True})
-            llm_args["telemetry_config"] = telemetry_config
+            llm_args = {**llm_args, "telemetry_config": telemetry_config}
         apply_usage_session_config(
             telemetry_config,
             default_usage_context="cli_serve",
             component=component,
             lifecycle_phase="config_validation",
         )
+    return llm_args
 
 
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
@@ -413,120 +423,6 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
     return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
 
-def _publish_bound_address(report_addr: Optional[str], host: str,
-                           port: int) -> None:
-    """Write the address this server actually bound to ``report_addr``.
-
-    Lets a launcher pass ``--port 0`` and learn the kernel-assigned port
-    afterwards, instead of picking a port up front and racing whoever grabs it
-    before this process binds. The write is atomic (temp file in the same
-    directory, then rename) so a reader never observes a partial line, which
-    matters on the shared filesystems multi-node tests coordinate through.
-
-    The caller is responsible for making the path unique per run: a stale file
-    from an earlier run points at a dead server, which fails far less obviously
-    than a port conflict.
-
-    A wildcard bind host is replaced by this machine's hostname, since readers
-    use the published value as a URL authority and cannot dial 0.0.0.0 or ::.
-    """
-    if not report_addr:
-        return
-    if host in ("0.0.0.0", "::", ""):  # nosec B104 - reporting, not binding
-        resolved = socket.gethostname()
-        logger.info(f"Reporting hostname {resolved} instead of wildcard bind "
-                    f"address {host!r}, which a reader cannot dial")
-        host = resolved
-    report_addr = os.path.abspath(report_addr)
-    parent = os.path.dirname(report_addr)
-    os.makedirs(parent, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=parent,
-                                    prefix=os.path.basename(report_addr) + ".",
-                                    suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            # Bracket IPv6 literals so the value is a usable URL authority:
-            # readers build "http://<reported>/..." from it verbatim.
-            reported_host = f"[{host}]" if ":" in host else host
-            f.write(f"{reported_host}:{port}\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, report_addr)
-    finally:
-        # A successful replace already consumed tmp_path; this only cleans up
-        # after a failed write so a partial file is not left behind.
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-    logger.info(f"Reported bound address {host}:{port} to {report_addr}")
-
-
-def _diagnose_port_in_use(port: int) -> str:
-    """Describe which process currently holds the given port, best effort."""
-    try:
-        import psutil
-    except ImportError:
-        return "psutil unavailable; cannot identify the process holding the port"
-
-    details = []
-    try:
-        for conn in psutil.net_connections(kind="inet"):
-            if conn.laddr and conn.laddr.port == port:
-                holder = ""
-                if conn.pid is not None:
-                    try:
-                        proc = psutil.Process(conn.pid)
-                        holder = (f" pid={conn.pid} name={proc.name()} "
-                                  f"cmdline={' '.join(proc.cmdline())}")
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        holder = f" pid={conn.pid}"
-                details.append(
-                    f"{conn.laddr.ip}:{conn.laddr.port} status={conn.status}{holder}"
-                )
-    except (psutil.Error, OSError) as e:
-        return f"failed to inspect port holders: {e}"
-
-    if not details:
-        return ("no listening socket found for this port; it may have already "
-                "been released, indicating a transient race")
-    return "; ".join(details)
-
-
-def _bind_failure(kind: str, host: str, port: int,
-                  error: OSError) -> RuntimeError:
-    """Log a failed listener bind and return the exception to raise.
-
-    An address lookup failure (``socket.gaierror``) is an ``OSError`` too, but
-    no port was ever tried, so it is reported as such instead of being
-    diagnosed as a port conflict. It covers both a name that does not resolve
-    and an address of a family the socket cannot use, such as an IPv6 literal
-    on an IPv4-only listener.
-    """
-    if isinstance(error, socket.gaierror):
-        reason = f"address lookup failed for host {host!r}: {error}"
-        logger.error(f"Failed to bind {kind} socket to {host}:{port} "
-                     f"(pid={os.getpid()}): {reason}")
-        return RuntimeError(f"Failed to bind socket to {host}:{port}: {reason}")
-    holder = _diagnose_port_in_use(port)
-    logger.error(
-        f"Failed to bind {kind} socket to {host}:{port} (pid={os.getpid()}): "
-        f"{error}. Current port holder(s): {holder}")
-    return RuntimeError(f"Failed to bind socket to {host}:{port}: {error}. "
-                        f"Port holder(s): {holder}")
-
-
-def _listener_address_family(kind: str, host: str,
-                             port: int) -> socket.AddressFamily:
-    """The family to bind ``host`` with: IPv6 only if it resolves to nothing else."""
-    try:
-        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                       socket.SOCK_STREAM)
-    except socket.gaierror as e:
-        raise _bind_failure(kind, host, port, e) from e
-    if all(info[0] == socket.AF_INET6 for info in addr_info):
-        return socket.AF_INET6
-    return socket.AF_INET
-
-
 def _reserve_multi_frontend_port(host: str, port: int,
                                  family: socket.AddressFamily) -> socket.socket:
     """Refuse a port another server uses; return a lock to hold while serving.
@@ -557,7 +453,7 @@ def _reserve_multi_frontend_port(host: str, port: int,
 
 @contextlib.contextmanager
 def _provision_kv_cache_pool(llm_args: dict,
-                             owns_engine: bool = True) -> Iterator[None]:
+                             owns_engine: bool = True) -> Iterator[dict]:
     """Bring up the shared cache this server joins, for its lifetime.
 
     A connector backed by a cluster-wide pool needs that pool reachable before
@@ -568,9 +464,12 @@ def _provision_kv_cache_pool(llm_args: dict,
     Only the process that owns the engine does this. An attached frontend
     re-execs this command line but shares the launcher's executor, so it would
     otherwise render a second client config over the first.
+
+    Yields the mapping to pass to the LLM constructor; never modifies
+    ``llm_args``. The caller binds the yielded mapping (``as llm_args``).
     """
     if not owns_engine:
-        yield
+        yield llm_args
         return
 
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
@@ -582,10 +481,10 @@ def _provision_kv_cache_pool(llm_args: dict,
         # before the LLM constructor would coerce it. The validated model is
         # handed on so it is not parsed twice.
         connector_config = KvCacheConnectorConfig(**connector_config)
-        llm_args["kv_connector_config"] = connector_config
+        llm_args = {**llm_args, "kv_connector_config": connector_config}
 
     with maybe_provision_pool(connector_config):
-        yield
+        yield llm_args
 
 
 def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
@@ -628,15 +527,18 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
 def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
                                          port: int, grpc: bool,
                                          report_addr: Optional[str],
-                                         enable_sleep_mode: bool) -> None:
+                                         enable_sleep_mode: bool) -> dict:
     """Fall back to one frontend where the default count cannot run.
 
     An explicit count (CLI, --config YAML or --set) is left alone, so the
     guard that owns the conflict still rejects it.
+
+    Returns the mapping to use; never modifies ``llm_args``. The caller
+    rebinds its name to the result.
     """
     num_frontends = llm_args.get("num_serve_frontends", 1)
     if requested or num_frontends <= 1:
-        return
+        return llm_args
     if grpc:
         # OpenEngine supports several frontends, but only when asked to.
         reason = "--grpc"
@@ -649,12 +551,12 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
     elif enable_sleep_mode:
         reason = "--enable_sleep_mode"
     else:
-        return
+        return llm_args
     logger.info(
         f"num_serve_frontends defaults to {num_frontends} for the OpenAI HTTP "
         f"server only; running 1 frontend because of {reason}. Pass "
         "--num_serve_frontends explicitly to override.")
-    llm_args["num_serve_frontends"] = 1
+    return {**llm_args, "num_serve_frontends": 1}
 
 
 def _bool_setting(value: object) -> bool:
@@ -798,6 +700,13 @@ def launch_server(
         enable_runtime_control_endpoints: bool = False,
         runtime_control_api_key: Optional[str] = None) -> None:
 
+    # Model validation normalizes graph settings; keep those changes local to
+    # this launch as well as edits to the outer mapping.
+    llm_args = dict(llm_args)
+    cuda_graph_config = llm_args.get("cuda_graph_config")
+    if isinstance(cuda_graph_config, BaseCudaGraphConfig):
+        llm_args["cuda_graph_config"] = cuda_graph_config.model_copy(deep=True)
+
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
     if server_role is not None:
@@ -819,6 +728,10 @@ def launch_server(
                                 internal_disagg_auth_key.encode("utf-8"))
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    if not multi_frontend_enabled:
+        # Entry points that disable multi-frontend mode must not hand the knob
+        # to the LLM constructor, which rejects unknown keys.
+        llm_args.pop("num_serve_frontends", None)
     _check_context_only_settings(llm_args,
                                  warn=not multi_frontend.is_attached_frontend)
     # An attached frontend gets the launcher's socket from its spawn env; the
@@ -861,30 +774,23 @@ def launch_server(
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
     address_family = _listener_address_family("server", host, port)
+    # port == 0 lets the kernel pick the port; the caller then needs a way
+    # to learn it, either by service discovery or by report_addr.
+    assert port > 0 or disagg_cluster_config is not None or report_addr, (
+        "Port must be specified unless disagg cluster config or "
+        "--report_addr is provided")
     port_lock = (_reserve_multi_frontend_port(host, port, address_family)
                  if multi_frontend.is_launcher else contextlib.nullcontext())
-    with port_lock, socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # port == 0 lets the kernel pick the port; the caller then needs a way
-        # to learn it, either by service discovery or by report_addr.
-        assert port > 0 or disagg_cluster_config is not None or report_addr, (
-            "Port must be specified unless disagg cluster config or "
-            "--report_addr is provided")
-        # Without SO_REUSEADDR a restart is refused for the whole TIME_WAIT
-        # window (~60s) by the tombstones of connections this server accepted.
-        # The flag has to be set on the socket that owns the port first, since
-        # the TIME_WAIT entry inherits it -- setting it only on the later bind
-        # is not enough.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
-            # Every frontend process binds its own listening socket on the
-            # same port; the kernel load-balances accepts across them.
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        try:
-            s.bind((host, port))
-            if port == 0:
-                port = s.getsockname()[1]
-        except OSError as e:
-            raise _bind_failure("server", host, port, e) from e
+    # Every frontend process binds its own listening socket on the same port;
+    # the kernel load-balances accepts across them.
+    reuse_port = multi_frontend.is_launcher or multi_frontend.is_attached_frontend
+    with port_lock, _bind_listener("server",
+                                   host,
+                                   port,
+                                   family=address_family,
+                                   reuse_port=reuse_port) as s:
+        if port == 0:
+            port = s.getsockname()[1]
 
         # Only now is the address final, and the socket stays bound from here
         # until uvicorn takes it over, so no one can steal the port in between.
@@ -898,8 +804,8 @@ def launch_server(
                 _diagnose_port_in_use) as
               (affinity_socket, attached_affinity_sockets),
               _provision_kv_cache_pool(
-                  llm_args,
-                  owns_engine=not multi_frontend.is_attached_frontend)):
+                  llm_args, owns_engine=not multi_frontend.is_attached_frontend)
+              as llm_args):
             if backend == 'pytorch':
                 llm_args.pop("build_config", None)
                 llm = PyTorchLLM(**llm_args)
@@ -982,6 +888,8 @@ def launch_mm_encoder_server(
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
     allow_request_chat_template: bool = False,
 ) -> None:
+    # Never write into the caller's mapping; every edit below is on this copy.
+    encoder_args = dict(encoder_args)
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
@@ -1180,6 +1088,8 @@ def launch_embedding_server(
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ) -> None:
+    # Never write into the caller's mapping; every edit below is on this copy.
+    llm_args = dict(llm_args)
     model = llm_args["model"]
     llm_args.pop("build_config", None)
     # encode_only is forced on below; drop any value coming from --config to avoid
@@ -1229,6 +1139,8 @@ def launch_rerank_server(
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ) -> None:
+    # Never write into the caller's mapping; every edit below is on this copy.
+    llm_args = dict(llm_args)
     model = llm_args["model"]
     llm_args.pop("build_config", None)
     llm_args.pop("encode_only", None)
@@ -1305,15 +1217,8 @@ def launch_visual_gen_server(
     # the bind until uvicorn started, anything else on the host could grab the
     # port in that window and trtllm-serve would die at bind() time.
     address_family = _listener_address_family("VisualGen server", host, port)
-    with socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # See launch_server: without this, TIME_WAIT tombstones from the
-        # connections this server accepted refuse a restart for ~60s.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((host, port))
-        except OSError as e:
-            raise _bind_failure("VisualGen server", host, port, e) from e
-
+    with _bind_listener("VisualGen server", host, port,
+                        family=address_family) as s:
         logger.info(f"Initializing VisualGen ({model})")
 
         previous_sigterm_handler = signal.signal(signal.SIGTERM,
@@ -1617,17 +1522,18 @@ def launch_visual_gen_server(
     default=False,
     help="Enable locality domain execution for supported PyTorch backend ops.",
     status="prototype")
-@stability_option("--media_io_kwargs",
-                  type=str,
-                  default=None,
-                  help="Keyword arguments for media I/O as a JSON string. "
-                  "Keys are modality names (\"video\", \"image\", \"audio\") "
-                  "whose values are dicts of keyword arguments forwarded to "
-                  "the corresponding loader. "
-                  "Example: '{\"video\": {\"extract_audio\": true, "
-                  "\"num_frames\": 16}}' to enable audio extraction from "
-                  "video files.",
-                  status="prototype")
+@stability_option(
+    "--media_io_kwargs",
+    type=str,
+    default=None,
+    help="Keyword arguments for media I/O as a JSON string. "
+    "Keys are modality names (\"video\", \"image\", \"audio\") "
+    "whose values are dicts of keyword arguments forwarded to "
+    "the corresponding loader. The keys format and device are unsupported. "
+    "Example: '{\"video\": {\"extract_audio\": true, "
+    "\"num_frames\": 16}}' to enable audio extraction from "
+    "video files.",
+    status="prototype")
 @stability_option("--video_pruning_rate",
                   type=float,
                   default=None,
@@ -1918,6 +1824,18 @@ def serve(
             "--enable_sleep_mode is only supported by the HTTP "
             "text-generation server.")
 
+    try:
+        media_options = json.loads(
+            media_io_kwargs) if media_io_kwargs is not None else None
+        multimodal_server_config = MultimodalServerConfig(
+            media_io_kwargs=media_options)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"Invalid JSON for media_io_kwargs: {error}") from error
+    except ValueError as error:
+        raise click.BadParameter(str(error),
+                                 param_hint="--media_io_kwargs") from error
+
     def _serve_llm():
         try:
             from tensorrt_llm.usage.usage_lib import _mark_llm_startup
@@ -1983,9 +1901,9 @@ def serve(
         # even when an explicit convenience flag targets the same nested field.
         llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
         if enable_sleep_mode and llm_args.get("sleep_config") is None:
-            llm_args["sleep_config"] = SleepConfig()
+            llm_args = {**llm_args, "sleep_config": SleepConfig()}
 
-        _resolve_default_num_serve_frontends(
+        llm_args = _resolve_default_num_serve_frontends(
             llm_args,
             requested=("num_serve_frontends" in explicit_cli_keys
                        or "num_serve_frontends" in llm_args_extra_dict),
@@ -1994,7 +1912,8 @@ def serve(
             report_addr=report_addr,
             enable_sleep_mode=enable_sleep_mode)
 
-        _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+        llm_args = _apply_effective_telemetry_config(llm_args,
+                                                     telemetry=telemetry)
         # Preserve requested settings for failures before entering the LLM constructor.
         try:
             from tensorrt_llm.usage.usage_lib import _capture_startup_context
@@ -2007,7 +1926,8 @@ def serve(
 
         # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
         # but disagg_cluster_uri takes precedence over cluster uri in config file
-        disagg_cluster_config = llm_args.pop("disagg_cluster", None)
+        disagg_cluster_config = llm_args.get("disagg_cluster")
+        llm_args = {k: v for k, v in llm_args.items() if k != "disagg_cluster"}
         if disagg_cluster_config:
             disagg_cluster_config = extract_disagg_cluster_config(
                 disagg_cluster_config, disagg_cluster_uri)
@@ -2025,17 +1945,6 @@ def serve(
             except KeyError:
                 raise ValueError(f"Invalid server role: {server_role}. " \
                                 f"Must be one of: {', '.join([role.name for role in ServerRole])}")
-        # Parse media_io_kwargs from JSON string to dict if provided
-        parsed_media_io_kwargs = None
-        if media_io_kwargs is not None:
-            try:
-                parsed_media_io_kwargs = json.loads(media_io_kwargs)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON for media_io_kwargs: {e}")
-
-        multimodal_server_config = MultimodalServerConfig(
-            media_io_kwargs=parsed_media_io_kwargs)
-
         if grpc:
             effective_num_serve_frontends = llm_args.get(
                 "num_serve_frontends", num_serve_frontends)
@@ -2082,9 +1991,9 @@ def serve(
                 from tensorrt_llm.grpc.smg.server import launch_smg_server
 
                 _check_context_only_settings(llm_args, warn=True)
-                launch_smg_server(host,
-                                  port,
-                                  llm_args,
+                launch_smg_server(host=host,
+                                  port=port,
+                                  llm_args=llm_args,
                                   served_model_name=served_model_name)
             else:
                 try:
@@ -2104,11 +2013,11 @@ def serve(
                 with _provision_kv_cache_pool(
                         llm_args,
                         owns_engine=not grpc_multi_frontend.is_attached_frontend
-                ):
+                ) as llm_args:
                     launch_grpc_server(
-                        host,
-                        port,
-                        llm_args,
+                        host=host,
+                        port=port,
+                        llm_args=llm_args,
                         served_model_name=served_model_name,
                         report_failure=_report_observed_child_failure,
                         enable_load_metrics=openengine_enable_load_metrics,
@@ -2119,16 +2028,16 @@ def serve(
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
-                host,
-                port,
-                llm_args,
-                tool_parser,
-                middleware,
-                chat_template,
-                metadata_server_cfg,
-                server_role,
-                disagg_cluster_config,
-                multimodal_server_config,
+                host=host,
+                port=port,
+                llm_args=llm_args,
+                tool_parser=tool_parser,
+                middleware=middleware,
+                chat_template=chat_template,
+                metadata_server_cfg=metadata_server_cfg,
+                server_role=server_role,
+                disagg_cluster_config=disagg_cluster_config,
+                multimodal_server_config=multimodal_server_config,
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
@@ -2147,12 +2056,12 @@ def serve(
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host,
-                                 port,
-                                 model,
-                                 parsed_visual_gen_args,
-                                 metadata_server_cfg,
-                                 middleware,
+        launch_visual_gen_server(host=host,
+                                 port=port,
+                                 model=model,
+                                 visual_gen_args=parsed_visual_gen_args,
+                                 metadata_server_cfg=metadata_server_cfg,
+                                 middleware=middleware,
                                  media_load_workers=num_media_load_workers)
 
     # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
@@ -2321,16 +2230,17 @@ def serve_encoder(
     encoder_args = update_llm_args_with_extra_dict(
         llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
-    _apply_effective_telemetry_config(encoder_args, telemetry=telemetry)
+    encoder_args = _apply_effective_telemetry_config(encoder_args,
+                                                     telemetry=telemetry)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
     launch_mm_encoder_server(
-        host,
-        port,
-        encoder_args,
-        metadata_server_cfg,
+        host=host,
+        port=port,
+        encoder_args=encoder_args,
+        metadata_server_cfg=metadata_server_cfg,
         allow_request_chat_template=allow_request_chat_template)
 
 
@@ -2375,7 +2285,7 @@ def _prepare_encode_only_llm_args(
     )
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
-    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+    llm_args = _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
     effective_tp = llm_args.get("tensor_parallel_size") or 1
     effective_pp = llm_args.get("pipeline_parallel_size") or 1
@@ -2493,8 +2403,12 @@ def serve_embedding(
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    launch_embedding_server(host, port, llm_args, max_queue_delay,
-                            max_queue_size, metadata_server_cfg)
+    launch_embedding_server(host=host,
+                            port=port,
+                            llm_args=llm_args,
+                            max_queue_delay=max_queue_delay,
+                            max_queue_size=max_queue_size,
+                            metadata_server_cfg=metadata_server_cfg)
 
 
 @click.command("rerank")
@@ -2618,7 +2532,9 @@ def serve_rerank(
                   "--request_timeout",
                   type=int,
                   default=180,
-                  help="Request timeout",
+                  help="Request timeout in seconds. A streamed response "
+                  "from a worker may run longer: it times out only after "
+                  "this many seconds without data.",
                   status="beta")
 @stability_option("-l",
                   '--log_level',
@@ -2736,17 +2652,16 @@ def disaggregated(
     # (c) num_workers==1, no external coordinator: a single disagg server with an
     # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = "server_coordinator"
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        # See launch_server: without this, TIME_WAIT tombstones from the
-        # connections this server accepted refuse a restart for ~60s.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((disagg_cfg.hostname, disagg_cfg.port))
-            if disagg_cfg.port == 0:
-                disagg_cfg.port = s.getsockname()[1]
-        except OSError as e:
-            raise _bind_failure("disaggregated server", disagg_cfg.hostname,
-                                disagg_cfg.port, e) from e
+    address_family = _listener_address_family("disaggregated server",
+                                              disagg_cfg.hostname,
+                                              disagg_cfg.port,
+                                              policy="ipv4")
+    with _bind_listener("disaggregated server",
+                        disagg_cfg.hostname,
+                        disagg_cfg.port,
+                        family=address_family) as s:
+        if disagg_cfg.port == 0:
+            disagg_cfg.port = s.getsockname()[1]
 
         _publish_bound_address(report_addr, disagg_cfg.hostname,
                                disagg_cfg.port)
@@ -2961,14 +2876,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         # the kernel always rejects with "invalid argument", because the scope id can
         # only be derived from an interface name. Binding AF_INET here also surfaces a
         # port conflict with the same diagnostics as the other two listeners.
-        coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            coord_socket.bind((public_host, coord_port))
-        except OSError as e:
-            coord_socket.close()
-            raise _bind_failure("coordinator", public_host, coord_port,
-                                e) from e
+        coord_socket = _bind_listener("coordinator",
+                                      public_host,
+                                      coord_port,
+                                      family=_listener_address_family(
+                                          "coordinator",
+                                          public_host,
+                                          coord_port,
+                                          policy="ipv4"))
 
         # 1. Launch the delegating fleet pointed at the implicit coordinator we start
         #    below (port-1 for TCP; UDS for the hot path). Workers hold
@@ -3137,7 +3052,9 @@ def _run_fleet_worker_impl():
     server = _build_disagg_server_from_env()
     host, port = server._config.hostname, server._config.port
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = socket.socket(
+        _listener_address_family("fleet worker", host, port, policy="ipv4"),
+        socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # SO_REUSEPORT: every worker binds the same (host, port); the kernel spreads
     # connections across the workers' accept queues by 4-tuple hash.
@@ -3388,7 +3305,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         llm_args = _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         # Ignore the non-LLM args
-        llm_args.pop("router", None)
+        llm_args = {k: v for k, v in llm_args.items() if k != "router"}
         _launch_disaggregated_server(config_file, llm_args)
         return
 

@@ -16,6 +16,12 @@
 
 # Model PATH of local dir synced from internal LLM models repo
 MODEL_PATH_DICT = {
+    "kimi_k3_nvfp4_dep8": "Kimi-K3-NVFP4",
+    "glm_5.3_flash_nvfp4_mtp_bf16_kv": "GLM-5.3-Flash-NVFP4",
+    "qwen3.8_flash_next_fp8_mtp_tep4": "Qwen3.8-Flash-Next-FP8",
+    "minimax_m3.1_flash_nvfp4": "MiniMax-M3.1-Flash",
+    "minimax_m3.1_flash_nvfp4_dspark": "MiniMax-M3.1-Flash",
+    "muse_spark_open_nvfp4_agentx": "Muse-Spark-Open-816B-A42B-NVFP4",
     "muse_spark_open_nvfp4": "Muse-Spark-Open-816B-A42B-NVFP4",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",

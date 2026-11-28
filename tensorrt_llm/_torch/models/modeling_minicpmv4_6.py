@@ -182,13 +182,11 @@ class MiniCPMV4_6VisionAttention(Attention):
             config=model_config,
             reduce_output=False,
             head_dim=config.hidden_size // config.num_attention_heads,
+            # Vision attention runs eagerly from the VL wrapper (outside the
+            # compiled LM region); unregistered, `forward_impl` uses the eager
+            # path with the vision-local `attn_metadata` instead of the LM's.
+            register_to_config=False,
         )
-        # Vision attention runs eagerly from the VL wrapper (outside the
-        # compiled LM region); unregister so `forward_impl` uses the eager path
-        # with the vision-local `attn_metadata` instead of the LM's.
-        if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers", {}).pop(self.layer_idx_str, None)
-            self.register_to_config = False
 
     def forward(
         self,
@@ -522,9 +520,9 @@ class MiniCPMV4_6VisionModel(nn.Module, MultimodalEncoderMixin):
         self.insert_layer_id = self.vision_config.insert_layer_id
 
         # Replicated, unquantized ModelConfig for the vision sub-modules.
-        # dataclasses.replace gives a fresh extra_attrs (init=False), so the
-        # vision attention's transient layer registration can't collide with
-        # the LLM's.
+        # dataclasses.replace gives a fresh extra_attrs (init=False), apart
+        # from the LLM's; vision attention does not register in it anyway
+        # (register_to_config=False).
         # NOTE: mapping=Mapping() (tp=1) is load-bearing for correctness, not
         # just perf. It makes the whole vision tower run REPLICATED on every
         # rank (all vision Linears use tensor_parallel_mode=None and vision
@@ -781,8 +779,6 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         do_rescale = True
         if images and isinstance(images[0], torch.Tensor):
             do_rescale = False
-        # load_video hands us CHW float frames already scaled to [0, 1], so
-        # the HF rescale (x / 255) must be skipped for video.
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
         call_kwargs = dict(
@@ -812,7 +808,7 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
     def get_num_tokens_per_video(self, *, video, video_metadata=None, **kwargs) -> int:
         # `video` is the list of pre-sampled frames (see find_mm_token_lengths).
         frames = video
-        do_rescale = not (frames and isinstance(frames[0], torch.Tensor))
+        do_rescale = not (len(frames) and isinstance(frames[0], torch.Tensor))
         processed = self.processor(
             text=[self.video_token_str],
             videos=[frames],

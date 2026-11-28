@@ -971,9 +971,7 @@ class Cosmos3EdgeInputProcessor(Qwen3VLInputProcessorBase):
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         # Benchmark clips are already sampled. Do not resample them to the
         # shared ten-frame default.
-        media_io_kwargs = super().get_preferred_media_io_kwargs()
-        media_io_kwargs["video"].update({"num_frames": -1, "fps": -1})
-        return media_io_kwargs
+        return {"video": {"num_frames": -1, "fps": -1}}
 
 
 def _edge_positional_embedding_params(config) -> PositionalEmbeddingParams:
@@ -1016,6 +1014,7 @@ class Cosmos3EdgeModel(Qwen3VLModelBase):
     supported_encoder_attention_backends = {"vision": frozenset()}
 
     supports_encoder_cache = True
+    supports_multimodal_breakable_cuda_graph = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         omni_config = model_config.pretrained_config

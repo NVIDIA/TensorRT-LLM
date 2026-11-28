@@ -345,6 +345,11 @@ class Gemma4VisionAttention(Attention):
             config=model_config,
             q_scaling=q_scaling,
             head_dim=padded_head_dim,
+            # Vision attention runs from the multimodal wrapper with tower-local
+            # metadata. Unregistered, it never takes the custom-op path
+            # (torch.compile or breakable CUDA graph), which reads the decoder's
+            # metadata (same as Qwen2_5_VLVisionAttention).
+            register_to_config=False,
         )
         self.vision_config = vision_config
         # ``self.head_dim`` is now ``padded_head_dim`` (the kernel-facing value).

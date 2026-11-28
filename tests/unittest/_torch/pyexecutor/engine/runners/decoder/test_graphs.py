@@ -35,6 +35,61 @@ from tensorrt_llm.mapping import Mapping
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    ("model_kind", "has_ple"),
+    [
+        ("plain", False),
+        ("text", False),
+        ("text", True),
+        ("vlm", False),
+        ("vlm", True),
+        ("compiled_text", False),
+        ("compiled_text", True),
+        ("compiled_vlm", False),
+        ("compiled_vlm", True),
+    ],
+)
+def test_context_promotion_follows_qwen4_exp_ple(model_kind: str, has_ple: bool) -> None:
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import (
+        Qwen4ExpForCausalLM,
+        Qwen4ExpForConditionalGeneration,
+    )
+
+    model = torch.nn.Identity()
+    if model_kind != "plain":
+        text_model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+        torch.nn.Module.__init__(text_model)
+        text_model.model = torch.nn.Identity()
+        text_model.model.has_ple = has_ple
+        if model_kind.startswith("compiled"):
+            # Production compiles the decoder inside the causal LM.
+            text_model.model = torch.compile(text_model.model, backend="eager")
+        model = text_model
+        if "vlm" in model_kind:
+            model = Qwen4ExpForConditionalGeneration.__new__(Qwen4ExpForConditionalGeneration)
+            torch.nn.Module.__init__(model)
+            model.llm = text_model
+
+    graphs = decoder_graphs(decoder_config(), model=model)
+    graphs.cuda_graph_runner.enabled = True
+    context = _make_request_stub(10, prompt_len=1)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [context]
+
+    graph_batch, promoted_ids = graphs.promote_final_contexts(
+        batch,
+        SimpleNamespace(context_swa_layer_limit=None),
+        enable_spec_decode=False,
+        runtime_draft_len=0,
+        ced_enabled=False,
+    )
+
+    blocked = model_kind != "plain" and has_ple
+    assert promoted_ids == (frozenset() if blocked else frozenset({10}))
+    assert (graph_batch is batch) is blocked
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     ("runner_type", "graphs_path"),
     [
         (
@@ -905,6 +960,91 @@ def test_prefill_capture_skips_break_graphs_without_graphable_breaks(
     # Bucket 128 exceeds max_num_tokens // 4, so only bucket 16 is a candidate.
     captured = [c.args[1] for c in capture_break_graphs.call_args_list]
     assert captured == ([16] if graphable_breaks else [])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peers_agree", [False, True])
+def test_prefill_capture_gates_are_agreed_across_ranks(peers_agree: bool) -> None:
+    """Each bucket is captured, and its break graphs too, on all ranks or none, so the
+    ranks keep the same buckets and the prefill graph vote picks one for all of them."""
+    dummy_requests = MagicMock()
+    dummy_requests.release_batch_context.return_value.__enter__.return_value = object()
+    graphs = decoder_graphs(
+        decoder_config(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[16],
+            max_num_tokens=256,
+        ),
+        dummy_requests=dummy_requests,
+    )
+    graphs._metadata.attn_metadata.decoder_replay_plan = None
+    runner = Mock(metrics={}, num_break_graphs=0)
+    runner.capture.side_effect = lambda num_tokens, forward, scope, can_capture: can_capture()
+    runner.has_graphable_breaks.return_value = True
+    graphs.breakable_cuda_graph_runner = runner
+    graphs._metrics = collections.defaultdict(float)
+    local_flags = []
+
+    def agree_flag(flag: bool) -> bool:
+        # Stand-in for the all-gather: a peer answers peers_agree.
+        local_flags.append(flag)
+        return flag and peers_agree
+
+    with (
+        patch.object(graphs._agreement, "agree_flag", side_effect=agree_flag),
+        patch.object(graphs, "_capture_break_graphs") as capture_break_graphs,
+        patch("torch.cuda.mem_get_info", return_value=(0, 0)),
+        patch("torch.cuda.synchronize"),
+    ):
+        graphs._capture_prefill_cuda_graphs(ResourceManager({}))
+
+    # Capture, then break graphs: this rank says yes to both, and its peer decides.
+    assert local_flags == [True, True]
+    assert capture_break_graphs.call_count == int(peers_agree)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("vote_passed", [False, True])
+def test_prefill_step_reaches_the_staged_input_vote_only_after_the_graph_vote(
+    vote_passed: bool,
+) -> None:
+    """The staged-input agreement runs inside BreakableCUDAGraphRunner.execute, so a step
+    the prefill graph vote turned down runs eagerly with no added all-gather."""
+    from tensorrt_llm._torch.utils import (
+        get_per_request_prefill_cuda_graph_flag,
+        set_per_request_prefill_cuda_graph_flag,
+    )
+
+    graphs = decoder_graphs(
+        decoder_config(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[8],
+        )
+    )
+    runner = Mock(is_capturing_break_graphs=False, is_warming_up=False)
+    runner.has_graph.return_value = True
+    graphs.breakable_cuda_graph_runner = runner
+    run_model = Mock()
+    incoming_flag = get_per_request_prefill_cuda_graph_flag()
+    set_per_request_prefill_cuda_graph_flag(vote_passed)
+    try:
+        graphs._run(
+            None,
+            {"input_ids": torch.zeros(8, dtype=torch.int)},
+            run_model,
+            Mock(),
+            attn_metadata=None,
+            draft_kv_cache_manager=None,
+            moe_load_balancer=None,
+            enable_spec_decode=False,
+            gather_context_logits=False,
+            position_id_offsets=None,
+        )
+    finally:
+        set_per_request_prefill_cuda_graph_flag(incoming_flag)
+
+    assert runner.execute.call_count == int(vote_passed)
+    assert run_model.call_count == int(not vote_passed)
 
 
 class _SplitMetadata:

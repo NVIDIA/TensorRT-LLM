@@ -1705,16 +1705,25 @@ def test_swa_table_backing_stays_fixed_across_publication_and_fallback(published
     outer = torch.arange(16, dtype=torch.int32).reshape(2, 2, 4)
     published = outer[:, 0, :3]
     host = torch.full((2, 3), 17, dtype=torch.int32)
-    first = metadata._bind_swa_pages(0, host, published if published_first else None)
+
+    def bind(source):
+        copies = []
+        result = metadata._bind_swa_pages(0, host, source, copies)
+        if copies:
+            targets, sources = zip(*copies)
+            torch._foreach_copy_(targets, sources, non_blocking=True)
+        return result
+
+    first = bind(published if published_first else None)
     pointer, stride = first.data_ptr(), first.stride()
     assert (pointer == published.data_ptr()) == published_first
     # Direct fallback refreshes captured backing, even when that backing is an
     # outer-table view rather than the old private contiguous allocation.
-    fallback = metadata._bind_swa_pages(0, host, None)
+    fallback = bind(None)
     assert (fallback.data_ptr(), fallback.stride()) == (pointer, stride)
     torch.testing.assert_close(fallback, host, atol=0, rtol=0)
     other = torch.full((2, 2, 4), 29, dtype=torch.int32)[:, 0, :3]
-    normal = metadata._bind_swa_pages(0, host, other)
+    normal = bind(other)
     assert (normal.data_ptr(), normal.stride()) == (pointer, stride)
     torch.testing.assert_close(normal, other, atol=0, rtol=0)
 

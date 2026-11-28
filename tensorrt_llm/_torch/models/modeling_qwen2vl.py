@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
+from transformers.image_utils import is_scaled_image as _is_scaled_image
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed, Qwen2_5_VisionTransformerPretrainedModel)
@@ -86,6 +87,46 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
 
+def _qwen_processor_for_media(processor, kwargs, images, videos):
+    """Set per-request rescaling while keeping HF's other options in their original scope."""
+    if "do_rescale" in kwargs:
+        return processor
+
+    def scaled_arrays(items):
+        # A black image or clip fits in [0, 1] even in a batch of raw pixels.
+        return isinstance(items[0], np.ndarray) and all(
+            np.issubdtype(item.dtype, np.floating) and _is_scaled_image(item)
+            for item in items if isinstance(item, np.ndarray))
+
+    rescale = {}
+    if images:
+        rescale["images_kwargs"] = not (isinstance(images[0], torch.Tensor)
+                                        or scaled_arrays(images))
+    if videos:
+        rescale["videos_kwargs"] = not (isinstance(videos[0][0], torch.Tensor)
+                                        or scaled_arrays(videos))
+    if len(set(rescale.values())) < 2 and not rescale.keys() & kwargs.keys():
+        kwargs["do_rescale"] = next(iter(rescale.values()), True)
+        return processor
+
+    local = processor
+    for name, value in rescale.items():
+        if name in kwargs:
+            kwargs[name] = {"do_rescale": value, **kwargs[name]}
+            continue
+        # Creating a modality dictionary would hide caller options such as
+        # frame sampling in Transformers 5.5. Adjust only the component default.
+        attr = "image_processor" if name == "images_kwargs" else "video_processor"
+        component = getattr(processor, attr)
+        if component.do_rescale != value:
+            if local is processor:
+                local = copy.copy(processor)
+            component = copy.copy(component)
+            component.do_rescale = value
+            setattr(local, attr, component)
+    return local
+
+
 def _prepare_qwen_vl_mrope_config(
     *,
     multimodal_params: List[MultimodalParams],
@@ -141,6 +182,32 @@ def _prepare_qwen_vl_mrope_config(
                 0, mrope_delta_read_seq_slots).unsqueeze(1)
 
     return mrope_config
+
+
+def _pad_qwen_vl_mrope_deltas(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Pad the MRoPE generation deltas of breakable prefill graph inputs.
+
+    `_prepare_qwen_vl_mrope_config` gives one delta per generation request.
+    Pad them to the token count so their shape does not depend on the batch.
+    Updates and returns `inputs`.
+    """
+    mrope_config = inputs.get("mrope_config")
+    if mrope_config is None or "mrope_rotary_cos_sin" not in mrope_config:
+        return inputs
+    num_tokens = inputs["inputs_embeds"].shape[0]
+    padded_deltas = torch.zeros((num_tokens, 1),
+                                dtype=torch.int32,
+                                device=inputs["inputs_embeds"].device)
+    deltas = mrope_config.get("mrope_position_deltas")
+    if deltas is not None:
+        if deltas.numel() > num_tokens:
+            raise ValueError(
+                "MRoPE generation deltas exceed the prefill token count")
+        # Generation kernels index deltas from zero, without a context-request offset.
+        padded_deltas[:deltas.numel()].copy_(deltas.reshape(-1, 1))
+    inputs["mrope_config"] = dict(mrope_config,
+                                  mrope_position_deltas=padded_deltas)
+    return inputs
 
 
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
@@ -1230,11 +1297,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             videos = [video_data.frames for video_data in video_datas]
         else:
             videos = None
-        do_rescale = True
-        if images and isinstance(images[0], torch.Tensor):
-            do_rescale = False
-        if videos and isinstance(videos[0][0], torch.Tensor):
-            do_rescale = False
+        proc_kwargs = dict(mm_processor_kwargs)
+        processor = _qwen_processor_for_media(self.processor, proc_kwargs,
+                                              images, videos)
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
@@ -1244,13 +1309,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # 'video_grid_thw'``. ``_install_processor_output_validation_filter``
         # (called from ``__init__``) installs a process-wide filter that drops
         # those keys before the validator sees them.
-        return self.processor(text=[text],
-                              images=images,
-                              videos=videos,
-                              padding=True,
-                              do_rescale=do_rescale,
-                              return_tensors='pt',
-                              **mm_processor_kwargs)
+        return processor(text=[text],
+                         images=images,
+                         videos=videos,
+                         padding=True,
+                         return_tensors='pt',
+                         **proc_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         # Keep image / vision / video placeholders in-vocab; the model engine
@@ -1683,22 +1747,18 @@ class Qwen2_5_VLVisionAttention(Attention):
             # hidden_size; don't inherit head_dim mirrored from the text
             # sub-config onto the top-level pretrained_config.
             head_dim=config.hidden_size // config.num_heads,
+            # Vision attention runs from the outer VL wrapper (outside the
+            # compiled LM region). A registered layer would take
+            # `attn_custom_op_inplace` under torch.compile or a breakable
+            # CUDA graph, which looks `attention_metadata` up in the global
+            # `extra_attrs` -- the LM decoder's metadata, set by
+            # `DecoderRunner._model_forward` -- so vision FMHA would get the
+            # LM's S/num_contexts with vision's head_dim and dispatch fails
+            # (`FMHA kernels are not found ... D: <vision_head_dim>`).
+            # Unregistered, `forward_impl` takes the eager path that uses
+            # vision's own `attn_metadata`.
+            register_to_config=False,
         )
-        # Vision attention runs from the outer VL wrapper (outside the
-        # compiled LM region). When `set_torch_compiling(True)` is set
-        # for the LM, `forward_impl` would otherwise dispatch vision
-        # through `attn_custom_op_inplace`, which looks
-        # `attention_metadata` up in the global `extra_attrs` --
-        # that slot is populated by `DecoderRunner._model_forward` with
-        # the LM decoder's metadata, so vision FMHA receives the LM's
-        # S/num_contexts with vision's head_dim and dispatch fails
-        # (`FMHA kernels are not found ... D: <vision_head_dim>`).
-        # Unregister so `forward_impl` falls back to the eager path
-        # that uses vision's own `attn_metadata`.
-        if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers",
-                                         {}).pop(self.layer_idx_str, None)
-            self.register_to_config = False
 
     def apply_rope(self,
                    q: torch.Tensor,
@@ -2350,6 +2410,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     }
 
     supports_mm_encoder_item_scheduling = True
+    supports_multimodal_breakable_cuda_graph = True
 
     def get_multimodal_item_partitions(
         self,
@@ -2413,24 +2474,13 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
                             device='cuda'),
                 persistent=False)
 
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         text_config = getattr(llm_model_config.pretrained_config, 'text_config',
                               None)
         if text_config is not None:
             llm_model_config.pretrained_config = text_config
         llm_model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
-        # The LM's attention modules look themselves up in the global
-        # `extra_attrs` that `DecoderRunner._model_forward` binds via
-        # `with_model_extra_attrs(self._model.extra_attrs)` -- the
-        # outer wrapper's dict. Without sharing, `llm_model_config`
-        # carries a deep-copied dict, so LM `attn_custom_op_inplace`
-        # (used under `set_torch_compiling(True)`) fails its layer
-        # lookup and the piecewise-CUDA-graph dynamo trace blows up
-        # at the LM's `o_proj` call. Vision attention unregisters
-        # itself from this dict in `Qwen2_5_VLVisionAttention.__init__`
-        # so it does not poison LM lookups.
-        llm_model_config.extra_attrs = model_config.extra_attrs
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         # Normal worker owns encoder. MM E/P prefill worker gets attached embeddings.
@@ -2488,6 +2538,16 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
+
+    def prepare_breakable_cuda_graph_inputs(
+            self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        return _pad_qwen_vl_mrope_deltas(
+            super().prepare_breakable_cuda_graph_inputs(inputs))
+
+    def breakable_cuda_graph_input_buffers(self) -> tuple[torch.Tensor, ...]:
+        if hasattr(self, 'mrope_rotary_cos_sin_workspace'):
+            return (self.mrope_rotary_cos_sin_workspace, )
+        return ()
 
     def encode_multimodal_inputs(self,
                                  multimodal_params: List[MultimodalParams],

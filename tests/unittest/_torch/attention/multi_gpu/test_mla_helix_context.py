@@ -170,6 +170,15 @@ def test_k3_mla_helix_owned_prefill(fp8, fp8_cache, gate, tp_size, cp_size, num_
             marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs"),
         ),
         pytest.param(True, False, 1, 2, 6, id="fp8-no-gate-tp1-cp2-unaligned-q-scale-block"),
+        pytest.param(
+            False,
+            False,
+            1,
+            4,
+            32,
+            id="bf16-no-gate-tp1-cp4",
+            marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs"),
+        ),
     ],
 )
 def test_k3_mla_helix_context_heads(fp8, gate, tp_size, cp_size, num_heads):

@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import needs_multimodal_encoder
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.context_logits import context_logits_heads, context_logits_scope
@@ -85,7 +86,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...model_call import ModelCaller
-from ...multimodal import MultimodalItemScheduler
+from ...multimodal import MultimodalItemScheduler, keeps_text_prefill_body
 from ..common import make_scheduled_inputs
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
@@ -340,6 +341,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs.attach_cuda_graph_runners(
             self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
         )
+        self._metadata.keep_steady_growth_blocks = self._inputs.steady_decode_prepare_enabled
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -636,11 +638,20 @@ class DecoderRunner(ScheduledModelRunner):
         if self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return None
 
-        decoder_model = (
-            self._model
-            if isinstance(self._model, DecoderModelForCausalLM)
-            else getattr(self._model, "llm", None)
-        )
+        prepare_inputs = input_buffers = None
+        if isinstance(self._model, MultimodalModelMixin) and not keeps_text_prefill_body(
+            self._model, self._model.model_config.disable_mm_encoder
+        ):
+            # Fused embeddings are new tensors every step, so replay must refresh them.
+            decoder_model = self._model.language_model
+            prepare_inputs = self._model.prepare_breakable_cuda_graph_inputs
+            input_buffers = self._model.breakable_cuda_graph_input_buffers
+        else:
+            decoder_model = (
+                self._model
+                if isinstance(self._model, DecoderModelForCausalLM)
+                else getattr(self._model, "llm", None)
+            )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
         logger.info(
@@ -650,7 +661,24 @@ class DecoderRunner(ScheduledModelRunner):
         return BreakableCUDAGraphRunner(
             decoder_model.model,
             getattr(decoder_model, "prepare_breakable_cuda_graph_replay", None),
+            prepare_inputs,
+            self._all_ranks_replay
+            if prepare_inputs is not None
+            and self._config.enable_attention_dp
+            and self._mapping.tp_size > 1
+            else None,
+            input_buffers,
         )
+
+    def _all_ranks_replay(self, replayable: bool) -> bool:
+        """Agree on a staged-input check across attention DP ranks, as the prefill graph vote does.
+
+        Each rank checks its staged inputs during the forward, after that vote
+        (DecoderInputPreparer), so every rank replays or every rank runs eagerly.
+        With one TP rank there is nothing to agree on, as in the decode graph
+        agreement (CUDAGraphRunner._agree_graph_shape).
+        """
+        return bool(self._dist.tp_allgather_int64([int(replayable)])[:, 0].all())
 
     @property
     def _use_beam_search(self) -> bool:
@@ -698,14 +726,17 @@ class DecoderRunner(ScheduledModelRunner):
         )
         assert kv_cache_manager is not None, "the legacy runner requires a KV cache manager"
         semantic_requests = scheduled_requests
-        context_plan = (
+        output_plan = (
             ContextLogitsPlan.for_batch(
                 self._context_logits_heads,
                 semantic_requests,
                 is_spec_decode=self._config.is_spec_decode or enable_spec_decode,
             )
-            if gather_context_logits
+            if gather_context_logits and self._mapping.is_last_pp_rank()
             else None
+        )
+        context_plan = (
+            output_plan if output_plan is not None and output_plan.project_in_forward else None
         )
         scheduled_requests = self._graphs.attention_dp_execution_batch(
             scheduled_requests, runtime_draft_len
@@ -953,6 +984,7 @@ class DecoderRunner(ScheduledModelRunner):
                     enable_spec_decode=enable_spec_decode,
                     gather_context_logits=gather_context_logits,
                     static_inputs_staged=prepared.static_inputs_staged,
+                    pre_replay_staged=prepared.pre_replay_staged,
                     position_id_offsets=(
                         self._buffers.previous_pos_id_offsets_cuda
                         if enable_spec_decode
@@ -976,6 +1008,16 @@ class DecoderRunner(ScheduledModelRunner):
 
             if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:
                 outputs = self._logits_for_greedy_tokens(semantic_requests, outputs)
+            if output_plan is not None and output_plan.replay_rows and not output_plan.handled:
+                # A custom LM head can return all physical rows. Normalize them
+                # before post-processors, HandleLogits and sampling share the result.
+                logits = outputs.get("logits") if isinstance(outputs, dict) else None
+                if isinstance(logits, torch.Tensor) and not logits.is_nested and logits.ndim == 2:
+                    outputs = {
+                        **outputs,
+                        "logits": output_plan.store_full_logits(logits),
+                        "context_logits_handled": True,
+                    }
             self._execute_logit_post_processors(semantic_requests, outputs, pending_beam_histories)
 
             if not isinstance(outputs, dict):
@@ -1386,6 +1428,11 @@ class DecoderRunner(ScheduledModelRunner):
     @_dspark_device_budget.setter
     def _dspark_device_budget(self, value) -> None:
         self._inputs._dspark_device_budget = value
+
+    @property
+    def steady_mtp_reads_output_rows(self) -> bool:
+        """Whether steady MTP graph prepare can read the previous step's output rows."""
+        return self._graphs.enabled and self._inputs.steady_decode_prepare_enabled
 
     @property
     def previous_request_ids(self):

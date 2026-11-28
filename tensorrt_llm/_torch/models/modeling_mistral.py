@@ -834,13 +834,6 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
     def get_vocab_size(self) -> int:
         return self.config.get_text_config().vocab_size
 
-    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # A uint8 (H, W, C) array: the loaders decode a JPEG into it with
-        # torchvision, and the request's multimodal hash reads it in place.
-        # The processor converts it to the PIL image mistral-common encodes,
-        # without changing a pixel.
-        return {"image": {"format": "np"}}
-
     def get_mm_token_ids(self) -> torch.Tensor:
         return torch.tensor([
             self.processor.image_token_id,
@@ -1106,10 +1099,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         )
 
     @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
-
-    @property
     def lora_owner(self) -> DecoderLoraOwner:
         if not isinstance(self.llm, MistralForCausalLM):
             raise NotImplementedError(
@@ -1120,10 +1109,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._image_token_ids
-
-    @property
-    def text_embedding_layer(self) -> Embedding:
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:

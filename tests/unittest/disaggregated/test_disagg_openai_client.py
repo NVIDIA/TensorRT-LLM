@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import errno
 import json
 import socket
@@ -20,11 +21,14 @@ import struct
 import zlib
 from contextlib import aclosing
 from io import BytesIO
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
 import msgspec
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -1342,6 +1346,1308 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+
+class TestRequestTimeout:
+    """What timeout_secs (--request_timeout) bounds on a worker's response.
+
+    A streamed response is bounded by silence, so a long generation completes
+    while data keeps arriving. A non-streamed response is bounded by its total
+    time. The bounds are enforced by aiohttp's transport, so these tests run a
+    real worker server and a client that builds its own session, as the
+    disaggregated server does.
+    """
+
+    _TIMEOUT_SECS = 1
+    # Eight chunks a quarter of the timeout apart: twice the timeout in total,
+    # never silent for more than a quarter of it.
+    _CHUNKS = 8
+    _INTERVAL_SECS = 0.25
+
+    @staticmethod
+    def _request(stream: bool, prompt: str = "hi") -> CompletionRequest:
+        return CompletionRequest(
+            model="m",
+            prompt=prompt,
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only", first_gen_tokens=[7], ctx_request_id=1
+            ),
+        )
+
+    @staticmethod
+    async def _open_response(request: web.Request, content_type: str) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": content_type})
+        await response.prepare(request)
+        return response
+
+    @contextlib.asynccontextmanager
+    async def _worker(self, handler, timeout_secs=None):
+        """Serve handler as a worker's /v1/completions; yield a client of it and its router."""
+        app = web.Application()
+        app.router.add_post("/v1/completions", handler)
+        async with TestServer(app) as server:
+            _reset_prometheus_registry()
+            router = AsyncMock(spec=Router)
+            router.get_next_server = AsyncMock(return_value=(f"{server.host}:{server.port}", None))
+            client = OpenAIHttpClient(
+                router=router,
+                role=ServerRole.GENERATION,
+                timeout_secs=self._TIMEOUT_SECS if timeout_secs is None else timeout_secs,
+                max_retries=0,
+            )
+            try:
+                yield client, router
+            finally:
+                await client.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_a_stream_longer_than_the_timeout_completes_while_data_keeps_arriving(self):
+        expected = b"".join(f"data: {index}\n\n".encode() for index in range(self._CHUNKS))
+
+        async def generate(request):
+            response = await self._open_response(request, "text/event-stream")
+            for index in range(self._CHUNKS):
+                await asyncio.sleep(self._INTERVAL_SECS)
+                await response.write(f"data: {index}\n\n".encode())
+            return response
+
+        loop = asyncio.get_running_loop()
+        async with self._worker(generate) as (client, router):
+            started = loop.time()
+            response = await client.send_request(self._request(stream=True))
+            received = b"".join([chunk async for chunk in response])
+            elapsed = loop.time() - started
+
+        assert elapsed > self._TIMEOUT_SECS, "the stream must outlast the timeout to test it"
+        assert received == expected
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout_secs", [0, -1])
+    async def test_nonpositive_timeout_allows_delayed_headers_and_stream_data(self, timeout_secs):
+        async def generate(request):
+            await asyncio.sleep(0.05)
+            response = await self._open_response(request, "text/event-stream")
+            await asyncio.sleep(0.05)
+            await response.write(b"data: hello\n\n")
+            await asyncio.sleep(0.05)
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        async with self._worker(generate, timeout_secs=timeout_secs) as (client, router):
+            with patch.object(client._session, "post", wraps=client._session.post) as post:
+                response = await client.send_request(self._request(stream=True))
+                received = b"".join([chunk async for chunk in response])
+
+            post.assert_called_once()
+            timeout = post.call_args.kwargs["timeout"]
+            assert timeout.total is None
+            assert timeout.connect is None
+            assert timeout.sock_read is None
+
+        assert received == b"data: hello\n\ndata: [DONE]\n\n"
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_stream_silent_for_longer_than_the_timeout_fails(self):
+        async def stall(request):
+            response = await self._open_response(request, "text/event-stream")
+            await response.write(b'data: "first"\n\n')
+            # Far longer than the timeout; the stream would end cleanly here if
+            # nothing bounded the silence.
+            await asyncio.sleep(self._TIMEOUT_SECS * 10)
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        received = []
+        async with self._worker(stall) as (client, router):
+            response = await client.send_request(self._request(stream=True))
+            with pytest.raises(asyncio.TimeoutError):
+                async for chunk in response:
+                    received.append(chunk)
+
+        assert b"".join(received) == b'data: "first"\n\n'
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_stream_whose_request_the_worker_does_not_read_fails(self):
+        client_gave_up = asyncio.Event()
+
+        async def stall_before_reading(request):
+            # Far longer than the timeout unless the client gives up first; the
+            # stream would end cleanly here if nothing bounded sending the request.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(client_gave_up.wait(), self._TIMEOUT_SECS * 10)
+            response = await self._open_response(request, "text/event-stream")
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        # Far more than the socket buffers between client and worker hold, so
+        # sending it waits for the worker to read it.
+        request = self._request(stream=True, prompt="x" * (32 << 20))
+        async with self._worker(stall_before_reading) as (client, router):
+            response = await client.send_request(request)
+            with pytest.raises(asyncio.TimeoutError):
+                _ = [chunk async for chunk in response]
+            # A worker that is not reading cannot see the client leave, so
+            # release it rather than have the server's shutdown wait out the stall.
+            client_gave_up.set()
+
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_non_streamed_response_is_bounded_by_its_total_time(self):
+        body = json.dumps(TestOpenAIHttpClient().dummy_response().model_dump()).encode()
+        piece = -(-len(body) // self._CHUNKS)
+
+        async def trickle(request):
+            response = await self._open_response(request, "application/json")
+            for start in range(0, len(body), piece):
+                await asyncio.sleep(self._INTERVAL_SECS)
+                await response.write(body[start : start + piece])
+            return response
+
+        async with self._worker(trickle) as (client, router):
+            with pytest.raises(asyncio.TimeoutError):
+                await client.send_request(self._request(stream=False))
+
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_request_still_bounds_connecting(
+        self, openai_client, streaming_completion_request, mock_session
+    ):
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "text/event-stream"}
+
+        async def chunks():
+            yield b"data: [DONE]\n\n"
+
+        http_response.content.iter_any = chunks
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        mock_session.post.return_value = http_response
+
+        response = await openai_client.send_request(streaming_completion_request)
+        _ = [chunk async for chunk in response]
+
+        timeout = mock_session.post.call_args.kwargs["timeout"]
+        assert (timeout.total, timeout.connect, timeout.sock_read) == (None, 180, 180)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout_secs", [0, -1])
+    async def test_a_timeout_that_is_not_positive_does_not_bound_the_response_start(
+        self, mock_router, mock_session, completion_request, monkeypatch, timeout_secs
+    ):
+        import tensorrt_llm.serve.openai_client as openai_client_mod
+
+        bounds = []
+        orig_enter = openai_client_mod._enter_with_deadline
+
+        async def recording_enter(request, timeout):
+            bounds.append(timeout)
+            return await orig_enter(request, timeout)
+
+        monkeypatch.setattr(openai_client_mod, "_enter_with_deadline", recording_enter)
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=timeout_secs,
+            session=mock_session,
+        )
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json.return_value = TestOpenAIHttpClient().dummy_response().model_dump()
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        mock_session.post.return_value = http_response
+
+        response = await client.send_request(completion_request)
+
+        assert isinstance(response, CompletionResponse)
+        assert bounds == [None]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "use_py310_fallback", [False, True], ids=["py311_timeout", "py310_wait"]
+    )
+    async def test_response_start_cancel_in_same_turn_as_headers_propagates_and_cleans_up(
+        self, mock_router, mock_session, monkeypatch, use_py310_fallback
+    ):
+        """Cancelling the caller in the same turn headers arrive must not swallow cancellation."""
+        import tensorrt_llm.serve.openai_client as openai_client_mod
+
+        if use_py310_fallback:
+            monkeypatch.setattr(
+                openai_client_mod,
+                "_enter_with_deadline",
+                lambda req, timeout: (
+                    req.__aenter__()
+                    if timeout is None
+                    else openai_client_mod._enter_with_wait(req, timeout)
+                ),
+            )
+
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        headers_ready: asyncio.Future[None] = loop.create_future()
+        enter_task = None
+        chunks_read = 0
+
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "text/event-stream"}
+        http_response.close = Mock()
+
+        async def iter_any():
+            nonlocal chunks_read
+            chunks_read += 1
+            yield b'data: "should-not-be-read"\n\n'
+
+        http_response.content.iter_any = iter_any
+
+        class _PendingHeadersRequest:
+            async def __aenter__(self):
+                nonlocal enter_task
+                enter_task = asyncio.current_task()
+                entered.set()
+                try:
+                    await headers_ready
+                except BaseException:
+                    http_response.close()
+                    raise
+                return http_response
+
+            async def __aexit__(self, exc_type, exc, tb):
+                http_response.close()
+                return False
+
+        mock_session.post.return_value = _PendingHeadersRequest()
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=10,
+            max_retries=0,
+            session=mock_session,
+        )
+
+        async def consume():
+            gen = await client.send_request(self._request(stream=True))
+            async with aclosing(gen):
+                async for _ in gen:
+                    pass
+
+        consumer_task = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+            if use_py310_fallback:
+                await asyncio.sleep(0)
+
+            # Make headers ready and cancel the caller in the same event-loop turn.
+            headers_ready.set_result(None)
+            consumer_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await consumer_task
+        finally:
+            if not consumer_task.done():
+                consumer_task.cancel()
+                await asyncio.gather(consumer_task, return_exceptions=True)
+
+        if not use_py310_fallback and hasattr(asyncio, "timeout"):
+            assert enter_task is consumer_task
+        assert chunks_read == 0
+        http_response.close.assert_called_once()
+        mock_router.finish_request.assert_awaited_once()
+        assert mock_router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "use_py310_fallback", [False, True], ids=["py311_timeout", "py310_wait"]
+    )
+    async def test_response_start_deadline_plus_caller_cancel_preserves_cancellation(
+        self, mock_router, mock_session, monkeypatch, use_py310_fallback
+    ):
+        """A deadline firing in the same turn as caller cancellation must propagate CancelledError."""
+        import tensorrt_llm.serve.openai_client as openai_client_mod
+
+        if use_py310_fallback:
+            monkeypatch.setattr(
+                openai_client_mod,
+                "_enter_with_deadline",
+                lambda req, timeout: (
+                    req.__aenter__()
+                    if timeout is None
+                    else openai_client_mod._enter_with_wait(req, timeout)
+                ),
+            )
+
+        loop = asyncio.get_running_loop()
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "text/event-stream"}
+        http_response.close = Mock()
+        consumer_ref: list[asyncio.Task] = []
+
+        class _SlowHeadersRequest:
+            async def __aenter__(self):
+                # Schedule caller cancellation for the exact same loop turn as the 0s deadline.
+                loop.call_later(0, consumer_ref[0].cancel)
+                try:
+                    await loop.create_future()
+                except BaseException:
+                    http_response.close()
+                    raise
+                return http_response
+
+            async def __aexit__(self, exc_type, exc, tb):
+                http_response.close()
+                return False
+
+        mock_session.post.return_value = _SlowHeadersRequest()
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=1,
+            max_retries=0,
+            session=mock_session,
+        )
+        client._response_start_timeout_secs = 0.0
+
+        async def consume():
+            gen = await client.send_request(self._request(stream=True))
+            async with aclosing(gen):
+                async for _ in gen:
+                    pass
+
+        consumer_task = asyncio.create_task(consume())
+        consumer_ref.append(consumer_task)
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await consumer_task
+        finally:
+            if not consumer_task.done():
+                consumer_task.cancel()
+                await asyncio.gather(consumer_task, return_exceptions=True)
+
+        http_response.close.assert_called_once()
+        mock_router.finish_request.assert_awaited_once()
+        assert mock_router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_enter_with_wait_repeated_cancellation_still_closes_entered_response(self):
+        """A second cancellation while draining __aenter__ must still close a returned response."""
+        from tensorrt_llm.serve.openai_client import _enter_with_wait
+
+        loop = asyncio.get_running_loop()
+        response = Mock()
+        response.close = Mock()
+        aexit_calls: list[tuple[Any, Any, Any]] = []
+        entered = asyncio.Event()
+        drain_started = asyncio.Event()
+        caller_ref: list[asyncio.Task] = []
+
+        class _LateReturnRequest:
+            async def __aenter__(self):
+                entered.set()
+                try:
+                    await loop.create_future()
+                except asyncio.CancelledError:
+                    # Cancel the caller a second time while it drains gather(), then
+                    # finish __aenter__() with a response that must still be closed.
+                    drain_started.set()
+                    caller_ref[0].cancel()
+                    return response
+
+            async def __aexit__(self, exc_type, exc, tb):
+                aexit_calls.append((exc_type, exc, tb))
+                response.close()
+                return False
+
+        async def call_enter():
+            return await _enter_with_wait(_LateReturnRequest(), timeout_secs=5.0)
+
+        caller_task = asyncio.create_task(call_enter())
+        caller_ref.append(caller_task)
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        caller_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller_task
+        assert drain_started.is_set()
+        assert len(aexit_calls) == 1
+        response.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_enter_with_wait_stalled_headers_raises_timeout_error_not_cancelled(self):
+        """Ordinary response-start timeout on Python 3.10 fallback raises TimeoutError."""
+        from tensorrt_llm.serve.openai_client import _enter_with_wait
+
+        loop = asyncio.get_running_loop()
+
+        class _NeverHeadersRequest:
+            async def __aenter__(self):
+                await loop.create_future()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with pytest.raises(asyncio.TimeoutError):
+            await _enter_with_wait(_NeverHeadersRequest(), timeout_secs=0.02)
+
+    @pytest.mark.asyncio
+    async def test_renew_loop_schedules_next_attempt_without_extra_interval_after_slow_reply(
+        self, mock_session, monkeypatch
+    ):
+        """Slow /renew reply schedules the next attempt without another full-interval sleep."""
+        import tensorrt_llm.serve.openai_client as openai_client_mod
+
+        interval_s = 10.0
+        fake_now = [100.0]
+        sleep_calls: list[float] = []
+        second_started = asyncio.Event()
+        attempts = 0
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(openai_client_mod, "_monotonic", lambda: fake_now[0])
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+            fake_now[0] += delay
+            await real_sleep(0)
+
+        monkeypatch.setattr(openai_client_mod, "_async_sleep", fake_sleep)
+
+        mock_router = AsyncMock()
+        mock_router.reservation_renewal_interval_s = interval_s
+
+        async def fake_renew(request, req_id=None, timeout_s=None):
+            nonlocal attempts
+            del request, req_id, timeout_s
+            attempts += 1
+            if attempts == 1:
+                # Reply arrives after 1.4x interval_s (anchored to attempt_start).
+                fake_now[0] += interval_s * 1.4
+            elif attempts == 2:
+                second_started.set()
+                # Block on a future until cancelled so the loop doesn't spin further.
+                await loop.create_future()
+
+        mock_router.renew_request = AsyncMock(side_effect=fake_renew)
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=5,
+            max_retries=0,
+            session=mock_session,
+        )
+        req = self._request(stream=True)
+        task = client._start_reservation_renewal(req, req_id=77)
+        assert task is not None
+        try:
+            await asyncio.wait_for(second_started.wait(), timeout=5.0)
+            # Only the initial interval_s sleep occurred; attempt 2 ran without another sleep.
+            assert sleep_calls == [interval_s]
+        finally:
+            await client._stop_reservation_renewal(task)
+
+    @pytest.mark.asyncio
+    async def test_renew_loop_caps_timeout_and_backoff_within_tiny_remaining_lease(
+        self, mock_session, monkeypatch
+    ):
+        """Tiny remaining lease caps both /renew timeout and retry backoff before expiry."""
+        import tensorrt_llm.serve.openai_client as openai_client_mod
+
+        lease_s = 0.45
+        interval_s = lease_s / 3.0
+        started_at = 100.0
+        fake_now = [started_at + lease_s - 0.012]  # 12 ms remaining
+        observed_timeouts: list[float] = []
+        sleep_calls: list[float] = []
+        second_started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(openai_client_mod, "_monotonic", lambda: fake_now[0])
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+            fake_now[0] += delay
+            await real_sleep(0)
+
+        monkeypatch.setattr(openai_client_mod, "_async_sleep", fake_sleep)
+
+        mock_router = AsyncMock()
+        mock_router.reservation_renewal_interval_s = interval_s
+
+        async def fake_renew(request, req_id=None, timeout_s=None):
+            del request, req_id
+            observed_timeouts.append(timeout_s)
+            if len(observed_timeouts) == 1:
+                fake_now[0] += timeout_s
+                raise asyncio.TimeoutError()
+            second_started.set()
+            await loop.create_future()
+
+        mock_router.renew_request = AsyncMock(side_effect=fake_renew)
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=5,
+            max_retries=0,
+            session=mock_session,
+        )
+        task = client._start_reservation_renewal(
+            self._request(stream=True), req_id=78, started_at=started_at
+        )
+        assert task is not None
+        try:
+            await asyncio.wait_for(second_started.wait(), timeout=5.0)
+            assert len(observed_timeouts) == 2
+            assert 0 < observed_timeouts[0] <= 0.012 * 0.4 + 1e-9
+            assert len(sleep_calls) == 1
+            assert sleep_calls[0] == pytest.approx(0.0018)
+            assert 0 < sleep_calls[0] < 0.012 - observed_timeouts[0]
+            # Second attempt begins strictly before lease expiration.
+            assert fake_now[0] < started_at + lease_s
+        finally:
+            await client._stop_reservation_renewal(task)
+
+    @pytest.mark.asyncio
+    async def test_renew_loop_stops_on_missing_reservation_and_retries_transient_errors(
+        self, mock_session
+    ):
+        """HTTP 404 stops renewal after one attempt while transient 503 errors keep retrying."""
+        import msgpack
+
+        from tensorrt_llm.llmapi.disagg_utils import (
+            CtxGenServerConfig,
+            DisaggServerConfig,
+            RouterConfig,
+        )
+        from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+        from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+        from tensorrt_llm.serve.router import (
+            CoordinatorDelegatingRouter,
+            LoadBalancingRouter,
+            ReservationNotFoundError,
+        )
+
+        # 1) Real DisaggCoordinatorService + CoordinatorServer map missing reservation -> 404.
+        config = DisaggServerConfig(
+            ctx_router_config=RouterConfig(type="round_robin", server_role=ServerRole.CONTEXT),
+            gen_router_config=RouterConfig(
+                type="load_balancing", server_role=ServerRole.GENERATION
+            ),
+            server_configs=[CtxGenServerConfig(type="gen", hostname="gen", port=8000)],
+        )
+        coordinator = DisaggCoordinatorService(
+            config, lambda *args, **kwargs: None, reservation_timeout_secs=60
+        )
+        with pytest.raises(ReservationNotFoundError):
+            await coordinator.renew("generation", 999)
+
+        coord_server = CoordinatorServer(coordinator)
+        fake_raw_req = AsyncMock()
+        fake_raw_req.body = AsyncMock(
+            return_value=msgpack.packb({"role": "generation", "req_id": 999}, use_bin_type=True)
+        )
+        resp = await coord_server.renew(fake_raw_req)
+        assert resp.status_code == 404
+
+        # 2) Real CoordinatorDelegatingRouter + OpenAIHttpClient renewal loop:
+        #    attempt 1 -> 503 (transient, retried), attempt 2 -> 200 (renewed),
+        #    attempt 3 -> 404 (confirmed expired, stops loop cleanly).
+        statuses = [503, 200, 404]
+        seen_attempts: list[int] = []
+
+        async def handle_renew(request: web.Request) -> web.Response:
+            body = msgpack.unpackb(await request.read(), raw=False)
+            seen_attempts.append(body["req_id"])
+            status = statuses[min(len(seen_attempts) - 1, len(statuses) - 1)]
+            payload = (
+                {}
+                if status == 200
+                else {"error": "No active coordinator reservation" if status == 404 else "busy"}
+            )
+            return web.Response(
+                status=status,
+                body=msgpack.packb(payload, use_bin_type=True),
+                content_type="application/msgpack",
+            )
+
+        app = web.Application()
+        app.router.add_post("/renew", handle_renew)
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            url = f"http://{server.host}:{server.port}"
+            delegating_router = CoordinatorDelegatingRouter(
+                coordinator_url=url,
+                local_router=LoadBalancingRouter(server_role=ServerRole.GENERATION),
+                role="generation",
+                request_timeout_s=5.0,
+            )
+            delegating_router._reservation_timeout_s = 0.06
+            _reset_prometheus_registry()
+            client = OpenAIHttpClient(
+                router=delegating_router,
+                role=ServerRole.GENERATION,
+                timeout_secs=5,
+                max_retries=0,
+                session=mock_session,
+            )
+            task = client._start_reservation_renewal(self._request(stream=True), req_id=321)
+            assert task is not None
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+                assert seen_attempts == [321, 321, 321]
+                assert task.done() and not task.cancelled()
+                assert task.exception() is None
+                # Confirm no extra requests arrive after the loop terminates.
+                await asyncio.sleep(0.08)
+                assert len(seen_attempts) == 3
+            finally:
+                await client._stop_reservation_renewal(task)
+                await delegating_router.close()
+        finally:
+            await server.close()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_releases_late_inflight_select_without_starting_renewal(
+        self, mock_session
+    ):
+        """Late /select resolving after shutdown() releases its reservation without renewing."""
+        select_started = asyncio.Event()
+        release_select = asyncio.Event()
+        mock_router = AsyncMock()
+        mock_router.reservation_renewal_interval_s = 0.05
+
+        async def slow_select(request, req_id=None):
+            select_started.set()
+            await release_select.wait()
+            return "localhost:8000", {"server": "localhost:8000"}
+
+        mock_router.get_next_server = AsyncMock(side_effect=slow_select)
+        mock_router.finish_request = AsyncMock()
+        mock_router.renew_request = AsyncMock()
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=5,
+            max_retries=0,
+            session=mock_session,
+        )
+
+        req_task = asyncio.create_task(client.send_request(self._request(stream=True)))
+        await asyncio.wait_for(select_started.wait(), timeout=5.0)
+        await client.shutdown()
+        release_select.set()
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await asyncio.wait_for(req_task, timeout=5.0)
+        assert client._active_renewals == set()
+        assert client._pending_renewals == {}
+        mock_router.renew_request.assert_not_awaited()
+        mock_router.finish_request.assert_awaited_once()
+        assert mock_router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_stop_reservation_renewal_preserves_caller_cancellation_during_drain(self):
+        """Cancelling the caller while draining the renewal task must propagate CancelledError."""
+        loop = asyncio.get_running_loop()
+        renew_task = asyncio.create_task(asyncio.sleep(100))
+        await asyncio.sleep(0)
+
+        async def drain():
+            loop.call_soon(asyncio.current_task().cancel)
+            await OpenAIHttpClient._stop_reservation_renewal(renew_task)
+
+        drain_task = asyncio.create_task(drain())
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await drain_task
+        finally:
+            if not renew_task.done():
+                renew_task.cancel()
+                await asyncio.gather(renew_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["failure", "cancellation"])
+    async def test_stream_reservation_renewal_stops_on_failure_and_cancellation(
+        self, mock_session, mode
+    ):
+        """Periodic stream reservation renewal must stop on stream failure and cancellation."""
+        first_chunk_sent = asyncio.Event()
+        renewed_once = asyncio.Event()
+        renew_count = 0
+
+        class _RenewingRouter(Router):
+            def __init__(self):
+                super().__init__(
+                    server_role=None,
+                    servers=["localhost:8000"],
+                    metadata_server_cfg=None,
+                    metadata_server=None,
+                )
+                self.finish_calls = []
+
+            @property
+            def reservation_renewal_interval_s(self) -> float:
+                return 0.03
+
+            async def get_next_server(self, request, exclude_server=None, req_id=None):
+                return "localhost:8000", {}
+
+            async def renew_request(self, request, req_id=None, timeout_s=None):
+                nonlocal renew_count
+                del request, req_id, timeout_s
+                renew_count += 1
+                renewed_once.set()
+
+            async def finish_request(self, request, session=None, success=True, req_id=None):
+                self.finish_calls.append((req_id, success))
+
+            def _on_servers_updated(self):
+                pass
+
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "text/event-stream"}
+
+        async def iter_any():
+            yield b'data: "first"\n\n'
+            first_chunk_sent.set()
+            await renewed_once.wait()
+            if mode == "failure":
+                raise aiohttp.ClientPayloadError("stream truncated")
+            await asyncio.sleep(10)
+
+        http_response.content.iter_any = iter_any
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        mock_session.post.return_value = http_response
+
+        _reset_prometheus_registry()
+        router = _RenewingRouter()
+        client = OpenAIHttpClient(
+            router=router,
+            role=ServerRole.GENERATION,
+            timeout_secs=10,
+            max_retries=0,
+            session=mock_session,
+        )
+
+        async def consume():
+            gen = await client.send_request(self._request(stream=True))
+            async with aclosing(gen):
+                async for _ in gen:
+                    pass
+
+        task = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(first_chunk_sent.wait(), timeout=5.0)
+            await asyncio.wait_for(renewed_once.wait(), timeout=5.0)
+
+            if mode == "failure":
+                with pytest.raises(aiohttp.ClientPayloadError):
+                    await task
+            else:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        assert len(router.finish_calls) == 1
+        assert router.finish_calls[0][1] is False
+        count_after_stop = renew_count
+        await asyncio.sleep(0.15)
+        assert renew_count == count_after_stop
+
+    @pytest.mark.asyncio
+    async def test_active_stream_renews_coordinator_reservation_and_expires_after_owner_loss(
+        self, monkeypatch
+    ):
+        """Short-lease coordinator keeps load past expiry, releases at EOF, expires on loss."""
+        from tensorrt_llm.llmapi.disagg_utils import (
+            CtxGenServerConfig,
+            DisaggServerConfig,
+            RouterConfig,
+        )
+        from tensorrt_llm.serve import coordinator_server
+        from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+        from tensorrt_llm.serve.disagg_coordinator import (
+            CoordinatorClient,
+            DisaggCoordinatorService,
+        )
+
+        lease_s = 0.45
+        release_stream1 = asyncio.Event()
+        stream1_started = asyncio.Event()
+        release_stream2 = asyncio.Event()
+        stream2_started = asyncio.Event()
+
+        async def gen_handler(request):
+            payload = msgspec.msgpack.decode(await request.read())
+            rid = payload["disaggregated_params"]["ctx_request_id"]
+            response = await self._open_response(request, "text/event-stream")
+            await response.write(f"data: start-{rid}\n\n".encode())
+            if rid == 101:
+                stream1_started.set()
+                await release_stream1.wait()
+                await response.write(b"data: end-101\n\n")
+            else:
+                stream2_started.set()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(release_stream2.wait(), timeout=5.0)
+            return response
+
+        app = web.Application()
+        app.router.add_post("/v1/completions", gen_handler)
+
+        async with TestServer(app) as gen_worker:
+            config = DisaggServerConfig(
+                server_configs=[
+                    CtxGenServerConfig(type="gen", hostname=gen_worker.host, port=gen_worker.port)
+                ],
+                ctx_router_config=RouterConfig(type="round_robin", server_role=ServerRole.CONTEXT),
+                gen_router_config=RouterConfig(
+                    type="load_balancing", server_role=ServerRole.GENERATION
+                ),
+            )
+            _reset_prometheus_registry()
+
+            def _unused_client_factory(router, role, max_retries=1):
+                return OpenAIHttpClient(router, role, 10, max_retries)
+
+            coordinator = DisaggCoordinatorService(
+                config,
+                _unused_client_factory,
+                reservation_timeout_secs=lease_s,
+            )
+            coordinator.start = AsyncMock()
+
+            finish_calls = []
+            orig_finish_by_id = coordinator.gen_router.finish_request_by_id
+
+            async def spy_finish_by_id(req_id, success=True):
+                finish_calls.append((req_id, success))
+                return await orig_finish_by_id(req_id, success)
+
+            coordinator.gen_router.finish_request_by_id = spy_finish_by_id
+
+            renew_calls = []
+            orig_select = coordinator.select
+            orig_renew = coordinator.renew
+            delayed_select_once = False
+            timed_out_once = False
+            release_hung_renew = asyncio.Event()
+
+            async def spy_select(role, routing_key, req_id=None, exclude_server=None):
+                nonlocal delayed_select_once
+                result = await orig_select(
+                    role, routing_key, req_id=req_id, exclude_server=exclude_server
+                )
+                # Delay delivering the /select reply after the coordinator has started
+                # the lease timer to verify the first heartbeat accounts for select delay
+                # and budgets attempt timeout/backoff against the remaining lease.
+                if req_id == 101 and not delayed_select_once:
+                    delayed_select_once = True
+                    await asyncio.sleep(lease_s * 0.72)
+                return result
+
+            coordinator.select = spy_select
+
+            async def spy_renew(role, req_id):
+                nonlocal timed_out_once
+                # Stall the first /renew attempt for 101 BEFORE resetting the coordinator
+                # lease so the client times out and must back off and retry before expiry.
+                if req_id == 101 and not timed_out_once:
+                    timed_out_once = True
+                    await release_hung_renew.wait()
+                    return {"ok": False}
+                renew_calls.append((role, req_id))
+                return await orig_renew(role, req_id)
+
+            coordinator.renew = spy_renew
+
+            created_servers = []
+            real_create = coordinator_server.create_uvicorn_server
+
+            def track_create(uvicorn_cfg):
+                srv = real_create(uvicorn_cfg)
+                created_servers.append(srv)
+                return srv
+
+            monkeypatch.setattr(coordinator_server, "create_uvicorn_server", track_create)
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            coord_port = sock.getsockname()[1]
+            coord_url = f"http://127.0.0.1:{coord_port}"
+            serve_task = asyncio.create_task(
+                CoordinatorServer(coordinator)("127.0.0.1", coord_port, sockets=[sock])
+            )
+
+            def _active_gen_load() -> int:
+                return sum(
+                    state._num_active_requests
+                    for state in coordinator.gen_router._server_state.values()
+                )
+
+            worker = CoordinatorClient(coord_url, config, request_timeout_s=5.0)
+            client = None
+            task1 = None
+            task2 = None
+            try:
+                # Wait until CoordinatorServer accepts HTTP requests.
+                async with aiohttp.ClientSession() as probe_session:
+                    for _ in range(100):
+                        try:
+                            async with probe_session.get(f"{coord_url}/version") as resp:
+                                if resp.status == 200:
+                                    break
+                        except aiohttp.ClientError:
+                            await asyncio.sleep(0.05)
+                    else:
+                        raise AssertionError("CoordinatorServer did not start in time")
+
+                _reset_prometheus_registry()
+                client = OpenAIHttpClient(
+                    router=worker.gen_router,
+                    role=ServerRole.GENERATION,
+                    timeout_secs=5,
+                    max_retries=0,
+                )
+
+                def _gen_stream_req(rid: int) -> CompletionRequest:
+                    return CompletionRequest(
+                        model="m",
+                        prompt="hi",
+                        stream=True,
+                        disaggregated_params=DisaggregatedParams(
+                            request_type="generation_only",
+                            first_gen_tokens=[7],
+                            ctx_request_id=rid,
+                        ),
+                    )
+
+                # Part 1: healthy stream outlives the short lease (including a delayed
+                # /renew reply), remains registered past expiry, and releases once at EOF.
+                async def read_stream1():
+                    gen = await client.send_request(_gen_stream_req(101))
+                    return b"".join([chunk async for chunk in gen])
+
+                task1 = asyncio.create_task(read_stream1())
+                await asyncio.wait_for(stream1_started.wait(), timeout=5.0)
+
+                # Wait well past the initial lease expiry; renewal keeps load registered.
+                await asyncio.sleep(lease_s * 1.8)
+                assert ("generation", 101) in coordinator._reservation_tasks
+                assert _active_gen_load() == 1
+                assert finish_calls == []
+                assert sum(1 for _, rid in renew_calls if rid == 101) >= 2
+
+                release_stream1.set()
+                received1 = await asyncio.wait_for(task1, timeout=5.0)
+                await asyncio.wait_for(worker.gen_router._finish_queue.join(), timeout=5.0)
+
+                assert received1 == b"data: start-101\n\ndata: end-101\n\n"
+                assert finish_calls == [(101, True)]
+                assert coordinator._reservation_tasks == {}
+                assert _active_gen_load() == 0
+
+                renews_after_eof = len(renew_calls)
+                await asyncio.sleep(lease_s * 0.8)
+                assert len(renew_calls) == renews_after_eof
+
+                # Part 2: owner loss after a live renewal still lets the coordinator expire load.
+                captured_renew_tasks = []
+                orig_start_renewal = client._start_reservation_renewal
+
+                def capture_renewal(req, rid, **kwargs):
+                    t = orig_start_renewal(req, rid, **kwargs)
+                    if t is not None:
+                        captured_renew_tasks.append(t)
+                    return t
+
+                monkeypatch.setattr(client, "_start_reservation_renewal", capture_renewal)
+
+                async def read_stream2():
+                    gen = await client.send_request(_gen_stream_req(102))
+                    async for _ in gen:
+                        pass
+
+                task2 = asyncio.create_task(read_stream2())
+                await asyncio.wait_for(stream2_started.wait(), timeout=5.0)
+                # Confirm renewal fires at least once before simulating owner loss.
+                deadline = asyncio.get_running_loop().time() + lease_s * 1.5
+                while not any(rid == 102 for _, rid in renew_calls):
+                    assert asyncio.get_running_loop().time() < deadline
+                    await asyncio.sleep(0.02)
+                assert _active_gen_load() == 1
+
+                # Simulate owner process crash: renewal stops and no /finish is sent.
+                for renew_task in captured_renew_tasks:
+                    renew_task.cancel()
+                    await asyncio.gather(renew_task, return_exceptions=True)
+
+                expire_deadline = asyncio.get_running_loop().time() + lease_s * 2.5
+                while _active_gen_load() > 0:
+                    assert asyncio.get_running_loop().time() < expire_deadline, (
+                        "reservation did not expire after owner loss"
+                    )
+                    await asyncio.sleep(0.03)
+
+                assert ("generation", 102) not in coordinator._reservation_tasks
+                assert finish_calls == [(101, True), (102, False)]
+
+                release_stream2.set()
+                task2.cancel()
+                await asyncio.gather(task2, return_exceptions=True)
+                await asyncio.wait_for(worker.gen_router._finish_queue.join(), timeout=5.0)
+
+                # Part 3: shutting down the client cancels live stream renewals even if the
+                # caller retains a primed generator, so the coordinator expires the lease.
+                primed_gen = await client.send_request(_gen_stream_req(103))
+                assert len(client._active_renewals) == 1
+                assert ("generation", 103) in coordinator._reservation_tasks
+                await client.shutdown()
+                assert client._active_renewals == set()
+                client = None
+
+                renews_at_shutdown = sum(1 for _, rid in renew_calls if rid == 103)
+                expire3_deadline = asyncio.get_running_loop().time() + lease_s * 2.5
+                while _active_gen_load() > 0:
+                    assert asyncio.get_running_loop().time() < expire3_deadline, (
+                        "reservation did not expire after client.shutdown()"
+                    )
+                    await asyncio.sleep(0.03)
+                assert sum(1 for _, rid in renew_calls if rid == 103) == renews_at_shutdown
+                assert ("generation", 103) not in coordinator._reservation_tasks
+                assert [(rid, ok) for rid, ok in finish_calls if rid == 101] == [(101, True)]
+                assert [(rid, ok) for rid, ok in finish_calls if rid == 103] == [(103, False)]
+                del primed_gen
+            finally:
+                release_hung_renew.set()
+                release_stream1.set()
+                release_stream2.set()
+                for t in (task1, task2):
+                    if t is not None and not t.done():
+                        t.cancel()
+                        await asyncio.gather(t, return_exceptions=True)
+                if client is not None:
+                    await client.shutdown()
+                await worker.stop()
+                for srv in created_servers:
+                    srv.should_exit = True
+                await asyncio.wait_for(serve_task, timeout=5.0)
+                sock.close()
+
+    @pytest.mark.asyncio
+    async def test_conditional_disagg_renews_gen_reservation_across_slow_ctx_prefill(
+        self, monkeypatch
+    ):
+        """Conditional disagg renews GEN reservation across slow CTX prefill into streaming."""
+        from tensorrt_llm.llmapi.disagg_utils import (
+            ConditionalDisaggConfig,
+            CtxGenServerConfig,
+            DisaggServerConfig,
+            RouterConfig,
+        )
+        from tensorrt_llm.serve import coordinator_server
+        from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+        from tensorrt_llm.serve.disagg_coordinator import (
+            CoordinatorClient,
+            DisaggCoordinatorService,
+        )
+        from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
+
+        lease_s = 0.45
+        ctx_started = asyncio.Event()
+        release_ctx = asyncio.Event()
+
+        async def ctx_handler(request):
+            payload = msgspec.msgpack.decode(await request.read())
+            rid = payload["disaggregated_params"]["disagg_request_id"]
+            ctx_started.set()
+            await release_ctx.wait()
+            resp = CompletionResponse(
+                id="cmpl-ctx",
+                object="text_completion",
+                model="m",
+                choices=[
+                    CompletionResponseChoice(
+                        index=0,
+                        text="",
+                        finish_reason="length",
+                        disaggregated_params=DisaggregatedParams(
+                            request_type="context_only",
+                            first_gen_tokens=[7],
+                            ctx_request_id=rid,
+                            disagg_request_id=rid,
+                        ),
+                    )
+                ],
+                usage=UsageInfo(prompt_tokens=4, completion_tokens=1, total_tokens=5),
+            )
+            return web.json_response(resp.model_dump())
+
+        async def gen_handler(request):
+            response = await self._open_response(request, "text/event-stream")
+            await response.write(b"data: after-ctx\n\n")
+            return response
+
+        ctx_app = web.Application()
+        ctx_app.router.add_post("/v1/completions", ctx_handler)
+        gen_app = web.Application()
+        gen_app.router.add_post("/v1/completions", gen_handler)
+
+        async with TestServer(ctx_app) as ctx_worker, TestServer(gen_app) as gen_worker:
+            config = DisaggServerConfig(
+                server_configs=[
+                    CtxGenServerConfig(type="ctx", hostname=ctx_worker.host, port=ctx_worker.port),
+                    CtxGenServerConfig(type="gen", hostname=gen_worker.host, port=gen_worker.port),
+                ],
+                ctx_router_config=RouterConfig(type="round_robin", server_role=ServerRole.CONTEXT),
+                gen_router_config=RouterConfig(
+                    type="kv_cache_aware", server_role=ServerRole.GENERATION
+                ),
+                conditional_disagg_config=ConditionalDisaggConfig(max_local_prefill_length=1),
+            )
+            _reset_prometheus_registry()
+
+            def _make_client(router, role, max_retries=0):
+                _reset_prometheus_registry()
+                return OpenAIHttpClient(router, role, timeout_secs=5, max_retries=max_retries)
+
+            coordinator = DisaggCoordinatorService(
+                config,
+                _make_client,
+                reservation_timeout_secs=lease_s,
+            )
+            coordinator.start = AsyncMock()
+            # Stub coordinator-side placement on the KV router so the test does not
+            # depend on native block-hashing bindings in CPU stub runs.
+            active_gen: dict[int, bool] = {}
+            finish_calls = []
+
+            async def fake_select_by_key(routing_key, req_id=None, exclude_server=None):
+                active_gen[req_id] = True
+                return (
+                    f"{gen_worker.host}:{gen_worker.port}",
+                    {"match_length": 0, "num_tokens": 16},
+                    req_id,
+                )
+
+            async def fake_finish_by_id(req_id, success=True):
+                active_gen.pop(req_id, None)
+                finish_calls.append((req_id, success))
+
+            coordinator.gen_router.get_next_server_by_key = fake_select_by_key
+            coordinator.gen_router.finish_request_by_id = fake_finish_by_id
+
+            created_servers = []
+            real_create = coordinator_server.create_uvicorn_server
+
+            def track_create(uvicorn_cfg):
+                srv = real_create(uvicorn_cfg)
+                created_servers.append(srv)
+                return srv
+
+            monkeypatch.setattr(coordinator_server, "create_uvicorn_server", track_create)
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            coord_port = sock.getsockname()[1]
+            coord_url = f"http://127.0.0.1:{coord_port}"
+            serve_task = asyncio.create_task(
+                CoordinatorServer(coordinator)("127.0.0.1", coord_port, sockets=[sock])
+            )
+
+            worker = CoordinatorClient(coord_url, config, request_timeout_s=5.0)
+            worker.gen_router._local.routing_key = lambda req: {"tokens": [1, 2, 3, 4]}
+            worker.start = AsyncMock()
+            service = OpenAIDisaggregatedService(config, worker, _make_client, req_timeout_secs=5)
+            await service.setup()
+            req_task = None
+            try:
+                async with aiohttp.ClientSession() as probe_session:
+                    for _ in range(100):
+                        try:
+                            async with probe_session.get(f"{coord_url}/version") as resp:
+                                if resp.status == 200:
+                                    break
+                        except aiohttp.ClientError:
+                            await asyncio.sleep(0.05)
+                    else:
+                        raise AssertionError("CoordinatorServer did not start in time")
+
+                req = CompletionRequest(model="m", prompt="hello world", stream=True)
+
+                async def run_request():
+                    gen = await service._send_disagg_request(req)
+                    return b"".join([chunk async for chunk in gen])
+
+                req_task = asyncio.create_task(run_request())
+                wait_ctx = asyncio.create_task(ctx_started.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {wait_ctx, req_task},
+                        timeout=5.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if req_task in done:
+                        await req_task
+                        raise AssertionError("Request completed before CTX handler started")
+                    assert wait_ctx in done, "Timed out waiting for CTX handler to start"
+                finally:
+                    if not wait_ctx.done():
+                        wait_ctx.cancel()
+                        await asyncio.gather(wait_ctx, return_exceptions=True)
+
+                # Hold CTX prefill past the GEN lease expiry; GEN reservation must stay alive.
+                await asyncio.sleep(lease_s * 1.6)
+                assert len(active_gen) == 1
+                assert len(coordinator._reservation_tasks) == 1
+                assert finish_calls == []
+
+                release_ctx.set()
+                received = await asyncio.wait_for(req_task, timeout=5.0)
+                await asyncio.wait_for(worker.gen_router._finish_queue.join(), timeout=5.0)
+
+                assert received == b"data: after-ctx\n\n"
+                assert len(finish_calls) == 1
+                assert finish_calls[0][1] is True
+                assert active_gen == {}
+                assert coordinator._reservation_tasks == {}
+            finally:
+                release_ctx.set()
+                if req_task is not None and not req_task.done():
+                    req_task.cancel()
+                    await asyncio.gather(req_task, return_exceptions=True)
+                await service.teardown()
+                for srv in created_servers:
+                    srv.should_exit = True
+                await asyncio.wait_for(serve_task, timeout=5.0)
+                sock.close()
 
 
 def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():

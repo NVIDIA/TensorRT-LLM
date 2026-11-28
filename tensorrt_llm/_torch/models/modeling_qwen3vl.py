@@ -55,7 +55,6 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.backends.utils import get_attention_backend
 from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-from ..modules.embedding import Embedding
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
@@ -72,7 +71,9 @@ from .modeling_multimodal_mixin import (
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
+    _pad_qwen_vl_mrope_deltas,
     _prepare_qwen_vl_mrope_config,
+    _qwen_processor_for_media,
     _qwen_vision_item_partitions,
 )
 from .modeling_utils import (
@@ -384,24 +385,6 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             videos = [video_data.frames for video_data in video_datas]
         else:
             videos = None
-        # HF's Qwen3-VL processor takes a single `do_rescale` kwarg that is
-        # applied to both images and videos. Mixed pre-rescale states leave
-        # the raw side at 0-255 while the pre-rescaled side gets skipped —
-        # the ViT then produces garbage for the raw modality. Fail fast; the
-        # default `get_preferred_media_io_kwargs` ships `np` for both, so a
-        # divergence here means a caller override drifted.
-        image_is_pre = bool(images) and isinstance(images[0], torch.Tensor)
-        video_is_pre = bool(videos) and isinstance(videos[0][0], torch.Tensor)
-        if images and videos and image_is_pre != video_is_pre:
-            raise ValueError(
-                "Qwen3-VL requires image and video items to arrive in the same "
-                "pre-rescaled state (both torch.Tensor, or both uint8 numpy). "
-                f"Got image_is_pre_rescaled={image_is_pre}, "
-                f"video_is_pre_rescaled={video_is_pre}. Configure consistent "
-                "formats via `media_io_kwargs`."
-            )
-        do_rescale = not (image_is_pre if images else video_is_pre)
-
         do_sample_frames = _decide_do_sample_frames(video_datas, mm_processor_kwargs)
 
         # Pass `do_sample_frames` plus, when sampling is needed, the
@@ -439,23 +422,20 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 m["total_num_frames"] = len(vd.frames)
                 video_metadata.append(m)
 
-        do_rescale = proc_kwargs.pop("do_rescale", do_rescale)
+        processor = _qwen_processor_for_media(self.processor, proc_kwargs, images, videos)
         normalization = self._get_vision_normalization(mm_data, mm_processor_kwargs)
-        host_do_rescale = do_rescale
-        if normalization:
-            do_rescale = False
-            proc_kwargs["do_normalize"] = False
         processor_kwargs = dict(
             text=[text],
             images=images,
             videos=videos,
             padding=True,
-            do_rescale=do_rescale,
             return_tensors="pt",
             video_metadata=video_metadata,
             **proc_kwargs,
         )
-        processed = self.processor(**processor_kwargs)
+        if normalization:
+            processor_kwargs.update(do_rescale=False, do_normalize=False)
+        processed = processor(**processor_kwargs)
         if normalization:
             if any(
                 modality in normalization and processed[pixel_key].dtype != torch.uint8
@@ -466,7 +446,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             ):
                 # The processor returned non-uint8 pixels even with rescale and normalize off, so
                 # the device lookup table cannot be applied. Rerun it with the host settings.
-                processor_kwargs["do_rescale"] = host_do_rescale
+                processor_kwargs["do_rescale"] = proc_kwargs["do_rescale"]
                 processor_kwargs.pop("do_normalize")
                 return self.processor(**processor_kwargs)
             processed["vision_normalization"] = normalization
@@ -519,7 +499,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # class default delegates to) raises on video-only calls and returns a
         # wrong-formula fallback that would break chunked prefill, so we must
         # run the full processor here.
-        do_rescale = not (video and isinstance(video[0], torch.Tensor))
+        do_rescale = not (len(video) and isinstance(video[0], torch.Tensor))
         processed = self._processor(
             text=["<|vision_start|><|video_pad|><|vision_end|>"],
             videos=[video],
@@ -535,14 +515,6 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 "video_grid_thw for the provided video."
             )
         return self.get_num_tokens_per_video(video=video, video_grid_thw=vgt)
-
-    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # uint8 HWC arrays for both modalities so the HF processor rescales
-        # and normalizes uniformly in one pass. A single `do_rescale` kwarg
-        # controls both modalities; if they arrive in mismatched
-        # pre-rescale states (e.g. image=Tensor pre-rescaled, video=uint8
-        # np), the raw side is left at 0-255 and the ViT sees garbage.
-        return {"image": {"format": "np"}, "video": {"format": "np"}}
 
     def get_disagg_prefill_inputs(
         self, prompt_token_ids: List[int], multimodal_params: MultimodalParams
@@ -1732,14 +1704,8 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         llm_model_config.pretrained_config = config.text_config
-        # The LM attention modules use extra_attrs through the outer wrapper.
-        # Share the dict after deepcopy so compiled LM attention lookups see
-        # the same per-layer metadata as DecoderRunner._model_forward.
-        # Vision attention unregisters itself from this dict during init,
-        # so it does not pollute LM lookups.
-        llm_model_config.extra_attrs = model_config.extra_attrs
         llm_model_config.pretrained_config.architectures = [llm_arch]
         # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
@@ -1803,10 +1769,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
 
-    @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
-
     # Draft-model (two-model speculative decoding, e.g. DFlash / Eagle3)
     # delegation: `ModelLoader.load` reads `draft_config` / `draft_model` and
     # calls `load_draft_weights` on the *outer* model it resolved, but the
@@ -1826,10 +1788,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 
     def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
         return self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
-
-    @property
-    def text_embedding_layer(self) -> Embedding:
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:
@@ -1998,6 +1956,26 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         return fused_input_ids, inputs_embeds, tuple(deepstack_buffer.unbind(0))
 
+    def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        prepared_inputs = _pad_qwen_vl_mrope_deltas(
+            super().prepare_breakable_cuda_graph_inputs(inputs)
+        )
+        if self.deepstack_num_level > 0 and not prepared_inputs.get("deepstack_embeds"):
+            # Text batches replay the same body as image batches, with zero DeepStack embeddings.
+            # Image batches scatter their features into this same scratch buffer (see
+            # `_fuse_multimodal_embeddings`), so clear the last image batch's features. The graph
+            # reads this buffer in place (see `breakable_cuda_graph_input_buffers`).
+            num_tokens = prepared_inputs["inputs_embeds"].shape[0]
+            deepstack_buffer = self.deepstack_input_embeds[:, :num_tokens, :]
+            deepstack_buffer.zero_()
+            prepared_inputs["deepstack_embeds"] = list(deepstack_buffer.unbind(0))
+        return prepared_inputs
+
+    def breakable_cuda_graph_input_buffers(self) -> tuple[torch.Tensor, ...]:
+        # The model writes DeepStack embeddings and packed MRoPE cos/sin before each body call.
+        names = ("deepstack_input_embeds", "mrope_rotary_cos_sin_workspace")
+        return tuple(getattr(self, name) for name in names if hasattr(self, name))
+
     def get_language_model_extra_forward_kwargs(
         self,
         *,
@@ -2078,6 +2056,7 @@ class Qwen3VLModel(Qwen3VLModelBase):
     supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
 
     supports_encoder_cache = True
+    supports_multimodal_breakable_cuda_graph = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.
