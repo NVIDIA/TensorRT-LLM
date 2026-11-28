@@ -24,8 +24,8 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Callable, Dict, List, Optional, Tuple,
-                    TypeVar, Union)
+                    AsyncIterator, Callable, Dict, List, Literal, Optional,
+                    Tuple, TypeVar, Union)
 
 import msgspec
 import torch
@@ -264,6 +264,17 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "a relayed mode from a context worker. Reasoning content will not be "
         "separated correctly. Check that the context worker is running a "
         "build that relays 'resolved_thinking'.")
+
+
+# The request field that asks each generation route for a structured output.
+# The Anthropic Messages route runs on the chat route, which receives the
+# Messages `output_config.format` as `response_format`.
+_OUTPUT_FORMAT_FIELDS = {
+    "chat": ("Chat Completions API: 'response_format' (Anthropic Messages "
+             "API: 'output_config.format')"),
+    "completions": ("Completions API: 'response_format'"),
+    "responses": ("Responses API: 'text.format'"),
+}
 
 
 def _validate_required_tool_grammar_request(
@@ -1152,6 +1163,29 @@ class OpenAIServer(_VideoRoutesMixin):
                 getattr(self, "_internal_disagg_auth_key", None), request,
                 getattr(self, "server_role", None),
                 None if raw_request is None else raw_request.headers))
+
+    def _warn_if_output_format_unenforced(
+            self, sampling_params: Optional[SamplingParams],
+            route: Literal["chat", "completions", "responses"]) -> None:
+        """Warn, once per route, that a requested output format is not enforced.
+
+        A requested output format arrives as
+        ``sampling_params.guided_decoding``. Without a guided decoding backend
+        the engine builds no grammar for it and generates unconstrained, so
+        the request is served as if no format had been requested; this
+        warning is the only sign of that.
+        """
+        if (sampling_params is None or sampling_params.guided_decoding is None
+                or getattr(getattr(self.generator, "args", None),
+                           "guided_decoding_backend", None) is not None):
+            return
+        logger.warning_once(
+            f"{_OUTPUT_FORMAT_FIELDS[route]} is accepted but not enforced: "
+            "the server has no guided decoding backend, so the output is not "
+            "constrained to the requested format. Set "
+            "`guided_decoding_backend: xgrammar` in the --config YAML to "
+            "enforce it.",
+            key=f"{route}_output_format_unenforced")
 
     def _has_cache_transceiver_config(self) -> bool:
         cache_transceiver_config = getattr(
@@ -2437,6 +2471,12 @@ class OpenAIServer(_VideoRoutesMixin):
                         status_code=HTTPStatus.BAD_REQUEST)
                 forced_tool_name = request.tool_choice.function.name
 
+            # Record before tool handling below may install a guided decoding
+            # mode of its own; emit the warning only after generation is
+            # accepted so rejected requests cannot consume the once-per-route
+            # warning.
+            has_requested_output_format = (sampling_params.guided_decoding
+                                           is not None)
             reasoning_parser_name = self.generator.args.reasoning_parser
             # Message-level (dynamic) tools are a model extension (Kimi API);
             # only models whose extension declares them render them, so other
@@ -2733,6 +2773,8 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             _record_input_processing("total", input_started)
             input_started = None
+            if has_requested_output_format:
+                self._warn_if_output_format_unenforced(sampling_params, "chat")
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if raw_request is not None:
@@ -3433,6 +3475,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             _record_input_processing("total", input_started)
             input_started = None
+            self._warn_if_output_format_unenforced(sampling_params,
+                                                   "completions")
 
             if request.stream:
                 generators = [
@@ -3601,6 +3645,7 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             _record_input_processing("total", input_started)
             input_started = None
+            self._warn_if_output_format_unenforced(sampling_params, "chat")
 
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -3866,6 +3911,7 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             _record_input_processing("total", input_started)
             input_started = None
+            self._warn_if_output_format_unenforced(sampling_params, "responses")
 
             if not self.postproc_worker_enabled:
                 # Set by the executor only for postprocessing it runs itself.
