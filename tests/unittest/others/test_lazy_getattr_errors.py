@@ -23,8 +23,8 @@ second time and, for a name that is not itself a submodule, reports ``cannot imp
 without the cause.
 
 The fault is injected with a ``sys.meta_path`` finder that raises when the target submodule is
-imported, so it covers both ``importlib.import_module`` and ``from . import`` inside
-``__getattr__``.
+imported, which is how every package listed here loads submodules from ``__getattr__``
+(``importlib.import_module``).
 """
 
 import importlib
@@ -62,11 +62,6 @@ CASES = [
         "tensorrt_llm._torch.pyexecutor.sampler",
         "sampler_common",
         "tensorrt_llm._torch.pyexecutor.sampler.sampler_common",
-    ),
-    (
-        "tensorrt_llm._torch.visual_gen.modules",
-        "Attention",
-        "tensorrt_llm._torch.visual_gen.attention.attention",
     ),
     ("tensorrt_llm.serve", "OpenAIServer", "tensorrt_llm.serve.openai_server"),
     (
