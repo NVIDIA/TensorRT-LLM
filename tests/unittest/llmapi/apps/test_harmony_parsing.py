@@ -894,6 +894,112 @@ class TestRemainingTokensOnDone:
                 harmony_adapter.cleanup_stream_state(request_id)
 
 
+TOOL_CALL_TURN = (
+    "<|channel|>commentary to=functions.get_weather <|constrain|>json"
+    '<|message|>{"city":"SF"}<|call|>'
+)
+ANSWER_TURN = "<|channel|>final<|message|>It is sunny.<|return|>"
+
+
+def _stream_harmony_text(text, request_id, tool_choice=None, finish=True):
+    """Stream the tokens of ``text`` through handle_streaming_response.
+
+    With ``finish``, all tokens but the last arrive in one response and the
+    last one finishes the request with "stop", as the engine does when it hits
+    the <|call|> or <|return|> stop token. Otherwise all tokens arrive in one
+    response of a request that is still generating.
+    """
+    harmony_adapter = get_harmony_adapter()
+    tokens = harmony_adapter.encoding.encode(text, allowed_special="all")
+    batches = [(tokens[:-1], False), (tokens, True)] if finish else [(tokens, False)]
+    responses = []
+    num_streamed = 0
+    try:
+        for index, (token_ids, done) in enumerate(batches):
+            result = _make_mock_result(token_ids_diff=token_ids[num_streamed:], token_ids=token_ids)
+            result._done = done
+            responses += handle_streaming_response(
+                tools=[],
+                tool_choice=tool_choice,
+                result=result,
+                model="test-model",
+                request_id=request_id,
+                done=done,
+                num_prompt_tokens=5,
+                first_iteration=index == 0,
+            )
+            num_streamed = len(token_ids)
+    finally:
+        if request_id in harmony_adapter._stream_states:
+            harmony_adapter.cleanup_stream_state(request_id)
+    return _stream_payloads(responses)
+
+
+def _finish_reasons(payloads):
+    return [
+        choice["finish_reason"]
+        for payload in payloads
+        for choice in payload["choices"]
+        if choice.get("finish_reason")
+    ]
+
+
+def _streamed_tool_call_names(payloads):
+    return [
+        tool_call["function"]["name"]
+        for payload in payloads
+        for choice in payload["choices"]
+        for tool_call in choice["delta"].get("tool_calls") or []
+        if tool_call.get("function", {}).get("name")
+    ]
+
+
+class TestStreamingToolCallFinishReason:
+    """A streamed turn that makes a tool call finishes with "tool_calls".
+
+    The non-streaming Harmony path (_determine_finish_reason) and the chat
+    stream of other models report "tool_calls" for such a turn, and clients
+    run the tool loop on it.
+    """
+
+    @pytest.mark.parametrize(
+        "text, tool_choice, expected_finish_reasons, expected_tool_calls",
+        [
+            pytest.param(TOOL_CALL_TURN, None, ["tool_calls"], ["get_weather"], id="tool_call"),
+            pytest.param(ANSWER_TURN, None, ["stop"], [], id="answer"),
+            # tool_choice="none" suppresses the call, so nothing was streamed.
+            pytest.param(TOOL_CALL_TURN, "none", ["stop"], [], id="suppressed_tool_call"),
+        ],
+    )
+    def test_final_chunk_finish_reason(
+        self, text, tool_choice, expected_finish_reasons, expected_tool_calls
+    ):
+        payloads = _stream_harmony_text(
+            text, f"test-tool-call-finish-{tool_choice}", tool_choice=tool_choice
+        )
+
+        assert _streamed_tool_call_names(payloads) == expected_tool_calls
+        assert _finish_reasons(payloads) == expected_finish_reasons
+
+    def test_stream_stopped_on_repeated_channel_after_tool_call(self):
+        """A stream cut short after a streamed tool call also finishes with "tool_calls".
+
+        analysis, then a tool call, then final content makes the channel
+        sequence invalid, so the stream stops on its first final token.
+        """
+        text = (
+            "<|channel|>analysis<|message|>Check the weather.<|end|>"
+            "<|start|>assistant"
+            + TOOL_CALL_TURN.replace("<|call|>", "<|end|>")
+            + "<|start|>assistant"
+            "<|channel|>final<|message|>Sunny"
+        )
+        payloads = _stream_harmony_text(text, "test-tool-call-repeated-channel", finish=False)
+
+        assert _streamed_tool_call_names(payloads) == ["get_weather"]
+        assert _finish_reasons(payloads) == ["tool_calls"]
+
+
 # ===========================================================================
 # Fix 2  —  b18b2cee: Grouping deltas within one streaming interval
 # ===========================================================================
