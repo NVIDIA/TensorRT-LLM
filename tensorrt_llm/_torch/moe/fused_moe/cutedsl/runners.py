@@ -547,9 +547,12 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
     """Autotuner runner for the MXFP8 fused FC1+FC2 MoE on Rubin (SM107).
 
     Selects the routing tile size from {128, 256} and delegates to
-    ``forward_impl``, which drives the single fused FC1+FC2 CuTe DSL kernel.
-    The fused kernel has no B-reuse geometry, so the routing tile is exactly
-    the MMA tile M: 128 (1-CTA MMA) or 256 (2-CTA MMA).
+    ``forward_impl`` (the full-GPU fused FC1+FC2 kernel, or its inner-channel
+    split across two locality domains, chosen statically by the planner). The
+    fused kernel has no B-reuse
+    geometry, so the routing tile is exactly the MMA tile M: 128 (1-CTA MMA)
+    or 256 (2-CTA MMA). ``workload_identity`` distinguishes the localized
+    runner's tuning cache entries (shard shapes and compute topology).
     """
 
     tuning_config_cache = dict()
@@ -563,6 +566,8 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
         local_expert_offset: int,
         enable_alltoall: bool = False,
         output_dtype: torch.dtype = torch.bfloat16,
+        tune_max_num_tokens: int | None = None,
+        workload_identity: tuple | None = None,
     ) -> None:
         super().__init__()
         self.forward_impl = forward_impl
@@ -573,6 +578,8 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
+        self.tune_max_num_tokens = tune_max_num_tokens
+        self.workload_identity = workload_identity
 
     def unique_id(self) -> tuple:
         return (
@@ -582,6 +589,8 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             self.local_expert_offset,
             self.enable_alltoall,
             self.output_dtype,
+            self.tune_max_num_tokens,
+            self.workload_identity,
         )
 
     def get_valid_tactics(
@@ -606,12 +615,18 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             )
             # MXFP8 inputs: [x, token_selected_experts, token_final_scales,
             #                x_sf, moe_output]
+            # ``tune_max_num_tokens`` anchors the power-of-two token buckets to
+            # the module's tuning cap instead of the warmup forward's token
+            # count, so a small warmup still profiles the larger buckets and
+            # profiling stops at the cap; the nested fused-kernel tuning runs
+            # for each bucket.
             self.__class__.tuning_config_cache[key] = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
                         0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
                     ),
                 ),
+                tune_max_num_tokens=self.tune_max_num_tokens,
                 constraint_specs=(
                     ConstraintSpec(1, 0, helper.infer_shape_num_tokens),
                     ConstraintSpec(2, 0, helper.infer_shape_num_tokens),

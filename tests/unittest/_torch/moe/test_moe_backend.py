@@ -5971,8 +5971,16 @@ def should_skip_locality_domain_param(
     """Return a static skip reason for locality domain MoE backend params."""
     if backend_type != MoeBackendType.CUTEDSL:
         return "locality domain MoE backend test only supports CuteDSL"
-    if quant_algo not in (QuantAlgo.NVFP4, None):
-        return "locality domain MoE backend test only supports NVFP4 or BF16"
+    if quant_algo not in (QuantAlgo.NVFP4, QuantAlgo.MXFP8, None):
+        return "locality domain MoE backend test only supports NVFP4, MXFP8 or BF16"
+    if (
+        quant_algo == QuantAlgo.MXFP8
+        and model_config is not None
+        and model_config.intermediate_size % 256 != 0
+    ):
+        return (
+            "MXFP8 locality domain MoE splits the intermediate size into two 128-channel multiples"
+        )
     # plan_moe only enables the unquantized path for bfloat16 activations.
     if quant_algo is None and dtype != torch.bfloat16:
         return "unquantized locality domain MoE requires bfloat16"
@@ -6088,7 +6096,7 @@ def generate_test_params() -> List:
         )
         params.append(create_test_param(param_values, test_id))
 
-        if quant_algo in (QuantAlgo.NVFP4, None):
+        if quant_algo in (QuantAlgo.NVFP4, QuantAlgo.MXFP8, None):
             swiglu_gptoss_style = (
                 swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
             )
@@ -6364,6 +6372,9 @@ def test_moe_backend(
     locality_domain_runtime_skip = should_skip_locality_domain_runtime(enable_locality_domains)
     if locality_domain_runtime_skip:
         pytest.skip(locality_domain_runtime_skip)
+    if enable_locality_domains and quant_algo == QuantAlgo.MXFP8:
+        # The MXFP8 split is opt-in; the default policy keeps the full-GPU op.
+        monkeypatch.setenv("TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE", "1")
     locality_domain_policy = LocalityDomainPolicy(enabled=enable_locality_domains)
 
     ci_skip = should_skip_to_accelerate_ci(
@@ -6532,7 +6543,16 @@ def test_moe_backend(
         )
         with torch.inference_mode(), autotune(cache_path=cache_path):
             _ = run_moe()
-        if enable_locality_domains:
+        if enable_locality_domains and quant_algo == QuantAlgo.MXFP8:
+            # A split layer always runs the locality-domain op, so only its
+            # outer key and the concurrent shard tuning are profiled, under one
+            # key each whatever the input dtype.
+            expected_tuning_ops = (
+                "CuteDslFusedMoE::run_moe_mxfp8::locality_domain",
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin"
+                "::locality_domain::locality_domain_concurrent",
+            )
+        elif enable_locality_domains:
             quant_name = "nvfp4" if quant_algo == QuantAlgo.NVFP4 else "bf16"
             expected_tuning_ops = (
                 f"CuteDslFusedMoE::run_moe_{quant_name}::locality_domain_end_to_end",
@@ -6542,6 +6562,7 @@ def test_moe_backend(
                 f"trtllm::cute_dsl_{quant_name}_grouped_gemm_finalize_"
                 "inplace_rubin::locality_domain_concurrent",
             )
+        if enable_locality_domains:
             for op_name in expected_tuning_ops:
                 assert autotuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
                 assert not autotuner.stats.failed_profiling_count.get(op_name, set())
@@ -8686,12 +8707,23 @@ def _mxfp8_fp32_oracle(
     [
         (60, 4, 2048, 1408, 128),  # Qwen1.5-MoE-A2.7B
         (128, 10, 4096, 1024, 128),  # Qwen3.5-397B experts as seen by one EP4 rank
+        (128, 10, 4096, 1024, 16),  # decode-sized batch
     ],
-    ids=["e60_k4_h2048_i1408", "e128_k10_h4096_i1024"],
+    ids=["e60_k4_h2048_i1408", "e128_k10_h4096_i1024", "e128_k10_h4096_i1024_decode"],
 )
+# Every shape above is under FUSED_INPUT_QUANT_MAX_ELEMENTS, so quantize_input
+# hands the op raw BF16 that it quantizes in its workspace reset; the
+# "prequantized" case lowers the threshold to 0 so the op gets E4M3 input.
+@pytest.mark.parametrize("fused_input_quant", [True, False], ids=["raw_input", "prequantized"])
 def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
-    num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, seq_len: int
-):
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    seq_len: int,
+    fused_input_quant: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A/B the fused MXFP8 FC12 CuTeDSL MoE against independent references on identical inputs.
 
     Three legs consume the SAME MXFP8 activations and e4m3/UE8M0 weights:
@@ -8757,7 +8789,21 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
         ref_fused_moe.cuda()
 
         token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+        if not fused_input_quant:
+            monkeypatch.setattr(type(backend), "FUSED_INPUT_QUANT_MAX_ELEMENTS", 0)
         x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+        assert (x_quantized.dtype == torch.float8_e4m3fn) is not fused_input_quant
+        assert (x_sf is None) is fused_input_quant
+        # Raw BF16 is quantized inside the fused op; the references always
+        # consume explicitly quantized activations, which are byte-identical to
+        # what the op produces.
+        if x_quantized.dtype == torch.float8_e4m3fn:
+            x_q_ref, x_sf_ref = x_quantized, x_sf
+        else:
+            x_q_ref, x_sf_ref = torch.ops.trtllm.mxfp8_quantize(
+                x, False, alignment=backend.quant_method.weight_alignment
+            )
+            x_sf_ref = x_sf_ref.view(seq_len, -1)
 
         def run_fused():
             return run_backend_moe(
@@ -8778,8 +8824,8 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
             fused = run_fused().float()
             ref = ref_fused_moe.forward(x, router_logits).float()
             oracle = _mxfp8_fp32_oracle(
-                x_quantized,
-                x_sf,
+                x_q_ref,
+                x_sf_ref,
                 weights,
                 token_selected_experts,
                 token_final_scales,

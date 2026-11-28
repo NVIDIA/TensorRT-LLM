@@ -42,6 +42,7 @@ __all__ = [
     "get_locality_domain_mempool",
     "get_locality_domain_compute_sm_counts",
     "is_locality_domain_supported",
+    "is_balanced_locality_domain_split",
     "initialize_locality_domain_resources",
     "locality_domain_device",
     "get_current_locality_domain",
@@ -224,6 +225,21 @@ def is_locality_domain_supported(device: int | None = None) -> bool:
         return _tbr.device_supports_locality_domain(device)
     except Exception:
         return False
+
+
+def is_balanced_locality_domain_split() -> bool:
+    """Whether the locality domain partitions use the balanced (backfilled) split.
+
+    Mirrors ``parseStreamCreateMethod`` in ``locality_domain_utils.cpp``:
+    ``TLLM_LOCALITY_DOMAIN_STREAM_CREATE_METHOD=balanced`` backfills each
+    partition to half the device without a co-scheduling guarantee; any other
+    value selects the strict split along the locality domains.
+    """
+    return os.getenv("TLLM_LOCALITY_DOMAIN_STREAM_CREATE_METHOD", "") in (
+        "Balanced",
+        "balanced",
+        "BALANCED",
+    )
 
 
 @lru_cache(maxsize=1)
