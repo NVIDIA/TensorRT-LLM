@@ -67,9 +67,29 @@ input [
   },
   ## SamplingParams Arguments for Each Request ##
   {
+    name: "sampling_param_n"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
     name: "sampling_param_best_of"
     data_type: TYPE_INT32
     dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "sampling_param_use_beam_search"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  # Per-generation-step beam widths. The last value is reused when generation
+  # continues past the end of the array.
+  {
+    name: "sampling_param_beam_width_array"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
     optional: true
   },
   {
