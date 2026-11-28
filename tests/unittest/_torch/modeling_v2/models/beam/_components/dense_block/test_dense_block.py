@@ -47,15 +47,10 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
 
-try:
-    import tensorrt_llm._torch.models.modeling_beam as builtin_beam
-except ModuleNotFoundError as exc:
-    if exc.name != "tensorrt_llm._torch.models.modeling_beam":
-        raise
-    builtin_beam = None  # The standard-serving implementation is a separate PR.
 __extra_import_path__ = [".", "../..", "../../../.."]
 
 import _beam_component_support as support  # noqa: E402
+import _beam_reference as reference_beam
 import _dense_block_reference as reference  # noqa: E402
 from _beam_component_support import assert_all_pass  # noqa: E402
 from _validating import validating  # noqa: E402
@@ -529,15 +524,13 @@ def recording(*wrappers):
     )
 
 
-def builtin_beam_forbidden():
-    """The built-in Beam modeling must not run while the component does."""
-    if builtin_beam is None:
-        return support.builtin_forbidden([])
+def reference_beam_forbidden():
+    """The reference Beam modeling must not run while the component does."""
     targets = (
-        builtin_beam.BeamDecoderLayer,
-        builtin_beam.BeamAttention,
-        builtin_beam.BeamSwiGLU,
-        builtin_beam.BeamRMSNorm,
+        reference_beam.BeamDecoderLayer,
+        reference_beam.BeamAttention,
+        reference_beam.BeamSwiGLU,
+        reference_beam.BeamRMSNorm,
     )
     return support.builtin_forbidden([(cls, "forward") for cls in targets])
 
@@ -562,13 +555,12 @@ def test_block_constructs_alone(ieee_fp32) -> None:
         raise AssertionError(f"{type(self).__name__} constructed")
 
     with pytest.MonkeyPatch.context() as mp:
-        if builtin_beam is not None:
-            for cls in (
-                builtin_beam.BeamForCausalLM,
-                builtin_beam.BeamModel,
-                builtin_beam.BeamDecoderLayer,
-            ):
-                mp.setattr(cls, "__init__", refuse)
+        for cls in (
+            reference_beam.BeamForCausalLM,
+            reference_beam.BeamModel,
+            reference_beam.BeamDecoderLayer,
+        ):
+            mp.setattr(cls, "__init__", refuse)
         blk = BeamDenseBlockBf16Sm103Tp1(block_config(), LAYER_IDX, device="cuda")
     assert isinstance(blk, torch.nn.Module) and not list(blk.children())
     assert list(blk.checkpoint_tensors()) == list(reference.param_shapes())
@@ -737,13 +729,13 @@ def test_block_matches_source_captures(seed, length, ieee_fp32) -> None:
 @pytest.mark.parametrize("length", [1, 129])
 def test_forward_runs_the_component_path(length, ieee_fp32) -> None:
     """One case: the component's own composition ran, op by op, through thop attention on
-    this GPU, with no SDPA and no built-in Beam module on the way."""
+    this GPU, with no SDPA and no reference Beam module on the way."""
     seed = 17
     blk = loaded_block(seed)
     x, positions = case_inputs(seed, length)
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     with fresh_context(length) as md:
-        with builtin_beam_forbidden(), validating(*OPS), recording(*OPS) as calls:
+        with reference_beam_forbidden(), validating(*OPS), recording(*OPS) as calls:
             with torch.profiler.profile(activities=activities) as prof:
                 out = blk(x, positions, md)
                 torch.cuda.synchronize()

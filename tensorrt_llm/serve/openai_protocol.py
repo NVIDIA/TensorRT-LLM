@@ -65,7 +65,8 @@ from tensorrt_llm.sampling_params import (EmbeddingBias, SamplingParams,
                                           check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
-from tensorrt_llm.serve.serving_extensions import structured_output_format_for
+from tensorrt_llm.serve.serving_extensions import (structured_output_format_for,
+                                                   validate_tools_for)
 from tensorrt_llm.visual_gen.params import MediaRole
 
 _LOGIT_BIAS_MIN = -100.0
@@ -1467,6 +1468,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
+        validate_tools_for(reasoning_parser, self.tools)
         sampling_logprobs = None
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
@@ -1926,6 +1928,7 @@ class ResponsesRequest(OpenAIBaseModel):
         default_sampling_params: Optional[dict] = None,
         reasoning_parser: Optional[str] = None,
     ) -> SamplingParams:
+        validate_tools_for(reasoning_parser, self.tools)
         max_tokens = None
         if self.max_output_tokens is not None:
             max_tokens = self.max_output_tokens

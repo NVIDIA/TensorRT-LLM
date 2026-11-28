@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from tensorrt_llm._torch.configs.beam import BeamConfig
 from tensorrt_llm._torch.configs.cosmos3 import Cosmos3Config
 from tensorrt_llm._torch.configs.cosmos3_edge import (
     Cosmos3EdgeConfig,
@@ -72,6 +73,7 @@ def _register_custom_configs_with_transformers() -> None:
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 
     custom_configs = {
+        "beam": BeamConfig,
         # "cosmos3" is the canonical model_type; "cosmos3_omni" is kept as a
         # backward-compat alias for checkpoints that predate the rename.
         "cosmos3": Cosmos3Config,
@@ -138,11 +140,18 @@ def _register_custom_configs_with_transformers() -> None:
     # that cannot be loaded at all today.
     CONFIG_MAPPING.register("nemotron_h", NemotronHConfig, exist_ok=True)
 
+    # Beam uses a tokenizer.json-backed fast tokenizer, including checkpoints
+    # whose optional tokenizer_config.json does not name a tokenizer class.
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+    AutoTokenizer.register(BeamConfig, fast_tokenizer_class=PreTrainedTokenizerFast, exist_ok=True)
+
 
 _register_custom_configs_with_transformers()
 del _register_custom_configs_with_transformers
 
 __all__ = [
+    "BeamConfig",
     "Cosmos3Config",
     "Cosmos3EdgeConfig",
     "Cosmos3EdgeProjectorConfig",

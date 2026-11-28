@@ -9,6 +9,7 @@ The following is a table of supported models for the PyTorch backend:
 | `ApertusForCausalLM`                 | Apertus                            | `swiss-ai/Apertus-8B-Instruct-2509`          |
 | `Apertus1p5ForConditionalGeneration` [^22] | Apertus 1.5 (text input)     | `swiss-ai/Apertus-v1.5-8B`                   |
 | `BartForConditionalGeneration`       | BART                               | `facebook/bart-large-cnn`                    |
+| `BeamForCausalLM`                   | [Beam (Reflection AI)](../deployment-guide/deployment-guide-for-beam-on-trtllm.md) | `reflection/Beam-1.0-501B-A23B-NVFP4` |
 | `BertForSequenceClassification`      | BERT-based                         | `textattack/bert-base-uncased-yelp-polarity` |
 | `Cohere2ForCausalLM`                 | Command A                          | `CohereLabs/c4ai-command-a-03-2025`          |
 | `DeciLMForCausalLM`                  | Nemotron                           | `nvidia/Llama-3_1-Nemotron-51B-Instruct`     |
@@ -62,6 +63,13 @@ The following is a table of supported models for the PyTorch backend:
 | `WhisperForConditionalGeneration`    | Whisper                            | `openai/whisper-large-v3`                    |
 
 
+Beam uses the experimental ModelingV2/StairCase path on **four GB300 GPUs** with
+NVFP4 experts, TP4/EP1 and BF16 KV cache. This checkout supports eager baseline
+serving through `trtllm-serve` and `LLM()`, with overlap scheduling disabled.
+Speculative decoding, FP8 KV cache, disaggregated serving, Dynamo and CUDA graphs
+are outside this baseline. Follow the [Beam deployment guide](../deployment-guide/deployment-guide-for-beam-on-trtllm.md)
+for its configuration and build requirements; an older release image may not include it.
+
 ## Models Supported outside main branch
 
 Some newly released models are first supported on a dedicated feature branch, with release
@@ -80,7 +88,6 @@ following its [Docker guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/do
 | ----- | ----------- | ---------------- | ----------------- |
 | MiniMax-M3.1-Flash | [`feat/minimax-m3.1-flash`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/minimax-m3.1-flash) | [Serving MiniMax-M3.1-Flash](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/minimax-m3.1-flash/docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md#serving-minimax-m31-flash) in the MiniMax-M3 deployment guide | `nvcr.io/nvidia/tensorrt-llm/release:feat-minimax-m3.1-flash-1.4.0a0.dev202611050719` |
 | Kimi K3.1 Pro | [`feat/kimi-k3.1-pro`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/kimi-k3.1-pro) | [Kimi K3.1 Pro deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/kimi-k3.1-pro/docs/source/deployment-guide/deployment-guide-for-kimi-k3.1-pro-on-trtllm.md) | `nvcr.io/nvidia/tensorrt-llm/release:feat-kimi-k3.1-pro-1.4.0a0.dev202611050000` |
-| Beam (Reflection AI), `BeamForCausalLM` ([public NVFP4 checkpoint](https://huggingface.co/reflection/Beam-1.0-501B-A23B-NVFP4)) | [`feat/reflection-beam`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/reflection-beam) | [Beam deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/reflection-beam/docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md) | No container published yet — build from the branch sources per the guide |
 
 ## Model-Feature Support Matrix (Key Models)
 

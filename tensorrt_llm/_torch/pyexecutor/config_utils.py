@@ -850,6 +850,7 @@ class LazyConfigDict(dict):
 
 
 _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDict(
+    beam="BeamConfig",
     cosmos3="Cosmos3Config",
     cosmos3_omni=
     "Cosmos3Config",  # backward-compat alias for pre-rename checkpoints
