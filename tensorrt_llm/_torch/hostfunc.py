@@ -34,8 +34,9 @@ def launch_hostfunc(hostfunc, *args, **kwargs):
 def record_hostfunc_graph_replay() -> None:
     """Record an event after replaying a graph that contains host functions."""
     global _replay_event
-    _replay_event = torch.cuda.Event()
-    _replay_event.record()
+    event = torch.cuda.Event()
+    event.record()
+    _replay_event = event
 
 
 def hostfuncs_pending() -> bool:
@@ -51,17 +52,20 @@ def drain_captured_hostfuncs() -> None:
     """Wait until the host functions of the last replayed graph have run.
 
     A host function takes the GIL when it runs. A call that holds the GIL while
-    it waits on the device, such as a multimodal encoder that builds a cuDNN
-    plan, would otherwise deadlock with a host function that has not run yet.
-    The wait is skipped during stream capture, where host synchronization is
-    not allowed.
+    it waits on the device would otherwise deadlock with a host function that
+    has not run yet. Examples are a multimodal encoder that builds a cuDNN plan,
+    and a pybind11 extension without gil_scoped_release whose kernel launch
+    blocks on a full launch queue. The wait is skipped during stream capture,
+    where host synchronization is not allowed.
     """
     global _replay_event
-    if _replay_event is None or torch.cuda.is_current_stream_capturing():
+    event = _replay_event
+    if event is None or torch.cuda.is_current_stream_capturing():
         return
     # Event.synchronize releases the GIL, which lets the host functions run.
-    _replay_event.synchronize()
-    _replay_event = None
+    event.synchronize()
+    if _replay_event is event:
+        _replay_event = None
 
 
 def hostfunc(hostfunc):
