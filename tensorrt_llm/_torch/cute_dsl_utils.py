@@ -56,6 +56,10 @@ IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 # presence of both submodules as the capability marker for that kernel.
 IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE = False
 
+# The MXFP8 fused FC12 workspace reset indexes the output it zeroes and the raw
+# input it quantizes with Int32, so each holds at most this many elements.
+MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS = 2**31 - 1
+
 if platform.system() != "Windows":
     try:
         from cutlass import cute  # noqa

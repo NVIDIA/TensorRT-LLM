@@ -390,6 +390,7 @@ changes:
 | Routing | `test_moe_routing.py` |
 | Load balancer | `test_moe_load_balancer.py` |
 | CuteDSL MoE ops, including the MXFP8 fused FC12 op against an fp32 reference | `kernels/parallel/test_cute_dsl_moe.py` |
+| The MXFP8 fused FC12 workspace reset: in-launch input quantization against `mxfp8_quantize`, output zeroing, CUDA-graph replay ordering | `kernels/parallel/test_mxfp8_input_quant.py` |
 | Multi-GPU EP and all-to-all | `multi_gpu/` |
 
 Backend, quantization and skip matrices are shared, in `moe_test_utils.py` and
@@ -644,7 +645,18 @@ finalize (scatter-add) into one persistent kernel, driven through
 
 - Activations: e4m3 `[tokens, hidden]` plus **linear** UE8M0 scales
   `[tokens, hidden/32]` (`mxfp8_quantize(..., swizzled=False)`); the gather
-  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`.
+  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`. When
+  `quantize_input` is called with `post_quant_comm=False` (no communication,
+  or after a pre-quant dispatch), raw BF16/FP16 inputs up to
+  `FUSED_INPUT_QUANT_MAX_ELEMENTS` are passed through unquantized, with
+  `x_sf=None`, and quantized inside the op's workspace-reset launch
+  (`fused_fc12_mxfp8_workspace.py` / `mxfp8_input_quant.py`, bit-compatible
+  with `mxfp8_quantize` for finite inputs; a 32-element block holding a NaN
+  gets scale 0xFF and its finite values quantize to zero), saving the
+  separate quantize launch. Raw and prequantized inputs share one tuner key at
+  both levels (the leaf's tile choice and the op's kernel tactic): the
+  quantization costs the same for every candidate, so a warmup that sees only
+  one input dtype tunes the lookups of the other.
 - Weights: e4m3 `[E, 2I, H]` / `[E, H, I]` with block scales in the 128x4
   swizzled layout produced by `block_scale_interleave` (int32-packed storage,
   viewed as bytes). FC1 weight and scales are gate/up interleaved at
@@ -657,14 +669,30 @@ finalize (scatter-add) into one persistent kernel, driven through
   interleave to the whole slot.
 - Per-expert `fc1_alpha` / `fc2_alpha` and the FC1 `norm_const` are 1.0 for
   MXFP8 (all scaling lives in the block scales).
-- The output is accumulated into, so `moe_output_memset_inplace` must run
-  first; the per-launch readiness/scheduler counters are zero-initialized
-  inside the op runner.
-- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler)` with
+- The output is accumulated into, so it must be zero on entry. In the dense
+  case (no all-to-all, or `ep_size <= top_k`) the op clears it inside its
+  workspace-reset launch (`zero_output`), up to the reset kernel's Int32
+  element count; otherwise the backend runs the sparse
+  `moe_output_memset_inplace` first. The readiness/scheduler counters and the
+  fused input-quantization scratch are allocated per call (uninitialized; the
+  same launch clears the counters): the caching allocator is stream-ordered,
+  so calls in flight on different streams, such as overlapped chunks, never
+  share them.
+- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+  stream_weights)` with
   `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
   `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
-  `l2_atomic` / `static`. The outer `CuteDslFusedMoEMxfp8Runner` tunes the
-  routing tile and the comb checker pins the inner `mma_tiler_m` to it.
+  `l2_atomic` / `static`, and L2 evict-first weight loads for both GEMMs
+  (`stream_weights`); a tactic of any other length raises. The op profiles
+  with a 256 MiB L2 flush before every run (`cold_l2_flush_bytes`), so the
+  weights come from HBM as in serving. The FC1 A gather variant (sparse for
+  mostly padded tiles, static otherwise) is decided at the shape of the
+  tuning bucket, so every row count in a bucket runs the kernel that tuning
+  and priming compiled for it.
+  The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile with its
+  power-of-two buckets anchored to `moe_tune_max_num_tokens` (so a small
+  warmup still profiles the larger buckets, up to that cap), and the comb
+  checker pins the inner `mma_tiler_m` to it.
 - **DSL build requirement.** The kernel needs a newer CuTe DSL build (the
   `nvidia-cutlass-dsl` version pinned in `requirements.txt`, 4.8.0) than the
   bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes

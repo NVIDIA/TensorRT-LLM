@@ -183,6 +183,27 @@ def blk_reduce_bf16(dst_gemm, src_smem, size, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def streaming_weight_cache_policy(*, loc=None, ip=None) -> cutlass.Int64:
+    """Build the opaque TMA L2 eviction descriptor for streamed weights.
+
+    Decode workloads with one M tile per expert read each weight tile once.
+    Prefer evicting that stream before activations, scales, and intermediates.
+    Use createpolicy rather than depending on the descriptor's bit encoding.
+    """
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @dataclass(frozen=True)
 class Fc12Task:
     """One descriptor in a resident CTA's fused FC12 task stream."""
@@ -866,6 +887,18 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
     :param topk: Experts selected per token.
     :param swiglu_limit: DS-v4 SwiGLU clamp limit; ``+inf`` disables clamp.
     :param scheduler: Persistent work-ID scheduler: ``static`` or ``l2_atomic``.
+    :param sparse_gather: Compile the FC1 A gather as a dynamic-trip-count loop
+        that skips 16-row groups lying wholly beyond a tile's valid rows (decode
+        tiles with a few real rows per 128-row tile). Leave it False for full
+        tiles: that keeps the statically unrolled loop, which is faster when
+        every group is live. The runner selects it per tuning bucket
+        (``Sm107Mxfp8FusedFc12MoeRunner._sparse_gather_for_bucket``), so each
+        compiled kernel contains one loop body.
+    :param stream_weights: Give the FC1/FC2 B (weight) TMA loads L2 evict-first
+        priority. Intended for decode shapes with little weight reuse across M
+        tiles (about seven or more active experts per rank); leave it False
+        for workloads that benefit from caching weights. Scale-factor loads
+        keep their default cache policy.
     """
 
     def __init__(
@@ -879,8 +912,12 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         use_pdl: bool = True,
         swiglu_limit: cutlass.Float32 = float("inf"),
         scheduler: str = "static",
+        sparse_gather: bool = False,
+        stream_weights: bool = False,
     ):
         self.sf_vec_size = sf_vec_size
+        self.sparse_gather = sparse_gather
+        self.stream_weights = stream_weights
         self.topk = topk
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
@@ -2959,6 +2996,23 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
             while is_valid_tile:
                 gToken_ml_tile = gToken_ml[(None, tile_info[0])]
+                # Each gather iteration covers 16 M rows. With ``sparse_gather``
+                # skip groups wholly beyond the valid-row limit for MXFP8 decode
+                # tiles. Those rows never contribute to a valid output: MMA is
+                # row-wise and the epilogue masks padding. The final partial
+                # group keeps its per-row zero-fill predicates. All gather
+                # threads still commit every A/SFA stage, preserving barrier
+                # counts.
+                a_num_loads = self.fc1_a_num_loads
+                if cutlass.const_expr(self.sparse_gather and self.a_dtype.width == 8):
+                    valid_rows = cutlass.min(
+                        self.cta_tile_shape_mnk[0],
+                        cutlass.max(
+                            0,
+                            tile_info[4] - tile_info[0] * self.cta_tile_shape_mnk[0],
+                        ),
+                    )
+                    a_num_loads = cute.ceil_div(valid_rows, 16)
                 for i in range(self.fc1_a_num_loads):
                     token_ml_tile_offset = (tidx_in_warpgroup // 8) + i * 16
                     a_token_offset_tensor[i] = gToken_ml_tile[token_ml_tile_offset]
@@ -3018,7 +3072,24 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         (None, None, None, None, fc1_a_producer_state.index)
                     ]
 
-                    for i in range(self.fc1_a_num_loads):
+                    # Compile-time choice (``sparse_gather``): the statically unrolled
+                    # loop (compile-time `i`, no per-group guards) for full tiles, or the
+                    # dynamic-trip-count loop that skips wholly padded 16-row groups for
+                    # decode tiles. Both run the same per-row gather (its operands are
+                    # passed explicitly: a staged loop cannot capture them); only one loop is
+                    # traced, so neither variant pays for the other.
+                    def gather_fc1_a_row(
+                        i: Union[int, cutlass.Int32],
+                        A_gmem_thread_offset: cutlass.Int32,
+                        a_token_offset_tensor: cute.Tensor,
+                        a_predicate_tensor: cute.Tensor,
+                        tFC1AgA_ktile: cute.Tensor,
+                        tFC1AsA_ktile: cute.Tensor,
+                        a_atom_copy: cute.CopyAtom,
+                        a_elems: int,
+                        a_k_atom: int,
+                        a_k_passes: int,
+                    ) -> None:
                         A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
                             a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
                             divby=a_elems,
@@ -3028,7 +3099,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         )
                         a_predicate_slice[0] = a_predicate_tensor[i]
                         # One 16-byte copy per 128-byte atom column of the K tile.
-                        for kk in cutlass.range_constexpr(self.fc1_a_k_passes):
+                        for kk in cutlass.range_constexpr(a_k_passes):
                             A_gmem_slice_offset = cute.assume(
                                 A_gmem_row_offset + kk * a_k_atom, divby=a_elems
                             )
@@ -3045,6 +3116,35 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                 tFC1AgA_slice,
                                 tFC1AsA_slice,
                                 pred=a_predicate_slice,
+                            )
+
+                    if cutlass.const_expr(not (self.sparse_gather and self.a_dtype.width == 8)):
+                        for i in range(self.fc1_a_num_loads):
+                            gather_fc1_a_row(
+                                i,
+                                A_gmem_thread_offset,
+                                a_token_offset_tensor,
+                                a_predicate_tensor,
+                                tFC1AgA_ktile,
+                                tFC1AsA_ktile,
+                                a_atom_copy,
+                                a_elems,
+                                a_k_atom,
+                                self.fc1_a_k_passes,
+                            )
+                    else:
+                        for i in cutlass.range(a_num_loads):
+                            gather_fc1_a_row(
+                                i,
+                                A_gmem_thread_offset,
+                                a_token_offset_tensor,
+                                a_predicate_tensor,
+                                tFC1AgA_ktile,
+                                tFC1AsA_ktile,
+                                a_atom_copy,
+                                a_elems,
+                                a_k_atom,
+                                self.fc1_a_k_passes,
                             )
 
                     # SFA for the same stage, issued by the same threads so
@@ -3303,6 +3403,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
         # TMA B/SFB load warp (warp 9). Loads B/SFB GMEM → SMEM with multicast.
         if warp_idx == self.tma_b_warp_id:
+            weight_cache_policy = None
+            if cutlass.const_expr(self.stream_weights):
+                weight_cache_policy = streaming_weight_cache_policy()
             fc1_b_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -3389,6 +3492,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         tFC1BsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
+                        cache_policy=weight_cache_policy,
                     )
 
                     # TMA load SFB
@@ -3461,6 +3565,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         tFC2BsB[(None, fc2_b_producer_state.index)],
                         tma_bar_ptr=fc2_b_barrier,
                         mcast_mask=b_full_mcast_mask,
+                        cache_policy=weight_cache_policy,
                     )
                     cute.copy(
                         tma_atom_fc2_sfb,
@@ -3692,11 +3797,28 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         # SFA 128dp UTCCP (Cp128x128b, smem → 128dp TMEM) +
                         # SFB UTCCP (Cp4x32x128b). Both land before the MMA.
                         sfa_s2t_stage_coord = (None, None, None, sfa_stage_idx)
-                        cute.copy(
-                            sfa_s2t_bundle.tiled_copy,
-                            sfa_s2t_bundle.sSF_compact[sfa_s2t_stage_coord],
-                            sfa_s2t_bundle.tSF_compact,
-                        )
+                        # One gathered SFA chunk (16 bytes per row) covers
+                        # fc1_sfa_k_tiles_per_chunk consecutive k_tiles (four
+                        # for MXFP8 K=128, two for K=256). Copy it smem -> TMEM
+                        # once per chunk and keep it in its dedicated TMEM
+                        # region until the next chunk; the column offset above
+                        # selects the current tile's scales. k_tile restarts at
+                        # zero for each FC1 tile, so a new expert/N tile always
+                        # reloads SFA. SFB and accumulators occupy separate
+                        # regions.
+                        if cutlass.const_expr(self.fc1_sfa_k_tiles_per_chunk > 1):
+                            if k_tile % self.fc1_sfa_k_tiles_per_chunk == 0:
+                                cute.copy(
+                                    sfa_s2t_bundle.tiled_copy,
+                                    sfa_s2t_bundle.sSF_compact[sfa_s2t_stage_coord],
+                                    sfa_s2t_bundle.tSF_compact,
+                                )
+                        else:
+                            cute.copy(
+                                sfa_s2t_bundle.tiled_copy,
+                                sfa_s2t_bundle.sSF_compact[sfa_s2t_stage_coord],
+                                sfa_s2t_bundle.tSF_compact,
+                            )
                         self._mainloop_s2t_copies(b_stage_idx, sfb_s2t_bundle)
 
                         num_kblocks = cute.size(tCrA, mode=[2])
