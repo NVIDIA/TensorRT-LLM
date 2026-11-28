@@ -354,12 +354,24 @@ byte:
   boundary; derived buffers are enforced at the final tier because the
   receiver's `cache_derived_state()` runs after the transfer.
 
+Each manifest entry also records a checksum per 1 MiB chunk of the tensor,
+computed on the tensor's device before and after the digest is taken. The
+checksums never decide pass or fail; they explain a digest difference. The
+report names the differing byte ranges at 1 MiB resolution, and the byte and
+amount when one changed byte explains a chunk. When every chunk of a GPU tensor
+agrees, it says the device bytes most likely match and the hashed host copies
+differ. A final-tier failure reports every differing pair of roles and names the
+role that differs from the two others. Receiver parameters are the donor's
+transferred bytes, so a baseline that differs from both on a parameter can also
+mean a bad donor load.
+
 A row may list `final_manifest_exempt_patterns` on its `MxE2ECase` to exempt
 named tensors from the final-tier digest comparison. That is never a numeric
 tolerance and never applies to the transfer tier, and every pattern needs a
 code comment explaining why; the current rows exempt nothing.
-Manifests carry a `manifest_format_version`, and manifests of different
-versions never compare.
+Manifests carry a `manifest_format_version`. Versions 1 and 2 share the digest
+and metadata definitions and compare with each other; other differing versions
+never compare.
 
 Run the TP=1 smoke test against an isolated ModelExpress 0.5.1 service with
 NIXL enabled:
@@ -375,7 +387,10 @@ pytest -v tests/integration/defs/model_express/test_model_express.py \
 With `--output-dir` (always set in CI), the worker payloads, worker logs,
 transfer logs, weight manifests, and `timing.json` are copied to
 `model_express/<case-id>/` under that directory, so they are part of the stage
-results archive even when the test fails. The test also prints one
+results archive even when the test fails. A case archived again into the same
+directory (a CI rerun, or a repeated run with the same `--output-dir`) goes to
+`model_express/<case-id>.attempt-<n>/`, and `<case-id>/` keeps the first
+attempt. The test also prints one
 `MX E2E timing` line per role and rank with the load, generation, and manifest
 durations.
 

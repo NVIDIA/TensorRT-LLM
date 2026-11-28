@@ -56,6 +56,7 @@ from tensorrt_llm._torch.weight_sharing import (
     WEIGHT_MANIFEST_FILE_PATTERN,
     ArtifactIdentity,
     WeightManifest,
+    WeightManifestDiff,
     compare_weight_manifests,
     load_weight_manifest,
 )
@@ -826,6 +827,24 @@ def collect_available_manifests(manifest_dir: Path) -> dict[ManifestKey, WeightM
     return manifests
 
 
+def _manifest_diff(
+    expected: WeightManifest,
+    actual: WeightManifest,
+    expected_label: str,
+    actual_label: str,
+    *,
+    kinds: Sequence[str] = ("param", "buffer"),
+    exempt_patterns: Sequence[str] = (),
+) -> WeightManifestDiff:
+    diff = compare_weight_manifests(expected, actual, kinds=kinds, exempt_patterns=exempt_patterns)
+    if diff.exempted_digest_diffs:
+        print(
+            f"MX E2E manifest: exempted digest differences {expected_label} vs {actual_label}: "
+            f"{list(diff.exempted_digest_diffs)}"
+        )
+    return diff
+
+
 def _assert_manifests_equal(
     expected: WeightManifest,
     actual: WeightManifest,
@@ -835,14 +854,76 @@ def _assert_manifests_equal(
     kinds: Sequence[str] = ("param", "buffer"),
     exempt_patterns: Sequence[str] = (),
 ) -> None:
-    diff = compare_weight_manifests(expected, actual, kinds=kinds, exempt_patterns=exempt_patterns)
-    if diff.exempted_digest_diffs:
-        print(
-            f"MX E2E manifest: exempted digest differences {expected_label} vs {actual_label}: "
-            f"{list(diff.exempted_digest_diffs)}"
-        )
+    diff = _manifest_diff(
+        expected,
+        actual,
+        expected_label,
+        actual_label,
+        kinds=kinds,
+        exempt_patterns=exempt_patterns,
+    )
     if not diff.is_empty:
         pytest.fail(diff.describe(expected_label, actual_label))
+
+
+def _final_tier_disagreement(
+    diffs: Mapping[tuple[str, str], WeightManifestDiff],
+    roles: Sequence[str],
+    rank: int,
+    *,
+    limit: int = 20,
+) -> str:
+    """Name, per tensor, the final-tier role that differs from the two others.
+
+    A tensor differs between two roles when their diff lists it, so the
+    exemptions and the digest, metadata, and missing-tensor checks are those of
+    the comparison. With three roles, a tensor that only the two pairs of one
+    role list belongs to that role. Receiver parameters are the donor's
+    transferred bytes, so a baseline that differs from the donor and the receiver
+    on a parameter can mean a bad baseline load or a bad donor load; the line
+    says so. Returns an empty string with fewer than three roles or no differing
+    tensor.
+    """
+    if len(roles) < 3:
+        return ""
+    pairs_by_fqn: dict[str, set[tuple[str, str]]] = {}
+    kind_by_fqn: dict[str, str] = {}
+    for pair, diff in diffs.items():
+        differing = {
+            *diff.digest_diffs,
+            *diff.missing_in_actual,
+            *diff.unexpected_in_actual,
+            *(item[0] for item in diff.metadata_diffs),
+        }
+        for fqn in differing:
+            pairs_by_fqn.setdefault(fqn, set()).add(pair)
+            entry = diff.expected_entries.get(fqn) or diff.actual_entries.get(fqn)
+            if entry is not None:
+                kind_by_fqn[fqn] = entry.kind
+    lines: list[str] = []
+    for fqn in sorted(pairs_by_fqn):
+        pairs = pairs_by_fqn[fqn]
+        if len(pairs) == len(diffs):
+            lines.append(f"  {fqn}: no two roles agree")
+            continue
+        if len(pairs) == 1:
+            ((left, right),) = pairs
+            lines.append(f"  {fqn}: differs only between {left} and {right}")
+            continue
+        odd = next(role for role in roles if all(role in pair for pair in pairs))
+        others = " and ".join(role for role in roles if role != odd)
+        line = f"  {fqn}: {odd} differs from {others}"
+        if odd == "baseline" and kind_by_fqn.get(fqn) == "param":
+            line += (
+                " (receiver parameters are the donor's transferred bytes, so a bad donor "
+                "load reads the same)"
+            )
+        lines.append(line)
+    if not lines:
+        return ""
+    if len(lines) > limit:
+        lines = [*lines[:limit], f"  ... and {len(lines) - limit} more"]
+    return f"\n roles that disagree with the others on rank {rank}:\n" + "\n".join(lines)
 
 
 def assert_weight_manifests(
@@ -855,9 +936,11 @@ def assert_weight_manifests(
     Transfer tier: donor-at-publish and receiver-at-receive parameters are
     byte-identical, never exempted. Final tier: every launched role is
     pairwise byte-identical after finalization, honoring only the row's
-    `final_manifest_exempt_patterns`. The per-role context checks (load path,
-    preloaded flag, transfer boundary) apply to every launched role; `roles`
-    must match the value given to `collect_weight_manifests`.
+    `final_manifest_exempt_patterns`; a failure reports every differing pair
+    and, with three roles, the role that differs from the two others. The
+    per-role context checks (load path, preloaded flag, transfer boundary)
+    apply to every launched role; `roles` must match the value given to
+    `collect_weight_manifests`.
     """
     roles = _validated_roles(roles)
 
@@ -890,14 +973,23 @@ def assert_weight_manifests(
             f"receiver@receive rank{rank}",
             kinds=TRANSFER_TIER_KINDS,
         )
-        for expected_role, actual_role in final_pairs:
-            _assert_manifests_equal(
+        diffs = {
+            (expected_role, actual_role): _manifest_diff(
                 manifests[("final", expected_role, rank)],
                 manifests[("final", actual_role, rank)],
                 f"{expected_role}@final rank{rank}",
                 f"{actual_role}@final rank{rank}",
                 exempt_patterns=case.final_manifest_exempt_patterns,
             )
+            for expected_role, actual_role in final_pairs
+        }
+        failing = [
+            diff.describe(f"{expected_role}@final rank{rank}", f"{actual_role}@final rank{rank}")
+            for (expected_role, actual_role), diff in diffs.items()
+            if not diff.is_empty
+        ]
+        if failing:
+            pytest.fail("\n".join(failing) + _final_tier_disagreement(diffs, roles, rank))
 
 
 # Routed-expert tensors of the unquantized CUTLASS MoE backend, the only MoE
@@ -1056,11 +1148,21 @@ def report_timings(
 def archive_run_artifacts(
     output_dir: str | Path | None, case_id: str, layout: MxRunLayout
 ) -> Path | None:
-    """Copy payloads, logs, manifests, and timing into the CI-archived output directory."""
+    """Copy payloads, logs, manifests, and timing into the CI-archived output directory.
+
+    A case archived again into the same output directory, as when CI reruns a
+    failed test, goes to `<case_id>.attempt-<n>`, so the earlier attempt's
+    artifacts are kept.
+    """
     if not output_dir:
         return None
-    destination = Path(output_dir) / "model_express" / case_id
-    destination.mkdir(parents=True, exist_ok=True)
+    root = Path(output_dir) / "model_express"
+    destination = root / case_id
+    attempt = 1
+    while destination.exists():
+        attempt += 1
+        destination = root / f"{case_id}.attempt-{attempt}"
+    destination.mkdir(parents=True)
     for pattern in ("*.json", "*.log"):
         for path in layout.root.glob(pattern):
             if path.is_file():
