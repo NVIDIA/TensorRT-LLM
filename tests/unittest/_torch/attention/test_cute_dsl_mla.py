@@ -15,6 +15,9 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm.bindings import DataType
 
+if IS_CUTLASS_DSL_AVAILABLE:
+    import cutlass
+
 
 def test_fp8_mla_scales_remain_tensors() -> None:
     """FP8 scales reach the kernel as the same device tensors, never as host floats."""
@@ -118,6 +121,38 @@ def test_mla_decode_split_kv_workspace_rows_cover_every_bucket(num_heads: int) -
         )
         >= rows
     )
+
+
+def _bf16_mla_decode_runner(max_split_kv: int):
+    return _mla_decode_runner_cls()(
+        in_dtype=cutlass.BFloat16,
+        num_heads=64,
+        seq_len_q=4,
+        page_size=64,
+        max_batch_size=64,
+        max_split_kv=max_split_kv,
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="nvidia-cutlass-dsl is not installed")
+def test_mla_decode_split_cap_bounds_large_batches(monkeypatch) -> None:
+    """A runner's ``max_split_kv`` caps the split of batches of at least
+    ``_SPLIT_CAP_MIN_BATCH`` requests, and a set cap changes the autotuner id."""
+    runner_cls = _mla_decode_runner_cls()
+    monkeypatch.setattr(runner_cls, "_cute_dsl_max_active_blocks", 296, raising=False)
+    min_batch = runner_cls._SPLIT_CAP_MIN_BATCH
+    uncapped = _bf16_mla_decode_runner(0)
+    capped = _bf16_mla_decode_runner(2)
+
+    assert uncapped.default_tactic(min_batch)[2] > 2
+    assert capped.default_tactic(min_batch)[2] == 2
+    # Smaller batches keep the occupancy-derived split.
+    assert capped.default_tactic(min_batch // 2)[2] == uncapped.default_tactic(min_batch // 2)[2]
+
+    assert capped.unique_id() != uncapped.unique_id()
+    assert capped.unique_id() != _bf16_mla_decode_runner(1).unique_id()
+    with pytest.raises(ValueError, match="max_split_kv"):
+        _bf16_mla_decode_runner(-1)
 
 
 class _TrtllmGenStub:
