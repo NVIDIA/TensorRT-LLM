@@ -15,6 +15,8 @@ if IS_FLASHINFER_AVAILABLE:
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
     @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
     def flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim >= 2 and x.size(0) == 0 and x.size(-1) > 0 and x.size(-1) % 2 == 0:
+            return x.new_empty((*x.shape[:-1], x.size(-1) // 2))
         return silu_and_mul(x, enable_pdl=get_env_enable_pdl())
 
     @flashinfer_silu_and_mul.register_fake
@@ -24,6 +26,8 @@ if IS_FLASHINFER_AVAILABLE:
     @torch.library.custom_op("trtllm::flashinfer_gelu_tanh_and_mul",
                              mutates_args=())
     def flashinfer_gelu_tanh_and_mul(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim >= 2 and x.size(0) == 0 and x.size(-1) > 0 and x.size(-1) % 2 == 0:
+            return x.new_empty((*x.shape[:-1], x.size(-1) // 2))
         return gelu_tanh_and_mul(x, enable_pdl=get_env_enable_pdl())
 
     @flashinfer_gelu_tanh_and_mul.register_fake
@@ -34,6 +38,8 @@ if IS_FLASHINFER_AVAILABLE:
     @torch.library.custom_op("trtllm::flashinfer_rmsnorm", mutates_args=())
     def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor,
                            eps: float) -> torch.Tensor:
+        if input.ndim == 2 and input.size(0) == 0 and input.shape[1:] == weight.shape:
+            return torch.empty_like(input)
         return rmsnorm(input, weight, eps, enable_pdl=get_env_enable_pdl())
 
     @flashinfer_rmsnorm.register_fake
@@ -60,6 +66,9 @@ if IS_FLASHINFER_AVAILABLE:
     def flashinfer_fused_add_rmsnorm(input: torch.Tensor,
                                      residual: torch.Tensor,
                                      weight: torch.Tensor, eps: float) -> None:
+        if (input.ndim == 2 and input.size(0) == 0
+                and input.shape == residual.shape and input.shape[1:] == weight.shape):
+            return
         fused_add_rmsnorm(input,
                           residual,
                           weight,
@@ -110,6 +119,9 @@ if IS_FLASHINFER_AVAILABLE:
         cos_sin_cache: torch.Tensor,
         is_neox: bool = True,
     ) -> None:
+        if (positions.ndim == 1 and positions.numel() == 0
+                and query.ndim == key.ndim == 2 and query.size(0) == key.size(0) == 0):
+            return
         apply_rope_with_cos_sin_cache_inplace(
             positions,
             query,
