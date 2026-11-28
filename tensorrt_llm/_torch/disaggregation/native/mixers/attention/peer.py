@@ -577,10 +577,14 @@ class AttentionPolicy:
         Pool matching drops a view with no counterpart silently, so an
         index-key side cache the peer never declares would leave the receiver
         holding zeroed state instead of raising. Given both sides' tokens per
-        block, standalone draft pages must also hold the same bytes per token:
-        they are copied as bytes, so a storage dtype that differs between the
-        peers (a DSpark drafter's ``speculative_config.context_kv_dtype``) would
-        be reinterpreted. Raises ``ValueError``.
+        block, standalone draft pages must also hold the same bytes per token
+        and KV head: they are copied as bytes, so a storage dtype that differs
+        between the peers (a DSpark drafter's
+        ``speculative_config.context_kv_dtype``) would be reinterpreted. The
+        draft heads per rank may differ (e.g. attention TP8 vs TP16 or vs
+        attention DP): such groups are resharded by head range, which needs
+        one side's per-rank head count to divide the other's. Raises
+        ``ValueError``.
         """
         differing = find_replicated_role_mismatch(self_page_table, peer_page_table, CacheKind.PAGED)
         if differing:
@@ -602,7 +606,26 @@ class AttentionPolicy:
                     raise ValueError("Attention peers disagree on full-sequence CP-to-TP storage")
                 if local.cp_as_tp and local.total_kv_head_num != peer.total_kv_head_num:
                     raise ValueError("Standalone draft peers have different global KV head counts")
+                if local.cp_as_tp:
+                    AttentionPolicy._validate_draft_reshard(layer, local, peer)
+                    if (
+                        local.kv_head_num_per_rank != peer.kv_head_num_per_rank
+                        and self_tokens_per_block
+                        and peer_tokens_per_block
+                        and self_tokens_per_block != peer_tokens_per_block
+                    ):
+                        raise ValueError(
+                            f"Standalone draft layer {layer}: resharding heads "
+                            f"({local.kv_head_num_per_rank} vs {peer.kv_head_num_per_rank}/rank) "
+                            f"needs equal tokens_per_block (local {self_tokens_per_block}, "
+                            f"peer {peer_tokens_per_block})"
+                        )
                 if local.cp_as_tp and self_tokens_per_block and peer_tokens_per_block:
+                    # Per KV head: the heads per rank legitimately differ when
+                    # the peers shard the drafter differently (TP8 vs TP16 /
+                    # attention DP); the head-range mapper then copies whole
+                    # heads, so only a per-head size difference (dtype or
+                    # head_dim) makes the bytes unusable.
                     local_bytes = AttentionPolicy._draft_bytes_per_token(
                         local, self_tokens_per_block
                     )
@@ -610,16 +633,46 @@ class AttentionPolicy:
                     if local_bytes != peer_bytes:
                         raise ValueError(
                             f"Standalone draft peers store layer {layer} with different bytes "
-                            f"per token (local {local_bytes}, peer {peer_bytes}); set the same "
+                            f"per token per KV head (local {local_bytes} with "
+                            f"{local.kv_head_num_per_rank} heads/rank, peer {peer_bytes} with "
+                            f"{peer.kv_head_num_per_rank} heads/rank); set the same "
                             "speculative_config.context_kv_dtype on the context and generation "
                             "servers."
                         )
 
     @staticmethod
+    def _validate_draft_reshard(
+        layer: int, local: AttentionLayerGroup, peer: AttentionLayerGroup
+    ) -> None:
+        """Require draft head shards that a head-range copy can reshard.
+
+        HND head-mismatch mapping copies ``min(local, peer)`` contiguous heads
+        per rank pair, so the larger per-rank head count must be a whole
+        multiple of the smaller one.
+        """
+        local_heads = int(local.kv_head_num_per_rank)
+        peer_heads = int(peer.kv_head_num_per_rank)
+        if local_heads <= 0 or peer_heads <= 0:
+            raise ValueError(
+                f"Standalone draft layer {layer} has no KV heads on one side "
+                f"(local {local_heads}/rank, peer {peer_heads}/rank)"
+            )
+        if local_heads == peer_heads:
+            return
+        lo, hi = sorted((local_heads, peer_heads))
+        if hi % lo != 0:
+            raise ValueError(
+                f"Standalone draft layer {layer} KV heads cannot be resharded by head range: "
+                f"local {local_heads}/rank, peer {peer_heads}/rank "
+                f"(total {local.total_kv_head_num}); one count must divide the other."
+            )
+
+    @staticmethod
     def _draft_bytes_per_token(layer_group: AttentionLayerGroup, tokens_per_block: int) -> dict:
-        """Bytes per token of each role's page in a standalone draft layer group."""
+        """Bytes per token per KV head of each role's page in a standalone draft group."""
+        heads = max(1, int(layer_group.kv_head_num_per_rank))
         return {
-            "/".join(sorted(view.pool_role)): view.bytes_per_layer / tokens_per_block
+            "/".join(sorted(view.pool_role)): view.bytes_per_layer / tokens_per_block / heads
             for view in layer_group.pool_views
             if view.bytes_per_layer is not None
         }
