@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
 import psutil
@@ -64,6 +65,7 @@ def test_cute_dsl_allreduce_op_matrix() -> None:
         pytest.param("worker-failure", None, False, id="worker-failure"),
         pytest.param("worker-signal", None, False, id="worker-signal"),
         pytest.param("spawn-failure", None, False, id="spawn-failure"),
+        pytest.param("deadline", None, False, id="deadline"),
         pytest.param(
             "probe-teardown-failure",
             None,
@@ -74,7 +76,12 @@ def test_cute_dsl_allreduce_op_matrix() -> None:
 )
 def test_rendezvous_port_ownership(
     outcome: Literal[
-        "success", "worker-failure", "worker-signal", "spawn-failure", "probe-teardown-failure"
+        "success",
+        "worker-failure",
+        "worker-signal",
+        "spawn-failure",
+        "deadline",
+        "probe-teardown-failure",
     ],
     use_libuv: str | None,
     ignore_sigchld: bool,
@@ -268,7 +275,12 @@ def _open_supervisor_pidfd(
 
 def _run_rendezvous_case(
     outcome: Literal[
-        "success", "worker-failure", "worker-signal", "spawn-failure", "probe-teardown-failure"
+        "success",
+        "worker-failure",
+        "worker-signal",
+        "spawn-failure",
+        "deadline",
+        "probe-teardown-failure",
     ],
     use_libuv: str | None,
     ignore_sigchld: bool,
@@ -313,7 +325,7 @@ def _run_rendezvous_case(
 
 def _check_rendezvous_port_ownership(
     monkeypatch: pytest.MonkeyPatch,
-    outcome: Literal["success", "worker-failure", "worker-signal", "spawn-failure"],
+    outcome: Literal["success", "worker-failure", "worker-signal", "spawn-failure", "deadline"],
     use_libuv: str | None,
     tmp_path: Path,
     controller_read: int,
@@ -327,6 +339,19 @@ def _check_rendezvous_port_ownership(
     else:
         monkeypatch.setenv("USE_LIBUV", use_libuv)
     monkeypatch.setattr(launcher, "DEADLINE_S", 60)
+    if outcome == "deadline":
+        clock_time = 0.0
+
+        def advance_clock(seconds: float) -> None:
+            nonlocal clock_time
+            clock_time += 61.0
+            time.sleep(seconds)
+
+        monkeypatch.setattr(
+            launcher,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock_time, sleep=advance_clock),
+        )
     helper_path = tmp_path / "helper.pid"
     watch_controller = """
 import os
@@ -347,6 +372,10 @@ import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
+
+if os.environ["TEST_RANK_OUTCOME"] == "deadline":
+    os.write(sys.stdout.fileno(), b"R")
+    threading.Event().wait()
 
 import torch
 import torch.distributed as dist
@@ -385,6 +414,7 @@ dist.destroy_process_group()
     port = None
     owned_listeners = set()
     store_backends = []
+    launcher_running = True
 
     def listeners(port_number: int) -> set[Path]:
         return {
@@ -398,8 +428,15 @@ dist.destroy_process_group()
         store_backends.append(store.libuvBackend)
         return store
 
+    def require_owned_listener() -> None:
+        if port is None or not owned_listeners or not owned_listeners.issubset(listeners(port)):
+            raise AssertionError("launcher listener closed before worker cleanup")
+
     def kill_owned_group(process_group: int, signum: int) -> None:
-        os.waitid(os.P_PID, process_group, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        require_owned_listener()
+        status = os.waitid(os.P_PID, process_group, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if outcome == "deadline" and status is not None:
+            raise AssertionError("deadline worker exited before cleanup")
         if outcome == "success":
             raise AssertionError("successful workers must not be signaled")
         kill_group(process_group, signum)
@@ -437,6 +474,21 @@ dist.destroy_process_group()
                 stderr=subprocess.STDOUT,
             )
             children.append(child)
+            wait = child.wait
+
+            def wait_owned_worker(timeout: float | None = None) -> int:
+                if launcher_running:
+                    require_owned_listener()
+                return wait(timeout=timeout)
+
+            monkeypatch.setattr(child, "wait", wait_owned_worker)
+            if outcome == "deadline":
+                if child.stdout is None:
+                    raise AssertionError("deadline worker pipe is missing")
+                ready = select.poll()
+                ready.register(child.stdout, select.POLLIN)
+                if not ready.poll(10_000) or os.read(child.stdout.fileno(), 1) != b"R":
+                    raise AssertionError("deadline worker did not become ready")
             return child
 
         monkeypatch.setattr(launcher.subprocess, "Popen", start_worker)
@@ -450,10 +502,16 @@ dist.destroy_process_group()
                 expected_code = 7 if outcome == "worker-failure" else -signal.SIGTERM
                 with pytest.raises(AssertionError, match=f"rank 0 exited {expected_code}"):
                     launcher._spawn_ranks()
+            elif outcome == "deadline":
+                with pytest.raises(AssertionError, match=r"did not finish in 60s \(wedged\)"):
+                    launcher._spawn_ranks()
             else:
                 launcher._spawn_ranks()
+            launcher_running = False
             if not children:
                 raise AssertionError("no workers were started")
+            if outcome == "deadline" and len(children) != launcher.WORLD_SIZE:
+                raise AssertionError("deadline did not exercise every worker")
             for child in children:
                 with pytest.raises(ChildProcessError):
                     os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -465,15 +523,19 @@ dist.destroy_process_group()
                 backend == (use_libuv != "0") for backend in store_backends
             ):
                 raise AssertionError("unexpected rendezvous store backend")
-            for child in children:
-                child.communicate(timeout=10)
             if outcome in ("worker-failure", "worker-signal"):
                 helper_pid, helper_group = map(int, helper_path.read_text().split())
                 if helper_group != children[0].pid:
                     raise AssertionError("helper left its worker's process group")
-                if os.waitid(os.P_PID, helper_pid, os.WEXITED | os.WNOWAIT) is None:
-                    raise AssertionError("worker helper did not exit")
+                deadline = time.monotonic() + 10
+                while os.waitid(os.P_PID, helper_pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("worker helper did not exit")
+                    time.sleep(0.05)
+            for child in children:
+                child.communicate(timeout=10)
         finally:
+            launcher_running = False
             signal.signal(signal.SIGCHLD, signal.SIG_DFL)
             for child in children:
                 if child.poll() is None:
