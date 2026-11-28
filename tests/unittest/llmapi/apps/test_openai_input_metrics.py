@@ -15,12 +15,9 @@ from tensorrt_llm.bindings.executor import RequestPerfMetrics
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.metrics.perf_utils import _input_processing_observer, _time_input_processing
 from tensorrt_llm.serve.anthropic_protocol import AnthropicCreateBatchRequest
+from tensorrt_llm.serve.middleware.perf_metrics import PerfMetricsMiddleware
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
-from tensorrt_llm.serve.perf_metrics import (
-    RETURN_METRICS_HEADER,
-    SERVER_TIMING_HEADER,
-    PerfMetricsMiddleware,
-)
+from tensorrt_llm.serve.perf_metrics import RETURN_METRICS_HEADER, SERVER_TIMING_HEADER
 
 pytestmark = pytest.mark.cpu_only
 

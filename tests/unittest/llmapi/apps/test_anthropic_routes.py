@@ -33,6 +33,7 @@ from tensorrt_llm.executor.utils import RequestError, context_length_exceeded_me
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+from tensorrt_llm.serve.middleware.arrival_time import ServerArrivalTimeMiddleware
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -46,7 +47,6 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.render import chat as render_chat_module
-from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
 # CPU-Generic CI stage, which selects with `-m cpu_only`.
