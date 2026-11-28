@@ -29,7 +29,7 @@ By NVIDIA TensorRT-LLM team
   - [I-ExpCast](#i-expcast)
   - [Row Sum in the PV MMA](#row-sum-in-the-pv-mma)
   - [Lazy Rescale](#lazy-rescale)
-- [Why it needs Co-Design](#why-it-needs-co-design)
+- [Why It Needs Co-Design](#why-it-needs-co-design)
 - [Results](#results)
   - [Speedup](#speedup)
   - [Accuracy](#accuracy)
@@ -285,7 +285,7 @@ DeCo-Attention therefore uses *T* = 4 for both formats, as the balance of accura
 
 <p align="center"><sub><em>Figure 14. Attention time of a Wan2.2 call and relative L2 error (%) of the kernels with FP8 PV and NVFP4 PV on GB300 at three thresholds T of the lazy rescale.</em></sub></p>
 
-## Why it needs Co-Design
+## Why It Needs Co-Design
 
 Figure 15 shows why the compensation and the kernel optimizations were designed together.
 
