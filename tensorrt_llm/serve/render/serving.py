@@ -34,9 +34,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import os
 import uuid
 from typing import Any, Callable, Dict, List, Optional
+
+from tensorrt_llm.serve import envs
 
 from .chat import arender_chat, tokenize_rendered
 from .prompt_types import (
@@ -50,7 +51,6 @@ from .resources import RenderResources
 # Top-level request fields that a Dynamo gateway adds for its own routing and
 # that the inference request models do not define. They never change the prompt.
 DYNAMO_ONLY_FIELDS = ("nvext", "cache_namespace")
-_EXTRA_IGNORED_ENV = "TRTLLM_RENDER_IGNORED_FIELDS"
 
 
 class RenderRequestError(Exception):
@@ -66,9 +66,7 @@ class RenderRequestError(Exception):
 def strip_ignored_fields(body: Dict[str, Any]) -> Dict[str, Any]:
     """Drop gateway-only fields so the request validates like a normal one."""
     ignored = set(DYNAMO_ONLY_FIELDS)
-    ignored.update(
-        name.strip() for name in os.getenv(_EXTRA_IGNORED_ENV, "").split(",") if name.strip()
-    )
+    ignored.update(envs.TRTLLM_RENDER_IGNORED_FIELDS)
     return {key: value for key, value in body.items() if key not in ignored}
 
 

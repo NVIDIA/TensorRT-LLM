@@ -71,9 +71,20 @@ def test_neutral_env_selects_the_provider(monkeypatch):
     assert load_web_search_config().provider == "wikipedia"
 
 
-def test_numeric_settings_are_read_from_the_environment(monkeypatch):
+def test_numeric_settings_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRTLLM_WEB_SEARCH_MAX_RESULTS", "7")
-    assert load_web_search_config().max_results == 7
+    monkeypatch.setenv("TRTLLM_WEB_SEARCH_TIMEOUT_S", "0.25")
+    monkeypatch.setenv("TRTLLM_WEB_SEARCH_MAX_USES", "3")
+    monkeypatch.setenv("TRTLLM_WEB_SEARCH_RETRIES", "4")
+    config = load_web_search_config()
+    assert (config.max_results, config.timeout_s, config.max_uses, config.retries) == (
+        7,
+        0.25,
+        3,
+        4,
+    )
+    monkeypatch.setenv("TRTLLM_WEB_SEARCH_MAX_RESULTS", "11")
+    assert load_web_search_config().max_results == 11
 
 
 # ---------------------------------------------------------------------------

@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from tensorrt_llm.serve import envs
 
 from .prompt_types import RenderedRequest
 from .resources import RenderResources
@@ -29,14 +30,10 @@ from .serving import RenderRequestError, ServingRender
 CHAT_RENDER_PATH = "/v1/chat/completions/render"
 COMPLETION_RENDER_PATH = "/v1/completions/render"
 
-# The render routes are a separate exposed surface; a normal ``trtllm-serve``
-# worker mounts them only when this is set.
-ENABLE_ENV = "TRTLLM_ENABLE_RENDER_ENDPOINTS"
-
 
 def render_endpoints_enabled() -> bool:
     """Whether a serving worker mounts the render routes."""
-    return os.getenv(ENABLE_ENV, "0") == "1"
+    return envs.TRTLLM_ENABLE_RENDER_ENDPOINTS
 
 
 def error_response(error: RenderRequestError) -> JSONResponse:
