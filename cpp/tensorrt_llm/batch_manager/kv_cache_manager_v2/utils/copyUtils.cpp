@@ -181,14 +181,16 @@ public:
         return mCapacity.load(std::memory_order_acquire);
     }
 
-    //! Reserves \p bytes of staging for a write about to be issued; false when they do not fit.
-    bool reserve(size_t bytes) noexcept
+    //! Reserves \p bytes of staging for a write about to be issued; false when the reserved total would exceed
+    //! \p limit (at most capacity()). The check and the reservation are one atomic step, so writers racing for the
+    //! last bytes cannot both pass it.
+    bool reserve(size_t bytes, size_t limit) noexcept
     {
-        size_t const cap = capacity();
+        limit = std::min(limit, capacity());
         size_t used = mReserved.load(std::memory_order_relaxed);
         do
         {
-            if (cap == 0 || bytes > cap || used > cap - bytes)
+            if (limit == 0 || bytes > limit || used > limit - bytes)
             {
                 return false;
             }
@@ -262,7 +264,7 @@ public:
         }
         std::lock_guard<std::mutex> lock(mMutex);
         auto it = mPages.find(key);
-        return it == mPages.end() ? nullptr : it->second;
+        return it == mPages.end() ? nullptr : it->second.page;
     }
 
     //! Makes \p page the pending content of \p key, replacing an older one.
@@ -270,9 +272,9 @@ public:
     {
         std::shared_ptr<StagedDiskPage> replaced; // destroyed outside the lock
         std::lock_guard<std::mutex> lock(mMutex);
-        auto& slot = mPages[key];
-        replaced = std::move(slot);
-        slot = std::move(page);
+        auto& entry = mPages[key];
+        replaced = std::move(entry.page);
+        entry.page = std::move(page);
         mNumPages.store(mPages.size(), std::memory_order_release);
     }
 
@@ -283,62 +285,106 @@ public:
         kBusy,       // an older flush of the same page is still writing: try again later
     };
 
-    FlushStart beginFlush(DiskPageKey key, StagedDiskPage const* page)
+    //! Neither this nor endFlush allocates: the flush state lives in the page's map entry, so a flush worker (noexcept)
+    //! cannot fail here.
+    FlushStart beginFlush(DiskPageKey key, StagedDiskPage const* page) noexcept
     {
         std::lock_guard<std::mutex> lock(mMutex);
         auto it = mPages.find(key);
-        if (it == mPages.end() || it->second.get() != page)
+        if (it == mPages.end() || it->second.page.get() != page)
         {
             return FlushStart::kSuperseded;
         }
-        if (!mFlushing.insert(key).second)
+        if (it->second.flushing)
         {
             return FlushStart::kBusy;
         }
+        it->second.flushing = true;
         return FlushStart::kStart;
+    }
+
+    //! Waits until no flush of \p key is writing.
+    void waitFlushEnd(DiskPageKey key) noexcept
+    {
+        std::unique_lock<std::mutex> lock(mMutex);
+        mFlushedCv.wait(lock,
+            [&]()
+            {
+                auto it = mPages.find(key);
+                return it == mPages.end() || !it->second.flushing;
+            });
     }
 
     //! The flush of \p page has ended. Once written, the file holds the page, so it leaves staging unless a newer write
     //! replaced it meanwhile. A failed flush keeps it.
-    void endFlush(DiskPageKey key, StagedDiskPage const* page, bool written)
+    void endFlush(DiskPageKey key, StagedDiskPage const* page, bool written) noexcept
     {
         std::shared_ptr<StagedDiskPage> released; // destroyed outside the lock
         {
             std::lock_guard<std::mutex> lock(mMutex);
-            mFlushing.erase(key);
+            // A flushing entry is never removed (drop and dropPage wait for its flush), so it is still there.
             auto it = mPages.find(key);
-            if (written && it != mPages.end() && it->second.get() == page)
+            if (it != mPages.end())
             {
-                released = std::move(it->second);
-                mPages.erase(it);
-                mNumPages.store(mPages.size(), std::memory_order_release);
+                it->second.flushing = false;
+                if (written && it->second.page.get() == page)
+                {
+                    released = std::move(it->second.page);
+                    mPages.erase(it);
+                    mNumPages.store(mPages.size(), std::memory_order_release);
+                }
             }
         }
         mFlushedCv.notify_all();
     }
 
-    //! Drops the pending pages of \p fd at offsets in [\p minPos, \p maxPos], after any flush of them that is writing:
-    //! their file is about to be closed or shrunk, or (one page) overwritten by a copy that bypasses staging.
-    void drop(int fd, ssize_t minPos, ssize_t maxPos = std::numeric_limits<ssize_t>::max())
+    //! Drops the pending pages of \p fd at offsets from \p minPos, after any flush of them that is writing: their
+    //! file is about to be closed or shrunk. Allocates nothing, so every such page is gone when it returns: a file
+    //! descriptor reused later cannot read a stale page from staging.
+    void drop(int fd, ssize_t minPos) noexcept
     {
-        std::vector<std::shared_ptr<StagedDiskPage>> released; // destroyed outside the lock
         std::unique_lock<std::mutex> lock(mMutex);
-        auto const inRange = [fd, minPos, maxPos](DiskPageKey const& key)
-        { return key.first == fd && key.second >= minPos && key.second <= maxPos; };
-        mFlushedCv.wait(lock, [&]() { return std::none_of(mFlushing.begin(), mFlushing.end(), inRange); });
-        for (auto it = mPages.begin(); it != mPages.end();)
+        auto const first = [&]() { return mPages.lower_bound(DiskPageKey{fd, minPos}); };
+        auto const ofFd = [&](auto it) { return it != mPages.end() && it->first.first == fd; };
+        mFlushedCv.wait(lock,
+            [&]()
+            {
+                for (auto it = first(); ofFd(it); ++it)
+                {
+                    if (it->second.flushing)
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            });
+        // The pages are released under the lock: their destructor takes only the buffer mutex, never this one.
+        for (auto it = first(); ofFd(it);)
         {
-            if (inRange(it->first))
-            {
-                released.push_back(std::move(it->second));
-                it = mPages.erase(it);
-            }
-            else
-            {
-                ++it;
-            }
+            it = mPages.erase(it);
         }
         mNumPages.store(mPages.size(), std::memory_order_release);
+    }
+
+    //! Drops the pending page at \p key, after its flush if one is writing: the page is about to be written by a copy
+    //! that bypasses staging. A queued flush of it then writes nothing, and no read serves the older bytes. Allocates
+    //! nothing.
+    void dropPage(DiskPageKey key) noexcept
+    {
+        std::shared_ptr<StagedDiskPage> released; // destroyed outside the lock
+        std::unique_lock<std::mutex> lock(mMutex);
+        auto it = mPages.find(key);
+        while (it != mPages.end() && it->second.flushing)
+        {
+            mFlushedCv.wait(lock);
+            it = mPages.find(key);
+        }
+        if (it != mPages.end())
+        {
+            released = std::move(it->second.page);
+            mPages.erase(it);
+            mNumPages.store(mPages.size(), std::memory_order_release);
+        }
         lock.unlock();
     }
 
@@ -350,10 +396,16 @@ public:
 private:
     std::atomic<size_t> mCapacity{0};
     std::atomic<size_t> mReserved{0}; // reserved for issued writes, plus staged pages not yet released
+
+    struct Entry
+    {
+        std::shared_ptr<StagedDiskPage> page; // never null
+        bool flushing = false;                // a flush of this key is writing (of this page or an older one)
+    };
+
     std::mutex mMutex;
     std::condition_variable mFlushedCv;
-    std::map<DiskPageKey, std::shared_ptr<StagedDiskPage>> mPages;
-    std::set<DiskPageKey> mFlushing;
+    std::map<DiskPageKey, Entry> mPages;
     std::atomic<size_t> mNumPages{0};
     std::mutex mBufferMutex;
     std::map<size_t, std::vector<std::unique_ptr<std::byte[]>>> mFreeBuffers;
@@ -438,8 +490,10 @@ struct HostCopyJob
     std::atomic<size_t> finished{0};
     std::atomic<bool> success{true};
 
-    //! Runs unclaimed tasks until none is left. Returns how many it ran.
-    size_t work() noexcept
+    //! Runs unclaimed tasks until none is left. Returns how many it ran. A pool worker (\p helper) counts each task in
+    //! gHostCopyHelperTasks before it publishes the task's completion, so whoever has seen the callback return also
+    //! sees the count.
+    size_t work(bool helper) noexcept
     {
         size_t ran = 0;
         for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < numTasks;
@@ -450,6 +504,10 @@ struct HostCopyJob
                 success.store(false, std::memory_order_relaxed);
             }
             ++ran;
+            if (helper)
+            {
+                gHostCopyHelperTasks.fetch_add(1, std::memory_order_relaxed);
+            }
             // Release: the waiter that sees the last count also sees every task's bytes.
             if (finished.fetch_add(1, std::memory_order_acq_rel) + 1 == numTasks)
             {
@@ -539,8 +597,7 @@ private:
             }
             // The shared_ptr keeps next / finished alive after the caller returned; fn and context are only used for
             // a claimed task, which the caller waits for.
-            size_t const ran = job->work();
-            gHostCopyHelperTasks.fetch_add(ran, std::memory_order_relaxed);
+            job->work(/*helper=*/true);
         }
     }
 
@@ -556,6 +613,20 @@ std::atomic<HostCopyPool*> gHostCopyPool{nullptr};
 // The first value > 1 configureHostCopyThreads was given (0: none yet).
 std::atomic<size_t> gConfiguredHostCopyThreads{0};
 
+// Serializes setHostCopyThreads. The fork handlers hold it across fork(), so a child never starts with it locked by a
+// thread it does not have.
+std::mutex gHostCopyConfigMutex;
+
+void lockHostCopyConfigForFork() noexcept
+{
+    gHostCopyConfigMutex.lock();
+}
+
+void unlockHostCopyConfigInParent() noexcept
+{
+    gHostCopyConfigMutex.unlock();
+}
+
 void forgetHostCopyPoolInChild() noexcept
 {
     // A forked child has none of the workers, and the parent's pool mutex may have been held by one of them at the
@@ -563,14 +634,17 @@ void forgetHostCopyPoolInChild() noexcept
     gHostCopyPool.store(nullptr, std::memory_order_relaxed);
     gHostCopyThreads.store(1, std::memory_order_relaxed);
     gConfiguredHostCopyThreads.store(0, std::memory_order_relaxed);
+    gHostCopyConfigMutex.unlock(); // taken by the forking thread in the prepare handler
 }
 
 //! Sets the width of every later callback to \p numThreads (callback thread included), starting workers as needed.
 //! Returns the width set, which is smaller when not every worker started.
 size_t setHostCopyThreads(size_t numThreads) noexcept
 {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
+    // Registered before the first lock, so no fork can find the mutex held without the handlers in place.
+    static bool const kAtFork
+        = ::pthread_atfork(lockHostCopyConfigForFork, unlockHostCopyConfigInParent, forgetHostCopyPoolInChild) == 0;
+    std::lock_guard<std::mutex> lock(gHostCopyConfigMutex);
     if (numThreads <= 1)
     {
         gHostCopyThreads.store(1, std::memory_order_release);
@@ -579,15 +653,15 @@ size_t setHostCopyThreads(size_t numThreads) noexcept
     auto* pool = gHostCopyPool.load(std::memory_order_acquire);
     if (pool == nullptr)
     {
+        if (!kAtFork)
+        {
+            TLLM_LOG_WARNING("[kvCacheManagerV2Utils] pthread_atfork failed; a forked child may hang in a host copy");
+            return gHostCopyThreads.load();
+        }
         pool = new (std::nothrow) HostCopyPool;
         if (pool == nullptr)
         {
             return gHostCopyThreads.load();
-        }
-        static bool const kAtFork = ::pthread_atfork(nullptr, nullptr, forgetHostCopyPoolInChild) == 0;
-        if (!kAtFork)
-        {
-            TLLM_LOG_WARNING("[kvCacheManagerV2Utils] pthread_atfork failed; a forked child may hang in a host copy");
         }
         gHostCopyPool.store(pool, std::memory_order_release);
     }
@@ -633,7 +707,7 @@ bool forEachHostCopyTask(size_t numTasks, ssize_t numBytes, Fn const& fn) noexce
     job->numTasks = numTasks;
     job->maxHelpers = width - 1;
     bool const posted = pool->post(job);
-    job->work();
+    job->work(/*helper=*/false);
     if (posted)
     {
         pool->retract(job.get());
@@ -676,7 +750,7 @@ CUDA_CB void hostFnDiskToDiskCopy(void* userData) noexcept
                     if (diskWriteBehind().numPages() != 0)
                     {
                         // This write bypasses staging, so a pending write of the destination must not land after it.
-                        diskWriteBehind().drop(t.dst.fd, t.dst.pos, t.dst.pos);
+                        diskWriteBehind().dropPage({t.dst.fd, t.dst.pos});
                     }
                 }
                 catch (std::exception const&)
@@ -699,14 +773,7 @@ CUDA_CB void hostFnDiskToDiskCopy(void* userData) noexcept
         if (success && diskWriteBehind().numPages() != 0)
         {
             // This write bypasses staging, so a pending write of the destination must not land after it.
-            try
-            {
-                diskWriteBehind().drop(t.dst.fd, t.dst.pos, t.dst.pos);
-            }
-            catch (std::exception const&)
-            {
-                success = false;
-            }
+            diskWriteBehind().dropPage({t.dst.fd, t.dst.pos});
         }
         success = success && writeAll(t.dst.fd, t.dst.pos, buffer.data(), data->numBytes);
     }
@@ -945,6 +1012,13 @@ struct DiskTransfer : std::enable_shared_from_this<DiskTransfer>
             return readDiskPage(t.src.fd, t.src.pos, offset, reinterpret_cast<std::byte*>(t.dst) + offset, length);
         }
         auto const& t = writes[task];
+        if (diskWriteBehind().numPages() != 0)
+        {
+            // This piece bypasses staging. An older staged write of the page (its flush queued, running or failed)
+            // must neither land after it nor be read in its place: retire it first. Every piece does this, as the
+            // pieces of one page may run on different workers in any order.
+            diskWriteBehind().dropPage({t.dst.fd, t.dst.pos});
+        }
         bool const ok = !takeInjectedWriteFailure()
             && writeAll(t.dst.fd, t.dst.pos + offset, reinterpret_cast<std::byte const*>(t.src) + offset, length);
         if (!ok)
@@ -1377,12 +1451,12 @@ private:
         auto const& t = transfer.writes[task];
         size_t const bytes = static_cast<size_t>(transfer.numBytes);
         auto& wb = diskWriteBehind();
+        DiskPageKey const key{t.dst.fd, t.dst.pos};
         try
         {
             auto page = std::make_shared<StagedDiskPage>(wb.takeBuffer(bytes), bytes);
             transfer.unstagedReservedBytes.fetch_sub(bytes); // now owned by the page
             std::memcpy(page->data.get(), reinterpret_cast<void const*>(t.src), bytes);
-            DiskPageKey const key{t.dst.fd, t.dst.pos};
             wb.publish(key, page);
             {
                 // A background write keeps its transfer, and so its share of the background write cap, until the
@@ -1399,6 +1473,10 @@ private:
         {
             // Out of memory: fall through to a direct write.
         }
+        // The direct write bypasses staging. Retire any staged copy of the page first: an older write's, whose flush
+        // must not land after this one, or this write's own when it was published but its flush could not be queued,
+        // which would otherwise keep its staging and stay the page's read source with no flush to release it.
+        wb.dropPage(key);
         bool const ok = !takeInjectedWriteFailure()
             && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), transfer.numBytes);
         if (!ok)
@@ -1411,13 +1489,21 @@ private:
     void runFlush(Piece piece) noexcept
     {
         auto& wb = diskWriteBehind();
-        auto const start = wb.beginFlush(piece.key, piece.page.get());
-        if (start == DiskWriteBehind::FlushStart::kBusy)
+        auto start = wb.beginFlush(piece.key, piece.page.get());
+        while (start == DiskWriteBehind::FlushStart::kBusy)
         {
-            // An older flush of this page is still writing; this one must land after it.
+            // An older flush of this page is still writing; this one must land after it. Queue it again, or, without
+            // memory for that, wait for the older flush here.
+            try
             {
                 std::lock_guard<std::mutex> lock(mMutex);
-                mFlush.push_back(std::move(piece));
+                mFlush.push_back(std::move(piece)); // strong guarantee: on failure `piece` is unchanged
+            }
+            catch (std::exception const&)
+            {
+                wb.waitFlushEnd(piece.key);
+                start = wb.beginFlush(piece.key, piece.page.get());
+                continue;
             }
             std::this_thread::yield();
             return;
@@ -1708,14 +1794,8 @@ void discardDiskWriteBehind(int fd, ssize_t minPos) noexcept
     {
         return;
     }
-    try
-    {
-        diskWriteBehind().drop(fd, minPos);
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] could not discard write-behind pages: %s\n", e.what());
-    }
+    // Allocation-free: every staged page of the file is gone before its caller closes or truncates it.
+    diskWriteBehind().drop(fd, minPos);
 }
 
 size_t diskWriteBehindPagesForTesting() noexcept
@@ -1876,8 +1956,8 @@ CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_
         size_t const stagedBytes = static_cast<size_t>(numBytes) * tasks.size();
         // Background writes may take half of the staging at most, so evictions find room.
         auto& wb = diskWriteBehind();
-        bool const fits = transfer->backgroundBytes == 0 || wb.reservedBytes() + stagedBytes <= wb.capacity() / 2;
-        if (stagedBytes != 0 && fits && wb.reserve(stagedBytes))
+        size_t const limit = transfer->backgroundBytes == 0 ? wb.capacity() : wb.capacity() / 2;
+        if (stagedBytes != 0 && wb.reserve(stagedBytes, limit))
         {
             transfer->staged = true;
             transfer->unstagedReservedBytes.store(stagedBytes);
