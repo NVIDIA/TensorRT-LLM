@@ -475,3 +475,27 @@ def test_group_plan_checks_an_int64_request_index_before_narrowing(monkeypatch) 
     assert set(range(group_rows)) <= set(lone), "the foreign rows left the lone list"
     got, want = op(**args), _two_pass_out(args, monkeypatch)
     assert torch.equal(got.view(torch.int16), want.view(torch.int16)), "attn_out"
+
+
+def test_both_passes_write_into_a_supplied_out(launches) -> None:
+    """`out` given: a launch with row-tile groups and a lone group (rows of two requests)
+    writes both passes' rows into the supplied slice of a sentinel-filled buffer and returns
+    it; the rows around the slice keep the sentinel. An `out` over `q` is refused before any
+    kernel is launched."""
+    args = _build(_with([(3000, 50), (7000, 50)], slots=8), seed=7702)
+    q = args["q"]
+    rows, heads, dim = q.shape
+    sentinel = -1234.0
+    buffer = torch.full((rows + 4, heads, dim), sentinel, dtype=q.dtype, device=q.device)
+    out = buffer[2 : 2 + rows]
+    got = op(**args, out=out)
+    torch.cuda.synchronize()
+    assert got is out
+    names = [name for name, _ in launches]
+    assert "_rowtile_lone_kernel" in names and "_rowtile_attention_cute" in names, names
+    _compare(out, op.reference(**args))
+    assert bool((buffer[:2] == sentinel).all()) and bool((buffer[2 + rows :] == sentinel).all())
+    launches.clear()
+    with pytest.raises(ValueError, match="out"):
+        op(**args, out=q)
+    assert launches == []
