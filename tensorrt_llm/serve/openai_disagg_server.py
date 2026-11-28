@@ -22,9 +22,10 @@ import socket
 import traceback
 import uuid
 from contextlib import aclosing, asynccontextmanager
-from typing import AsyncGenerator, Callable, Optional
+from typing import AsyncGenerator, AsyncIterator, Awaitable, Callable, Optional
 
 import aiohttp
+import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -72,11 +73,13 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                UCompletionResponseOrGenerator,
-                                                get_steady_clock_now_in_seconds,
-                                                guard_responses_stream,
-                                                stream_error_event)
+from tensorrt_llm.serve.responses_utils import (
+    STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED,
+    STREAM_TERMINATION_UPSTREAM_ERROR, ClosingStreamingResponse,
+    ResponsesStreamingProcessor, ServerArrivalTimeMiddleware,
+    UCompletionResponseOrGenerator, get_steady_clock_now_in_seconds,
+    guard_responses_stream, iter_complete_sse_frames,
+    keep_responses_stream_alive, relay_after_opening, stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
@@ -87,6 +90,17 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+
+# Seconds a streamed /v1/responses request waits for its pipeline before the
+# response starts. The pipeline has a stream to return only once its context
+# phase is done, and until the response starts the client receives nothing,
+# not even the status line, which clients and proxies take for a dead
+# connection after a while. A pipeline that answers within the wait is relayed
+# or, if it failed, answered with its error status. For one still running, the
+# stream starts at once with response.created and response.in_progress, and
+# response.in_progress is sent again whenever the stream is silent, as an
+# aggregated server does.
+_RESPONSES_STREAM_START_WAIT_S = 1.0
 
 # Most round trips to spend estimating one ctx/gen server's steady-clock
 # offset. Only the least-delayed sample is kept; see `_sync_server_clock`.
@@ -202,6 +216,85 @@ class RawRequestResponseHooks(ResponseHooks):
                 self.gen_metrics,
                 disagg_request_id=self.disagg_request_id,
             ))
+
+
+async def _close_responses_pipeline(pipeline: asyncio.Future) -> None:
+    """Cancel a Responses pipeline and close any stream it already returned."""
+    pipeline.cancel()
+    with anyio.CancelScope(shield=True):
+        await asyncio.gather(pipeline, return_exceptions=True)
+        if (pipeline.done() and not pipeline.cancelled()
+                and pipeline.exception() is None
+                and isinstance(pipeline.result(), StreamingResponse)):
+            await pipeline.result().body_iterator.aclose()
+
+
+class _ResponsesStreamingResponse(ClosingStreamingResponse):
+    """Release the pipeline however the response ends, body iterated or not.
+
+    A pipeline still running is cancelled, and the stream of one that has
+    answered is closed: the body may stop, or never start, before it has read
+    that stream to its end.
+    """
+
+    def __init__(self,
+                 pipeline: asyncio.Future,
+                 content: AsyncIterator[str],
+                 *,
+                 status_code: int = 200,
+                 media_type: str = "text/event-stream",
+                 background=None) -> None:
+        super().__init__(content=content,
+                         status_code=status_code,
+                         media_type=media_type,
+                         background=background)
+        self._pipeline = pipeline
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await _close_responses_pipeline(self._pipeline)
+
+
+def _guard_relayed_responses_stream(answer: Response,
+                                    pipeline: asyncio.Future) -> Response:
+    """``answer``, with a stream that fails early ending in an ``error`` event.
+
+    The stream is the generation worker's own, response.created included, so
+    there is no response of this server's to report as failed. Wrapping it in
+    _ResponsesStreamingResponse ensures disconnecting before the body iterates
+    still closes the pipeline's upstream stream while preserving status code,
+    headers, media type, and background task.
+    """
+    if not isinstance(answer, StreamingResponse):
+        return answer
+    wrapped = _ResponsesStreamingResponse(
+        pipeline=pipeline,
+        content=guard_responses_stream(
+            iter_complete_sse_frames(answer.body_iterator),
+            stream_error_event),
+        status_code=answer.status_code,
+        media_type=answer.media_type or "text/event-stream",
+        background=answer.background)
+    wrapped.raw_headers = list(answer.raw_headers)
+    return wrapped
+
+
+def _error_response_failure(response: Response) -> tuple[str, str]:
+    """The cause and message a stream reports an error response with.
+
+    An over-length rejection keeps its code, context_length_exceeded, which
+    clients act on; any other error response is an upstream error.
+    """
+    try:
+        payload = json.loads(response.body)
+        message = str(payload.get("message") or payload.get("detail") or payload)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return STREAM_TERMINATION_UPSTREAM_ERROR, "Internal server error"
+    if payload.get("code") == CONTEXT_LENGTH_EXCEEDED_CODE:
+        return STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, message
+    return STREAM_TERMINATION_UPSTREAM_ERROR, message
 
 
 def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
@@ -468,14 +561,24 @@ class OpenAIDisaggServer:
         # annotation with request_type (as openai_server.py does).
         # hold_headers_until_first_chunk=False returns a stream at once, for a
         # caller that keeps it alive until the first chunk (/v1/messages pings).
-        @tracing.trace_span("disaggregated_request")
-        async def wrapper(req: request_type, raw_req: Request) -> Response:
+        service_responses = getattr(getattr(self, "_service", None),
+                                    "openai_responses", None)
+        use_early_open = (service_responses is not None
+                          and entry_point == service_responses)
+
+        async def run_once(req: request_type, raw_req: Request,
+                           hold_headers: bool,
+                           guard_responses: bool) -> Response:
             hooks: Optional[RawRequestResponseHooks] = None
             try:
                 hooks = self._prepare_request(req, raw_req)
                 response_or_generator = await self._run_entry_point(
-                    entry_point, req, hooks, raw_req,
-                    hold_headers_until_first_chunk)
+                    entry_point,
+                    req,
+                    hooks,
+                    raw_req,
+                    hold_headers,
+                    guard_responses=guard_responses)
                 self._finish_request(req, hooks)
                 return self._serialize_response(req, response_or_generator)
             except _ClientDisconnected:
@@ -486,6 +589,14 @@ class OpenAIDisaggServer:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
                 return self._finish_failed_request(e, req, hooks)
+
+        @tracing.trace_span("disaggregated_request")
+        async def wrapper(req: request_type, raw_req: Request) -> Response:
+            if req.stream and use_early_open:
+                return await self._serve_early_open_responses_stream(
+                    req, lambda: run_once(req, raw_req, False, False))
+            return await run_once(req, raw_req, hold_headers_until_first_chunk,
+                                  True)
         return wrapper
 
     def _prepare_request(self, req: UCompletionRequest,
@@ -514,26 +625,36 @@ class OpenAIDisaggServer:
             self._collect_perf_metrics)
 
     async def _run_entry_point(
-            self, entry_point: Callable, req: UCompletionRequest,
-            hooks: RawRequestResponseHooks, raw_req: Request,
-            hold_headers_until_first_chunk: bool = True
+            self,
+            entry_point: Callable,
+            req: UCompletionRequest,
+            hooks: RawRequestResponseHooks,
+            raw_req: Request,
+            hold_headers_until_first_chunk: bool = True,
+            *,
+            guard_responses: bool = True
     ) -> UCompletionResponseOrGenerator:
-        """Run the service and start its stream before counting a response.
+        """Run the service and, when holding headers, start its stream first.
 
-        Returns a typed response for non-streaming requests, or an async
-        generator of the worker's raw SSE bytes with Responses errors guarded.
+        When ``guard_responses`` is true, a streamed ``ResponsesRequest`` is
+        guarded with ``guard_responses_stream`` so an early failure ends with an
+        SSE ``error`` event. When ``hold_headers_until_first_chunk`` is true,
+        the first chunk is pulled via ``_start_stream``. Returns a typed
+        response for non-streaming requests, or an async generator of the
+        worker's raw SSE bytes.
         """
         response_or_generator = await entry_point(req, hooks)
         if req.stream:
             stream = response_or_generator
-            if isinstance(req, ResponsesRequest):
-                # A relayed Responses stream that fails ends with an
-                # `error` event, even before its first frame.
+            if isinstance(req, ResponsesRequest) and guard_responses:
+                # A relayed Responses stream that fails ends with an `error`
+                # event, even before its first frame.
                 stream = guard_responses_stream(stream, stream_error_event)
-            # Hold the headers until the first chunk: a chat or completion
-            # stream that fails before it becomes an HTTP error, not a 200
-            # whose body is cut off. Anthropic streams ping instead.
             if hold_headers_until_first_chunk:
+                # Hold the headers until the first chunk: a chat or completion
+                # stream that fails before it becomes an HTTP error, not a 200
+                # whose body is cut off. Anthropic and early-open Responses
+                # streams open and guard their streams themselves.
                 stream = await self._start_stream(stream, raw_req)
             return stream
         return response_or_generator
@@ -566,6 +687,112 @@ class OpenAIDisaggServer:
         # by_alias: e.g. text.format.schema goes out under its wire name.
         return JSONResponse(
             content=response_or_generator.model_dump(by_alias=True))
+
+    async def openai_responses(self, request: ResponsesRequest,
+                               raw_request: Request) -> Response:
+        """Serve Responses through the disaggregated pipeline.
+
+        A streamed request whose pipeline is still running after
+        _RESPONSES_STREAM_START_WAIT_S is answered from here at once; see
+        _responses_stream_when_done.
+        """
+        responses = self._wrap_entry_point(self._service.openai_responses,
+                                           ResponsesRequest)
+        return await responses(request, raw_request)
+
+    async def _serve_early_open_responses_stream(
+            self, request: ResponsesRequest,
+            start_pipeline: Callable[[], Awaitable[Response]]) -> Response:
+        """Run a streamed Responses pipeline and open the stream if it waits."""
+        pipeline = asyncio.ensure_future(start_pipeline())
+        try:
+            await asyncio.wait((pipeline, ),
+                               timeout=_RESPONSES_STREAM_START_WAIT_S)
+        except asyncio.CancelledError:
+            # Cancelling the request cancels its pipeline and closes any
+            # stream it may have already returned before wait resumed.
+            await _close_responses_pipeline(pipeline)
+            raise
+        if pipeline.done():
+            return _guard_relayed_responses_stream(pipeline.result(), pipeline)
+        try:
+            # The opening names request.request_id, the id every worker is sent
+            # (_encode_request_body) and answers under.
+            processor = ResponsesStreamingProcessor(
+                request=request,
+                sampling_params=request.to_sampling_params(),
+                model_name=request.model)
+            opening = processor.get_initial_responses()
+        except ValueError:
+            # The opening is built from the request alone; a request it cannot
+            # be built from is answered when its pipeline answers.
+            try:
+                answer = await pipeline
+            except asyncio.CancelledError:
+                await _close_responses_pipeline(pipeline)
+                raise
+            return _guard_relayed_responses_stream(answer, pipeline)
+        # keep_responses_stream_alive repeats the opening's response.in_progress
+        # whenever the stream is silent, as it is while the pipeline runs.
+        return _ResponsesStreamingResponse(
+            pipeline=pipeline,
+            content=keep_responses_stream_alive(
+                self._responses_stream_when_done(processor, opening,
+                                                 pipeline)))
+
+    async def _responses_stream_when_done(
+            self, processor: ResponsesStreamingProcessor, opening: list[str],
+            pipeline: asyncio.Future) -> AsyncIterator[str]:
+        """The stream of a Responses request whose pipeline outlasted the start wait.
+
+        ``opening`` is the request's response.created and response.in_progress,
+        and the pipeline's stream follows it without the worker's own
+        response.created and response.in_progress events (relay_after_opening),
+        so that every keepalive the client gets repeats ``opening``'s
+        response.in_progress. The status line is already out, so a pipeline
+        that fails ends the stream with error and response.failed, which carry
+        the message of its error response, and for an over-length rejection
+        its code, context_length_exceeded (_error_response_failure); so does a
+        pipeline's stream that fails before its terminal event. A stream
+        abandoned before the pipeline answers, as when the client disconnects,
+        cancels the pipeline.
+        """
+        try:
+            for frame in opening:
+                yield frame
+            try:
+                answer = await pipeline
+            except HTTPException as e:
+                failure = (STREAM_TERMINATION_UPSTREAM_ERROR, str(e.detail))
+            else:
+                failure = (None if isinstance(answer, StreamingResponse) else
+                           _error_response_failure(answer))
+        finally:
+            pipeline.cancel()
+        if failure is not None:
+            cause, detail = failure
+            for frame in processor.get_stream_failed_events(
+                    cause, detail, len(opening)):
+                yield frame
+            return
+        # Relay first so a mid-frame worker disconnect discards the truncated
+        # payload instead of closing it with a delimiter; the outer guard then
+        # appends error and response.failed numbered after the last valid event.
+        frames = guard_responses_stream(
+            relay_after_opening(answer.body_iterator, len(opening)),
+            lambda cause, detail, relayed: processor.get_stream_failed_events(
+                cause, detail, len(opening) + relayed),
+        )
+        try:
+            async for frame in frames:
+                yield frame
+        except Exception:  # noqa: BLE001 - the guard has reported it
+            # The guard has logged the failure and sent error and
+            # response.failed, unless the terminal event had gone out: either
+            # way the response is over, and so is the stream.
+            return
+        finally:
+            await frames.aclose()
 
     @staticmethod
     async def _start_stream(

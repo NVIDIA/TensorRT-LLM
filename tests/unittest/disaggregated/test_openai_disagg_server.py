@@ -560,7 +560,7 @@ async def test_stream_forwards_every_chunk(chunks, streaming_server):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["completion", "chat", "responses"])
+@pytest.mark.parametrize("kind", ["completion", "chat"])
 async def test_stream_closed_before_iteration_closes_upstream(kind, streaming_server):
     """A client that leaves before the body is sent still releases the upstream stream."""
     closed = []
@@ -643,13 +643,12 @@ async def test_responses_stream_failing_before_first_frame_ends_with_error_event
         raise RuntimeError("no generation worker")
         yield b"unreachable"
 
-    async def entry_point(request, hooks):
-        return failing_relay()
-
-    wrapper = streaming_server._wrap_entry_point(entry_point, ResponsesRequest)
+    streaming_server._service = SimpleNamespace(
+        openai_responses=AsyncMock(return_value=failing_relay())
+    )
     request = ResponsesRequest.model_validate({"model": "m", "input": "hi", "stream": True})
 
-    response = await wrapper(request, _streaming_raw_request())
+    response = await streaming_server.openai_responses(request, _streaming_raw_request())
 
     assert isinstance(response, StreamingResponse)
     frames = []
@@ -659,6 +658,76 @@ async def test_responses_stream_failing_before_first_frame_ends_with_error_event
     assert len(frames) == 1
     assert frames[0].startswith(b"event: error")
     assert json.loads(frames[0].decode().split("data: ", 1)[1])["sequence_number"] == 0
+
+
+@pytest.mark.asyncio
+async def test_fast_responses_disconnect_during_headers_closes_upstream(streaming_server):
+    """A client disconnecting during header send closes a fast relayed Responses stream."""
+    from starlette.requests import ClientDisconnect
+
+    closed = []
+
+    async def primed_generation_stream():
+        try:
+            yield None
+            yield b"event: response.created\ndata: {}\n\n"
+        finally:
+            closed.append(True)
+
+    upstream = primed_generation_stream()
+    await upstream.__anext__()
+
+    streaming_server._service = SimpleNamespace(openai_responses=AsyncMock(return_value=upstream))
+    request = ResponsesRequest.model_validate({"model": "m", "input": "hi", "stream": True})
+
+    response = await streaming_server.openai_responses(request, _streaming_raw_request())
+    assert isinstance(response, StreamingResponse)
+
+    async def send(message):
+        assert message["type"] == "http.response.start"
+        raise OSError("client disconnected")
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}}
+    with pytest.raises(ClientDisconnect):
+        await response(scope, receive, send)
+
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_responses_wait_closes_completed_pipeline_stream(streaming_server):
+    """Cancelling openai_responses after pipeline resolves closes the returned upstream stream."""
+    closed = []
+
+    async def primed_generation_stream():
+        try:
+            yield None
+            yield b"event: response.created\ndata: {}\n\n"
+        finally:
+            closed.append(True)
+
+    upstream = primed_generation_stream()
+    await upstream.__anext__()
+
+    handler_task = None
+
+    async def fast_pipeline(request, hooks):
+        handler_task.cancel()
+        return upstream
+
+    streaming_server._service = SimpleNamespace(openai_responses=fast_pipeline)
+    request = ResponsesRequest.model_validate({"model": "m", "input": "hi", "stream": True})
+
+    handler_task = asyncio.create_task(
+        streaming_server.openai_responses(request, _streaming_raw_request())
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await handler_task
+
+    assert closed == [True]
 
 
 @pytest.mark.asyncio

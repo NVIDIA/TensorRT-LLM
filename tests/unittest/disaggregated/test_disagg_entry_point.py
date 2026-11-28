@@ -487,3 +487,44 @@ def test_streamed_responses_request_is_guarded(tmp_path):
             stream_requests=1,
             total_responses=1,
         )
+
+
+@pytest.mark.parametrize("hold_headers_until_first_chunk", [True, False])
+def test_streamed_responses_request_guards_first_pull_failure(
+    tmp_path, hold_headers_until_first_chunk
+):
+    with isolated_serve_env(tmp_path) as env:
+        server, counters = _server_with_counters(env)
+
+        async def failing():
+            raise RuntimeError("worker failed")
+            yield b"unreachable"
+
+        entry_point = AsyncMock(return_value=failing())
+        wrapper = server._wrap_entry_point(
+            entry_point,
+            ResponsesRequest,
+            hold_headers_until_first_chunk=hold_headers_until_first_chunk,
+        )
+        req = ResponsesRequest(model="m", input="hi", stream=True)
+
+        async def run():
+            response = await wrapper(req, _raw_request())
+            assert isinstance(response, StreamingResponse)
+            assert response.media_type == "text/event-stream"
+            frames = []
+            with pytest.raises(RuntimeError, match="worker failed"):
+                async for chunk in response.body_iterator:
+                    frames.append(chunk)
+            assert len(frames) == 1
+            assert frames[0].startswith(b"event: error\n")
+            assert json.loads(frames[0].decode().split("data: ", 1)[1])["sequence_number"] == 0
+
+        asyncio.run(run())
+        _assert_counts(
+            counters,
+            "a streamed Responses request whose first pull fails",
+            total_requests=1,
+            stream_requests=1,
+            total_responses=1,
+        )

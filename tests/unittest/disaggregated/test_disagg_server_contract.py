@@ -38,7 +38,8 @@ from unittest.mock import AsyncMock, Mock
 import aiohttp
 import pytest
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from test_common.serve.app_factory import isolated_serve_env
 from test_common.serve.routes import effective_routes
 
@@ -48,12 +49,15 @@ from tensorrt_llm.llmapi.disagg_utils import (
     RouterConfig,
     ServerRole,
 )
+from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
     CompletionRequest,
+    ResponsesRequest,
+    ResponsesResponse,
     UCompletionRequest,
     UsageInfo,
 )
@@ -345,3 +349,147 @@ def test_call_serves_host_port_sockets(server_cls):
     assert parameters["sockets"].default is None, _contract(
         "the sockets argument of __call__ defaulting to None"
     )
+
+
+def test_responses_route_works_through_two_arg_wrap_override(tmp_path, server_cls, monkeypatch):
+    class _ExtendedResponsesRequest(ResponsesRequest):
+        required_marker: str
+
+    responses_response = ResponsesResponse(
+        model="m",
+        output=[],
+        parallel_tool_calls=False,
+        temperature=1.0,
+        tool_choice="auto",
+        tools=[],
+        top_p=1.0,
+        background=False,
+        service_tier="auto",
+        status="completed",
+        top_logprobs=0,
+        truncation="disabled",
+    )
+
+    async def stream_frames():
+        yield b'event: response.created\ndata: {"type":"response.created","sequence_number":0}\n\n'
+        yield (
+            b"event: response.completed\ndata: "
+            b'{"type":"response.completed","sequence_number":1}\n\n'
+        )
+
+    handler_box = {}
+    seen_markers = []
+    background_ran = []
+
+    async def fake_service_responses(self, req, hooks):
+        return await handler_box["fn"](req, hooks)
+
+    monkeypatch.setattr(OpenAIDisaggregatedService, "openai_responses", fake_service_responses)
+
+    class _ResponsesAdaptor(_contract_subclass(server_cls)):
+        def _wrap_entry_point(self, entry_point, request_type=UCompletionRequest):
+            effective_type = (
+                _ExtendedResponsesRequest if request_type is ResponsesRequest else request_type
+            )
+            inner = super()._wrap_entry_point(entry_point, effective_type)
+
+            async def wrapper(req: effective_type, raw_req: Request) -> Response:
+                if isinstance(req, _ExtendedResponsesRequest):
+                    seen_markers.append(req.required_marker)
+                response = await inner(req, raw_req)
+                if isinstance(response, StreamingResponse):
+                    response.status_code = 202
+                    response.headers["x-wrapped-stream"] = "1"
+                    response.background = BackgroundTask(lambda: background_ran.append(True))
+                return response
+
+            return wrapper
+
+    with isolated_serve_env(tmp_path) as env:
+        server = _ResponsesAdaptor(
+            _disagg_server_config(), req_timeout_secs=7, coordinator_url=None, marker=1
+        )
+        client = env.client(server.app, lifespan=False)
+
+        # Missing subclass-required field must fail FastAPI validation on POST /v1/responses.
+        missing = client.post("/v1/responses", json={"model": "m", "input": "hi"})
+        assert missing.status_code == 400, _contract(
+            "/v1/responses must validate against the request model swapped by _wrap_entry_point"
+        )
+        assert "required_marker" in missing.text
+
+        # Non-streaming POST /v1/responses passes the swapped model and subclass header.
+        handler_box["fn"] = AsyncMock(return_value=responses_response)
+        non_stream = client.post(
+            "/v1/responses",
+            json={"model": "m", "input": "hi", "required_marker": "non-stream"},
+        )
+        assert non_stream.status_code == 200
+        assert non_stream.headers.get("x-wrapped") == "1"
+        assert seen_markers == ["non-stream"]
+
+        # Fast-path streaming POST /v1/responses preserves status, header, body, and background.
+        handler_box["fn"] = AsyncMock(side_effect=lambda req, hooks: stream_frames())
+        fast_stream = client.post(
+            "/v1/responses",
+            json={"model": "m", "input": "hi", "stream": True, "required_marker": "fast"},
+        )
+        assert fast_stream.status_code == 202
+        assert fast_stream.headers.get("x-wrapped-stream") == "1"
+        assert "event: response.created" in fast_stream.text
+        assert "event: response.completed" in fast_stream.text
+        assert seen_markers == ["non-stream", "fast"]
+        assert background_ran == [True]
+
+        # Slow-path early-open streaming through the registered /v1/responses endpoint.
+        background_ran.clear()
+        disagg_mod = importlib.import_module(server_cls.__module__)
+        monkeypatch.setattr(disagg_mod, "_RESPONSES_STREAM_START_WAIT_S", 0.0)
+        responses_endpoint = next(
+            route.endpoint
+            for path, route in effective_routes(server.app)
+            if path == "/v1/responses" and "POST" in (getattr(route, "methods", None) or ())
+        )
+
+        async def run_slow_stream():
+            gate = asyncio.Event()
+
+            async def delayed_responses(req, hooks):
+                await gate.wait()
+                return stream_frames()
+
+            handler_box["fn"] = delayed_responses
+            streamed = await responses_endpoint(
+                _ExtendedResponsesRequest(
+                    model="m", input="hi", stream=True, required_marker="slow"
+                ),
+                _raw_request(),
+            )
+            assert isinstance(streamed, StreamingResponse), _contract(
+                "streaming /v1/responses through a two-argument _wrap_entry_point override"
+            )
+            messages = []
+
+            async def send(message):
+                messages.append(message)
+                if message["type"] == "http.response.start":
+                    gate.set()
+
+            async def receive():
+                await asyncio.Future()
+                return {"type": "http.disconnect"}
+
+            await streamed({"type": "http"}, receive, send)
+            return messages
+
+        slow_messages = _run_through_subclass(asyncio.wait_for(run_slow_stream(), timeout=10.0))
+        slow_start = next(m for m in slow_messages if m["type"] == "http.response.start")
+        assert slow_start["status"] == 202
+        slow_headers = {k.lower(): v for k, v in slow_start["headers"]}
+        assert slow_headers.get(b"x-wrapped-stream") == b"1"
+        slow_body = b"".join(
+            m.get("body", b"") for m in slow_messages if m["type"] == "http.response.body"
+        )
+        assert b"event: response.created" in slow_body and b"event: response.completed" in slow_body
+        assert seen_markers == ["non-stream", "fast", "slow"]
+        assert background_ran == [True]

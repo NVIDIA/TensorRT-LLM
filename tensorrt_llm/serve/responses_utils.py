@@ -17,6 +17,7 @@ from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
                     Union)
 
 import anyio
+import pydantic_core
 from fastapi.responses import StreamingResponse
 from jinja2.exceptions import TemplateError
 from openai.types.responses import (ResponseCompletedEvent,
@@ -59,6 +60,7 @@ from tensorrt_llm._utils import \
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
+from tensorrt_llm.executor.utils import CONTEXT_LENGTH_EXCEEDED_CODE
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
 from tensorrt_llm.inputs.chat_template_guard import \
     unreferenced_chat_template_kwargs
@@ -3224,6 +3226,35 @@ def _stream_terminal_event(
     )
 
 
+def _response_failed_frame(snapshot: dict, code: str, message: str,
+                           sequence_number: int) -> str:
+    """A ``response.failed`` frame whose snapshot fails with ``code``.
+
+    ``snapshot`` is a ``ResponsesResponse`` dump, which has no ``error``; the
+    SDK's Response, which the event carries, does. The SDK's ``ResponseError``
+    does not list ``context_length_exceeded``, the code OpenAI fails an
+    over-length input with and the one clients act on. So the event is
+    validated with ``server_error`` in ``error.code``; any other code is then
+    written into its serialized form, with the serializer every frame uses.
+    """
+    event = ResponseFailedEvent(
+        type="response.failed",
+        sequence_number=sequence_number,
+        response={
+            **snapshot, "error": {
+                "code": "server_error",
+                "message": message
+            }
+        },
+    )
+    if code == "server_error":
+        return _format_sse_event(event)
+    payload = event.model_dump(mode="json", by_alias=True)
+    payload["response"]["error"]["code"] = code
+    return (f"event: {event.type}\n"
+            f"data: {pydantic_core.to_json(payload).decode()}\n\n")
+
+
 class ResponsesStreamingProcessor:
 
     def __init__(
@@ -3348,7 +3379,9 @@ class ResponsesStreamingProcessor:
 
         ``events_sent`` is the number of frames that reached the wire, which
         the terminal events are numbered after; without it they continue this
-        processor's own numbering.
+        processor's own numbering. The failed snapshot's ``error.code`` is
+        ``context_length_exceeded`` for an over-length rejection and
+        ``server_error`` for every other cause.
         """
         if events_sent is not None:
             self.sequence_number = events_sent
@@ -3369,15 +3402,12 @@ class ResponsesStreamingProcessor:
             status="failed",
             usage=None,
         ).model_dump(by_alias=True)
-        # Set on the dump: the SDK Response carries `error`, ResponsesResponse
-        # does not.
-        snapshot["error"] = {"code": "server_error", "message": detail}
-        failed_event = self._send_event(
-            ResponseFailedEvent(
-                type="response.failed",
-                sequence_number=-1,
-                response=snapshot,
-            ))
+        code = (CONTEXT_LENGTH_EXCEEDED_CODE
+                if cause == STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED else
+                "server_error")
+        failed_event = _response_failed_frame(snapshot, code, detail,
+                                              self.sequence_number)
+        self.sequence_number += 1
         return [error_event, failed_event]
 
 
@@ -3389,6 +3419,11 @@ class ResponsesStreamingProcessor:
 STREAM_TERMINATION_ENGINE_ERROR = "engine_error"
 STREAM_TERMINATION_UPSTREAM_ERROR = "upstream_error"
 STREAM_TERMINATION_INTERNAL_ERROR = "internal_error"
+# The engine rejected an input longer than the context window. This answers
+# the request rather than breaking it: the stream fails with OpenAI's code for
+# it, which clients act on (the Codex CLI compacts its history), and then ends
+# normally.
+STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED = CONTEXT_LENGTH_EXCEEDED_CODE
 
 _SSE_EVENT_DELIMITER = "\n\n"
 # A terminal event frame always follows another frame, and JSON payloads
@@ -3407,10 +3442,20 @@ def _sse_delimiter_and_markers(sample: Any) -> Tuple[Any, tuple]:
     return _SSE_EVENT_DELIMITER, _TERMINAL_FRAME_STARTS
 
 
+class _UpstreamStreamEOFError(EOFError):
+    """The upstream SSE stream ended in the middle of an event."""
+
+
+_SSE_DELIMITER_RE = re.compile(rb"\r?\n\r?\n")
+_SSE_DELIMITER_MAX_LEN = 4
+
+
 def classify_stream_termination(exc: Exception) -> str:
     """Attribute a stream-ending exception to a cause."""
     if isinstance(exc, (RequestError, EngineDeadError)):
         return STREAM_TERMINATION_ENGINE_ERROR
+    if isinstance(exc, _UpstreamStreamEOFError):
+        return STREAM_TERMINATION_UPSTREAM_ERROR
     # By module, to keep the HTTP client library out of this layer.
     if type(exc).__module__.split(".")[0] in ("aiohttp", "httpx", "httpcore"):
         return STREAM_TERMINATION_UPSTREAM_ERROR
@@ -3458,11 +3503,11 @@ async def guard_responses_stream(
     completed = False
     try:
         async for chunk in stream:
-            if not completed:
+            if not completed and chunk:
+                delimiter, markers = _sse_delimiter_and_markers(chunk)
                 if tail is None:
-                    tail = chunk[:0]
+                    tail = delimiter
                 text = tail + chunk
-                delimiter, markers = _sse_delimiter_and_markers(text)
                 events_sent += text.count(delimiter) - tail.count(delimiter)
                 if in_terminal_frame:
                     # A delimiter that ends the frame takes a byte of this chunk.
@@ -3692,6 +3737,83 @@ async def keep_responses_stream_alive(
     finally:
         # Stops the task reading ``frames`` when this stream ends early.
         await items.aclose()
+
+
+_OPENING_FRAME_STARTS = ("event: response.created\n", _IN_PROGRESS_FRAME_START)
+
+
+async def iter_complete_sse_frames(
+    stream: AsyncGenerator[Union[str, bytes],
+                           None], ) -> AsyncGenerator[str, None]:
+    r"""Yield complete ``\n\n``- or ``\r\n\r\n``-delimited SSE frames from ``stream``.
+
+    Fragments are accumulated in a single buffer and scanned incrementally from
+    the previous search boundary. If the upstream stream raises or ends
+    mid-frame, the truncated fragment is discarded rather than forwarded; a
+    clean EOF with a non-empty trailing fragment raises
+    ``_UpstreamStreamEOFError`` so an enclosing stream guard can emit terminal
+    error events after the last valid frame. ``stream`` is closed when
+    iteration ends.
+    """
+    pending = bytearray()
+    search_from = 0
+    try:
+        async for chunk in stream:
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            if not chunk:
+                continue
+            pending.extend(chunk)
+            start = 0
+            while True:
+                match = _SSE_DELIMITER_RE.search(pending, search_from)
+                if match is None:
+                    break
+                event = pending[start:match.start()].lstrip(b"\r\n")
+                start = match.end()
+                search_from = start
+                if event:
+                    frame = (
+                        event.decode(errors="replace").replace("\r\n", "\n") +
+                        _SSE_EVENT_DELIMITER)
+                    yield frame
+            if start:
+                del pending[:start]
+            search_from = max(0, len(pending) - _SSE_DELIMITER_MAX_LEN + 1)
+        if pending.strip(b"\r\n"):
+            # Discard the incomplete frame and signal premature EOF to the guard.
+            raise _UpstreamStreamEOFError("Responses stream ended mid-event")
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+async def relay_after_opening(stream: AsyncGenerator[Union[str, bytes], None],
+                              events_sent: int) -> AsyncGenerator[str, None]:
+    """Relay a worker's Responses stream to a client that already has its opening.
+
+    The client holds ``events_sent`` events, ``response.created`` and
+    ``response.in_progress`` among them, and is kept alive with that
+    ``response.in_progress`` by the stream this relay feeds
+    (``keep_responses_stream_alive``). So every ``response.created`` and
+    ``response.in_progress`` of the worker's is dropped, wherever it comes:
+    the worker's opening and its keepalives, which repeat that opening, carry
+    the worker's response object, not the one the client holds, and a second
+    source of keepalives would only add to the relaying stream's own. Every
+    other event is numbered to follow on, and is yielded whole, one per item
+    as ``keep_responses_stream_alive`` takes them, wherever ``stream`` splits
+    it. ``stream`` is closed when the relay ends.
+    """
+    frames = iter_complete_sse_frames(stream)
+    try:
+        async for frame in frames:
+            if frame.startswith(_OPENING_FRAME_STARTS):
+                continue
+            yield _stamp_sequence_number(frame, events_sent)
+            events_sent += 1
+    finally:
+        await frames.aclose()
 
 
 class ServerArrivalTimeMiddleware:
